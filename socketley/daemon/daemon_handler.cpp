@@ -44,38 +44,10 @@
 #include <csignal>
 #include "../shared/logging.h"
 
-// ─── How long a command will wait for a worker to answer ────────────────────
-//
-// Measured on this machine: a worker that has to compile a script, build its
-// ring and bind its listener reports back 17-22 ms after `create` has forked it,
-// over ten runs.  A refusal comes back sooner, because the child stops at the
-// script and exits rather than going on to bind anything.
-//
-// Two seconds is therefore about a hundred times the cost of the case it is
-// timing, which is the point: it is not a budget the normal path spends, it is
-// the backstop for a worker that has wedged and will never answer.  The wait
-// ends on the answer, so what a create actually costs is the 20 ms, and the
-// bound is only ever reached when something is already wrong.
-//
-// Two seconds rather than a new number of its own because it is the interval
-// this daemon already uses for the health tick -- the longest anything here
-// waits to notice a worker. One timescale in the file is easier to reason about
-// than two, and a wait that outlived the tick meant to supersede it would be the
-// confusing combination.
-//
-// Four commands wait on this: `create`, for the verdict on a configuration;
-// `reload-lua`, for the declaration a re-read script produces; and `start` and
-// `reload`, which fork exactly the same child `create -s` does and used to
-// return the moment they had asked for the fork.  All four are the control
-// path, and all four would otherwise report success for something the worker
-// had not done yet.
-//
-// It is one budget per COMMAND, not per runtime.  Each of those commands forks
-// every child it is going to fork before it waits for any of them, so the
-// children come up concurrently and the waits overlap: `start` of twenty pays
-// about one child's startup.  Spending the bound per name instead would let a
-// single wedged worker multiply it by the number of names on the command line,
-// which is how a two-second backstop becomes a minute.
+// Two seconds is the backstop for a worker that has wedged, not a budget the
+// normal path spends -- a child reports in 17-22 ms -- and it is one budget
+// per command rather than per runtime, because every child is forked before
+// any is waited on.
 namespace
 {
 constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
@@ -84,21 +56,9 @@ constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
 bool        daemon_handler::system_socket = false;
 
-// Why this runtime's TLS configuration cannot be honoured, or an empty string
-// if it can.
-//
-// The parse gate in flag_handlers.cpp stops the unsupported options being set
-// by `create`, but an instance can also be configured from a state file written
-// before that gate existed, so the check is repeated wherever a runtime is
-// about to go live.  Without it a state file from an older daemon still brings
-// up a listener that answers cleartext on a port `inspect` describes as
-// encrypted.
-//
-// A server and a cache terminate TLS on their own listener, a client on its
-// outbound socket and a proxy on both of its legs, so a complete configuration
-// for any of them passes.  What is refused is a configuration that would leave
-// part of the traffic in the clear — a cache replicating out of a TLS port
-// being the one that is not simply a half-typed flag set.  See tls_context.h.
+// Why this runtime's TLS configuration cannot be honoured, repeated wherever a
+// runtime goes live because a state file written before the parse gate existed
+// would otherwise bring up a cleartext listener `inspect` calls encrypted.
 static std::string instance_tls_refusal(const runtime_instance* inst)
 {
     if (!inst)
@@ -114,16 +74,9 @@ static std::string instance_tls_refusal(const runtime_instance* inst)
                               inst->get_replication_target());
 }
 
-// Why this runtime's shard count cannot be honoured, or an empty string if it
-// can.  The instance's own answer to shards_config_refusal — see
-// runtime_definitions.h for the rule and why it lives there rather than here.
-//
-// It used to take a `lua_override`, for the one caller that could not ask the
-// instance: `create` defers --lua to after every flag has been read, so at the
-// point the set was checked the script was still a local string.  That existed
-// solely to make `--shards 4 --lua x` and `--lua x --shards 4` refuse
-// identically.  A scripted server is no longer refused, so there is nothing for
-// the order to change and the parameter is gone with the rule that needed it.
+// Why this runtime's shard count cannot be honoured, asked of the instance,
+// since a scripted server is no longer refused and there is nothing left for
+// flag order to change.
 static std::string instance_shards_refusal(const runtime_instance* inst)
 {
     if (!inst)
@@ -134,44 +87,10 @@ static std::string instance_shards_refusal(const runtime_instance* inst)
                                  inst->get_listen_path());
 }
 
-// ─── MAY THIS CALLER HAND THE DAEMON THIS PID ───────────────────────────────
-//
-// `attach --pid` is how an embedded process registers a runtime it is serving
-// itself, and it is meant to be its own: the SDK example passes getpid().  The
-// daemon remembers it and sends it SIGTERM when the runtime is stopped, which
-// is the feature — `socketley stop app_cache` stops the process behind it.
-//
-// Nothing checked whose pid it was.  Measured on the parent commit, against a
-// process the daemon had nothing to do with:
-//
-//     $ sleep 300 &                       # pid 1328283
-//     $ socketley attach server bystander 18790 --pid 1328283
-//     $ socketley stop bystander
-//     [2]+  Terminated              sleep 300
-//
-// On a single-user daemon that is not a boundary — whoever may open the socket
-// could signal the process themselves.  On the packaged one it is: the socket
-// is 0660 socketley:socketley precisely so operators can reach a daemon that
-// runs as its own user (as root, in the container image), and any member of
-// that group could make it signal anything that uid can signal.  That is the
-// one line the whole threat model rests on; see setup() below.
-//
-// So the pid has to belong to the caller.  SO_PEERCRED gives the uid on the
-// other end of this connection — the kernel's answer, not the client's — and
-// /proc/<pid> is owned by the uid running that process.  Equal, and the caller
-// could have signalled it without the daemon's help; different, and the daemon
-// would be lending out a privilege it was never asked to lend.
-//
-// Deliberately NOT a check that the pid is the peer itself.  Both documented
-// spellings are legitimate and neither is the peer: the SDK's own connection
-// carries the process's pid, and a shell that starts a program and attaches it
-// with `--pid $!` names a sibling of the CLI, not the CLI.  Ownership is the
-// property that separates those from the escalation.
-//
-// A root peer passes everything, because root can signal everything anyway and
-// refusing would only break the container image's own arrangement.
-//
-// Returns an empty string when the pid may be used.
+// The pid `attach --pid` names has to belong to the caller, judged from
+// SO_PEERCRED against the owner of /proc/<pid>, because the packaged socket is
+// group-readable and the daemon would otherwise lend out a privilege it was
+// never asked to lend.
 static std::string attach_pid_refusal(int conn_fd, pid_t pid)
 {
     if (pid <= 0)
@@ -182,9 +101,9 @@ static std::string attach_pid_refusal(int conn_fd, pid_t pid)
     if (conn_fd < 0 ||
         ::getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0)
     {
-        // No credentials means no way to judge, and this runs on the path that
-        // decides who may be signalled.  Refusing is the answer that cannot be
-        // wrong in the direction that matters.
+        // No credentials means no way to judge on the path that decides who
+        // may be signalled, so refusing is the answer that cannot be wrong in
+        // the direction that matters.
         return "could not establish who is asking, so --pid was not accepted\n";
     }
 
@@ -207,14 +126,9 @@ static std::string attach_pid_refusal(int conn_fd, pid_t pid)
     return {};
 }
 
-// Why this runtime's --cpus / --sqpoll request cannot be honoured, or an empty
-// string if it can.
-//
-// The reasoning and the text live on runtime_instance, next to the request they
-// are about, because `create` is no longer the only place that asks: the
-// request is persisted now, and the daemon's restore path meets it again on a
-// ring that was created before the state file was read.  See
-// runtime_instance::ring_policy_refusal.
+// Why this runtime's --cpus / --sqpoll request cannot be honoured, with the
+// text on runtime_instance because the restore path meets the request again on
+// a ring created before the state file was read.
 static std::string instance_ring_refusal(const runtime_instance* inst,
                                          const event_loop& loop)
 {
@@ -223,21 +137,9 @@ static std::string instance_ring_refusal(const runtime_instance* inst,
     return inst->ring_policy_refusal(loop);
 }
 
-// Everything `create` prints, delivered to the client that typed it.
-//
-// cmd_create and every flag parser it calls report their refusals on std::cout,
-// which is the daemon's stdout — /dev/null in any daemon a user actually starts.
-// So a mistyped flag, a port that will not parse, a TLS set with a key and no
-// certificate, an impossible CPU set: all of them answered exit code 1 and not
-// one word about why.  The command's own reply channel is conn->write_buf, and
-// nothing was putting them there.
-//
-// Rewriting seventeen hundred lines of parser to take a connection would be the
-// thorough fix.  This is the one that reaches every one of them at once and
-// leaves them printing the way they read: cout is borrowed for the length of the
-// command and given back.  Safe on this thread because it is the only one that
-// writes cout — the metrics endpoint has its own thread and logs to stderr —
-// and the swap is undone by the destructor whatever the command does.
+// cout is borrowed for the length of a command and given back, because every
+// parser reports its refusals there and there is the daemon's stdout -- safe
+// on this thread, which is the only one that writes cout.
 namespace
 {
 
@@ -254,8 +156,8 @@ public:
         if (text.empty())
             return;
         // No connection means the command came from somewhere with no reply
-        // channel — the boot-time restore, a Lua call.  Those keep the old
-        // behaviour rather than losing the text entirely.
+        // channel, which keeps the old behaviour rather than losing the text
+        // entirely.
         if (m_conn) m_conn->write_buf += text;
         else        std::cout << text;
     }
@@ -269,12 +171,9 @@ private:
     std::streambuf*   m_saved;
 };
 
-// The STATUS column for a listing that can carry a runtime in any state.
-//
-// A running runtime shows how long it has been up.  Every other state shows the
-// state's name instead, because "how long has it been up" has no answer for a
-// runtime that never came up — and printing an uptime for one is how a listing
-// makes a failed runtime look healthy.
+// A running runtime shows how long it has been up and every other state shows
+// its name, because printing an uptime for a runtime that never came up makes
+// a failed one look healthy.
 std::string state_column(const runtime_instance* inst)
 {
     switch (inst->get_state())
@@ -309,19 +208,10 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     m_accept_addrlen = sizeof(m_accept_addr);
     m_accept_req = { this, nullptr, -1, 0, op_accept };
 
-    // Every republished table also goes to the workers.  Registered here rather
-    // than in setup() because the manager can publish before the listener is
-    // up — the boot-time restore does exactly that.
-    // And the map itself, on the same trigger.
-    //
-    // Two tables, one moment: the endpoint table says where a runtime can be
-    // reached and the map says what runtimes there are, and both are stale the
-    // instant a runtime is created, started, stopped, removed or renamed.
-    // publish_endpoints() is called at every one of those already — that is the
-    // whole reason it is a republish rather than an update — so the map rides it
-    // instead of growing a second list of call sites for the next one to be
-    // forgotten from.  The periodic push in check_managed_health() is the other
-    // half: it carries the connection counts, which move with no event at all.
+    // The map rides publish_endpoints() rather than growing a second list of
+    // call sites, because both tables are stale at exactly the same moments;
+    // the periodic push carries the connection counts, which move with no
+    // event at all.
     m_manager.set_endpoint_sink([this](const endpoint_table& tbl)
                                 {
                                     publish_endpoints_to_workers(tbl);
@@ -337,37 +227,29 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
                                { publish_to_workers(cache_name, channel, message); });
 
     // And a message addressed to one named runtime whose connections are in a
-    // worker.  cmd_send() reaches the supervisor by hand because it has
-    // m_proxy_workers in scope; socketley.send() has only the manager, so the
-    // manager gets the same route the other two have.
+    // worker, given to the manager so socketley.send() gets the route
+    // cmd_send() reaches by hand.
     m_manager.set_deliver_sink([this](std::string_view name,
                                       std::string_view message)
                                { return deliver_to_worker(name, message); });
 
-    // And the moment before a runtime leaves the map, for whoever is holding a
-    // pointer into it.  This is the reconcile cmd_remove() runs by hand, given
-    // to the manager so that a caller which has only the manager — a Lua
-    // script — cannot free a placeholder out from under its supervisor.
+    // And the moment before a runtime leaves the map, so a caller with only
+    // the manager cannot free a placeholder out from under its supervisor.
     m_manager.set_worker_release_sink([this] { reconcile_proxy_workers(); });
 
-    // And who answers for one SHARD of a runtime.  The manager registers a sink
-    // per name; only this side knows a name is N processes, so only this side
-    // can register the qualified entries a cross-shard request is addressed to.
-    // See shared/shard_target.h.
+    // And who answers for one shard, because only this side knows a name is N
+    // processes and can register the qualified entries.
     m_manager.set_shard_sink_publisher([this](request_channel& ch)
                                        { publish_shard_sinks(ch); });
 
-    // And a routing verb aimed at a runtime this process does not hold.  The
-    // pointer, not a lambda, because the sink is an interface with two methods
-    // whose contracts differ -- see route_relay::sink.  Cleared in teardown()
-    // beside the others; the manager outlives this handler.
+    // And a routing verb aimed at a runtime this process does not hold, as a
+    // pointer rather than a lambda because the sink is an interface with two
+    // contracts.
     m_manager.set_route_sink(this);
 
-    // And a cluster event, for the runtimes this process does not hold -- which
-    // is all of them.  dispatch_cluster_events walks the map and reaches for
-    // each runtime's lua_context; a placeholder has none, so on_cluster_join,
-    // on_cluster_leave and on_group_change fired nowhere at all.  See
-    // cluster_ev_wire for why the members list is resolved before it travels.
+    // And a cluster event for the runtimes this process does not hold, which
+    // is all of them, because dispatch_cluster_events reaches for a
+    // lua_context a placeholder does not have.
     m_manager.set_cluster_event_sink(
         [this](const cluster_ev_wire& w)
         {
@@ -375,10 +257,9 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
             for (auto& [name, shards] : m_proxy_workers)
             {
                 (void)name;
-                // Every shard.  A cluster event is about the cluster, not about
-                // one connection, so every process running the script has to
-                // see it -- telling only shard 0 would run on_group_change in
-                // one of four identical interpreters.
+                // Every shard, because a cluster event is about the cluster
+                // and telling only shard 0 would run on_group_change in one of
+                // four identical interpreters.
                 for (auto& sup : shards)
                     if (sup)
                         sup->send_cluster_event(payload);
@@ -386,43 +267,14 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
         });
 }
 
-// Every shard of every sharded runtime, under `name#index`.
-//
-// Rebuilt wholesale on every membership change, exactly like the table it is
-// appended to, and for the same reason: a supervisor that has been retired must
-// not still be reachable through a name.  The index IS the position in the
-// vector — reconcile_proxy_workers() only ever appends and only ever retires
-// from the back — so nothing else has to be kept in step with it.
-//
-// A runtime with one worker gets no entry.  Its name already resolves to that
-// worker, and `c#0` for an unsharded cache would be a second spelling of the
-// same thing for nobody to use.
-// Is there descriptor room to mesh this many shards?
-//
-// N shards need N(N-1) descriptors held AT ONCE in the daemon while the set is
-// forked — both ends of every pair, because the second child of a pair has not
-// been forked when the first one takes its end.  At the tree's max_shards of 64
-// that is 4,032.
-//
-// Answered from RLIMIT_NOFILE rather than from taste, and it SAYS SO when it
-// refuses.  A runtime that quietly stopped meshing would report the same
-// throughput as one that never tried, and be indistinguishable from a mesh that
-// did not help — which is the whole reason the route counters exist.
-//
-// Half the soft limit, less headroom for the listeners, rings and control
-// sockets the daemon already holds.  On this box the soft limit is 1,048,576,
-// so the cap cannot fire at any legal shard count; the branch is exercised by
-// lowering the limit, which test/integration/test_cache_shard_mesh.sh does.
+// Every shard of every sharded runtime under `name#index`, rebuilt wholesale
+// so a retired supervisor is not still reachable, with the index being the
+// position in the vector -- and meshing N shards needs N(N-1) descriptors at
+// once, answered from RLIMIT_NOFILE and said out loud when it refuses.
 bool daemon_handler::mesh_fits(size_t shards) const
 {
-    // The measurement control.
-    //
-    // The mesh and the relay are two routes for one crossing, and the question
-    // that decides whether the mesh is worth its descriptors is a comparison
-    // between them.  A comparison across two BUILDS makes the build a variable;
-    // this makes it one binary and one environment variable, so the arms differ
-    // only in the route.  Read here because this is the one function that
-    // decides whether a runtime meshes at all.
+    // The measurement control, so the mesh and the relay differ in the route
+    // alone rather than in the build.
     if (const char* off = ::getenv("SOCKETLEY_NO_SHARD_MESH");
         off && *off && *off != '0')
     {
@@ -491,15 +343,9 @@ bool daemon_handler::is_running()
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
     bool alive = connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
 
-    // EACCES/EPERM counts as running.  The socket is there and this uid may not
-    // open it, which since the mode was tightened is what another user's daemon
-    // looks like — and the caller's next move on `false` is setup(), which
-    // opens with unlink(socket_path).  On /tmp the sticky bit refuses that, but
-    // SOCKETLEY_SOCKET can name a directory with no sticky bit, and there the
-    // unlink succeeds: a second user starting a daemon would take the path away
-    // from the daemon that owns it, leaving that daemon serving a socket with
-    // no name and every CLI command going to the new one.  Refusing to start is
-    // the same answer as for a daemon we could talk to, and the right one.
+    // EACCES/EPERM counts as running, because the caller's next move on false
+    // is a setup() that unlinks the path -- which in a directory with no
+    // sticky bit would take the socket from the daemon that owns it.
     if (!alive)
     {
         const int err = errno;
@@ -517,14 +363,9 @@ bool daemon_handler::setup()
 {
     unlink(socket_path.c_str());
 
-    // SOCK_CLOEXEC: this is the socket every CLI command arrives on, and the
-    // daemon forks and execs a worker for every runtime there is.  Without the
-    // flag the worker inherits it — measured, as
-    // fd 5 of a live worker, an SO_ACCEPTCON row on the daemon's own path — and
-    // then answers the question "is a daemon serving this socket" in the
-    // affirmative for as long as it lives.  The test suite asks exactly that
-    // question, by inode, to decide whether a daemon is up; a worker that
-    // outlives a killed daemon made it say yes with no daemon in existence.
+    // SOCK_CLOEXEC, because without it a worker inherits the socket every CLI
+    // command arrives on and answers "is a daemon serving this" for as long as
+    // it lives.
     m_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
@@ -534,87 +375,29 @@ bool daemon_handler::setup()
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     // ─── WHO MAY OPEN THE CONTROL PLANE ─────────────────────────────────────
-    //
-    // This was `chmod(socket_path, 0666)` — "Allow all users to connect".  It
-    // did exactly that, and connecting is not a small thing to grant: every
-    // command the CLI can send arrives here.  Any local uid could stop a
-    // runtime, read `stats`, rewrite a runtime's configuration, and — because
-    // `create --lua` takes a script and a handler runs with the daemon's
-    // privileges, which is a property of the design and not a defect (see the
-    // sandbox note in lua_context.cpp) — run code as the daemon's user.
-    //
-    // Measured on the parent commit, dev mode, daemon owned by uid 1000:
-    //
-    //     socket mode                                srw-rw-rw-  (0666)
-    //     uid nobody: connect + "ping"               answered
-    //     uid nobody: create --lua + start           accepted
-    //     the handler's io.popen("id -un") wrote     the daemon's user
-    //     the file it created was owned by           the daemon's user
-    //
-    // That is privilege escalation with Lua as one route to it and the rest of
-    // the command set as the others, so the fix is here rather than in the
-    // interpreter.
-    //
-    // THE RULE.  A daemon serving the packaged path shares its socket with its
-    // own group and nobody else; every other daemon keeps its socket to itself.
-    //
-    //     /run/socketley/socketley.sock   0660  socketley:socketley
-    //     anything else                   0600  <the user who started it>
-    //
-    // Both halves matter.  0600 everywhere would break the packaged deployment,
-    // where the daemon runs as `socketley` and the operator does not; 0660
-    // everywhere would be a hole on any distribution that gives its users a
-    // shared primary group — `users`, which several do — since there the
-    // daemon's group is every human on the machine.  system_socket is the only
-    // thing that distinguishes the two, and it defaults to false.
-    //
-    // The unprivileged single-user case, which is the ordinary one, is
-    // unaffected: the socket belongs to the uid that started the daemon and
-    // that uid is the one running the CLI.
-    //
-    // WHERE THE MODE IS SET, AND WHY THERE IS NO WINDOW.  bind() creates the
-    // file with 0777 & ~umask — commonly 0755 — and the mode is not corrected
-    // until a few lines below it.  That gap is not reachable: an AF_UNIX
-    // stream socket that has been bound but not yet listen()ed refuses every
-    // connect() with ECONNREFUSED, and the listen() below is the first moment
-    // a connect() to this path can succeed.  Both chmods are above it, so the
-    // socket is never both connectable and open, in either order.  The widening
-    // pair is ordered the same way — chown to the group first, chmod second —
-    // so the group bits are never granted to a group that has not been set.
-    //
-    // Setting a umask around the bind instead would also work and was tried;
-    // it was dropped because umask is process-wide and state_persistence has
-    // already started its writer thread by the time setup() runs, so the
-    // narrow window would silently apply to whatever that thread happened to
-    // create.  A property of the socket should not be paid for by every other
-    // file in the process.
+    // A daemon serving the packaged path shares its socket with its own group
+    // at 0660 and every other daemon keeps it at 0600, because connecting is
+    // not a small thing to grant -- `create --lua` runs code as the daemon's
+    // user -- and there is no window, since a bound socket refuses connect()
+    // until listen().
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
-        // Which path, and why.  A daemon that cannot bind its IPC socket exits
-        // without serving anything, and "already in use" and "permission
-        // denied" want opposite things done about them.
+        // Which path and why, because a daemon that cannot bind exits without
+        // serving anything and "already in use" and "permission denied" want
+        // opposite things done.
         LOG_ERROR(("ipc socket: " + std::string(addr.sun_path) + " could not be bound: " +
                    std::string(std::strerror(errno))).c_str());
-        // Raw close on purpose: the first submission this descriptor can ever
-        // appear in is the accept at the bottom of this function, and the
-        // failure paths do not reach it.  The number provably never entered the
-        // ring, so there is nothing to hold it for.
+        // Raw close on purpose, because the failure paths never reach the
+        // accept at the bottom of this function and the number provably never
+        // entered the ring.
         close(m_listen_fd);
         m_listen_fd = -1;
         return false;
     }
 
-    // 0600 first and unconditionally, so the packaged branch below only ever
-    // widens from a closed door and every other path is done in one line.
-    //
-    // Fatal when it fails, which is the one place in this function where an
-    // errno is worth refusing to start over.  Everything that reaches this
-    // socket is a command, so a daemon that could not put a mode on it would
-    // be serving its control plane at whatever the umask left — 0755 under the
-    // usual one, which already refuses another uid's connect(), but 0777 for a
-    // daemon started from a shell with `umask 0`.  "Started, and might be open
-    // to the machine" is not a state to have; not starting says so plainly and
-    // costs nothing that cannot be retried.
+    // 0600 first and unconditionally so the packaged branch only ever widens,
+    // and fatal on failure because a daemon serving its control plane at
+    // whatever the umask left is not a state to have.
     if (::chmod(socket_path.c_str(), 0600) < 0)
     {
         LOG_ERROR("ipc socket: could not set its mode, so it may be reachable "
@@ -626,16 +409,10 @@ bool daemon_handler::setup()
 
     if (system_socket)
     {
-        // The group by name, not by whatever this process happens to have.  The
-        // unit runs the daemon as socketley:socketley and the two agree, but
-        // `sudo socketley daemon` on the same installation runs it as root:root
-        // and 0660 there would hand the socket to group root instead of to the
-        // operators who were added to `socketley` — an installation that works
-        // under systemd and not by hand.  Failure here is not fatal, unlike the
-        // 0600 above: a chown that is refused, or an installation with no such
-        // group, leaves the socket at the 0600 it already has — a working
-        // daemon with a narrower door rather than a broken one, and never a
-        // wider one.
+        // The group by name and not by whatever this process has, because
+        // `sudo socketley daemon` would otherwise hand the socket to group
+        // root -- and a refused chown leaves the 0600 it already has, which is
+        // narrower rather than wider.
         if (struct group* gr = ::getgrnam("socketley"); gr != nullptr)
         {
             if (::chown(socket_path.c_str(), static_cast<uid_t>(-1), gr->gr_gid) < 0)
@@ -647,12 +424,9 @@ bool daemon_handler::setup()
         }
         else if (::geteuid() != 0)
         {
-            // Only worth saying when the daemon is a dedicated user, which is
-            // the packaged case: there, no group means no operator can reach
-            // it and someone needs to know before they go looking.  A daemon
-            // running as root with no such group is the container image's
-            // arrangement — root administers it and root opens anything — and
-            // a warning there is noise on every start.
+            // Only worth saying when the daemon is a dedicated user, because a
+            // root daemon with no such group is the container image's
+            // arrangement and a warning there is noise on every start.
             LOG_WARN("ipc socket: no `socketley` group on this system, so the "
                      "socket stays owner-only — members of that group are how "
                      "an operator reaches the packaged daemon");
@@ -687,12 +461,9 @@ bool daemon_handler::setup()
     return true;
 }
 
-// Arm the accept that every CLI connection arrives through.
-//
-// Nothing re-arms this but its own completion, so a submission that never
-// reached the ring leaves the daemon deaf — running, holding its runtimes, and
-// answering no command until it is restarted.  The flag lets the health tick
-// pick the chain back up, the same shape as start_health_timer().
+// Arm the accept every CLI connection arrives through, whose only re-arm is
+// its own completion, so a refused submission leaves the daemon deaf until the
+// health tick picks the chain back up.
 void daemon_handler::start_accept()
 {
     m_accept_addrlen = sizeof(m_accept_addr);
@@ -707,14 +478,9 @@ void daemon_handler::start_accept()
 
 void daemon_handler::teardown()
 {
-    // The workers first.  Each is asked to shut down over its control socket
-    // and then signalled, so a child stops its proxy while it still has a ring
-    // of its own to cancel into.  Left to the destructor these would be orphans
-    // reparented to init, still bound to their ports, and the next daemon would
-    // fail to bind.
-    // Every shard of every runtime, and not one per name: a runtime with four
-    // workers has four members of the REUSEPORT group to give back, and three
-    // left bound is what the next daemon fails to bind against.
+    // The workers first, every shard of every runtime, because a child left to
+    // the destructor is an orphan still bound to its port and the next daemon
+    // fails to bind.
     for (auto& [_, shards] : m_proxy_workers)
     for (auto& sup : shards)
     {
@@ -722,35 +488,17 @@ void daemon_handler::teardown()
         if (const pid_t p = sup->release_pid(); p > 0)
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
 
-        // Retired here too, so that "a supervisor is never destroyed while
-        // something still holds it" holds on both paths that destroy one rather
-        // than on the one that happened to be reported.  The clear() below is
-        // safe in the daemon for a different reason — daemon_start() shuts the
-        // ring down before this runs, so no completion can be dispatched
-        // afterwards — but this is also the destructor's path, and that reason
-        // belongs to the caller, not to this function.  There is nothing to
-        // wait for afterwards and nothing left to wait with, so the token is
-        // dropped.
+        // Retired here too, so "a supervisor is never destroyed while
+        // something still holds it" holds on both paths rather than only on
+        // the reported one.
         if (sup->retire() != 0) {}
     }
     m_proxy_workers.clear();
 
-    // ─── Wait for the children that were just told to go ────────────────────
-    //
-    // This did not wait, and until the workers acquired PR_SET_PDEATHSIG it did
-    // not have to: a signalled worker unwound as an orphan after this process
-    // was gone, which was untidy but harmless.  It is no longer harmless.  The
-    // parent-death signal is SIGKILL — see the note above claim_current_daemon()
-    // for why it cannot be anything softer — so exiting while a worker is still
-    // unwinding turns the graceful shutdown into a kill, and on_stop stops
-    // running for out-of-process runtimes whenever the daemon itself goes down.
-    //
-    // A worker unwinds in single-digit milliseconds: cancel the ring, close the
-    // connections, run on_stop.  So this costs nothing in the normal case and
-    // is bounded for the case that is not normal.  The bound is deliberately
-    // shorter than reap_orphan_workers()' own five-second escalation, because
-    // that escalation is what handles a worker that will not leave and this is
-    // only here to let the ordinary one finish.
+    // Wait for the children just told to go, because PR_SET_PDEATHSIG is
+    // SIGKILL and exiting while a worker unwinds turns a graceful shutdown
+    // into a kill -- bounded shorter than reap_orphan_workers()' own
+    // escalation, which handles a worker that will not leave.
     {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
@@ -766,10 +514,8 @@ void daemon_handler::teardown()
         }
     }
 
-    // The children are on their way out and this process is too, so init would
-    // adopt whatever is left.  Reaped here anyway for the case teardown() does
-    // not end in exit(): a daemon that is torn down and set up again would
-    // otherwise carry the previous generation's zombies for the rest of its life.
+    // Reaped here for the case teardown() does not end in exit(), or a daemon
+    // torn down and set up again carries the previous generation's zombies.
     reap_orphan_workers();
 
     // Nothing may call the sink once the workers are gone: it would encode a
@@ -791,52 +537,26 @@ void daemon_handler::teardown()
         }
     }
 
-    // The health timer, which nothing below reaches.  A timeout hangs off no
-    // descriptor, so the close_fd() calls further down and the cancels they
-    // submit walk straight past it and the loop goes on owing this handler a
-    // completion for up to two seconds.  Every runtime teardown withdraws its
-    // own timers for exactly that reason; this is the daemon's own, and it was
-    // the last one left counting down.
-    //
-    // On the daemon's path this is a formality and known to be one, like the
-    // closes below: daemon.cpp ends the ring before it gets here, so the
-    // submission is refused and the timer died with the ring.  It is written
-    // for the destructor's path, which does not get to assume that ordering.
-    //
-    // What it does not buy is worth saying: a withdrawn timeout still reports
-    // once more, with -ECANCELED, carrying this same request.  Tearing a
-    // handler down under a live ring therefore still needs the handler to
-    // outlive that completion — this only makes it arrive now rather than two
-    // seconds from now.
-    //
-    // Once per teardown, not once per call: daemon.cpp tears down explicitly and
-    // the destructor does it again, and the second withdrawal would name a
-    // request the first one already took back.
+    // The health timer, which nothing below reaches because a timeout hangs
+    // off no descriptor, withdrawn once per teardown -- a formality on the
+    // daemon's path, written for the destructor's, and it only makes the
+    // -ECANCELED arrive now rather than in two seconds.
     if (m_health_pending && !m_torn_down)
     {
-        // The answer is ignored on purpose, and this is the one place that is
-        // right: false means either the ring is already gone — the daemon's own
-        // path, where the timer went with it — or the submission was refused,
-        // and all that is left to do about the second is let the timer fire,
-        // which is what happened before this call existed.
+        // The answer is ignored on purpose, because false means either the
+        // ring is already gone or the submission was refused, and all that is
+        // left for the second is to let the timer fire.
         if (!m_loop.submit_timeout_remove(&m_health_req)) {}
 
-        // m_health_pending stays set.  The withdrawn timeout is still owed
-        // exactly one completion carrying this request, and clearing the flag
-        // would let a later start_health_timer() hand the kernel a request it
-        // is already carrying one for.  on_cqe() clears it when that completion
-        // lands, and m_torn_down is what stops it starting the chain again.
+        // m_health_pending stays set, because the withdrawn timeout still owes
+        // one completion carrying this request and clearing it would let a
+        // later arm hand the kernel a request it is already carrying one for.
     }
     m_torn_down = true;
 
-    // ── Anything a worker was still waiting on ──────────────────────────────
-    //
-    // Refused rather than dropped, and the descriptors closed.  A dropped
-    // request is not a smaller failure than a refused one: the worker's script
-    // is blocked on the answer, so silence costs it its whole deadline and then
-    // tells it nothing about why.  The nop that would have served these is not
-    // coming — m_torn_down is set above and the ring is ending — so this is the
-    // last chance anything has to say so.
+    // Anything a worker was still waiting on is refused rather than dropped,
+    // because the nop that would serve it is not coming and silence costs the
+    // script its whole deadline.
     for (auto& q : m_map_queue)
     {
         proxy_supervisor::answer_map_request(q.reply_fd, q.ticket, false,
@@ -846,31 +566,19 @@ void daemon_handler::teardown()
     }
     m_map_queue.clear();
 
-    // Stop cluster discovery before closing IPC.  This is the graceful path the
-    // man page's stale-detection table calls "file deleted, peers drop it at
-    // once", so it has to reach unpublish().
+    // Stop cluster discovery before closing IPC, because this is the graceful
+    // path the man page calls "file deleted, peers drop it at once" and it has
+    // to reach unpublish().
     stop_cluster();
 
-    // After stop_cluster(), because that is the last thing that can add to it.
-    // Everything here was retired — detached from the loop and dropped by
-    // whatever held it — on a path where waiting longer is not on offer, and
-    // the same reasoning covers it as the clears above: daemon.cpp ends the
-    // ring before this runs, so no completion can be dispatched afterwards.
+    // After stop_cluster(), which is the last thing that can add to it, and
+    // everything here was retired on a path where waiting longer is not on
+    // offer.
     m_retired_handlers.clear();
 
-    // Through the loop, not close(): every one of these numbers has been named
-    // by an SQE — a read on each client, an accept on the listener — and a
-    // close that only frees the number lets the next accept inherit it while
-    // the old operation is still queued against it.
-    //
-    // On the daemon's own shutdown path this is a formality and known to be
-    // one: daemon.cpp ends the ring before it gets here, so close_fd() sees no
-    // ring and is exactly close(), and the accept that was armed on the
-    // listener died with the ring rather than with the descriptor.  It is
-    // written this way because teardown() is also the destructor's path and
-    // does not get to assume that ordering, and because the one arrangement
-    // that would be wrong — closing these while the ring is live — is the one
-    // close_fd() is free to handle.
+    // Through the loop and not close(), because every one of these numbers has
+    // been named by an SQE -- a formality on the daemon's own path, and
+    // written this way because teardown() is also the destructor's.
     for (auto& [fd, conn] : m_clients)
     {
         if (conn->interactive)
@@ -884,13 +592,9 @@ void daemon_handler::teardown()
 
     m_clients.clear();
 
-    // Connections already handed to close_fd() in handle_read().  Their
-    // descriptors are the loop's business now — either still held for an
-    // operation that has not reported or already closed by the sweep in
-    // shutdown_ring() — so a second close here would be closing a number that
-    // may since have been reissued.  Only the storage is ours to drop, and
-    // nothing can still be pointing at it: reaching here means the ring is down
-    // (daemon shutdown) or nothing was ever submitted (setup failure).
+    // Connections already handed to close_fd() in handle_read(), whose
+    // descriptors are the loop's business now, so only the storage is ours to
+    // drop.
     m_closing.clear();
 
     if (m_listen_fd >= 0)
@@ -921,10 +625,9 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             handle_write(cqe, req);
             break;
         case op_nop:
-            // The loop coming back once every handler on the stack has unwound.
-            // Nothing else in this class submits one, and the address is checked
-            // anyway: a nop is the one submission whose type says nothing about
-            // who asked for it.
+            // The loop coming back once every handler on the stack has
+            // unwound, with the address checked anyway because a nop's type
+            // says nothing about who asked for it.
             if (req == &m_map_defer_req)
             {
                 m_map_defer_armed = false;
@@ -937,8 +640,8 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
             {
                 m_health_pending = false;
 
-                // The withdrawal teardown() submitted, answered.  There is
-                // nothing left to supervise and nothing to re-arm.
+                // The withdrawal teardown() submitted, answered, with nothing
+                // left to supervise and nothing to re-arm.
                 if (m_torn_down)
                     break;
 
@@ -949,13 +652,10 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
                     start_accept();
 
                 check_managed_health();
-                // Release the retired runtimes the ring has finished with.
-                // Removal reaps too, but only ever the ones retired before it —
-                // the instance it retires itself is still owed completions at
-                // that moment.  Without a second caller, the last runtime a
-                // daemon removes keeps its whole object until something else is
-                // removed or the daemon exits: two megabytes for a proxy before
-                // a single connection, six with its connection pools.
+                // Release the retired runtimes the ring has finished with,
+                // because removal only ever reaps the ones retired before it
+                // and the last runtime a daemon removes would keep its whole
+                // object.
                 m_manager.reap_retired(m_loop);
                 start_health_timer();
             }
@@ -965,14 +665,9 @@ void daemon_handler::on_cqe(struct io_uring_cqe* cqe)
     }
 }
 
-// A write submitted by send_response() has reported.
-//
-// For a connection the daemon still owns this is where the exchange finishes:
-// the reply is out, the buffer is free to be rebuilt, and the read that was
-// deliberately left un-armed while the write was queued goes back in.  For one
-// that close_client() parked because the client hung up while its reply was
-// still in the ring, it is the only thing that can say the ring has finished
-// with the request and the buffer inside it.
+// A write submitted by send_response() has reported, which for a live
+// connection re-arms the read and for a parked one is the only thing that can
+// say the ring has finished with the buffer.
 void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* req)
 {
     auto it = m_clients.find(req->fd);
@@ -985,21 +680,18 @@ void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* re
     auto* conn = it->second.get();
     conn->write_pending = false;
 
-    // A failed send says the reply is not going to be delivered — -EPIPE is the
-    // ordinary form, a client that read what it wanted and hung up.  There is
-    // no one left to answer, so this connection goes rather than sitting in
-    // m_clients holding a descriptor with nothing armed on it.
+    // A failed send says the reply is not going to be delivered, so this
+    // connection goes rather than sitting in m_clients with nothing armed on
+    // it.
     if (cqe->res <= 0)
     {
         close_client(it);
         return;
     }
 
-    // send() is entitled to take less than it was given, and does as soon as a
-    // reply outgrows the socket buffer — `ls` over a few hundred runtimes, or a
-    // `dump` of any size.  The rest of it was simply dropped: the CLI reads
-    // until the NUL terminator that ends the reply, so it sat out its five
-    // second SO_RCVTIMEO and then reported the daemon as unreachable.
+    // send() is entitled to take less than it was given, and the rest used to
+    // be dropped, so a CLI reading to the NUL terminator sat out its timeout
+    // and reported the daemon unreachable.
     conn->write_off += static_cast<size_t>(cqe->res);
     if (conn->write_off < conn->out_buf.size())
     {
@@ -1019,14 +711,9 @@ void daemon_handler::handle_write(struct io_uring_cqe* cqe, const io_request* re
     }
 }
 
-// Take a client connection down: its interactive registration, its descriptor,
-// then its storage.
-//
-// Reached from the client's own hangup and from every path where the daemon can
-// no longer finish the exchange — a reply that could not be queued, a send that
-// failed, a read that could not be re-armed.  All of them have the same
-// requirement: the connection must not be left in m_clients waiting for a
-// completion that is never coming.
+// Take a client connection down, reached from every path where the daemon can
+// no longer finish the exchange, all of which require that it not be left
+// waiting for a completion that is never coming.
 void daemon_handler::close_client(client_map::iterator it)
 {
     auto* conn = it->second.get();
@@ -1039,30 +726,15 @@ void daemon_handler::close_client(client_map::iterator it)
             inst->remove_interactive_fd(fd);
     }
 
-    // The only close in this file that happens while the ring is live, and the
-    // only one where the number can still be spoken for.  A response is not
-    // written here — send_response() submits it — so a client that hangs up
-    // before draining a reply larger than the socket buffer leaves that write
-    // queued against this descriptor number.  close() would free the number
-    // with the write still in the queue, the next CLI connection would be
-    // handed it by accept, and that client would find somebody else's `ls`
-    // output spliced into its own reply.  Same shape as the proxy's crossed
-    // streams, one runtime up.
-    //
-    // close_fd() holds the number instead until the write reports, and
-    // discounts the completion we are inside — so on the ordinary path, where
-    // the reply went out long before the hangup, this is one indexed load and
-    // then the close it was always going to do.
+    // The only close here that happens while the ring is live, so close_fd()
+    // holds the number until a queued reply write reports -- otherwise the
+    // next CLI connection finds somebody else's `ls` output spliced into its
+    // own.
     m_loop.close_fd(fd);
 
-    // Whatever fd_inflight() still counts after that discount is that queued
-    // write, and it is pointing at write_req and out_buf inside this
-    // connection.  Erasing now would leave the ring holding a request that no
-    // longer exists and a buffer the kernel is still reading from; run() reads
-    // the request back out of the completion, so it would be reading freed
-    // memory, and the only reason that was survivable before is that the block
-    // was usually still mapped.  Park the connection instead and let the
-    // write's own completion release it.
+    // Whatever fd_inflight() still counts is that queued write pointing at
+    // write_req and out_buf inside this connection, so the connection is
+    // parked and released by the write's own completion.
     if (m_loop.fd_inflight(fd) > 0)
         m_closing.push_back(std::move(it->second));
 
@@ -1080,21 +752,9 @@ void daemon_handler::release_closing(const io_request* req)
         if ((*it)->fd != req->fd)
             continue;
 
-        // Not "a completion arrived" but "nothing else names this number" —
-        // the same condition close_fd() releases the descriptor on, asked
-        // rather than assumed, because only the loop knows what is still queued
-        // against an fd this connection was parked for.
-        //
-        // With one write outstanding at a time it is this completion and no
-        // other, so the discount for the one in hand makes it zero.  It was not
-        // always: a client that pipelined two commands into one packet got two
-        // writes submitted through the one write_req, and releasing on the
-        // first of them handed the ring back the freed storage the parking
-        // exists to prevent.  send_response() is what ended that.
-        //
-        // The descriptor is still close_fd()'s to release, and it does that
-        // after this returns — which is why the number cannot have gone to a
-        // new client while this entry was still standing.
+        // Not "a completion arrived" but "nothing else names this number",
+        // asked of the loop rather than assumed, because a client that
+        // pipelined two commands once got two writes through one write_req.
         if (m_loop.fd_inflight((*it)->fd) == 0)
             m_closing.erase(it);
         return;
@@ -1103,8 +763,8 @@ void daemon_handler::release_closing(const io_request* req)
 
 void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
 {
-    // This completion is the accept, spent.  Cleared before anything can fail
-    // so the re-arm below, and the health tick behind it, both see the truth.
+    // This completion is the accept, spent, cleared before anything can fail
+    // so the re-arm and the health tick both see the truth.
     m_accept_armed = false;
 
     int client_fd = cqe->res;
@@ -1119,10 +779,9 @@ void daemon_handler::handle_accept(struct io_uring_cqe* cqe)
         auto it = m_clients.insert_or_assign(client_fd, std::move(conn)).first;
         auto* ptr = it->second.get();
 
-        // Refused, this connection never hears from the daemon again and the
-        // client waits out its own timeout for a command that was never even
-        // read.  Nothing is queued against the number, so close_client() closes
-        // it outright and the client gets an immediate EOF instead.
+        // Refused, so this connection never hears from the daemon again, and
+        // with nothing queued against the number close_client() closes it
+        // outright for an immediate EOF.
         if (!m_loop.submit_read(client_fd, ptr->read_buf, sizeof(ptr->read_buf), &ptr->read_req))
         {
             LOG_ERROR("daemon: could not arm the read on an accepted CLI connection; "
@@ -1149,14 +808,9 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    // Cannot happen, and checked because of what it would mean if it did: a read
-    // is only ever armed on a connection with no write outstanding, so reaching
-    // here with one would mean the daemon is about to rebuild out_buf — or, on
-    // the interactive path below, write to the socket directly — while the
-    // kernel is still reading the buffer.  That is precisely the defect
-    // send_response() was rewritten to make impossible; if it comes back, it
-    // comes back as a dropped connection and a line in the log, not as a
-    // corrupted reply.
+    // Cannot happen, and checked for what it would mean: a read armed with a
+    // write outstanding is the daemon rebuilding a buffer the kernel is still
+    // reading.
     if (SOCKETLEY_UNLIKELY(conn->write_pending))
     {
         LOG_ERROR("daemon: a CLI connection was read while its reply was still in "
@@ -1223,16 +877,8 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // ─── TWO FRAMINGS ON ONE CONNECTION ─────────────────────────────────────
-    //
-    // A command is a line, unless it begins with the frame marker — see
-    // ipc_framing.h for the whole of it and for why a marker rather than a
-    // negotiation.  The short version: a payload with a newline in it cannot
-    // travel on a line protocol, and every command that has no newline is sent
-    // exactly as it always was, so nothing about the ordinary path changes.
-    //
-    // Both are handled in one loop because both can arrive in one packet: a CLI
-    // is free to pipeline, and the `send` that needs a frame may follow a `ls`
-    // that does not.
+    // A command is a line unless it begins with the frame marker, and both are
+    // handled in one loop because both can arrive in one packet.
     bool queued = false;
     while (!conn->partial.empty())
     {
@@ -1246,10 +892,9 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 break;
             if (r == ipc_frame::take::fatal)
             {
-                // A length past the cap means this stream's framing is wrong,
-                // and there is no point in the buffer that is provably the
-                // start of the next frame.  Closing is the only answer that
-                // cannot make it worse.
+                // A length past the cap means this stream's framing is wrong
+                // and no point in the buffer is provably the start of the next
+                // frame.
                 LOG_ERROR("daemon: a CLI connection sent a frame longer than the "
                           "limit; closing it rather than guessing where the next "
                           "one starts");
@@ -1317,32 +962,9 @@ int daemon_handler::check_empty_names(const std::vector<std::string>& names,
 int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
 {
     // ─── One guard, for every command ───────────────────────────────────────
-    //
-    // cout_to_reply was written to "reach every one of them at once" and was
-    // then installed on two of them.  cmd_create and cmd_edit had it; cmd_send,
-    // cmd_start, cmd_attach and the `default:` arm below did not, and every
-    // std::cout in those went to the daemon's own stdout — which is /dev/null
-    // once it has daemonised.  Measured, against a daemon whose stdout and
-    // stderr were both redirected to a file:
-    //
-    //     $ socketley send nosuchruntime hello ; echo $?
-    //     1                        <- and not one word, on either stream
-    //     $ socketley start ; echo $?
-    //     1                        <- the usage line, likewise gone
-    //
-    // "runtime not found: nosuchruntime" is written, and nobody can read it.
-    // An exit code with no sentence behind it is the same defect this whole
-    // audit is about, one command family over from the Lua one.
-    //
-    // Here rather than in each handler, because a per-handler guard is a list
-    // that goes stale the moment somebody adds a command — which is exactly how
-    // these four came to be missing one.  There is a single caller and no
-    // re-entry, and the destructor runs before append_response() reads
-    // write_buf, so the text is in the frame that answers this command.
-    //
-    // It also fixes cmd_send without changing its signature: the guard needs a
-    // connection, the handler does not, and cmd_send is the one command whose
-    // parameter list has no ipc_connection at all.
+    // The reply guard is held here rather than in each handler, because a
+    // per-handler list goes stale the moment somebody adds a command -- which
+    // is how four of them came to write to the daemon's own stdout.
     const cout_to_reply reply_guard(conn);
 
     parsed_args pa;
@@ -1354,23 +976,10 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         return 1;
     }
 
-    // ─── A COMMAND WITH MORE ARGUMENTS THAN THE PARSER HAS SLOTS ────────────
-    //
-    // parsed_args puts the whole remainder in its last slot, so a command whose
-    // final argument is free text is complete and correct: `send`, `action` and
-    // `import` all read their payload with rest_from(), which spans to the end
-    // of the line.  That is the case worth keeping — a message, a cache value
-    // or a configuration document has no business having a word limit.
-    //
-    // Every other command reads its arguments as a LIST, and for those the
-    // merged tail is not the request that was made.  `start a b c ...` past the
-    // limit would look up one impossible name made of the rest; `create` would
-    // lose flags and build a runtime nobody asked for.  Both used to happen
-    // silently, which is what this refuses.
-    //
-    // The allowlist is here rather than in parsed_args because this is where
-    // the commands are known, and it is three entries rather than a rule
-    // because there are three: everything else would be guessing.
+    // parsed_args merges the tail into its last slot, which is right for the
+    // three commands whose final argument is free text and wrong for every
+    // command that reads a list, so the allowlist is three entries rather than
+    // a rule.
     if (pa.overflowed)
     {
         switch (pa.hashes[0])
@@ -1422,11 +1031,9 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
     }
 }
 
-// conn is unused now and the parameter stays anyway: the dispatcher hands every
-// handler the connection, and a handler that prints its refusals needs nothing
-// else — process_command holds the reply guard for all of them.  Dropping it
-// here would make this signature the odd one out for a reason that is no longer
-// about this command.
+// conn is unused and stays anyway, because the dispatcher hands every handler
+// the connection and dropping it here would make this signature the odd one
+// out.
 int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                               const parsed_args& pa)
 {
@@ -1445,9 +1052,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     std::string_view name = pa.args[2];
 
-    // The reason, not a guess at it.  This reported "runtime already exists"
-    // for a name that was refused for its characters, on a daemon holding
-    // nothing — see runtime_manager::create_result.
+    // The reason and not a guess at it, because this reported "runtime already
+    // exists" for a name refused for its characters on a daemon holding
+    // nothing.
     switch (m_manager.try_create(type, name))
     {
         case runtime_manager::create_result::ok:
@@ -1490,28 +1097,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // parsed, and the block below the TLS and ring refusals for where it is.
     std::string lua_script;
 
-    // ─── Where a runtime runs, and why there is no longer a flag for it ─────
-    //
-    // In its own process.  Always, for every type, with nothing to type and
-    // nothing to read off the command line.
-    //
-    // There was a flag, `--daemon-process`, and what it bought back was the
-    // reason to keep it: a script in a worker could not manage the runtime map
-    // and could not route a connection to another runtime.  Both are gone --
-    // the four map calls travel over the control plane at child_map_fd, and
-    // routing addresses a connection by conn_ref through shared/route_relay.h.
-    // A flag whose entire purpose is to restore capabilities that are no longer
-    // missing is a flag that only offers a worse arrangement: one runtime able
-    // to take the daemon down with it, stall another runtime's event loop, and
-    // share a core with whatever else that loop was doing.
-    //
-    // This used to be a PRE-SCAN, ahead of the flag loop, and that half is
-    // worth keeping in mind rather than only deleting: what --lua does depends
-    // on this bit -- a placeholder compiles the script and discards it, an
-    // in-process runtime loads and runs it -- so `--lua x --daemon-process` and
-    // `--daemon-process --lua x` did different things until the scan settled
-    // the bit before either was read.  With one answer there is no ordering
-    // left to get wrong.
+    // Every runtime runs in its own process, with nothing to type, because the
+    // flag that bought back the map calls and routing is a flag whose purpose
+    // no longer exists -- and with one answer there is no argument order left
+    // to get wrong.
     instance->mark_out_of_process();
 
     for (size_t i = 3; i < pa.count; ++i)
@@ -1554,13 +1143,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         }
     }
 
-    // The TLS options are checked as a set, once every flag has been seen.
-    // Individually they are meaningless — --tls says nothing about whether a
-    // certificate was also given, and the flag that completes the set may come
-    // later on the command line — so this is the first point at which the
-    // question can be answered.  Refusing here rather than at the next start
-    // keeps the runtime from being created at all, which is what an operator
-    // who mistyped one flag of three wants.
+    // The TLS options are checked as a set once every flag has been seen,
+    // which is the first point the question can be answered, and refusing here
+    // keeps the runtime from being created at all.
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
         std::cout << msg;
@@ -1577,13 +1162,8 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // And the shard count, for the third time the same reason: --listen may be
-    // typed on either side of --shards, so the whole set is checked here once
-    // every flag has been seen.
-    //
-    // --lua used to be the sharpest member of that set — a scripted server was
-    // refused, so the answer had to be the same whichever side of --shards the
-    // script was typed.  It is no longer part of the question.
+    // And the shard count, for the same reason, because --listen may be typed
+    // on either side of --shards.
     if (const std::string msg = instance_shards_refusal(instance);
         !msg.empty())
     {
@@ -1592,26 +1172,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // ─── The script, last, because it reads everything else back ────────────
-    //
-    // Loading builds the interpreter, runs the file's top level and snapshots
-    // `self` from the instance — so it has to happen after every flag has been
-    // applied, or `self` describes a half-configured runtime.  See the --lua
-    // case in parse_common_flags for what that cost.
-    //
-    // After the two refusals above and not before them, for the reason they
-    // give for being where they are: a runtime that is about to be refused must
-    // not have run a line of anybody's script first.  A top level is allowed to
-    // create children, open sockets and send messages, and undoing that is not
-    // something `m_manager.remove(name)` can do.
+    // The script last, because loading snapshots `self` from the instance and
+    // because a runtime about to be refused must not have run a line of
+    // anybody's script first.
     if (!lua_script.empty() && !instance->load_lua_script(lua_script))
     {
-        // The reason, not just the fact.  This used to print exactly the four
-        // words below while the parse error, or the sentence one of the
-        // `filters`/`routes` validators wrote for the person editing the file,
-        // went to stderr — and stderr is the daemon's log, one process away
-        // from the terminal that ran the command.  An operator was told their
-        // script would not load and never told why.
+        // The reason and not just the fact, because the parse error or the
+        // validator's sentence went to the daemon's log one process away from
+        // the terminal that ran the command.
         std::cout << "could not load Lua script: " << lua_script << "\n";
         if (!lua_diag::text().empty())
             std::cout << lua_diag::text() << "\n";
@@ -1638,39 +1206,11 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     {
         reconcile_proxy_workers();
 
-        // ─── The answer waits for the process that decides it ───────────────
-        //
-        // Everything above this line was judged in the daemon, and for a runtime
-        // that lives in the daemon that was the whole configuration.  For one
-        // that lives in a worker it is not: the script runs there, the port is
-        // bound there, the TLS pair is checked there.  `create` returned on the
-        // strength of having forked a process, which is not the same as that
-        // process having accepted anything -- and the gap was a report of
-        // success for a configuration that was about to be refused, with the
-        // reason arriving in the log afterwards.
-        //
-        // A declaration is where that finally bit, because servers run out of
-        // process and servers are the role that declares routes.  `path = "no-slash"` is faultless Lua, so the
-        // placeholder's compile-only check passes it and only the worker ever
-        // discovers it is not a path.
-        //
-        // Waiting is what this tree does everywhere else a setting might not be
-        // honoured -- --sqpoll a ring cannot give, --tls on a role with no
-        // handshake, a restored runtime whose ring requirement cannot be met --
-        // and all three refuse the create rather than reporting one. The rule
-        // against synchronous cross-runtime calls is not this: that is the data
-        // path, where a request would have to suspend across a round trip.  This
-        // is the control path, which already waits -- on the IPC socket, and on
-        // the fork above.
-        // The runtime is deliberately left where the refusal put it, which is
-        // `failed`, rather than being removed as the in-daemon path removes a
-        // runtime whose script will not load.  Two things in the tree already
-        // say so and outrank the symmetry argument: proxy_supervisor keeps a
-        // refused configuration `failed` "where the operator can see it", and
-        // a restored runtime whose ring requirement cannot be met lands there
-        // too.  A create that refuses and leaves nothing to look at would make
-        // the worker's reason the only record, in a log, of a runtime the
-        // operator can no longer ask about.
+        // The answer waits for the process that decides it, because the script
+        // runs, the port binds and the TLS pair is checked in the worker --
+        // and the runtime is left `failed` rather than removed, so the
+        // worker's reason is not the only record of a runtime the operator can
+        // no longer ask about.
         std::string wmsg;
         const int   wrc = await_worker_startup(
             name, wmsg, std::chrono::steady_clock::now() + worker_startup_bound);
@@ -1680,63 +1220,22 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             return wrc;
         }
 
-        // ─── `instance` may not exist any more ──────────────────────────────
-        //
-        // The wait drains the worker's control plane and SERVES what comes off
-        // it, inline -- that is what makes a script's on_start able to call
-        // socketley.create at all.  One of the things a script may ask for is
-        // `socketley.remove(<its own name>)`, and the daemon does exactly that:
-        // takes the runtime out of the map and retires it.  retire() has a
-        // shortcut for an instance that never reached setup(), which a
-        // placeholder for an out-of-process runtime never does, so it is freed
-        // on the spot -- while this frame is still holding the pointer.
-        //
-        // Found by AddressSanitizer, at the line below this block: a
-        // heap-use-after-free in cmd_create, on a Release build that was green.
-        // It was reachable before this branch and unreachable by the suite,
-        // because the only test that removed a runtime from its own top level
-        // ran that top level in the daemon, where no wait was in progress.
-        //
-        // Re-resolved rather than cached, which is the rule this tree applies
-        // everywhere something may have run a script in between.  Gone means
-        // the create did what it was asked and there is nothing left to report
-        // about: the runtime the operator named removed itself.
+        // `instance` may not exist any more, because the wait serves map
+        // requests inline and a script's own `socketley.remove` frees a
+        // placeholder that never reached setup(), so the name is re-resolved
+        // rather than cached.
         instance = m_manager.get(name);
         if (!instance)
             return 0;
     }
 
-    // ─── A script whose on_start raised is not a silent success ─────────────
-    //
-    // Last, after the save and after the worker's verdict, because the runtime
-    // IS created and IS running and nothing above this line is being undone.
-    // start() will not fail on a raise — the listener is already up by the time
-    // on_start runs, and taking it down over a callback is not something this
-    // tree does anywhere else — so the runtime stays exactly where it is, with
-    // whatever on_start managed before it gave up.
-    //
-    // But `create -s` reported that with exit 0 and not one character of output,
-    // and the only record was a line in the daemon's log.  `reload-lua` has
-    // answered 1 with the reason since it began re-running on_start, on the
-    // rule that a command does not report success for something that did not
-    // happen; the same script, the same callback and the same raise answered 0
-    // here.  An operator cannot be expected to know that the exit code for a
-    // broken on_start depends on which command they used to reach it.
-    //
-    // 1 rather than 2, per this tree's codes: the fault is in the file the
-    // operator named, which is bad input.  It is also the code `create` already
-    // gives when that same file will not PARSE — "could not load Lua script",
-    // one step earlier in the same script's life — and answering the two
-    // differently would be the arbitrary part.
+    // A script whose on_start raised is not a silent success, reported last
+    // because nothing above is undone, and as exit 1 because the fault is in
+    // the file the operator named.
     if (autostart && !instance->get_test_mode())
     {
-        // Two places to ask, because on_start runs wherever the script runs.
-        // In the daemon the instance itself kept the reason; in a worker the
-        // script never came near this process, and the child sent it up as a
-        // `start_err` frame before the `state` frame the wait above ended on.
-        // Asking only the first would have covered the flag nobody passes:
-        // since 8399bee a runtime is out of process unless it says otherwise,
-        // so the worker leg IS the ordinary `create -s`.
+        // Two places to ask, because on_start runs wherever the script runs
+        // and the worker leg is the ordinary `create -s`.
         std::string why = on_start_error(name);
 
         if (!why.empty())
@@ -1786,21 +1285,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // Refused before anything is started, not after.
-    //
-    // This check used to sit below the start loop, so `start myproxy -i` started
-    // the proxy, persisted was_running, and then exited 1 saying interactive mode
-    // was not supported — an operator told the command failed, with a listener up
-    // and a state file that would bring it back on the next daemon restart.
-    //
-    // And it stays a refusal.  Interactive mode is a stream: for a server what is
-    // typed is broadcast to its clients, for a client it is sent to its server,
-    // for a cache it is executed as a command and the reply comes back.  A proxy
-    // has no such stream — it relays between a client and a backend and speaks
-    // for neither — so there is nothing for typed input to mean.  Offering it
-    // would mean inventing a semantics rather than exposing one.  This is the
-    // same on both paths: a worker's proxy has no more of a stream than the
-    // daemon's does, so nothing here is about where the runtime runs.
+    // Refused before anything is started rather than after, and it stays a
+    // refusal because a proxy has no stream for typed input to mean anything
+    // on.
     if (want_interactive)
     {
         if (auto* first = m_manager.get(names.front());
@@ -1816,9 +1303,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     }
 
     int failed = 0;
-    // The ones this command actually brought up, in order.  Collected because
-    // the verdict on a runtime that lives in a worker cannot be read until
-    // reconcile_proxy_workers() below has forked the child; see the wait there.
+    // The ones this command actually brought up, collected because a
+    // worker-backed runtime's verdict cannot be read until
+    // reconcile_proxy_workers() has forked the child.
     std::vector<std::string> started;
     for (const auto& n : names)
     {
@@ -1829,8 +1316,8 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         if (!already_running)
         {
             // Refuse to bring up a listener that would serve cleartext under a
-            // configuration promising encryption.  Reached by runtimes restored
-            // from a state file written before TLS was gated at parse time.
+            // configuration promising encryption, reached by runtimes restored
+            // from a state file written before TLS was gated.
             if (const std::string msg = instance_tls_refusal(inst); !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
@@ -1838,12 +1325,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
                 continue;
             }
 
-            // Reached by a runtime whose shard count did not come from a flag:
-            // a state file written by hand or by another build, restored at
-            // boot without passing a parser.  runtime_instance::start() refuses
-            // it too and is the gate that cannot be walked around, but it can
-            // only say so by failing — this is what puts the reason on the
-            // terminal of whoever typed `start`.
+            // Reached by a runtime whose shard count came from a hand-written
+            // state file, which start() also refuses -- but only this puts the
+            // reason on the terminal of whoever typed `start`.
             if (const std::string msg = instance_shards_refusal(inst); !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
@@ -1862,21 +1346,10 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             inst = m_manager.get(n);
             started.push_back(n);
 
-            // The runtime is up; its script's set-up is not.  Counted as a
-            // failure and reported with the reason, for the reasoning written
-            // out at the end of cmd_create — and counted rather than returned,
-            // because `start a b c` has to start b and c whatever a's script
-            // did, exactly as it does for a TLS refusal above.
-            //
-            // was_running is set anyway, deliberately: it records that the
-            // operator asked for this runtime to be up, and it is up.  Clearing
-            // it would mean a daemon restart silently leaving down a listener
-            // that is serving traffic right now.
-            // Read below rather than here.  When the script runs in a worker
-            // the reason is a frame that has not arrived yet — the child has
-            // not even been forked until reconcile_proxy_workers() — so asking
-            // at this line would answer "nothing went wrong" for the case that
-            // is now the ordinary one.
+            // The runtime is up and its script's set-up is not, counted rather
+            // than returned because `start a b c` has to start b and c, with
+            // was_running set anyway and the reason read below, where a
+            // worker's frame has arrived.
         }
 
         if (want_interactive && inst)
@@ -1888,45 +1361,15 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Any runtime just moved into `running` in a worker now needs its
-    // child.  Doing it here rather than waiting for the health timer is what
-    // makes `start` followed immediately by a request work.
+    // Any runtime just moved into `running` in a worker now needs its child,
+    // done here rather than on the health timer so `start` followed
+    // immediately by a request works.
     reconcile_proxy_workers();
 
-    // ─── And `start` waits for the answer, exactly as `create -s` does ──────
-    //
-    // It did not, and what that cost is not the on_start report it was noticed
-    // through.  Measured on the parent commit, one runtime whose script
-    // declares `path = "no-slash"` — faultless Lua, so the placeholder's
-    // compile-only check passes it and only the worker discovers it is not a
-    // path:
-    //
-    //     create -s        exit 1   "the worker did not accept its configuration"
-    //     start            exit 0   (silence)      ls, 2s later: Failed
-    //     reload           exit 0   (silence)      ls, 2s later: Failed
-    //
-    // Same runtime, same configuration, same refusal, and the answer depended
-    // on which command reached it.  `start` was reporting success for a start
-    // that did not happen — not a missing detail about one that did.
-    // await_worker_startup()'s own comment already says the wait is what turns
-    // "the fork was requested" into "the child is serving", and `start` forks
-    // exactly the same child.
-    //
-    // ─── What the wait costs ────────────────────────────────────────────────
-    //
-    // One child's startup, not one per runtime.  reconcile_proxy_workers()
-    // above forks every one of them before this loop begins, so they come up
-    // concurrently and these waits overlap; the deadline is shared across the
-    // command for the same reason, so a wedged child cannot multiply the bound
-    // by the number of names.  Measured, ten worker-backed servers started with
-    // one `start 'wk*'`:
-    //
-    //     before   84 ms / 103 ms   returning before any child had bound
-    //     after    (see the commit) returning when all ten were serving
-    //
-    // The runtimes are left exactly where the verdict put them, and `failed`
-    // is counted rather than returned, for the reason the TLS refusal above is
-    // written under: `start a b c` has to start b and c whatever a did.
+    // `start` waits for the answer exactly as `create -s` does, because it was
+    // reporting success for a start that did not happen -- one child's startup
+    // for the whole command, since every child is forked before any is waited
+    // on.
     if (!started.empty())
     {
         const auto deadline = std::chrono::steady_clock::now() + worker_startup_bound;
@@ -1940,16 +1383,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
                 continue;   // it is not serving; on_start is the smaller news
             }
 
-            // The runtime is up; its script's set-up is not.  Counted as a
-            // failure and reported with the reason, for the reasoning written
-            // out at the end of cmd_create — and counted rather than returned,
-            // because `start a b c` has to start b and c whatever a's script
-            // did, exactly as it does for a TLS refusal above.
-            //
-            // was_running is set anyway, deliberately: it records that the
-            // operator asked for this runtime to be up, and it is up.  Clearing
-            // it would mean a daemon restart silently leaving down a listener
-            // that is serving traffic right now.
+            // The runtime is up and its script's set-up is not, counted rather
+            // than returned, with was_running set anyway because the operator
+            // asked for this runtime to be up and it is.
             if (std::string why = on_start_error(n); !why.empty())
             {
                 conn->write_buf += "start " + std::string(n) + ": " + why + "\n"
@@ -2008,27 +1444,16 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
             m_manager.stop(n, m_loop);
     }
 
-    // Before the instances leave the map: the supervisor holds a pointer to the
-    // placeholder it writes stats into, and that pointer must be dropped while
-    // the object it names is still there.  Reconciling after the removal would
-    // read a name that no longer resolves and leave the child running.
+    // Before the instances leave the map, because the supervisor holds a
+    // pointer to the placeholder it writes stats into and that pointer must be
+    // dropped while the object is still there.
     reconcile_proxy_workers();
 
     for (const auto& n : names)
     {
-        // Nothing is held on this side any more.  remove() hands the runtime to
-        // the manager's graveyard, which is what waits for the ring to finish
-        // with the io_requests embedded in it — the reason this used to keep the
-        // object alive for a tick.  A tick was never the right measure anyway: a
-        // POLLOUT on a connect socket or a parked splice outlives one easily.
-        //
-        // Holding it here as well was worse than redundant.  The list was
-        // emptied by a timeout whose "did it reach the ring" answer nobody read,
-        // and the flag saying one was pending was set before the submission
-        // rather than after it, so a submission that never made it left the flag
-        // set for the life of the daemon and the list was never emptied again —
-        // one whole runtime retained per removal from then on, six megabytes for
-        // a proxy once its connection pools are counted, with nothing said.
+        // Nothing is held on this side any more, because remove() hands the
+        // runtime to the manager's graveyard -- and the list that used to hold
+        // it here was emptied by a timeout whose answer nobody read.
         if (m_manager.remove(n))
         {
             if (m_persistence)
@@ -2071,11 +1496,9 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--created"): col_created = true; break;
             case fnv1a("--group"):   col_group   = true; break;
         }
-        // Handle --format json
-        // `--format json` is the only spelling there is.  Anything else was
-        // consumed and ignored, so `--format xml` produced the default table
-        // and said nothing — an operator asking for a format they do not have
-        // deserves to be told, not answered in a different one.
+        // `--format json` is the only spelling there is, so anything else is
+        // refused rather than answered in a format the operator did not ask
+        // for.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
@@ -2090,12 +1513,8 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // `-s` with no column named is the documented listing: "prints only runtime
-    // names (one per line)".  It used to suppress the header and print the
-    // whole eight-column table underneath it, so the operator who read that
-    // sentence and wrote `for n in $(socketley ls -s)` iterated over ids,
-    // ports, connection counts and the words "Up" and "seconds".  Naming a
-    // column is a request for that column and still means header-off only.
+    // `-s` with no column named prints only runtime names, as documented,
+    // rather than the whole table with the header off.
     if (silent && !col_id && !col_name && !col_type && !col_port &&
         !col_status && !col_conn && !col_owner && !col_created && !col_group)
         col_name = true;
@@ -2125,14 +1544,9 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
-            // Escaped, all of them.  A name is validated now, but a group and
-            // an owner are arbitrary operator strings, and a quote in either
-            // used to produce a document no JSON parser would accept.
-            // Where a runtime with no port listens.  Empty for every other
-            // runtime, so a consumer reading `port` alone sees exactly what it
-            // saw before -- but a server on a unix socket reports `"port":0`
-            // and nothing else, and a caller reading this document has no other
-            // way to find out where it is.
+            // Escaped, all of them, because a group and an owner are arbitrary
+            // operator strings -- and where a runtime with no port listens,
+            // empty for every other runtime.
             const std::string_view listen_path = instance->get_listen_path();
             out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
                 << "\",\"name\":\"" << sp_detail::json_escape(name)
@@ -2247,21 +1661,9 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-// `ps`, and `ps -a`.
-//
-// Bare `ps` lists running runtimes and nothing else, which is what the name
-// promises and what every script in test/integration and examples/ that greps
-// this output already assumes.  It is also why a runtime that failed to start
-// produced no row at all — and when nothing else was up, no output at all.  The
-// operator who has just watched a runtime not come up types the command named
-// after "what is running", gets an empty screen, and reads it as "the runtime
-// does not exist" rather than "it exists and is broken".  `failed` is exactly
-// the state you go looking for, and it was the one state this could not show.
-//
-// So the widening is opt-in, spelled the way `docker ps -a` is spelled, and the
-// rows it adds carry their state in the STATUS column so that a script which
-// asks for them can still tell them apart.  Default output is untouched, byte
-// for byte.
+// Bare `ps` lists running runtimes and `-a` widens it, because `failed` is
+// exactly the state you go looking for and was the one state this could not
+// show.
 int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 {
     std::shared_lock lock(m_manager.mutex);
@@ -2294,10 +1696,9 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
         }
-        // `--format json` is the only spelling there is.  Anything else was
-        // consumed and ignored, so `--format xml` produced the default table
-        // and said nothing — an operator asking for a format they do not have
-        // deserves to be told, not answered in a different one.
+        // `--format json` is the only spelling there is, so anything else is
+        // refused rather than answered in a format the operator did not ask
+        // for.
         if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
         {
             if (pa.hashes[i + 1] == fnv1a("json"))
@@ -2312,9 +1713,8 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // Nothing to list means no output, not an empty table — the same silence
-    // `ls` keeps for an empty inventory.  The flags are parsed above this
-    // rather than below it because `-a` decides what "nothing to list" means.
+    // Nothing to list means no output rather than an empty table, with the
+    // flags parsed above because `-a` decides what nothing to list means.
     const auto listed = [&](const runtime_instance* inst)
     { return all || inst->get_state() == runtime_running; };
 
@@ -2346,12 +1746,9 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             auto owner = instance->get_owner();
             auto group = instance->get_group();
             const bool running = instance->get_state() == runtime_running;
-            // The literal "running" used to be written here because every row
-            // this could print was running.  Under -a that would be a row for a
-            // failed runtime claiming to be up, which is worse than no row.
-            // uptime goes empty for the same reason: a runtime that never
-            // started has no start time to measure from.
-            // See the note in `ls --json` above.
+            // The state is read rather than written as "running", because
+            // under -a a literal would be a row for a failed runtime claiming
+            // to be up.
             const std::string_view listen_path = instance->get_listen_path();
             out << "{\"id\":\"" << sp_detail::json_escape(instance->get_id())
                 << "\",\"name\":\"" << sp_detail::json_escape(name)
@@ -2445,17 +1842,9 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-// The one command whose answer is the daemon itself.
-//
-// A CLI that has only connect() to go on cannot tell a daemon from a stranger
-// bound to the same path, and it was writing the operator's command into
-// whichever it found.  This is what it asks first.  The reply has to be
-// something no other program produces by accident, so it leads with a literal
-// that names this project, and it carries the version and pid because the
-// second question after "is this a daemon" is always "which one".
-//
-// Cheap on purpose: no lock, no runtime touched, one string.  It runs ahead of
-// every CLI command in the tree.
+// The one command whose answer is the daemon itself, leading with a literal no
+// other program produces by accident and carrying the version and pid, cheap
+// enough to run ahead of every CLI command.
 int daemon_handler::cmd_ping(ipc_connection* conn)
 {
     if (!conn)
@@ -2465,23 +1854,9 @@ int daemon_handler::cmd_ping(ipc_connection* conn)
     out << socketley::daemon_ident_prefix << SOCKETLEY_VERSION
         << ' ' << getpid();
 
-    // And which executable this daemon is, exactly.
-    //
-    // The version cannot answer that.  Nothing in premake5.lua defines
-    // SOCKETLEY_VERSION, so it is one literal in shared/version.h that every build of a
-    // release carries: a daemon started before a rebuild and a CLI built after
-    // it report the same string, which is the one case an operator actually
-    // hits — "I rebuilt and my new flag is rejected" is a same-version rebuild
-    // against a daemon still holding its runtimes.  The inode does answer it.
-    //
-    // Read fresh rather than cached, because the interesting change happens
-    // while the daemon is running: the link gains " (deleted)" the moment the
-    // file it was started from is unlinked, and a value captured at startup
-    // would be the one value that can never show it.  Two syscalls against a
-    // page-cached /proc entry, in a command that already costs an accept, a
-    // read, a write and a close.
-    //
-    // The path goes last in the reply, because a path may contain spaces.
+    // And which executable this daemon is, which the version cannot answer,
+    // read fresh because the link gains " (deleted)" the moment the file is
+    // unlinked -- and last in the reply, because a path may contain spaces.
     std::string exe;
     uint64_t    dev = 0, ino = 0;
     if (socketley::self_exe_identity(exe, dev, ino))
@@ -2522,16 +1897,9 @@ int daemon_handler::cmd_owner(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
-// ─── Where a message addressed to a name goes ───────────────────────────────
-//
-// One rule, two callers.  `send` typed at the CLI reaches it through cmd_send()
-// below and reports `why` to the terminal; `socketley.send` called in a worker's
-// script reaches it through on_worker_deliver() and reports `why` to the log.
-//
-// Written as one function because the interesting half is the routing — is this
-// runtime in this process, in a worker, or nowhere — and two copies of that
-// would be two answers to "is a send delivered", which is the question this
-// tree has already got wrong once in exactly this place.
+// One rule and two callers, written as one function because two copies of the
+// routing would be two answers to "is a send delivered", which this tree has
+// already got wrong in exactly this place.
 bool daemon_handler::deliver_to_runtime(std::string_view name,
                                         std::string_view message,
                                         std::string& why,
@@ -2556,25 +1924,17 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
         return false;
     }
 
-    // The connections are wherever the runtime is.
-    //
-    // This used to switch on the type and call lua_broadcast() straight away,
-    // which for a runtime in a worker reached the placeholder: it has the name,
-    // the port and the state, and not one connection.  The call succeeded, the
-    // command returned 0, and the message went nowhere.  A `send` that reports
-    // success and delivers nothing is worse than one that fails.
+    // The connections are wherever the runtime is, because calling
+    // lua_broadcast() on a placeholder succeeded, returned 0, and sent the
+    // message nowhere.
     if (instance->is_out_of_process())
     {
-        // deliver_to_worker() fans the message out across every shard of this
-        // runtime and answers true if any of them took it; see the note there
-        // for why delivering to one is not an option once there is more than
-        // one.
+        // deliver_to_worker() fans the message out across every shard and
+        // answers true if any took it.
         if (!deliver_to_worker(name, message, exclude))
         {
-            // With `exclude` set this is the sibling half of a broadcast on a
-            // one-shard runtime that thought it had more, or a runtime whose
-            // every other shard has gone.  Nothing was owed a delivery, so it
-            // is not an error; the caller reports it and the log says so.
+            // With `exclude` set this is a sibling fan-out with no siblings
+            // left, so nothing was owed a delivery and it is not an error.
             why = "could not reach the worker holding " + std::string(name);
             return false;
         }
@@ -2620,27 +1980,15 @@ int daemon_handler::cmd_send(const parsed_args& pa)
     return 0;
 }
 
-// The same verb arriving from a worker's script instead of from a terminal.
-//
-// Nothing is answered: the frame is one-way, and the caller's own error cases
-// were decided out there against the replica of this map — see the note on
-// deliver_to in worker_protocol.h.  What can still go wrong here is what the
-// replica was too old to know, so it is said in the log rather than dropped:
-// the window is one push interval wide, and a send into it is a message the
-// script believes it made.
+// The same verb arriving from a worker's script, answered by nothing, with
+// what the replica was too old to know said in the log rather than dropped.
 void daemon_handler::on_worker_deliver(proxy_supervisor* from,
                                        std::string_view name,
                                        std::string_view message)
 {
-    // Whether this is a cross-runtime send or a sibling fan-out is decided
-    // here, from the name, and not by a flag on the wire.  A worker holds
-    // exactly one runtime, so a frame naming that runtime can only be the
-    // second: the first would have been answered where it stood, by the
-    // worker's own deliver sink, without a wire at all.
-    //
-    // Deriving it beats carrying it.  A bit on the frame is a second place for
-    // the two sides to disagree, and the older half of this protocol would have
-    // had to grow one it never sets.
+    // Whether this is a cross-runtime send or a sibling fan-out is derived
+    // from the name rather than carried on the wire, because a bit on the
+    // frame is a second place for the two sides to disagree.
     const proxy_supervisor* exclude = nullptr;
     if (from)
         if (const auto it = m_proxy_workers.find(std::string(name));
@@ -3416,11 +2764,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     runtime_type type = instance->get_type();
     bool is_running = instance->get_state() == runtime_running;
 
-    // What the runtime's TLS configuration was before this edit.  The flags
-    // are applied one at a time as they are parsed, but they only mean
-    // anything as a set — and a set that comes out incomplete has to leave no
-    // trace, or an operator who mistyped `--key` is left with a runtime whose
-    // in-memory configuration no longer matches its state file.
+    // What the runtime's TLS configuration was before this edit, because the
+    // flags only mean anything as a set and an incomplete one has to leave no
+    // trace.
     const bool        tls_before  = instance->get_tls();
     const std::string cert_before(instance->get_cert_path());
     const std::string key_before(instance->get_key_path());
@@ -3430,10 +2776,8 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     // to leave the runtime exactly as it found it.
     const uint32_t    shards_before = instance->get_shards();
     const std::string listen_before(instance->get_listen_path());
-    // The proxy's half of the same set.  Its backend leg is configured by
-    // three more paths, and they are as much a set as the listener's: half a
-    // client-certificate pair is refused, so an edit that leaves one behind
-    // has to leave no trace either.
+    // The proxy's half of the same set, whose backend leg is as much a set as
+    // the listener's.
     std::string_view mca_v, mcert_v, mkey_v;
     instance->get_mesh_tls_paths(mca_v, mcert_v, mkey_v);
     const std::string mesh_ca_before(mca_v), mesh_cert_before(mcert_v),
@@ -3459,14 +2803,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                         static_cast<proxy_instance*>(instance), pa, i);
                     break;
                 case runtime_cache:
-                    // There is no parse_cache_edit_flags, so every
-                    // cache-specific flag falls through to the refusal below.
-                    // That is a decision rather than an omission — `import` is
-                    // the fuller of the two ways to reconfigure a runtime and
-                    // applies all of these — but "unknown flag" was the wrong
-                    // sentence for it: the flag exists, spelling it differently
-                    // will not help, and the operator needs to be sent to the
-                    // command that does take it.
+                    // There is no parse_cache_edit_flags, so cache flags fall
+                    // through here with a message that sends the operator to
+                    // `import` rather than reading as a typo.
                     result = -1;
                     break;
             }
@@ -3517,16 +2856,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // The shard set, checked here for the reason the TLS set is: --listen and
-    // --shards are both editable, and either can be the flag that completes an
-    // incompatible pair.  `edit srv --listen unix:/tmp/s.sock` on a runtime
-    // already carrying --shards 4 is refused by nothing in the --listen case
-    // label, because that label has no reason to know about shards.
-    //
-    // Rolled back the same way and for the same sentence: a set that comes out
-    // incomplete has to leave no trace, or an operator who mistyped one flag is
-    // left with a runtime whose in-memory configuration no longer matches its
-    // state file.
+    // The shard set, checked here because --listen and --shards are both
+    // editable and either can complete an incompatible pair, and rolled back
+    // the same way.
     if (const std::string msg = instance_shards_refusal(instance); !msg.empty())
     {
         instance->set_shards(shards_before);
@@ -3605,14 +2937,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // The listener field, judged by the same function the flag is.  It has to
-    // be re-read from the document rather than taken from cfg, because
-    // parse_json_string has no error channel for a single field: it strips the
-    // `unix:` prefix and leaves the field empty when there is none, which is
-    // indistinguishable from a document that clears it on purpose.  Without
-    // this, `"listen": "/run/x.sock"` -- the same value with the prefix
-    // forgotten -- imported as "no unix listener at all" and the server came
-    // back on a TCP port, reported by nothing.
+    // The listener field is re-read from the document rather than taken from
+    // cfg, because parse_json_string cannot tell a missing `unix:` prefix from
+    // a field cleared on purpose.
     if (cfg.has("listen"))
     {
         const std::string raw = m_persistence->raw_field(json_str, "listen");
@@ -3631,26 +2958,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     bool is_running = instance->get_state() == runtime_running;
     runtime_type type = instance->get_type();
 
-    // Same gate as the create path: a config carrying TLS this build cannot
-    // honour is rejected before anything is applied or written back to the
-    // state file.
-    //
-    // ─── JUDGED ON THE RESULT, NOT ON THE DOCUMENT ──────────────────────────
-    //
-    // This used to read cfg directly, on the reasoning that a document which
-    // omits the TLS fields is clearing them — which was true when every field
-    // was applied unconditionally.  It is not any more: an omitted field now
-    // leaves the runtime's own value in place (see the apply block below), so
-    // reading cfg would judge a configuration that is not the one about to
-    // exist.
-    //
-    // Concretely, and this is the hole it would have opened: a TLS cache with
-    // no replication, handed a document that names only replicate_target.  cfg
-    // says tls=false, the gate passes, and the apply gives it a replication
-    // leg — the exact cleartext-replication pair tls_config_refusal exists to
-    // refuse.  So each value is taken from the document where the document
-    // names it and from the instance where it does not, which is what the
-    // runtime will be carrying a few lines from now.
+    // Judged on the result and not on the document, because an omitted field
+    // now leaves the runtime's own value in place -- so reading cfg would pass
+    // a TLS cache handed only a replicate_target.
     std::string_view inst_mca, inst_mcert, inst_mkey;
     instance->get_mesh_tls_paths(inst_mca, inst_mcert, inst_mkey);
 
@@ -3685,15 +2995,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // The shard set, merged the same way and for the same reason.  Reading cfg
-    // alone would judge a configuration that is not the one about to exist: a
-    // document naming only `shards` on a server that already carries a script
-    // says lua_script="" and would pass, and the apply would then produce
-    // exactly the sharded scripted server the flag parser refuses.
-    //
-    // Before the apply rather than after it, because import has no rollback: it
-    // writes each field as it reads it, so a refusal that came later would
-    // leave the runtime half-changed and its state file disagreeing with it.
+    // The shard set merged the same way and before the apply, because import
+    // has no rollback and a refusal later would leave the runtime
+    // half-changed.
     const uint32_t    eff_shards = merged("shards", cfg.shards,
                                           instance->get_shards());
     const std::string eff_listen = merged("listen", cfg.listen_path,
@@ -3717,10 +3021,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "cannot rename while running\n";
             return 1;
         }
-        // Two reasons, said apart.  rename() refuses a taken name and an
-        // invalid one, and "already taken" for a name with a slash in it sends
-        // the operator looking for a runtime that does not exist — the same
-        // defect cmd_create still has one command over.
+        // Two reasons said apart, because "already taken" for a name with a
+        // slash in it sends the operator looking for a runtime that does not
+        // exist.
         if (!runtime_manager::valid_name(cfg.name))
         {
             conn->write_buf = "invalid runtime name: " + cfg.name + "\n"
@@ -3747,20 +3050,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             conn->write_buf = "cannot change port while running\n";
             return 1;
         }
-        // The listener's other spelling, under the same rule.  A running
-        // server is bound to the socket node it has; moving it would mean
-        // unbinding one path and binding another underneath whatever is already
-        // connected, and the node the old listener owns would be left for the
-        // teardown that never came.
+        // The listener's other spelling under the same rule, because a running
+        // server is bound to the socket node it has and moving it would leave
+        // that node for a teardown that never came.
         if (cfg.listen_path != std::string(instance->get_listen_path()))
         {
             conn->write_buf = "cannot change the listen socket while running\n";
             return 1;
         }
-        // The same rule as the port above, and as `edit --shards`: applying it
-        // to a running proxy would mean retiring workers out from under live
-        // connections.  Refused rather than quietly dropped — see the note
-        // where the field is applied below for what quietly dropping it cost.
+        // The same rule as the port above, because applying it to a running
+        // proxy would retire workers out from under live connections.
         if (cfg.shards != instance->get_shards())
         {
             conn->write_buf = "cannot change the shard count while running\n";
@@ -3805,9 +3104,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "cannot change RESP mode while running\n";
                 return 1;
             }
-            // A running cluster has already published its map, and every
-            // client holding it would keep sending keys to ports that had
-            // stopped answering.  Same rule as the port itself.
+            // A running cluster has already published its map, so every client
+            // holding it would keep sending keys to ports that had stopped
+            // answering.
             if (cfg.cluster != cache->get_cluster())
             {
                 conn->write_buf = "cannot change cluster mode while running\n";
@@ -3822,28 +3121,10 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     }
 
     // ─── ONLY WHAT THE DOCUMENT NAMES ───────────────────────────────────────
-    //
-    // Every field in runtime_config has a default, and this used to apply all
-    // of them unconditionally — so a document that left a field out cleared it.
-    // Measured, against a runtime with a port, a log path, two limits and a
-    // complete TLS set:
-    //
-    //     socketley import c '{"name":"c"}'
-    //     exit 0, no output
-    //     ... and port, log_file, max_connections, idle_timeout, tls,
-    //         cert_path and key_path were all gone.
-    //
-    // A runtime configured to speak TLS answered in cleartext afterwards, and
-    // the command that did it reported success.  The whole tls_config_refusal
-    // apparatus misses it, because it judges the INCOMING document and that
-    // document no longer has any TLS in it to be incomplete.
-    //
-    // ─── CLEARING IS STILL POSSIBLE, AND IS NOW SAID OUT LOUD ───────────────
-    //
-    // Emptying a field was the documented escape hatch — dump, delete the
-    // lines, import — and it stays available: `"tls": false`, `"cert_path": ""`.
-    // What changes is that it has to be written rather than implied.  The
-    // ordinary round trip is unaffected, because `show` emits every field.
+    // A field the document leaves out keeps its current value rather than
+    // being cleared, because applying every default meant `import c
+    // '{"name":"c"}'` silently took a runtime's TLS away -- clearing is still
+    // possible and now has to be written.
     const auto has = [&cfg](const char* key) { return cfg.has(key); };
 
     if (has("port"))              instance->set_port(cfg.port);
@@ -3853,24 +3134,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
     if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
     if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
-    // ─── The three flags a client does not have, refused here too ───────────
-    //
-    // create and edit refuse --rate-limit, --max-connections and --idle-timeout
-    // on a client, because it accepts no connections and there is nothing for
-    // any of them to limit.  import writes the same fields through a different
-    // door: it does not go through the flag parser at all, so the refusal did
-    // not exist here.  Measured, on a build where create already said no:
-    //
-    //     socketley show c | jq '.rate_limit = 5' | socketley import c   -> 0
-    //     socketley show c                          -> "rate_limit": 5
-    //
-    // which is the same shape as 2cf7a4e, where import could give a runtime a
-    // name create would have refused.  A validation that only guards one entrance
-    // is a validation that is not there.
-    //
-    // Refused rather than ignored: silently dropping a field the caller wrote
-    // makes `show | import` stop being a round trip, and the caller is told
-    // nothing.  The whole document is rejected, so nothing half-applies.
+    // The three flags a client does not have are refused here too, because
+    // import does not go through the flag parser and a validation that guards
+    // one entrance is not there.
     if (type == runtime_client)
     {
         const char* offender = has("rate_limit")      ? "rate_limit"
@@ -3900,16 +3166,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("target"))            instance->set_target(cfg.target);
     if (has("cache_name"))        instance->set_cache_name(cfg.cache_name);
     if (has("group"))             instance->set_group(cfg.group);
-    // Carried into this form from the block it replaced.  `show` emits shards,
-    // so a round trip that did not read it back would return a sharded proxy
-    // with one worker -- reported Up by `ls` and wrong by nothing.  set_shards
-    // clamps, so a hand-edited 0 or 900 becomes 1 or 64 rather than a runtime
-    // with no worker at all.
+    // Carried into this form from the block it replaced, because `show` emits
+    // shards and a round trip that dropped it would return a sharded proxy
+    // with one worker.
     if (has("shards"))            instance->set_shards(cfg.shards);
 
-    // Lua script: reload if changed — and only when the document says which
-    // script it wants.  Without the guard, a partial document reads as
-    // lua_script="" and detaches the runtime's handler.
+    // Lua script, reloaded if changed and only when the document says which
+    // script it wants, or a partial document detaches the runtime's handler.
     std::string cur_lua(instance->get_lua_script_path());
     if (has("lua_script") && cfg.lua_script != cur_lua)
     {
@@ -3943,18 +3206,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (cfg.master_forward)
                 srv->set_master_forward(true);
 
-            // The list is replaced only when the document names it.  Clearing
-            // it on a document that never mentioned upstreams is the same
-            // silent loss as the common fields above, and the loudest version
-            // of it: a server whose upstream leg simply stops existing.
+            // The list is replaced only when the document names it, because
+            // clearing it on a document that never mentioned upstreams is a
+            // server whose upstream leg stops existing.
             if (!has("upstreams")) break;
             srv->clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
             {
-                // Reported rather than dropped.  This is a document a person
-                // edited, and the list was cleared a line ago — silently
-                // storing fewer upstreams than the document names is the
-                // half-applied import this command already refuses elsewhere.
+                // Reported rather than dropped, because the list was cleared a
+                // line ago and storing fewer upstreams than the document names
+                // is a half-applied import.
                 if (!srv->add_upstream_target(u))
                 {
                     conn->write_buf = "invalid upstream address: " + u +
@@ -3983,12 +3244,9 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                     prx->add_backend(b);
             }
             prx->set_runtime_manager(&m_manager);
-            // The clearing half of the escape hatch: without it a proxy
-            // restored from a state file with mesh mTLS paths could never be
-            // emptied, and would refuse to start forever.  Each is applied only
-            // when the document names it, so emptying is now written as
-            // `"mesh_client_ca": ""` rather than by leaving the key out — the
-            // gate above judged whatever this is about to produce.
+            // The clearing half of the escape hatch, without which a proxy
+            // restored with mesh mTLS paths could never be emptied and would
+            // refuse to start forever.
             if (has("mesh_client_ca"))   prx->set_mesh_client_ca(cfg.mesh_client_ca);
             if (has("mesh_client_cert")) prx->set_mesh_client_cert(cfg.mesh_client_cert);
             if (has("mesh_client_key"))  prx->set_mesh_client_key(cfg.mesh_client_key);
@@ -4028,8 +3286,7 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
 
     // Take whatever the workers have sent since the last tick, so an
     // out-of-process proxy answers about now rather than about the last health
-    // timer.  Costs a non-blocking read per worker and nothing at all when
-    // there are none.
+    // timer.
     poll_proxy_workers();
 
     for (const auto& n : names)
@@ -4039,53 +3296,14 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
         {
             conn->write_buf += inst->get_stats();
 
-            // ─── THERE IS NO AGE TO PRINT HERE ANY MORE ─────────────────
-            //
-            // `figures:pushed` and `figures_age_ms` used to follow this, and
-            // they were honest: a worker's counters were pushed on a 250 ms
-            // timer, so they were up to a quarter second old and an operator
-            // comparing a proxy's byte count against a backend's had no way to
-            // know it.
-            //
-            // The counters are summed out of shared memory now, by the
-            // stats_prefix() the line above just built — at this instant, on
-            // this thread, from lines each worker stores into once per loop
-            // turn.  There is no interval left between the reading and the
-            // printing, so a figure that stated one would be inventing it.
-            //
-            // Nothing needs the label to know a worker is elsewhere: `pid:` and
-            // `shard_pids:` below say so, and say where.
+            // There is no age to print here any more, because the counters are
+            // summed out of shared memory at this instant rather than pushed
+            // on a timer.
 
-            // Which process this runtime is actually in.
-            //
-            // The supervisor has called set_pid(child) since the split landed
-            // and nothing ever printed it, so the one question an operator has
-            // about an out-of-process runtime — where do I look for it, which
-            // process do I strace, whose RSS is this — had no answer from the
-            // tool that knows it.  `figures:pushed` says the runtime is
-            // elsewhere without saying where.
-            //
-            // Printed from the daemon's own record rather than from
-            // get_stats(), because for a worker-backed runtime that string was
-            // built in the child and pushed: the child knows its pid and the
-            // daemon knows which child it is, and only the daemon's answer is
-            // still right after a restart has replaced the process.
-            //
-            // Emitted only when there is a process to name, so an in-process
-            // runtime's output is unchanged.  Managed external runtimes set the
-            // same field and get the same line, which is the same question.
-            // ─── With shards there is more than one process to name ─────────
-            //
-            // set_pid() is called by every supervisor against the one
-            // placeholder, so `pid:` alone answers with whichever shard was
-            // forked last — a true pid for a real process, and the wrong answer
-            // to "which process is this runtime in", because there are four and
-            // it names one of them arbitrarily.
-            //
-            // So a sharded runtime gets the count and the whole list, and an
-            // unsharded one gets exactly the line it got before: `shards:` is
-            // omitted at 1, and `pid:` still prints the single pid.  Nothing
-            // that reads `stats` today sees a field appear.
+            // Which process this runtime is actually in, printed from the
+            // daemon's own record because only that stays right after a
+            // restart -- and as a list for a sharded runtime, since `pid:`
+            // alone names one of N arbitrarily.
             if (auto it = m_proxy_workers.find(n);
                 it != m_proxy_workers.end() && it->second.size() > 1)
             {
@@ -4156,31 +3374,9 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         }
         m_manager.stop(n, m_loop);
 
-        // ─── The child comes down here, or the reload never reaches it ──────
-        //
-        // Without this line `reload` did nothing at all to a runtime in a
-        // worker, which since 8399bee is every runtime that did not ask
-        // otherwise.  The two calls around it move the PLACEHOLDER's state to
-        // stopped and back to running, and reconciliation is what turns a
-        // placeholder's state into a live child — so reconciling only at the
-        // end sees `running`, the same thing it saw before, and leaves the
-        // original child alone.  Measured on the parent commit, a worker-backed
-        // server whose script was edited under it:
-        //
-        //     reload   exit 0   (silence)   ls: Up   — old script still serving
-        //
-        // The command reported success for a reload that had not happened, and
-        // the script the operator had just edited was not running anywhere.
-        // With the child taken down while the placeholder says stopped, the
-        // reconcile after the loop forks a fresh one that reads the new file:
-        //
-        //     reload   exit 1   "on_start error: ..."          — the new script
-        //     reload   exit 1   "the worker did not accept ..."  ls: Failed
-        //
-        // Per name rather than once for the whole command, because the start
-        // that follows is per name too: batching the stops would take every
-        // named runtime down before bringing any back, which is a different
-        // command from the one this is.
+        // The child comes down here, per name, or the reconcile after the loop
+        // sees the same `running` it saw before and leaves the original child
+        // serving the script the operator has just replaced.
         reconcile_proxy_workers();
 
         if (m_manager.start(n, m_loop) && m_persistence)
@@ -4194,16 +3390,8 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         // the reason is a frame that has not been asked for yet.
     }
 
-    // The same sentence a third time: reload is a stop followed by a start, so
-    // it is a start, and a start now brings the child back and waits for it.
-    //
-    // Neither half was here.  A worker-backed runtime reloaded through this
-    // command had its placeholder flipped and nothing else: the child came back
-    // on the health tick up to two seconds later, and the command returned 0 in
-    // the meantime — including for a configuration the child was about to
-    // refuse, which `ls` then showed as Failed.  Reconciling here is what
-    // cmd_start's own comment gives the reason for, one command along: it is
-    // what makes `reload` followed immediately by a request work.
+    // Reload is a stop followed by a start, so it is a start, and a start now
+    // brings the child back and waits for it.
     if (!restarted.empty())
     {
         reconcile_proxy_workers();
@@ -4219,12 +3407,9 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
                 continue;
             }
 
-            // "reload is a stop followed by a start, so it is a start" — the
-            // sentence this command is already written under, applied to the
-            // other thing a start answers for.  Leaving it out would put the
-            // inconsistency back one command along: the same script and the
-            // same raise reported by `start` and not by the command that is a
-            // start.
+            // The same sentence applied to the other thing a start answers
+            // for, or the same raise is reported by `start` and not by the
+            // command that is a start.
             if (std::string why = on_start_error(n); !why.empty())
             {
                 conn->write_buf += "reload " + std::string(n) + ": " + why + "\n"
@@ -4252,25 +3437,13 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
-    // A runtime whose script runs in a worker has to be asked, and the answer
-    // waited for.  Every reload is sent before any of them is waited on, so
-    // reloading N runtimes costs one round trip rather than N of them.
+    // A runtime whose script runs in a worker has to be asked and the answer
+    // waited for, with every reload sent before any is waited on.
     std::vector<std::tuple<proxy_supervisor*, const void*, std::string>> pending;
 
-    // ─── A reload that did not happen is not a success ──────────────────────
-    //
-    // The bool from reload_lua_script() was discarded here, so `reload-lua`
-    // answered 0 with an empty reply for a script that no longer compiled — and
-    // the reason went to stderr, which is the daemon's log rather than the
-    // terminal of whoever ran the command.  An operator edited a file, ran
-    // this, was told nothing, and went on believing the edit was live.  The
-    // previous script stays in force in that case, which is the right
-    // behaviour and the worst possible one to be silent about: everything
-    // keeps working, and it keeps working the old way.
-    //
-    // Failures are collected rather than returned at the first: `reload-lua`
-    // takes a pattern, and reloading eight runtimes of which two are broken
-    // should say which two.  The other six are still reloaded.
+    // A reload that did not happen is not a success, and failures are
+    // collected rather than returned at the first, because `reload-lua` takes
+    // a pattern and the previous script stays in force.
     std::string failures;
     auto note_failure = [&failures](std::string_view name, std::string_view why) {
         failures += "reload-lua ";
@@ -4284,11 +3457,8 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     {
         auto* inst = m_manager.get(n);
 
-        // The script lives in the worker, and the daemon's copy of this runtime
-        // is a placeholder that compiled the file once and discarded it.  So
-        // reloading here would re-read the file into an interpreter that does
-        // not serve anything, and would still leave the process that does
-        // serving running the old one.
+        // The script lives in the worker and this daemon's copy is a
+        // placeholder that compiled the file once and discarded it.
         if (auto it = m_proxy_workers.find(n); it != m_proxy_workers.end() &&
                                                !it->second.empty())
         {
@@ -4296,31 +3466,22 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
             // arrived between the two.
             const void* prev = inst ? inst->worker_routes().get() : nullptr;
 
-            // Every shard re-runs the script, because every shard IS running
-            // it: reloading one would leave the other three serving the file
-            // the operator has just replaced, which is the exact failure this
-            // command was given a worker path to avoid.
+            // Every shard re-runs the script, because reloading one would
+            // leave the others serving the file the operator has just
+            // replaced.
             for (auto& sup : it->second)
                 sup->send_reload();
 
-            // Waited on through shard 0 alone, and that is a statement about
-            // the declaration rather than about the reload.  Every shard reads
-            // the same file and produces the same `routes` frame into the same
-            // placeholder, so waiting for a second one would be waiting for a
-            // value already written.  Whether each shard's reload SUCCEEDED is
-            // a different question and is asked of all of them — see the error
-            // collection at the end of this command.
+            // Waited on through shard 0 alone, which is a statement about the
+            // declaration rather than the reload, since every shard writes the
+            // same `routes` frame into the same placeholder.
             pending.emplace_back(it->second.front().get(), prev, n);
             continue;
         }
 
         // The two preconditions reload_lua_script() returns false on without
-        // anything having gone wrong — no script, and a runtime that is not
-        // running — are checked here rather than reported.  A stopped runtime
-        // loads its script when it is started, so "nothing to reload" is not a
-        // failure and must not print like one; only a file that would not load
-        // is.  Everything past this point that answers false has written a
-        // reason, which is what note_failure carries.
+        // anything having gone wrong are checked here rather than reported,
+        // because a stopped runtime loads its script when it is started.
         if (inst && !inst->get_lua_script_path().empty() &&
             inst->get_state() == runtime_running)
         {
@@ -4337,28 +3498,10 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    // ─── The publish waits for the declarations it is meant to carry ────────
-    //
-    // `reload-lua` is the command that makes "the declaration is published, not
-    // configured" true: an operator edits a handler's script, runs this, and
-    // expects the gateway in front of it to enforce the new declaration on the
-    // very next request.  Returning as soon as the frames were written would
-    // publish whatever the daemon happened to be holding -- which is the
-    // previous version of exactly the thing being changed -- and the new one
-    // would land on the health tick up to two seconds later.  The command would
-    // report success for a change that had not taken effect yet, which is the
-    // same shape of false success `create` was fixed for.
-    //
-    // This is the control path.  It waits on the IPC socket already, and the
-    // rule against synchronous cross-runtime calls is about the data path,
-    // where a request would have to suspend across a round trip.  The bound is
-    // the one `create` uses, for the reason given there: one timescale in this
-    // file rather than two.  A worker that never answers leaves the declaration
-    // it had in force, and the publish below carries that.
-    // The same ::poll-inside-a-command-handler as await_worker_startup(), and
-    // the same consequence: a reloaded script runs its top level again, so it
-    // reaches the same four map calls, and the nop that would serve them is not
-    // going to be dispatched until this returns.  See m_worker_wait_depth.
+    // The publish waits for the declarations it is meant to carry, or it
+    // publishes the previous version of the thing being changed -- and it is
+    // the same ::poll inside a command handler await_worker_startup() uses,
+    // with the same consequence for map requests.
     const worker_wait_scope reload_waiting{m_worker_wait_depth};
 
     for (auto& [sup, prev, name] : pending)
@@ -4366,19 +3509,10 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
         if (!sup->await_routes(prev, worker_startup_bound))
             LOG_WARN("reload-lua: a worker did not report its declaration in "
                      "time; the gateway keeps enforcing the previous one");
-        // Read after the wait, never before: the child writes reload_err ahead
-        // of the routes frame the wait ends on, so by here it has been ingested
-        // if it was sent at all.  Empty means the reload loaded.
-        //
-        // Asked of every shard and not only the one waited on.  `sup` is shard
-        // 0 — see where `pending` is filled, and why waiting on one is right for
-        // the DECLARATION — but whether a reload succeeded is per process: a
-        // file that loads in one and raises in another is unlikely and is
-        // exactly the case a report is for.  Reported once, from the first
-        // shard that has a reason, because four copies of one diagnostic is not
-        // four pieces of information; taken from all of them regardless,
-        // because take_ is destructive and a reason left behind would be handed
-        // to the next reload as its own answer.
+        // Read after the wait and asked of every shard, reported once from the
+        // first that has a reason but taken from all of them, because take_ is
+        // destructive and a reason left behind becomes the next reload's
+        // answer.
         std::string why = sup->take_reload_error();
         if (auto it = m_proxy_workers.find(name); it != m_proxy_workers.end())
             for (auto& other : it->second)
@@ -4390,29 +3524,16 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
             note_failure(name, why);
     }
 
-    // A script is where a runtime's route declaration lives, so reloading one
-    // can change what it says it will answer.  Without this the proxies in
-    // front of it would go on enforcing the declaration from the previous
-    // version of the file — the exact drift publishing exists to prevent, and
-    // the worst kind, because the two copies came from the same script.
-    //
-    // Published even when one of the reloads was refused: a script that would
-    // not load left the previous one in force, so the declaration the daemon
-    // holds for it is still the one being enforced, and the runtimes that did
-    // reload have new ones that have to go out.
+    // A script is where a route declaration lives, so reloading one can change
+    // it, and it is published even when a reload was refused because the
+    // runtimes that did reload have new ones.
     m_manager.publish_endpoints();
 
     if (!failures.empty())
     {
-        // Straight into the reply buffer rather than through cout: the
-        // cout_to_reply guard that borrows cout for a command exists only in
-        // cmd_create and cmd_edit, so cout from here would land on the daemon's
-        // own stdout — which is the very place these messages were already
-        // being lost.  A null connection is the boot-time restore, which has no
-        // reply channel; that keeps the old destination.
-        //
-        // Bad input — the file the operator named is the thing that is wrong —
-        // so exit 1, per the project's codes.  Success stays silent.
+        // Straight into the reply buffer rather than through cout, which for
+        // this command is the daemon's own stdout, and exit 1 because the file
+        // the operator named is what is wrong.
         if (conn) conn->write_buf += failures;
         else      std::cout << failures;
         return 1;
@@ -4637,21 +3758,17 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
 
 void daemon_handler::start_health_timer()
 {
-    // m_health_pending means a completion is still owed on m_health_req — from
-    // a timer that is counting down, or from one teardown() withdrew.  Either
-    // way re-arming would hand the kernel a request it is already carrying one
+    // m_health_pending means a completion is still owed on m_health_req, so
+    // re-arming would hand the kernel a request it is already carrying one
     // for.
     if (m_health_pending || m_torn_down)
         return;
     m_health_req = { this, nullptr, -1, 0, op_timeout };
     m_health_ts = { 2, 0 };  // 2 seconds
 
-    // Nothing re-arms this chain but its own completion, so a submission that
-    // never reached the ring ends it — and it takes both of the daemon's
-    // periodic duties with it: managed runtimes stop being supervised, and
-    // retired instances stop being reaped.  The flag is left clear so a later
-    // caller can pick the chain back up, and the loss is said out loud rather
-    // than being found later as a leak.
+    // Nothing re-arms this chain but its own completion, so a refused
+    // submission stops both of the daemon's periodic duties, and the loss is
+    // said out loud rather than found later as a leak.
     if (!m_loop.submit_timeout(&m_health_ts, &m_health_req))
     {
         LOG_ERROR("daemon health timer refused: managed runtimes are no longer "
@@ -4678,9 +3795,9 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
         for (const auto& ep : eps)
             groups.push_back({group, ep.host, ep.port});
 
-    // The declarations travel with the table.  A proxy in a worker enforces
-    // what this frame says and nothing else — it cannot read the daemon's
-    // endpoint_table object, which is where these used to stay.
+    // The declarations travel with the table, because a proxy in a worker
+    // enforces what this frame says and cannot read the daemon's
+    // endpoint_table object.
     worker_proto::route_decl_wire name_routes, group_routes;
     for (const auto& [n, rt] : tbl.name_routes())
         if (rt) name_routes.emplace_back(n, rt);
@@ -4689,26 +3806,17 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
 
     const std::string payload =
         worker_proto::encode_endpoints(names, groups, name_routes, group_routes);
-    // Every shard, because every shard resolves its own backends: a table that
-    // reached three of four workers leaves the fourth refusing to start on a
-    // backend written as a name, which reads from outside as an intermittently
-    // broken proxy.
+    // Every shard, because a table that reached three of four workers leaves
+    // the fourth refusing to start on a backend written as a name.
     for (auto& [_, shards] : m_proxy_workers)
         for (auto& sup : shards)
             sup->send_endpoints(payload);
 }
 
-// What runtimes there are, as the workers' replicas of the map.
-//
-// Built here and not in runtime_manager for the reason every other worker-facing
-// push is: the manager knows what it holds, this class knows where the sockets
-// are, and the sink between them is what keeps the manager from having to know
-// there are other processes at all.
-//
-// The connection count is reported_connection_count(), which is the figure the
-// CLI prints and the one socketley.get() already answers with — a live walk for
-// a runtime in this process, and the last pushed figure for one in a worker.
-// EVENT-LOOP THREAD ONLY, because of that walk; every caller is.
+// What runtimes there are, as the workers' replicas, built here because the
+// manager knows what it holds and this class knows where the sockets are --
+// event-loop thread only, because the connection count is a live walk for a
+// local runtime.
 std::string daemon_handler::build_runtime_map_payload()
 {
     std::vector<worker_proto::runtime_wire> rts;
@@ -4736,11 +3844,9 @@ void daemon_handler::publish_runtime_map_to_workers()
     if (m_proxy_workers.empty())
         return;
 
-    // Encoded once for all of them, like the endpoint table above: the map is
-    // the same map whichever child is being told about it.  Each supervisor
-    // decides whether it is news — see send_runtime_map, which drops a payload
-    // identical to the one that child already has, so an idle daemon's health
-    // tick costs one string compare per worker and no frame at all.
+    // Encoded once for all of them, with each supervisor deciding whether it
+    // is news, so an idle daemon's health tick costs one string compare per
+    // worker.
     const std::string payload = build_runtime_map_payload();
     for (auto& [_, shards] : m_proxy_workers)
         for (auto& sup : shards)
@@ -4749,29 +3855,14 @@ void daemon_handler::publish_runtime_map_to_workers()
     m_last_map_push = std::chrono::steady_clock::now();
 }
 
-// What the cluster looks like, for the workers that cannot look.
-//
-// Built from this daemon's cluster_discovery, which is the only object that has
-// any of it and which a worker may not have one of: it publishes into the
-// shared directory and claims this node's name there, so a worker running one
-// would read as a second daemon to every other member.  See
-// shared/cluster_view.h.
-//
-// An empty view is sent when there is no cluster_discovery — but only once this
-// daemon has ever had one.  That is the withdrawal, and it is needed because
-// clustering can be restarted under a new name or a new directory: a worker
-// left holding the old view would answer the four cluster calls out of a
-// cluster this daemon has left.  A daemon that was never clustered sends
-// nothing at all, which keeps the ordinary case free of a frame that says
-// nothing and keeps those four calls refused out there, which is the honest
-// answer for a worker whose daemon is in no cluster.
+// What the cluster looks like for the workers that cannot look, with an empty
+// view sent as a withdrawal only once this daemon has ever had a cluster -- a
+// never-clustered one sends nothing, keeping those four calls honestly
+// refused.
 std::string daemon_handler::build_cluster_view_payload()
 {
-    // Empty means "there is nothing to say and nothing to withdraw": a daemon
-    // that has never been in a cluster.  The callers send no frame at all for
-    // it, which is what keeps those four calls refused in its workers — the
-    // honest answer, rather than the empty table a successful call returns on a
-    // daemon that IS in a cluster and alone in it.
+    // Empty means there is nothing to say and nothing to withdraw, which is a
+    // daemon that has never been in a cluster.
     if (!m_cluster && !m_cluster_view_pushed)
         return {};
 
@@ -4801,60 +3892,19 @@ void daemon_handler::publish_cluster_view_to_workers()
     m_cluster_view_pushed = true;
 }
 
-// ─── A connection count is news, and nothing else announces it ──────────────
-//
-// Membership changes republish the map through publish_endpoints(), which is
-// right for a create or a stop and answers nothing for the field that moves on
-// its own.  A client connecting to a runtime in a worker changes that runtime's
-// count and moves nothing in the daemon: the figure arrives in a stats frame,
-// lands in the placeholder, and until now waited for the two-second health tick
-// to reach any other worker.
-//
-// What that cost was measurable and was the point of the exercise.  The
-// daemon's own answer for a worker-backed runtime is as old as the last stats
-// frame — 250 ms — and a script in a worker asking about the same runtime was
-// reading a figure up to 2 s old.  The parity harness caught it as the one
-// field of socketley.get() that differed between the two arms: 0 against 1.
-//
-// So the counts ride the cadence they arrive on.  Each worker publishes every
-// stats_interval_ms, so any worker's frame is a tick of that clock, and this
-// pushes the map when one arrives.
-//
-// ─── COALESCED, AND WHY THAT IS THE WHOLE DESIGN ────────────────────────────
-//
-// Pushing per arrival is quadratic: N workers publish N frames per interval,
-// and each one changes the payload — a count moved — so the per-child dedupe
-// cannot drop any of them, and every one of the N arrivals sends to all N
-// children.  Sixteen workers is 256 frames per 250 ms.
-//
-// One round per interval instead, whoever's frame started it: 16 frames per
-// 250 ms, four rounds a second, linear in the number of workers.  A delta frame
-// carrying only the counts was considered and not built — the full row set at
-// this rate is under a kilobyte per worker per round, and a second encoding of
-// what a runtime is, kept in step with the first, costs more than it saves.
-//
-// The price of coalescing is that a figure can wait out the remainder of the
-// window before it goes: the daemon is ≤250 ms stale and a worker is ≤500 ms in
-// the worst case.  Both are the stats cadence rather than the health tick,
-// which is what parity here means; the floor is one constant if it has to come
-// down.
+// A connection count moves with traffic and nothing else announces it, so the
+// map rides the stats cadence -- coalesced to one round per interval, because
+// pushing per arrival is N frames to N children and sixteen workers would be
+// 256 frames per 250 ms.
 void daemon_handler::on_worker_stats(const std::string& name)
 {
-    // First, and outside the floor below: the placeholder every reader in this
-    // process looks at holds the sum over this runtime's shards, and the frame
-    // that has just arrived changed one of the terms.  Coalescing this the way
-    // the map push is coalesced would answer `stats` from figures one interval
-    // old for no saving — the numbers are already in hand and the work is an
-    // addition over at most max_shards terms.
+    // First and outside the floor, because the placeholder holds the sum over
+    // this runtime's shards and the frame that just arrived changed one of the
+    // terms.
     aggregate_worker_stats(name);
 
-    // Half the publish interval, and strictly below it on purpose.  A floor
-    // equal to the arrival period is a floor that ordinary jitter trips over:
-    // a frame landing a millisecond early is dropped, and the figure it carried
-    // then waits for the NEXT one, so the worst case is two intervals rather
-    // than one.  Below the period, every arrival gets through and the floor
-    // only does what it is for — bounding the rounds when many children report
-    // inside one interval.
+    // Half the publish interval and strictly below it, because a floor equal
+    // to the arrival period is one that ordinary jitter trips over.
     const auto now = std::chrono::steady_clock::now();
     if (now - m_last_map_push <
         std::chrono::milliseconds(worker_proto::stats_interval_ms / 2))
@@ -4870,42 +3920,23 @@ void daemon_handler::publish_to_workers(std::string_view cache_name,
     if (m_proxy_workers.empty())
         return;
 
-    // Encoded once for all of them.  A PUBLISH on a busy cache is a hot path in
-    // a way an endpoint republish is not, and the payload does not depend on
-    // which worker it is going to.
+    // Encoded once for all of them, because a PUBLISH on a busy cache is a hot
+    // path and the payload does not depend on which worker it goes to.
     const std::string payload = worker_proto::encode_publish(cache_name, channel, message);
     for (auto& [_, shards] : m_proxy_workers)
     for (auto& sup : shards)
     {
-        // Everyone but whoever sent it up.  A worker that published has already
-        // run its own subscribers — it cannot wait for a round trip to do that,
-        // and it should not have to — so echoing the frame back would run every
-        // subscriber in that process a second time for one PUBLISH.
-        //
-        // The exclusion is per PROCESS and not per runtime, which is what makes
-        // it still right with shards: only the one shard that published has
-        // already run its own subscribers, and its siblings are separate
-        // processes holding separate interpreters that have not.  Excluding the
-        // whole shard set would silently stop delivering to N-1 of them.
+        // Everyone but whoever sent it up, excluded per process and not per
+        // runtime, because a sibling shard is a separate interpreter that has
+        // not run this publish.
         if (sup.get() == m_publish_origin)
             continue;
         sup->send_publish(payload);
     }
 }
 
-// One runtime, not every worker: this message is addressed to a name, and the
-// connections it is meant for belong to that runtime and no other.
-//
-// But "that runtime" is now every shard of it.  `send` broadcasts to the
-// connections a runtime is holding, and with --shards those are spread across N
-// processes by the kernel's own choice — so delivering to one shard delivers to
-// the fraction of the clients that happened to land there, and reports success
-// for the rest.  Which fraction is not even stable between two sends.
-//
-// So the frame goes to all of them and each broadcasts to what it holds.  True
-// if any shard took it: a partial delivery is still worth reporting as one,
-// because the alternative is telling the operator nothing was sent when most of
-// it was.  A shard that would not take the frame has already logged why.
+// One runtime and every shard of it, because the clients are spread across N
+// processes by the kernel's own choice, answering true if any shard took it.
 bool daemon_handler::deliver_to_worker(std::string_view name,
                                        std::string_view message,
                                        const proxy_supervisor* exclude)
@@ -4917,17 +3948,9 @@ bool daemon_handler::deliver_to_worker(std::string_view name,
     bool any = false;
     for (auto& sup : it->second)
     {
-        // Everyone but whoever sent it up, and only when somebody did.  A
-        // shard fanning a broadcast out to its siblings has already run the
-        // delivery against its own clients — it cannot wait for a round trip
-        // to do that, and it should not have to — so echoing the frame back
-        // would write the message into every one of its connections twice.
-        //
-        // Per PROCESS and not per runtime, which is what keeps it right: the
-        // siblings are separate processes holding separate connection tables
-        // that have NOT seen this message.  Excluding the whole shard set
-        // would deliver to nobody at all.  Same rule, same words, as the
-        // publish fan-out above — see publish_sinks().
+        // Everyone but whoever sent it up and only when somebody did, excluded
+        // per process, because excluding the whole shard set would deliver to
+        // nobody at all.
         if (exclude && sup.get() == exclude)
             continue;
         if (sup->send_deliver(message))
@@ -4943,14 +3966,9 @@ void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
     if (!from)
         return;
 
-    // Which runtime the asking shard belongs to.  Found by walking the map
-    // rather than carried on the frame, for the reason on_worker_deliver gives:
-    // the daemon already holds the only authoritative answer, and a field the
-    // worker filled in would be a second one to disagree with it.
-    //
-    // A ref is only ever resolvable inside the runtime that minted it, so a
-    // shard cannot address another runtime's connection by accident — and if it
-    // tried, write_to_ref() at the far end refuses on the owner half.
+    // Which runtime the asking shard belongs to, found by walking the map
+    // rather than carried on the frame, because a field the worker filled in
+    // would be a second answer to disagree with the daemon's.
     for (auto& [name, shards] : m_proxy_workers)
     {
         bool mine = false;
@@ -4962,19 +3980,14 @@ void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
         const uint32_t target = conn_ref_shard(ref);
         if (target >= shards.size())
         {
-            // A ref minted by a shard that has since been retired.  Not an
-            // error: the connection went with the process, and the far end
-            // would have refused it anyway.  Said at debug because a script
-            // holding one is not doing anything wrong.
+            // A ref minted by a shard that has since been retired, which is
+            // not an error because the connection went with the process.
             LOG_DEBUG("a send named a connection on a shard that is gone");
             return;
         }
 
-        // The asking shard is not a legal target here.  It would have written
-        // the message itself rather than sending it up — send_to_client only
-        // reaches the ref sink when the shard in the ref is NOT its own — so a
-        // frame that comes back round is a build that has lost that check, and
-        // delivering it would hide the fault rather than the message.
+        // The asking shard is not a legal target, so a frame that comes back
+        // round is a build that has lost send_to_client's own check.
         if (shards[target].get() == from)
         {
             LOG_WARN("a shard asked the daemon to deliver to itself; dropped");
@@ -4987,49 +4000,26 @@ void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
     }
 }
 
-// ─── self.route and the three-argument socketley.pipe ───────────────────────
-//
-// A connection stays where it is and another RUNTIME answers it.  The daemon is
-// in this path because it holds the only authoritative answer to "where is
-// `to`", and for no other reason: once a route is open the two ends still talk
-// through here, which is a relay and is the floor rather than the destination
-// -- shard_mesh.h makes the same argument for sibling shards and then measures
-// the direct link that replaces it.  Nothing here has been measured yet, and
-// this comment will be wrong the day it is.
-//
-// ─── WHICH SHARD A ROUTED CONNECTION LANDS ON ───────────────────────────────
-//
-// The first, always, and this is a limitation stated rather than a decision
-// defended.  A routed connection produces exactly one on_connect and one handle
-// at the far end, so it goes to exactly one process; there is no key to hash
-// and no field on the ref that means anything about the TARGET -- the ref's
-// shard bits name the shard that MINTED it, which is the origin's.  Sending it
-// to shard 0 is what the request-sink override already does for cross-runtime
-// requests, for the same "one question, one answer" reason.
-//
-// What it costs: routing into a sharded server concentrates every routed
-// connection on one of its shards while its accepted connections spread across
-// all of them.  That is visible in the per-shard connection counts and is worth
-// fixing with a real placement rule; it is not worth guessing at one here.
+// A connection stays where it is and another runtime answers it, with the
+// daemon in the path only because it holds the authoritative answer to where
+// `to` is -- and a routed connection lands on shard 0 always, which is a
+// limitation stated rather than a placement rule defended.
 void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
                                     worker_proto::route_op op,
                                     const conn_ref& ref,
                                     std::string_view payload)
 {
-    // In this process, and a real server rather than a placeholder standing in
-    // for one.  local_server() is the single test; see route_relay.h for what
-    // goes wrong when a caller writes the two halves of it by hand.
+    // In this process and a real server rather than a placeholder standing in
+    // for one, asked through local_server(), which is the single test.
     if (auto* srv = route_relay::local_server(&m_manager, to))
     {
         switch (op)
         {
             case worker_proto::route_op::open:
                 // The one op that can be refused after it has been accepted at
-                // this level.  The origin was already told yes -- open()
-                // answers from the map, deliberately -- so the unwind is a
-                // `drop` back the way the ask came, which is the same message
-                // the origin gets when the target dies a moment later.  It has
-                // one path for both.
+                // this level, unwound as a `drop` back the way the ask came,
+                // which is the same message the origin gets when the target
+                // dies.
                 if (srv->accept_routed(ref, frm) < 0)
                     route_dispatch(frm, to, worker_proto::route_op::drop, ref, {});
                 break;
@@ -5051,11 +4041,9 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
                 srv->lua_broadcast(payload);
                 break;
             case worker_proto::route_op::forget:
-                // Not reachable through post(): forget() fans out directly,
-                // because it addresses every runtime rather than one.  Handled
-                // anyway so that a worker sending it up -- which nothing does,
-                // and which a future build might -- is served rather than
-                // silently dropped by a switch that looks complete.
+                // Not reachable through post(), because forget() fans out
+                // directly, but handled anyway so a worker sending it up is
+                // served rather than dropped by a switch that looks complete.
                 srv->forget_runtime(frm);
                 break;
         }
@@ -5066,9 +4054,7 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
     if (it == m_proxy_workers.end() || it->second.empty())
     {
         // The runtime went away between the ask and this frame, which for
-        // teardown ops is the ORDINARY case: a stopping runtime tells every
-        // origin to drop its routes, and some of those origins are stopping
-        // too.  Debug rather than warn, for that reason.
+        // teardown ops is the ordinary case, so debug rather than warn.
         LOG_DEBUG("a routing frame named a runtime the daemon no longer holds");
         return;
     }
@@ -5087,15 +4073,10 @@ void daemon_handler::post(std::string_view to, std::string_view frm,
 bool daemon_handler::open(std::string_view target, const conn_ref& ref,
                           std::string_view origin, std::string& err)
 {
-    // Reached only when the target is NOT in this process -- route_relay tried
-    // that first -- so this is the daemon answering on behalf of a child, or
-    // for a runtime that does not exist at all.  Both are decided here from the
-    // map, which is the whole reason the ask travels to the daemon rather than
-    // being answered against a worker's stale replica.
-    //
-    // The three refusals are worded exactly as the in-process path words them,
-    // because a script cannot tell which path it took and must not be able to
-    // tell from the message.
+    // Reached only when the target is not in this process, so the daemon
+    // decides from the map -- and the three refusals are worded exactly as the
+    // in-process path words them, because a script must not be able to tell
+    // which path it took.
     auto* rt = m_manager.get(target);
     if (!rt)
     {
@@ -5119,18 +4100,10 @@ bool daemon_handler::open(std::string_view target, const conn_ref& ref,
 
 void daemon_handler::forget(std::string_view gone)
 {
-    // Everyone but the runtime that is leaving, and everyone means both kinds:
-    // the ones this process holds and the ones in children.  A fan-out rather
-    // than a lookup because the daemon keeps no table of who routed to whom --
-    // and deliberately does not.  Such a table would be a third place a route
-    // is recorded, after the origin's m_routes and the target's m_forwarded,
-    // and the two that exist are already the authority.  forget_runtime is
-    // idempotent, so telling a runtime that held no route costs a map walk over
-    // what it does hold and nothing else.
-    //
-    // Collected first.  release_routed runs a script's on_disconnect, which may
-    // create or remove a runtime, and this must not be walking the map when it
-    // does.
+    // Everyone but the runtime that is leaving, as a fan-out rather than a
+    // lookup because a table of who routed to whom would be a third place a
+    // route is recorded -- collected first, since release_routed runs a
+    // script's on_disconnect.
     std::vector<std::string> local;
     {
         std::shared_lock lock(m_manager.mutex);
@@ -5149,10 +4122,8 @@ void daemon_handler::forget(std::string_view gone)
     {
         if (name == gone)
             continue;
-        // Every shard, not the first.  Routing INTO a runtime lands on shard 0
-        // today, but routing OUT of one is done by whichever shard holds the
-        // connection -- so a sibling of shard 0 can be holding a route to the
-        // departed runtime, and telling only shard 0 would leave it set.
+        // Every shard and not the first, because routing out of a runtime is
+        // done by whichever shard holds the connection.
         for (auto& sup : shards)
             if (sup && !sup->send_route(name, gone,
                                         worker_proto::route_op::forget,
@@ -5171,12 +4142,9 @@ void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to
     if (!from)
         return;
 
-    // `frm` is checked against what this supervisor actually stands for rather
-    // than trusted.  A worker filling in somebody else's name would make the
-    // target's on_connect report the wrong origin, and owner_send would then
-    // write into a runtime the connection never came from -- which is the exact
-    // class of defect conn_identity.h was written to close, arriving through a
-    // different door.
+    // `frm` is checked against what this supervisor stands for rather than
+    // trusted, or the target's on_connect reports the wrong origin and
+    // owner_send writes into a runtime the connection never came from.
     const auto* ph = from->placeholder();
     if (!ph || ph->get_name() != frm)
     {
@@ -5188,17 +4156,15 @@ void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to
     route_dispatch(to, frm, op, ref, payload);
 }
 
-// ─── socketley.create/.start/.stop/.remove, asked by a script in a worker ───
-//
-// See the note on m_map_queue in the header for why these are recorded here and
-// served a turn later rather than where they arrive.
+// socketley.create/.start/.stop/.remove asked by a script in a worker,
+// recorded here and served a turn later rather than where they arrive.
 void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
                                        std::string op, std::string name,
                                        std::string config)
 {
-    // A daemon on its way down will not come back round, so a request parked
-    // here would be answered by nothing and the worker would wait out its whole
-    // deadline for silence.  Refused with a reason instead, on the spot.
+    // A daemon on its way down will not come back round, so a parked request
+    // would be answered by nothing and the worker would wait out its whole
+    // deadline for silence.
     if (m_torn_down)
     {
         proxy_supervisor::answer_map_request(reply_fd, ticket, false,
@@ -5210,10 +4176,9 @@ void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
     m_map_queue.push_back({ticket, reply_fd, std::move(op), std::move(name),
                            std::move(config)});
 
-    // Inside a wait for a worker, served here rather than deferred.  The loop
-    // is not coming back — this daemon is in a ::poll inside a command handler
-    // — and what it is waiting for is the script that is blocked on this very
-    // answer.  See m_worker_wait_depth for why serving from there is safe.
+    // Inside a wait for a worker, served here rather than deferred, because
+    // the loop is not coming back and what it waits for is the script blocked
+    // on this answer.
     if (m_worker_wait_depth > 0)
     {
         serve_map_requests();
@@ -5230,11 +4195,9 @@ void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
 
     if (!m_map_defer_armed)
     {
-        // The ring would not take it, so nothing is going to bring the loop
-        // back for these.  Answering here is a re-entrancy this function exists
-        // to avoid — the caller is a supervisor's own completion — so the
-        // requests are refused rather than served: a `false` with a reason is
-        // recoverable, a freed supervisor is not.
+        // The ring would not take the nop, so the requests are refused rather
+        // than served: a false with a reason is recoverable and a freed
+        // supervisor is not.
         LOG_ERROR("daemon: could not defer a worker's map request; refusing it");
         for (auto& q : m_map_queue)
         {
@@ -5249,11 +4212,9 @@ void daemon_handler::queue_map_request(uint64_t ticket, int reply_fd,
 
 void daemon_handler::serve_map_requests()
 {
-    // Taken by value first.  Serving one of these can create a runtime whose
-    // script calls straight back — socketley.create in a top level runs inside
-    // load_lua_script — and a second request appended while this loop held an
-    // iterator into the vector would be a reallocation under it.  What arrives
-    // during the loop lands in the fresh m_map_queue and gets its own nop.
+    // Taken by value first, because serving one of these can create a runtime
+    // whose script calls straight back and appends to the vector this loop
+    // would be holding an iterator into.
     std::vector<pending_map_request> batch;
     batch.swap(m_map_queue);
 
@@ -5271,20 +4232,10 @@ void daemon_handler::serve_map_requests()
 // One of the four, against the map this process holds.
 //
 // ─── WHAT THIS IS AND IS NOT A COPY OF ──────────────────────────────────────
-//
-// It is the in-daemon socketley.create/.start/.stop/.remove, reached from a
-// different direction.  The parsing is NOT here: the script's config table was
-// read by the interpreter that has it — in the worker — and what crosses is a
-// runtime_config, the same struct a config frame carries the other way and the
-// same one a state file holds.  So there is one table parser, in lua_context,
-// and one field-by-field application, in runtime_config_apply.h, and this is
-// neither.
-//
-// What it does duplicate, deliberately and in three lines each, is the ORDER
-// cmd_start uses: refuse, start, persist, fork, wait for the child's verdict.
-// Sharing that with cmd_start would mean handing it an ipc_connection to write
-// into and a parsed_args to read, and inventing both here is a larger lie than
-// the repetition.
+// The in-daemon socketley.create/.start/.stop/.remove reached from a different
+// direction, parsing nothing because a runtime_config crosses -- and
+// duplicating cmd_start's order in three lines each, since sharing it would
+// mean inventing an ipc_connection and a parsed_args here.
 bool daemon_handler::serve_map_request(const std::string& op,
                                        const std::string& name,
                                        const std::string& config,
@@ -5303,10 +4254,8 @@ bool daemon_handler::serve_map_request(const std::string& op,
             return false;
         }
 
-        // The name on the wire wins over the one in the config.  They are
-        // written from the same string one line apart in lua_context, so they
-        // cannot differ today; saying which is authoritative is what stops a
-        // future field from deciding it by accident.
+        // The name on the wire wins over the one in the config, which is what
+        // stops a future field deciding it by accident.
         cfg.name = name;
 
         switch (m_manager.try_create(cfg.type, name))
@@ -5335,23 +4284,10 @@ bool daemon_handler::serve_map_request(const std::string& op,
         inst->set_event_loop(&m_loop);
         inst->set_owner(cfg.owner);
 
-        // ─── The runtime this builds runs IN THE DAEMON, as it always has ───
-        //
-        // A CLI `create` marks its runtime out-of-process; this does not, and
-        // the divergence is deliberate rather than an omission.
-        //
-        // socketley.create has produced an in-daemon runtime since it existed,
-        // and what this change is about is WHERE THE CALL IS SERVED — a script
-        // in a worker could not make one at all before, and now it can. Making
-        // it also produce a different kind of runtime would put a second change
-        // inside the first, and the script cannot see either: the same three
-        // lines of Lua would build a different thing depending on which process
-        // ran them, which is the exact property the worker/daemon parity work
-        // exists to remove.
-        //
-        // So both sides of the boundary answer this call the same way. Whether
-        // socketley.create should follow the CLI's default is a separate
-        // question about the API, to be asked once and answered for both.
+        // The runtime this builds runs in the daemon as it always has,
+        // deliberately, because making the same three lines of Lua build a
+        // different thing depending on which process ran them is the property
+        // this work exists to remove.
         inst->set_lua_created(true);
         inst->set_child_policy(
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
@@ -5360,11 +4296,9 @@ bool daemon_handler::serve_map_request(const std::string& op,
         apply_common_config(*inst, cfg);
         apply_typed_config(*inst, cfg);
 
-        // The script, and the same unwind the in-daemon path takes: a child
-        // whose script will not load is removed rather than left standing with
-        // no callbacks on it, which is indistinguishable from a working one
-        // until traffic arrives.  The reason is in the log, written by the load
-        // under the CHILD's name.
+        // The script, and the same unwind the in-daemon path takes, because a
+        // runtime with no callbacks is indistinguishable from a working one
+        // until traffic arrives.
         if (!cfg.lua_script.empty() && !inst->load_lua_script(cfg.lua_script))
         {
             m_manager.remove(name);
@@ -5385,16 +4319,9 @@ bool daemon_handler::serve_map_request(const std::string& op,
     }
 
     // ── route ──────────────────────────────────────────────────────────────
-    //
-    // The fifth op, and the one that is not a map mutation.  It is on this
-    // socket because this socket is what a worker can BLOCK on -- see the note
-    // at encode_map_request, which now says so in as many words.
-    //
-    // `name` is the target runtime, as it is for every op here; the connection
-    // and the runtime asking ride in `config`.  It is answered by open() rather
-    // than inline, so that an in-daemon script routing to a worker and a worker
-    // script routing anywhere get one implementation and cannot drift apart in
-    // what they refuse.
+    // The fifth op is not a map mutation and is on this socket because this
+    // socket is what a worker can block on, answered by open() so an in-daemon
+    // script and a worker script cannot drift apart in what they refuse.
     if (h == fnv1a("route"))
     {
         conn_ref    ref{};
@@ -5407,14 +4334,10 @@ bool daemon_handler::serve_map_request(const std::string& op,
         return open(name, ref, origin, err);
     }
 
-    // ── The other three, and where their wording comes from ────────────────
-    //
-    // Word for word what socketley.start/.stop/.remove answer in the daemon —
-    // see the four bindings in lua_context.cpp — because a script must not be
-    // able to tell which side of the boundary it is running on from the text of
-    // a refusal.  The bindings ask this side FIRST for exactly that reason: a
-    // worker's map is a replica on a coalescing push, so a check made out there
-    // can be a snapshot behind, and these are made against the map itself.
+    // Word for word what the daemon's own bindings answer, because a script
+    // must not be able to tell which side of the boundary it is on from the
+    // text of a refusal, and these are made against the map itself rather than
+    // a replica.
     auto* inst = m_manager.get(name);
     if (!inst)
     {
@@ -5472,9 +4395,8 @@ bool daemon_handler::serve_map_request(const std::string& op,
             }
         }
 
-        // The runtime is up; its script's set-up may not be.  Reported as a
-        // failure with the reason, exactly as cmd_start reports it, and
-        // was_running is left set for the reason written there.
+        // The runtime is up and its script's set-up may not be, reported as a
+        // failure exactly as cmd_start reports it.
         if (std::string why = on_start_error(name); !why.empty())
         {
             err = why;
@@ -5549,23 +4471,10 @@ void daemon_handler::on_worker_publish(proxy_supervisor* from,
 
 void daemon_handler::poll_proxy_workers()
 {
-    // ─── Nothing here may hold into the map across a poll() ─────────────────
-    //
-    // poll() drains a control socket, and what comes off one reaches back here:
-    // a `publish` runs the subscribe callbacks of every runtime in this daemon,
-    // a subscriber may call socketley.remove, and that reconciles — which
-    // erases from m_proxy_workers.  await_worker_startup() documents the same
-    // path and re-takes its iterator for the same reason.
-    //
-    // A range-for over the map was already resting on that not happening.  It
-    // became worth fixing rather than noting when the aggregate below started
-    // using the KEY after the drain: a structured binding's `name` is a
-    // reference into the node, so an erase during poll() would leave this
-    // reading a freed string, not merely a stale iterator.
-    //
-    // So: the names are copied first, and every element is re-found by name
-    // between drains.  One string copy per runtime per tick, against a
-    // use-after-free that needs a Lua subscriber and a removal to reach.
+    // Nothing may hold into the map across a poll(), because a publish runs
+    // subscribe callbacks that may remove a runtime and erase from
+    // m_proxy_workers -- so the names are copied and every element re-found
+    // between drains.
     std::vector<std::string> names;
     names.reserve(m_proxy_workers.size());
     for (const auto& [name, _] : m_proxy_workers)
@@ -5583,39 +4492,17 @@ void daemon_handler::poll_proxy_workers()
             ++k;
         }
 
-        // Once per runtime and after its whole shard set has been drained, not
-        // once per shard: the placeholder holds the SUM, so writing it while
-        // half the shards still carry figures from the previous interval would
-        // publish a total that never existed.  It re-finds the name itself and
-        // does nothing when the runtime has gone.
+        // Once per runtime after its whole shard set has been drained, because
+        // the placeholder holds the sum and writing it half-way would publish
+        // a total that never existed.
         aggregate_worker_stats(name);
     }
 }
 
-// ─── One runtime's figures, out of N processes' ─────────────────────────────
-//
-// A shard is an implementation detail of a runtime and not a runtime: `ls`
-// prints one line, `inspect` prints one record, and the connection count on it
-// is what the runtime is serving.  With N workers that is the sum over them,
-// which is why apply_stats() stopped writing the placeholder — see the note
-// there.
-//
-// ─── AND WHY THIS IS NO LONGER WHERE THE FIGURES COME FROM ──────────────────
-//
-// The five counters are summed out of the shared region instead, by whoever
-// prints them — see runtime_instance::worker_figures().  What is summed here is
-// the same arithmetic over the frames, and it is the FALLBACK: it is what
-// `stats` reports for a runtime whose memfd region could not be created, which
-// is logged where the attempt failed.  The two cannot both be in force for one
-// runtime: worker_figures() prefers the region whenever it is mapped.
-//
-// It is also still where the detail TEXT is assembled, for every runtime,
-// region or no region.  That part was never summable.
-//
-// A shard that has not published yet contributes nothing at all rather than
-// zeros.  Otherwise every restart — and every `create -s`, for the moments
-// between the forks — would report a runtime as having lost the connections its
-// unstarted shards have not yet claimed.
+// One runtime's figures out of N processes', which is the fallback for a
+// runtime whose memfd region could not be created and still where the detail
+// text is assembled -- with a shard that has not published contributing
+// nothing rather than zeros.
 void daemon_handler::aggregate_worker_stats(const std::string& name)
 {
     auto it = m_proxy_workers.find(name);
@@ -5647,31 +4534,9 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
         out         += s.bytes_out;
         active      += s.active_connections;
 
-        // One shard's detail text is passed through unchanged, which is the
-        // whole of the unsharded case and keeps `stats` byte-identical to what
-        // it printed before this existed.  Several are labelled, because the
-        // text is a walk of ONE process's connection tables and concatenating
-        // them unlabelled would read as one runtime with the same connection
-        // listed several times.
-        //
-        // ─── AND THE SHARD'S OWN FIGURES, UNDER ITS OWN NAMES ───────────────
-        //
-        // How the work is spread is a question the sum cannot answer, and it is
-        // the question a shard count is created to make somebody ask: three
-        // shards that bind and never accept look exactly like three that share
-        // the load, in every figure except these.
-        //
-        // They used to be here by accident — each shard pushed a full `stats`
-        // text, prefix and all, so a four-shard runtime printed four
-        // `total_connections:` lines and NO runtime-level one.  A reader had to
-        // know to sum them, and one that did not was reading whichever shard
-        // came first.  Now the runtime's line is the runtime's, and a shard's
-        // carries `shard_`, so neither can be mistaken for the other.
-        //
-        // Read from the region rather than from the frame that shard last sent:
-        // this runs immediately before `stats` prints, which is the same
-        // instant the summed prefix is taken at, so the parts and the total
-        // agree.
+        // One shard's detail text passes through unchanged and several are
+        // labelled, with each shard's own figures under `shard_` names,
+        // because how the work is spread is a question the sum cannot answer.
         const size_t idx = static_cast<size_t>(&sup - it->second.data());
         if (it->second.size() > 1)
         {
@@ -5714,20 +4579,16 @@ void daemon_handler::aggregate_worker_stats(const std::string& name)
 
 void daemon_handler::reconcile_proxy_workers()
 {
-    // What the runtime map says should be running out of process, and HOW MANY
-    // processes each of them wants.  The count is part of what is being
-    // reconciled now, not just the presence: `--shards 4` on a runtime that
-    // currently has one worker is three forks, and a restore that brings a
-    // four-shard proxy back has to bring back four.
+    // What the map says should be running out of process and how many
+    // processes each wants, because the count is part of what is being
+    // reconciled and not just the presence.
     std::vector<std::pair<std::string, size_t>> wanted;
     {
         std::shared_lock lock(m_manager.mutex);
         for (const auto& [name, inst] : m_manager.list())
         {
             // The supervisor does not care what kind of runtime it is
-            // supervising — it forks, hands over a config frame, restarts and
-            // reads stats back, and none of that reads the type.  It held a
-            // proxy_instance* it never dereferenced until 1b5c046.
+            // supervising, and none of what it does reads the type.
             if (!inst->is_out_of_process())
                 continue;
             if (inst->get_state() == runtime_running)
@@ -5735,35 +4596,18 @@ void daemon_handler::reconcile_proxy_workers()
         }
     }
 
-    // Retire one shard: the whole of what used to happen to the single
-    // supervisor for a name, unchanged, and now reached from two places — a
-    // runtime that is going away entirely, and one that is merely going from
-    // four shards to two.
-    //
-    // Its own function because getting this wrong is not a visible failure.
-    // The erase must NOT destroy: the erase used to run the destructor, and the
-    // supervisor's control-socket poll had been cancelled rather than
-    // completed, so its completion arrived on a later turn and the loop read
-    // the owner token out of an io_request living inside the freed object.
-    // Removing or stopping an out-of-process runtime was enough; no traffic was
-    // needed.  retire() gives the ring back, drops every pointer to this
-    // supervisor while the things holding them are still alive, and hands over
-    // the identity to wait on; drain_retired_handlers() destroys it once the
-    // loop says nothing more will name it.
-    // Runtimes whose whole shard set is being retired on this pass.  Told to
-    // let go of their routes AFTER the loops below, not during: forget() runs
-    // other runtimes' on_disconnect, and a script may answer that by creating
-    // or removing a runtime, which reconciles again -- into the container this
-    // is iterating.  Same rule, and the same reason, as the `died` list in the
-    // health tick.
+    // Retire one shard without destroying it, because the erase used to run
+    // the destructor while a cancelled poll's completion was still on its way
+    // -- and runtimes losing their whole shard set are told to forget their
+    // routes after the loops, since forget() runs on_disconnect and a script
+    // may reconcile again.
     std::vector<std::string> retired_names;
 
     const auto retire_one = [this](std::unique_ptr<proxy_supervisor> sup)
     {
         sup->shutdown();
-        // shutdown() reaps only a child that was already gone, and one that has
-        // just been asked to unwind its ring never is.  This is the last moment
-        // anything knows the pid.
+        // shutdown() reaps only a child that was already gone, so this is the
+        // last moment anything knows the pid.
         if (const pid_t p = sup->release_pid(); p > 0)
             m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
 
@@ -5771,10 +4615,9 @@ void daemon_handler::reconcile_proxy_workers()
         m_retired_handlers.push_back({std::move(sup), tok});
     };
 
-    // Children whose runtime has stopped, been removed or renamed — and shards
-    // of a runtime that is still wanted with fewer of them than it has.  Taken
-    // down before anything is started, so a rename that reuses a port does not
-    // have two children bound to it at once.
+    // Children whose runtime has gone, and surplus shards, taken down before
+    // anything is started so a rename that reuses a port does not have two
+    // children bound to it.
     for (auto it = m_proxy_workers.begin(); it != m_proxy_workers.end();)
     {
         const auto w = std::find_if(wanted.begin(), wanted.end(),
@@ -5788,17 +4631,9 @@ void daemon_handler::reconcile_proxy_workers()
             retired_names.push_back(it->first);
             for (auto& sup : it->second)
                 retire_one(std::move(sup));
-            // The region goes with the last shard.  Nothing may read it after
-            // this — every process that had it mapped is being torn down — and
-            // keeping it would hand a restarted runtime a table still holding
-            // the counts of the shards it replaced.
-            //
-            // The placeholder's reader goes first.  It holds a DUPLICATED
-            // descriptor and its own mapping, so dropping the map entry does
-            // not disturb it: it would go on answering `stats` out of a table
-            // no process writes any more, which is a figure that can never
-            // change and looks exactly like one that has not. Closed here, so
-            // the runtime falls back to the last figures it actually reported.
+            // The region goes with the last shard, and the placeholder's own
+            // duplicated reader is closed first, or the runtime would go on
+            // answering `stats` out of a table no process writes any more.
             if (auto* inst = m_manager.get(it->first))
                 inst->shard_stats_table().close();
             m_shard_regions.erase(it->first);
@@ -5807,34 +4642,23 @@ void daemon_handler::reconcile_proxy_workers()
             continue;
         }
 
-        // Wanted, but with fewer processes than it currently has.  Reached when
-        // a stopped runtime was edited to a smaller --shards and started again;
-        // the shrink itself is refused while running, see parse_common_edit_flags.
-        //
-        // From the back, so the shards that survive keep their index — the
-        // index is what `stats` labels a shard's detail text with, and having
-        // it renumber underneath a reader for no reason is a worse answer than
-        // leaving a gap that cannot occur.
+        // Wanted with fewer processes than it has, retired from the back so
+        // the surviving shards keep the index `stats` labels their detail text
+        // with.
         while (it->second.size() > w->second)
         {
             retire_one(std::move(it->second.back()));
             it->second.pop_back();
         }
 
-        // The surviving shards must stop counting the ones that just went.  A
-        // retired shard publishes nothing on its way out — that is the whole
-        // point of retiring it — so its last figure would sit in the table
-        // being summed forever, and `self.connections()` would report a runtime
-        // holding connections that no process has.  Told here, by the one side
-        // that knows a shard has gone.
+        // The surviving shards must stop counting the ones that just went,
+        // because a retired shard publishes nothing and its last figure would
+        // sit in the sum forever.
         if (const auto r = m_shard_regions.find(it->first); r != m_shard_regions.end())
             r->second.set_shard_count(static_cast<uint32_t>(w->second));
 
-        // The client list is sized from the shard count, so it cannot be
-        // resized in place the way the counter table can.  A retired shard's
-        // block is cleared instead, which is what stops it being read; the
-        // region keeps its original width until the runtime stops and the next
-        // start builds one to fit.
+        // The client list is sized from the shard count, so a retired shard's
+        // block is cleared instead of the region being resized.
         if (const auto c = m_shard_client_regions.find(it->first);
             c != m_shard_client_regions.end())
             for (size_t i = w->second; i < c->second.count(); ++i)
@@ -5869,26 +4693,14 @@ void daemon_handler::reconcile_proxy_workers()
             continue;   // nothing to describe the runtime with
         }
 
-        // The shards forked in this pass, so `start` can be sent to all of them
-        // AFTER the endpoint table has been published once — see the note below
-        // the spawn for why the table has to arrive before the start, and why
-        // publishing it once for N children beats publishing it N times.
+        // The shards forked in this pass, so `start` can be sent to all of
+        // them after the endpoint table has been published once.
         std::vector<proxy_supervisor*> forked;
 
-        // ── The shared table this runtime's shards publish into ─────────────
-        //
-        // Made before the first fork and kept for the life of the runtime; see
-        // m_shard_regions.  A runtime that is not sharded gets none and every
-        // reader below is written for that: shard_fd stays -1, the supervisor
-        // passes nothing across the exec, and the worker finds no descriptor and
-        // does not map anything.
-        //
-        // A region that cannot be made is not fatal.  memfd_create is old
-        // enough to be everywhere this daemon runs, but the failure mode if it
-        // is not is the behaviour this tree had yesterday — each shard answers
-        // for itself — and taking the runtime down instead would turn a missing
-        // optimisation into an outage.  It is logged once, here, so the reason
-        // `self.connections()` is answering per-shard is written down somewhere.
+        // The shared table this runtime's shards publish into, made before the
+        // first fork and kept for the life of the runtime, and not fatal when
+        // it cannot be made -- the fallback is each shard answering for
+        // itself.
         int shard_fd   = -1;
         int clients_fd = -1;
         {
@@ -5911,18 +4723,9 @@ void daemon_handler::reconcile_proxy_workers()
             shard_fd = region.fd();
 
             // ── And the daemon's own way in ─────────────────────────────────
-            //
-            // `stats`, `ls`, the metrics thread and every Lua binding ask the
-            // PLACEHOLDER for this runtime's figures, not the map that owns the
-            // memfd.  So the placeholder gets a reader's mapping of the same
-            // region — no slot, never writable — and reported_connection_count()
-            // and worker_figures() answer out of it at the moment they are
-            // called.  That is the whole of "read at print time": there is no
-            // step between the worker's store and this daemon's load.
-            //
-            // Attached once.  A region that is already mapped here is the same
-            // region: create() is called only when the map has none, and a grow
-            // rewrites the header of a mapping this reader shares.
+            // The placeholder gets a reader's mapping of the same region,
+            // attached once, so every reader that asks it for figures loads
+            // them at the moment it is called.
             if (!inst->shard_stats_table().mapped() && region.mapped())
                 if (!inst->shard_stats_table().attach_reader(shard_fd))
                     LOG_WARN(("could not attach to the shared figures table for "
@@ -5932,10 +4735,9 @@ void daemon_handler::reconcile_proxy_workers()
         }
         if (want_count > 1)
         {
-            // And the client list.  Same lifetime, same failure policy: a
-            // region that cannot be made leaves each shard answering
-            // self.clients() with its own connections, which is the behaviour
-            // this tree had before the change and not an outage.
+            // And the client list, on the same lifetime and the same failure
+            // policy: each shard answering self.clients() with its own
+            // connections is not an outage.
             auto& creg = m_shard_client_regions[name];
             if (!creg.mapped())
             {
@@ -5947,9 +4749,7 @@ void daemon_handler::reconcile_proxy_workers()
             else if (creg.count() != want_count)
             {
                 // Width is fixed at creation, so a changed shard count needs a
-                // new region.  Reached only when a runtime grew while running,
-                // which reconcile does not currently produce — see the note on
-                // set_shard_count above.
+                // new region, which reconcile does not currently produce.
                 if (!creg.create(static_cast<uint32_t>(want_count)))
                     LOG_WARN(("could not resize the shared client list for "
                               + name).c_str());
@@ -5958,17 +4758,9 @@ void daemon_handler::reconcile_proxy_workers()
         }
 
         // ── The shard mesh ─────────────────────────────────────────────────
-        //
-        // N(N-1)/2 socketpairs, made here because this is the only moment both
-        // ends can reach both processes: a socketpair is inherited, never
-        // attached, so it has to exist before the fork of the second child that
-        // needs it.  mesh[i][j] is the end child i gets for talking to child j.
-        //
-        // Only for a set being forked whole.  A runtime that GREW its shard
-        // count while running would have existing children that cannot be given
-        // new descriptors, and reconcile does not currently produce that — see
-        // the note on set_shard_count above.  Those shards relay, which is the
-        // route that always exists.
+        // N(N-1)/2 socketpairs made here, the only moment both ends can reach
+        // both processes, and only for a set being forked whole -- a runtime
+        // that grew while running has shards that relay.
         std::vector<std::vector<int>> mesh;
         if (want_count > 1 && shards.empty() && mesh_fits(want_count))
         {
@@ -5998,10 +4790,9 @@ void daemon_handler::reconcile_proxy_workers()
             }
         }
 
-        // Every end the daemon made, closed once the whole set is forked.  It
-        // keeps none: a restarted shard cannot be given a socketpair end that
-        // its siblings are already holding the other side of, so the mesh is
-        // built once per runtime start and a restarted shard relays.
+        // Every end the daemon made is closed once the whole set is forked,
+        // because a restarted shard cannot be given an end its siblings
+        // already hold the other side of.
         struct mesh_closer
         {
             std::vector<std::vector<int>>& m;
@@ -6017,20 +4808,16 @@ void daemon_handler::reconcile_proxy_workers()
         {
         auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
 
-        // Which of N this child is, and where it publishes.  The position in
-        // this vector IS the index — reconcile only ever appends here and only
-        // ever retires from the back, exactly so that a shard's index does not
-        // move underneath a reader — so no counter has to be kept beside it.
+        // Which of N this child is, where the position in this vector is the
+        // index, so no counter has to be kept beside it.
         sup->set_shard(static_cast<uint32_t>(shards.size()), shard_fd, clients_fd);
 
         // Its row of the mesh, which spawn() places and then forgets.
         if (!mesh.empty())
             sup->set_mesh_fds(mesh[shards.size()]);
 
-        // The supervisor answers for the runtime it supervises.  Set before the
-        // spawn so that a request arriving in the same turn as the start has
-        // somewhere to go, and pointed at the placeholder so that
-        // publish_sinks() below picks it up instead of the empty local object.
+        // The supervisor answers for the runtime it supervises, set before the
+        // spawn so a request arriving in the same turn has somewhere to go.
         sup->set_channel(&m_manager.requests());
         sup->set_event_loop(&m_loop);
         sup->set_publish_handler([this](proxy_supervisor* from,
@@ -6050,47 +4837,24 @@ void daemon_handler::reconcile_proxy_workers()
                                { on_worker_route(f, to, frm, op, r, pl); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
 
-        // The four map calls, recorded here and served a turn later; see
-        // queue_map_request().  `this` outlives every supervisor it installs
-        // this on — they are all in m_proxy_workers, which is a member.
+        // The four map calls, recorded here and served a turn later, with
+        // `this` outliving every supervisor it is installed on.
         sup->set_map_handler([this](uint64_t ticket, int reply_fd,
                                     std::string op, std::string n,
                                     std::string cfg)
                              { queue_map_request(ticket, reply_fd, std::move(op),
                                                  std::move(n), std::move(cfg)); });
 
-        // ─── Only the first shard is the request sink ───────────────────────
-        //
-        // A cross-runtime request names a runtime and expects ONE answer.  The
-        // override is a single pointer because that is the shape of the
-        // question, not a limitation to route around: sending `cache get k` to
-        // four shards would produce four replies to a channel holding one
-        // ticket.
-        //
-        // Shard 0 rather than a rotation, because a request must be answerable
-        // and any shard can answer one — a request is served from the runtime's
-        // configuration and its script, both of which every shard has, and not
-        // from the connections, which is the one thing they do not share.  The
-        // types where that is untrue are exactly the types --shards refuses.
+        // Only shard 0 is the request sink, because a cross-runtime request
+        // expects one answer and any shard can serve one -- a request is
+        // answered from the configuration and the script, which every shard
+        // has.
         if (shards.empty())
             inst->set_request_sink_override(sup.get());
 
-        // ─── What this child must know before it reads its config ───────────
-        //
-        // Handed over before the fork, not published after it.  There is no
-        // socket yet, so these only fill the supervisor's caches — and those
-        // caches are exactly what spawn() writes ahead of the config frame,
-        // which is the frame that makes the worker load its script.
-        //
-        // Publishing after the spawn, which is what the map used to rely on,
-        // puts both frames BEHIND the config: fine for the map, which is read
-        // when a callback runs, and not fine for the cluster view, whose
-        // bindings are refused or not at the moment the script is loaded.  A
-        // script's top level asking socketley.cluster.daemons() was answered by
-        // a refusal installed a few microseconds before the view arrived.
-        //
-        // The map is primed the same way for the smaller version of the same
-        // problem: a top-level socketley.list() saw an empty map.
+        // Handed over before the fork rather than published after it, because
+        // these only fill the supervisor's caches and those are what spawn()
+        // writes ahead of the config frame that loads the script.
         sup->send_runtime_map(build_runtime_map_payload());
         if (const std::string cv = build_cluster_view_payload(); !cv.empty())
         {
@@ -6101,58 +4865,29 @@ void daemon_handler::reconcile_proxy_workers()
         if (!sup->spawn(cfg))
         {
             LOG_ERROR("could not start out-of-process proxy worker");
-            // The override must not outlive the supervisor it points at.  Only
-            // when this IS the supervisor it points at: with shards, a fork
-            // that fails on the third child must not unhook the first, which is
-            // alive, serving, and the one answering requests.
+            // The override must not outlive the supervisor it points at, and
+            // only when this is that supervisor, because a fork failing on the
+            // third child must not unhook the first.
             if (shards.empty())
                 inst->set_request_sink_override(nullptr);
             inst->mark_failed();
 
-            // Stop adding to a runtime that has just been marked failed rather
-            // than trying the remaining shards.  Whatever stopped this fork —
-            // memory, a descriptor limit, a process limit — is not going to be
-            // any different one line later, and the shards that DID come up are
-            // retired by the loop above on the next reconcile, because a
-            // `failed` runtime is no longer in `wanted`.
+            // Stop adding to a runtime just marked failed, because whatever
+            // stopped this fork will not be different one line later and the
+            // shards that came up are retired on the next reconcile.
             break;
         }
-        // Three frames have to reach this child, in this order: config, the
-        // endpoint table, then start.  The first went with spawn(); the other
-        // two are sent below, once the whole shard set is in the map — the
-        // table's only way to a worker is publish_endpoints(), which reaches
-        // one by walking m_proxy_workers, so every shard has to be IN the map
-        // before the publish and started after it.
-        //
-        // The table travels as its own frame rather than riding on `start`,
-        // because that is the frame spawn() already re-sends to a restarted
-        // child from its cache: one path into the worker, not two.
-        //
-        // sup is moved into the map, so the start goes through the supervisor
-        // itself.  A pointer rather than an iterator: a vector reallocates as
-        // shards are appended, so the pointer is taken from the element after
-        // the push and the ones collected earlier would dangle if they were
-        // element addresses.  They are not — proxy_supervisor is held by
-        // unique_ptr, so the OBJECT does not move when the vector grows, only
-        // the pointers to the pointers do.
+        // Three frames reach this child in order -- config, endpoint table,
+        // start -- with the last two sent once the whole shard set is in the
+        // map, and a pointer rather than an iterator because the vector
+        // reallocates as shards are appended.
         shards.push_back(std::move(sup));
         forked.push_back(shards.back().get());
         }
 
-        // Once for however many were forked, and before any of them is started.
-        //
-        // A backend written as a bare runtime name is turned into host:port by
-        // resolve_backend(), which runs inside start() — before the listener is
-        // bound, and it fails the start outright when there is no table to look
-        // the name up in.  A supervisor forked in this loop has an empty
-        // endpoint cache, so the send inside spawn() had nothing to send yet.
-        //
-        // With start sent first, an out-of-process proxy whose backend was a
-        // name never came up at all: the worker resolved nothing, refused to
-        // bind, and every client got a connection refused on a port `ls` showed
-        // as running.  A literal address was unaffected — it needs no table —
-        // which is what made this look like a proxy bug rather than an ordering
-        // one.
+        // Once for however many were forked and before any is started, because
+        // a backend written as a bare name is resolved inside start() and a
+        // proxy forked with an empty endpoint cache never came up at all.
         if (!forked.empty())
         {
             m_manager.publish_endpoints();
@@ -6160,9 +4895,9 @@ void daemon_handler::reconcile_proxy_workers()
                 s->send_start();
         }
 
-        // The descriptors have been placed into every child that wanted them.
-        // Dropped from the supervisors so a restart cannot place numbers the
-        // guard above is about to close.
+        // The descriptors have been placed into every child that wanted them,
+        // and are dropped so a restart cannot place numbers the guard above is
+        // about to close.
         for (auto& sup : shards)
             sup->clear_mesh_fds();
 
@@ -6180,13 +4915,9 @@ void daemon_handler::reconcile_proxy_workers()
         }
     }
 
-    // ─── And now the routes, once nothing is iterating the map ──────────────
-    //
-    // A retire covers what the stop hook does not: a runtime whose whole shard
-    // set went away without runtime_manager::stop being the cause -- a rename,
-    // a shard count reduced to zero, a restore that no longer wants it.  It
-    // also fires a second time for an ordinary stop, which is why
-    // forget_runtime() is idempotent and says so.
+    // And now the routes, once nothing is iterating the map, covering the
+    // departures the stop hook does not reach -- a rename, a shard count
+    // reduced to zero, a restore that no longer wants it.
     for (const auto& n : retired_names)
         route_relay::forget(&m_manager, n);
 }
@@ -6196,17 +4927,9 @@ std::string daemon_handler::on_start_error(std::string_view name)
     if (auto* inst = m_manager.get(name); inst && !inst->last_on_start_error().empty())
         return inst->last_on_start_error();
 
-    // Nothing on the instance means either that on_start ran, or that it ran
-    // somewhere else: for a runtime in a worker the placeholder never touches
-    // the script, and the reason came up the control socket instead.
-    // The first shard that has one.  Taken from every shard and not only the
-    // first, because on_start runs in each of them and the one that raised may
-    // be any: reading shard 0 alone would report success for a runtime three
-    // quarters of whose processes never finished their set-up.
-    //
-    // Taken from ALL of them even after one is found, because take_ is
-    // destructive — leaving a sibling's error in place would hand it to the
-    // next command that asked, as the answer to a start it was not about.
+    // Nothing on the instance means on_start ran or ran somewhere else, so the
+    // first shard that has a reason reports it and every shard is drained,
+    // because take_ is destructive.
     if (auto it = m_proxy_workers.find(std::string(name)); it != m_proxy_workers.end())
     {
         std::string first;
@@ -6226,36 +4949,21 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     if (it == m_proxy_workers.end())
         return 0;   // in-daemon, or never spawned: nothing in another process
 
-    // Whatever is left of the command's budget, never less than zero.  A caller
-    // waiting on several children has already spent some of it on the ones
-    // ahead of this — which costs nothing when they answered in 20 ms, and is
-    // the whole point when one of them did not answer at all.
+    // Whatever is left of the command's budget and never less than zero, which
+    // costs nothing when the children ahead answered in 20 ms.
     auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now());
     if (left < std::chrono::milliseconds(0))
         left = std::chrono::milliseconds(0);
 
-    // ─── Every shard, and the worst verdict any of them gave ────────────────
-    //
-    // A `create -s` on a four-shard proxy that waits only for the first one is
-    // a command that returns before three quarters of the runtime exists, and —
-    // worse — returns 0 for a configuration the other three are about to
-    // refuse.  The refusal that matters is usually the SAME on every shard,
-    // because they are handed the same config; the one that is not is the port,
-    // and that is exactly the case where waiting for one is silently wrong.
-    //
-    // Worst-of, in the order refused > pending > serving: a shard that refused
-    // is the answer whatever its siblings did, and a shard that never reported
-    // outranks a shard that came up.  They share one deadline rather than
-    // getting one each, which is what the `deadline` parameter is already for —
-    // see the note above it: a caller waiting on several children spends the
-    // budget on the ones ahead.
+    // Every shard, and the worst verdict any of them gave in the order refused
+    // > pending > serving, sharing one deadline so a wedged child cannot
+    // multiply the bound.
     auto verdict = proxy_supervisor::startup::serving;
     {
-        // Everything below is a ::poll inside a command handler, so nothing the
-        // ring owes gets dispatched while it runs — including the nop that
-        // serves a worker's map requests.  This is what tells queue_map_request
-        // to serve them where they arrive instead; see m_worker_wait_depth.
+        // Everything below is a ::poll inside a command handler, so nothing
+        // the ring owes is dispatched while it runs, which is what tells
+        // queue_map_request to serve where requests arrive.
         const worker_wait_scope waiting{m_worker_wait_depth};
 
         const size_t n = it->second.size();
@@ -6282,18 +4990,9 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
         }
     }
 
-    // The iterator is re-taken rather than reused, and that is not tidiness.
-    //
-    // await_startup() drains the control socket, and what comes off it can reach
-    // back into this map: a `publish` runs the subscribe callbacks of every
-    // runtime in this daemon, a subscriber may call socketley.remove, and that
-    // reconciles — which erases from m_proxy_workers.  `it` then names a node
-    // that has been freed, and the two uses below would read it.
-    //
-    // Older than the map frame this commit adds and not reached by it: the way
-    // in is the publish path, which has existed since a cache in a worker could
-    // reach a subscriber in the daemon.  Fixed here because auditing what a new
-    // frame could reach is what found it.
+    // The iterator is re-taken rather than reused, because await_startup()
+    // drains the control socket and a publish can reach a subscriber that
+    // removes a runtime, which erases from this map.
     it = m_proxy_workers.find(std::string(name));
     if (it == m_proxy_workers.end())
         return 0;   // gone while we waited: nothing left to report on
@@ -6301,18 +5000,9 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     switch (verdict)
     {
         case proxy_supervisor::startup::serving:
-            // The child is listening, so it is a group member others may be
-            // routed to now — and until this runs, deliberately, they have not
-            // been told about it.  This is what turns the wait into the
-            // announcement rather than leaving it to the health tick two
-            // seconds later; a create that returns has already published.
-            // take_reachability_change() is consumed here so the tick does not
-            // publish a second time for the same transition.
-            //
-            // Consumed from every shard, and one publish for however many
-            // reported it: the table is rebuilt whole, so N calls would send N
-            // identical tables — and a flag left unconsumed on a sibling makes
-            // the health tick republish for a transition already announced.
+            // The child is listening, so it becomes a group member here rather
+            // than on the health tick, with the flag consumed from every shard
+            // and one publish for however many reported it.
             {
                 bool moved = false;
                 for (auto& sup : it->second)
@@ -6325,34 +5015,18 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
 
         case proxy_supervisor::startup::refused:
         {
-            // Deliberately "did not accept" rather than "refused its script".
-            // Two different things reach this verdict -- a worker that exits
-            // rather than serve without its script, and one that started and
-            // could not bind, resolve its backend or load its TLS pair -- and
-            // only the first is a refusal in the narrow sense.  The message has
-            // to be true of both, and the child has already written the specific
-            // reason: "'path' must start with '/'" names the entry and the rule,
-            // which is more than this side knows.  What is added here is the
-            // consequence, on the CLI's own stream, because a log line the
-            // operator has not gone looking for is not an answer to a command.
-            //
-            // Exit 1 for both, because both are the configuration that was
-            // handed in: a script that will not load, a backend that cannot be
-            // resolved, a port already taken.  That is bad input, not a fatal.
+            // "Did not accept" rather than "refused its script", because two
+            // different things reach this verdict and only one is a refusal in
+            // the narrow sense -- exit 1 for both, because both are the
+            // configuration that was handed in.
             out += "runtime ";
             out += name;
             out += " could not start: the worker did not accept its "
                    "configuration";
 
-            // The child's own reason, when it managed to send one.  It says
-            // things this side cannot know -- "'path' must start with '/'"
-            // names the entry and the rule -- and until config_err existed the
-            // only place it went was a log the operator has not opened.
-            //
-            // Read from the first shard that has one: a configuration refusal
-            // is the same for every shard of a runtime, so N copies of one
-            // sentence is noise, and a shard that died before it could write
-            // leaves the string empty rather than wrong.
+            // The child's own reason when it managed to send one, read from
+            // the first shard that has one, because a configuration refusal is
+            // the same for every shard.
             std::string why;
             if (auto wit = m_proxy_workers.find(std::string(name));
                 wit != m_proxy_workers.end())
@@ -6373,32 +5047,10 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             }
 
             // ─── AND IT IS NOT `was_running` ────────────────────────────────
-            //
-            // cmd_start and cmd_reload both set was_running=true the moment
-            // m_manager.start() returns, which is before the child exists --
-            // the placeholder is optimistically `running` and the verdict is
-            // this frame, arriving later.  Neither cleared it when the verdict
-            // came back refused, so a runtime that never served was recorded as
-            // one the operator wants brought back, and the next daemon start
-            // brought it back.
-            //
-            // Two writers, and every path that learns a start did not happen
-            // comes through this function, so the clear belongs here rather
-            // than at each of them -- a third caller is a matter of time and
-            // would not know to do it.
-            //
-            // Only on `refused`, never on `pending`: pending is this side not
-            // knowing, and the case below says so at length.  Clearing on a
-            // child that is merely slow would leave a listener serving traffic
-            // and marked not-to-be-restored, which is the worse of the two
-            // wrong answers.
-            //
-            // What it cost, measured on `--listen unix:` where two claimants
-            // for one path cannot both win: a refused server was restored after
-            // a daemon restart, took the path from the runtime that owned it,
-            // and -- having no --http of its own -- answered 404 to every
-            // request, permanently.  22% of runs under load, on this commit and
-            // on every commit before it.
+            // was_running is cleared here, and only on `refused`, because two
+            // commands set it before the child exists and a refused runtime
+            // restored after a restart took a unix path from the runtime that
+            // owned it in 22% of runs.
             if (m_persistence)
                 m_persistence->set_was_running(name, false);
             return 1;
@@ -6408,13 +5060,9 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             break;
     }
 
-    // Neither answer inside the bound.  Deliberately NOT reported as a refusal
-    // and deliberately not marked failed here: this side does not know which it
-    // is, and the two wrong answers available -- "it failed" about a runtime
-    // that comes up a moment later, "it worked" about one that never does --
-    // are both worse than saying what is actually known.  The supervisor still
-    // owns the child, the health tick still settles the state, and `ls` will
-    // show whichever it turns out to be.
+    // Neither answer inside the bound, reported as neither, because this side
+    // does not know which it is and both wrong answers are worse than saying
+    // what is known.
     out += "runtime ";
     out += name;
     out += " did not report back within 2s of starting; it is still being "
@@ -6428,9 +5076,8 @@ void daemon_handler::reap_orphan_workers()
         return;
 
     // Long enough for a worker to cancel its ring and close its connections,
-    // short enough that a daemon stopping runtimes in a loop does not accumulate
-    // them.  A child that is still here after this has not answered SIGTERM and
-    // is not going to.
+    // short enough that a daemon stopping runtimes in a loop does not
+    // accumulate them.
     constexpr auto kill_after = std::chrono::seconds(5);
     const auto     now        = std::chrono::steady_clock::now();
 
@@ -6465,11 +5112,8 @@ void daemon_handler::drain_retired_handlers()
 
     for (auto it = m_retired_handlers.begin(); it != m_retired_handlers.end();)
     {
-        // The one question worth asking, and the loop is the only thing that
-        // can answer it: is any completion still going to name the storage
-        // inside this object.  Not "has it been deregistered" — a deregistered
-        // owner's completion is dropped, and dropping one reads the request to
-        // decide.
+        // The one question worth asking, which only the loop can answer: is
+        // any completion still going to name the storage inside this object.
         if (m_loop.token_inflight(it->token) != 0)
         {
             ++it;
@@ -6491,8 +5135,8 @@ void daemon_handler::check_managed_health()
     // later turn of the loop than the removal was.
     drain_retired_handlers();
 
-    // The children first: liveness, then whatever they have reported.  Both
-    // before the managed-runtime sweep below, which can return early.
+    // The children first -- liveness, then whatever they have reported -- both
+    // before the managed-runtime sweep, which can return early.
     bool routes_moved = false;
     // Names whose child was found dead on this tick; see the fan-out below the
     // loop for why they are collected rather than acted on in place.
@@ -6503,26 +5147,21 @@ void daemon_handler::check_managed_health()
     {
         // The child's own report, drained before liveness so a runtime that
         // failed to start reaches the state file on the same tick it was heard
-        // about.  poll_proxy_workers() below is where the frame is read; this
-        // collects what the previous drain decided.
+        // about.
         if (sup->take_state_change() && m_persistence)
         {
             if (auto* inst = m_manager.get(worker_name))
                 m_persistence->save_runtime(inst);
         }
 
-        // A declaration that arrived since the last tick.  publish_endpoints()
-        // rebuilds the whole table, so one call covers however many sent one.
+        // A declaration that arrived since the last tick, where one publish
+        // covers however many sent one because the whole table is rebuilt.
         if (sup->take_routes_change())
             routes_moved = true;
 
-        // A child that has started listening since the last tick.  Folded into
-        // the same republish for the same reason, and it is the backstop rather
-        // than the fast path: a `create` announces its own worker as soon as
-        // await_worker_startup() sees it serving.  What reaches here is every
-        // other way a worker can come up — a restart after a crash above all,
-        // where nothing is waiting on the child and the member has been out of
-        // its group since the fork.
+        // A child that has started listening since the last tick, folded into
+        // the same republish as the backstop for every way a worker comes up
+        // without something waiting on it.
         if (sup->take_reachability_change())
             routes_moved = true;
 
@@ -6535,20 +5174,10 @@ void daemon_handler::check_managed_health()
                 if (auto* inst = m_manager.get(worker_name))
                     m_persistence->save_runtime(inst);
 
-            // ─── And every route in or out of it ────────────────────────────
-            //
-            // Whether it was restarted or marked failed, every connection that
-            // child held is gone -- a restarted worker comes back with an empty
-            // connection table, not with the old one.  So a target still holds
-            // handles for connections that no longer exist, and an origin still
-            // relays into a runtime that will never answer.
-            //
-            // This is the case route_op::forget was designed for and the one
-            // the stop hook does not reach: a killed worker runs no teardown,
-            // so nothing goes through runtime_manager::stop.  Collected rather
-            // than fanned out here, because forget() runs other runtimes'
-            // on_disconnect and a script is entitled to answer that by removing
-            // a runtime -- which erases from the map this loop is walking.
+            // And every route in or out of it, because a restarted worker
+            // comes back with an empty connection table -- collected rather
+            // than fanned out here, since forget() runs on_disconnect and a
+            // script may remove a runtime from the map this loop walks.
             died.push_back(worker_name);
         }
     }
@@ -6561,31 +5190,14 @@ void daemon_handler::check_managed_health()
     if (routes_moved)
         m_manager.publish_endpoints();
 
-    // The workers' replica of the map, refreshed for what no event announces.
-    //
-    // Membership changes ride publish_endpoints() and arrive at once; two things
-    // do not.  A connection count moves with traffic and nothing republishes for
-    // it, and a runtime whose worker refused its configuration reaches `failed`
-    // through mark_failed(), which is not a transition the manager publishes
-    // either.  Both are collected above, so this is the point at which the tick
-    // has the freshest answer it is going to have.
-    //
-    // After reconcile_proxy_workers(), so a child forked on this tick is in
-    // m_proxy_workers and gets the map with everything else.  Unconditional
-    // because the decision belongs one level down: send_runtime_map() drops a
-    // payload the child already has, so a daemon where nothing moved sends
-    // nothing.
+    // The workers' replica refreshed for what no event announces -- a
+    // connection count, and a runtime that reached `failed` through
+    // mark_failed() -- unconditionally, because send_runtime_map() drops a
+    // payload the child already has.
     publish_runtime_map_to_workers();
 
-    // And what the cluster looks like, on the same tick.
-    //
-    // That is not a convenience: cluster_discovery scans the shared directory
-    // every PUBLISH_INTERVAL_SEC, which is the two seconds this tick already
-    // runs at, so a view pushed here is exactly as old as the one a script in
-    // the daemon reads off get_all_daemons().  Pushing it more often would
-    // resend a snapshot that has not been re-scanned; less often — only when
-    // local membership moved — would freeze it, because a remote daemon joining
-    // or leaving changes nothing in the local map.
+    // And what the cluster looks like on the same tick, which is exactly the
+    // cadence cluster_discovery re-scans the shared directory at.
     publish_cluster_view_to_workers();
 
     std::shared_lock lock(m_manager.mutex);
@@ -6624,12 +5236,9 @@ int daemon_handler::cmd_cluster_dir(ipc_connection* conn)
     return 0;
 }
 
-// The local half of `socketley cluster`.  Everything else that command prints
-// it reads off the shared directory, which is exactly the view a node excluded
-// from the cluster does not appear in — so the one fact the directory can never
-// carry is whether THIS daemon is in it, and why not.
-//
-// Always exits 0: "clustering is off" is an answer, not a failure to answer.
+// The local half of `socketley cluster`, because the one fact the shared
+// directory cannot carry is whether this daemon is in the cluster and why not;
+// always exits 0.
 int daemon_handler::cmd_cluster_status(ipc_connection* conn)
 {
     std::string out;
@@ -6659,17 +5268,9 @@ void daemon_handler::stop_cluster()
     if (!m_owned_cluster)
         return;
 
-    // Not reset() — quarantined.  cluster_discovery's publish timer is an
-    // io_request inside the object, so a timeout still counting down names
-    // storage the reset would free, and the loop reads the owner token out of
-    // that request when the completion lands.  stop() did not deregister at
-    // all, so the token still matched and the completion was dispatched: a
-    // virtual call on a freed cluster_discovery, about two seconds after this
-    // line.  Pointing `daemon --cluster` at a second directory was enough, and
-    // so was renaming a clustered daemon, which restarts discovery through
-    // here.
-    //
-    // The pointers first, so that nothing can reach the object while it waits.
+    // Quarantined rather than reset, because cluster_discovery's publish timer
+    // is an io_request inside the object and a reset would free storage a
+    // completion still names.
     m_cluster = nullptr;
     m_manager.set_cluster_discovery(nullptr);
 
@@ -6687,11 +5288,9 @@ bool daemon_handler::start_cluster(const std::string& name, const std::string& d
     cd->set_event_callback([this](const std::vector<cluster_event>& events) {
         m_manager.dispatch_cluster_events(events);
 
-        // A daemon joining or leaving moves nothing in the local map, so
-        // nothing else would carry it to a worker before the next tick.  The
-        // tick is the backstop; this is the moment the daemon itself learned,
-        // and a script out there should not hear about it later than one in
-        // here does.
+        // A daemon joining or leaving moves nothing in the local map, so a
+        // script in a worker should not hear about it later than one in here
+        // does.
         publish_cluster_view_to_workers();
     });
 
@@ -6708,10 +5307,9 @@ bool daemon_handler::start_cluster(const std::string& name, const std::string& d
     return true;
 }
 
-// The sentence an operator gets from every surface that can be asked about
-// clustering after the fact.  A daemon that was never given --cluster and a
-// daemon that was given it and could not honour it are two different states,
-// and reporting them with one message is how "accepted and not applied" hides.
+// The sentence every surface gives when asked about clustering afterwards,
+// because a daemon never given --cluster and one that could not honour it are
+// two different states.
 std::string daemon_handler::cluster_off_reason() const
 {
     if (m_cluster_error.empty())
@@ -6755,13 +5353,9 @@ int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // If cluster is active, restart it with the new name.
-    //
-    // A rename that the cluster cannot honour is refused whole: the daemon goes
-    // back to the name it had and republishes under it.  It used to keep the
-    // new name, with clustering off and its old entry already deleted, so a
-    // rejected rename cost the node its membership under a name that was never
-    // in dispute.
+    // A rename the cluster cannot honour is refused whole, because keeping the
+    // new name with clustering off cost the node its membership under a name
+    // that was never in dispute.
     if (m_owned_cluster)
     {
         const std::string cluster_dir(m_owned_cluster->get_cluster_dir());
@@ -6789,9 +5383,8 @@ int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // Not clustered, so nothing to republish.  Any standing refusal named the
-    // old name and stops describing this daemon here; `cluster ls` goes back to
-    // the plain "not in cluster mode" until --cluster is issued afresh.
+    // Not clustered, so nothing to republish, and any standing refusal named
+    // the old name and stops describing this daemon.
     m_daemon_name = new_name;
     m_cluster_error.clear();
     return 0;
@@ -6818,11 +5411,9 @@ int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& 
 
     std::string cluster_dir(pa.args[1]);
 
-    // A flag that cannot be honoured is refused with the reason named, the same
-    // way --sqpoll and --tls are, and it is refused loudly enough to survive the
-    // exit code: the log says it, and every `socketley cluster` subcommand says
-    // it afterwards.  What is never on offer is accepting --cluster and running
-    // without it.
+    // A flag that cannot be honoured is refused with the reason named, loudly
+    // enough to survive the exit code, and accepting --cluster while running
+    // without it is never on offer.
     if (!start_cluster(m_daemon_name, cluster_dir))
     {
         conn->write_buf = "cluster mode not enabled: " + m_cluster_error + "\n"
@@ -6852,14 +5443,9 @@ int daemon_handler::cmd_dashboard(ipc_connection* conn)
     return 0;
 }
 
-// Frame one command's reply onto the end of the connection's outgoing stream:
-// exit code byte, payload, NUL terminator — what ipc_client.cpp reads back.
-//
-// The payload is copied out of write_buf rather than framed in place.  write_buf
-// is scratch that every cmd_* assigns to and that handle_read() clears before
-// each command; out_buf is the only thing a write SQE is ever given, and it is
-// appended to and never rebuilt.  The copy also drops the insert() this used to
-// do to put the exit code in front, which shifted the whole reply.
+// Frame one command's reply onto the outgoing stream, copied out of write_buf
+// because that is scratch every cmd_* assigns to while out_buf is the only
+// thing a write SQE is ever given.
 void daemon_handler::append_response(ipc_connection* conn, int exit_code)
 {
     conn->out_buf += static_cast<char>(exit_code);
@@ -6867,26 +5453,10 @@ void daemon_handler::append_response(ipc_connection* conn, int exit_code)
     conn->out_buf += '\0';
 }
 
-// Submit the one write that carries everything append_response() has framed,
-// starting from whatever a short write has already got out.
-//
-// One write outstanding per connection, and no read re-armed until it reports:
-// that is what makes the buffer safe, and it is the whole of the fix.  This used
-// to submit a write per command, out of the one write_req and the one write_buf.
-// A client that put `ls` and `ps` in a single packet therefore had the second
-// command clear and rebuild write_buf while the first write was still queued, so
-// the kernel sent whatever the reallocated string had become — freed memory as
-// often as not.  The one write_req carried both submissions at once, which left
-// the two completions indistinguishable and the loop's per-request bookkeeping
-// describing only the later of them.  And nothing linked the two SQEs, so the
-// kernel was free to put the second reply on the wire first, handing the CLI one
-// command's exit code in front of the other's output.
-//
-// False means the SQE never reached the ring.  Nothing will complete for this
-// connection, so the caller must take it down rather than leave a client waiting
-// on a reply that was never queued: what ended that wait before was the CLI's own
-// five second SO_RCVTIMEO, and it ended it with "failed to connect to daemon" on
-// a daemon that is running and healthy.
+// One write outstanding per connection with no read re-armed until it reports,
+// which is what makes the buffer safe -- a write per command let a pipelined
+// second command rebuild write_buf under the first, and left the two
+// completions indistinguishable.
 bool daemon_handler::send_response(ipc_connection* conn)
 {
     char* base = conn->out_buf.data() + conn->write_off;
