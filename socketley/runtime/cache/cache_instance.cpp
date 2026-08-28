@@ -29,71 +29,12 @@
 #include <sys/stat.h>
 #include <poll.h>
 
-// ─── PERSISTENCE ACROSS A CHANGED SHARD COUNT ───────────────────────────────
-//
-// N shards hold N slices, so N shards write N dumps.  Started again with M
-// shards the split only still holds when M == N; otherwise every key belongs
-// somewhere else, and a dump loaded under the wrong split is a miss for data
-// that was stored — the failure the cache's --shards refusal names, moved from
-// runtime to restart.
-//
-// So each dump says, in its own head, what split it was written under:
-//
-//     shard_count   how many slices the keyspace was cut into
-//     shard_index   which of them this file is
-//     fingerprint   what the ownership function DID, see cache_shard_map.h
-//
-// and the load is decided from the set, not from one file:
-//
-//   count == N, indices complete, fingerprint matches  -> FAST: this shard
-//       reads its own dump and trusts the split.
-//   anything else                                      -> FILTER: every shard
-//       reads every dump and keeps only what hashes to it now.
-//
-// The filter path is O(N*M) reads once at start and is correct with no special
-// cases.  The unsharded case is the same path with count == 1.
-//
-// ─── THE FOUR WAYS THIS LOSES DATA QUIETLY, AND WHAT EACH MEETS ─────────────
-//
-// 1. A DUMP IS MISSING.  Shard 3's file deleted: its keys are gone and the
-//    cache comes up looking healthy.  Met by requiring the set to be COMPLETE —
-//    0..count-1 with no gap — and refusing the start by name when it is not.
-//
-// 2. TWO SETS IN ONE PLACE.  An old run's files beside a new run's: indices
-//    that overlap, keys that contradict.  Met by requiring every header in the
-//    set to agree on `shard_count`, and by refusing an index at or above it.
-//
-// 3. A HALF-WRITTEN SET.  A crash in the middle of dumping.  Met by the write
-//    being atomic PER FILE — save_v2 writes a temp with O_EXCL and renames —
-//    so a torn write leaves the previous file, never half of a new one.  A
-//    crash between two shards' renames therefore leaves a COMPLETE set of
-//    files from two moments, and because the slices are disjoint by hash that
-//    is per-key staleness rather than loss: no key is dropped and none is
-//    duplicated.  The case that does lose is a file that was never written at
-//    all, and that is case 1, which aborts.
-//
-//    This is a deviation from the design note, which asked for a barrier —
-//    rename only once every shard has finished.  A barrier across N processes
-//    at shutdown needs a coordinator, and it would still not cover a crash
-//    between its own renames.  The requirement it exists for is "a half set
-//    must never be loaded"; per-file atomicity plus the completeness check
-//    meets that, and covers the crash the barrier does not.
-//
-// 4. THE OWNERSHIP FUNCTION CHANGED.  Every key belongs elsewhere and the fast
-//    path loads them all into the wrong slices.  Met by the fingerprint, which
-//    is not a version somebody has to remember to bump; see cache_shard_map.h.
-//
-// ─── WHERE THE FILES ARE, AND THE ONE COMPATIBILITY NOTE ────────────────────
-//
-// `<path>.shard<i>`, always — including at one shard, where it is
-// `<path>.shard0`.  A dump has to say what split it holds, and the only file
-// that cannot is the one written before this existed.
-//
-// So the bare `<path>` is READ and never written: when no `.shard*` file is
-// present it is taken as a complete set of one, with no fingerprint, which is
-// exactly what it is.  An existing --persistent cache therefore keeps its data
-// across the upgrade and writes a self-describing file from then on; the old
-// bare file is never consulted again once one exists.
+// Each dump says in its own head what split it was written under -- count,
+// index and an ownership fingerprint -- so a set that is complete and agrees
+// takes the fast path and anything else has every shard read every dump and
+// keep what hashes to it now, which is what makes a missing file, two sets in
+// one place, a half-written set and a changed hash function all refusals or
+// corrections rather than quiet losses.
 inline constexpr char       shard_dump_magic[8] = { 'S','K','L','S','H','R','D','1' };
 inline constexpr size_t     shard_dump_header_size = 32;
 
@@ -122,8 +63,8 @@ static std::string encode_shard_dump_header(uint32_t count, uint32_t index)
     return h;
 }
 
-// Read a dump's head.  `legacy` comes back true for a file written before this
-// header existed — a complete set of one, which is what it is.
+// Read a dump's head, where `legacy` means a file written before this header
+// existed, which is a complete set of one.
 static bool read_shard_dump_header(const std::string& path,
                                    shard_dump_header& out, bool& legacy)
 {
@@ -158,20 +99,15 @@ static bool read_shard_dump_header(const std::string& path,
     return true;
 }
 
-// The header of a framed run of commands between two shards of one runtime.
-//
-// A control byte no command can begin with, then which interpreter the bytes
-// that follow are for.  It is deliberately NOT a general request payload: only
-// cache_instance writes one and only cache_instance reads one, and a payload
-// that does not begin with this is the ordinary `cache <cmd>` stream any other
-// runtime sends.
+// The header of a framed run of commands between two shards, a control byte no
+// command can begin with followed by which interpreter the bytes are for,
+// written and read by cache_instance alone.
 static constexpr char shard_batch_marker = '\x01';
 static constexpr std::string_view shard_batch_text = "\x01skl-shard t\n";
 static constexpr std::string_view shard_batch_resp = "\x01skl-shard r\n";
 
-// `<len>\n<bytes>`, the framing both directions use.  Length-prefixed rather
-// than newline-delimited because RESP commands contain newlines and a text
-// value may as well.
+// `<len>\n<bytes>`, length-prefixed rather than newline-delimited because RESP
+// commands contain newlines and a text value may as well.
 static void shard_frame_append(std::string& out, std::string_view bytes)
 {
     out.append(std::to_string(bytes.size()));
@@ -179,8 +115,9 @@ static void shard_frame_append(std::string& out, std::string_view bytes)
     out.append(bytes);
 }
 
-// Take one frame off the front.  False leaves `p` where it was, which is what
-// makes a truncated or foreign reply detectable rather than half-consumed.
+// Take one frame off the front, leaving `p` where it was on false, which is
+// what makes a truncated or foreign reply detectable rather than
+// half-consumed.
 static bool shard_frame_take(const char*& p, const char* end, std::string_view& out)
 {
     const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
@@ -211,18 +148,15 @@ cache_instance::cache_instance(std::string_view name)
 
 cache_instance::~cache_instance()
 {
-    // Normally already gone: the manager rebuilds the whole sink table on every
-    // membership change, and removing a runtime is one.  This is the case that
-    // does not go through the manager — an instance built and dropped by a
-    // test, or one whose removal raced a rebuild — where a stale entry would be
-    // a pointer into this object after it is freed.
+    // Normally already gone, because the manager rebuilds the sink table on
+    // every membership change, so this covers an instance dropped without
+    // going through it.
     if (auto* mgr = get_runtime_manager())
     {
         mgr->requests().drop_sink(this);
-        // And the other direction, for the same reason and on the same path a
-        // server takes: a cache that routes is an ORIGIN as well as a sink, and
-        // an origin the channel still holds is a pointer into this object after
-        // it is freed.
+        // And the other direction, because a cache that routes is an origin as
+        // well as a sink, and an origin the channel still holds is a pointer
+        // into this object after it is freed.
         mgr->requests().drop_origin(this);
     }
 
@@ -234,10 +168,9 @@ void cache_instance::close_tracked(int fd)
 {
     if (fd < 0)
         return;
-    // m_loop while running, m_retired_loop once teardown has cleared it — the
-    // descriptors closed after a stop are exactly the ones the ring is most
-    // likely to still be naming, so falling back to plain close() there would
-    // leave the hazard open on the worst case.
+    // m_loop while running and m_retired_loop once teardown has cleared it,
+    // because the descriptors closed after a stop are the ones the ring is
+    // most likely to be naming.
     event_loop* lp = m_loop ? m_loop : m_retired_loop;
     if (SOCKETLEY_LIKELY(lp != nullptr))
         lp->close_fd(fd);
@@ -273,18 +206,15 @@ bool cache_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
             if (op.waiting[k] != req)
                 continue;
 
-            // A read that came out of the provided-buffer ring still holds one
-            // even when it is only reporting its own cancellation — and a
-            // bundled read may hold several, which only the dispatching loop
-            // can name.  Hand them back, or every restart costs the ring a few
-            // buffers for good.
+            // A read out of the provided-buffer ring still holds one even when
+            // only reporting its own cancellation, and a bundled read holds
+            // several, so every restart would otherwise cost the ring buffers.
             if ((cqe->flags & IORING_CQE_F_BUFFER) && m_retired_loop)
                 m_retired_loop->return_cqe_buf(cqe, req);
 
-            // More to come: a multishot read keeps delivering until it reports
-            // without this flag, and a zero-copy send answers twice — once for
-            // the write and once to say the kernel is done reading the buffer.
-            // The memory stays where it is until that last word.
+            // More to come, because a multishot read keeps delivering and a
+            // zero-copy send answers twice, so the memory stays until that
+            // last word.
             if (cqe->flags & IORING_CQE_F_MORE)
                 return true;
 
@@ -329,13 +259,9 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
         conn->direct_fd = false;
     }
 
-    // The TLS session dies with the connection that owned it, here rather than
-    // in reset(), so that a struct being *retired* below — one the ring still
-    // owes a completion — does not hold an OpenSSL session and two memory BIOs
-    // for however long that takes.  No completion can name the session:
-    // everything the kernel reads or writes was copied into or out of a buffer
-    // this struct owns before the SQE was built, which is why this needs none
-    // of the "wait until the ring is finished" care write_batch does.
+    // The TLS session dies with the connection here rather than in reset(), so
+    // a retired struct does not hold a session and two BIOs for however long
+    // the ring takes -- and no completion can name it.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
         tls_context::free_ssl(conn->ssl);
@@ -344,13 +270,9 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     conn->tls_state = tls_conn_none;
     conn->tls_peer_closed = false;
 
-    // A struct only goes back into the pool once the ring is finished with it.
-    // The pool hands its structs to the very next accepted connection, and a
-    // completion landing on one that has already been reissued is charged to a
-    // connection it has nothing to do with — while the kernel is still reading
-    // out of write_batch[0], which reset() clears.  Anything still owed is
-    // retired instead, requests included, so its completion comes back to
-    // absorb_retired() and the memory is released only then.
+    // A struct only goes back into the pool once the ring is finished with it,
+    // because the pool hands structs to the very next accepted connection
+    // while the kernel is still reading out of write_batch[0].
     {
         io_request* owed[2];
         size_t n = 0;
@@ -390,17 +312,16 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
 void cache_instance::close_client([[maybe_unused]] client_connection* conn, int fd,
                                   [[maybe_unused]] const char* reason)
 {
-    // A crossing this socket was waiting on has nowhere to land now.  Dropped
-    // here — the one function every close on this runtime goes through — rather
-    // than at each of them, so a path added later cannot forget it.
+    // A crossing this socket was waiting on has nowhere to land now, dropped
+    // in the one function every close goes through so a path added later
+    // cannot forget it.
     if (conn)
         batch_drop(conn);
 
     m_store.unsubscribe_all(fd);
-    // A follower registered on this descriptor has to go with it.  It holds no
-    // reference of its own — the socket is this client's — so leaving it behind
-    // pointed replication at a number the kernel was free to hand to the next
-    // connection that came in.
+    // A follower registered on this descriptor goes with it, because it holds
+    // no reference of its own and would otherwise point replication at a
+    // number the kernel reissued.
     detach_follower(fd);
     SKL_TRACE_CLOSE(conn, fd, reason);
     close_tracked(fd);
@@ -449,18 +370,14 @@ size_t cache_instance::get_connection_count() const
 }
 
 // ─── ONE LISTENER, TWO PORTS ────────────────────────────────────────────────
-//
-// A sharded cache binds two: the shared one every shard joins under
-// SO_REUSEPORT, and one this shard alone holds.  They are the same socket with
-// the same options and the same refusals, so this is one function called twice
-// rather than a second copy that will be fixed once and stay broken in the
-// other place — the rule shared/ exists for, applied inside one file.
+// A sharded cache binds two listeners that are the same socket with the same
+// options, so this is one function called twice rather than a second copy
+// fixed once and left broken in the other place.
 bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 {
-    // SOCK_CLOEXEC, same reasoning as the server and proxy listeners: a cache
-    // lives in the daemon, and the daemon forks proxy workers that have no use
-    // for this port and every opportunity to keep it bound after the cache is
-    // gone.
+    // SOCK_CLOEXEC, because a cache lives in the daemon and the daemon forks
+    // workers with no use for this port and every opportunity to keep it
+    // bound.
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
@@ -473,48 +390,10 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // ─── NO TCP_DEFER_ACCEPT, FOR THE SERVER'S REASONS ──────────────────────
-    //
-    // This set it with a one-second timeout.  setup_tcp_listener in
-    // server_instance.cpp carries the full argument; what follows is what is
-    // different about a cache, because a cache is the case where the usual
-    // defence of this option is actually true.
-    //
-    // RESP is request/response and nothing greets, so a cache client speaks
-    // first by definition and the DELAY the option introduces costs a real one
-    // nothing.  Measured here and stated plainly:
-    //
-    //     connect storm      (`server burst`, no client ever speaks)
-    //         with 106,456/s   without 73,448/s   -25.8%  +/-13.9% CI95
-    //     client speaks first (connect, SET, read the answer, close)
-    //         with  28,708/s   without 30,887/s    +7.9%  +/-10.3% CI95
-    //
-    // Fifteen pairs each, interleaved, gated on the port pool; the method and
-    // why the paired median is the statistic are written out once, next to the
-    // same measurement in proxy_instance.cpp.
-    //
-    // So the intuition holds and is now a number: on the only shape a cache
-    // client has, this option is worth nothing that can be told from zero.  The
-    // -26% is a storm of connections that never send a command, which is not a
-    // cache workload -- it is the case the deferral was written for.
-    //
-    // It is removed anyway, and not for the delay.  A connection still in
-    // SYN-RECV is a request sock rather than a socket, and when the listener
-    // closes the kernel drops it with no FIN and no RST — the client keeps an
-    // ESTABLISHED socket against a peer that no longer exists, and nothing on an
-    // accepted cache connection sets SO_KEEPALIVE.  "Until it next writes" is
-    // the whole problem for this runtime in particular: a cache client library
-    // holds a POOL of idle connections and hands one out on demand, so a
-    // connection killed while idle is not noticed at the moment it dies but at
-    // the moment somebody's request is written into it.  Idle is the normal
-    // state of most of that pool, and the window is every connection between
-    // the handshake and the first command.
-    //
-    // Nor is it only the delay that the deferral hides: a connection in
-    // SYN-RECV is in no count, no stats figure and no listing this runtime can
-    // produce, so an operator asking how many clients a cache has is told a
-    // number the kernel disagrees with.
-    //
+    // No TCP_DEFER_ACCEPT, measured at +7.9% on the only shape a cache client
+    // has, and removed not for the delay but because a SYN-RECV connection
+    // dies with the listener unnoticed -- which for a pooled cache client is
+    // discovered at the moment somebody's request is written into it.
     int rcvbuf = 131072;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
@@ -546,17 +425,10 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 
 bool cache_instance::setup(event_loop& loop)
 {
-    // Nothing from the previous run is cleaned up here any more.  teardown()
-    // hands everything it cannot free to retire(), which owns it for as long as
-    // the ring might still touch it; freeing it here instead was the crash —
-    // the event loop went on to read req->owner out of a connection that had
-    // just been deleted, and a follower write was still reading out of a string
-    // that no longer existed.
-    //
-    // What can go is whatever the loop confirms is finished with.  A completion
-    // from a previous registration is dropped rather than delivered, so
-    // absorb_retired() never hears about those and this is the only thing that
-    // releases them.
+    // Nothing from the previous run is cleaned up here, because teardown()
+    // hands what it cannot free to retire(); what can go is whatever the loop
+    // confirms is finished with, which is the only thing that releases a
+    // dropped completion's storage.
     if (!m_retired.empty() && loop.owner_inflight(this) == 0)
         m_retired.clear();
 
@@ -574,10 +446,9 @@ bool cache_instance::setup(event_loop& loop)
     m_retired_loop = &loop;
 
     // ── This shard's slice of the keyspace ──────────────────────────────────
-    //
-    // Read once, here, because get_shards() is not inline and the question is
-    // asked per command.  1 and 0 are the unsharded answers, which is what
-    // makes every routing check below a single compare against a member.
+    // Read once here because get_shards() is not inline and the question is
+    // asked per command, with 1 and 0 the unsharded answers that make every
+    // routing check a single compare.
     m_shard_n = get_shards();
     m_shard_i = get_shard_index();
     if (m_shard_i >= m_shard_n)
@@ -590,24 +461,16 @@ bool cache_instance::setup(event_loop& loop)
     m_route_payload.assign(m_shard_n, std::string{});
     m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
-    // ── The dump set, and the refusal that used to stand here ───────────────
-    //
-    // `--persistent` with more than one shard was refused, because N shards
-    // would have written N slices over one path.  They now write one file each,
-    // every file says what split it holds, and a set that cannot be trusted
-    // refuses the START rather than being loaded in part.  See the persistence
-    // note above load_shard_set().
+    // `--persistent` with more than one shard is no longer refused: each shard
+    // writes its own self-describing file, and a set that cannot be trusted
+    // refuses the start rather than being loaded in part.
     if (!load_shard_set())
         return false;
 
     // ─── --listen unix:/path/to.sock ────────────────────────────────────────
-    //
-    // Judged here rather than only in the flag parser, for the server's
-    // reason: setup() is the one function every route to a listening socket
-    // passes through — create, restore, a worker's config frame, import, and
-    // a restart after edit.  Before the TLS block, so a doomed configuration
-    // is refused without loading certificates it may not use.  --shards with
-    // --listen is not asked here: shards_config_refusal owns that pair.
+    // Judged here rather than only in the flag parser, because setup() is the
+    // one function every route to a listening socket passes through, and
+    // before the TLS block so a doomed configuration loads no certificates.
     const std::string listen_path(get_listen_path());
     if (!listen_path.empty())
     {
@@ -619,10 +482,8 @@ bool cache_instance::setup(event_loop& loop)
             LOG_ERROR(("cache: " + msg).c_str());
             return false;
         }
-        // And the member only this runtime carries.  --cluster advertises
-        // base+1+i out of a port FORMULA (see shard_port()), and a path has
-        // no successor to compute — every advertised address would be one
-        // nothing answers on.
+        // And the member only this runtime carries, because --cluster
+        // advertises a port formula and a path has no successor to compute.
         if (m_cluster_forced)
         {
             LOG_ERROR("cache: --listen and --cluster cannot be combined -- "
@@ -634,25 +495,16 @@ bool cache_instance::setup(event_loop& loop)
     }
 
     // ── TLS listener ────────────────────────────────────────────────────────
-    //
-    // Certificates are read and parsed here, at setup, before a single
-    // completion is armed.  That is file I/O and it blocks, which is exactly
-    // why it happens here and nowhere near the event loop: the handshake
-    // itself never touches a file, and never touches a socket either — see
-    // tls_feed/tls_flush.
-    //
-    // Every refusal below returns false, which puts the runtime in the failed
-    // state.  None of them may fall through to a plaintext listener: a cache
-    // that asked for encryption and got a cleartext port is the one outcome
-    // the operator cannot see, because `inspect` reports what was configured.
+    // Certificates are read here at setup because that is blocking file I/O
+    // and the handshake touches neither file nor socket -- and every refusal
+    // returns false rather than falling through to a plaintext listener
+    // `inspect` still calls encrypted.
     m_tls.reset();
     if (get_tls())
     {
-        // The configuration gate in runtime_instance::start() has already
-        // refused --replicate here, on every path including the restore.  This
-        // is the belt to that braces: setup() is what actually dials the
-        // leader a few lines below, and the cost of the two disagreeing is the
-        // dataset going out in the clear.
+        // The configuration gate has already refused --replicate here on every
+        // path, and this is the belt to that braces, because setup() is what
+        // actually dials the leader.
         if (m_repl_role == repl_follower && !m_replicate_target.empty())
         {
             LOG_ERROR("cache: --tls encrypts this cache's own listener, and the "
@@ -665,7 +517,7 @@ bool cache_instance::setup(event_loop& loop)
         if (!ctx->init_server(get_cert_path(), get_key_path(), get_ca_path()))
         {
             // init_server has already said which file and what OpenSSL made of
-            // it.  This says what it cost.
+            // it, so this says what it cost.
             LOG_ERROR("cache: TLS listener not started -- the certificate, key or "
                       "client CA could not be loaded");
             return false;
@@ -677,10 +529,9 @@ bool cache_instance::setup(event_loop& loop)
 
     if (!listen_path.empty())
     {
-        // The mechanism — the stale-node probe, the bind, the 0600, the
-        // listen — is shared/unix_listener.h's, one implementation for every
-        // runtime that listens.  Everything below the branch is the same for
-        // both families: one accept chain, one client table.
+        // The mechanism is shared/unix_listener.h's, one implementation for
+        // every runtime that listens, with everything below the branch the
+        // same for both families.
         auto r = socketley::unix_sock::bind_listener(listen_path);
         if (r.fd < 0)
         {
@@ -696,25 +547,10 @@ bool cache_instance::setup(event_loop& loop)
         return false;
 
     // ── The per-shard port ──────────────────────────────────────────────────
-    //
-    // Bound in ADDITION to the shared one, never instead of it, so a client
-    // that has never heard of a slot map keeps being served exactly as before.
-    //
-    // A failure here fails the START, and that is deliberate.  The address a
-    // client is sent to is a FORMULA — base + 1 + index, computed by whichever
-    // shard happens to answer CLUSTER SLOTS, which has no way to find out
-    // whether its siblings' binds succeeded.  A shard that quietly ran without
-    // its own port would be advertised anyway, and every cluster client would
-    // spend its retry budget on a connection refused.  So the operator is told
-    // now, by name, rather than the client being told later by silence.
-    //
-    // The practical consequence, stated because it is a change: `--shards N` on
-    // port P now needs P+1 .. P+N free as well.  Two four-shard caches one port
-    // apart used to work and now refuse.
-    // Only under --cluster, and only above one shard.  A cluster of one node
-    // needs no second port: its one node is the shared port, and the map says
-    // so.  Without the flag this whole block is skipped and the runtime is
-    // byte-for-byte the shared-port cache it was before client routing existed.
+    // The per-shard port is bound in addition to the shared one and only under
+    // --cluster above one shard, and a failure fails the start, because the
+    // address a client is sent to is a formula no shard can verify its
+    // siblings honoured.
     m_cluster_ports = m_cluster_forced && m_shard_n > 1;
 
     if (m_cluster_ports)
@@ -755,24 +591,18 @@ bool cache_instance::setup(event_loop& loop)
     m_idle_timeout_cached = get_idle_timeout();
     m_max_conns_cached = get_max_connections();
     m_rate_limit_cached = get_rate_limit();
-    // Seed from the store rather than clearing: load() above restores expiry
-    // timestamps from the persistence file, and this flag gates both the
-    // periodic sweep and every lazy check_expiry() call.  Forcing it to false
-    // here would leave keys restored with a TTL immortal until some unrelated
-    // command set a new TTL and flipped the flag back on.
+    // Seed from the store rather than clearing, because load() restores expiry
+    // timestamps and forcing this false would leave restored TTL keys immortal
+    // until an unrelated command flipped it back.
     m_has_ttl_keys = m_store.has_expiry_keys();
 
     // Connect to master if follower
     if (m_repl_role == repl_follower && !m_replicate_target.empty())
         connect_to_master();
 
-    // Provided-buffer ring geometry.  Buffer size decides how many commands a
-    // single read completion can carry: with 4 KB buffers a 4 KB value fills one
-    // buffer per command, so every command costs its own completion.  Count
-    // decides how much concurrent traffic fits before the pool runs dry and
-    // reads fall back to a slower per-read path.  Both are tunable so the
-    // trade-off against memory (count * size per cache runtime) can be measured
-    // rather than guessed.
+    // Provided-buffer ring geometry, where the size decides how many commands
+    // one completion can carry and the count how much concurrent traffic fits,
+    // both tunable so the memory trade-off is measured rather than guessed.
     uint32_t buf_count = BUF_COUNT;
     uint32_t buf_size  = BUF_SIZE;
     if (const char* e = getenv("SOCKETLEY_CACHE_BUF_COUNT"))
@@ -791,18 +621,14 @@ bool cache_instance::setup(event_loop& loop)
     // SOCKETLEY_RECV_BUNDLE=0 — which is also the A/B switch: same binary,
     // same pool geometry, only the arm differs.
     m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();
-    // Not send_zc_supported(): the kernel having the opcode is not the
-    // question.  A pending zero-copy notification is not a cancellable request
-    // and only the peer can release it, so it would hold this instance in
-    // retire()'s graveyard for as long as one client declines to read.  See
-    // event_loop::send_zc_enabled().
+    // Not send_zc_supported(), because a pending zero-copy notification is not
+    // cancellable and only the peer can release it, which would hold this
+    // instance in the graveyard.
     m_send_zc = loop.send_zc_enabled();
 
-    // A fresh accept request for this run.  The previous one may still be owed
-    // a completion — a multishot accept stays armed until it reports without
-    // IORING_CQE_F_MORE — and re-arming that same request would leave the
-    // listener with two accept chains sharing one io_request and one address
-    // buffer.
+    // A fresh accept request for this run, because the previous one may still
+    // be owed a completion and re-arming would leave the listener with two
+    // chains on one io_request.
     m_accept = std::make_unique<accept_op>();
     arm_listener(m_listen_fd, *m_accept, m_multishot_active);
 
@@ -813,17 +639,10 @@ bool cache_instance::setup(event_loop& loop)
                      m_cluster_multishot_active);
     }
 
-    // Periodic TTL sweep, started only once a key actually carries an expiry —
-    // a store loaded from disk may already contain some, otherwise the first
-    // SETEX/EXPIRE arms it via mark_ttl_keys().  Arming unconditionally would
-    // leave a timer running for the lifetime of every cache runtime, which is
-    // enough to keep the SQPOLL kernel thread from ever sleeping.
-    //
-    // The interval trades memory against CPU, not correctness: an expired key is
-    // never served regardless, because every read path checks the expiry itself.
-    // The sweep only decides how quickly keys that nobody touches again release
-    // their memory.  It also has to stay well above the SQPOLL idle timeout, or
-    // the poller is re-armed before it can ever sleep.
+    // The TTL sweep starts only once a key carries an expiry, because a timer
+    // running for every cache runtime keeps the SQPOLL thread from ever
+    // sleeping -- and the interval trades memory against CPU, never
+    // correctness, since every read path checks expiry itself.
     long sweep_ms = 500;
     const char* sweep_env = getenv("SOCKETLEY_CACHE_TTL_SWEEP_MS");
     if (sweep_env)
@@ -833,11 +652,9 @@ bool cache_instance::setup(event_loop& loop)
         if (send != sweep_env && v > 0)
             sweep_ms = v;
     }
-    // Fresh timers for this run, for the reason spelled out on timer_op: the
-    // sweep that was running when the runtime stopped is still on its way, and
-    // it cannot be cancelled.  m_ttl_timer_armed cannot tell the difference
-    // either — each sweep clears the flag and sets it again — so reusing the
-    // request left two chains expiring keys on one timer.
+    // Fresh timers for this run, because the sweep that was running at the
+    // stop cannot be cancelled and m_ttl_timer_armed cannot tell the
+    // difference.
     m_ttl_timer = std::make_unique<timer_op>();
     m_ttl_timer->ts = { sweep_ms / 1000, (sweep_ms % 1000) * 1'000'000 };
     m_ttl_timer->req = { this, nullptr, -1, 0, op_timeout };
@@ -861,30 +678,18 @@ bool cache_instance::setup(event_loop& loop)
 
 void cache_instance::teardown(event_loop& /*loop*/)
 {
-    // This shard's own slice, into its own file, atomically.  Never the bare
-    // path: a dump has to say what split it holds, and only a file written
-    // before this existed cannot.
+    // This shard's own slice into its own file, atomically, and never the bare
+    // path, because a dump has to say what split it holds.
     if (!save_shard_dump())
         LOG_ERROR(("cache: could not write the dump for slice "
                    + std::to_string(m_shard_i) + " of "
                    + std::to_string(m_shard_n) + " beside " + m_persistent_path
                    + "; the next start will refuse the incomplete set").c_str());
 
-    // Shutdown before closing.  A multishot accept holds its own reference to
-    // the socket, so close() does not end it and the terminating completion
-    // never arrives — which leaves the loop counting one operation this owner
-    // still owes, forever.  reap_retired waits for that count to reach zero, so
-    // the whole instance was never freed: about 6 MB per removed runtime, held
-    // until the daemon exited.  shutdown() also ends the listen state, which is
-    // what takes the socket out of the SO_REUSEPORT group so a restart's bind
-    // is not competing with it.
-    //
-    // The explicit cancel-and-flush that used to stand here is gone into
-    // close_fd, which submits the same cancel and — unlike a flush, which under
-    // SQPOLL does not even make a syscall — holds the descriptor number until
-    // both the accept and the cancel have actually reported.  Flushing and
-    // closing left both of them able to resolve the number after the next
-    // accept had taken it.
+    // Shutdown before closing, because a multishot accept holds its own
+    // reference and close() leaves the loop owing this owner an operation
+    // forever -- with the cancel now inside close_fd(), which holds the number
+    // until both have reported.
     if (m_listen_fd >= 0)
     {
         shutdown(m_listen_fd, SHUT_RDWR);
@@ -902,11 +707,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
         m_cluster_listen_fd = -1;
     }
 
-    // The socket node, for a unix listener: closing the descriptor does not
-    // unlink the path, so a stopped cache would otherwise leave a node the
-    // next start meets as its own leftover.  Exactly the node THIS run bound,
-    // which is why the path was remembered rather than re-read from the
-    // configuration.
+    // The socket node for a unix listener, exactly the one this run bound,
+    // because closing the descriptor does not unlink the path.
     if (!m_bound_listen_path.empty())
     {
         if (unlink(m_bound_listen_path.c_str()) < 0) {}
@@ -918,21 +720,10 @@ void cache_instance::teardown(event_loop& /*loop*/)
     {
         for (auto& [fd, conn] : m_clients)
         {
-            // ── a session's bytes are records, drain or no drain ──
-            //
-            // These are blocking writes straight at the descriptor, and on a
-            // TLS connection the buffers below are plaintext.  Writing them
-            // here as-is would send the answers to a peer's last commands in
-            // the clear, at shutdown, on the one port the operator encrypted —
-            // a downgrade that only ever happens on the way out and is
-            // therefore the one nobody would catch.
-            //
-            // So they go through the session: encrypted, then the ciphertext
-            // the write BIO produced is what reaches the socket.  A session
-            // that is not ready yet — a handshake still in flight — has no way
-            // to encrypt anything, and the reply is dropped rather than
-            // downgraded.  A lost reply on shutdown is recoverable; cleartext
-            // is not.
+            // These blocking writes go through the session, because the
+            // buffers are plaintext and writing them as-is would downgrade the
+            // port at shutdown -- and a handshake still in flight has no keys,
+            // so the reply is dropped rather than sent in the clear.
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
             {
                 if (conn->tls_state != tls_conn_ready)
@@ -977,11 +768,9 @@ void cache_instance::teardown(event_loop& /*loop*/)
                 continue;
             }
 
-            // Flush response_buf first.
-            //
-            // Giving up on this client must not give up on the rest: the break
-            // below used to leave the enclosing for-loop, so one peer that had
-            // already hung up cost every remaining client its pending replies.
+            // Giving up on this client must not give up on the rest, because
+            // the break used to leave the enclosing loop and cost every
+            // remaining client its pending replies.
             if (!conn->response_buf.empty())
             {
                 if (!socketley::write_all(fd, conn->response_buf.data(),
@@ -1000,10 +789,9 @@ void cache_instance::teardown(event_loop& /*loop*/)
 
     std::memset(m_conn_idx, 0, sizeof(m_conn_idx));
 
-    // The listener goes first, then everything that hangs off it.  Each object
-    // is closed and then handed to pool_release()/retire(), which keeps it —
-    // and its io_requests, still pointing here — until the ring has finished
-    // with it.  The next setup() starts from nothing and touches none of this.
+    // The listener first and then everything hanging off it, each closed and
+    // handed to pool_release()/retire(), so the next setup() starts from
+    // nothing.
     for (auto& [fd, conn] : m_clients)
     {
         // Release fixed file slot before closing
@@ -1017,9 +805,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
         // the kernel now rather than whenever the peer gets around to it.
         shutdown(fd, SHUT_RDWR);
         close_tracked(fd);
-        // Drop the subscriptions with the socket.  Leaving them in the store
-        // let a connection that later landed on the same fd number inherit the
-        // dead client's channels.
+        // Drop the subscriptions with the socket, or a connection that later
+        // lands on the same fd number inherits the dead client's channels.
         m_store.unsubscribe_all(fd);
         // A follower promoted from this connection must lose the descriptor
         // before the loop below sees it, or it would close the number a second
@@ -1046,10 +833,9 @@ void cache_instance::teardown(event_loop& /*loop*/)
     }
     for (auto& f : m_followers)
     {
-        // The socket belonged to the client connection above, which has already
-        // closed it; only the buffers are ours to account for here.  The kernel
-        // reads straight out of f->out for the duration of a write, which is
-        // why this object cannot simply be dropped.
+        // The socket belonged to the client connection, which has already
+        // closed it, so only the buffers are ours -- and the kernel reads
+        // straight out of f->out for the duration of a write.
         f->fd = -1;
         f->dead = true;
         io_request* owed[1];
@@ -1060,23 +846,10 @@ void cache_instance::teardown(event_loop& /*loop*/)
     }
     m_followers.clear();
 
-    // Withdraw every timer this run armed, before they are retired below.
-    //
-    // Nothing above reached them: a timeout hangs off no descriptor, so the
-    // shutdown()s and the cancel on the listen fd walked straight past, and the
-    // ring went on owing this owner one completion per armed timer — half a
-    // second for the TTL sweep, thirty for the idle sweep.  reap_retired() frees
-    // a removed instance only once that count reaches zero, and with the TTL
-    // sweep re-arming itself every half second it never did: the whole cache
-    // stayed in the graveyard, about 6 MB, until the daemon exited.
-    //
-    // A withdrawal does not take the completion away, it brings it forward: the
-    // timeout reports once more with -ECANCELED, which is the completion the
-    // retire() below is already waiting for, so every `owed` count here stays
-    // exactly as it was.  Withdrawing only where a completion is genuinely owed
-    // matters for the same reason — the cancelled timeout is delivered carrying
-    // the address of its request, and retire() with a count of zero would have
-    // freed the storage that address points into.
+    // Withdraw every timer this run armed, because nothing above reached them
+    // and the self-rearming TTL sweep kept the instance in the graveyard
+    // forever -- and a withdrawal brings the completion forward rather than
+    // taking it away, so every `owed` count stays as it was.
     if (m_loop)
     {
         bool withdrawn = true;
@@ -1093,10 +866,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
                      "stays retired until the timer fires on its own");
     }
 
-    // The timers and the listener, for the reason on timer_op: nothing cancels
-    // an io_uring timeout, and the accept completion is still owed.  Retiring
-    // them costs a few dozen bytes per stop; re-arming them cost a second timer
-    // chain per restart, each one keeping the next alive.
+    // The timers and the listener retired, because nothing cancels an io_uring
+    // timeout and the accept completion is still owed.
     {
         io_request* owed[1];
         if (m_accept)
@@ -1127,13 +898,9 @@ void cache_instance::teardown(event_loop& /*loop*/)
         }
     }
 
-    // ── Nothing may be told about a crossing after this ─────────────────────
-    //
-    // Symmetrical with the sink registration the manager withdraws: an origin
-    // is a bare pointer in the channel, and a runtime can be stopped without
-    // ever being destroyed.  The batches go with it — every connection that was
-    // waiting on one has just been pooled above, so there is nobody left to
-    // deliver to.
+    // Nothing may be told about a crossing after this, symmetrical with the
+    // sink registration, because an origin is a bare pointer and a runtime can
+    // be stopped without being destroyed.
     if (auto* mgr = get_runtime_manager())
         mgr->requests().drop_origin(this);
     m_batches.clear();
@@ -1155,10 +922,9 @@ void cache_instance::arm_ttl_timer()
     m_ttl_timer_armed = true;
     if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_ttl_timer->ts, &m_ttl_timer->req)))
     {
-        // Clear the flag again.  Nothing else would ever retry: mark_ttl_keys()
-        // only submits while the flag is unset, so a single refused timeout
-        // would stop the sweep for the lifetime of the runtime and leave every
-        // key with an expiry holding its memory until something touched it.
+        // Clear the flag again, because mark_ttl_keys() only submits while it
+        // is unset and one refused timeout would stop the sweep for the
+        // lifetime of the runtime.
         m_ttl_timer_armed = false;
         LOG_WARN("cache: TTL sweep timer refused — expired keys keep their memory until touched");
     }
@@ -1210,26 +976,25 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             }
         }
 #endif
-        // Only keep sweeping while keys with an expiry remain.  sweep_expired()
-        // may have removed the last one, in which case the timer stops here.
+        // Only keep sweeping while keys with an expiry remain, since
+        // sweep_expired() may have removed the last one.
         if (m_has_ttl_keys)
             arm_ttl_timer();
         return;
     }
 
-    // Read from the master (replication), matched by request rather than by fd.
-    // The link owns its request, so this cannot be confused with a client that
-    // happens to sit on the same descriptor number.
+    // Read from the master, matched by request rather than fd, because the
+    // link owns its request and a client may sit on the same descriptor
+    // number.
     if (m_master && req == &m_master->read_req)
     {
         handle_master_read(cqe);
         return;
     }
 
-    // Replication writes, matched by request pointer rather than by fd: a
-    // follower reached the leader as an ordinary client, so its socket also has
-    // a client_connection and the generic write handler would otherwise claim
-    // these completions and look up the wrong state.
+    // Replication writes matched by request pointer, because a follower
+    // reached the leader as an ordinary client and the generic write handler
+    // would claim these completions.
     for (auto& f : m_followers)
     {
         if (req == &f->write_req)
@@ -1240,8 +1005,8 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         }
     }
 
-    // Remembered before the dispatch: the handler may release the struct and the
-    // request along with it.  Only per-connection operations name a connection.
+    // Remembered before the dispatch, because the handler may release the
+    // struct and the request with it.
     const int cqe_fd = (req->type == op_accept || req->type == op_multishot_accept ||
                         req->type == op_timeout)
                        ? -1 : req->fd;
@@ -1271,10 +1036,9 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
                 for (auto& [cfd, cconn] : m_clients)
                 {
-                    // A replication follower is idle by definition: it may not
-                    // send anything once promoted, and the stream it receives
-                    // never touches last_activity.  Sweeping it would tear
-                    // replication down on a timer for behaving correctly.
+                    // A replication follower is idle by definition, so
+                    // sweeping it would tear replication down on a timer for
+                    // behaving correctly.
                     if (cconn->is_follower)
                         continue;
                     if (!cconn->closing && (now - cconn->last_activity) > timeout)
@@ -1287,15 +1051,14 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                                                                &m_idle_sweep_timer->req)))
                     LOG_ERROR("cache: idle sweep timer refused — no further sweeps will run");
             }
-            // Accept backoff expired — resubmit accept.  The timer has spoken,
-            // so it owes nothing more and the next shortage may arm a new one.
+            // Accept backoff expired, so the timer owes nothing more and the
+            // next shortage may arm a new one.
             else if (m_accept_backoff_timer && req == &m_accept_backoff_timer->req)
             {
                 m_accept_backoff_timer.reset();
-                // Both listeners, and one timer for the two of them: the
-                // shortage that armed it is EMFILE or a full submission queue,
-                // and neither is a property of one socket.  A second timer
-                // would be a second retry chain for one condition.
+                // Both listeners and one timer for the two, because the
+                // shortage that armed it is EMFILE or a full queue and neither
+                // is a property of one socket.
                 if (m_listen_fd >= 0)
                     rearm_accept();
                 if (m_cluster_listen_fd >= 0)
@@ -1307,26 +1070,10 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
     }
 
     // ── The chokepoint ──────────────────────────────────────────────────────
-    //
-    // Every teardown in this runtime runs out of a completion handler, and
-    // every completion handler runs from here.  The handlers each decide for
-    // themselves whether the connection they just touched can be finished, and
-    // seven of those decisions say a connection with a read armed cannot be —
-    // "a completion is still owed, so the teardown will run when it lands".
-    //
-    // For a read that is not true, and it is the only one of the three flags
-    // for which it is not.  A write and a zero-copy notification are requests
-    // the ring answers whatever the socket does.  An armed read is finished by
-    // the peer sending something, or by the socket ending — and a connection
-    // that is closing is one whose peer has already gone.  free_fixed_file_slot()
-    // records the same finding one level down: a multishot recv "could only ever
-    // end by itself, and by itself means the peer or the socket".
-    //
-    // So this runs after the dispatch, for the connection the completion named,
-    // and finishes it when nothing the ring owes can.  Taking the read back is
-    // close_client()'s to do and it already does it: close_fd() cancels one
-    // armed on a descriptor, free_fixed_file_slot() cancels one armed on a fixed
-    // index, and retire() holds the struct until that -ECANCELED lands.
+    // A connection that is closing with only a read armed is finished here,
+    // because an armed read is ended by the peer or the socket and a closing
+    // connection's peer has already gone -- taking the read back is
+    // close_client()'s job and it already does it.
     finish_unreachable_client(cqe_fd);
 
 #ifdef SOCKETLEY_INVARIANTS
@@ -1334,14 +1081,9 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
 #endif
 }
 
-// See the call site in on_cqe() for why this exists.  The rule itself, and the
-// argument for it, moved to shared/conn_reachability.h when the server turned
-// out to have the same defect through the same shape; what is left here is the
-// part that is this runtime's — finding the connection, naming its flags, and
-// closing it.
-//
-// Everything before the verdict is a guard: a descriptor with no connection on
-// it, or one that is not closing, is somebody else's business.
+// The rule and its argument live in shared/conn_reachability.h; what is here
+// is finding the connection, naming its flags and closing it, with everything
+// before the verdict a guard.
 void cache_instance::finish_unreachable_client(int fd)
 {
     if (fd < 0 || fd >= MAX_FDS)
@@ -1356,8 +1098,8 @@ void cache_instance::finish_unreachable_client(int fd)
                                        conn_has_output(conn)))
     {
         case verdict::keep:
-            // A write or a zero-copy notification is outstanding.  Its
-            // completion comes back here and asks this question again.
+            // A write or a zero-copy notification is outstanding, and its
+            // completion comes back here to ask this question again.
             return;
 
         case verdict::flush:
@@ -1384,10 +1126,8 @@ void cache_instance::finish_unreachable_client(int fd)
     }
 }
 
-// The flags this runtime's connection carries, sorted by who is obliged to
-// report them.  A cache client has no file read, no splice and no cross-runtime
-// request of its own, so three of the shared fields are simply not reachable
-// here; the two that are are the two the ring answers whatever the socket does.
+// The flags this runtime's connection carries sorted by who must report them,
+// of which three are simply not reachable for a cache client.
 socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) const
 {
     socketley::reach::owed o;
@@ -1398,11 +1138,8 @@ socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) 
 }
 
 #ifdef SOCKETLEY_INVARIANTS
-// Invariant (1) from invariants.h.  A cache client has no peer — it asks and is
-// answered on the one socket — so the pair here is a single half, and the
-// question is simply whether the ring still owes it anything.  If it does not,
-// nothing will ever run the read that would take its next command, and whatever
-// is in its write queue is an answer that will never be sent.
+// Invariant (1), where a cache client has no peer so the pair is a single half
+// and the question is whether the ring still owes it anything.
 void cache_instance::inv_check_reachable(int fd, const char* where)
 {
     if (fd < 0 || fd >= MAX_FDS)
@@ -1429,9 +1166,9 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 {
     int client_fd = cqe->res;
 
-    // Which of the two listeners reported.  The request is the only thing that
-    // says so — the completion carries the ACCEPTED descriptor, not the
-    // listening one — and this is why handle_accept is handed it at all.
+    // Which of the two listeners reported, which only the request says,
+    // because the completion carries the accepted descriptor rather than the
+    // listening one.
     const bool from_cluster =
         (m_cluster_accept != nullptr && req == &m_cluster_accept->req);
 
@@ -1450,10 +1187,9 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
             goto cache_resubmit_accept;
         }
 
-        // TCP-level, so a client accepted off a unix listener has nothing to
-        // hear from it — the call would fail rather than do harm, but it is a
-        // syscall per accept spent on nothing.  The cluster listener is TCP
-        // by construction (--cluster and --listen are refused together).
+        // TCP-level, so a client accepted off a unix listener would spend a
+        // syscall per accept on nothing; the cluster listener is TCP by
+        // construction.
         if (m_bound_listen_path.empty() || from_cluster)
         {
             int opt = 1;
@@ -1485,17 +1221,15 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
             m_conn_idx[client_fd] = ptr;
 
         // A TLS listener gives every accepted socket a session before anything
-        // else touches the connection.  The session is created here and the
-        // handshake starts on the first read completion — nothing is written
-        // yet, because the client speaks first.
+        // else touches it, with the handshake starting on the first read
+        // because the client speaks first.
         if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
         {
             ptr->ssl = m_tls->create_ssl_server();
             if (SOCKETLEY_UNLIKELY(!ptr->ssl))
             {
-                // No session, no encryption, so no connection.  Serving this
-                // client in cleartext is the one alternative and it is worse
-                // than dropping it.
+                // No session means no encryption and so no connection, because
+                // serving this client in cleartext is worse than dropping it.
                 shutdown(client_fd, SHUT_RDWR);
                 close_client(ptr, client_fd, "tls-session-alloc-failed");
                 goto cache_resubmit_accept;
@@ -1514,10 +1248,8 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
         ptr->last_activity = now_tp;
 
-        // A connection whose very first read cannot be armed has no way to make
-        // progress: the client would sit on an open socket that this side never
-        // reads from.  Nothing else touches ptr after this, so the teardown is
-        // safe here — the accept is still re-armed below.
+        // A connection whose first read cannot be armed can make no progress,
+        // and nothing touches ptr after this, so the teardown is safe here.
         if (SOCKETLEY_UNLIKELY(!submit_client_read(ptr, client_fd)))
             close_client(ptr, client_fd, "read-submit-failed");
     }
@@ -1530,9 +1262,9 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
     }
 
 cache_resubmit_accept:
-    // The listener that reported, and only that one.  Re-arming the other here
-    // would give it a second accept chain on one io_request and one address
-    // buffer, which is the defect accept_op was introduced to stop.
+    // The listener that reported and only that one, because re-arming the
+    // other would give it a second chain on one io_request and one address
+    // buffer.
     {
         const bool multishot = from_cluster ? m_cluster_multishot_active
                                             : m_multishot_active;
@@ -1553,10 +1285,9 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
     bool queued = false;
     if (conn->direct_fd)
     {
-        // Bundle first, plain multishot behind it.  A refused bundle is not an
-        // error: the group's cursor may have tripped, and the plain arm serves
-        // the same bytes one buffer per completion.  (When the refusal was the
-        // SQ, the fallback is refused too and the caller handles it as ever.)
+        // Bundle first and plain multishot behind it, because a refused bundle
+        // is not an error and the plain arm serves the same bytes one buffer
+        // per completion.
         if (m_recv_bundle)
             queued = m_loop->submit_recv_multishot_bundle_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_recv_multishot)
@@ -1591,9 +1322,9 @@ void cache_instance::schedule_accept_backoff()
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
-    // One backoff timer at a time.  A second one on the same request would give
-    // the listener two retry chains, and the earlier timeout cannot be taken
-    // back — it is not attached to any descriptor.
+    // One backoff timer at a time, because a second on the same request gives
+    // the listener two retry chains and the earlier timeout cannot be taken
+    // back.
     if (m_accept_backoff_timer)
         return;
 
@@ -1610,9 +1341,8 @@ void cache_instance::schedule_accept_backoff()
     }
 }
 
-// Choose the accept shape and arm it.  Written once for both listeners: which
-// of multishot or one-shot this kernel can do is a property of the kernel, and
-// two copies of that choice is two places for it to be decided differently.
+// Choose the accept shape and arm it, written once for both listeners because
+// which shape this kernel can do is a property of the kernel.
 void cache_instance::arm_listener(int fd, accept_op& op, bool& multishot)
 {
     op.req = { this, nullptr, -1, 0, op_accept };
@@ -1662,22 +1392,14 @@ void cache_instance::rearm_cluster_accept()
                     m_cluster_multishot_active);
 }
 
-// Ciphertext in, plaintext into conn->partial.  One call per read completion,
-// which is what makes the handshake asynchronous: OpenSSL is handed the bytes
-// that have arrived and asked what it makes of them, and whatever it wants to
-// say back is drained by tls_flush at the end of handle_read.  Several rounds
-// of that is a handshake; there is no loop here waiting for one.
-//
-// This is the server runtime's implementation over the cache's connection
-// struct, and deliberately not a second design.  The two structs differ in what
-// they queue — owned strings here, shared_ptr there — and in nothing this
-// function touches.
+// Ciphertext in and plaintext into conn->partial, one call per read
+// completion, which is what makes the handshake asynchronous -- the server
+// runtime's implementation over the cache's connection struct and deliberately
+// not a second design.
 void cache_instance::tls_feed(client_connection* conn, const char* data, size_t len)
 {
-    // Inbound ciphertext into the read BIO.  A refusal is fatal by contract —
-    // the peer is over the per-connection buffer cap, or the BIO failed — and
-    // it has to be: there is nowhere to hold what was not taken, and handing a
-    // record layer a stream with a hole in it is worse than closing.
+    // Inbound ciphertext into the read BIO, whose refusal is fatal by contract
+    // because there is nowhere to hold what was not taken.
     size_t off = 0;
     while (off < len)
     {
@@ -1696,16 +1418,9 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
         const int r = tls_context::do_handshake(conn->ssl);
         if (SOCKETLEY_UNLIKELY(r < 0))
         {
-            // Closing, but not silently: what OpenSSL produced on its way to
-            // failing is the alert that tells the peer why, and it is the only
-            // diagnosis the other end will ever get.  tls_flush at the end of
-            // handle_read puts it on the wire, and the connection is torn down
-            // when that write completes.
-            //
-            // This is also the path a plaintext client takes.  A RESP command
-            // or a bare line is not a TLS record, so the handshake fails here
-            // and the connection is dropped — it is never parsed as a command,
-            // which is the whole point of refusing rather than downgrading.
+            // Closing but not silently, because the alert is the only
+            // diagnosis the other end gets -- and this is also the path a
+            // plaintext client takes, which is refused rather than downgraded.
             conn->closing = true;
             return;
         }
@@ -1713,11 +1428,9 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             return;   // another round; its records go out at the end of the read
 
         conn->tls_state = tls_conn_ready;
-        // Deliberately falling through rather than returning: the same read can
-        // already carry application data behind the handshake's last flight —
-        // under TLS 1.3 a client's Finished and its first command routinely
-        // arrive in one packet, and returning here would leave that command
-        // sitting in the BIO until the client sent something else.
+        // Deliberately falling through rather than returning, because under
+        // TLS 1.3 a client's Finished and its first command routinely arrive
+        // in one packet.
     }
 
     // Plaintext into partial, where RESP detection and the line parser read it.
@@ -1729,9 +1442,8 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
         {
             conn->partial.append(plain, static_cast<size_t>(n));
             // The same ceiling the cleartext path applies, checked inside the
-            // loop rather than after it: one read completion can decrypt
-            // everything the inbound BIO had buffered, so "one read cannot
-            // produce more than one buffer's worth" is not true here.
+            // loop, because one read completion can decrypt everything the
+            // inbound BIO had buffered.
             if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
             {
                 conn->closing = true;
@@ -1741,10 +1453,9 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
         }
         if (n < 0)
         {
-            // Either the peer's close_notify or a record we cannot use.  Both
-            // end the connection, and neither ends it here: the bytes decrypted
-            // above may be a command that deserves an answer, so this is
-            // recorded and applied once handle_read has parsed them.
+            // Either the peer's close_notify or an unusable record, recorded
+            // and applied once handle_read has parsed the bytes decrypted
+            // above.
             conn->tls_peer_closed = true;
         }
         break;
@@ -1753,9 +1464,8 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
 
 void cache_instance::tls_close_when_read_is_all(client_connection* conn, int fd)
 {
-    // See the declaration for why this exists at all.  Everything here is a
-    // guard: a connection that is not closing, or still owes a write, or has
-    // no session, is somebody else's business.
+    // Everything here is a guard: a connection that is not closing, still owes
+    // a write, or has no session is somebody else's business.
     if (!conn->closing || conn->ssl == nullptr)
         return;
     if (conn->write_pending || conn->zc_notif_pending || !conn->read_pending)
@@ -1777,26 +1487,20 @@ bool cache_instance::conn_has_output(const client_connection* conn) const
 }
 
 // Every byte a TLS connection sends is a record, including the ones nobody
-// queued.  Reached from flush_write_queue for a TLS connection and from the end
-// of handle_read; there is no other way onto the wire.
+// queued, and there is no other way onto the wire.
 bool cache_instance::tls_flush(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || !conn->ssl))
         return true;
 
-    // One write in flight at a time, exactly as the cleartext path does — the
-    // ciphertext buffer built below is what the kernel reads out of, and a
-    // second submission would need a second buffer and would interleave two
-    // record streams on one socket.  Whatever does not go now stays in the
-    // queue or in the write BIO; handle_write comes back here when this write
-    // lands.
+    // One write in flight at a time, because a second submission would need a
+    // second buffer and would interleave two record streams on one socket.
     if (conn->write_pending || conn->zc_notif_pending)
         return true;
 
-    // Application data only once the handshake is done.  A reply queued before
-    // a single record has crossed waits here rather than being handed to an SSL
-    // that would answer WANT_READ and leave the caller unsure what was
-    // consumed.
+    // Application data only once the handshake is done, so a reply queued
+    // before a record has crossed waits rather than being handed to an SSL
+    // that answers WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
         while (!conn->write_queue.empty())
@@ -1806,18 +1510,16 @@ bool cache_instance::tls_flush(client_connection* conn)
                                                  static_cast<int>(msg.size()));
             if (n <= 0)
             {
-                // 0 is backpressure: the write BIO is at its cap, and OpenSSL's
-                // contract is that the same buffer is offered again once it has
-                // drained — which is what leaving this message at the front of
-                // the queue arranges.  -1 is fatal for the session.
+                // 0 is backpressure and the same buffer is offered again once
+                // the write BIO drains, which leaving the message at the front
+                // of the queue arranges; -1 is fatal.
                 if (n < 0)
                     conn->closing = true;
                 break;
             }
-            // Partial writes are not enabled on this context, so SSL_write is
-            // all-or-nothing.  A short count would mean the record layer and
-            // this queue disagree about what has been sent, and a stream with a
-            // hole in it has no framing left to recover: close instead.
+            // Partial writes are not enabled on this context, so a short count
+            // would mean the record layer and this queue disagree about what
+            // has been sent.
             if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg.size()))
             {
                 conn->closing = true;
@@ -1830,16 +1532,9 @@ bool cache_instance::tls_flush(client_connection* conn)
     if (!tls_context::has_pending_out(conn->ssl))
         return true;
 
-    // Ciphertext out of the write BIO and into a buffer this connection owns.
-    // It has to be copied rather than pointed at: an SQE names an address the
-    // kernel reads at its leisure, and the BIO's storage moves under it as
-    // OpenSSL writes the next record.  Copying is also what keeps the SSL free
-    // of anything the ring can name, which is what makes the session safe to
-    // release the moment the connection is torn down.
-    //
-    // The buffer then rides in write_batch[0] like any other message, so the
-    // short-write retry and the batch release in handle_write need no
-    // TLS-specific case at all.
+    // Ciphertext copied out of the write BIO into a buffer this connection
+    // owns, because the BIO's storage moves under an SQE -- and it rides in
+    // write_batch[0] so the short-write retry needs no TLS case.
     std::string cipher;
     char buf[16384];
     for (;;)
@@ -1864,21 +1559,18 @@ bool cache_instance::tls_flush(client_connection* conn)
     conn->write_pending = true;
     conn->write_req.type = op_write;
 
-    // Plain op_write and never send_zc, unlike the cleartext path.  A zero-copy
-    // send answers twice and keeps the kernel reading out of write_batch[0]
-    // until the notification lands, and this buffer has to be refilled from the
-    // BIO on the very next flush; the notification round trip also costs more
-    // than it saves at the sizes a record layer produces.
+    // Plain op_write and never send_zc, because a zero-copy send keeps the
+    // kernel reading write_batch[0] until the notification lands and this
+    // buffer is refilled on the next flush.
     const auto len = static_cast<uint32_t>(conn->write_batch[0].size());
     const bool queued = conn->direct_fd
         ? m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(),
                                           len, &conn->write_req)
         : m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
 
-    // Nothing reached the ring, so no completion will arrive.  Undo the
-    // in-flight bookkeeping and report it, as the cleartext path does: a
-    // write_pending that never clears keeps the teardown waiting for a
-    // completion that cannot come.
+    // Nothing reached the ring, so the in-flight bookkeeping is undone and
+    // reported, because a write_pending that never clears keeps the teardown
+    // waiting.
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
@@ -1889,19 +1581,18 @@ bool cache_instance::tls_flush(client_connection* conn)
     return true;
 }
 
-// The text line splitter, out of handle_read so that a connection whose
-// crossing has just come back is driven by the same code the read handler uses.
-// Two drivers for one parser is how the second one stops matching the first.
+// The text line splitter, out of handle_read so a connection whose crossing
+// has come back is driven by the same code, because two drivers for one parser
+// stop matching.
 void cache_instance::parse_text_lines(client_connection* conn)
 {
     size_t scan_from = 0;
     size_t pos;
     while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
     {
-        // A run of routed commands is cut here rather than in the router,
-        // because this is the loop that decides what has been CONSUMED.  What
-        // is left stays in `partial` and runs on the turn after this crossing
-        // lands: nothing is lost and nothing is reordered.
+        // A run of routed commands is cut here, in the loop that decides what
+        // has been consumed, with the rest left in `partial` for the turn
+        // after this crossing lands.
         if (SOCKETLEY_UNLIKELY(m_collect
                                && m_collect->slots.size() >= MAX_ROUTED_PER_BATCH))
             break;
@@ -1919,9 +1610,9 @@ void cache_instance::parse_text_lines(client_connection* conn)
 
         scan_from = pos + 1;
 
-        // REPLICATE takes effect on the line that carried it, so the rest of
-        // the batch is already follower input.  Answering it would put a
-        // second writer on the socket the dump is going out on.
+        // REPLICATE takes effect on the line that carried it, so answering the
+        // rest of the batch would put a second writer on the socket the dump
+        // is going out on.
         if (SOCKETLEY_UNLIKELY(conn->is_follower))
             break;
     }
@@ -1939,15 +1630,9 @@ void cache_instance::parse_text_lines(client_connection* conn)
         refuse_follower_input(conn);
 }
 
-// Everything a connection's buffered bytes turn into: commands run here,
-// commands sent to the shard that owns their key, and replies queued for the
-// wire.
-//
-// The one thing it will not do is start a second crossing for a connection that
-// is already waiting on one.  That is the ordering rule, and it is here rather
-// than at each of the two dispatches because it is a property of the SOCKET,
-// not of a command: replies go back down one pipe, in the order the questions
-// came up it.
+// Everything a connection's buffered bytes turn into, except a second crossing
+// for a connection already waiting on one -- which is a property of the socket
+// rather than of a command, because replies go back down one pipe in order.
 void cache_instance::pump(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->closing))
@@ -1974,9 +1659,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     int fd = req->fd;
     if (SOCKETLEY_UNLIKELY(fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]))
     {
-        // Nobody owns this any more, but the buffer it carries belongs to the
-        // ring.  Dropping it here leaked one per stale completion, and the group
-        // is shared by every cache on this loop.
+        // Nobody owns this any more, but the buffer it carries belongs to a
+        // ring group shared by every cache on this loop.
         if (m_loop) m_loop->return_cqe_buf(cqe, req);
         return;
     }
@@ -1998,9 +1682,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        // Return provided buffer(s) if kernel allocated any before the error.
-        // Through the loop, which knows whether this completion was a bundle
-        // carrying more buffers than the one the CQE names.
+        // Return any provided buffers through the loop, which knows whether
+        // this completion was a bundle carrying more than the CQE names.
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
             m_loop->return_cqe_buf(cqe, req);
 
@@ -2009,13 +1692,9 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         {
             SKL_TRACE_ADD(conn, enobufs, 1);
             conn->read_pending = true;
-            // Reset the request type: the fallback is a plain read into the
-            // connection's own buffer, not a provided-buffer one.  Leaving it
-            // as a recv/provided type makes the completion handler treat the
-            // result as a buffer-ring delivery — it then appends whatever sits
-            // in ring buffer 0 instead of the bytes just read, discards those
-            // bytes, and returns a buffer it never took, corrupting the ring's
-            // free list.
+            // Reset the request type, because leaving it as a provided-buffer
+            // type makes the handler append ring buffer 0's contents and
+            // return a buffer it never took.
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
@@ -2034,32 +1713,21 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error — defer if a write is still owed.  Drop the
-        // subscriptions right away even when deferring: the read side is
-        // already gone, so a publish must not queue further writes to it.
-        //
-        // A zero-copy send answers twice and clears write_pending on the first
-        // of them, so write_pending alone says "done" while the kernel is still
-        // reading out of write_batch[0] — which the struct's reset() clears the
-        // moment it is handed to the next connection.
+        // Connection closed or error, deferred if a write is still owed, with
+        // the subscriptions dropped at once -- and conn_ops_pending rather
+        // than write_pending, because a zero-copy send clears that on the
+        // first of its two answers.
         m_store.unsubscribe_all(fd);
 
-        // Asked FIRST, and the order is the whole of the fix.
-        //
-        // A crossing owed to this socket outranks a write in flight, because
-        // `closing` is not "tear down when the ring is finished" for these
-        // bytes — flush_responses() drops the buffer of a closing connection,
-        // so the reply that is still coming would never be written at all.
-        // With the two tests the other way round the hold applied only to a
-        // connection that happened to have no write outstanding: measured, one
-        // run in five of a twelve-command pipeline came back with the first
-        // reply alone.
+        // Asked first, because a crossing owed to this socket outranks a write
+        // in flight: flush_responses() drops a closing connection's buffer, so
+        // one run in five of a twelve-command pipeline came back with the
+        // first reply alone.
         if (conn->batch_id != 0)
         {
-            // Held, not closed.  Another shard of this runtime owes this
-            // socket an answer, and the client half-closing the moment it
-            // finished asking is what a request/response client does — see
-            // client_connection::peer_gone.
+            // Held and not closed, because another shard owes this socket an
+            // answer and a client half-closing the moment it finished asking
+            // is what a request/response client does.
             conn->peer_gone = true;
         }
         else if (conn->write_pending || conn->zc_notif_pending)
@@ -2077,32 +1745,20 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
 
-    // Wire bytes in.  Three runtimes fed this counter from their completion
-    // handlers and the cache forgot, so `stats` printed bytes_in:0 for a cache
-    // that had just served hundreds of commands — in every mode.  There is no
-    // shared chokepoint to route this through: what a completion contributes is
-    // already decided by the branches above (errors and ENOBUFS returned, and a
-    // bundle's res is the byte total across its buffers, which is also what the
-    // trace lines below record), and WHICH completions are a runtime's wire
-    // traffic is a per-runtime decision that already diverges — the proxy
-    // counts its client side only, and its bytes_out at enqueue.  This
-    // handler is the cache's own chokepoint: every client read of all four
-    // recv shapes lands here and nowhere else.
+    // Wire bytes in, counted at this handler because there is no shared
+    // chokepoint: what a completion contributes is decided by the branches
+    // above and which completions count is a per-runtime decision that already
+    // diverges.
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
-    // On a TLS connection these bytes are ciphertext and tls_feed is what puts
-    // plaintext into partial; everything below this point — RESP detection, the
-    // line parser, every command handler — reads exactly the same buffer it
-    // always did and knows nothing about TLS.
+    // On a TLS connection these bytes are ciphertext and tls_feed puts
+    // plaintext into partial, so everything below reads the same buffer it
+    // always did.
     if (is_provided)
     {
         // How a completion's buffers are named and sliced is the loop's rule,
-        // not this runtime's -- see for_each_cqe_buf.  What stays here is the
-        // only part that is actually the cache's: where the bytes go.  The
-        // buffer goes back to the group whatever the TLS session made of it,
-        // and that happens inside the helper, because the group is shared with
-        // every other cache on this loop and one failed handshake is no reason
-        // to starve them.
+        // and what stays here is where the bytes go -- with the buffer
+        // returned inside the helper whatever the session made of it.
         m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
                 tls_feed(conn, p, static_cast<size_t>(n));
@@ -2145,30 +1801,18 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->resp_mode = true;
     }
 
-    // A connection that was promoted by REPLICATE is not a client any more: the
-    // socket carries the replication stream and this runtime is its only writer.
-    // Parsing what arrives on it would produce replies with nowhere to go —
-    // handle_replicate_request() has the rule and the reasoning.
+    // A connection promoted by REPLICATE is not a client any more, so parsing
+    // what arrives on it would produce replies with nowhere to go.
     pump(conn);
 
     // Flush accumulated responses as single write
     if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
         conn->closing = true;
 
-    // ── the TLS half of the same idea ──
-    //
-    // The peer's close_notify is applied here rather than where it was read:
-    // the read that carried it can carry the last command ahead of it, and
-    // marking the connection closing any earlier would have made the parse
-    // above throw that command away with the answer half computed.
-    //
-    // Then one flush for everything the record layer owes the wire — the next
-    // handshake flight, the alert explaining a handshake that just failed, a
-    // session ticket, and whatever flush_responses left in the queue because
-    // the handshake was not finished when it ran.  It has to happen even when
-    // the connection is already closing, which is why it is not inside
-    // flush_responses: that returns early on a closing connection, and the
-    // alert is the only diagnosis the other end will ever get.
+    // close_notify is applied here because the read that carried it can carry
+    // the last command ahead of it, and then one flush covers everything the
+    // record layer owes -- outside flush_responses(), which returns early on a
+    // closing connection.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
         if (conn->tls_peer_closed)
@@ -2187,23 +1831,14 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    // Closing with nothing left in flight.  Every teardown in this runtime used
-    // to run out of a completion handler, which only works while a completion is
-    // still owed: a connection marked closing after its last operation had
-    // already finished sat here holding its fd and its subscriptions until the
-    // runtime stopped.  A refused submission makes that the ordinary case rather
-    // than a corner one, because the completion being waited on never existed.
+    // Closing with nothing left in flight, because every teardown used to run
+    // out of a completion handler and a refused submission makes "the
+    // completion never existed" the ordinary case.
     if (conn->closing && !conn->read_pending && !conn->write_pending && !conn->zc_notif_pending)
     {
-        // A queue that still holds data is not "nothing in flight": those are
-        // bytes the client already handed us and considers answered.  Push them
-        // out and let the write completion finish the teardown; closing on top
-        // of them discards a reply that was accepted.
-        //
-        // conn_has_output and not the queue alone, for the TLS case: a session
-        // can owe the wire an alert or the tail of a record with an empty
-        // queue, and that alert is what tells the peer why its handshake
-        // failed.
+        // A queue that still holds data is not nothing in flight, and
+        // conn_has_output rather than the queue alone because a session can
+        // owe an alert with an empty queue.
         if (conn_has_output(conn))
         {
             if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
@@ -2211,10 +1846,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 close_client(conn, fd, "write-submit-failed");
                 return;
             }
-            // A flush can legitimately submit nothing — a TLS connection with
-            // a reply queued while the handshake is still running has output
-            // and no way to send it.  Without this the connection would be
-            // left closing with nothing in flight and nothing to wake it.
+            // A flush can legitimately submit nothing, and without this the
+            // connection would be left closing with nothing to wake it.
             if (SOCKETLEY_UNLIKELY(!conn->write_pending && !conn->zc_notif_pending))
                 close_client(conn, fd, "closing-with-unsendable-output");
         }
@@ -2225,9 +1858,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    // Closing, with the read as the only thing still outstanding.  A session
-    // gets here after its alert has been queued; nothing will complete that
-    // read unless the socket is moved.
+    // Closing with the read as the only thing outstanding, which nothing will
+    // complete unless the socket is moved.
     tls_close_when_read_is_all(conn, fd);
 }
 
@@ -2286,10 +1918,8 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    // Wire bytes out, counted per completed send — a short write's remainder
-    // completes again and is counted then, and the zero-copy NOTIF returned
-    // above before reaching here.  See the bytes_in note in handle_read() for
-    // why this is the site and not a shared helper.
+    // Wire bytes out counted per completed send, with a short write's
+    // remainder counted when it completes again.
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     // Short write handling: resubmit remaining bytes
@@ -2357,10 +1987,9 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             }
             if (SOCKETLEY_UNLIKELY(!queued))
             {
-                // The tail of a short write cannot be handed over.  Leaving
-                // write_pending set strands the connection halfway through a
-                // reply, and the client would keep waiting for the rest of a
-                // response that no completion is left to finish.
+                // The tail of a short write cannot be handed over, because
+                // leaving write_pending set strands the connection halfway
+                // through a reply.
                 conn->write_pending = false;
                 conn->closing = true;
                 if (!conn->read_pending && !conn->zc_notif_pending)
@@ -2378,11 +2007,9 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->write_batch_count = 0;
     }
 
-    // Flush whatever is still owed.  conn_has_output and not the queue alone:
-    // a TLS connection owes the wire the next handshake flight, a session
-    // ticket or the tail of a record with nothing queued at all, and asking
-    // only about the queue is how a handshake stalls one round short of
-    // finishing.
+    // Flush whatever is still owed, asking conn_has_output rather than the
+    // queue, because a TLS connection owes handshake records with nothing
+    // queued at all.
     if (conn_has_output(conn) && !conn->zc_notif_pending)
     {
         if (SOCKETLEY_UNLIKELY(!flush_write_queue(conn)))
@@ -2421,33 +2048,16 @@ static bool parse_int_sv(std::string_view sv, int& out)
     return ec == std::errc{} && ptr == sv.data() + sv.size();
 }
 
-// A request payload is a newline-delimited command stream, and not one command.
-//
-// That is what would arrive on this cache's own port, so it is what the request
-// channel carries: the same framing, the same interpreter, the same answers
-// concatenated in the same order.  A caller with one command sends one line and
-// gets one answer, which is the whole of what `cache <cmd>` through a server
-// needs.  A caller with a stream of them — the server's `--cache` auto-store,
-// which produces one `set` per message a client sends — sends them together and
-// pays for one queue entry instead of one per message.  Without that, a client
-// pushing a megabyte down a socket in one write posts a request per line, and
-// the queue's cap turns into dropped writes: measured at 88% loss on a 200 000
-// message burst before this was batched.
-// ─── One payload, split into lines or taken whole ───────────────────────────
-//
-// `split` is what separates a client socket from a replication frame.  A client
-// sends a stream and every newline in it ends a command.  A frame is one
-// command that CONTAINS a newline — that is the only reason it was framed — so
-// splitting it again undoes the framing and applies half of it.
-//
-// The two share everything else: the same connection setup, the same
-// re-entrancy guard, the same interpreter.  They are one function with a flag
-// rather than two because the setup is the part that must not drift.
+// A request payload is a command stream and not one command, which is what
+// would arrive on this cache's own port -- batched because one entry per
+// message lost 88% of the writes on a 200,000 message burst -- and `split` is
+// the one thing separating a client stream from a replication frame, which is
+// framed precisely because it contains a newline.
 void cache_instance::serve_payload(std::string_view payload, std::string& out, bool split)
 {
-    // The re-entrant case: a command that publishes reaches Lua, and a Lua
-    // callback can ask this cache another question from inside the first.  Rare
-    // enough to pay full price for, and it must not share the buffer.
+    // The re-entrant case, where a command that publishes reaches Lua and a
+    // callback asks this cache another question, rare enough to pay full price
+    // for.
     if (SOCKETLEY_UNLIKELY(m_serving))
     {
         client_connection nested{};
@@ -2459,10 +2069,9 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
         return;
     }
 
-    // A run of commands from a SIBLING SHARD of this runtime, framed so the
-    // replies can be taken apart again.  Recognised before anything else parses
-    // it: the payload is not a command stream and reading it as one would run
-    // the marker line as a command.  See the routing note in cache_instance.h.
+    // A framed run from a sibling shard, recognised before anything else
+    // parses it, because reading it as a command stream would run the marker
+    // line as a command.
     if (SOCKETLEY_UNLIKELY(split && !payload.empty()
                            && payload.front() == shard_batch_marker))
     {
@@ -2508,36 +2117,10 @@ void cache_instance::serve_one_command(std::string_view line, std::string& out)
     serve_payload(line, out, false);
 }
 
-// One command from a LEADER, applied to this shard's slice of the keyspace.
-//
-// ─── EVERY SHARD OF A SHARDED FOLLOWER SEES THE WHOLE STREAM ────────────────
-//
-// `--replicate` is a property of the runtime, so all N shards dial the leader
-// and all N are promoted: measured, a four-shard follower of one leader shows
-// `followers:4` on that leader and each shard receives the entire dump and the
-// entire command stream.  Each therefore has to keep exactly its own slice.
-//
-// That filtering already happened before this function existed, and it happened
-// BY ACCIDENT: the apply path runs on a connection with no descriptor, and the
-// router refuses a key it does not own on such a connection because there is no
-// socket to wait for the crossing on.  The keys landed in the right shards for
-// a reason that had nothing to do with replication, and the same accident lost
-// every multi-key write outright — `mset a 1 b 2` names keys belonging to
-// different shards, so it belonged to none of them and was dropped whole.
-//
-// Two things follow, and both are now decisions rather than side effects:
-//
-//   * a replicated command names AT MOST ONE KEY — enforced where they are
-//     emitted, see replicate_command();
-//   * a command whose key is not this shard's is dropped HERE, deliberately,
-//     because a sibling is applying the same command to the same key at the
-//     same moment.  Nothing is lost by dropping it; the slice that owns it has
-//     it.
-//
-// The cost, named: N shards each carry the leader's whole stream, so a sharded
-// follower reads N times the bytes an unsharded one does.  The alternative is a
-// leader that knows its follower is sharded, which the protocol has no way to
-// express — see the note on the leader-side refusal.
+// Every shard of a sharded follower sees the whole stream and drops what it
+// does not own, which is now a decision rather than the accident that lost
+// every multi-key write -- at the cost of N shards each reading the leader's
+// whole stream.
 void cache_instance::apply_replicated(std::string_view line)
 {
     std::string discard;
@@ -2598,15 +2181,10 @@ static inline void append_int_nl(std::string& buf, int64_t v)
 }
 
 // ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────────
-//
-// The mechanism, in one sentence: a shard owns the keys whose hash falls to it,
-// so a command naming somebody else's key is framed, grouped with every other
-// command in the same pipeline bound for the same shard, and answered by the
-// process that holds it.
-//
-// Everything below is unreachable on an unsharded cache — m_shard_n is 1 and
-// every entry point compares against it first — which is what keeps the cost of
-// this on the runtime that does not use it at exactly one predicted branch.
+// A command naming somebody else's key is framed, grouped with every other
+// command in the pipeline bound for that shard, and answered by the process
+// that holds it -- all of it unreachable on an unsharded cache at one
+// predicted branch.
 
 // An error written into a plain buffer rather than a connection: a merge that
 // cannot be performed has to answer the command it belongs to, and by then the
@@ -2623,9 +2201,8 @@ static void append_error_reply(std::string& out, bool resp, std::string_view why
     }
 }
 
-// `<int>\n` in the text protocol, `:<int>\r\n` in RESP.  Strict: anything else
-// is a reply this rule was not written for, and saying so is what keeps a
-// mis-framed answer from being summed into a confident wrong number.
+// `<int>\n` in text and `:<int>\r\n` in RESP, strictly, because anything else
+// is a reply this rule was not written for.
 static bool parse_int_reply(std::string_view part, bool resp, int64_t& out)
 {
     if (resp)
@@ -2666,13 +2243,9 @@ static bool take_resp_array_header(std::string_view part, int64_t& count,
     return true;
 }
 
-// Run one complete command out of THIS shard's store and hand back what it
-// wrote, without disturbing whatever the connection has queued.
-//
-// One function for the two callers that need it — the shard answering a
-// crossing, and the shard routing one to a part it owns itself — because they
-// have to run a command the same way or a key served locally and the same key
-// served across a boundary stop agreeing.
+// Run one complete command out of this shard's store without disturbing what
+// the connection has queued, in one function so a key served locally and the
+// same key served across a boundary cannot disagree.
 void cache_instance::run_local_raw(client_connection* conn, std::string_view raw,
                                    bool resp, std::string& out)
 {
@@ -2702,8 +2275,8 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
     conn->response_buf.swap(held);
 }
 
-// Reserve a command's place in the reply order.  `parts` is how many pieces its
-// answer will be assembled from: one for everything step one routed.
+// Reserve a command's place in the reply order, where `parts` is how many
+// pieces its answer needs.
 uint32_t cache_instance::slot_open(client_connection* conn, bool resp,
                                    cache_merge merge, uint32_t parts)
 {
@@ -2729,8 +2302,8 @@ void cache_instance::route_part(client_connection* conn, uint32_t owner,
                                 uint32_t slot, uint32_t part,
                                 std::string_view raw, bool resp)
 {
-    // A piece this shard owns is run here and filled now.  At least one part of
-    // every keyspace fan-out is always this, and no crossing is opened for it.
+    // A piece this shard owns is run here and filled now, so no crossing is
+    // opened for it.
     if (owner == m_shard_i)
     {
         std::string produced;
@@ -2754,9 +2327,9 @@ void cache_instance::route_part(client_connection* conn, uint32_t owner,
     m_route_slots[owner].push_back(fill_target{slot, part});
 }
 
-// Put a finished slot's pieces together.  False means they did not have the
-// shape the rule expects — which is answered as an error for that one command,
-// because a merge that guesses produces a reply the client cannot frame.
+// Put a finished slot's pieces together, where false is answered as an error
+// for that command because a merge that guesses produces a reply the client
+// cannot frame.
 bool cache_instance::slot_render(const reply_slot& sl, bool resp,
                                  std::string& out) const
 {
@@ -2770,8 +2343,7 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
         case cache_merge::elements:
         {
             // Each part is one `get` reply, which is already exactly one
-            // element in both protocols: `val\n` or `nil\n` in text, a bulk
-            // string or a null in RESP.  So there is nothing to parse.
+            // element in both protocols, so there is nothing to parse.
             if (resp)
             {
                 out.push_back('*');
@@ -2792,8 +2364,8 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
             for (const auto& p : sl.parts)
                 if (p != ok)
                 {
-                    // The first shard that refused, said in its own words.  A
-                    // blanket "ok" over a partial write is the answer this
+                    // The first shard that refused, in its own words, because
+                    // a blanket "ok" over a partial write is the answer this
                     // cannot give.
                     out.append(p);
                     return true;
@@ -2810,17 +2382,10 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
                 int64_t v = 0;
                 if (!parse_int_reply(p, resp, v))
                 {
-                    // Not a number, so not something to add.  Every part here
-                    // is a reply to the SAME command sent to shards configured
-                    // identically, so a refusal — `denied: readonly mode`, a
-                    // usage line — is one every shard gave and echoing it is
-                    // the honest answer.  An unreachable shard lands here too,
-                    // and its error says more than a generic merge failure.
-                    //
-                    // The one case this loses is a multi-key del where one
-                    // shard errored and the others counted: the counts go with
-                    // the error.  A number that silently omits a shard is the
-                    // worse of the two.
+                    // Not a number, so not something to add, and echoing it is
+                    // honest because every shard is configured identically --
+                    // at the cost of a multi-key del whose counts go with one
+                    // shard's error.
                     out.append(p);
                     return true;
                 }
@@ -2857,8 +2422,9 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
                 out.append(body);
                 return true;
             }
-            // Text: each part is its shard's lines followed by `end\n`.  One
-            // terminator for the runtime, not one per shard.
+            // Text: each part is its shard's lines followed by `end`, and
+            // there is one terminator for the runtime rather than one per
+            // shard.
             for (const auto& p : sl.parts)
             {
                 if (!p.ends_with("end\n"))
@@ -2872,16 +2438,9 @@ bool cache_instance::slot_render(const reply_slot& sl, bool resp,
     return false;
 }
 
-// Where this shard's slice lives.
-//
-// At ONE shard it is the configured path itself, unsuffixed — the file
-// `--persistent /x` has always produced, and a contract this change has no
-// business altering.  Found by test_cache_dump_permissions.sh, which checks the
-// mode of exactly that path: writing `/x.shard0` instead left it looking at a
-// file that no longer existed.
-//
-// Above one shard there is no single file it could be, so each slice is named
-// and the set is what carries the split.
+// Where this shard's slice lives: at one shard the configured path unsuffixed,
+// which is the contract `--persistent /x` has always had, and above one shard
+// a named slice per file.
 std::string cache_instance::shard_dump_path(uint32_t index) const
 {
     if (m_shard_n <= 1)
@@ -2889,8 +2448,8 @@ std::string cache_instance::shard_dump_path(uint32_t index) const
     return m_persistent_path + ".shard" + std::to_string(index);
 }
 
-// Write this shard's slice.  Atomic on its own file; see case 3 in the note
-// above for why that is the whole of what the write side owes.
+// Write this shard's slice, atomic on its own file, which is the whole of what
+// the write side owes.
 bool cache_instance::save_shard_dump() const
 {
     if (m_persistent_path.empty())
@@ -2902,19 +2461,9 @@ bool cache_instance::save_shard_dump() const
     const bool ok = m_store.save(shard_dump_path(m_shard_i),
                                  encode_shard_dump_header(m_shard_n, m_shard_i));
 
-    // ── The slices this runtime no longer has ───────────────────────────────
-    //
-    // A cache run at eight shards and then at four writes shard0..3 and leaves
-    // shard4..7 where they were.  Those files are a complete set from another
-    // run, so the NEXT start sees two sets in one place and refuses — which is
-    // the right answer to that state and a terrible thing to do to an operator
-    // who merely reduced the shard count.  Found here rather than by the test:
-    // the shrink is legitimate, it is the leftovers that are not.
-    //
-    // So they go with the dump that supersedes them.  Shard 0 alone, because N
-    // processes making the same unlink calls buys nothing, and only for indices
-    // AT OR ABOVE the current count — never a slice this run owns, whether or
-    // not its shard has finished writing yet.
+    // The slices this runtime no longer has go with the dump that supersedes
+    // them, from shard 0 alone and only at or above the current count, or the
+    // next start sees two complete sets and refuses a legitimate shrink.
     if (ok && m_shard_i == 0)
         for (uint32_t j = (m_shard_n <= 1 ? 0 : m_shard_n); j < max_shards; ++j)
         {
@@ -2928,11 +2477,9 @@ bool cache_instance::save_shard_dump() const
     return ok;
 }
 
-// Gather what is on disk and decide how to read it.
-//
-// Returns false only for a set that must not be loaded — a gap or a
-// contradiction.  A start on that is refused rather than served from whatever
-// happened to survive.
+// Gather what is on disk and decide how to read it, returning false only for a
+// set that must not be loaded, because a start on a gap is refused rather than
+// served from what survived.
 bool cache_instance::load_shard_set()
 {
     if (m_persistent_path.empty())
@@ -3054,17 +2601,9 @@ bool cache_instance::load_shard_set()
     if (declared == 1 && m_shard_n == 1)
         same_function = true;
 
-    // ── The check whose absence is measurable ───────────────────────────────
-    //
-    // Measured with the ownership hash perturbed by one bit in its offset basis
-    // and this `&& same_function` removed, against a four-shard dump set:
-    //
-    //     DBSIZE reported 40.  All 40 keys were unreachable.
-    //
-    // Every key had been loaded into the wrong shard's store, so the count was
-    // exactly right and every single GET was a miss.  An assertion on "does it
-    // load" passes that, and so does an assertion on the key COUNT — which is
-    // why the test reads every key back individually.
+    // The fingerprint check, measured by perturbing the hash and removing it:
+    // DBSIZE reported 40 and all 40 keys were unreachable, which an assertion
+    // on the count also passes.
     const bool fast = (declared == m_shard_n) && same_function;
 
     if (fast)
@@ -3075,11 +2614,9 @@ bool cache_instance::load_shard_set()
         return true;
     }
 
-    // ── the filter path ──
-    //
-    // Every shard reads every dump and keeps what hashes to it NOW.  Slower by
-    // N, once, at start — and correct without a special case for any of the
-    // ways the split can have moved.
+    // The filter path, where every shard reads every dump and keeps what
+    // hashes to it now -- slower by N once at start, and correct with no
+    // special case for any way the split moved.
     if (!same_function)
         LOG_WARN(("cache: the dumps beside " + m_persistent_path + " were written "
                   "by a different ownership function; every shard will read every "
@@ -3104,35 +2641,14 @@ bool cache_instance::load_shard_set()
 }
 
 // ─── THE CLUSTER VIEW ───────────────────────────────────────────────────────
-//
-// Why a cache that is not a Redis cluster answers CLUSTER at all.
-//
-// The whole point of the CRC16 slot function is that a client can compute a
-// key's owner without asking.  It still has to learn the MAP once — which
-// address holds which slots — and every cluster-aware client learns it exactly
-// one way: it sends CLUSTER SLOTS (or, on newer libraries, CLUSTER SHARDS)
-// at connect and again whenever it is redirected.  Without these replies the
-// slot function is unusable and every key would still be routed by the kernel's
-// 4-tuple hash, which is the situation this change exists to leave.
-//
-// What is published is a FORMULA, not a negotiation.  Shard i listens on
-// base + 1 + i and owns slots [i*16384/N, (i+1)*16384/N).  Any shard can
-// therefore answer for all of them, without a cluster bus, without gossip, and
-// without any shard being reachable from any other — which is what makes this
-// safe to answer on every port including the shared one.
-//
-// What is deliberately NOT here: failover, migration, ASK redirection,
-// CLUSTER SETSLOT, epochs that ever change.  There is one owner per slot for
-// the life of the run — reconcile_proxy_workers() refuses to change a running
-// runtime's shard count — so an epoch is a constant and a slot is never
-// migrating.  A client that supports resharding will simply never see one.
+// CLUSTER is answered because a client has to learn the map once, and what is
+// published is a formula rather than a negotiation -- so any shard can answer
+// for all of them, with no failover, migration or epoch that ever changes.
 uint16_t cache_instance::cluster_port_of(uint32_t shard) const
 {
-    // One node: its port is the port the operator configured.  Not base+1,
-    // which nothing is bound to — a client told to go there would get a
-    // connection refused for a cache that is working perfectly.  That is the
-    // answer for an unsharded cache AND for a sharded one without --cluster,
-    // which is one node as far as any client can tell.
+    // One node listens on the port the operator configured and not base+1,
+    // which nothing is bound to, and that is the answer for an unsharded cache
+    // and for a sharded one without --cluster.
     if (!m_cluster_ports)
         return m_base_port;
     return static_cast<uint16_t>(m_base_port + 1 + shard);
@@ -3140,10 +2656,9 @@ uint16_t cache_instance::cluster_port_of(uint32_t shard) const
 
 std::string cache_instance::cluster_node_id(uint32_t shard) const
 {
-    // Deterministic, because a node id that changed on restart would make every
-    // client believe the whole cluster had been replaced.  Derived from the
-    // runtime name as well as the index so two caches in one daemon do not
-    // publish the same ids.
+    // Deterministic, because a node id that changed on restart would make
+    // every client believe the cluster had been replaced, and derived from the
+    // runtime name so two caches do not publish the same ids.
     uint64_t h = 1469598103934665603ull;
     const std::string_view nm = get_name();
     for (const char c : nm)
@@ -3182,10 +2697,9 @@ std::string cache_instance::cluster_node_id(uint32_t shard) const
 
 std::string cache_instance::cluster_host(const client_connection* conn) const
 {
-    // The listener is bound to INADDR_ANY, so it cannot say which address a
-    // client reached it on — but the accepted socket can, and that address is
-    // reachable from the client by construction.  This is what makes the map
-    // correct on loopback and on a LAN without an --announce flag.
+    // The listener is bound to INADDR_ANY and cannot say which address a
+    // client reached it on, but the accepted socket can, and that address is
+    // reachable by construction.
     if (conn && conn->fd >= 0)
     {
         struct sockaddr_in local{};
@@ -3232,12 +2746,10 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
                                   std::string_view arg, bool resp)
 {
     auto& rb = conn->response_buf;
-    // How many nodes this cache presents as.  Without --cluster that is ONE,
-    // whatever the shard count: nothing is bound at base+1+i, so publishing
-    // those addresses would send every client to a connection refused.  One
-    // node covering every slot on the shared port is both true and safe.
+    // How many nodes this cache presents as, which without --cluster is one
+    // whatever the shard count, because nothing is bound at base+1+i.
     const uint32_t n    = m_cluster_ports ? m_shard_n : 1;
-    // And which of them is us.  Collapsed to node 0 when there is one node, or
+    // And which of them is us, collapsed to node 0 when there is one node, or
     // all four shards would answer CLUSTER NODES with no line marked myself.
     const uint32_t me   = m_cluster_ports ? m_shard_i : 0;
     const std::string host = cluster_host(conn);
@@ -3251,10 +2763,8 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         l += host;
         l += ':';
         l += std::to_string(cluster_port_of(sh));
-        // The cluster BUS port.  There is no bus here — nothing gossips,
-        // because the map is a formula — but the field is not optional in the
-        // format and lettuce parses it as a number.  base+10000 is the
-        // convention; 0 where that would not be a port.
+        // The cluster bus port, of which there is none here, but the field is
+        // not optional in the format and lettuce parses it as a number.
         const uint32_t bus = static_cast<uint32_t>(cluster_port_of(sh)) + 10000u;
         l += '@';
         l += std::to_string(bus <= 65535u ? bus : 0u);
@@ -3315,9 +2825,9 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         {
             if (!resp)
             {
-                // The text protocol has no nested types, and a client that
-                // speaks CLUSTER SHARDS speaks RESP by definition.  The same
-                // information in the line form the text protocol can carry.
+                // The text protocol has no nested types and a client that
+                // speaks CLUSTER SHARDS speaks RESP, so this is the same
+                // information in the line form.
                 emit_cluster(conn, "slots", arg, false);
                 break;
             }
@@ -3363,13 +2873,9 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
         case fnv1a("info"):
         {
             std::string out;
-            // cluster_enabled is 1 only when there is a map worth reading: an
-            // unsharded cache says 0, which is what stops a cluster client from
-            // opening N connections to a single-node cache.
-            // The FLAG, not the shard count.  A client asking whether to
-            // route deserves the answer to that question: a sharded cache
+            // The flag and not the shard count, because a sharded cache
             // without --cluster routes nothing and must say 0, and a
-            // single-shard cache WITH it speaks the protocol and says 1.
+            // single-shard cache with it speaks the protocol and says 1.
             out += m_cluster_forced ? "cluster_enabled:1\r\n" : "cluster_enabled:0\r\n";
             out += "cluster_state:ok\r\n";
             out += "cluster_slots_assigned:16384\r\n";
@@ -3397,10 +2903,9 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
 
         case fnv1a("keyslot"):
         {
-            // redis-cli's own way of asking this question, and the one command
-            // here that takes an argument.  Answering it is what lets an
-            // operator check our slot arithmetic against a real Redis without
-            // reading either source.
+            // redis-cli's own way of asking, and the one command here that
+            // takes an argument, which lets an operator check our slot
+            // arithmetic against a real Redis.
             const int64_t slot = static_cast<int64_t>(cache_slot_of(arg));
             if (resp) resp::encode_integer_into(rb, slot);
             else    { rb += std::to_string(slot); rb += '\n'; }
@@ -3409,9 +2914,9 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
 
         case fnv1a("countkeysinslot"):
         {
-            // Only answerable for a slot this shard owns; every other answer
-            // would need a crossing to produce a number nothing depends on.
-            // Named rather than guessed at.
+            // Only answerable for a slot this shard owns, because every other
+            // answer would need a crossing to produce a number nothing depends
+            // on.
             const uint32_t slot = static_cast<uint32_t>(
                 std::strtoul(std::string(arg).c_str(), nullptr, 10));
             if (slot >= cache_slot_count)
@@ -3454,10 +2959,8 @@ void cache_instance::emit_cluster(client_connection* conn, std::string_view sub,
 void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd,
                                    bool resp, std::string_view why)
 {
-    // Named rather than swallowed, and named per command rather than per
-    // connection: a client that pipelines `get k` and `mget a b` gets an answer
-    // to the first and a refusal to the second, in that order, which is the
-    // only shape a pipelined client can read.
+    // Named rather than swallowed, and per command rather than per connection,
+    // because that is the only shape a pipelined client can read.
     if (resp)
     {
         std::string text;
@@ -3482,8 +2985,8 @@ void cache_instance::route_flush(client_connection* conn)
     if (SOCKETLEY_LIKELY(!m_collect))
         return;
 
-    // A connection that has given up on the answer is not worth crossing for.
-    // The slots go with it; nothing else has a reference to them.
+    // A connection that has given up on the answer is not worth crossing for,
+    // and the slots go with it.
     if (conn->closing)
     {
         for (uint32_t sh = 0; sh < m_shard_n; ++sh)
@@ -3502,11 +3005,9 @@ void cache_instance::route_flush(client_connection* conn)
     const int collected_for = m_collect_fd;
     m_collect_fd = -1;
 
-    // The batch being collected belongs to the connection being parsed, and one
-    // connection is parsed at a time.  Checked rather than assumed, because the
-    // cost of it not holding is a reply written down somebody else's socket —
-    // and because a future caller of pump() that does not know this is the way
-    // it stops holding.
+    // The batch being collected belongs to the connection being parsed and one
+    // connection is parsed at a time, checked rather than assumed because the
+    // cost is a reply down somebody else's socket.
     if (SOCKETLEY_UNLIKELY(collected_for != conn->fd))
     {
         LOG_WARN("cache: a routed batch was collected for another connection; "
@@ -3521,10 +3022,9 @@ void cache_instance::route_flush(client_connection* conn)
 
     const uint64_t id = m_next_batch++;
 
-    // Posted first, counted first.  A crossing whose post is refused is filled
-    // in on the spot — the alternative is a batch permanently one answer short
-    // of complete, which is a client waiting for ever on a socket nothing will
-    // ever write to.
+    // Posted first and counted first, with a refused post filled in on the
+    // spot, because the alternative is a batch permanently one answer short of
+    // complete.
     for (uint32_t sh = 0; sh < m_shard_n; ++sh)
     {
         if (m_route_payload[sh].empty())
@@ -3593,11 +3093,9 @@ void cache_instance::batch_drop(client_connection* conn)
         return;
     m_batches.erase(conn->batch_id);
     conn->batch_id = 0;
-    // The posts are left where they are.  Each one resolves through the batch,
-    // so a reply that arrives for a batch that has gone finds nothing and is
-    // dropped — the same arrangement the channel makes for a stale origin, and
-    // for the same reason: a cookie is the only thing that survives being
-    // stale.
+    // The posts are left where they are, because each resolves through the
+    // batch and a reply for a batch that has gone finds nothing and is
+    // dropped.
 }
 
 void cache_instance::batch_finish(uint64_t id)
@@ -3610,9 +3108,9 @@ void cache_instance::batch_finish(uint64_t id)
     client_connection* conn =
         (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
 
-    // Both halves are load-bearing.  The descriptor may already belong to a
-    // client that never asked anything, and that client would have a batch_id
-    // of its own or none — either way not this one.
+    // Both halves are load-bearing, because the descriptor may already belong
+    // to a client that never asked anything and would have a different
+    // batch_id or none.
     if (!conn || conn->batch_id != id)
     {
         m_batches.erase(it);
@@ -3628,10 +3126,9 @@ void cache_instance::batch_finish(uint64_t id)
     m_batches.erase(it);
     conn->batch_id = 0;
 
-    // Whatever the client pipelined behind the crossing has been sitting in
-    // `partial` since; it runs now, and may open a crossing of its own.  A peer
-    // that has gone is no reason to skip it: the commands arrived before the
-    // FIN did and are owed answers exactly as much as this one was.
+    // Whatever the client pipelined behind the crossing runs now and may open
+    // a crossing of its own, because those commands arrived before the FIN and
+    // are owed answers.
     if (!conn->closing)
         pump(conn);
 
@@ -3645,9 +3142,8 @@ void cache_instance::batch_finish(uint64_t id)
     if (conn->batch_id != 0)
         return;
 
-    // The debt is paid, so a held close can be taken.  After the flush, which
-    // is what puts the answer in the ring — the write completion is what
-    // actually tears the connection down.
+    // The debt is paid so a held close can be taken, after the flush, because
+    // the write completion is what actually tears the connection down.
     if (conn->peer_gone)
         conn->closing = true;
 
@@ -3678,11 +3174,9 @@ void cache_instance::on_request_reply(uint64_t cookie, request_status st,
     }
     else
     {
-        // One frame per command sent, in the order they were sent.  A reply
-        // with the wrong number of frames is a build on the other side that
-        // does not speak this framing; the pieces it did not fill are answered
-        // rather than left, because a piece nobody fills is a client that never
-        // hears back.
+        // One frame per command sent in the order they were sent, with
+        // unfilled pieces answered rather than left, because a piece nobody
+        // fills is a client that never hears back.
         const char* p   = reply.data();
         const char* end = reply.data() + reply.size();
         size_t      i   = 0;
@@ -3746,9 +3240,9 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
                     + (resp ? shard_batch_resp.size() : shard_batch_text.size());
     const char* end = payload.data() + payload.size();
 
-    // Saved and restored rather than set and cleared: a command served here can
-    // reach Lua, and a script can ask this cache another question from inside
-    // it.  See the note in publish().
+    // Saved and restored rather than set and cleared, because a command served
+    // here can reach Lua and a script can ask this cache another question from
+    // inside it.
     const bool prev_serving = m_serving_shard_batch;
     m_serving_shard_batch   = true;
     struct batch_serving_guard
@@ -3771,8 +3265,8 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
     return true;
 }
 
-// The sharded scan cursor takes the top six bits of the store's cursor.  They
-// are free only while the store's map index fits in the two bits below them.
+// The sharded scan cursor takes the top six bits of the store's cursor, which
+// are free only while the store's map index fits in the two below them.
 static_assert(cache_scan_shard_shift == 64 - 6,
               "the sharded scan cursor assumes six shard bits");
 static_assert(cache_store::scan_last_map <= 3,
@@ -3780,11 +3274,8 @@ static_assert(cache_store::scan_last_map <= 3,
               "index no longer fits below the six bits the sharded scan cursor "
               "takes -- a cursor would silently name another shard");
 
-// Rebuild a RESP command from the arguments the parser produced.
-//
-// The same message: parse_message_views() made those views out of exactly these
-// bytes.  Building it here rather than carrying the original length down from
-// the parse loop keeps one fact about one message in one place.
+// Rebuild a RESP command from the parsed arguments, which are views into
+// exactly these bytes, so one fact about one message stays in one place.
 static void rebuild_resp(std::string& out, std::string_view* args, int argc)
 {
     out.clear();
@@ -3802,12 +3293,9 @@ static void rebuild_resp(std::string& out, std::string_view* args, int argc)
     }
 }
 
-// Which shard a SCAN call resumes in, read off its cursor.
-//
-// A cursor this shard cannot make sense of — not a number, or naming a shard
-// that does not exist — is answered HERE rather than sent somewhere: the local
-// interpreter already has the words for an invalid cursor, and shard_scan()
-// below makes the same judgement so the two cannot disagree.
+// Which shard a SCAN resumes in, read off its cursor, with an unusable cursor
+// answered here because the local interpreter already has the words and
+// shard_scan() makes the same judgement.
 uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
 {
     const size_t sp = cursor_arg.find(' ');
@@ -3825,13 +3313,9 @@ uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
     return sh < m_shard_n ? sh : m_shard_i;
 }
 
-// One SCAN page out of this shard, and the cursor the caller resumes with.
-//
-// Unsharded this is m_store.scan() and nothing else — the shard field is zero,
-// the store cursor is the whole cursor, and the exhausted answer is 0, exactly
-// as before.  Sharded it is the sequential walk described in
-// shared/cache_shard_map.h: this shard to exhaustion, then the next shard's
-// opening cursor, then zero when the last one is done.
+// One SCAN page out of this shard and the cursor to resume with, which
+// unsharded is m_store.scan() exactly as before and sharded is the sequential
+// walk cache_shard_map.h describes.
 bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 size_t count, std::vector<std::string_view>& out,
                                 uint64_t& next, bool node_local)
@@ -3842,16 +3326,9 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
         return true;
     }
 
-    // ── A SCAN that arrived on the per-shard port walks THIS shard only ──────
-    //
-    // The sequential walk below is what a client asking the runtime as a whole
-    // needs: shard 0 to exhaustion, then shard 1, then zero.  A cluster client
-    // does the opposite — it holds a cursor per node and expects each node's
-    // walk to END, because it is going to ask the other nodes itself.
-    //
-    // Handing it the sequential cursor would not merely duplicate keys: the
-    // cursor that says "on to shard i+1" is served HERE on this port, from the
-    // start, so the walk would restart forever and SCAN would never terminate.
+    // A SCAN on the per-shard port walks this shard only, because a cluster
+    // client asks each node itself -- and handing it the sequential cursor
+    // would restart the walk here forever.
     if (node_local)
     {
         const uint64_t store_next =
@@ -3877,9 +3354,9 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     return true;
 }
 
-// A single-key command built for the wire, in whichever protocol the caller is
-// speaking.  The sub-commands a multi-key command explodes into are built here
-// and nowhere else.
+// A single-key command built for the wire in whichever protocol the caller
+// speaks, which is where every sub-command a multi-key command explodes into
+// is built.
 static void build_text_cmd(std::string& out, std::string_view verb,
                            std::string_view a, std::string_view b = {})
 {
@@ -3913,37 +3390,15 @@ static void build_resp_cmd(std::string& out, std::string_view verb,
     }
 }
 
-// A ceiling on how many pieces one command may be exploded into.
-//
-// `partial` is capped at a megabyte, so `mget` with ten-byte keys can already
-// name a hundred thousand of them, and each piece costs a string here and a
-// framed command on the wire.  Beyond this the command is refused by name
-// rather than served slowly: a limit that says so is a better answer than a
-// limit discovered as memory.
+// A ceiling on how many pieces one command may explode into, because `partial`
+// is a megabyte and a limit that says so is a better answer than one
+// discovered as memory.
 static constexpr size_t MAX_PARTS_PER_COMMAND = 65536;
 
-// ─── A MULTI-KEY COMMAND ON THE PER-SHARD PORT ──────────────────────────────
-//
-// Three outcomes, and the third is why this is a function rather than a repeat
-// of the single-key rule:
-//
-//   every key ours          -> serve it here.  Returns false; the caller falls
-//                              through to the local interpreter.
-//   every key one other     -> -MOVED naming that shard.  The client re-sends
-//   shard's                    the whole command there and it works.
-//   anything else           -> -CROSSSLOT.
-//
-// The third case is not pedantry.  A command with SOME keys here and some on
-// shard 3 cannot be answered with -MOVED 3: shard 3 would look at the same
-// command, find keys that are OURS, and answer -MOVED back.  The client would
-// bounce between the two until it ran out of redirects, which is a hang rather
-// than an error.  -CROSSSLOT is the answer every cluster client already knows,
-// and it means "split this yourself", which is what they do.
-//
-// Deliberately laxer than Redis in one direction: Redis refuses two keys in two
-// SLOTS even when one node holds both, and this serves them.  A cluster client
-// never sends that — it splits by slot before it splits by node — so the
-// difference is only ever visible to somebody typing at the port by hand.
+// A multi-key command on the per-shard port is served here, redirected with
+// -MOVED, or refused with -CROSSSLOT -- because -MOVED for a command with keys
+// on both sides would bounce the client between two shards until it ran out of
+// redirects.
 bool cache_instance::cluster_multi_verdict(client_connection* conn,
                                            const std::vector<std::string_view>& keys,
                                            bool resp)
@@ -3993,13 +3448,9 @@ bool cache_instance::cluster_multi_verdict(client_connection* conn,
     return true;
 }
 
-// mget / mset in the text protocol, exploded into one single-key command each.
-//
-// The splitting must match the interpreter's exactly — mget takes keys
-// separated by single spaces, mset takes key value pairs the same way, and a
-// text mset value therefore cannot contain a space.  Read off those two
-// handlers rather than assumed; see cache_shard_map.h on why the router and the
-// store must read a line the same way.
+// mget and mset in the text protocol exploded into single-key commands, split
+// exactly as the interpreter splits them, because the router and the store
+// must read a line the same way.
 bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
                                         std::string_view args)
 {
@@ -4037,9 +3488,8 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
     if (keys.empty() || keys.size() > MAX_PARTS_PER_COMMAND)
         return false;       // a usage error, or past the ceiling
 
-    // The per-shard port does not explode and cross; it tells the client where
-    // to go.  Returning false means every key is this shard's, and the local
-    // interpreter answers it without a crossing at all.
+    // The per-shard port does not explode and cross but tells the client where
+    // to go, and false means every key is this shard's.
     if (SOCKETLEY_UNLIKELY(conn->cluster_port)
         && cluster_multi_verdict(conn, keys, false))
         return true;
@@ -4070,9 +3520,8 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     if (is_mset && ((argc - 1) % 2 != 0))
         return false;       // the interpreter's own arity refusal
 
-    // Same verdict as the text spelling, over the same keys read the RESP way.
-    // The vector is built only on this port, so the crossing path pays nothing
-    // for it.
+    // Same verdict as the text spelling over the same keys read the RESP way,
+    // with the vector built only on this port.
     if (SOCKETLEY_UNLIKELY(conn->cluster_port))
     {
         std::vector<std::string_view> ks;
@@ -4108,11 +3557,8 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     return true;
 }
 
-// The same command to every shard, merged: a keyspace-wide read, or a publish.
-//
-// One part per shard, and the part this shard owns is executed in place, so a
-// four-shard `dbsize` is three crossings and one local call — and if several
-// arrive in one pipeline they still share those three crossings.
+// The same command to every shard, merged, with the local part executed in
+// place, so a four-shard `dbsize` is three crossings that a pipeline shares.
 void cache_instance::fan_all_shards(client_connection* conn, uint32_t h,
                                     std::string_view raw, bool resp)
 {
@@ -4121,12 +3567,9 @@ void cache_instance::fan_all_shards(client_connection* conn, uint32_t h,
         route_part(conn, sh, slot, sh, raw, resp);
 }
 
-// The one place the text interpreter asks who owns a key.
-//
-// Sixty-odd command handlers sit behind this switch and none of them knows a
-// shard exists.  That is the point: an invariant every handler has to remember
-// is one the next handler will not know about, and the handlers outnumber the
-// people reading them.
+// The one place the text interpreter asks who owns a key, because an invariant
+// sixty-odd handlers have to remember is one the next handler will not know
+// about.
 void cache_instance::process_command(client_connection* conn, std::string_view line)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
@@ -4138,16 +3581,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
     const cache_text_parts parts = cache_split_text(line);
     const uint32_t         h     = fnv1a_lower(parts.cmd);
 
-    // ── A client on the per-shard port is asking THIS NODE ──────────────────
-    //
-    // Redis answers DBSIZE, KEYS, SCAN and FLUSH for the node they were sent
-    // to, and every cluster client is written against that: it asks each node
-    // in turn and adds the answers up itself.  Fanning out here would give it N
-    // times the truth, and spend N-1 crossings doing so.
-    //
-    // Only these two classes.  A publish still fans out — pub/sub is
-    // cluster-wide in Redis too, and a subscriber on another shard is a
-    // subscriber — and a single-key command is handled by -MOVED below.
+    // A client on the per-shard port is asking this node, so DBSIZE, KEYS,
+    // SCAN and FLUSH answer for it alone, while a publish still fans out and a
+    // single-key command is handled by -MOVED.
     if (SOCKETLEY_UNLIKELY(conn->cluster_port))
     {
         const cache_cmd_class cc = cache_classify_text(h);
@@ -4170,15 +3606,10 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 const uint32_t owner = cache_shard_of(key, m_shard_n);
                 if (owner != m_shard_i)
                 {
-                    // ── The whole point of the per-shard port ──────────────
-                    //
                     // This client read the slot map and chose this shard, so a
-                    // key that is not ours is a routing mistake and not work to
-                    // do.  -MOVED is the only answer that FIXES it: every
-                    // cluster client refreshes its map on one and does not come
-                    // back.  Crossing instead would answer correctly and leave
-                    // the client making the same mistake forever, at 11.56 us
-                    // against 8.01.
+                    // key that is not ours is a routing mistake and -MOVED is
+                    // the only answer that fixes it -- crossing instead leaves
+                    // the client making it forever, at 11.56 us against 8.01.
                     if (conn->cluster_port)
                     {
                         run_in_reply_order(conn, [&] {
@@ -4186,14 +3617,10 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         });
                         return;
                     }
-                    // A crossing needs somebody to keep waiting, and only a
-                    // socket can.  fd < 0 is the scratch connection
-                    // serve_payload() answers a request from ANOTHER runtime
-                    // on: that answer is filled in before serve_request()
-                    // returns, so there is no later turn for a reply to arrive
-                    // on.  Refused by name rather than served out of this
-                    // shard's slice — the wrong answer here is a miss for data
-                    // that was stored.
+                    // A crossing needs somebody to keep waiting and only a
+                    // socket can, so the scratch connection serve_payload()
+                    // uses is refused by name rather than served out of this
+                    // shard's slice.
                     if (SOCKETLEY_UNLIKELY(conn->fd < 0))
                     {
                         run_in_reply_order(conn, [&] {
@@ -4214,9 +3641,9 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case cache_cmd_class::multi_key:
         {
-            // A crossing needs somebody to keep waiting; the scratch connection
-            // serve_payload() answers another runtime on cannot.  Same gate as
-            // the single-key case, same reason.
+            // A crossing needs somebody to keep waiting, which the scratch
+            // connection cannot: same gate as the single-key case and the same
+            // reason.
             if (SOCKETLEY_UNLIKELY(conn->fd < 0))
             {
                 run_in_reply_order(conn, [&] {
@@ -4250,9 +3677,8 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case cache_cmd_class::cursor_scan:
         {
-            // The cursor names the shard.  One crossing per call, and the
-            // owning shard re-packs the cursor it hands back — see the SCAN
-            // note in cache_shard_map.h.
+            // The cursor names the shard, so there is one crossing per call
+            // and the owning shard re-packs the cursor it hands back.
             const uint32_t owner = scan_cursor_owner(parts.args);
             if (owner == m_shard_i)
                 break;
@@ -4353,14 +3779,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         return {a.substr(0, sp), a.substr(sp + 1)};
     };
 
-    // ─── A COMMAND ADDED HERE MUST BE CLASSIFIED IN cache_shard_map.h ───────
-    //
-    // A hash this table does not name reads `unknown` and is served where it
-    // was asked.  That is right for a command that does not exist — "unknown
-    // command" is the same answer in every process — and WRONG for a real one,
-    // which would then be answered out of one shard's slice with nothing saying
-    // so.  All 54 handlers across this switch and the RESP one are classified
-    // today; the next one is the one at risk.
+    // A command added here must be classified in cache_shard_map.h, because an
+    // unnamed hash reads `unknown` and is served where it was asked -- right
+    // for a command that does not exist and wrong for a real one.
     switch (fnv1a_lower(cmd))
     {
         // ─── Strings ───
@@ -4428,12 +3849,10 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 #ifndef SOCKETLEY_NO_LUA
                 if (lua() && lua()->has_on_miss())
                 {
-                    // Checked BEFORE the result is read, and that is not a formality:
-                    // on a failed call the value at index 0 is the ERROR OBJECT, and
-                    // reading it as an optional<string> would store a Lua error message
-                    // in the cache and answer it to the client as the fetched value.
-                    // A raise still means a miss, which is what the catch this replaces
-                    // decided by falling through to the nil below.
+                    // Checked before the result is read, because on a failed
+                    // call index 0 is the error object and reading it would
+                    // store a Lua error message in the cache as the fetched
+                    // value.
                     sol::protected_function_result res = lua()->on_miss()(args);
                     if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
@@ -4470,10 +3889,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("denied: readonly mode\n", 22);
                 return;
             }
-            // Unlike set/lpush/sadd, del() cannot detect a stale key by failing:
-            // it happily removes one that has already expired and reports
-            // success, so DEL on an expired key would answer "ok" instead of
-            // "nil".  The expiry check has to happen up front.
+            // Unlike set/lpush/sadd, del() happily removes an already-expired
+            // key and reports success, so the expiry check has to happen up
+            // front.
             if (m_has_ttl_keys) m_store.check_expiry(args);
             if (m_store.del(args))
             {
@@ -4660,17 +4078,10 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rest = rest.substr(sp2 + 1);
             }
             rb.append("ok\n", 3);
-            // ── One key per replicated command; see replicate_command() ─────
-            //
-            // Not `replicate_command(line)`.  A follower that is sharded gets
-            // the whole stream and keeps what it owns, and `mset a 1 b 2` names
-            // keys that belong to different shards — so as one command it
-            // belongs to none of them and was dropped entire.  Measured: a
-            // four-shard follower of an unsharded leader lost every key of
-            // every mset, while its size never moved and nothing reported it.
-            //
-            // Replicating the EFFECT instead is the decision this file already
-            // took for SET; see repl_set_effect below.
+            // One key per replicated command, because `mset a 1 b 2` names
+            // keys belonging to different shards and a sharded follower
+            // dropped it whole -- so the effect is replicated instead, as SET
+            // already does.
             {
                 std::string_view r = args;
                 while (!r.empty())
@@ -5263,10 +4674,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining = unix_s - now_s;
-                // Replicated verbatim, which is the right form for this one:
-                // the argument is an ABSOLUTE timestamp, so the follower
-                // arrives at the same expiry however long the line took to get
-                // there.  A relative `expire` would drift by the wire delay.
+                // Replicated verbatim, because the argument is an absolute
+                // timestamp and the follower arrives at the same expiry
+                // however long the line took.
                 if (remaining <= 0)
                 {
                     m_store.del(key);
@@ -5366,9 +4776,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("failed: no persistent path set\n", 31);
                 return;
             }
-            // This shard's own slice into its own file — the same write
-            // teardown makes.  Fanned out to every shard by the router, so a
-            // `flush` on the runtime writes the whole set and `all_ok` says so
+            // This shard's own slice into its own file, the same write
+            // teardown makes, fanned out to every shard so `all_ok` says so
             // only when every shard managed it.
             rb.append(save_shard_dump() ? "ok\n" : "failed: flush failed\n");
             break;
@@ -5385,8 +4794,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("failed: no persistent path set\n", 31);
                 return;
             }
-            // The whole set, judged as a set: a gap or a contradiction refuses
-            // rather than loading part of it.  Same decision as at start.
+            // The whole set judged as a set, so a gap or a contradiction
+            // refuses rather than loading part of it, exactly as at start.
             rb.append(load_shard_set() ? "ok\n" : "failed: load failed\n");
             break;
         }
@@ -5450,9 +4859,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             append_int_nl(rb, m_store.get_memory_used());
             break;
         }
-        // The same map, for the text protocol.  A cluster client speaks RESP,
-        // so this exists for the operator holding an `nc` open and for the
-        // suite, which is how it is tested at all.
+        // The same map for the text protocol, which exists for the operator
+        // holding an `nc` open and for the suite that tests it.
         case fnv1a("cluster"):
         {
             if (args.empty()) { rb.append("error: usage: cluster <slots|shards|nodes|info|myid|keyslot>\n"); break; }
@@ -5471,13 +4879,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
     }
 }
 
-// Returns false only when a submission was attempted and did not reach the
-// ring.  A caller that leaves write_pending set after that waits for a
-// completion that cannot come: the connection stops making progress and the
-// client is left holding a request nobody will ever answer.  On failure the
-// pending flags are cleared and the batch dropped — the bytes are
-// undeliverable, and saying so is the difference between a closed connection
-// and a hung one.
+// False only when a submission was attempted and did not reach the ring, after
+// which the pending flags are cleared and the batch dropped -- because the
+// difference is a closed connection rather than a hung one.
 bool cache_instance::flush_responses(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->response_buf.empty() || !m_loop || conn->closing))
@@ -5492,9 +4896,8 @@ bool cache_instance::flush_responses(client_connection* conn)
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
-        // The peer has genuinely stopped reading while megabytes pile up.
-        // Dropping the connection is the right answer, but it must not happen
-        // quietly: everything still in flight for this client is lost with it.
+        // The peer has genuinely stopped reading while megabytes pile up, so
+        // dropping the connection is right but must not happen quietly.
         std::cerr << "[cache] client " << conn->fd << " is not draining its socket ("
                   << conn->write_queue.bytes() << " bytes in "
                   << conn->write_queue.size() << " queued buffers), closing\n";
@@ -5502,14 +4905,9 @@ bool cache_instance::flush_responses(client_connection* conn)
         return true;
     }
 
-    // Fast-path: if no write is pending and queue is empty, submit directly
-    // from response_buf without the queue round-trip (saves move + pop).
-    //
-    // Never on a TLS connection: this path builds an SQE straight out of
-    // response_buf, which is plaintext, and would put the answer to a command
-    // on the wire in the clear on a port the operator encrypted.  Those bytes
-    // go into the queue and out through the record layer below, which is the
-    // only writer a session has.
+    // Fast path straight out of response_buf when nothing is queued, never on
+    // a TLS connection, because response_buf is plaintext and this would put
+    // an answer on an encrypted port in the clear.
     if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() &&
                          !conn->zc_notif_pending && conn->ssl == nullptr))
     {
@@ -5551,15 +4949,10 @@ bool cache_instance::flush_responses(client_connection* conn)
         return true;
     }
 
-    // Append to the tail entry instead of adding another one whenever that keeps
-    // it a sensible size.  A pipelined client produces one tiny reply per
-    // command — "ok\n" is three bytes — and one queue entry per flush turns a
-    // few kilobytes of data into thousands of entries, each with its own node
-    // and allocation.  Merging them costs a memcpy and saves all of that.
-    //
-    // Only the tail is touched: entries are moved out of the queue into
-    // write_batch before submission, so nothing the kernel is reading gets
-    // modified here.
+    // Append to the tail entry whenever that keeps it a sensible size, because
+    // a pipelined client's three-byte replies turn kilobytes into thousands of
+    // entries -- and only the tail, since entries are moved out before
+    // submission.
     if (!conn->write_queue.empty() &&
         conn->write_queue.back().size() + conn->response_buf.size() <= client_connection::WRITE_COALESCE_LIMIT)
     {
@@ -5582,10 +4975,9 @@ bool cache_instance::flush_responses(client_connection* conn)
 // as one that is still going to be written to.
 bool cache_instance::flush_write_queue(client_connection* conn)
 {
-    // A TLS connection's bytes go through the record layer, which is the only
-    // thing allowed to put them on the wire.  This branch is what keeps every
-    // caller above — the command handlers, publish(), the closing paths — from
-    // having to know which kind of connection it is holding.
+    // A TLS connection's bytes go through the record layer, which is what
+    // keeps every caller above from having to know which kind of connection it
+    // holds.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
         return tls_flush(conn);
 
@@ -5946,11 +5338,9 @@ void cache_instance::process_resp(client_connection* conn)
         {
             if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
             {
-                // Nothing more can be delivered to this client, so parsing the
-                // rest of the pipeline only grows a reply buffer that will never
-                // be written.  Marking it is all this may do — the caller is
-                // still holding conn — and the tail of the read handler tears it
-                // down once it sees closing with nothing in flight.
+                // Nothing more can be delivered to this client, and marking it
+                // is all this may do, because the caller still holds conn and
+                // the read handler's tail tears it down.
                 conn->closing = true;
                 break;
             }
@@ -5968,11 +5358,8 @@ void cache_instance::process_resp(client_connection* conn)
     }
 }
 
-// The same question, asked once for the other interpreter.
-//
-// Two sites decide routing after this change and zero decided it before, which
-// is the count that matters: the alternative was the sixty-odd handlers behind
-// these two switches.
+// The same question asked once for the other interpreter, which is two sites
+// deciding routing against the sixty-odd handlers behind them.
 void cache_instance::process_resp_command(client_connection* conn,
                                           std::string_view* args, int argc)
 {
@@ -5984,16 +5371,9 @@ void cache_instance::process_resp_command(client_connection* conn,
 
     const uint32_t h = fnv1a_lower(args[0]);
 
-    // ── A client on the per-shard port is asking THIS NODE ──────────────────
-    //
-    // Redis answers DBSIZE, KEYS, SCAN and FLUSH for the node they were sent
-    // to, and every cluster client is written against that: it asks each node
-    // in turn and adds the answers up itself.  Fanning out here would give it N
-    // times the truth, and spend N-1 crossings doing so.
-    //
-    // Only these two classes.  A publish still fans out — pub/sub is
-    // cluster-wide in Redis too, and a subscriber on another shard is a
-    // subscriber — and a single-key command is handled by -MOVED below.
+    // A client on the per-shard port is asking this node, so DBSIZE, KEYS,
+    // SCAN and FLUSH answer for it alone, while a publish still fans out and a
+    // single-key command is handled by -MOVED.
     if (SOCKETLEY_UNLIKELY(conn->cluster_port))
     {
         const cache_cmd_class cc = cache_classify_resp(h, argc);
@@ -6013,10 +5393,9 @@ void cache_instance::process_resp_command(client_connection* conn,
                 const uint32_t owner = cache_shard_of(args[1], m_shard_n);
                 if (owner != m_shard_i)
                 {
-                    // The per-shard port's answer, for the reason the text
-                    // router gives: this client chose this shard out of the
-                    // slot map, so -MOVED corrects the map rather than hiding
-                    // the mistake behind a crossing.
+                    // The per-shard port's answer, because this client chose
+                    // this shard out of the slot map and -MOVED corrects the
+                    // map rather than hiding the mistake behind a crossing.
                     if (conn->cluster_port)
                     {
                         run_in_reply_order(conn, [&] {
@@ -6037,13 +5416,10 @@ void cache_instance::process_resp_command(client_connection* conn,
                         return;
                     }
 
-                    // Rebuilt from the parsed arguments rather than forwarded as
-                    // the bytes that arrived.  The two are the same message —
-                    // parse_message_views() produced these views out of exactly
-                    // those bytes — and building it here means the router does
-                    // not have to be handed a length from the parse loop, which
-                    // is a second fact about one message for the two to
-                    // disagree about.
+                    // Rebuilt from the parsed arguments rather than forwarded
+                    // as the bytes that arrived, because they are the same
+                    // message and a length threaded down from the parse loop
+                    // is a second fact to disagree about.
                     std::string raw;
                     rebuild_resp(raw, args, argc);
                     const uint32_t slot =
@@ -6185,26 +5561,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         replicate_command(cmd);
     };
 
-    // ─── SET IS THE ONE COMMAND repl() CANNOT FLATTEN ───────────────────────
-    //
-    // repl() joins the arguments with spaces and the follower reads the result
-    // with the TEXT interpreter, which takes everything after the key as the
-    // value.  That is correct for every command whose arguments end with the
-    // value — including a value containing spaces — and wrong for the one whose
-    // options come AFTER it.  Measured, leader and follower side by side:
-    //
-    //     RESP  SET rk rv EX 100
-    //     leader    get rk -> 'rv'          ttl 96
-    //     follower  get rk -> 'rv EX 100'   ttl -1
-    //
-    // Not a stale value: a different one, on a key the leader holds correctly,
-    // with the expiry lost as well.  Neither side can tell.
-    //
-    // What is replicated is therefore the EFFECT rather than the command.  The
-    // leader has already decided what NX and XX mean — the follower must not
-    // re-evaluate them against its own copy — and `set` plus `pexpire` are two
-    // commands the text interpreter expresses exactly.  pexpire rather than
-    // expire because it is the finer unit and covers both spellings.
+    // SET replicates its effect rather than its command, because repl() joins
+    // arguments with spaces and the text interpreter takes everything after
+    // the key as the value -- so `SET rk rv EX 100` reached the follower as
+    // the value "rv EX 100" with no expiry.
     auto repl_set_effect = [&](std::string_view key, std::string_view val,
                                int ex_sec, int64_t px_ms) {
         if (m_repl_role != repl_leader || m_followers.empty()) return;
@@ -6232,14 +5592,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
-    // ─── A COMMAND ADDED HERE MUST BE CLASSIFIED IN cache_shard_map.h ───────
-    //
-    // A hash this table does not name reads `unknown` and is served where it
-    // was asked.  That is right for a command that does not exist — "unknown
-    // command" is the same answer in every process — and WRONG for a real one,
-    // which would then be answered out of one shard's slice with nothing saying
-    // so.  All 54 handlers across this switch and the RESP one are classified
-    // today; the next one is the one at risk.
+    // A command added here must be classified in cache_shard_map.h, because an
+    // unnamed hash reads `unknown` and is served where it was asked -- right
+    // for a command that does not exist and wrong for a real one.
     switch (fnv1a_lower(args[0]))
     {
         case fnv1a("set"):
@@ -6308,12 +5663,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     case fnv1a("nx"): nx = true; break;
                     case fnv1a("xx"): xx = true; break;
                     default:
-                        // Refused rather than ignored.  `SET k v FOO` matched no
-                        // case, fell through here and the SET reported success —
-                        // so a mistyped option silently became a plain SET, and
-                        // a caller that wrote EXX instead of EX got a key with
-                        // no expiry and an "+OK".  Redis answers a syntax error;
-                        // so does this now.
+                        // Refused rather than ignored, because `SET k v FOO`
+                        // matched no case, fell through and reported success
+                        // -- so EXX instead of EX gave a key with no expiry
+                        // and an "+OK".
                         resp::encode_error_into(rb, "syntax error");
                         return;
                 }
@@ -6361,12 +5714,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 #ifndef SOCKETLEY_NO_LUA
                 if (SOCKETLEY_UNLIKELY(lua() && lua()->has_on_miss()))
                 {
-                    // Checked BEFORE the result is read, and that is not a formality:
-                    // on a failed call the value at index 0 is the ERROR OBJECT, and
-                    // reading it as an optional<string> would store a Lua error message
-                    // in the cache and answer it to the client as the fetched value.
-                    // A raise still means a miss, which is what the catch this replaces
-                    // decided by falling through to the nil below.
+                    // Checked before the result is read, because on a failed
+                    // call index 0 is the error object and reading it would
+                    // store a Lua error message in the cache as the fetched
+                    // value.
                     sol::protected_function_result res = lua()->on_miss()(args[1]);
                     if (SOCKETLEY_UNLIKELY(!res.valid()))
                     {
@@ -6423,21 +5774,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 #endif
                 }
             }
-            // ── One key per replicated command, and this one was ALREADY
-            //    broken before any of the sharding work ──────────────────────
-            //
-            // repl() joins the arguments with spaces and the follower reads the
-            // result with the TEXT interpreter, whose `del` takes the WHOLE
-            // remainder as one key.  So `DEL p1 p2` replicated as `del p1 p2`
-            // deleted a key literally named "p1 p2" on the follower and left p1
-            // and p2 where they were.  Measured on two UNSHARDED caches:
-            //
-            //     leader   after DEL p1 p2 -> nil nil
-            //     follower after DEL p1 p2 -> q1 q2
-            //
-            // The leader and the follower diverge and nothing reports it.  This
-            // is the same trap the note on repl_set_effect describes for SET,
-            // which was found and fixed there and missed here.
+            // One key per replicated command, because the text interpreter's
+            // `del` takes the whole remainder as one key, so `DEL p1 p2`
+            // deleted a key literally named "p1 p2" on the follower and left
+            // both where they were.
             if (deleted > 0)
                 for (int i = 1; i < argc; ++i)
                 {
@@ -6612,14 +5952,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_bulk_into(rb, args[1]);
             break;
         }
-        // ─── The map a cluster client bootstraps from ───────────────────────
-        //
-        // Answered here, in the LOCAL dispatch, and therefore on every port and
-        // at every shard count.  Two consequences, both wanted: an unsharded
-        // cache still answers (with cluster_enabled:0, which is how a client
-        // learns not to bother), and a shard answers about the whole map rather
-        // than crossing to collect it — every field is derived from the shard
-        // count and the base port, which every shard already holds.
+        // The map a cluster client bootstraps from, answered in the local
+        // dispatch and therefore on every port and at every shard count,
+        // because every field is derived from two numbers each shard already
+        // holds.
         case fnv1a("cluster"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
@@ -7133,75 +6469,23 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 continue;
 
             auto* sub_conn = m_conn_idx[fd];
-            // A promoted follower has had its subscriptions dropped, so it
-            // should never appear here; the check stays because delivering to it
-            // would mean a publish writing into the middle of the replication
-            // stream, and that is not something to leave to one call site.
+            // A promoted follower has had its subscriptions dropped and should
+            // never appear here, and the check stays because delivering to it
+            // would write into the middle of the replication stream.
             if (sub_conn->closing || sub_conn->is_follower)
                 continue;
 
-            // ─── Why the two marks below defer to an armed read, and may ────
-            //
-            // Both of them leave a `closing` connection whose teardown is left
-            // to the read that subscriber has armed, which is the shape
-            // shared/conn_reachability.h exists to refuse — and on_cqe's
-            // chokepoint cannot see these, because publish() runs on the
-            // PUBLISHER's completion while the connection being given up on is
-            // a subscriber's.  It is sound anyway, and the divergence is in the
-            // premise rather than the shape.
-            //
-            // That rule rests on "a connection that is `closing` is one whose
-            // peer has already gone".  True in the two defects it was written
-            // for — 87d2c9d here and 86877cc in the server both marked the
-            // connection closing BECAUSE the peer reset, with the error already
-            // consumed by a write, so nothing was left to complete the read.
-            // Neither mark below has anything to do with the peer: one is this
-            // process running out of queue budget, the other this process
-            // running out of submission queue.  The subscriber is alive and its
-            // read is reachable by the one thing that can complete it.
-            //
-            // MEASURED, because acting on the shared verdict here is the
-            // obvious repair and it is a regression.  Same binary, the drain
-            // switched by an environment variable, SQPOLL, 3000 subscribers,
-            // one publish, 952 of them given up on; each then made to speak:
-            //
-            //     left to the armed read      952 of 952 reached and closed
-            //     routed through classify()     0 of 952
-            //
-            // finish_unreachable_client() runs inside the window where the
-            // submission queue is exhausted, which is the only window in which
-            // the second mark fires at all, so close_fd() cannot submit the
-            // cancel that would release the connection — and it has already
-            // been taken out of m_conn_idx, so nothing looks at it again.
-            // test_cache_publish_subscriber_reachable.sh holds that line.
-            //
-            // The defect that paragraph left open — a subscriber dropped for a
-            // transient local shortage, silently, never retried and never told,
-            // going on believing it is subscribed — was real and is fixed, and
-            // NOT here.  It was one line in shared/event_loop.cpp: get_sqe()
-            // treated a full submission queue as permanent because its only
-            // recovery was io_uring_submit(), which under SQPOLL is a store to
-            // the ring tail and frees no slot.  It now waits for the poller.
-            // See get_sqe_when_full() for the measurements and for why waiting
-            // rather than dropping or growing the ring is the answer, and
-            // test_cache_publish_delivers_to_all.sh for the guard.
-            //
-            // So the second mark below is now reached only when the ring is
-            // genuinely closed or the kernel refuses IORING_ENTER_SQ_WAIT, and
-            // the loop logs both.  The reasoning above still governs what
-            // happens WHEN it is reached, and it is still not classify()'s
-            // business — which is why the sibling test stays.
+            // These two marks defer a teardown to an armed read, which
+            // conn_reachability.h refuses, and it is sound because neither is
+            // about the peer -- measured, 952 of 952 subscribers reached and
+            // closed when left to the read against 0 when routed through
+            // classify() -- while the defect that paragraph left open was
+            // fixed in get_sqe_when_full().
 
-            // A subscriber that has stopped reading must not be allowed to grow
-            // the queue without limit, but the bound is memory: a slow reader on
-            // 30-byte notifications was dropped after 123 KB when this counted
-            // entries.
-            //
-            // Reaching this cap needs a write in flight — every push below is
-            // followed by a flush when nothing is pending — so the ring does owe
-            // this connection a completion and the chokepoint sees it on that
-            // completion regardless.  Measured over a backlog storm: 180 marks
-            // here, 0 of them with nothing outstanding.
+            // The bound on a subscriber that has stopped reading is memory
+            // rather than entries, and reaching it needs a write in flight, so
+            // the chokepoint sees the connection on that completion
+            // regardless.
             if (sub_conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
             {
                 sub_conn->closing = true;
@@ -7236,19 +6520,10 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
 
             if (!sub_conn->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(sub_conn)))
             {
-                // Marking it is all that is allowed here.  close_client() would
-                // call unsubscribe_all() on the very subscriber set this loop is
-                // walking, and publish() returns into a command handler that
-                // goes on using its own connection.  The subscriber has a read
-                // armed; its handler finishes the teardown.
-                //
-                // Nothing reached the ring, so this is the local-shortage mark
-                // the block above describes.  It used to fire for a submission
-                // queue that was merely full — measured at 952 of 3000
-                // subscribers on a 2048-entry ring, every one of them alive and
-                // none of them told — and get_sqe() now waits that out instead.
-                // What is left here is a ring that is closed or a kernel that
-                // will not wait, and the loop has already logged either.
+                // Marking is all that is allowed here, because close_client()
+                // would call unsubscribe_all() on the set this loop is walking
+                // -- and what is left of this branch is a ring that is closed
+                // or a kernel that will not wait, both already logged.
                 sub_conn->closing = true;
                 continue;
             }
@@ -7256,18 +6531,9 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
         }
     }
 
-    // ─── The cross-RUNTIME half, and only from the shard the client asked ───
-    //
-    // This reaches the Lua subscribers of every OTHER runtime, and out of a
-    // worker it goes up as a frame the daemon fans to every other worker — the
-    // siblings of this runtime included, where it runs their scripts.
-    //
-    // A shard answering a sibling's crossing must not do it again.  Each of the
-    // N shards runs this same publish() for one client PUBLISH, so without the
-    // guard a four-shard cache would dispatch the message to every other
-    // runtime four times, and every sibling's Lua subscriber would fire once
-    // per shard.  The socket delivery above is per-shard and is what the
-    // crossing exists for; this is per-publish and belongs to one of them.
+    // The cross-runtime half, done by one shard only, because each of N shards
+    // runs this same publish() and without the guard every sibling's Lua
+    // subscriber would fire once per shard.
     if (!m_serving_shard_batch)
     {
         if (auto* mgr = get_runtime_manager())
@@ -7328,43 +6594,15 @@ void cache_instance::set_replicate_target(std::string_view host_port)
     m_replicate_target = host_port;
 
     // ─── What an empty target means ────────────────────────────────────────
-    //
-    // This setter names the leader this cache follows.  An empty string names
-    // no leader, so it means "follows nobody" — not "follows something
-    // unspecified", which is what assigning repl_follower unconditionally used
-    // to make of it.
-    //
-    // That distinction is not academic, because every `import` and every `edit`
-    // calls this with whatever the document holds, and a cache that was never
-    // meant to replicate has no replicate_target field in its document at all.
-    // So editing a plain cache — changing its eviction policy, say — turned it
-    // into a follower of nothing.  From that point on it could never become a
-    // leader either: handle_replicate_request() answers "error: this node is a
-    // follower" before it looks at anything else, so a cache that had simply
-    // been edited once refused to serve REPLICATE for the rest of its life.
-    //
-    // Two other sites had already met this state and papered over it locally —
-    // setup() checks `repl_follower && !m_replicate_target.empty()` in both the
-    // dial and the TLS refusal, because a follower with no leader to dial is
-    // nonsense.  Those checks are the symptom.  This is where the state was
-    // created.
-    //
+    // An empty target means follows nobody rather than follows something
+    // unspecified, because assigning repl_follower unconditionally turned
+    // every `edit` of a plain cache into a follower of nothing that could
+    // never become a leader again.
     // ─── Why a leader is left alone ────────────────────────────────────────
-    //
-    // repl_leader is not configuration.  It is established at runtime, when a
-    // peer sends REPLICATE, and it owns live sockets: m_followers holds a
-    // connection per follower and this runtime is the only writer on each.
-    // Letting a config change revoke it silently is worse than the bug above.
-    // It happened, too — an edit that touched only the eviction policy demoted a
-    // leader with a follower attached, and because replicate_command() returns
-    // early unless the role is repl_leader, every write after that stopped
-    // reaching a follower whose socket was still open and still healthy from
-    // both ends.  Neither side can detect that; the datasets simply drift.
-    //
-    // The target is still recorded, so an operator who genuinely wants this
-    // cache to follow another gets what they asked for at the next restart —
-    // which is when it would take effect in any case, since setup() is what
-    // dials the leader and a fresh instance starts at repl_none.
+    // repl_leader is established at runtime and owns live sockets, so a config
+    // change may not revoke it: an edit that touched only the eviction policy
+    // demoted a leader and every write after it stopped reaching a healthy
+    // follower.
     if (m_repl_role == repl_leader)
         return;
 
@@ -7383,11 +6621,9 @@ cache_instance::repl_role cache_instance::get_repl_role() const
 
 void cache_instance::follower_kick(follower_conn& f)
 {
-    // fd < 0 means the client this follower was promoted from has gone and
-    // taken the socket with it.  Submitting against the number anyway is how
-    // the whole replication stream — dump included — used to end up in an
-    // unrelated client's socket the moment the kernel reissued it, with every
-    // write reporting success so nothing ever noticed.
+    // fd < 0 means the client this follower was promoted from has gone, and
+    // submitting anyway is how the whole replication stream ended up in an
+    // unrelated client's socket with every write reporting success.
     if (f.write_pending || f.dead || f.fd < 0 || !m_loop)
         return;
 
@@ -7403,12 +6639,9 @@ void cache_instance::follower_kick(follower_conn& f)
     if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(f.fd, f.out.data(),
                                                  static_cast<uint32_t>(f.in_flight), &f.write_req)))
     {
-        // Nothing restarts the stream after this: the write completion is what
-        // kicks the next one, and there will not be one.  Replication would go
-        // on looking healthy while the follower silently stopped advancing, so
-        // the follower is dropped instead — that it reconnects and takes a fresh
-        // dump is recoverable, a follower quietly stuck at an old snapshot is
-        // not.
+        // Nothing restarts the stream after this, so the follower is dropped
+        // rather than left silently frozen at an old snapshot -- a reconnect
+        // and a fresh dump is recoverable.
         f.write_pending = false;
         f.in_flight = 0;
         f.dead = true;
@@ -7447,9 +6680,8 @@ void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_co
         return;
     }
 
-    // Replication bytes are this runtime's wire traffic too — the server
-    // counts its upstream links the same way.  See the bytes_in note in
-    // handle_read() for why the counting lives in each handler.
+    // Replication bytes are this runtime's wire traffic too, counted in each
+    // handler for the reason the bytes_in note in handle_read() gives.
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     // A short write is normal; only the acknowledged prefix may be dropped.
@@ -7472,18 +6704,10 @@ void cache_instance::reap_followers()
             continue;
         }
 
-        // The socket is not ours to close: it belongs to the client_connection
-        // this follower was promoted from, and close_client() is the only path
-        // that also drops that client's subscriptions and hands its struct
-        // back.  Ask for the connection to go instead of taking the descriptor
-        // out from under it.
-        //
-        // Marking rather than closing, because this runs from inside command
-        // handling — replicate_command() reaches here from process_command() —
-        // and the connection being dropped may be the very one whose handler is
-        // running.  The read completion that the shutdown produces finishes the
-        // teardown from a place where freeing it is safe; a handler that is
-        // already mid-close finishes it itself when it finds nothing in flight.
+        // The socket belongs to the client_connection this follower was
+        // promoted from, so the connection is asked to go rather than the
+        // descriptor taken -- and marked rather than closed, because this runs
+        // from inside command handling.
         const int fd = (*it)->fd;
         if (fd >= 0 && fd < MAX_FDS && m_conn_idx[fd])
         {
@@ -7503,11 +6727,9 @@ void cache_instance::detach_follower(int fd)
     {
         if (f->fd != fd)
             continue;
-        // The descriptor goes back to the kernel with the client; everything
-        // this follower still holds is buffers.  A write that is already in
-        // flight keeps going to the socket it was submitted against — the
-        // operation holds its own reference — so only new submissions have to
-        // be stopped, which clearing the fd does.
+        // The descriptor goes back with the client and only buffers remain, so
+        // an in-flight write keeps going to the socket it was submitted
+        // against and only new submissions have to be stopped.
         f->fd = -1;
         f->dead = true;
     }
@@ -7526,9 +6748,8 @@ cache_instance::follower_conn* cache_instance::follower_for_fd(int fd)
 
 void cache_instance::refuse_follower_input(client_connection* conn)
 {
-    // The bytes are dropped, not parsed.  Executing them would produce a
-    // response, and there is nowhere to put a response: the follower buffer owns
-    // this socket now.
+    // The bytes are dropped and not parsed, because executing them would
+    // produce a response and the follower buffer owns this socket now.
     conn->partial.clear();
 
     if (conn->follower_refused)
@@ -7537,12 +6758,9 @@ void cache_instance::refuse_follower_input(client_connection* conn)
 
     LOG_WARN("cache: command received on a replication follower connection, ignoring");
 
-    // Say so through the replication stream itself, so the socket keeps exactly
-    // one writer.  A real follower drops any line it does not recognise —
-    // handle_master_read() acts on a fixed set of commands and ignores the rest
-    // — so this reaches a person watching the socket and nobody else.  Once per
-    // connection: a client that keeps sending would otherwise be able to push
-    // the follower past MAX_FOLLOWER_PENDING with error lines alone.
+    // Said through the replication stream itself so the socket keeps exactly
+    // one writer, once per connection, or a client could push the follower
+    // past its cap with error lines alone.
     follower_conn* f = follower_for_fd(conn->fd);
     if (!f)
         return;
@@ -7553,63 +6771,20 @@ void cache_instance::refuse_follower_input(client_connection* conn)
     }
 }
 
-// ─── A REPLICATED COMMAND NAMES AT MOST ONE KEY ─────────────────────────────
-//
-// Every caller of this function owes that, and it is not decoration:
-//
-//   * the follower reads the stream with the TEXT interpreter, whose `del`
-//     takes the whole remainder as ONE key -- so `del a b`, which the RESP
-//     spelling means as two, deletes a key named "a b" and leaves a and b
-//     alone.  Leader and follower diverge with nothing reporting it.  Measured
-//     on two unsharded caches before this was fixed.
-//   * a sharded follower keeps the part of the stream its slice owns, and a
-//     command naming keys from several slices belongs to none of them.
-//
-// So the multi-key spellings replicate the EFFECT: `mset` goes out as one `set`
-// per pair and a multi-key `DEL` as one `del` per key.  That is the same
-// decision repl_set_effect describes for SET's options, applied to arity.
-//
-// It cannot be checked here, and that is worth saying plainly rather than
-// leaving as an omission: `del a b` is a legal single-key command in the text
-// protocol, so this function cannot tell a correctly-emitted one from a
-// flattened one.  The obligation lives at the emitters, and each of them names
-// it.
+// A replicated command names at most one key, because the follower's text
+// interpreter takes the whole remainder as one and a sharded follower's slices
+// own separate keys -- an obligation this function cannot check and each
+// emitter names.
 void cache_instance::replicate_command(std::string_view cmd)
 {
     if (m_repl_role != repl_leader || m_followers.empty())
         return;
 
     // ─── A VALUE WITH A NEWLINE IN IT ───────────────────────────────────────
-    //
-    // The replication link is one command per line, and a cache value is
-    // arbitrary bytes — a RESP bulk string may contain anything.  So a value
-    // with a line break ended at the break on the follower, and the remainder
-    // was interpreted as a command of its own.  Measured:
-    //
-    //     RESP  SET nk "a\nb"
-    //     leader    get nk  ->  a<LF>b
-    //     follower  get nk  ->  a
-    //
-    // The two stores then disagreed and neither side could tell: replication
-    // reports no error, because from the link's point of view nothing failed.
-    //
-    // This is the same defect as the control socket's, which ipc_framing.h
-    // fixed, so it is the same fix and literally the same framing — a second
-    // format for one job in one tree is how the two drift apart.
-    //
-    // ─── AND THE OLD FOLLOWER, WHICH IS THE ONLY DECISION HERE ──────────────
-    //
-    // A frame is sent ONLY when the line protocol cannot carry the command, so
-    // every value without a newline is byte-identical on the wire and an old
-    // follower sees exactly what it always saw.  The one case that changes is
-    // the case that was already broken: an old follower now receives a frame it
-    // does not understand and stores nothing, instead of storing a truncated
-    // value and executing the tail as a command.  Neither is replication, and
-    // between them, not applying a command is the one that does not corrupt the
-    // dataset or run something nobody sent.
-    //
-    // There is no negotiation on this link to do better with, and adding one to
-    // hand back a truncated value is not worth a protocol version.
+    // Framed by the same rule ipc_framing.h uses, only when a line cannot
+    // carry the command, so every value without a newline is byte-identical on
+    // the wire and an old follower stores nothing rather than a truncated
+    // value plus a command nobody sent.
     std::string line;
     if (ipc_frame::needs_frame(cmd))
     {
@@ -7632,24 +6807,10 @@ void cache_instance::replicate_command(std::string_view cmd)
 
 void cache_instance::handle_replicate_request(client_connection* conn)
 {
-    // ─── A TLS cache is not a replication leader ───────────────────────────
-    //
-    // The other half of the refusal in tls_config_refusal, and the half no
-    // configuration gate can make: this cache becomes a leader here, when a
-    // client asks, long after `create` and `start` have had their say.
-    //
-    // What promotion would do on a TLS listener is put a *second writer* on
-    // this socket — follower_conn submits raw bytes straight at the descriptor
-    // (see follower_kick), around the record layer that owns it.  Every one of
-    // them would be cleartext inside what the peer believes is an encrypted
-    // session: unreadable to a real follower, and this cache's entire dataset
-    // in the clear on the wire.  Routing it through the session instead is not
-    // a smaller change than it looks — it would mean two independent writers
-    // on one write BIO, which is the exact thing the promotion rules below
-    // exist to prevent.
-    //
-    // So it is refused, and the refusal goes to conn->response_buf, which is
-    // still the ordinary reply path because no promotion has happened.
+    // A TLS cache is not a replication leader, which no configuration gate can
+    // decide because promotion happens when a client asks -- and follower_conn
+    // writes raw bytes around the record layer, which would put the whole
+    // dataset in the clear.
     if (m_tls)
     {
         conn->response_buf.append(
@@ -7666,10 +6827,9 @@ void cache_instance::handle_replicate_request(client_connection* conn)
         return;
     }
 
-    // A follower is a socket, and interactive execute() has none: it runs
-    // commands through a connection with fd -1.  Registering one anyway put a
-    // follower in the list that could never be written to and that the reaper
-    // would then try to tie back to a client connection.
+    // A follower is a socket and interactive execute() has none, so
+    // registering one put a follower in the list that could never be written
+    // to.
     if (conn->fd < 0)
     {
         conn->response_buf.append("error: replicate needs a connection\n", 36);
@@ -7677,30 +6837,11 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     }
 
     // ─── What REPLICATE promises ───────────────────────────────────────────
-    //
-    // The promotion makes this runtime the sole writer on the descriptor.  From
-    // the moment it succeeds the socket carries one thing, leader to follower:
-    // the "ok", the full dump, and then the replicated command stream, all out
-    // of the follower's own buffer and therefore in that order.  A client may
-    // read that stream or close the socket.  It may not send anything else —
-    // any further command is dropped with a single error line and never
-    // executed (see refuse_follower_input()).
-    //
-    // The alternative was to let the connection keep answering commands, which
-    // is what it did: its client_connection is still there and still queues into
-    // conn->response_buf, and flush_responses() then submits a second write on
-    // the same fd.  io_uring orders nothing between two writes in flight, so
-    // that reply lands wherever it lands — including inside a replicated
-    // command, which the follower has no way to detect and no way to resync
-    // from.  One socket, one writer, is the only version of this that can be
-    // made to hold.
-    //
-    // Which is also why promotion is refused while the ordinary path still owes
-    // this client bytes.  Those bytes were promised before REPLICATE and cannot
-    // be moved into the replication stream — a GET reply is arbitrary data and a
-    // follower would try to read it as commands — nor dropped, since the client
-    // is waiting for them.  The one case that matters in practice, a client
-    // whose first command is REPLICATE, passes straight through.
+    // Promotion makes this runtime the sole writer on the descriptor, because
+    // two writes in flight are ordered by nothing and a reply landing inside a
+    // replicated command cannot be resynced from -- which is also why
+    // promotion is refused while the ordinary path still owes this client
+    // bytes.
     if (!conn->response_buf.empty() || !conn->write_queue.empty() ||
         conn->write_pending || conn->zc_notif_pending)
     {
@@ -7714,10 +6855,9 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     // pipelined behind the REPLICATE line as well.
     conn->is_follower = true;
 
-    // Any channel this connection had subscribed to goes with the promotion.
-    // publish() writes straight into a subscriber's write queue, which is the
-    // same second writer by another route, and the subscriber can no longer
-    // unsubscribe itself.
+    // Any channel this connection subscribed to goes with the promotion,
+    // because publish() writes straight into the write queue and the
+    // subscriber can no longer unsubscribe itself.
     m_store.unsubscribe_all(conn->fd);
 
     // Register first, then queue the dump: both the dump and every command that
@@ -7727,11 +6867,9 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     follower_conn& fc = *f;
     m_followers.push_back(std::move(f));
 
-    // The acknowledgement travels through the follower buffer too, ahead of the
-    // dump.  Writing it to conn->response_buf instead would put a second,
-    // independent writer on the same socket and let the two interleave.  The
-    // follower ignores commands it does not recognise, so a leading "ok" is
-    // harmless there.
+    // The acknowledgement travels through the follower buffer ahead of the
+    // dump, because response_buf would be a second independent writer on the
+    // same socket.
     bool ok = follower_write(fc, "ok\n") && send_full_dump(fc);
     if (!ok)
     {
@@ -7750,9 +6888,8 @@ bool cache_instance::send_full_dump(follower_conn& f)
     if (buf.empty())
         return true;
 
-    // Queued rather than written synchronously.  A dataset of any size exceeds
-    // the socket buffer, and the follower may be a runtime inside this very
-    // daemon: waiting for it to drain would block the loop that has to feed it.
+    // Queued rather than written synchronously, because a dataset exceeds the
+    // socket buffer and the follower may be a runtime inside this very daemon.
     return follower_write(f, buf);
 }
 
@@ -7814,10 +6951,9 @@ bool cache_instance::connect_to_master()
     const char* cmd = "replicate\n";
     if (::write(fd, cmd, 10) < 0) { ::close(fd); return false; }
 
-    // A link of its own, never the previous one reused.  The read armed on the
-    // old link survives its socket being closed, and a reconnect usually lands
-    // on the same fd number: two reads filling one buffer left the replication
-    // stream with holes in it that neither side could see.
+    // A link of its own and never the previous one reused, because the read
+    // armed on the old link survives its socket and a reconnect usually lands
+    // on the same fd number.
     auto link = std::make_unique<master_link>();
     link->fd = fd;
     link->read_req = { this, link->buf, fd, sizeof(link->buf), op_read };
@@ -7826,10 +6962,9 @@ bool cache_instance::connect_to_master()
     if (m_loop && SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, link->buf,
                                                           sizeof(link->buf), &link->read_req)))
     {
-        // Without this read the node is connected and deaf: the leader would
-        // stream the full dump and every command after it into a socket nobody
-        // drains.  Failing the connect outright keeps the follower visibly
-        // unsynced rather than silently frozen at an empty dataset.
+        // Without this read the node is connected and deaf, so failing the
+        // connect outright keeps the follower visibly unsynced rather than
+        // silently frozen at an empty dataset.
         LOG_ERROR("cache: read from master could not be armed — replication link not established");
         close_tracked(fd);
         return false;
@@ -7855,32 +6990,24 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
     if (cqe->res <= 0)
     {
-        // Master disconnected.  The link goes with it rather than being kept for
-        // the next attempt: nothing is in flight on it any more, and a fresh one
-        // is what connect_to_master() hands back.
+        // Master disconnected, and the link goes with it rather than being
+        // kept, because nothing is in flight on it and connect_to_master()
+        // hands back a fresh one.
         if (link.fd >= 0)
             close_tracked(link.fd);
         m_master.reset();
         return;
     }
 
-    // The replication stream from the leader is wire traffic in.  See the
-    // bytes_in note in handle_read() for why the counting lives here.
+    // The replication stream from the leader is wire traffic in, counted here
+    // for the reason the bytes_in note gives.
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     link.partial.append(link.buf, cqe->res);
 
-    // ─── Framed or line, decided by the first byte ──────────────────────────
-    //
-    // 0x00 cannot begin a command in the line protocol — every one of them is
-    // printable text starting with a letter — so the two forms travel on one
-    // link and a leader that sends no frames is byte-identical to the one that
-    // never could.  See replicate_command() for why only some commands are
-    // framed and what an old peer makes of them.
-    //
-    // Scanned by offset with one erase at the end, rather than consumed per
-    // command: a single read from a busy leader carries many commands, and
-    // erasing the front for each would make the batch quadratic in its size.
+    // Framed or line, decided by a first byte no line command can begin with,
+    // and scanned by offset with one erase at the end because erasing per
+    // command would make a busy leader's batch quadratic.
     size_t scan_from = 0;
     bool   framing_broken = false;
     while (scan_from < link.partial.size())
@@ -7913,36 +7040,10 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
         if (!line.empty())
         {
-            // ─── THE SAME INTERPRETER THE LEADER RAN ────────────────────
-            //
-            // This used to be a hand-picked switch over six commands — set,
-            // del, lpush, rpush, sadd, hset — with everything else falling into
-            // `default: break`.  The leader replicates EVERY mutating command
-            // verbatim, so an incr, a decr, an incrby, an append, a getset, a
-            // setnx, an lpop, an srem, an hdel, an mset, an expire or a persist
-            // reached the follower and was dropped on the floor.  Both sides
-            // then believed they were in sync and neither could tell.  Measured
-            // on the parent commit, one assertion per command family:
-            //
-            //     incr    follower 5,  leader 6
-            //     append  follower "hello", leader "helloworld"
-            //     lpop    follower llen 1, leader llen 0
-            //     expire  follower ttl -1, leader ttl 100
-            //     ... ten more of the same shape.
-            //
-            // The comment that stood here — "Actually, we can just call the
-            // store methods directly" — is the shortcut that caused it, and it
-            // could never have been complete: the set of mutating commands is
-            // whatever the interpreter supports, and this was a copy of it that
-            // stopped being true the moment one was added.
-            //
-            // serve_request() is that interpreter.  A follower cannot loop back
-            // through it, because replicate_command() returns at once for any
-            // role that is not leader.
-            //
-            // The response is built and dropped: nothing is listening on a
-            // replication link, and it costs a string per command that the text
-            // path was already building for its own clients.
+            // The same interpreter the leader ran, because the hand-picked
+            // switch over six commands dropped every incr, append, lpop,
+            // expire and mset on the floor with both sides believing they were
+            // in sync.
             cache_mode saved = m_mode;
             m_mode = cache_mode_readwrite;
 
@@ -7952,11 +7053,9 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         }
     }
 
-    // A length past max_payload means the stream's framing is wrong, and there
-    // is no point in it that says where the next command starts.  Guessing
-    // would apply whatever the bytes happened to spell to the dataset, so the
-    // link goes instead — which surfaces as a master disconnect, the one
-    // failure this side already knows how to report.
+    // A length past max_payload means the framing is wrong and no point says
+    // where the next command starts, so the link goes rather than the bytes
+    // being applied.
     if (framing_broken)
     {
         LOG_ERROR("cache: replication frame longer than the protocol allows — "
@@ -7982,11 +7081,9 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(link.fd, link.buf,
                                                     sizeof(link.buf), &link.read_req)))
         {
-            // This read is the only thing that ever re-arms itself, so a refusal
-            // ends replication for good.  Dropping the socket makes the break
-            // look like a master disconnect, which is at least visible, instead
-            // of a follower that stays up serving a dataset that stopped
-            // advancing.
+            // This read is the only thing that re-arms itself, so a refusal
+            // ends replication for good and dropping the socket at least
+            // surfaces as a master disconnect.
             LOG_ERROR("cache: read from master refused — the replication link is dropped");
             link.read_pending = false;
             close_tracked(link.fd);
@@ -7997,11 +7094,9 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
 // ─── Stats ───
 
-// The cache-specific half of `stats`.  Every figure below is a walk of a store
-// that only this process's thread may walk, which is why it is the part a
-// worker still pushes: rebuilding it in the daemon reads the placeholder's own
-// empty store and answers confidently, printing keys:0 and
-// commands_processed:0 for a cache that had just served five SETs.
+// The cache-specific half of `stats`, which is the part a worker still pushes,
+// because rebuilding it in the daemon reads the placeholder's empty store and
+// prints keys:0 for a cache that had just served five SETs.
 std::string cache_instance::stats_extra() const
 {
     std::ostringstream out;
