@@ -1,39 +1,10 @@
 #!/usr/bin/env bash
-# Integration test: TLS on a server listener.
-#
-# The project advertised TLS for years and had none: tls_context.cpp was a
-# complete OpenSSL wrapper that nothing constructed, and every TLS flag was
-# refused so that a listener could not come up promising encryption and serve
-# cleartext.  A server runtime terminates TLS now — accept, handshake and
-# record layer driven by the same io_uring completions as everything else,
-# through a memory BIO pair so OpenSSL never touches a socket.
-#
-# The handshake is several rounds of "OpenSSL wants more bytes" / "OpenSSL has
-# bytes to send" and each round is a completion, so the failure mode this file
-# is written against is a session that works once and stalls, corrupts or leaks
-# on some later connection.  That is why the payloads are distinguishable, why
-# the aborts are run in bulk, and why the whole file is worth running more than
-# once.
-#
-# WHAT IT CHECKS
-#   1. a real handshake against a self-signed certificate, verified by the
-#      client, and application data in both directions with the bytes intact
-#   2. no downgrade: a plaintext client on the TLS port is dropped, and nothing
-#      it sent is ever delivered to the runtime as a message; and https:// and
-#      wss:// work on the same listener, with the zero-copy splice path for
-#      static files bypassed rather than leaking plaintext into the stream
-#   3. clients that abort mid-handshake do not accumulate — connections falls
-#      back to zero and the listener still serves the next real client
-#   4. mutual TLS: with --ca set, a client presenting no certificate is
-#      rejected and one signed by that CA is accepted
-#   5. fail closed: a certificate that cannot be loaded, a key that does not
-#      match it, and every incomplete flag combination refuse rather than
-#      falling back to a cleartext listener
-#   6. who may hold these flags at all: no role is left without a handshake
-#      behind it, so cache, proxy and client each take a complete set and
-#      refuse the incomplete ones.  What each does with them is its own file's
-#      subject — test_cache_tls.sh, test_proxy_tls_backend.sh,
-#      test_client_tls.sh; this file only asserts who is allowed to hold them
+# TLS on a server listener: a real handshake with data intact both ways, no
+# downgrade for a plaintext client and no splice leaking plaintext, aborts that
+# do not accumulate, mutual TLS, every incomplete flag set refused rather than
+# falling back to cleartext, and which roles may hold these flags at all --
+# with distinguishable payloads and bulk aborts, because the failure this is
+# written against is a session that works once and stalls later.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -61,9 +32,8 @@ if ! python3 -c 'import ssl' >/dev/null 2>&1; then
     exit 0
 fi
 
-# Own daemon, socket and state directory.  This test asserts on the failed
-# state of runtimes it deliberately misconfigures, and against the shared
-# daemon those would outlive the run.
+# Own daemon, socket and state directory, because this test asserts on the
+# failed state of runtimes it deliberately misconfigures.
 TMPDIR_T=$(mktemp -d /tmp/socketley-tls-XXXXXX)
 export HOME="$TMPDIR_T/home"
 export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
@@ -106,9 +76,8 @@ assert_ok() {
     fi
 }
 
-# Run a command and echo its exit status.  Half of this file is about commands
-# that are *supposed* to fail, and under `set -e` a bare `cmd; rc=$?` ends the
-# run before the assertion is ever reached.
+# Run a command and echo its exit status, because half this file is about
+# commands that are supposed to fail and `set -e` would end the run first.
 rc_of() {
     local rc=0
     "$@" >"$TMPDIR_T/last-cmd.log" 2>&1 || rc=$?
@@ -116,24 +85,20 @@ rc_of() {
 }
 
 # ── certificates ────────────────────────────────────────────────────────────
-# A self-signed leaf for the listener, and a separate one-level CA that signs a
-# client certificate for the mutual-TLS case.  Everything expires tomorrow and
-# lives in a directory the trap removes.
+# A self-signed leaf for the listener and a one-level CA that signs a client
+# certificate, all expiring tomorrow in a directory the trap removes.
 CERTS="$TMPDIR_T/certs"
 mkdir -p "$CERTS"
 
-# Each guarded, so that the SKIP below is reachable.  Under `set -e` an openssl
-# that failed ended the file on the spot — silently, since all five are
-# redirected to /dev/null — and the "could not generate the test certificates"
-# message a few lines down, which exists precisely to say so, could never print.
-# The existence check is the real gate; these statuses are not.
+# Each guarded so the SKIP below is reachable, because under `set -e` a failed
+# openssl ended the file before the message explaining it could print.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$CERTS/server-key.pem" -out "$CERTS/server.pem" \
     -subj "/CN=localhost" \
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || true
 
-# A second key, never paired with any certificate.  Used to prove that a key
-# which does not match the certificate is refused rather than accepted.
+# A second key never paired with any certificate, to prove that a key which
+# does not match is refused rather than accepted.
 openssl genrsa -out "$CERTS/other-key.pem" 2048 >/dev/null 2>&1 || true
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -181,14 +146,9 @@ fi
 assert_ok "$(rc_of ready_tls 127.0.0.1 "$SRV_PORT" "$CERTS/server.pem" localhost 20)" \
     "TLS listener completes a verified handshake"
 
-# One client, one session: send several payloads chosen so that a shift or a
-# truncation in the BIO plumbing is visible (a repetitive payload would survive
-# an off-by-one unnoticed), then ask the daemon to broadcast and read it back
-# through the same session.
-# `|| true`: a listener that never came up makes this exit non-zero, and a bare
-# command that fails under `set -e` ends the file — here, before every assertion
-# in the file.  The output is already being captured to a file that the checks
-# below read, so an empty capture is a result they can report.
+# One client and one session with payloads chosen so a shift or truncation is
+# visible, and `|| true` because a listener that never came up would otherwise
+# end the file before every assertion in it.
 python3 - "$SRV_PORT" "$CERTS/server.pem" "$BIN" > "$TMPDIR_T/roundtrip.out" 2>&1 <<'PYEOF' || true
 import socket, ssl, subprocess, sys, time
 
@@ -265,13 +225,9 @@ assert_eq "$(read_key 4)" "$BIG"                        "client -> server: 700 b
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. No downgrade: a plaintext client is not served
 # ─────────────────────────────────────────────────────────────────────────────
-# The bytes below are a perfectly good line for the cleartext protocol.  On a
-# TLS listener they are not a record, so the handshake fails and the connection
-# is dropped -- what must never happen is the line being delivered as a message,
-# which is what a listener that fell back to cleartext would do.
-# `|| true`: this one only has to *happen* — what it proves is asserted a few
-# lines down, off the daemon's own state.  Failing to connect is not a reason to
-# stop the file, and under `set -e` a bare failing command was exactly that.
+# A perfectly good cleartext line is not a TLS record, so the handshake fails
+# and what must never happen is the line being delivered as a message -- with
+# `|| true` because failing to connect is not a reason to stop the file.
 python3 - "$SRV_PORT" >/dev/null 2>&1 <<'PYEOF' || true
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
@@ -295,12 +251,9 @@ assert_eq "$(read_key 5)" "$(read_key 991)" \
 # ─────────────────────────────────────────────────────────────────────────────
 # 2b. HTTPS and wss:// on the same listener
 # ─────────────────────────────────────────────────────────────────────────────
-# Protocol detection runs on the decrypted stream, so a TLS listener serves
-# HTTP and WebSocket without being told to.  The non-HTML file is the one that
-# matters: static files are normally sent with splice(), which moves the file's
-# bytes into the socket without OpenSSL ever seeing them.  On a TLS connection
-# that would be plaintext in the middle of an encrypted stream, so the splice
-# path is bypassed -- and this is the assertion that says it still is.
+# Protocol detection runs on the decrypted stream, and the non-HTML file is the
+# one that matters: the splice path would move plaintext into an encrypted
+# stream, so it is bypassed and this asserts that it still is.
 mkdir -p "$TMPDIR_T/www"
 printf '<html><body>HTTPS-STATIC-OK</body></html>' > "$TMPDIR_T/www/index.html"
 printf 'not-html-so-this-would-have-been-spliced' > "$TMPDIR_T/www/data.txt"
@@ -343,10 +296,8 @@ print("101" if b"101" in s.recv(512).split(b"\r\n")[0] else "no")
 s.close()
 PYEOF
 ) || true
-# `|| true` for the same reason as the curl capture above: this python exits
-# non-zero when the listener is not there to connect to, and a lone `VAR=$(…)`
-# would make that the end of the file rather than the end of this test.  An
-# empty $WSS is not "101", which is what assert_eq is here to say.
+# `|| true` because this python exits non-zero when the listener is not there,
+# and an empty $WSS is not "101", which is what assert_eq is here to say.
 assert_eq "$WSS" "101" "wss:// upgrade succeeds on the same TLS listener"
 
 rc_of "$BIN" stop tls_http >/dev/null
@@ -356,13 +307,9 @@ rc_of "$BIN" remove tls_http >/dev/null
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Clients that abort mid-handshake
 # ─────────────────────────────────────────────────────────────────────────────
-# Three ways to leave a handshake unfinished, forty times each: a genuine
-# ClientHello followed by an RST, a truncated record that can never complete,
-# and a connection that is opened and closed without a byte.  A session leaked
-# on any of those shows up as connections that never falls back to zero.
-# `|| true`: the aborted handshakes are the setup, not the assertion — the
-# assertion is the connections counter falling back to zero afterwards, and it
-# cannot be read if a failure to connect ends the file first.
+# Three ways to leave a handshake unfinished, forty times each, with `|| true`
+# because the aborts are the setup and the connections counter falling back to
+# zero is the assertion.
 python3 - "$SRV_PORT" "$CERTS/server.pem" >/dev/null 2>&1 <<'PYEOF' || true
 import socket, ssl, struct, sys
 
@@ -406,34 +353,14 @@ for _ in range(40):
         pass
 PYEOF
 
-# Connections has to fall back to zero.  A session or a connection struct left
-# behind by an aborted handshake keeps this above zero for the rest of the
-# runtime's life, which is the sharpest assertion in this file.
-#
-# ─── AND IT WAS BEING ANSWERED BY A FIGURE OLDER THAN THE ABORTS ────────────
-#
-# This runtime is in a worker, so `connections` is a sample it takes every
-# 250 ms and pushes, not a number read when it is printed.  What stood here was
-# a loop that broke the moment the figure read 0 — and the figure read 0
-# immediately, from the sample taken BEFORE the aborts, so the loop exited on a
-# state of the world that predates the thing under test.  Measured on this
-# build: the first read was accepted with a sample instant 14 ms after the abort
-# script was launched, which is before python had finished starting, let alone
-# aborted a handshake.  A build that leaked a struct per aborted handshake would
-# have passed here just as fast.
-#
-# ready_conns is the same wait with the age of the sample checked, so what is
-# accepted is a zero the runtime saw after the aborts rather than before them.
-# The read below is left as it was: if the wait timed out, the figure it could
-# not settle is exactly what assert_eq should print.
+# Connections has to fall back to zero, waited on with ready_conns so the
+# accepted zero is one the runtime saw after the aborts rather than the pushed
+# sample taken 14 ms before python had finished starting.
 ready_conns "$BIN" tls_srv 0 15 || true
 CONNS=""
-# `|| true`: grep exits 1 when the field is absent, `pipefail` promotes it,
-# and a lone `VAR=$(…)` takes its status from the substitution — so a runtime
-# that is not there ended the file here, with the sharpest assertion in the
-# file and everything after it unreported.  CONNS is pre-set to "" above
-# precisely so an unreadable counter falls through to assert_eq, which fails on
-# "" and says what it wanted.
+# `|| true` because grep exits 1 on an absent field and pipefail promotes it,
+# which ended the file at the sharpest assertion with everything after it
+# unreported.
 CONNS=$("$BIN" stats tls_srv 2>/dev/null | grep '^connections:' | cut -d: -f2 | tr -d ' ') || true
 assert_eq "$CONNS" "0" "aborted handshakes leave no connections behind"
 
@@ -497,10 +424,9 @@ print("WITHCERT", "yes" if with_ else "no")
 print("NOCERT", "yes" if attempt(False) else "no")
 PYEOF
 ) || true
-# `|| true`: an mTLS listener that never came up makes this python exit
-# non-zero, and a lone `VAR=$(…)` turned that into the end of the file — taking
-# section 5, "fail closed", with it, which is about a different feature again.
-# An empty $MTLS_RESULT fails both assertions below, which is the correct report.
+# `|| true` because an mTLS listener that never came up would end the file and
+# take section 5 with it, while an empty result fails both assertions
+# correctly.
 assert_eq "$(echo "$MTLS_RESULT" | grep '^WITHCERT' | cut -d' ' -f2)" "yes" \
     "mTLS: a client certificate signed by --ca is accepted"
 assert_eq "$(echo "$MTLS_RESULT" | grep '^NOCERT' | cut -d' ' -f2)" "no" \
@@ -509,14 +435,12 @@ assert_eq "$(echo "$MTLS_RESULT" | grep '^NOCERT' | cut -d' ' -f2)" "no" \
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Fail closed
 # ─────────────────────────────────────────────────────────────────────────────
-# The STATUS column of `ls`, lower-cased.  Columns are
-# ID NAME TYPE PORT CONN "OWNED BY" STATUS CREATED..., and CREATED is several
-# words ("0 seconds ago"), so the status is the seventh field and not the last.
+# The seventh field of `ls` is the status, because CREATED is several words.
 state_of() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2==n {print tolower($7)}'; }
 
-# (a) A certificate file that does not exist.  The runtime must go to failed,
-#     and nothing may be listening on its port -- a listener that came up here
-#     would be serving cleartext under a TLS configuration.
+# A certificate file that does not exist must leave the runtime failed with
+# nothing listening, because a listener here would serve cleartext under a TLS
+# configuration.
 rc_of "$BIN" create server tls_missing -p "$BAD_PORT" \
     --tls --cert "$CERTS/does-not-exist.pem" --key "$CERTS/server-key.pem" >/dev/null
 rc_of "$BIN" start tls_missing >/dev/null
@@ -539,8 +463,8 @@ sleep 0.5
 assert_eq "$(state_of tls_mismatch)" "failed" "mismatched key: runtime fails to start"
 rc_of "$BIN" remove tls_mismatch >/dev/null
 
-# (c) Incomplete flag sets.  Each of these describes a listener that could only
-#     serve cleartext, so `create` refuses and leaves no runtime behind.
+# Incomplete flag sets each describe a listener that could only serve
+# cleartext, so `create` refuses and leaves no runtime behind.
 assert_eq "$(rc_of "$BIN" create server tls_nokey -p "$BAD_PORT" \
     --tls --cert "$CERTS/server.pem")" "1" "--tls --cert without --key is refused"
 assert_eq "$(state_of tls_nokey)" "" "--tls --cert without --key creates no runtime"
@@ -555,20 +479,9 @@ assert_eq "$(rc_of "$BIN" create server tls_certonly -p "$BAD_PORT" \
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Who may hold these flags
 # ─────────────────────────────────────────────────────────────────────────────
-# This section used to enumerate the roles that had no handshake behind them
-# and still refused the flags outright.  There are none left: every runtime
-# type terminates or dials TLS somewhere, so what it enumerates now is that
-# each of them takes a complete set — and a stale entry here is exactly how the
-# gate ends up refusing a role that has since grown a handshake.
-#
-# A cache listener was the last one to arrive.  It terminates TLS on its own
-# port with the same three flags a server uses, and RESP runs on the decrypted
-# stream; see test_cache_tls.sh for the transport, the mutual-TLS case and the
-# one thing a TLS cache still refuses, which is replicating in cleartext out of
-# an encrypted port.
-#
-# tlsprobe_ and not tls_: tls_cache is the live cache this file linked the
-# server to, and asking `ls` about it would answer for that one instead.
+# What this section enumerates is that every role takes a complete set, because
+# none is left without a handshake behind it and a stale entry here is how the
+# gate ends up refusing a role that has since grown one.
 assert_eq "$(rc_of "$BIN" create cache tlsprobe_cache -p "$BAD_PORT" \
     --tls --cert "$CERTS/server.pem" --key "$CERTS/server-key.pem")" "0" \
     "--tls --cert --key on a cache runtime is accepted"
@@ -581,18 +494,15 @@ assert_eq "$(rc_of "$BIN" create cache tlsprobe_cachebare -p "$BAD_PORT" --tls)"
     "--tls with no certificate is refused on a cache"
 assert_eq "$(state_of tlsprobe_cachebare)" "" "--tls with no certificate creates no cache"
 
-# The client takes the complete set, as the proxy below does.  Asserted
-# here because this is the file that enumerates who may hold these flags.
+# The client takes the complete set, asserted here because this is the file
+# that enumerates who may hold these flags.
 assert_eq "$(rc_of "$BIN" create client tlsprobe_client -t "127.0.0.1:$BAD_PORT" \
     --tls --ca "$CERTS/server.pem")" "0" "--tls --ca on a client runtime is accepted"
 rc_of "$BIN" remove tlsprobe_client >/dev/null
 
-# The proxy is no longer one of them: it terminates TLS on its own listener and
-# dials one to its backends, so the complete set is accepted here exactly as it
-# is on a server.  Asserted in this file rather than only in the proxy's own,
-# because this is the file that enumerates who may hold these flags — and a
-# stale entry here is how the gate ends up refusing a role that has since grown
-# a handshake.  See test_proxy_tls_backend.sh for the transport itself.
+# The proxy terminates TLS on its listener and dials one to its backends,
+# asserted here rather than only in its own file because a stale entry is how
+# the gate refuses a role that has grown a handshake.
 assert_eq "$(rc_of "$BIN" create proxy tlsprobe_proxy -p "$BAD_PORT" \
     --backend 127.0.0.1:1 --tls --cert "$CERTS/server.pem" \
     --key "$CERTS/server-key.pem")" "0" \
@@ -613,9 +523,9 @@ assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxcert -p "$BAD_PORT" \
     "a certificate without --tls is refused on a proxy"
 assert_eq "$(state_of tlsprobe_pxcert)" "" "a certificate without --tls creates no proxy"
 
-# --client-ca verifies the certificates *clients* present, which only a TLS
-# listener can ask for.  On a cleartext port it would authenticate nobody while
-# inspect reported mutual TLS, which is the shape this whole gate exists for.
+# --client-ca verifies the certificates clients present, which only a TLS
+# listener can ask for, so on a cleartext port it would authenticate nobody
+# while inspect reported mutual TLS.
 assert_eq "$(rc_of "$BIN" create proxy tlsprobe_pxmca -p "$BAD_PORT" \
     --backend 127.0.0.1:1 --client-ca "$CERTS/ca.pem")" "1" \
     "--client-ca without --tls is refused on a proxy"

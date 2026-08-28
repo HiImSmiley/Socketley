@@ -1,51 +1,17 @@
 #!/usr/bin/env bash
-# Integration test: an @group HTTP gateway under concurrent keep-alive load,
-# with members joining and leaving while traffic flows.
-#
-# The existing @group test sends one request per connection, which is the only
-# shape that works.  A keep-alive connection is the ordinary shape -- curl
-# reuses, browsers reuse, every HTTP client library reuses -- and through a
-# group gateway only the *first* request on a connection is rewritten.  Every
-# request after it is forwarded to the member verbatim, with the gateway's own
-# path prefix still on the request line, so a real backend answers 404 to all
-# of them.  The same connection is also pinned to the member chosen for request
-# one, so a member that leaves the group keeps receiving its traffic.
-#
-# The cause is one guard.  A finished HTTP response detaches the backend and
-# resets the client for the next request only when
-#     !m_backends[conn->backend_idx].is_group
-# and the group selection path never assigns backend_idx -- it writes the
-# chosen endpoint onto the connection instead.  So the guard always reads slot
-# 0.  With the group in slot 0 the reset never runs and header_parsed stays
-# true, which sends the next request down the "subsequent data (request body)
-# -- forward as-is" branch.  Listing a direct backend first is enough to make
-# the same group route correctly, which is what pins the guard as the cause.
-#
-# Every request carries a marker "<connection>-<sequence>" that the backend
-# echoes, and each backend stamps its own id beside it, so a response answers
-# two questions at once: did this connection get its own data back, and which
-# member produced it.  The second is what makes a claim about failover or
-# membership checkable rather than merely plausible -- "the request succeeded"
-# says nothing about where it went.
-#
-# The three windows are anchored to observed events, never to the clock: the
-# load window opens on the first response, the after-leave window on the last
-# response the departing member served, the after-join window on the first
-# response the joining member served, and each closes once it has actually
-# carried traffic.  lib_window.sh has the reasoning and the measurements that
-# forced it; the short version is that this test used to compute its phases from
-# "second N to second M", and inside `bash test/run_all.sh` the control commands
-# took long enough that the last window opened after the run had ended.  It then
-# reported an empty window -- a measurement that never happened -- in the same
-# words it would have used for a gateway that routed to the wrong member.
+# An @group HTTP gateway under concurrent keep-alive load with members joining
+# and leaving, because only the first request on a connection was rewritten and
+# the rest reached the member with the gateway's prefix still on them -- with
+# every request carrying a marker the backend echoes beside its own id, and
+# three windows anchored to observed events rather than to the clock.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_ready.sh"
 . "$(dirname "$0")/lib_window.sh"
 . "$(dirname "$0")/lib_create.sh"
-# For daemon_sweep in cleanup only.  Sourcing defines functions without running
-# anything, so this file's own inline isolation is untouched.
+# For daemon_sweep in cleanup only, sourced because that defines functions
+# without running anything.
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ports.sh"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -55,9 +21,7 @@ export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
 mkdir -p "$HOME"
 
-# Ports come off one base so two runs can share a machine.  The daemon socket
-# and state directory are already per-run; the ports were the one thing left
-# that made a second run of this test collide with the first, and a collision
+# Ports come off one base so two runs can share a machine, because a collision
 # looks exactly like a broken gateway.
 PORT_BASE=$((SL_PORT_BASE+540))
 CTRL=$PORT_BASE
@@ -68,31 +32,15 @@ GRP=kagrp; GW_NAME=kagw
 CLIENTS=${CLIENTS:-12}
 SEQ_REQS=8          # requests on the single deterministic connection
 
-# Twelve connections, paced.  Concurrency is what this test needs -- twelve
-# keep-alive connections interleaving through one gateway -- and rate is not.
-#
-# The pace was forced on this test by a defect it then made visible: a
-# group-routed request was excluded from the backend pool, so every request
-# opened a fresh TCP connection to a member.  Unpaced, twelve clients put ~2000
-# of those a second through the gateway and a run of this test left ~26000
-# sockets in TIME_WAIT -- past the 16384 this kernel keeps
-# (net.ipv4.tcp_max_tw_buckets), after which connects to the gateway hang, the
-# gateway's own connects to its members hang, and the run measures a machine it
-# broke itself.  Measured: at 4 ms the table pinned at the ceiling and windows
-# went empty; at 20 ms the same run leaves ~8000 and every window fills.
-#
-# That defect is fixed -- the pool is keyed by endpoint now, so a group
-# connection is reused like any other and the same run peaks in the single
-# digits instead of at the ceiling.  The pace stays regardless, because it was
-# never the point: this test asks where requests go while membership changes,
-# and a burst answers that no better than a steady stream does.
+# Twelve connections, paced, because concurrency is what this test needs and
+# rate is not -- the pace was forced by an unpooled group path that put 26,000
+# sockets into TIME_WAIT, and it stays now that the pool is fixed because a
+# burst answers this test's question no better.
 PACE=${PACE:-0.02}
 
-# Each window stays open until it has carried at least this much traffic and has
-# been open at least this long, whichever takes longer.  The seconds keep an
-# idle machine from measuring a burst; the counts keep a busy one from measuring
-# nothing.  A window that reaches neither inside its cap is reported as not
-# measurable rather than as a routing failure.
+# Each window stays open until it has carried enough traffic and been open long
+# enough, whichever takes longer, and one that reaches neither is reported as
+# not measurable rather than as a routing failure.
 LOAD_SECS=${LOAD_SECS:-5}
 MIN_REQS=2000       # below this the load window proved nothing
 PHASE_SECS=${PHASE_SECS:-4}
@@ -118,20 +66,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet -- or not up any more -- starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so this can only
-    # ever hit daemons belonging to this run.
-    #
-    # This was an inline `pgrep -f 'socketley daemon'` loop.  `-f` matches the
-    # whole command line, so the pattern also matches any shell whose own command
-    # line happens to carry that string -- including the runner invoking this
-    # file -- and an -f match one character too broad kills the run doing the
-    # killing, which has happened twice in this project.  The environ check
-    # underneath made it safe in practice, but the shape is the one lib_daemon.sh
-    # exists to delete.  daemon_sweep asks the socket who is serving it instead,
-    # and matches nothing by name.
+    # Killed through daemon_sweep, which asks the socket who is serving it,
+    # because a `pgrep -f` pattern one character too broad kills the run doing
+    # the killing -- which has happened twice in this project.
     daemon_sweep "$SOCKETLEY_SOCKET"
     rm -rf "$TMPD"
 }
@@ -140,11 +77,8 @@ trap cleanup EXIT
 ok()   { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad()  { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 check(){ if [ "$1" = "$2" ]; then ok; else bad "$3" "got '$1', expected '$2'"; fi; }
-# A claim the run was unable to put a question to.  Kept apart from bad() on
-# purpose: an empty window and a mis-routed one used to print the same sentence,
-# and the run that printed it was read as a product failure by two people.  Both
-# end the run non-zero -- an assertion that was never evaluated has not passed --
-# but only one of them is about the product.
+# A claim the run was unable to put a question to, kept apart from bad()
+# because an empty window and a mis-routed one used to print the same sentence.
 herr() { TOTAL=$((TOTAL+1)); HERR=$((HERR+1)); echo "  NOT MEASURABLE [$1]: $2"; }
 
 echo "=== Integration: @group HTTP gateway under keep-alive load ==="
@@ -224,14 +158,9 @@ python3 "$TMPD/be.py" $CTRL be1:$BE1 be2:$BE2 be3:$BE3 be4:$BE4 >"$TMPD/be.log" 
 BEPID=$!
 for _ in $(seq 1 60); do grep -q ready "$TMPD/be.log" 2>/dev/null && break; sleep 0.1; done
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet --
-# cli.cpp's ensure_daemon() forks, setsids and re-execs 'socketley daemon' -- so
-# polling 'ps' against the daemon this test has just launched races it and spawns
-# a second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run: the FD0/FD1 samples below are then a corpse's.  Measured at 2 spawned
-# orphans in 30 startups of this sequence.
+# Wait on the IPC socket itself, never by polling with a CLI command, because
+# polling auto-starts a second daemon and when the loser is $DPID the samples
+# below are a corpse's.
 cat > "$TMPD/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -259,19 +188,10 @@ SOCKETLEY_DLOG="$TMPD/daemon.log"
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart -- so this looks at the descriptor table, which only
-# a live process has.  Said here rather than left to the FD0/FD1 check at the
-# end, which would report it as a descriptor problem long after the fact.
-#
-# `|| true` because of `set -o pipefail`: when the pid really is gone -- the
-# case this check exists for -- `ls` fails and the pipeline fails with it.
-# This file runs without `set -e`, so that leaves nothing worse than a status
-# behind; in the sibling tests that do set it, the one check able to report a
-# dead daemon exited the run before it could report one.  The `|| true` is what
-# makes this line safe to copy into a file that has the -e.  The two FD0/FD1
-# readings below carry it for the same reason.
+# The daemon that answers is the one this test launched, asked of the
+# descriptor table because `kill -0` cannot tell a zombie from a live process
+# -- with `|| true` so pipefail does not make the one check able to report a
+# dead daemon exit before it can.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -279,13 +199,9 @@ case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     *) ok ;;
 esac
 
-# Group members are TCP proxies in the group, each in front of one backend --
-# the same shape as test_proxy_group_http.sh, so the member is a real runtime
-# whose membership the daemon controls.
-#
-# One assertion per member rather than one for the set: which member is missing
-# is the whole question in a group test, and a single "setup failed" would send
-# the reader back to a log to find out.  Three lines is not noise.
+# Group members are TCP proxies each in front of one backend, with one
+# assertion per member because which member is missing is the whole question in
+# a group test.
 create_ok "group member 1 created" \
     "$BIN" create proxy kam1 -p $M1 --backend "127.0.0.1:$BE1" --protocol tcp -g $GRP -s
 create_ok "group member 2 created" \
@@ -294,9 +210,8 @@ create_ok "group member 3 created" \
     "$BIN" create proxy kam3 -p $M3 --backend "127.0.0.1:$BE3" --protocol tcp -g $GRP -s
 create_ok "gateway created" \
     "$BIN" create proxy "$GW_NAME" -p $GW --backend "@$GRP" --protocol http -s
-# A 200 through the gateway proves the group resolved to at least one member
-# and that member answered.  An accepted connection proves only that the
-# gateway is listening, which it does before any member is routable.
+# A 200 through the gateway proves the group resolved and a member answered,
+# where an accepted connection proves only that the gateway is listening.
 if ! ready_http 127.0.0.1 $GW "/$GW_NAME/ready" 20; then
     bad "setup" "the gateway never answered a request on $GW"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"; exit $((FAIL+HERR))
@@ -310,9 +225,8 @@ fi
 FD0=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l || true)
 if [ -z "$FD0" ] || [ "$FD0" -eq 0 ] 2>/dev/null; then FD0=""; fi
 
-# ---- 1. deterministic: one connection, several requests -------------------
-# No concurrency and no timing in this one.  If it fails, it fails identically
-# on every machine and every run.
+# One connection and several requests, with no concurrency and no timing, so a
+# failure here fails identically on every machine and every run.
 SEQ_OUT=$(python3 - "$GW" "$GW_NAME" "$SEQ_REQS" <<'PYEOF'
 import socket, sys
 port, name, n = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
@@ -352,16 +266,9 @@ if [ "${SEQ_GOOD:-0}" = "$SEQ_REQS" ]; then ok; else
         "${SEQ_GOOD:-<none>} of $SEQ_REQS correct -- $(printf '%s\n' "$SEQ_OUT" | sed 's/.*note=//')"
 fi
 
-# ---- 2 & 3. concurrent load, then membership churn -------------------------
-#
-# The driver is a load generator and nothing else now.  It runs no schedule,
-# performs no control commands and knows nothing about phases: it writes down
-# what happened and when, and the shell below -- which is what actually stops
-# and creates the members -- decides where the windows are from the events it
-# sees.  The old driver did all three jobs, and the control commands it ran with
-# subprocess.run blocked its own event loop, so the very act of changing the
-# membership stopped the traffic it was supposed to be measuring and consumed
-# the window it was supposed to run in.
+# The driver is a load generator and nothing else, because the old one ran its
+# control commands with subprocess.run and blocked its own event loop,
+# consuming the window it was supposed to measure.
 cat > "$TMPD/drv.py" <<'PYEOF'
 import asyncio, os, re, sys, time
 
@@ -510,9 +417,9 @@ python3 "$TMPD/drv.py" "$GW" "$GW_NAME" "$CLIENTS" "$DRIVER_CAP" "$STOPF" "$PACE
     >"$EVF" 2>"$TMPD/drv.err" &
 LPID=$!
 
-# Anchor: the load window opens on the first response, not on the driver's
-# start.  Opening twelve connections and filling the gateway's backend pool is
-# setup, and a window that contains the setup measures the setup.
+# The load window opens on the first response rather than the driver's start,
+# because opening twelve connections is setup and a window containing it
+# measures the setup.
 LOAD_START=$(win_wait_backend "$EVF" any 0 "$ANCHOR_WAIT")
 if [ -z "$LOAD_START" ]; then
     bad "the gateway serves the load" \
@@ -528,11 +435,9 @@ fi
 LOAD_END=$(win_now)
 
 # ---- the member leaves ----------------------------------------------------
-# Two anchors, in the order the change actually travels.  The daemon's own view
-# first -- `stop` returning means the request was accepted, not that the group
-# no longer resolves to it -- and then the traffic: the last response the
-# departing member served.  Only after both is "it serves nothing" a claim about
-# the gateway rather than about the moment the question was asked.
+# Two anchors in the order the change travels -- the daemon's view, then the
+# last response the departing member served -- because only after both is "it
+# serves nothing" a claim about the gateway.
 T_LEAVE_CMD=$(win_now)
 "$BIN" stop kam3 >/dev/null 2>&1
 CTRL_LEAVE=$(win_wait_output "$ANCHOR_WAIT" '!"name":"kam3"[^}]*"status":"running"' "$BIN" ls --json)
@@ -562,10 +467,9 @@ if [ -z "$CTRL_JOIN" ]; then
         "kam4 not listed as running ${ANCHOR_WAIT}s after create returned"
     CTRL_JOIN=$(win_now)
 fi
-# The join anchor is the first response the new member serves.  That it is
-# reached at all is the assertion -- a gateway that keeps routing to the old
-# membership never reaches it, and the bound expiring is that failure, stated as
-# one.  The window that opens there then shows whether it keeps getting work.
+# The join anchor is the first response the new member serves, and reaching it
+# at all is the assertion, because a gateway routing to the old membership
+# never does.
 JOIN_START=$(win_wait_backend "$EVF" be4 "$CTRL_JOIN" "$ANCHOR_WAIT")
 if [ -n "$JOIN_START" ]; then ok; else
     bad "a member that joined starts receiving traffic" \
@@ -582,20 +486,9 @@ JOIN_END=$(win_now)
 wait "$LPID" 2>/dev/null
 LPID=""
 
-# Each window is reported against the instant its change was requested, so the
-# "pre" counters below are connections that were already open when the
-# membership changed -- not merely ones older than the window.
-#
-# The two gap windows cover the change itself -- from the moment the command was
-# issued to the moment the window after it opens.  They are printed and not
-# asserted on, deliberately.  Anchoring the measured windows to observed events
-# means the disruption a change causes now falls between them, and a number that
-# stops being printed is a number nobody looks at again.  What it costs today is
-# in the run below: every request in flight when a runtime is created or removed
-# waits out the proxy's 2 s backend timeout and is then answered 504, or dropped
-# with no answer at all when the backend connect had not completed.  That is a
-# product defect, it is not caused by the group, and it is not this test's to
-# fix; it is this test's to keep visible.
+# The two gap windows cover the change itself and are printed rather than
+# asserted on, because the disruption now falls between the measured windows
+# and a number that stops being printed is one nobody looks at again.
 OUT=$(win_report "$EVF" \
         "load:$LOAD_START:$LOAD_END" \
         "leave-gap:$T_LEAVE_CMD:$LEAVE_START" \
@@ -606,8 +499,8 @@ printf '%s\n' "$OUT" | sed 's/^/  /'
 
 L_TOTAL=$(win_field "$OUT" load total); L_OK=$(win_field "$OUT" load ok)
 
-# The headline assertion.  Not "most succeeded" -- every request that came back
-# has to be the one that was asked for.
+# The headline assertion: every request that came back has to be the one that
+# was asked for, rather than most having succeeded.
 if [ -n "$L_TOTAL" ] && [ -n "$L_OK" ] && [ "$L_TOTAL" -gt 0 ] && [ "$L_OK" -eq "$L_TOTAL" ]; then
     ok
 else
@@ -617,10 +510,9 @@ else
     fi
     bad "every response under load is the one that was requested" \
         "${L_OK:-<none>} of ${L_TOTAL:-<none>} correct ($RATE wrong)"
-    # What each loss looked like, not only how many there were.  A request that
-    # waited the proxy's two-second backend deadline and was then dropped is a
-    # different animal from one whose connection went away instantly, and the
-    # count alone cannot tell them apart.
+    # What each loss looked like rather than only how many, because a request
+    # that waited the backend deadline is a different animal from one whose
+    # connection went away instantly.
     win_detail "$EVF" "$LOAD_START" "$LOAD_END"
 fi
 
@@ -629,10 +521,9 @@ for K in crossed garbled wrongseq; do
     check "${N:-0}" "0" "no $K responses under load"
 done
 
-# Membership, judged on connections that were already open when it changed and
-# on responses that were both sent and answered inside the window.  A window
-# that holds too few of those is reported as not measurable -- which is a
-# statement about this run, not about the gateway.
+# Membership, judged on connections already open when it changed and on
+# responses both sent and answered inside the window, with too few reported as
+# not measurable.
 LEAVE_PRE=$(win_field "$OUT" after-leave preok)
 if [ -n "$LEAVE_PRE" ] && [ "$LEAVE_PRE" -ge "$MIN_PRE_OK" ]; then
     BE3_AFTER=$(printf '%s\n' "$OUT" | grep "^WINDOW after-leave " | sed 's/.*prebe://;s/ .*//' \
@@ -662,32 +553,10 @@ if "$BIN" stats "$GW_NAME" >/dev/null 2>&1; then ok; else
 fi
 if kill -0 "$DPID" 2>/dev/null; then ok; else bad "daemon alive" "the daemon died"; fi
 
-# Descriptors: the backend pool holds sockets for POOL_IDLE_TIMEOUT_SEC (60)
-# and the sweep that evicts them runs every 30 s, so a check here can only be
-# a ceiling, never "back to baseline".  An unreadable count is reported as
-# unreadable -- two numbers that are both empty compare equal.
-#
-# What the pool is holding is not a leak, and it has to be read rather than
-# assumed.  The old ceiling (FD0 + 4*CLIENTS + 40) was written while the group
-# path pooled nothing, so it was a bound on *not* pooling: once pooling worked
-# it read 122 against 98, and even a theoretically perfect pool of one socket
-# per client would have had four descriptors of room.  A bound no correct
-# implementation can satisfy tests nothing.
-#
-# Seven descriptors per pooled connection, because of what this test builds:
-# the members are themselves splicing TCP proxies inside this same daemon, so
-# one idle gateway->member socket also keeps that member's accepted socket, its
-# own backend socket, and the two pipes it splices them with.  /proc/PID/fd is
-# the whole daemon and counts all four runtimes; against plain servers the same
-# connection would cost three.  Slack stays a flat 40 either way -- it does not
-# scale with the pool, so a real leak of a few dozen descriptors is still red
-# no matter how many connections were legitimately retained.
-#
-# The count is read on both sides of the descriptor tally and the larger one
-# wins.  The load driver has been waited on, so nothing new is being opened and
-# the pool only shrinks from here -- but the idle sweep may fire between the two
-# readings, and charging fewer connections than the tally still includes is
-# exactly how this check would go red for the wrong reason.
+# Descriptors can only be bounded rather than returned to baseline, at seven
+# per pooled connection because the members are themselves splicing proxies in
+# this daemon, with a flat 40 of slack and the larger of two readings winning
+# because the idle sweep may fire between them.
 POOL_A_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_A_RC=$?
 FD1=$(ls /proc/"$DPID"/fd 2>/dev/null | wc -l || true)
 POOL_B_RAW=$("$BIN" stats "$GW_NAME" 2>/dev/null); POOL_B_RC=$?
