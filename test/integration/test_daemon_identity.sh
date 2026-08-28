@@ -1,57 +1,22 @@
 #!/usr/bin/env bash
-# Integration test: the CLI identifies the daemon before it talks to it.
-#
-# `ensure_daemon()` in cli.cpp decided whether a daemon existed by connect()ing
-# to the socket path and believing the answer.  connect() answers one question —
-# "is anything listening here" — and the CLI was reading it as the answer to a
-# different one: "is the thing listening here the daemon I am about to hand a
-# command to".  Any AF_UNIX listener on that path collects the answer yes.
-#
-# The test side of this tree stopped identifying by the wrong property a while
-# ago.  81dcf4a rewrote lib_daemon.sh to find a daemon by the inode of the
-# socket it serves rather than by the process's name, because a binary copied
-# under another name was being reported dead while it was serving.  f6670f8
-# gave a cluster node an identity triple so it could tell "me, again" from
-# "somebody else".  Production still asked connect().
-#
+# ensure_daemon decided a daemon existed by connect()ing and believing the
+# answer, which tells you only that something is listening -- while the test
+# side of this tree stopped identifying by the wrong property long ago.
 # ─── WHY THE FAILURE IS ASYMMETRIC ──────────────────────────────────────────
-#
-# A false negative — "no daemon" while one is serving — forks a spare daemon,
-# which finds the socket taken and exits 0.  One wasted process.
-#
-# A false positive — "a daemon" while something else is bound — means every
-# command in the session is delivered to a stranger.  `create server db -p 9000`
-# is written, in full, to whatever accepted the connection, and if that thing
-# writes back so much as two zero bytes the CLI reads a framed reply of exit
-# code 0 with no text and reports success, in a shell whose convention is that
-# silence means it worked.  Nothing was created.  The operator is told it was.
-#
+# A false negative forks one wasted daemon, while a false positive writes the
+# operator's whole command to a stranger -- and a stranger that answers two
+# zero bytes makes the CLI report exit 0 with no text, which in this shell
+# means it worked.
 # ─── WHAT IS ASSERTED ───────────────────────────────────────────────────────
-#
-# Not the exit code alone.  Against the mute impostor the exit code was already
-# non-zero before this change — ipc_send's read timeout expires and the CLI
-# says "failed to connect to daemon" — so an exit-code assertion there passes
-# on the broken build and proves nothing.  The oracle is what the impostor
-# RECEIVED: a command that was never sent cannot have been misdelivered.
-#
-# The impostors:
-#
-#   mute     accepts, reads, never writes.  A program that has the path open
-#            for its own reasons.
-#   yes-man  accepts, reads, writes \x00\x00 — a well-formed socketley reply
-#            frame meaning "exit 0, no output".  This is the one that turns a
-#            misdelivered command into a reported success.
-#
+# The oracle is what the impostor received rather than the exit code, which was
+# already non-zero against the mute one -- with two impostors, a mute program
+# that has the path open for its own reasons and a yes-man whose well-formed
+# reply frame turns a misdelivered command into a reported success.
 # ─── THE CONTROLS ───────────────────────────────────────────────────────────
-#
-# A probe that refuses everything would pass every assertion above, so three
-# assertions have to hold in the other direction:
-#
-#   * a real daemon is still found, and a `create` against it still works;
-#   * a real daemon is still AUTO-STARTED from cold, which is the whole point
-#     of ensure_daemon and the thing a stricter probe is most likely to break;
-#   * a stale socket file left by a killed daemon still auto-starts a daemon,
-#     rather than being mistaken for an occupied path.
+# Three assertions in the other direction, because a probe that refuses
+# everything would pass every assertion above: a real daemon is still found,
+# still auto-started from cold, and a stale socket file left by a killed daemon
+# still auto-starts one.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -72,29 +37,23 @@ bad() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
-# Does HAYSTACK contain NEEDLE.
-#
-# NOT `printf '%s' "$x" | grep -q "$n"`.  This file runs under `set -o
-# pipefail` and `grep -q` exits at its first match, which hands the writer a
-# SIGPIPE; the pipeline then reports 141 and the `if` takes the "no match"
-# branch precisely when it matched.  lib_daemon.sh carries the same warning
-# over daemon_starting_pids; test_ps_failed_visible.sh carries the account of
-# it actually happening.  A case statement has no pipeline and cannot do it.
+# A case statement rather than `grep -q`, which exits at its first match and
+# under pipefail takes the no-match branch precisely when it matched.
 has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 IMP_PID=""
 
-# Kill the impostor and take the path back to empty.  Between scenarios, not
-# only at the end: every scenario below starts from "nothing is bound here".
+# Kill the impostor and take the path back to empty between scenarios, because
+# every scenario below starts from nothing being bound here.
 clear_socket() {
     if [ -n "$IMP_PID" ]; then
         kill "$IMP_PID" 2>/dev/null || true
         wait "$IMP_PID" 2>/dev/null || true
         IMP_PID=""
     fi
-    # Anything the CLI auto-started during a scenario goes too.  A daemon left
-    # on this run's socket outlives the test and is the one thing this file is
-    # not allowed to do.
+    # Anything the CLI auto-started during a scenario goes too, because a
+    # daemon left on this run's socket outliving the test is the one thing this
+    # file may not do.
     daemon_sweep "$SOCKETLEY_SOCKET"
     rm -f "$SOCKETLEY_SOCKET"
 }
@@ -108,10 +67,8 @@ trap cleanup EXIT
 echo "=== Integration: the CLI identifies the daemon before it talks to it ==="
 
 # ─── the impostor ────────────────────────────────────────────────────────────
-#
-# Binds the daemon's socket path and writes down every byte it is handed.  In
-# `yes` mode it answers each connection with a framed reply the CLI parses as
-# success; in `mute` mode it answers nothing at all.
+# Binds the daemon's socket path and writes down every byte it is handed,
+# answering with a frame the CLI parses as success or with nothing at all.
 IMPOSTOR_PY=$SOCKETLEY_TMPD/impostor.py
 cat > "$IMPOSTOR_PY" <<'PY'
 import os, socket, sys, threading
@@ -179,24 +136,17 @@ start_impostor() {
 # What the impostor was handed, or empty.
 heard() { [ -f "$IMP_LOG" ] && cat "$IMP_LOG" || true; }
 
-# The identity probe is itself a message, so "the impostor heard nothing" is the
-# wrong oracle — it can never be true of a probe that asks a question.  What has
-# to be true is that the question is ALL it heard: the operator's command, with
-# the runtime's name, its type and its port in it, must not be written to a
-# program that has not answered the question.
-#
-# Stated as an exact match rather than "does not contain create", so that a
-# probe which asks its question and then sends the command anyway is caught, and
-# so is one that leaks any other command on the way.
+# The probe is itself a message, so what has to be true is that the question is
+# all the impostor heard -- stated as an exact match, so a probe that asks and
+# then sends the command anyway is caught.
 only_the_probe() {
     [ "$(heard | tr -d '\n')" = "ping" ]
 }
 
 # ─── 1. the yes-man ──────────────────────────────────────────────────────────
-#
-# The dangerous one.  It answers every connection with a success frame, so a
-# CLI that believes connect() reports that a runtime was created on a machine
-# where nothing was.
+# The dangerous one: it answers every connection with a success frame, so a CLI
+# that believes connect() reports a runtime created on a machine where nothing
+# was.
 clear_socket
 start_impostor yes
 
@@ -226,9 +176,8 @@ if has "$OUT" "$SOCKETLEY_SOCKET"; then ok; else
 fi
 
 # ─── 2. the mute impostor ────────────────────────────────────────────────────
-#
-# Exit code proves nothing here — it was already non-zero.  The oracle is
-# whether the command text left the CLI at all.
+# The exit code proves nothing here because it was already non-zero, so the
+# oracle is whether the command text left the CLI at all.
 clear_socket
 start_impostor mute
 
@@ -244,11 +193,9 @@ if only_the_probe; then ok; else
         "  $(printf '%s' "$HEARD" | head -c 200 | tr -d '\000')"
 fi
 
-# ─── 3. CONTROL: a real daemon is still found, and still auto-started ────────
-#
-# Nothing above is worth anything if the probe simply refuses everything.  This
-# is the cold path: no socket file, no daemon, one CLI command, which must fork
-# a daemon of its own and then use it.
+# Nothing above is worth anything if the probe simply refuses everything, so
+# this is the cold path: no socket file, no daemon, one CLI command that must
+# fork a daemon and then use it.
 clear_socket
 
 if [ ! -e "$SOCKETLEY_SOCKET" ]; then ok; else
@@ -276,12 +223,9 @@ if has "$LS" "realsrv"; then ok; else
         "ls does not list realsrv:" "  ${LS:-<nothing>}"
 fi
 
-# ─── 4. CONTROL: a stale socket file still auto-starts ───────────────────────
-#
-# A daemon killed with SIGKILL leaves the socket file behind and its listening
-# row in /proc/net/unix goes in the same instant.  connect() to it fails, so
-# this case was already right — and it has to stay right, because the obvious
-# way to write a stricter probe is to look at the file.
+# A SIGKILLed daemon leaves the socket file behind while its listening row goes
+# in the same instant, so this case was already right and has to stay right --
+# because the obvious way to write a stricter probe is to look at the file.
 "$BIN" remove realsrv >/dev/null 2>&1 || true
 DPIDS=$(daemon_pids "$SOCKETLEY_SOCKET")
 for p in $DPIDS; do kill -9 "$p" 2>/dev/null || true; done

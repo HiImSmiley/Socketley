@@ -1,74 +1,13 @@
 #!/usr/bin/env bash
-# Integration test: an HTTP client that vanishes with a response still owed is
-# torn down.
-#
-# THE SHAPE, which is not this runtime's alone
-#
-# Every teardown in server_instance runs out of a completion handler, and each
-# handler decides for itself whether the connection it just touched may be
-# finished.  Every one of those decisions goes through conn_ops_pending(), and
-# that predicate counts an armed read as a completion the ring owes.  For a
-# write and for a zero-copy notification that is true — the ring answers them
-# whatever the socket does.  For a read it is not: an armed recv is ended by the
-# peer sending something or by the socket ending, and a connection that is
-# closing is one whose peer has already gone.
-#
-# So a write that takes ECONNRESET marks the connection closing, declines to
+# A write that takes ECONNRESET marks the connection closing, declines to
 # finish it because a read is armed, and hands the teardown to an operation
-# whose only remaining trigger has already been consumed by the write.  The
-# connection then sits in m_clients holding its descriptor, its fixed-file slot
-# and its pool entry until the runtime stops.
-#
-# This is 87d2c9d's mechanism, which was found and fixed in the cache.  The
-# server's read is armed the same way — submit_recv_multishot_fixed_file, a
-# multishot recv on a direct descriptor — and free_fixed_file_slot() in
-# event_loop.cpp already records why that particular operation is the one that
-# cannot be relied on: it "could only ever end by itself, and by itself means
-# the peer or the socket".
-#
-# THE PROVOCATION
-#
-# A pipeline of GETs for a 4 MB file, then close with SO_LINGER (on, 0) so the
-# close is an RST and not a FIN.  The response is large enough that a write is
-# always in flight when the reset lands, which is what lets the write consume it
-# instead of the read.  Verifying clients run alongside throughout, so a healthy
-# connection is always present to be damaged by a recycled descriptor number.
-#
-# HONEST ABOUT THE RATE.  Whether an individual abort lands in the window is
-# luck: measured on 20 consecutive rounds against 77fb675, the count of stranded
-# connections went 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 2 2 3 3 3 — three strandings in
-# 20 rounds, or about 15% per round.  What is not luck is that a stranded
-# connection never goes away, so the rounds accumulate: this file runs several
-# and asserts once at the end, which is why one invocation catches it most of the
-# time rather than one in seven.  A single green run is therefore not proof; the
-# number that is proof is a rate over many invocations.
-#
-# WHAT IT CATCHES
-#   - a connection that is never reaped: 'connections' from 'stats' has to fall
-#     back to 0.  A connection with nothing left to wake it keeps that number
-#     above zero for as long as the runtime lives, and this is the sharpest
-#     assertion in the file
-#   - collateral damage: 'wrong' is a healthy client answered with the wrong
-#     bytes and 'reset' is a healthy connection closed by the runtime.  Both are
-#     zero in a correct build and both are what a recycled descriptor number
-#     looks like from the victim's side
-#   - a daemon left wedged: after the storm a runtime that never existed during
-#     it is created and has to serve a real round trip
-#
-# WHAT IT DOES NOT CATCH
-#   - a descriptor held by an unreaped connection.  There is deliberately no fd
-#     assertion here: the sample would have to be taken after the runtime is
-#     stopped, and teardown() closes every client socket it still holds, so a
-#     connection that was never reaped gives its descriptor back at that point
-#     like any other.  'delta=0' beside a failed drain is the expected reading,
-#     not a contradiction of it.  See the same note in
-#     test_abrupt_client_abort.sh, where it was read as a contradiction for a
-#     while
-#   - TLS, WebSocket, UDP, Lua or upstream paths: plain TCP, --http --http-cache
-#     only
-#   - the same defect in the proxy or the client.  Measured and reported
-#     separately; the proxy arms its client read on a plain descriptor rather
-#     than a fixed index and did not strand in 15,000 aborted connections
+# whose only trigger it has already consumed -- so a pipeline of GETs for a 4
+# MB file closed with SO_LINGER (on, 0) strands connections at about 15% a
+# round, which is why several rounds run and one assertion at the end says
+# whether `connections` fell back to 0, with healthy clients alongside to catch
+# a recycled descriptor number and a fresh runtime afterwards to catch a wedged
+# daemon; there is deliberately no fd assertion, because teardown closes every
+# client socket it still holds.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -86,17 +25,11 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-# Own daemon, socket and state directory.  Against the shared daemon
-# auto-restart puts a crashed runtime straight back, and a restarted runtime has
-# by definition dropped every connection it was holding — the check that matters
-# here would pass over the corpse.
-#
-# daemon_isolate rather than a hand-rolled mktemp: it does the same three things,
-# and run_group.sh reads the call as this file's declaration that it shares
-# nothing, which is what lets it run alongside the rest of its group instead of
-# in the serial tail.  The daemon itself is still started here, because the
-# assertions below need its pid to tell "it survived" from "something is
-# listening".
+# Own daemon, socket and state directory, because against the shared daemon
+# auto-restart puts a crashed runtime straight back and the check that matters
+# would pass over the corpse -- through daemon_isolate, which run_group.sh
+# reads as this file's declaration that it shares nothing, with the daemon
+# still started here because the assertions need its pid.
 daemon_isolate srvabort
 TMPDIR_T="$SOCKETLEY_TMPD"
 mkdir -p "$TMPDIR_T/www"
@@ -108,18 +41,15 @@ NAME=sab_srv
 ROUNDS=8            # see "HONEST ABOUT THE RATE" above
 LOAD_SECS=1.2       # per round
 PIPELINE=20         # GETs for the big file per aborted connection
-# One definition, used by the file that is written, the pre-storm assertion that
-# checks it came back whole, and nothing else.  4 MB so that a pipeline of 20
-# owes 80 MB and a write is certain to be in flight when the reset lands.
+# One definition, at 4 MB so that a pipeline of 20 owes 80 MB and a write is
+# certain to be in flight when the reset lands.
 BIG_BYTES=$((4 * 1024 * 1024))
 ABORT_THREADS=3
 VERIFY_THREADS=2
 DRAIN_SECS=10       # how long the runtime may take to reap its dead connections
 FINAL_SERVE_SECS=30
-# Floors, not targets.  Against this box one round produced roughly 600 aborts
-# and 250 verified round trips per round; these are set well below that so a
-# busy machine does not fail the test while a run that never got going still
-# does.
+# Floors rather than targets, set well below what this box produces so a busy
+# machine does not fail the test while a run that never got going still does.
 MIN_ABORTS=$((ROUNDS * 40))
 MIN_OK=$((ROUNDS * 8))
 
@@ -152,10 +82,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # By socket as well as by pid: a CLI command run while the daemon is not up
-    # starts one of its own, detached from this shell.  Matched by exact process
-    # name and never by command line — `pgrep -f` also matches the shell that
-    # merely carries the string in its own arguments, including this one.
+    # By socket as well as by pid and by exact process name, because a CLI
+    # command run while the daemon is down starts a detached one and `pgrep -f`
+    # also matches the shell carrying the string.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -171,9 +100,8 @@ cleanup() {
 trap cleanup EXIT
 
 # ── The document under load ────────────────────────────────────────────────
-# 4 MB, so that a pipeline of 20 owes the aborting client 80 MB and a write is
-# certain to be in flight when the reset arrives.  Content is fixed and checked
-# by the verifiers, so a wrong answer is distinguishable from no answer.
+# 4 MB so a pipeline of 20 owes 80 MB, with fixed content the verifiers check,
+# so a wrong answer is distinguishable from no answer.
 python3 - "$TMPDIR_T/www" "$BIG_BYTES" <<'PYEOF'
 import sys, os
 d = sys.argv[1]
@@ -465,7 +393,7 @@ else
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
 fi
 
-# ...and the daemon answering is the one this test launched.  Without this a
+# ...and the daemon answering is the one this test launched, without which a
 # zombie $DPID would be reported at the very end rather than here.
 TOTAL=$((TOTAL+1))
 if [ -d "/proc/$DPID/fd" ]; then
@@ -489,13 +417,9 @@ else
     echo "  FAIL [setup]: the server never answered a request at all"
 fi
 
-# ...and it serves THE FILE THE ABORTERS ASK FOR, whole.  Separate from the
-# probe above on purpose: that one fetches /small.txt, and a green /small.txt
-# says nothing about /big.txt.  A missing or truncated /big.txt answers every
-# aborted connection with a 404 instead of 80 MB — no write is then in flight
-# when the reset arrives, the provocation is empty, and every zero below would
-# pass while measuring nothing.  This is the assertion that can fail against
-# that, and it is the reason the storm's numbers mean anything.
+# It serves the file the aborters ask for, whole, because a missing or
+# truncated /big.txt answers every aborted connection with a 404 and leaves no
+# write in flight -- so every zero below would pass while measuring nothing.
 TOTAL=$((TOTAL+1))
 PRIMED=$(python3 "$H" primed "$PORT" "$BIG_BYTES" 2>&1 || true)
 if [ "$PRIMED" = "PRIMED status=ok want=$BIG_BYTES" ]; then
@@ -568,24 +492,20 @@ assert_zero() {  # value label
     fi
 }
 
-# The failure window actually opened.  Precisely: this counts clients that got a
-# full pipeline onto the wire and were then reset — it is the client's own view,
-# and it does not by itself prove the server began a response to any of them.
-# What proves that is the /big.txt assertion in the setup above (the response is
-# 4 MB, so a write is in flight) together with the healthy-traffic floor below.
-# A run that finished before the storm started fails here rather than passing.
+# The failure window actually opened: this counts clients that got a full
+# pipeline onto the wire and were then reset, so a run that finished before the
+# storm started fails here rather than passing.
 assert_min "$T_AB" "$MIN_ABORTS" "enough clients sent a full pipeline and were reset"
 
-# Collateral damage on the healthy clients running alongside.  Timeouts are
-# printed but not asserted on: on a loaded machine a timeout is usually
-# scheduling, and asserting it would make this flaky for a reason it is not
-# about.
+# Timeouts are printed but not asserted on, because on a loaded machine a
+# timeout is usually scheduling and asserting it would make this flaky for a
+# reason it is not about.
 assert_zero "$T_WRONG" "the server answered a healthy client with the wrong bytes"
 assert_zero "$T_RESET" "the server closed a healthy connection"
 
-# Zeroes above are worthless if barely any healthy traffic got through.  Zero
-# still fails in every build: "the sanitizer is slow" and "nothing got through
-# at all" are not the same statement and only the first is excused.
+# Zeroes above are worthless if barely any healthy traffic got through, and
+# zero still fails in every build -- "the sanitizer is slow" and "nothing got
+# through" are not the same statement.
 if [ -n "$SANITIZED" ] && [ "$T_OK" -gt 0 ]; then
     not_asserted "enough healthy traffic to mean something" \
         "ok=$T_OK against a floor of $MIN_OK calibrated on a Release build"
@@ -594,8 +514,8 @@ else
 fi
 
 # ── The point of the test ──────────────────────────────────────────────────
-# Every client is gone.  A connection nothing will ever wake keeps this number
-# above zero for as long as the runtime lives.
+# Every client is gone, because a connection nothing will ever wake keeps this
+# number above zero for as long as the runtime lives.
 wait_conns_zero() {   # seconds
     local end v="unreadable"
     end=$(( $(date +%s) + $1 ))

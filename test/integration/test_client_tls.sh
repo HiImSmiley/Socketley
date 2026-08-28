@@ -1,36 +1,12 @@
 #!/usr/bin/env bash
-# Integration test: a client runtime dials its target over TLS, and verifies it.
-#
-# The transport half of this is easy to see: bytes arrive at a TLS listener and
-# come back.  The half that cannot be seen from outside is the verification, and
-# it is the half that matters -- a client that encrypts and trusts anybody looks
-# exactly like one that encrypts and checks, right up until somebody stands in
-# the middle.  An unverified TLS client is worse than a cleartext one, because
-# cleartext at least does not claim to be safe.  socketley's Lua http client had
-# exactly that defect once; this file exists so the runtime cannot grow it back.
-#
-# So most of the assertions here are refusals, with two control cases in front
-# of them.  Without the controls the file could pass by having no working
-# configuration at all -- four silences prove nothing if the fifth case is
-# silent too.  With them, the file says: these configurations work, those do
-# not, and the only difference between them is who signed the certificate, who
-# it was issued to, and whether it had expired.
-#
-# WHAT IT CHECKS
-#   1. control: a peer whose certificate is signed by --ca is talked to, and
-#      the bytes on the wire are a TLS record and not the plaintext line
-#   2. control: --tls plus --ca is what did it -- the same peer, dialled
-#      without --tls, gets nothing a TLS listener can use
-#   3. a CA that signed nothing here is refused
-#   4. an expired certificate is refused
-#   5. a certificate that verifies but was issued to another name is refused
-#   6. no --ca at all: a self-signed peer is refused against the system store
-#   7. a plaintext peer is refused -- a TLS client never falls back
-#   8. every refusal leaves the runtime dialling, never delivering: the peer
-#      logs no application data from any of them
-#   9. the configuration gate: --cert without --key, --key without --cert, a
-#      certificate with no --tls, and --tls on a UDP client are all refused
-#  10. a cache still refuses TLS outright
+# A client that encrypts and trusts anybody looks exactly like one that
+# encrypts and checks, right up until somebody stands in the middle, so most of
+# what is asserted here are refusals -- an unknown CA, an expired certificate,
+# a chain that verifies under the wrong name, a self-signed peer against the
+# system store, a plaintext peer -- with two controls in front, since four
+# silences prove nothing if the fifth case is silent too, plus the peer's log
+# showing no refusal ever delivered anything, the configuration gate, and a
+# cache still refusing TLS outright.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -60,11 +36,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # A CLI command run against a daemon that is not up yet starts one of its
-    # own, detached from this shell.  The socket path comes from mktemp, so this
-    # can only ever match our own.  Matching on the environment and not on the
-    # command line is deliberate: a -f pattern also matches the shell carrying
-    # the pattern, which is this script.
+    # Matched on the environment rather than the command line, because a -f
+    # pattern also matches the shell carrying it, and the socket path comes
+    # from mktemp so this can only hit our own.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         if grep -qx "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" \
                 < <(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null); then
@@ -87,14 +61,9 @@ if ! python3 -c "import ssl" >/dev/null 2>&1; then
     echo "  SKIP: python3 has no ssl module"; exit 0
 fi
 
-# Four certificates, each isolating one reason to refuse.
-#   peer      -- valid, for 127.0.0.1, used as its own CA in the control case
-#   other     -- a CA that signed nothing here
-#   expired   -- valid name, valid self-signature, and already past its notAfter
-#   wrong     -- issued to a name this client never dials; handed over as the CA
-#                too, so the *chain* verifies and only the name check can reject
-#                it.  That is the case a chain-only check passes and a correct
-#                one does not, which is the difference this file exists to hold.
+# Four certificates, each isolating one reason to refuse -- with the wrong-name
+# one handed over as the CA too, so the chain verifies and only the name check
+# can reject it, which is the case a chain-only check passes.
 gen() {  # $1 = base, $2 = CN, $3 = SAN, $4... = extra openssl args
     local base=$1 cn=$2 san=$3; shift 3
     openssl req -x509 -newkey rsa:2048 -keyout "$TMPD/$base.key" -out "$TMPD/$base.pem" \
@@ -106,11 +75,9 @@ gen other   unrelated        "DNS:unrelated"       -days 2 \
   || { echo "  SKIP: could not generate a test certificate"; exit 0; }
 gen wrong   elsewhere.example "DNS:elsewhere.example" -days 2 \
   || { echo "  SKIP: could not generate a test certificate"; exit 0; }
-# An expired certificate needs an explicit validity window in the past, and
-# `openssl req -x509` grew -not_before only in 3.5.  python's cryptography
-# module can always set one, so it mints this case where it is installed; where
-# neither is available the case is skipped rather than silently turned into a
-# valid certificate that would assert nothing.
+# An expired certificate needs an explicit window in the past, which `openssl
+# req -x509` grew only in 3.5, so python mints it where installed and the case
+# is skipped rather than silently turned into a valid certificate.
 HAVE_EXPIRED=0
 if openssl req -x509 -newkey rsa:2048 -keyout "$TMPD/expired.key" \
         -out "$TMPD/expired.pem" -nodes -subj "/CN=127.0.0.1" \
@@ -143,9 +110,9 @@ then
     HAVE_EXPIRED=1
 fi
 
-# The peer.  It speaks TLS when given a certificate and plaintext when not, and
-# it logs one line per *application* message it receives -- which is the log the
-# refusals below are checked against.  A refused handshake never produces one.
+# The peer speaks TLS when given a certificate and plaintext when not, logging
+# one line per application message, which is the log the refusals below are
+# checked against.
 cat > "$TMPD/peer.py" <<'PYEOF'
 import socket, ssl, sys, threading
 
@@ -254,9 +221,8 @@ start_peer "$TMPD/peer.log" tls "$TMPD/peer.pem" "$TMPD/peer.key"
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# Create a client, start it, send one line, and report whether the peer received
-# it as application data.  "yes" means the handshake completed and the message
-# crossed; "no" means it did not, for whatever reason.
+# Create a client, start it, send one line, and report whether the peer
+# received it as application data.
 delivered() {   # $1 = name, $2 = marker, $3... = create flags
     local name=$1 marker=$2; shift 2
     "$BIN" create client "$name" -t "127.0.0.1:$PEER" "$@" -s >/dev/null 2>&1
@@ -281,9 +247,8 @@ else
 fi
 
 # ── 2. control: it was --tls that did it ─────────────────────────────────────
-# The same peer, the same address, without --tls.  A TLS listener cannot make a
-# plaintext line into a handshake, so nothing is delivered -- which is what says
-# case 1 above went through the record layer rather than past it.
+# The same peer without --tls delivers nothing, which is what says case 1 went
+# through the record layer rather than past it.
 R=$(delivered tplain m-2)
 if [ "$R" = "no" ]; then ok; else
     bad "a cleartext client gets nothing from a TLS peer" \
@@ -309,11 +274,9 @@ else
     echo "  SKIP: neither openssl nor python could mint an expired certificate"
 fi
 
-# ── 5. the chain verifies, the name does not ─────────────────────────────────
-# The peer now presents a certificate for elsewhere.example, and that same
-# certificate is handed to the client as its CA -- so SSL_VERIFY_PEER is
-# satisfied and only the name check stands between this and a connection to
-# whoever holds that key.
+# The peer's certificate for another name is handed to the client as its CA, so
+# verification is satisfied and only the name check stands between this and a
+# connection to whoever holds that key.
 start_peer "$TMPD/peer_wrong.log" tls "$TMPD/wrong.pem" "$TMPD/wrong.key"
 R=$(delivered tbadname m-5 --tls --ca "$TMPD/wrong.pem")
 if [ "$R" = "no" ]; then ok; else
@@ -343,9 +306,8 @@ if grep -q "saw-tls-record" "$TMPD/peer_plain.log" 2>/dev/null; then ok; else
         "no TLS record reached the peer, so case 7 may have passed by never connecting"
 fi
 
-# ── 8. nothing was ever delivered by a refused configuration ─────────────────
-# Every refusal above ends during the handshake.  If any of them had fallen back
-# to cleartext, or verified nothing, the peer would have logged its marker.
+# Every refusal above ends during the handshake, so any that had fallen back to
+# cleartext or verified nothing would have left its marker in the peer's log.
 if grep -qE "^got m-[234567]\$" "$TMPD"/peer*.log 2>/dev/null; then
     bad "a refused peer is never talked to anyway" \
         "the peer logged application data from a configuration that failed verification"
@@ -354,8 +316,8 @@ else
 fi
 
 # ── 9. the configuration gate ────────────────────────────────────────────────
-# Each of these is a configuration that could only present nothing, verify
-# nothing, or dial in the clear.  They are refused where they are typed.
+# Each of these could only present nothing, verify nothing, or dial in the
+# clear, so they are refused where they are typed.
 "$BIN" create client thalf1 -t "127.0.0.1:$PEER" --tls --cert "$TMPD/peer.pem" >/dev/null 2>&1
 if [ $? -ne 0 ]; then ok; else bad "--cert without --key is refused" "it was accepted"; fi
 "$BIN" create client thalf2 -t "127.0.0.1:$PEER" --tls --key "$TMPD/peer.key" >/dev/null 2>&1
@@ -363,19 +325,10 @@ if [ $? -ne 0 ]; then ok; else bad "--key without --cert is refused" "it was acc
 "$BIN" create client tnotls -t "127.0.0.1:$PEER" --ca "$TMPD/peer.pem" >/dev/null 2>&1
 if [ $? -ne 0 ]; then ok; else bad "--ca without --tls is refused" "it was accepted"; fi
 
-# --tls on a UDP client would need DTLS.  The flags are accepted in either
-# order, so this is caught at start rather than at parse -- and what happens
-# then depends on how the runtime was started, so both ways are asked.
-#
-# `create -s` refuses: exit 2, "could not start runtime", and the runtime it had
-# already made is unwound, so nothing named tudp is left in any listing.  The
-# assertion this replaced looked for the string "failed" in `ps -a` or for the
-# absence of tudp from `ps`.  The first half could never match -- the runtime is
-# gone, not failed -- so the whole thing rested on the second, which is also
-# satisfied by a create that failed for any other reason, a typo in the flag
-# among them.  So the exit code is asserted too, and the absence is asked of
-# `ls` as well, because `ps` without -a would not show this runtime even if it
-# did exist and had come up.
+# --tls on a UDP client would need DTLS and the flags are accepted in either
+# order, so it is caught at start and asked both ways -- with the exit code
+# asserted and the absence asked of `ls` as well, because the old oracle rested
+# on a `ps` check that any failed create satisfies.
 "$BIN" create client tudp -t "127.0.0.1:$PEER" --udp --tls -s >/dev/null 2>&1
 CREATE_RC=$?
 sleep 0.5
@@ -385,20 +338,10 @@ if [ $CREATE_RC -ne 0 ] && ! printf '%s\n' "$LISTED" | grep -q "tudp"; then ok; 
         "a UDP client came up under a TLS configuration and is sending datagrams in the clear"
 fi
 
-# And without -s the create itself is refused, so nothing is left behind at all.
-#
-# This assertion used to be the other way round: create, then start, then look
-# for the runtime sitting in `failed`.  That was the behaviour while the pair
-# was caught in client_instance::setup(), which a placeholder for a runtime in
-# a worker never runs — so the same command was refused in the daemon and
-# accepted out of it.  The rule is a question about two flags and needs no
-# socket to answer, so it moved to tls_config_refusal, where every other
-# impossible TLS combination is answered, and it is now refused at create like
-# its siblings above.
-#
-# The property that assertion also covered — a runtime whose start fails stays
-# visible and `failed` — is not lost: test_ps_failed_visible.sh holds it down,
-# with a port conflict, which is a trigger nothing can decide in advance.
+# Without -s the create itself is refused, because the rule is a question about
+# two flags that needs no socket to answer and moved to tls_config_refusal --
+# while the property the old assertion also covered, a runtime whose start
+# fails staying visible and failed, is held down by test_ps_failed_visible.sh.
 "$BIN" create client tudp2 -t "127.0.0.1:$PEER" --udp --tls >/dev/null 2>&1
 CREATE2_RC=$?
 sleep 0.3

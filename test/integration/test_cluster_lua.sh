@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# Integration test: Lua cluster introspection API + event callbacks
-#
-# Starts 2 daemons with a shared cluster directory, creates servers with
-# Lua scripts that exercise socketley.cluster.* and on_cluster_* callbacks,
-# then verifies the output.
-#
-# Two daemons in one filesystem namespace is a simulation of a cluster, not how
-# one is deployed: members find each other through the shared cluster directory
-# and the network addresses they advertise there, never through socket paths.
-# Both sockets and the state directory are per-run — they used to be two fixed
-# names in /tmp and the caller's real state directory.
+# Two daemons with a shared cluster directory running scripts that exercise
+# socketley.cluster.* and the on_cluster_* callbacks -- a simulation, since
+# members find each other through the directory and the addresses they
+# advertise rather than through socket paths, and both sockets and the state
+# directory are per-run.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -25,8 +19,8 @@ CLUSTER_DIR="$TMPD/cluster"
 mkdir -p "$CLUSTER_DIR"
 SOCK_A="$TMPD/nodeA.sock"
 SOCK_B="$TMPD/nodeB.sock"
-# One base, so this file can be driven on a private port block while it is being
-# changed.  The default is the pair it has always used.
+# One base, so this file can be driven on a private port block while it is
+# being changed.
 PB=$((SL_PORT_BASE+401))
 PORT_A=$((PB + 0))
 PORT_B=$((PB + 1))
@@ -36,8 +30,8 @@ DAEMON_PIDS=()
 # Unique runtime names
 RT_A="clua_srvA"
 RT_B="clua_srvB"
-# Created on nodeA and never started.  A cluster callback is a callback, and a
-# runtime that has never run must not execute one; see Test 2b.
+# Created on nodeA and never started, because a cluster callback is a callback
+# and a runtime that has never run must not execute one.
 RT_N="clua_srvN"
 
 # Temp files for Lua output
@@ -53,14 +47,9 @@ nodeB() { SOCKETLEY_SOCKET="$SOCK_B" "$BIN" "$@"; }
 
 cleanup() {
     set +e
-    # Only talk to a daemon that is answering.  Test 6 kills nodeB's daemon on
-    # purpose, and these loops then ran `nodeB stop` and `nodeB remove` against
-    # its dead socket — which auto-starts a detached daemon rather than failing,
-    # because that is what every CLI command except `daemon`, `version` and
-    # `help` does when the socket is silent.  Nothing below could kill it: its
-    # pid slot is 0 by then, and the `rm -f` unlinked the socket so it could not
-    # even be found again.  That is one of the two daemons a full suite run left
-    # behind; test_cluster.sh left the other.
+    # Only talk to a daemon that is answering, because test 6 kills nodeB's on
+    # purpose and a CLI command against its dead socket auto-starts a detached
+    # daemon nothing below could find again.
     for sock in "$SOCK_A" "$SOCK_B"; do
         daemon_alive "$sock" || continue
         for rt in "$RT_A" "$RT_B" "$RT_N"; do
@@ -97,20 +86,12 @@ assert_contains() {
     fi
 }
 
-# assert_ge GOT WANT LABEL
-#
-# Defined since this file was written and called by none of it: every numeric
-# thing the script reported was checked with assert_contains, which asks whether
-# the KEY is present and never looks at the value.  "runtimes_count=" is
-# satisfied by runtimes_count=0, "api_group_count=" by a group of one — so the
-# two assertions that are supposed to prove this daemon can see across the
-# cluster passed on a view that contained only itself.  The counts below are the
-# ones a second daemon changes.
-#
-# `2>/dev/null` on the comparison because GOT is extracted from a file the Lua
-# script writes: an absent line yields the empty string, `[ "" -ge 2 ]` is an
-# error rather than a false, and under `set -e` that would end the run at the
-# assertion instead of reporting it.
+# Every numeric thing the script reported used to be checked with
+# assert_contains, which asks whether the key is present and never looks at the
+# value, so the two assertions meant to prove this daemon sees across the
+# cluster passed on a view containing only itself -- with `2>/dev/null` because
+# an absent line yields the empty string and `[ "" -ge 2 ]` is an error that
+# would end the run at the assertion.
 assert_ge() {
     TOTAL=$((TOTAL+1))
     if [ "${1:-}" -ge "$2" ] 2>/dev/null; then
@@ -121,10 +102,8 @@ assert_ge() {
     fi
 }
 
-# num_max KEY — the largest value the script wrote for KEY, or empty if it never
-# wrote one.  The largest and not the last: on_tick reports repeatedly while the
-# cluster view is still filling in, so the last line can be a snapshot taken
-# before the remote daemon was visible.
+# The largest value rather than the last, because on_tick reports repeatedly
+# while the cluster view is still filling in.
 num_max() {
     { grep -aoE "^$1=[0-9]+$" "$LUA_OUT" 2>/dev/null || true; } \
         | cut -d= -f2 | sort -n | tail -1
@@ -204,11 +183,9 @@ end
 LUAEOF
 
 # ─── Start daemon A ──────────────────────────────────────────────────────────
-#
-# The configuration call below is a CLI command, so it auto-starts a detached
-# daemon of its own if the socket is not answering yet.  The `sleep 0.3` it used
-# to wait was a guess; losing that guess did not fail loudly, it silently left a
-# daemon nobody had the pid of.  Wait for the daemon to say it is up instead.
+# Wait for the daemon to say it is up, because the configuration call below is
+# a CLI command that would otherwise auto-start a detached daemon nobody has
+# the pid of.
 start_node() {   # start_node SOCKET NAME [env assignments...]
     local sock=$1 name=$2 i; shift 2
     env "$@" SOCKETLEY_SOCKET="$sock" "$BIN" daemon >>"$TMPD/$name.log" 2>&1 &
@@ -230,10 +207,8 @@ sleep 0.2
 
 # ─── Create server on A with Lua script ─────────────────────────────────────
 # create_ok takes the whole command because these go through the per-node
-# wrapper functions rather than through $BIN directly.  A script the daemon
-# refuses to load makes `create` fail, and every assertion below reads the file
-# that script writes — so a refusal used to be reported as "the callback never
-# fired", which is the defect this file exists to catch.
+# wrappers, and a script the daemon refuses to load used to be reported as "the
+# callback never fired" -- the defect this file exists to catch.
 create_ok "server on nodeA created with the cluster script" \
     nodeA create server "$RT_A" -p "$PORT_A" -g api --lua "$LUA_SCRIPT" \
  -s
@@ -250,16 +225,9 @@ assert_ge "$(num_max stats_running)" 1 "cluster.stats().running at on_start"
 assert_ge "$(num_max stats_groupcount)" 1 "cluster.stats().groups is not empty"
 assert_ge "$(num_max stats_group_api)" 1 "cluster.stats().groups counts the api group"
 
-# ─── A runtime on A that is created and never started ───────────────────────
-#
-# Same daemon, same cluster, its own script and its own output file — the file
-# is why it needs a script of its own rather than a second copy of the one
-# above: both would append to CLUA_OUT_FILE and "JOIN=nodeB" would not say whose
-# callback wrote it.  The path is baked in for the same reason, since the
-# environment variable belongs to the daemon and both runtimes inherit it.
-#
-# Registered before nodeB exists, so the join it must not hear has not happened
-# yet when it is created.
+# Its own script and its own output file, because two runtimes appending to one
+# file could not say whose callback wrote a line, and registered before nodeB
+# exists so the join it must not hear has not happened yet.
 cat > "$NEVER_SCRIPT" <<LUAEOF
 local out_file = "$NEVER_OUT"
 local function append(line)
@@ -274,19 +242,11 @@ function on_group_change(group, members)
 end
 LUAEOF
 # ─── Started, proved loaded, then stopped ───────────────────────────────────
-#
-# It used to be created and never started, and LOADED was written by the
-# script's top level during the `create`.  That worked because `create --lua x`
-# in the daemon loaded AND RAN the script.  Every runtime is in a worker now, a
-# worker exists from `start`, and a bare `create` only compiles -- so a
-# never-started runtime writes nothing, and the control that made this test
-# mean anything cannot be produced that way.
-#
-# Started, then stopped, and the claim is strictly stronger for it.  "Never
-# started" left open whether the callbacks had ever been registered; this one
-# has demonstrably registered them and then been stopped, so a line in the file
-# afterwards is delivery to a stopped runtime and nothing else.  Stopped before
-# nodeB exists, so the join it must not hear has not happened yet.
+# Started and then stopped rather than never started, because a worker exists
+# only from `start` and a bare `create` now only compiles -- and the claim is
+# stronger for it, since a runtime that has demonstrably registered its
+# callbacks and then been stopped makes any later line delivery to a stopped
+# runtime.
 create_ok "server on nodeA that will be stopped created" \
     nodeA create server "$RT_N" -p "$PORT_N" -g api --lua "$NEVER_SCRIPT" -s
 
@@ -313,16 +273,9 @@ echo "  Test 2: on_cluster_join fires for new daemon"
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "JOIN=nodeB"
 
-# ─── Test 2b: the stopped runtime heard none of it ──────────────────────────
-#
-# The assertion above is this one's control, and they are deliberately about the
-# same event: nodeB joined, the running runtime's on_cluster_join fired for it,
-# and a runtime on the same daemon that is stopped must not have run a line.  A
-# build that delivered to neither would fail Test 2 first.
-#
-# LOADED proves the second half that an absence cannot: the script was read, ran
-# and registered its callbacks, so "nothing in the file after the stop" is a
-# decision about delivery rather than a script that never ran.
+# The assertion above is this one's control and both are about the same join,
+# so a build that delivered to neither would fail test 2 first -- with LOADED
+# proving the script ran and registered, which an absence cannot.
 echo "  Test 2b: a stopped runtime hears no cluster event"
 NEVER=$(cat "$NEVER_OUT" 2>/dev/null || echo "")
 assert_contains "$NEVER" "LOADED"
@@ -357,8 +310,8 @@ echo "  Test 5: cluster.group() returns group members"
 # that the local runtime is in the table it was put in.
 assert_ge "$(num_max api_group_count)" 2 "cluster.group(\"api\") members"
 
-# The argument on_group_change was handed, rather than only that it fired.  The
-# substring check in Test 3 is satisfied by members=0.
+# The argument on_group_change was handed rather than only that it fired,
+# because the substring check in test 3 is satisfied by members=0.
 assert_ge "$({ grep -aoE '^GROUP_CHANGE=api members=[0-9]+$' "$LUA_OUT" 2>/dev/null || true; } \
            | cut -d= -f3 | sort -n | tail -1)" 2 "on_group_change member count"
 
@@ -379,17 +332,10 @@ OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "LEAVE=nodeB"
 
 # ─── on_tick's argument ─────────────────────────────────────────────────────
-#
-# tick_ms is 500 and the man page says dt is "the actual elapsed time in
-# milliseconds since the last tick (double)".  Measured: 500.128.  Nothing had
-# ever read the argument, so neither the unit nor the magnitude was held down —
-# and the two plausible readings are a factor of a thousand apart, which a
-# script doing rate arithmetic gets wrong in silence.
-#
-# The bound is wide on purpose: this runs beside two daemons and a suite, so the
-# actual gap drifts.  What it excludes is the reading that matters — dt in
-# SECONDS would land at 500 thousandths, three orders of magnitude below the
-# floor, and dt in microseconds three above the ceiling.
+# Nothing had ever read dt, so neither its unit nor its magnitude was held down
+# -- and the bound is wide on purpose, excluding only the readings that matter,
+# since seconds would land three orders of magnitude below the floor and
+# microseconds three above the ceiling.
 DT_MILLI=$(num_max TICKDT_MILLI)
 assert_ge "$DT_MILLI" 300000 "on_tick dt is milliseconds and near tick_ms (lower bound)"
 TOTAL=$((TOTAL+1))
