@@ -5726,6 +5726,14 @@ void daemon_handler::reconcile_proxy_workers()
     // supervisor while the things holding them are still alive, and hands over
     // the identity to wait on; drain_retired_handlers() destroys it once the
     // loop says nothing more will name it.
+    // Runtimes whose whole shard set is being retired on this pass.  Told to
+    // let go of their routes AFTER the loops below, not during: forget() runs
+    // other runtimes' on_disconnect, and a script may answer that by creating
+    // or removing a runtime, which reconciles again -- into the container this
+    // is iterating.  Same rule, and the same reason, as the `died` list in the
+    // health tick.
+    std::vector<std::string> retired_names;
+
     const auto retire_one = [this](std::unique_ptr<proxy_supervisor> sup)
     {
         sup->shutdown();
@@ -5750,6 +5758,10 @@ void daemon_handler::reconcile_proxy_workers()
 
         if (w == wanted.end())
         {
+            // Recorded before the retire, because retire() nulls the
+            // supervisor's placeholder pointer and this is a name the map is
+            // about to stop holding either way.
+            retired_names.push_back(it->first);
             for (auto& sup : it->second)
                 retire_one(std::move(sup));
             // The region goes with the last shard.  Nothing may read it after
@@ -6143,6 +6155,16 @@ void daemon_handler::reconcile_proxy_workers()
             m_shard_client_regions.erase(name);
         }
     }
+
+    // ─── And now the routes, once nothing is iterating the map ──────────────
+    //
+    // A retire covers what the stop hook does not: a runtime whose whole shard
+    // set went away without runtime_manager::stop being the cause -- a rename,
+    // a shard count reduced to zero, a restore that no longer wants it.  It
+    // also fires a second time for an ordinary stop, which is why
+    // forget_runtime() is idempotent and says so.
+    for (const auto& n : retired_names)
+        route_relay::forget(&m_manager, n);
 }
 
 std::string daemon_handler::on_start_error(std::string_view name)
@@ -6418,6 +6440,10 @@ void daemon_handler::check_managed_health()
     // The children first: liveness, then whatever they have reported.  Both
     // before the managed-runtime sweep below, which can return early.
     bool routes_moved = false;
+    // Names whose child was found dead on this tick; see the fan-out below the
+    // loop for why they are collected rather than acted on in place.
+    std::vector<std::string> died;
+
     for (auto& [worker_name, shards] : m_proxy_workers)
     for (auto& sup : shards)
     {
@@ -6446,15 +6472,35 @@ void daemon_handler::check_managed_health()
         if (sup->take_reachability_change())
             routes_moved = true;
 
-        if (sup->check_liveness() && m_persistence)
+        if (sup->check_liveness())
         {
             // A child that died and was not restarted has moved the runtime to
             // `failed`; that has to reach the state file or a daemon restart
             // would bring back a runtime the operator was told had failed.
-            if (auto* inst = m_manager.get(worker_name))
-                m_persistence->save_runtime(inst);
+            if (m_persistence)
+                if (auto* inst = m_manager.get(worker_name))
+                    m_persistence->save_runtime(inst);
+
+            // ─── And every route in or out of it ────────────────────────────
+            //
+            // Whether it was restarted or marked failed, every connection that
+            // child held is gone -- a restarted worker comes back with an empty
+            // connection table, not with the old one.  So a target still holds
+            // handles for connections that no longer exist, and an origin still
+            // relays into a runtime that will never answer.
+            //
+            // This is the case route_op::forget was designed for and the one
+            // the stop hook does not reach: a killed worker runs no teardown,
+            // so nothing goes through runtime_manager::stop.  Collected rather
+            // than fanned out here, because forget() runs other runtimes'
+            // on_disconnect and a script is entitled to answer that by removing
+            // a runtime -- which erases from the map this loop is walking.
+            died.push_back(worker_name);
         }
     }
+    for (const auto& n : died)
+        route_relay::forget(&m_manager, n);
+
     poll_proxy_workers();
     reconcile_proxy_workers();
 
