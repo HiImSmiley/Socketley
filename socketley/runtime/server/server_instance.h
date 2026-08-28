@@ -45,16 +45,12 @@ struct alignas(64) server_connection
     // === HOT fields (CQE dispatch path) — first 2 cache lines ===
     int fd{-1};
     int fixed_idx{-1};       // io_uring fixed file table index (-1 = not registered)
-    // Identity of the connection currently living in this struct.  Structs are
-    // pooled and file descriptor numbers are reissued, so "same address, same
-    // fd" is not the same connection; every request this connection submits
-    // carries this stamp and the dispatcher compares before acting on it.
+    // Identity of the connection currently in this struct, because structs are
+    // pooled and descriptor numbers reissued, so same address and same fd is
+    // not the same connection.
     uint32_t generation{0};
-    // The half of this connection's conn_ref that varies.  `generation` above
-    // is the *loop's* stamp — 32 bits, process-wide, and it wraps, all of which
-    // is fine for deciding whether a completion still belongs to its submitter
-    // and none of which is fine for a name another process holds.  This one is
-    // 64 bits, per runtime, and never repeats.  See conn_identity.h.
+    // The half of this connection's conn_ref that varies, 64 bits and per
+    // runtime, because `generation` above is the loop's stamp and wraps.
     uint64_t ref_serial{0};
     bool direct_fd{false};   // true if fd came from direct-accept (fixed file index)
     bool read_pending{false};
@@ -69,26 +65,13 @@ struct alignas(64) server_connection
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
 
-    // === TLS session ===
-    // Non-null only on a listener configured with --tls.  OpenSSL never sees
-    // this socket: the session is fed ciphertext a read completion delivered
-    // and drained of ciphertext that a write submission carries, so nothing
-    // the kernel holds ever names it or its memory BIOs — every byte is copied
-    // into or out of a buffer this struct owns before any SQE is built.
-    //
-    // Who may free this: this struct, and nothing else.  It is released in
-    // pool_release() on the way back to the pool, in reset() as a second line
-    // of defence for a struct coming back out, and in ~server_connection for
-    // one that reaches neither because the runtime stopped with its
-    // completions still outstanding.  Because no completion can name the
-    // session, freeing it never has to wait on the ring — unlike the write
-    // batch and the file buffer beside it.
+    // Non-null only with --tls, on a memory BIO pair nothing the kernel holds
+    // ever names, and freed only by this struct -- which is what makes freeing
+    // it never have to wait on the ring.
     SSL* ssl{nullptr};
     tls_conn_state tls_state{tls_conn_none};
-    // The peer's close_notify, remembered rather than acted on.  The read that
-    // carries it can carry the last request ahead of it, and marking the
-    // connection closing before that request is parsed answers it with a
-    // dropped connection; handle_read applies this once the parse is done.
+    // The peer's close_notify, remembered rather than acted on, because the
+    // read that carries it can carry the last request ahead of it.
     bool tls_peer_closed{false};
 
     io_request read_req;
@@ -98,62 +81,25 @@ struct alignas(64) server_connection
     std::string partial;
     socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
 
-    // Relay traffic that arrived before this connection said what it speaks.
-    //
-    // A connection joins the relay set the moment it is accepted, but nothing
-    // is known about its protocol until its first read has been classified —
-    // and a client whose opening move is an HTTP request or a WebSocket
-    // upgrade is waiting for the response to it.  Writing relay bytes in the
-    // meantime does not merely deliver them early, it puts them *in front of*
-    // that response: the client reads "hello tcp 7" where the "HTTP/1.1 101"
-    // it is parsing for should be, and the handshake is corrupted.
-    //
-    // So they are held here and released by relay_hold_flush() once the
-    // protocol is settled — behind whatever the classifying read queued, and
-    // through the framing that protocol uses.  Held rather than dropped
-    // because the client is entitled to them: an inout server relays every
-    // client's messages to every other client, and this connection goes on
-    // receiving exactly this traffic for the rest of its life.
-    //
-    // Or by the deadline, for a connection that has said nothing at all.  See
-    // RELAY_HOLD_DEADLINE_MS and `spoke` below for why those two are the same
-    // release and not two policies.
+    // Relay traffic that arrived before this connection said what it speaks,
+    // held rather than dropped because writing it early puts it in front of
+    // the response the client is parsing for, and released by
+    // relay_hold_flush() or by the deadline.
     socketley::byte_counted_queue<std::shared_ptr<const std::string>> relay_hold;
 
-    // When this hold started — set as it goes from empty to non-empty, and
-    // meaningless while it is empty.  The deadline is measured from the first
-    // message held rather than from the accept, because until there is traffic
-    // to hold there is nothing for a deadline to be late for.
+    // When this hold started, measured from the first message held rather than
+    // from the accept, because until there is traffic to hold there is nothing
+    // to be late for.
     std::chrono::steady_clock::time_point relay_hold_since{};
 
-    // Has this client ever sent a byte of application data?
-    //
-    // Sticky, and it is the whole of what separates a listener from a client
-    // mid-request.  Both are unclassified, and the relay owes them opposite
-    // things: a connection that has sent something is waiting for an answer to
-    // it, so relay bytes released early land in front of that answer and this
-    // is the defect all over again; a connection that has sent nothing has no
-    // answer outstanding for anything to land in front of, so releasing its
-    // hold cannot reorder anything.  Only the second kind has a deadline.
-    //
-    // Set where inbound bytes reach `partial`, so a TLS connection counts as
-    // having spoken when its plaintext arrives and not when its handshake
-    // records do — a client is not "waiting for an answer" to a ClientHello
-    // that OpenSSL answers by itself.
+    // Has this client ever sent a byte of application data, sticky, because a
+    // connection that has spoken is waiting for an answer relay bytes would
+    // land in front of and only one that has not gets a deadline.
     bool spoke{false};
 
-    // Has this connection ever been an HTTP request/response connection?
-    //
-    // Sticky, because `proto` is not: it is reset to proto_unknown after every
-    // keep-alive response so the classifier can run again on the next request,
-    // and a connection that forgot it was HTTP would rejoin the relay set in
-    // every gap between two requests.  Set where proto_http is decided, and
-    // deliberately NOT set for a WebSocket, which arrives over the same HTTP
-    // and is a relay target for the rest of its life.
-    //
-    // What it excludes is exactly the relay — the unsolicited traffic this
-    // connection never asked for.  Its own responses, and anything a script
-    // addresses to it by client_id, are unaffected.
+    // Has this connection ever been HTTP, sticky because `proto` is reset
+    // after every keep-alive response and a connection that forgot would
+    // rejoin the relay set between two requests.
     bool http_seen{false};
 
     // writev batch: holds refs alive until CQE completes
@@ -169,9 +115,9 @@ struct alignas(64) server_connection
     size_t file_size{0};
     std::string file_content_type;
     bool file_is_html{false};
-    // Set only when this read is a candidate for the revalidating cache above,
-    // so handle_file_read knows which key to store the bytes under and what
-    // identity they were read at.  Empty means "do not store".
+    // Set only when this read is a candidate for the revalidating cache, so
+    // handle_file_read knows which key to store under; empty means do not
+    // store.
     std::string file_url_path;
     struct stat file_st{};
 
@@ -184,10 +130,9 @@ struct alignas(64) server_connection
     // Headers are queued and the file→pipe splice starts once they are on the
     // wire; this says the transfer is owed, not that an op is armed.
     bool splice_pending{false};
-    // These two say an op is armed.  splice_remaining and splice_pending are
-    // transfer bookkeeping that splice_cleanup zeroes, so guarding a close with
-    // them proved nothing: the cleanup made the guard true and the connection
-    // was freed with a splice still running against its fd and its requests.
+    // These two say an op is armed, unlike the splice bookkeeping
+    // splice_cleanup zeroes, which made a guard true and freed the connection
+    // with a splice still running.
     bool splice_in_pending{false};
     bool splice_out_pending{false};
 
@@ -205,19 +150,9 @@ struct alignas(64) server_connection
     // Master auth attempt tracking
     uint8_t auth_failures{0};
 
-    // Cache requests this connection has asked for and not been answered yet.
-    //
-    // A count and not a queue: the request channel answers one origin in the
-    // order it posted, so a reply is written the moment it arrives and the wire
-    // order is the request order without anything having to be held.  What this
-    // is for is the cap — a client pipelining `cache` commands can post them far
-    // faster than the channel drains, and an unbounded backlog is a
-    // memory-exhaustion path reachable from one socket.
-    //
-    // Nothing in flight points into this struct: the channel copies the payload
-    // and carries a cookie, so the connection can be closed and pooled with
-    // requests still queued, and the stale reply is dropped by the generation
-    // check in on_request_reply().
+    // Cache requests this connection has not been answered yet, a count and
+    // not a queue because the channel answers one origin in order -- and
+    // nothing in flight points into this struct.
     uint32_t cache_pending{0};
 
     // WebSocket fragment reassembly (zero-alloc, in-place compaction in partial)
@@ -239,29 +174,17 @@ struct alignas(64) server_connection
     // 16KB read buffer — at the very end to keep hot fields in first cache lines
     char read_buf[READ_BUF_SIZE];
 
-    // What a struct owns that no container releases for it.
-    //
-    // Normally pool_release() does this, and every connection reaches it — but
-    // only by way of a completion.  A connection with a file read still in
-    // flight is put on the retired list, and if the runtime stops before that
-    // completion lands the loop drops it rather than dispatching it, so
-    // reap_retired() never runs and pool_release() never happens.  The struct is
-    // then freed with the instance, and the file's whole contents go with it:
-    // one malloc the size of the file served, per connection, held until the
-    // process exits.  The descriptors are the same story a level down.
-    //
-    // Reached only when the instance itself is going away, which runtime_manager
-    // does only once the ring owes it nothing — so no submission can still name
-    // either descriptor and a plain close is right, exactly as it is in reset().
+    // What a struct owns that no container releases for it, because a
+    // connection retired with a file read in flight never reaches
+    // pool_release() if the runtime stops first -- and a plain close is right,
+    // since the instance only goes away once the ring owes it nothing.
     ~server_connection()
     {
         free(file_buf);
         if (file_fd >= 0)        close(file_fd);
         if (splice_file_fd >= 0) close(splice_file_fd);
-        // The session, for a struct that never reached pool_release() — a
-        // retired connection whose completion was dropped when the runtime
-        // stopped.  Safe here for the same reason it is safe anywhere: no
-        // submission ever named it.
+        // The session, for a struct that never reached pool_release(), safe
+        // here because no submission ever named it.
         tls_context::free_ssl(ssl);
     }
 
@@ -274,15 +197,14 @@ struct alignas(64) server_connection
     {
         fd = new_fd;
         fixed_idx = -1;
-        // Cleared, not carried.  pool_acquire() mints a fresh one straight
-        // after; leaving the previous connection's serial in a struct being
-        // handed to a new client is the whole defect one level up.
+        // Cleared and not carried, because leaving the previous connection's
+        // serial in a struct handed to a new client is the defect one level
+        // up.
         ref_serial = 0;
         direct_fd = false;
-        // pool_release() already did this; repeated here because a struct
-        // leaving the pool must not carry the previous connection's session
-        // under any circumstances, and this is the last point at which that
-        // can still be true.
+        // pool_release() already did this, repeated because a struct leaving
+        // the pool must not carry the previous connection's session under any
+        // circumstances.
         tls_context::free_ssl(ssl);
         ssl = nullptr;
         tls_state = tls_conn_none;
@@ -291,20 +213,14 @@ struct alignas(64) server_connection
         write_req = {};
         write_queue.clear();
         // The previous occupant's unclassified relay traffic must not be
-        // handed to this one.  pool_release() already did it; repeated here for
-        // the same reason the TLS session above is.
+        // handed to this one.
         relay_hold.clear();
         relay_hold_since = {};
         // A struct that carried a client which had spoken would otherwise hand
-        // the next one a permanent exemption from the deadline: it would be a
-        // listener the relay believed was mid-request, and it would be held for
-        // as long as it stayed connected — which is the behaviour the deadline
-        // exists to end, reintroduced through the pool.
+        // the next one a permanent exemption from the deadline.
         spoke = false;
         // And a struct that carried an HTTP client would hand the next one a
-        // permanent exclusion from the relay — the more visible half of the same
-        // mistake: a client that never spoke HTTP, silently receiving nothing
-        // for as long as it stayed connected.
+        // permanent exclusion from the relay, silently receiving nothing.
         http_seen = false;
         for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
         write_batch_count = 0;
@@ -407,10 +323,9 @@ struct upstream_connection
     // cancel it; it stays armed on this struct for up to 30 seconds.
     bool timeout_pending{false};
 
-    // Resolved endpoint, kept across reconnects.  upstream_try_connect runs on
-    // the event loop thread, so every name lookup it performs stalls every other
-    // connection this runtime is serving — and a flapping upstream retries on a
-    // timer, so that was once per attempt.
+    // Resolved endpoint kept across reconnects, because upstream_try_connect
+    // runs on the event loop thread and a flapping upstream would look up the
+    // name once per attempt.
     struct sockaddr_in cached_addr{};
     bool has_cached_addr{false};
 };
@@ -421,8 +336,8 @@ public:
     server_instance(std::string_view name);
     ~server_instance() override;
 
-    // See runtime_instance::as_server().  The whole of the override: this class
-    // is what the question is asking for, and a class that is not says nothing.
+    // See runtime_instance::as_server(): this class is what the question is
+    // asking for.
     server_instance* as_server() override { return this; }
 
     void set_mode(server_mode mode);
@@ -436,11 +351,9 @@ public:
     void teardown(event_loop& loop) override;
 
 private:
-    // The two listeners setup() chooses between.  Each opens m_listen_fd, binds
-    // it and puts it in the listen state, or leaves it -1 and returns false.
-    // Everything after that point in setup() — the buffer ring, the accept
-    // chain, the connection tables — is the same for both, which is the whole
-    // reason they are two functions and not two copies of setup().
+    // The two listeners setup() chooses between, each of which opens and binds
+    // m_listen_fd or returns false, with everything after that point the same
+    // for both.
     bool setup_tcp_listener(uint16_t port);
     bool setup_unix_listener(const std::string& path);
 
@@ -486,79 +399,50 @@ public:
     std::string stats_extra() const override;
 
     // ── Client routing ──────────────────────────────────────────────────────
-    //
-    // The Lua-facing half.  `client_id` is whatever Lua was handed for this
-    // connection: a descriptor for one of this runtime's own clients, or a
-    // handle out of conn_identity.h's reserved range for one that was routed
-    // here from elsewhere.  Nothing above this line ever sees a conn_ref, and
-    // nothing below it ever sees a descriptor belonging to another process.
-    // `err`, when given, is filled with the reason a false was returned.  It
-    // exists because the reason is no longer in this process: a target in a
-    // worker is refused by the daemon, in the daemon's words, and a caller that
-    // renders its own guess at why would print something that contradicts it.
-    // socketley.pipe passes one; self.route does not, because Lua's route()
-    // answers a bare boolean and always has.
+    // The Lua-facing half, taking a descriptor or a routed handle and never a
+    // conn_ref, with `err` filled in because the reason may be the daemon's
+    // words rather than a guess this side would render.
     bool route_client(int client_id, std::string_view target_name,
                       std::string* err = nullptr);
     bool unroute_client(int client_id);
     std::string_view get_client_route(int client_id) const;
     bool send_to_client(int client_id, std::string_view msg);
 
-    // Owner-targeted sending (sub-server → the connection that was routed here)
-    //
-    // owner_send used to take a descriptor number from a sub-server's Lua and
-    // write it straight into the owner's connection table, with no check that
-    // the number still named the connection the sub-server was talking about.
-    // It resolves a handle now, and a handle whose connection has gone resolves
-    // to nothing.
+    // owner_send resolves a handle rather than writing a sub-server's
+    // descriptor number into the owner's table, and a handle whose connection
+    // has gone resolves to nothing.
     bool owner_send(int client_id, std::string_view msg);
     bool owner_broadcast(std::string_view msg);
 
     // ── The cross-runtime interface ─────────────────────────────────────────
-    //
     // Everything one runtime does to another's connection goes through these
-    // four, and every one of them takes a conn_ref.  That is the property the
-    // process split needs: none of them can be called with a number that only
-    // means something in the caller's address space, so the in-process form and
-    // the form that arrives over a socket are the same call with the same
-    // arguments.
-    //
-    // Called on the *receiving* runtime.  Mints a local handle for a connection
-    // that lives in `origin_name` and tells this runtime's script about it.
-    // Returns the handle, or -1 if the ref is not usable.
+    // four, each taking a conn_ref, so the in-process form and the form
+    // arriving over a socket are the same call -- and accept_routed mints a
+    // local handle or returns -1.
     int accept_routed(const conn_ref& ref, std::string_view origin_name);
 
     // Called on the receiving runtime: the connection is gone.
     void release_routed(const conn_ref& ref);
 
-    // Both directions at once, for a runtime that has stopped.  Releases every
-    // connection `gone` routed here and drops every route this runtime holds
-    // that pointed at it.
-    //
-    // Idempotent, and it has to be: the in-process path already does this per
-    // connection from the departing runtime's own teardown, so in one process
-    // this arrives second and finds nothing.  Across processes it arrives
-    // FIRST, because the teardown's frames never make it out -- see
-    // route_op::forget.
+    // Both directions at once for a runtime that has stopped, idempotent
+    // because in one process this arrives second and finds nothing while
+    // across processes it arrives first.
     void forget_runtime(std::string_view gone);
 
-    // Called on the *owning* runtime by a receiver that is shutting down: stop
-    // routing this connection, it has nowhere to go.  The connection itself is
-    // untouched and goes back to being served here.
+    // Called on the owning runtime by a receiver that is shutting down,
+    // leaving the connection itself untouched and served here again.
     void drop_route(const conn_ref& ref);
 
     // Called on the receiving runtime: bytes arrived from it.
     void deliver_routed(const conn_ref& ref, std::string_view msg);
 
-    // Called on the *owning* runtime: write to one of my connections, named the
-    // way a stranger is allowed to name it.  False when the ref names nothing
-    // here any more, which is the case that used to write into whichever
-    // connection had inherited the descriptor number.
+    // Called on the owning runtime to write to one of its connections by name,
+    // false when the ref names nothing here any more.
     bool write_to_ref(const conn_ref& ref, std::string_view msg);
 
-    // The name of one of this runtime's own connections, for a caller that is
-    // about to hand it to another runtime.  Invalid for a descriptor this
-    // runtime does not hold.
+    // The name of one of this runtime's own connections, for a caller about to
+    // hand it to another runtime, invalid for a descriptor this runtime does
+    // not hold.
     conn_ref ref_for_fd(int fd) const;
 
     // Master mode
@@ -575,10 +459,8 @@ public:
     bool get_http_cache() const;
     void rebuild_http_cache();
 
-    // Upstream connections
-    // False when the address named a port that cannot work; nothing is stored
-    // in that case.  See the definition for which spellings are refused and
-    // why a bare host is not one of them.
+    // False when the address named a port that cannot work, storing nothing in
+    // that case.
     [[nodiscard]] bool add_upstream_target(std::string_view addr);
     void clear_upstream_targets();
     const std::vector<upstream_target>& get_upstream_targets() const;
@@ -589,164 +471,55 @@ public:
     std::vector<int> lua_upstreams() const;
 
     // ── request_origin ──────────────────────────────────────────────────────
-    // An answer from the linked cache, one turn of the event loop after the
-    // command that asked for it.  The cookie names the connection that asked
-    // and the identity it had at the time; a client that has gone since — or a
-    // struct the pool has already handed to somebody else — fails that compare
-    // and the answer is dropped rather than written into a stranger's stream.
+    // An answer from the linked cache one turn later, whose cookie names the
+    // connection and the identity it had, so a client that has gone fails the
+    // compare and the answer is dropped.
     void on_request_reply(uint64_t cookie, request_status st,
                           std::string_view reply) override;
 
 private:
-    // Ask the linked cache something on behalf of `conn`.  `silent` is the
-    // auto-store: it wants no answer and is not charged to the connection,
-    // because the client never asked for it.
+    // Ask the linked cache something on behalf of `conn`, where `silent` is
+    // the auto-store, which wants no answer and is not charged to the
+    // connection.
     void post_cache_request(server_connection* conn, std::string_view payload, bool silent);
 
-    // How many unanswered cache requests one connection may have.  Well above
-    // what a single 16 KB read can hold in `cache get k` lines, so ordinary
-    // pipelining never meets it; a client that keeps going past it is closed,
-    // which is the same answer this runtime already gives a client that outruns
-    // its own write queue.  Refusing in place is not an option — the refusal
-    // would overtake the answers already queued ahead of it, and a client that
-    // cannot tell which answer belongs to which question has no protocol left.
+    // How many unanswered cache requests one connection may have, well above
+    // what a 16 KB read can hold, with a close rather than a refusal because a
+    // refusal would overtake the answers queued ahead of it.
     static constexpr uint32_t MAX_CACHE_PENDING = 4096;
 
-    // ── Relay traffic held across classification ────────────────────────────
-    // What one connection may accumulate while it is still unclassified,
-    // before the oldest held message is dropped to make room.
-    //
-    // This is not a transient.  A client that has sent half a request and
-    // paused holds until the rest of it arrives, which is its own decision and
-    // may be a long one, and a server with many such connections pays this per
-    // connection.  The figure is sized for the window it exists to cover —
-    // accept to the read that classifies, normally a single turn of the event
-    // loop — and deliberately not for a backlog: 64 KB is four full 16 KB
-    // reads' worth of relayed lines, far more than that window can produce, and
-    // 1/128th of the 8 MB a connection's own write queue may hold, so a
-    // connection waiting to be classified cannot cost more than an active
-    // client already may.
-    //
-    // Overflow drops the oldest.  The three alternatives are all worse:
-    // growing is the memory-exhaustion path this bound exists to close;
-    // disconnecting punishes a client that has done nothing but stay quiet;
-    // and blocking would let one silent listener stall every client that is
-    // talking, which is a far worse failure than a listener missing the start
-    // of a conversation it has not joined yet.
+    // What one unclassified connection may accumulate before the oldest held
+    // message is dropped, sized for the accept-to-classification window rather
+    // than for a backlog -- and dropping the oldest beats growing,
+    // disconnecting or blocking.
     static constexpr size_t RELAY_HOLD_MAX_BYTES = 64 * 1024;
 
-    // How long relay traffic is held for a connection that has said nothing.
-    //
-    // Holding until classification and only until classification has one
-    // consequence that is worse than the defect it fixes: a connection that
-    // never sends is never classified, so a pure listener — connect, stay
-    // quiet, read what everybody else broadcasts — would receive no relay
-    // traffic at all, ever.  That is a legitimate client of an inout server,
-    // whose whole job is to relay every client's messages to every other
-    // client, and it worked before the hold existed.  So the hold has a
-    // deadline, and on it the connection is treated as raw and flushed through
-    // the ordinary path.
-    //
-    // Only for a connection that has not spoken.  See `spoke`: a client
-    // mid-request is waiting for an answer, and releasing its hold on a timer
-    // would put relay bytes in front of that answer — the original defect,
-    // moved from fast clients to slow ones.  Such a connection holds until it
-    // is classified however long that takes, exactly as before.
-    //
-    // 250 ms, bounded from both sides:
-    //
-    //   * It must not expire before a client that intends to speak has been
-    //     heard, because a listener is what this classifies it as, permanently.
-    //     The gap it has to clear is connect-to-first-byte for a client that
-    //     writes its request immediately — under a millisecond on loopback or a
-    //     LAN, and 250 ms still covers a full round trip on an intercontinental
-    //     link.  The clock also starts at the first held message rather than at
-    //     the accept, so an idle server never runs it at all: a slow client is
-    //     only ever at risk while other clients are actively broadcasting.
-    //
-    //   * It must not be long enough to read as a stall.  A listener's added
-    //     latency is 250 ms once, on its first relayed message; every message
-    //     after that goes straight out, because the deadline classifies the
-    //     connection rather than merely emptying its queue.  That is under the
-    //     ~300 ms at which a delay becomes visible in interactive traffic, and
-    //     two orders of magnitude below the 30 s idle sweep, which is the only
-    //     other timer that would otherwise have touched such a connection.
+    // How long relay traffic is held for a connection that has said nothing,
+    // 250 ms, because a pure listener is a legitimate client of an inout
+    // server and would otherwise never be classified -- long enough to hear a
+    // client that intends to speak, short enough not to read as a stall.
     static constexpr uint32_t RELAY_HOLD_DEADLINE_MS = 250;
 
-    // Is this connection still waiting to be classified?  Both states mean the
-    // same thing to the relay — nothing has been decided about what the client
-    // speaks, so nothing unsolicited may be written to it.  proto_ws_upgrading
-    // counts because it is the middle of a handshake and not the end of one:
-    // headers can span several reads, and the 101 has not been queued yet.
+    // Is this connection still waiting to be classified, where
+    // proto_ws_upgrading counts because a handshake spanning several reads has
+    // not queued its 101 yet.
     static bool proto_unsettled(const server_connection* conn)
     {
         return conn->proto == proto_unknown || conn->proto == proto_ws_upgrading;
     }
 
-    // May the relay write to this connection at all?
-    //
-    // The question the ordering defects on this connection kept being asked one
-    // window at a time, answered once instead.  An HTTP connection is never a
-    // relay target, at any point in its life:
-    //
-    //   * While a request is in flight — which it is from the four bytes that
-    //     settle the protocol until the last byte of the body — a relayed line
-    //     goes into the write queue ahead of the response, and the client, which
-    //     is parsing for a status line, reads that line instead.
-    //
-    //   * Between two keep-alive requests the client is not reading.  When it
-    //     next does, having sent another request, it parses whatever was left on
-    //     the connection as that response's status line.  The corruption is not
-    //     avoided by waiting, only deferred.
-    //
-    //   * HTTP frames bodies by Content-Length and responses by their order
-    //     against requests.  A server-initiated line has no place in either.
-    //     There is no delay, no hold and no ordering that makes one well formed.
-    //
-    // So this is a membership question rather than a timing one, and it is
-    // stated here rather than left implicit in a guard at one call site.  A
-    // WebSocket is not covered: it arrives over the same HTTP, and once upgraded
-    // it has framing for server-initiated messages, which is the whole point of
-    // it and the supported way for a browser to receive relay traffic.
-    //
-    // RESP is the same protocol shape and therefore the same answer.  A RESP
-    // client sends a command and reads the next value on the stream as its
-    // reply — RESP2 correlates replies to commands by their order and by
-    // nothing else, exactly as HTTP does — so an unsolicited value is consumed
-    // as the answer to whatever that client asked next.  Two further reasons it
-    // cannot be made well formed by delaying it:
-    //
-    //   * What broadcast() writes is not a RESP value at all.  It is the
-    //     message text with a newline, so the client reads a plain letter where
-    //     a type byte belongs; a real RESP client answers that with a protocol
-    //     error and drops the connection.
-    //
-    //   * Encoding it as one would not rescue it.  The only channel RESP2 has
-    //     for a server-initiated value is pub/sub, which the client must enter
-    //     with SUBSCRIBE and which this runtime does not implement — the RESP
-    //     branch of handle_read joins argv with spaces and hands the result to
-    //     process_message like any other line.
-    //
-    // No sticky companion to http_seen is needed for it.  http_seen exists
-    // because `proto` does not survive a keep-alive gap; every one of those
-    // resets is on an HTTP response path, and proto_resp is never reset — a
-    // connection that speaks RESP speaks it until it closes.  If that ever
-    // stops being true, this needs a resp_seen for the same reason HTTP needed
-    // http_seen.
+    // An HTTP connection is never a relay target at any point in its life, and
+    // RESP is the same protocol shape and the same answer, because both
+    // correlate replies to requests by order alone -- so there is no delay or
+    // hold that makes an unsolicited line well formed.
     static bool relay_targetable(const server_connection* conn)
     {
         return !conn->http_seen && conn->proto != proto_resp;
     }
 
-    // May the deadline release this connection's hold?
-    //
-    // Three conditions, and each one is a different way of asking whether
-    // anything is owed to this client that relay bytes could arrive in front
-    // of.  It must still be unclassified (a classified one has no hold left to
-    // release); it must never have spoken (see `spoke`); and its TLS handshake,
-    // if it has one, must be finished — a session still exchanging records has
-    // no keys to encrypt with, so flushing into it would queue plaintext behind
-    // a handshake and then deliver it in front of the first real response.
+    // May the deadline release this connection's hold: still unclassified,
+    // never spoken, and with any TLS handshake finished, since a session still
+    // exchanging records has no keys to encrypt with.
     static bool relay_deadline_applies(const server_connection* conn)
     {
         return proto_unsettled(conn) && !conn->spoke
@@ -757,44 +530,25 @@ private:
     void relay_hold_push(server_connection* conn,
                          const std::shared_ptr<const std::string>& msg);
 
-    // Release what was held, once the protocol is known.  Called from the one
-    // point every path through handle_read reaches, so a connection cannot be
-    // classified without its held traffic going out behind the response to the
-    // very read that classified it.
+    // Release what was held once the protocol is known, from the one point
+    // every path through handle_read reaches.
     void relay_hold_flush(server_connection* conn);
 
-    // Arm the deadline timer if it is not already counting.  One timer for the
-    // whole instance rather than one per connection: a per-connection timeout
-    // would need an io_request, an armed flag and a withdrawal on every close
-    // path, for a deadline that is the same length for every connection and is
-    // only ever waited on by connections that are doing nothing.
+    // Arm the deadline timer if it is not already counting, one for the whole
+    // instance, because a per-connection timeout would need a request and a
+    // withdrawal on every close path.
     void relay_deadline_arm(uint32_t after_ms);
 
-    // Everything whose deadline has passed, and re-arm for the oldest that is
-    // left.  Arming for the full deadline each time would make the worst-case
-    // wait twice the constant, for a connection whose hold began just after the
-    // previous arming; re-arming for the remainder is what keeps the bound the
-    // number that is written down.
+    // Everything whose deadline has passed, re-arming for the remainder rather
+    // than the full deadline, which is what keeps the bound the number that is
+    // written down.
     void relay_deadline_sweep();
 
     // ── the --cache auto-store ──────────────────────────────────────────────
-    // Every message a linked server receives is written to the cache under an
-    // incrementing key.  That used to be one m_store.set() through a pointer to
-    // the cache object; it is a request now, and a request per message is the
-    // wrong granularity: one 16 KB read is two thousand messages, and posting
-    // two thousand entries for it fills the channel's queue faster than a turn
-    // of the loop can drain it.  Measured on a 200 000 message burst, that was
-    // 88% of the writes dropped.
-    //
-    // So the lines are accumulated here and posted together — the channel
-    // carries a command stream, which is what would go over the cache's socket
-    // anyway.  One entry per read instead of one per message, and the loss goes
-    // away because the queue is nowhere near its cap.
-    //
-    // Flushed at every point where the batch could otherwise be stranded: the
-    // end of a read, the end of a datagram, a stop, and immediately before any
-    // command the client is waiting on — that last one so a client which sends
-    // a message and then asks the cache for it by key sees its own write.
+    // A linked server's auto-store is accumulated per read and posted
+    // together, because one entry per message dropped 88% of the writes on a
+    // 200,000 message burst -- flushed wherever the batch could otherwise be
+    // stranded.
     std::string m_cache_store_batch;
     // Flush at this size rather than only at the end of a read, so a single
     // enormous read cannot build an unbounded batch.
@@ -805,46 +559,34 @@ private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_file_read(struct io_uring_cqe* cqe, io_request* req);
-    // Parses conn->partial and dispatches whatever whole messages are in it.
-    // Called from handle_read, and from the three completion arms that finish
-    // an async HTTP response -- a response completion is the other moment at
-    // which a request can be sitting here unanswered.  See the definition.
+    // Parses conn->partial and dispatches whatever whole messages are in it,
+    // from handle_read and from the three completion arms that finish an async
+    // HTTP response.
     void parse_partial(server_connection* conn);
     void handle_splice_in(struct io_uring_cqe* cqe, server_connection* conn);
     void handle_splice_out(struct io_uring_cqe* cqe, server_connection* conn);
     void splice_cleanup(server_connection* conn);
     void invoke_on_websocket(int fd);
 
-    // Every descriptor this runtime gives back to the kernel goes through here
-    // — sockets, listeners, the files an HTTP response is served out of, the
-    // splice pipes.  A close does not withdraw an SQE that already carries the
-    // number; it only frees the number for the next accept to take, and the
-    // queued operation then lands on that connection instead.  See
-    // event_loop::close_fd, which holds the number until nothing in the ring
-    // still names it.
-    //
-    // m_ring_loop and not m_loop, for the same reason release_fixed_slot uses
-    // it: descriptors are still closed after teardown has cleared m_loop, and
-    // that is exactly when the ring is most likely to be holding something.
+    // Every descriptor this runtime gives back goes through here, because a
+    // close does not withdraw an SQE that already carries the number --
+    // through m_ring_loop, since descriptors are closed after teardown has
+    // cleared m_loop.
     void close_tracked(int fd);
 
-    // Is anything the kernel is holding still naming this struct?  Every close
-    // path asks this one question now.  Each used to assemble its own list of
-    // flags, and the lists disagreed: the zero-copy notification was missing
-    // from two of them and the splice ops were tracked by nothing at all.
+    // Is anything the kernel holds still naming this struct, asked once,
+    // because each close path used to assemble its own list of flags and the
+    // lists disagreed.
     bool conn_ops_pending(const server_connection* conn) const;
 
-    // The same flags, sorted by who is obliged to report them.  See
-    // shared/conn_reachability.h; this function is the seam between that
-    // classification and this runtime's connection struct.
+    // The same flags sorted by who is obliged to report them, which is the
+    // seam between conn_reachability.h and this runtime's connection struct.
     socketley::reach::owed conn_owed(const server_connection* conn) const;
 
-    // The one place a connection nothing is going to finish is finished.
-    // Called from on_cqe() after every completion, for the connection that
-    // completion named; see the call site for why an armed read does not count
-    // as something that will finish it.
+    // The one place a connection nothing is going to finish is finished,
+    // called after every completion for the connection it named.
     void finish_unreachable_conn(int fd);
-    // The single teardown for a client connection.  Only legal when
+    // The single teardown for a client connection, legal only when
     // conn_ops_pending() is false.
     void close_conn(server_connection* conn, bool notify_disconnect = true);
     // Hand a connection struct back: to the pool when the ring is done with it,
@@ -853,15 +595,14 @@ private:
     // Completions for retired connections and upstreams: recognised by the
     // address the kernel hands back, since they are no longer in any index.
     bool reap_retired(struct io_uring_cqe* cqe, io_request* req);
-    // Give a provided buffer back to its group when we drop the completion that
-    // carried it.  The group is shared by every server runtime on this loop, so
-    // dropping one silently starves the others.
+    // Give a provided buffer back when its completion is dropped, because the
+    // group is shared by every server runtime on this loop.
     void return_provided_buf(struct io_uring_cqe* cqe);
     void arm_udp_recv();
 
 #ifdef SOCKETLEY_INVARIANTS
-    // Debug-only: see invariants.h.  Asserts that a connection the runtime still
-    // has indexed still has something that will wake it.
+    // Debug-only: asserts that a connection the runtime still has indexed
+    // still has something that will wake it.
     void inv_check_reachable(int fd, const char* where);
 #endif
 
@@ -869,11 +610,9 @@ private:
     void serve_http(server_connection* conn, std::string_view path);
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
 
-    // Answer a request whose framing could not be established, and end the
-    // connection.  One function rather than one copy per refusal site, because
-    // the three steps are a unit: a refusal that forgets to clear `partial`
-    // leaves bytes behind that the reparse loop picks up as a fresh request —
-    // which is the very confusion being refused.
+    // Answer a request whose framing could not be established and end the
+    // connection, in one function because a refusal that forgets to clear
+    // `partial` leaves bytes the reparse loop reads as a fresh request.
     void refuse_http_request(server_connection* conn,
                              const std::shared_ptr<const std::string>& resp);
 
@@ -892,50 +631,40 @@ private:
     void process_message(server_connection* sender, std::string_view msg);
     void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
     void remove_active_fd(int fd);
-    // `even_when_closing` is for an answer that was already promised.  A
-    // connection normally stops accepting output the moment it is marked
-    // closing — the conversation is over and anything produced after that is
-    // computed and thrown away — but a cache reply was asked for before the
-    // client half-closed, and its socket is still open precisely because that
-    // answer is owed.  Nothing else may set it.
+    // `even_when_closing` is for an answer that was already promised, which
+    // nothing else may set: the socket is still open precisely because that
+    // answer is owed.
     void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                  bool even_when_closing = false);
     void flush_write_queue(server_connection* conn);
 
     // ── TLS record layer ────────────────────────────────────────────────────
-    // OpenSSL does no I/O here.  These two move bytes between a connection's
-    // memory BIO pair and the buffers io_uring reads into and writes out of,
-    // so the handshake happens one completion at a time and nothing blocks the
-    // event loop.  Everything above them — protocol detection, WebSocket,
-    // HTTP, RESP, Lua — sees the same plaintext it always did.
+    // OpenSSL does no I/O here: these two move bytes between the memory BIO
+    // pair and the buffers io_uring uses, so everything above them sees the
+    // same plaintext it always did.
 
-    // Ciphertext a read completion delivered, in.  Drives the handshake while
-    // one is running and appends whatever plaintext comes out to conn->partial.
-    // Marks the connection closing on anything terminal (a failed handshake, a
-    // buffer cap exceeded, a broken record); a peer's orderly close_notify
-    // lands in tls_peer_closed instead, so the request it arrived with is
-    // still answered.  There is no path from here back to plaintext.
+    // Ciphertext in, driving the handshake and appending plaintext to
+    // conn->partial, marking the connection closing on anything terminal while
+    // an orderly close_notify lands in tls_peer_closed instead.
     void tls_feed(server_connection* conn, const char* data, size_t len);
 
-    // Plaintext queue → SSL → one write submission of ciphertext, and the only
-    // thing that puts handshake records or alerts on the wire.  Submits at most
-    // one write, exactly as the cleartext path does; the rest waits for that
-    // completion.
+    // Plaintext queue to SSL to one write submission, the only thing that puts
+    // handshake records or alerts on the wire, at most one write exactly as
+    // the cleartext path does.
     void tls_flush(server_connection* conn);
 
-    // Has this connection bytes to send that the ring has not been given?  For
-    // a TLS connection the write queue is only half the answer — a handshake
-    // record or a session ticket sits in the write BIO with the queue empty.
+    // Has this connection bytes the ring has not been given, which for TLS the
+    // write queue only half answers because a handshake record sits in the
+    // write BIO.
     bool conn_has_output(const server_connection* conn) const;
 
-    // Sends our FIN once the response is fully on the wire.  See the definition
-    // for why it is shutdown() and not close(), and why only completions call it.
+    // Sends our FIN once the response is fully on the wire; see the definition
+    // for why it is shutdown() and why only completions call it.
     void maybe_shutdown_write(server_connection* conn);
 
-    // The listener's TLS context, or null when this server serves cleartext.
-    // Rebuilt by setup() on every start so that `reload` is how a renewed
-    // certificate is installed; sessions already handed out hold their own
-    // reference to the old SSL_CTX and are unaffected.
+    // The listener's TLS context, rebuilt on every start so `reload` installs
+    // a renewed certificate, with existing sessions holding their own
+    // reference.
     std::unique_ptr<tls_context> m_tls;
     void submit_conn_read(server_connection* conn);
     void release_fixed_slot(server_connection* conn);
@@ -956,35 +685,22 @@ private:
     bool m_master_forward{false};
     std::string m_master_pw;
     int m_listen_fd;
-    // The socket node this run's listener is actually bound to, when it is an
-    // AF_UNIX one.  Deliberately not get_listen_path(): teardown() has to
-    // remove the node THIS bind created, and a runtime edited between its start
-    // and its stop would otherwise unlink a path it never bound.  Empty for a
-    // TCP listener, which is what says there is nothing to unlink.
+    // The socket node this run's listener actually bound, deliberately not
+    // get_listen_path(), because a runtime edited between start and stop would
+    // unlink a path it never bound.
     std::string m_bound_listen_path;
     struct sockaddr_in m_accept_addr;
     socklen_t m_accept_addrlen;
-    // The request the current accept chain was armed with, and the ones earlier
-    // chains were armed with that the ring has not finished naming.
-    //
-    // One per chain rather than one per instance, because a stop does not end
-    // the chain it belongs to: teardown() closes the listener and close_fd()
-    // submits a cancel, both of which make the accept report, but reporting only
-    // puts a CQE in the ring — and nothing reaps the ring between a stop and the
-    // start that follows it.  See setup() for what arming a second submission on
-    // an occupied request costs.
-    //
-    // A spent request is not freed when it is replaced.  Its completion is
-    // dropped rather than dispatched — stop() deregistered the owner — but the
-    // loop reads the request in order to drop it, so the storage has to outlive
-    // the ring's interest in it.  setup() releases them once owner_inflight()
-    // says nothing is left.
+    // One accept request per chain rather than per instance, because a stop
+    // does not end the chain and nothing reaps the ring between a stop and the
+    // start that follows -- and a spent request is released only once
+    // owner_inflight() says nothing is left.
     std::unique_ptr<io_request> m_accept_req;
     std::vector<std::unique_ptr<io_request>> m_accept_spent;
     event_loop* m_loop;
-    // The same loop, kept across teardown.  A completion that arrives while we
-    // are stopped may carry a provided buffer or a fixed-file slot that has to
-    // go back, and m_loop is null exactly then.  Never used to submit.
+    // The same loop kept across teardown, because a completion arriving while
+    // stopped may carry a buffer or a slot that has to go back; never used to
+    // submit.
     event_loop* m_ring_loop{nullptr};
 
     // EMFILE/ENFILE accept backoff
@@ -995,18 +711,14 @@ private:
     io_request m_idle_sweep_req{};
     struct __kernel_timespec m_idle_sweep_ts{};
 
-    // Relay-hold deadline timer.  Armed on demand — by the first message held
-    // for a connection that qualifies — and re-armed by its own completion for
-    // as long as anything is still waiting, so a server with no listeners never
-    // puts it in the ring at all.
+    // Relay-hold deadline timer, armed on demand and re-armed by its own
+    // completion, so a server with no listeners never puts it in the ring.
     io_request m_relay_deadline_req{};
     struct __kernel_timespec m_relay_deadline_ts{};
 
-    // An armed request stays armed across a stop: a timeout is attached to no
-    // fd, so neither shutdown() nor a cancel reaches it, and it completes when
-    // it completes.  Arming a second one at the next start() is what gave a
-    // restarted server two sweep chains, then three.  These say "occupied";
-    // nothing re-arms an occupied request, and the completion is what frees it.
+    // An armed request stays armed across a stop, because a timeout is
+    // attached to no fd, and these flags say occupied so a restart does not
+    // give the server a second sweep chain.
     bool m_accept_armed{false};
     bool m_accept_backoff_armed{false};
     bool m_idle_sweep_armed{false};
@@ -1026,27 +738,18 @@ private:
     uint64_t m_message_counter = 0;
 
     // ── Cross-runtime routing ───────────────────────────────────────────────
-    //
-    // Both of these used to be keyed by a file descriptor number, and the
-    // sub-server's copy was keyed by the *parent's* descriptor number — a value
-    // that means nothing in the sub-server's own address space and less than
-    // nothing once the two are in different processes.  See conn_identity.h for
-    // the three properties of a descriptor that made that unworkable.
-    //
-    // What this runtime owns and has routed away: our own connection's serial →
-    // the runtime it went to.  Keyed by serial rather than fd so that a
-    // descriptor reissued to a new client is not silently still routed.
+    // What this runtime owns and has routed away, keyed by serial rather than
+    // fd so a descriptor reissued to a new client is not silently still
+    // routed.
     std::unordered_map<uint64_t, std::string> m_routes;
 
-    // Our serials back to the descriptor that currently carries them.  This is
-    // the only place a conn_ref becomes an fd again, it is private to the
-    // runtime that minted the ref, and the entry is removed the moment the
-    // connection closes — which is what makes a stale ref resolve to nothing
-    // instead of to whoever inherited the number.
+    // Our serials back to the descriptor that carries them, the only place a
+    // conn_ref becomes an fd, with the entry removed the moment the connection
+    // closes.
     std::unordered_map<uint64_t, int> m_conn_by_serial;
 
-    // What another runtime has routed *to* us.  The connection lives elsewhere;
-    // all we hold is its name and a local handle to show Lua.
+    // What another runtime has routed to us, of which we hold only the name
+    // and a local handle to show Lua.
     struct forwarded_client
     {
         conn_ref    ref;
@@ -1057,20 +760,18 @@ private:
     int m_next_handle{conn_handle_base};
     int alloc_handle();
 
-    // Mints the serial half of this runtime's conn_refs.  Per instance, seeded
-    // from the monotonic clock, never restarting at a value a peer could still
-    // be holding from a previous lifetime.
+    // Mints the serial half of this runtime's conn_refs, per instance and
+    // seeded from the monotonic clock, so it never restarts at a value a peer
+    // could hold.
     conn_serial_source m_serials;
 
-    // Whether m_serials has been told which shard it mints for; see
-    // next_serial().  Not a value comparison, because shard 0 is a real shard.
+    // Whether m_serials has been told which shard it mints for, as a flag
+    // rather than a value comparison because shard 0 is a real shard.
     bool     m_serials_shard_set{false};
     uint64_t next_serial();
 
-    // conn_owner_key(get_id()), computed once.  get_id() is set after
-    // construction, so this is filled lazily on first use rather than in the
-    // constructor — a ref minted before the daemon has assigned an id would
-    // carry owner 0 and be invalid by construction.
+    // conn_owner_key(get_id()) computed lazily, because get_id() is set after
+    // construction and a ref minted before that would carry owner 0.
     mutable uint64_t m_owner_key{0};
     uint64_t owner_key() const;
 
@@ -1081,12 +782,9 @@ private:
     static constexpr size_t CONN_POOL_INIT = 64;
     std::vector<std::unique_ptr<server_connection>> m_conn_pool;
 
-    // Connections and upstreams the kernel has not finished with.  They are not
-    // freed and not reused; they sit here until their completions arrive, and
-    // each completion that lands is what tells us one more of them is free.
-    // Freeing them at the next start() instead — which is what this code used to
-    // do — is how a completion came to be read out of memory that had already
-    // been handed to somebody else.
+    // Connections and upstreams the kernel has not finished with, held until
+    // their completions arrive, because freeing them at the next start read a
+    // completion out of memory already handed to somebody else.
     std::vector<std::unique_ptr<server_connection>> m_conn_retired;
     std::vector<std::unique_ptr<upstream_connection>> m_upstream_retired;
 
@@ -1109,14 +807,9 @@ private:
     static constexpr size_t MAX_UDP_PEERS = 10000;
     struct udp_peer { struct sockaddr_in addr; };
     int m_udp_fd{-1};
-    // Everything one recvmsg names: the request, the msghdr the kernel walks,
-    // the buffer it writes the datagram into and the sockaddr it writes the
-    // sender into.  Held apart from the instance and replaced per run, for the
-    // reason given for the accept request above: a stop deregisters this owner,
-    // so the completion that would lower m_udp_recv_armed is dropped rather
-    // than dispatched, and a start that follows before the ring is reaped would
-    // otherwise either arm a second recvmsg into the same buffer or — with the
-    // flag still standing — arm nothing at all and never receive again.
+    // Everything one recvmsg names, held apart from the instance and replaced
+    // per run, because a stop drops the completion that would lower
+    // m_udp_recv_armed.
     struct udp_recv_state
     {
         io_request         req{};
@@ -1141,18 +834,15 @@ private:
     std::filesystem::path m_http_dir;
     std::filesystem::path m_http_base;  // canonical resolved path (set at setup/rebuild time)
 
-    // A directory descriptor on m_http_base, so a request can be opened
-    // relative to it with openat2(RESOLVE_BENEATH) instead of canonicalising
-    // the path first.  See serve_http's disk mode for what that replaces and
-    // what it costs.  -1 when there is no --http dir or the open failed, in
-    // which case the old path is taken.
+    // A directory descriptor on m_http_base so a request can be opened with
+    // openat2(RESOLVE_BENEATH) rather than canonicalised, -1 when there is
+    // none and the old path is taken.
     int m_http_root_fd{-1};
     void open_http_root();
     bool m_http_cache_enabled{false};
-    // Both variants are prebuilt.  A cache hit has to stay a refcount bump —
-    // that is the whole point of this map — and the response's own Connection
-    // header has to match what the client asked for, so the choice cannot be
-    // made by rewriting the string at serve time.
+    // Both variants are prebuilt, because a cache hit has to stay a refcount
+    // bump and the response's own Connection header has to match what the
+    // client asked for.
     struct cached_file
     {
         std::shared_ptr<const std::string> response;        // Connection: keep-alive
@@ -1161,30 +851,10 @@ private:
     std::unordered_map<std::string, cached_file> m_http_cache;
 
     // ─── DISK MODE'S REVALIDATING CACHE ─────────────────────────────────────
-    //
-    // Plain `--http DIR` is the development mode: edit a file, reload, see the
-    // edit.  That promise is what it costs, and the cost was measured rather
-    // than assumed -- with strace -c over 2000 keep-alive requests, disk mode
-    // spends openat2 + fstat + close (1.000 each per request) and one extra
-    // io_uring_enter for the file read that `--http-cache` does not, then
-    // mallocs the file, copies it, and formats a response string, per request.
-    //
-    // This map keeps the response the way m_http_cache does and pays ONE statx
-    // per request to decide whether it is still good.  Priced on this box:
-    // openat2+fstat+close 1838 ns, statx 662 ns.
-    //
-    // The identity is dev+ino+size+mtime and dev+ino is not optional.  `mv`
-    // into place, `cp`, git checkout and every editor that writes-then-renames
-    // put a NEW inode at the same path, and `touch -r` will hand it the old
-    // timestamp to the nanosecond -- so an (mtime, size) check, which is the
-    // natural thing to write, serves the old bytes forever.  Pinned by
-    // test_http_disk_freshness.sh.
-    //
-    // It is also why the map cannot leak a file it may not serve: a MISS falls
-    // through to the openat2(RESOLVE_BENEATH) path, which is the only thing
-    // that ever admits bytes here, and a HIT means dev+ino equal to an inode
-    // that path already admitted.  statx follows symlinks, but a symlink to
-    // somewhere else is a different inode and therefore a miss.
+    // One statx per request to decide whether a cached response is still good
+    // -- 662 ns against 1838 for openat2+fstat+close -- keyed on
+    // dev+ino+size+mtime, because every editor that writes-then-renames puts a
+    // new inode at the same path.
     struct reval_file
     {
         dev_t    dev{0};
@@ -1200,15 +870,14 @@ private:
     size_t m_http_reval_bytes{0};
     bool   m_http_reval_full_logged{false};
 
-    // Bounded, unlike m_http_cache, because this one fills lazily from whatever
-    // is requested rather than eagerly from a tree the operator can see the RSS
-    // of at startup.  A file over the per-file cap is served exactly as it is
-    // today and never enters the map.
+    // Bounded, unlike m_http_cache, because this one fills lazily from
+    // whatever is requested, and a file over the per-file cap never enters the
+    // map.
     static constexpr size_t HTTP_REVAL_MAX_FILE  = 1u << 20;   // 1 MiB
     static constexpr size_t HTTP_REVAL_MAX_TOTAL = 64u << 20;  // 64 MiB
 
-    // SOCKETLEY_HTTP_REVALIDATE=0 turns it off and restores the per-request
-    // open/read exactly.  Read once, at start.
+    // SOCKETLEY_HTTP_REVALIDATE=0 restores the per-request open and read
+    // exactly, read once at start.
     bool m_http_reval_enabled{true};
     bool http_reval_active() const { return m_http_reval_enabled && m_http_root_fd >= 0; }
     void http_reval_store(const std::string& url_path, const struct stat& st,

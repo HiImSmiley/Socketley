@@ -22,9 +22,9 @@
 struct client_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 16;
-    // Upper size for merging consecutive responses into one queue entry.  Large
-    // enough that thousands of small replies share a handful of entries, small
-    // enough that a single entry stays a reasonable write.
+    // Upper size for merging consecutive responses into one queue entry, large
+    // enough that thousands of small replies share a handful and small enough
+    // that one entry stays a reasonable write.
     static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
@@ -49,90 +49,44 @@ struct client_connection
     bool closing{false};
     bool zc_notif_pending{false};
 
-    // ── Which listener this connection came in on ───────────────────────────
-    //
-    // False for the shared port, which every shard binds under SO_REUSEPORT and
-    // which behaves exactly as it always has: a key another shard owns is
-    // fetched over the mesh and the client never learns a shard exists.
-    //
-    // True for the port this shard alone binds, `base + 1 + shard index`.  A
-    // client that connected THERE has read CLUSTER SLOTS and chosen this shard
-    // on purpose, so a key that is not ours is not a crossing to run — it is a
-    // routing mistake to report, with -MOVED, which is the one answer that
-    // teaches the client to stop making it.  The whole 1.44x is in that
-    // difference, and it is a property of the socket rather than of the
-    // command, which is why it is recorded once at accept.
+    // Which listener this connection came in on, recorded at accept, because a
+    // client that chose this shard's own port has read CLUSTER SLOTS and a key
+    // that is not ours is a routing mistake to report with -MOVED rather than
+    // a crossing to run.
     bool cluster_port{false};
 
-    // ── A crossing this connection is waiting on ────────────────────────────
-    //
-    // Non-zero while commands from this socket are being answered by ANOTHER
-    // shard of this runtime — see cache_instance's routing note.  It is the
-    // whole of what stops the pipeline: every reply after the first crossing
-    // has to wait behind an answer that has not arrived, because a client
-    // pipelining down one socket has no way to tell two replies apart except
-    // by the order they come back in.
-    //
-    // An id and not a pointer.  The reply lands on a later turn of the loop, by
-    // which time this struct may have been pooled and handed to somebody else,
-    // and an id resolves to nothing where a pointer would resolve to a
-    // stranger's socket.
+    // A crossing this connection is waiting on, which stops the pipeline
+    // because a client pipelining down one socket can only tell replies apart
+    // by order -- an id and not a pointer, since the struct may be pooled by
+    // the time the reply lands.
     uint64_t batch_id{0};
 
-    // The peer sent its FIN while a crossing was still owed.
-    //
-    // A request/response client that half-closes the moment it has finished
-    // asking is an ordinary client and not a broken one — `nc -q1` is one, and
-    // so is every test in this directory that pipes into it.  Until routing
-    // existed the distinction could not arise: the answer was produced inside
-    // the same read handler that saw the bytes, so it was already queued when
-    // the FIN arrived.  A crossing is answered on a later turn, and closing on
-    // the FIN throws away an answer the client is still sitting there reading.
-    //
-    // So the close is HELD rather than taken: no more input is expected, the
-    // debt is paid, and the teardown happens once the reply is on the wire.
+    // The peer sent its FIN while a crossing was still owed, so the close is
+    // held rather than taken, because a crossing is answered on a later turn
+    // and closing would throw away an answer the client is reading.
     bool peer_gone{false};
 
     // RESP protocol mode (auto-detected or forced)
     bool resp_mode{false};
     bool resp_detected{false};  // true once first byte examined
 
-    // Set by REPLICATE: this socket now carries the replication stream and
-    // nothing else, and the follower buffer is its only writer.  Ordinary
-    // commands are refused from here on — see handle_replicate_request() for the
-    // rule and what a client is still allowed to do.  follower_refused keeps the
-    // refusal to one line per connection, so a client that keeps talking cannot
-    // grow the replication backlog until the follower is dropped for it.
+    // Set by REPLICATE, after which this socket carries the replication stream
+    // and nothing else, with the refusal kept to one line per connection.
     bool is_follower{false};
     bool follower_refused{false};
 
-    // === TLS session ===
-    // Non-null only on a listener created with --tls.  The design is the
-    // server runtime's, deliberately unchanged: OpenSSL never sees this
-    // socket, the session is fed ciphertext a read completion delivered and
-    // drained of ciphertext a write submission carries, and every byte is
-    // copied into or out of a buffer this struct owns before an SQE is built.
-    // Nothing the kernel holds ever names the SSL or its memory BIOs.
-    //
-    // Who may free this: this struct, and nothing else.  pool_release() on the
-    // way back to the pool, reset() as a second line of defence for a struct
-    // coming back out, and ~client_connection for one that reaches neither
-    // because it was retired with a completion still outstanding and the
-    // runtime went away before it landed.  Because no completion can name the
-    // session, freeing it never has to wait on the ring — unlike write_batch.
+    // Non-null only with --tls, on the server runtime's design deliberately
+    // unchanged, and freed only by this struct -- which is what makes freeing
+    // it never have to wait on the ring.
     SSL* ssl{nullptr};
     tls_conn_state tls_state{tls_conn_none};
-    // The peer's close_notify, remembered rather than acted on.  The read that
-    // carries it can carry the last command ahead of it, and marking the
-    // connection closing before that command is parsed answers it with a
-    // dropped connection; handle_read applies this once the parse is done.
+    // The peer's close_notify, remembered rather than acted on, because the
+    // read that carries it can carry the last command ahead of it.
     bool tls_peer_closed{false};
 
-    // What this struct owns that no container releases for it.  Reached by a
-    // connection that was retired — the ring still owed it a completion — and
-    // whose completion was dropped rather than delivered because the runtime
-    // stopped first, so absorb_retired() never ran.  Safe here for the same
-    // reason it is safe anywhere: no submission ever named the session.
+    // What this struct owns that no container releases for it, reached by a
+    // retired connection whose completion was dropped when the runtime stopped
+    // first.
     ~client_connection()
     {
         tls_context::free_ssl(ssl);
@@ -173,10 +127,8 @@ struct client_connection
         resp_detected = false;
         is_follower = false;
         follower_refused = false;
-        // pool_release() already did this; repeated here because a struct
-        // leaving the pool must not carry the previous connection's session
-        // under any circumstances, and this is the last point at which that
-        // can still be true.
+        // pool_release() already did this, repeated because a struct leaving
+        // the pool must not carry the previous connection's session.
         tls_context::free_ssl(ssl);
         ssl = nullptr;
         tls_state = tls_conn_none;
@@ -277,30 +229,23 @@ public:
     std::string execute(std::string_view line);
 
     // ── request_sink ────────────────────────────────────────────────────────
-    // Answer a command that reached this cache from another runtime.  Same
-    // interpreter as a socket client's, deliberately: a request that arrives
-    // over the channel and the same request typed at the cache's own port have
-    // to mean the same thing, mode checks and replication included.
-    //
-    // The caller is the request channel, never the runtime that asked — this
-    // runs inside a completion the channel owns, so nothing here is on anybody
-    // else's message path.  See shared/request_channel.h.
+    // Answer a command that reached this cache from another runtime, through
+    // the same interpreter a socket client's uses, called by the request
+    // channel inside a completion the channel owns.
     void serve_request(std::string_view payload, std::string& out) override;
 
     // ── request_origin ──────────────────────────────────────────────────────
-    // The other half of the same channel, and the direction that is new here: a
-    // shard asking a SIBLING for a key it does not own.  The cookie names the
-    // group of commands this reply answers; see the routing note below.
+    // The other half of the same channel: a shard asking a sibling for a key
+    // it does not own, with the cookie naming the group of commands this reply
+    // answers.
     void on_request_reply(uint64_t cookie, request_status st,
                           std::string_view reply) override;
-    // The same interpreter over a payload that is exactly one command, newlines
-    // included.  A replication frame is framed BECAUSE the command contains a
-    // newline, so running it through the line splitter would apply half of it —
-    // which is the truncation the framing exists to stop.
+    // The same interpreter over exactly one command, newlines included,
+    // because a replication frame is framed precisely when the command
+    // contains a newline.
     void serve_one_command(std::string_view line, std::string& out);
-    // One command from a leader, applied to this shard's slice.  See the
-    // definition for why a sharded follower sees the whole stream and what it
-    // is allowed to drop.
+    // One command from a leader applied to this shard's slice; see the
+    // definition for what a sharded follower may drop.
     void apply_replicated(std::string_view line);
     // Shared body of the two above; `split` picks which one it is.
     void serve_payload(std::string_view payload, std::string& out, bool split);
@@ -324,25 +269,10 @@ public:
     void set_resp_forced(bool enabled);
     bool get_resp_forced() const;
 
-    // ─── --cluster: whether this cache PUBLISHES a routable map ─────────────
-    //
-    // Off by default, and the default is the whole of the old behaviour: with
-    // --shards N alone the shards share one port, the kernel assigns
-    // connections by four-tuple hash, and a key another shard owns is fetched
-    // over the mesh.  Nothing binds base+1, nothing answers -MOVED, and
-    // CLUSTER SLOTS publishes ONE node covering every slot on the shared port,
-    // which is a true map and a safe one.
-    //
-    // It is a flag and not a consequence of --shards because client-side
-    // routing gives up an enforcement point, and that is a decision only the
-    // operator can make.  A routing client must reach every shard's own port
-    // DIRECTLY: put this cache behind a proxy and the address it advertises is
-    // the one the PROXY reaches it on, taken from getsockname() on the asking
-    // connection.  Either the client can reach that address -- and the proxy's
-    // rules have been bypassed by a map this cache handed out -- or it cannot,
-    // and the client spends its retry budget on a connection refused.  Neither
-    // is visible to the operator, and neither can be fixed here: it is what
-    // client-side routing IS, and Redis Cluster has the same property.
+    // --cluster is a flag and not a consequence of --shards, because
+    // client-side routing gives up an enforcement point: behind a proxy the
+    // advertised address either bypasses the proxy's rules or cannot be
+    // reached at all.
     void set_cluster(bool enabled);
     bool get_cluster() const;
 
@@ -355,9 +285,9 @@ public:
     std::string_view get_replicate_target() const;
     repl_role get_repl_role() const;
 
-    // What the TLS gate asks this role for.  A cache that terminates TLS on
-    // its listener and replicates out of it in cleartext is refused, at create
-    // and at every start; see tls_config_refusal.
+    // What the TLS gate asks this role for, since a cache that terminates TLS
+    // and replicates out of it in cleartext is refused at create and at every
+    // start.
     std::string_view get_replication_target() const override { return m_replicate_target; }
 
     // Stats
@@ -379,27 +309,19 @@ private:
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
 
 #ifdef SOCKETLEY_INVARIANTS
-    // Debug-only: see invariants.h.  Asserts that a connection the runtime still
-    // has indexed still has something that will wake it.
+    // Debug-only: asserts that a connection the runtime still has indexed
+    // still has something that will wake it.
     void inv_check_reachable(int fd, const char* where);
 #endif
 
-    // ── The two dispatches, and the one decision in front of each ───────────
-    //
-    // process_command() and process_resp_command() are the whole of what this
-    // runtime does with a command; every path in — a socket, a request from
-    // another runtime, a replication frame — arrives at one of them.  So the
-    // ownership question is asked THERE and nowhere else: two sites, both
-    // asking shared/cache_shard_map.h, against sixty-odd command handlers that
-    // would otherwise each have to remember.
-    //
-    // The `_local` halves are the interpreters as they were.  They answer out
-    // of THIS shard's store and ask no questions about ownership, which is
-    // exactly what the answering side of a crossing needs.
+    // The ownership question is asked at the two dispatches and nowhere else,
+    // rather than in sixty-odd command handlers, with the `_local` halves the
+    // interpreters as they were -- which is what the answering side of a
+    // crossing needs.
     void process_command(client_connection* conn, std::string_view line);
     void process_command_local(client_connection* conn, std::string_view line);
-    // Run every line of a request payload through process_command, in order.
-    // See serve_request() for why a payload is a stream and not a command.
+    // Run every line of a request payload through process_command in order,
+    // because a payload is a stream and not a command.
     void run_request_lines(client_connection* conn, std::string_view payload);
     void process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
@@ -411,44 +333,11 @@ private:
     void parse_text_lines(client_connection* conn);
 
     // ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────
-    //
-    // `shard = hash(key) mod N`, and a command whose key belongs to somebody
-    // else is answered by them.  What makes that affordable is that a PIPELINE
-    // is grouped by owner before anything is sent: a run of commands crosses
-    // once per shard, not once per command, which is the difference between
-    // paying a round trip per operation and amortising one over sixteen.
-    //
-    // The crossing itself is the request channel, unchanged — see
-    // shared/request_channel.h and shared/shard_target.h.  A shard posts to
-    // `name#j`; the daemon holds the only map that resolves it and relays the
-    // request to shard j's control socket, and the reply comes back with the
-    // cookie this side posted.  Two round trips rather than the one a direct
-    // shard mesh would cost, and deliberately: N shards meshed are N**2
-    // teardown paths, which is the defect class this tree has paid for most.
-    //
-    // What a batch is, and why it is not simply a string:
-    //
-    //   Replies are NOT self-delimiting.  Ten commands answer over several
-    //   lines each and some of them end with `end\n`, so a concatenated reply
-    //   cannot be split back into per-command answers without a table of reply
-    //   shapes — which is the duplication request_channel.h refuses in its own
-    //   note.  So the two shards of one runtime frame their exchange: each
-    //   command goes over as `<len>\n<bytes>` and comes back the same way, and
-    //   the framing is understood by cache_instance alone.  The daemon relays
-    //   bytes and understands neither side, which is the property that lets the
-    //   crossing be a socket at all.
-    // One client command's answer.
-    //
-    // Usually one piece: a command with one key has one owner and one reply,
-    // which is every command step one routed.  A command with several keys is
-    // exploded into one single-key command per key and a keyspace-wide one into
-    // one per shard, so its answer arrives in pieces that have to be put back
-    // together in the order the CALLER wrote them -- not the order the replies
-    // came back in, which is the order the shards happened to answer.
-    //
-    // The one-piece case is the same structure with one part and
-    // cache_merge::single, deliberately: two shapes for "an answer" is how the
-    // second one stops matching the first.
+    // A pipeline is grouped by owner before anything is sent, so a run crosses
+    // once per shard rather than once per command, and the two shards frame
+    // their exchange as `<len>\n<bytes>` because replies are not
+    // self-delimiting -- with one command's answer assembled in the caller's
+    // order rather than the order shards answered.
     struct reply_slot
     {
         cache_merge              merge{cache_merge::single};
@@ -459,10 +348,9 @@ private:
 
     struct shard_batch
     {
-        // Which connection is waiting.  A descriptor and not a pointer, checked
-        // against m_conn_idx and against the connection's own batch_id before
-        // anything is written: the socket may have closed and its number may
-        // already belong to a client that never asked anything.
+        // Which connection is waiting, as a descriptor checked against
+        // m_conn_idx and the connection's batch_id, because the socket may
+        // have closed and its number been reissued.
         int  fd{-1};
         bool resp{false};
 
@@ -470,8 +358,8 @@ private:
         // them.
         std::vector<reply_slot> slots;
 
-        // Crossings still owed an answer.  One per SHARD, not one per command
-        // and not one per part.
+        // Crossings still owed an answer, one per shard rather than one per
+        // command or per part.
         uint32_t outstanding{0};
     };
 
@@ -483,19 +371,17 @@ private:
         uint32_t part{0};
     };
 
-    // A batch that could grow without bound is a memory path a client controls,
-    // so a run of routed commands is cut here and the rest is left in `partial`
-    // for the turn after this crossing lands.  Nothing is lost and nothing is
-    // reordered; the pipeline simply crosses in more than one go.
+    // A batch that could grow without bound is a memory path a client
+    // controls, so a run of routed commands is cut and the rest left in
+    // `partial` -- nothing lost and nothing reordered.
     static constexpr size_t MAX_ROUTED_PER_BATCH = 8192;
 
     // Parse what a connection has buffered, send what belongs to somebody else,
     // and stop if a crossing is already in flight for it.
     void pump(client_connection* conn);
 
-    // Post one request per owning shard and put the batch in flight.  Called
-    // once at the end of a parse, which is what makes the grouping worth
-    // anything: everything the read delivered has been classified by then.
+    // Post one request per owning shard and put the batch in flight, once at
+    // the end of a parse, which is what makes the grouping worth anything.
     void route_flush(client_connection* conn);
 
     // Fill every slot a failed or missing crossing owed, so a batch cannot be
@@ -503,30 +389,30 @@ private:
     void batch_fill_error(shard_batch& b, const std::vector<fill_target>& targets,
                           std::string_view why);
 
-    // Reserve this command's place in the reply order.  Returns its slot index;
-    // `parts` is how many pieces its answer will be assembled from.
+    // Reserve this command's place in the reply order, returning its slot
+    // index, with `parts` the number of pieces its answer needs.
     uint32_t slot_open(client_connection* conn, bool resp, cache_merge merge,
                        uint32_t parts);
 
-    // Hand one PIECE of a command to the shard that owns it, or run it here.
-    // `raw` is a complete single-key command in the connection's protocol.
+    // Hand one piece of a command to the shard that owns it or run it here,
+    // where `raw` is a complete single-key command in the connection's
+    // protocol.
     void route_part(client_connection* conn, uint32_t owner, uint32_t slot,
                     uint32_t part, std::string_view raw, bool resp);
 
-    // Run one complete command out of THIS shard's store and hand back what it
-    // wrote.  One function for the two callers that must not diverge: the shard
-    // answering a crossing, and the shard filling a part it owns itself.
+    // Run one complete command out of this shard's store and hand back what it
+    // wrote, in one function for the two callers that must not diverge.
     void run_local_raw(client_connection* conn, std::string_view raw, bool resp,
                        std::string& out);
 
-    // Put a finished slot's pieces together under its merge rule.  False means
-    // the pieces did not have the shape the rule expects, which is answered as
-    // an error for that command rather than as a mis-framed reply.
+    // Put a finished slot's pieces together under its merge rule, where false
+    // means they did not have the shape the rule expects and is answered as an
+    // error for that command.
     bool slot_render(const reply_slot& sl, bool resp, std::string& out) const;
 
-    // The two multi-key spellings, exploded into single-key commands.  False
-    // means the command could not be split -- a usage error -- and is answered
-    // by the local interpreter as it always was.
+    // The two multi-key spellings exploded into single-key commands, where
+    // false is a usage error answered by the local interpreter as it always
+    // was.
     bool explode_text_multi(client_connection* conn, uint32_t h,
                             std::string_view args);
     bool explode_resp_multi(client_connection* conn, uint32_t h,
@@ -536,13 +422,11 @@ private:
     void fan_all_shards(client_connection* conn, uint32_t h,
                         std::string_view raw, bool resp);
 
-    // Which shard a SCAN call resumes in, and one page out of this one.  See
-    // the SCAN note in shared/cache_shard_map.h for the cursor's layout and for
-    // what a caller is and is not promised across shards.
+    // Which shard a SCAN call resumes in, and one page out of this one.
     uint32_t scan_cursor_owner(std::string_view cursor_arg) const;
-    // `node_local` is set for a SCAN that arrived on the per-shard port: it
-    // walks this shard's slice and then ENDS, rather than handing back a cursor
-    // that names the next shard.  See the note at the implementation.
+    // `node_local` is set for a SCAN on the per-shard port, which walks this
+    // shard's slice and ends rather than handing back a cursor naming the next
+    // shard.
     bool     shard_scan(uint64_t cursor, std::string_view pattern, size_t count,
                         std::vector<std::string_view>& out, uint64_t& next,
                         bool node_local);
@@ -554,16 +438,13 @@ private:
     // Give up a batch a connection can no longer be told about.
     void batch_drop(client_connection* conn);
 
-    // The answering side: run a framed run of commands out of THIS shard's
-    // store and frame the replies back.  Recognised by serve_payload(); see the
-    // framing note above.
+    // The answering side: run a framed run of commands out of this shard's
+    // store and frame the replies back.
     bool serve_shard_batch(std::string_view payload, std::string& out);
 
-    // What a command that this build does not route yet is answered with.  Said
-    // out loud, per command, rather than served wrong out of one shard's slice:
-    // a multi-key or keyspace-wide command answered from a quarter of the
-    // keyspace is a miss for data that was stored, which is the failure the
-    // cache's --shards refusal names.
+    // What a command this build does not route yet is answered with, said out
+    // loud per command rather than served out of a quarter of the keyspace as
+    // a miss for data that was stored.
     void emit_unrouted(client_connection* conn, std::string_view cmd, bool resp,
                        std::string_view why);
 
@@ -595,8 +476,8 @@ private:
     // Batches waiting on a sibling, by the id their connection holds.
     std::unordered_map<uint64_t, shard_batch> m_batches;
 
-    // One posted crossing: which batch it belongs to and which of its slots it
-    // will fill.  Keyed by the cookie the channel hands back.
+    // One posted crossing -- which batch it belongs to and which slot it fills
+    // -- keyed by the cookie the channel hands back.
     struct posted_group
     {
         uint64_t                 batch{0};
@@ -604,27 +485,23 @@ private:
     };
     std::unordered_map<uint64_t, posted_group> m_posts;
 
-    // The batch being collected by the parse that is running right now.  One at
-    // a time, because one connection is parsed at a time, and null everywhere
-    // else — including inside serve_request(), which is what keeps the
-    // answering side of a crossing from trying to make one of its own.
+    // The batch being collected by the parse running right now, one at a time
+    // because one connection is parsed at a time, and null inside
+    // serve_request().
     std::unique_ptr<shard_batch> m_collect;
     int                          m_collect_fd{-1};
 
-    // Per-owner accumulation for the parse in progress: the framed payload and
-    // the slots it will fill.  Sized once at setup and cleared per flush, so a
-    // pipeline costs no allocation per command.
+    // Per-owner accumulation for the parse in progress, sized once at setup
+    // and cleared per flush, so a pipeline costs no allocation per command.
     std::vector<std::string>              m_route_payload;
     std::vector<std::vector<fill_target>> m_route_slots;
 
     uint64_t m_next_batch{1};
     uint64_t m_next_cookie{1};
 
-    // This runtime's shard set, read once at setup.  get_shards() is not inline
-    // and this is asked per command; 1 and 0 are the unsharded answers and make
-    // every check below a single compare.
-    // ── Persistence across a changed shard count ────────────────────────────
-    // See the note above the implementation for what each of these meets.
+    // This runtime's shard set read once at setup, because get_shards() is not
+    // inline and this is asked per command, with 1 and 0 the unsharded
+    // answers.
     std::string shard_dump_path(uint32_t index) const;
     bool        save_shard_dump() const;
     bool        load_shard_set();
@@ -632,9 +509,8 @@ private:
     uint32_t m_shard_n{1};
     uint32_t m_shard_i{0};
 
-    // True while this shard is answering a crossing from a SIBLING rather than
-    // a client of its own.  Read by publish(), which has one half that is per
-    // shard and one half that belongs to a single publish; see the note there.
+    // True while this shard is answering a crossing from a sibling rather than
+    // a client of its own, read by publish().
     bool m_serving_shard_batch{false};
 
     // Both report whether the submission reached the ring; see the definitions
@@ -643,114 +519,72 @@ private:
     bool flush_write_queue(client_connection* conn);
 
     // ── TLS record layer ────────────────────────────────────────────────────
-    // OpenSSL does no I/O here.  These two move bytes between a connection's
-    // memory BIO pair and the io_uring submissions that carry every other byte
-    // in the daemon, which is what makes the handshake asynchronous: one call
-    // per completion, several completions per handshake, nothing blocking and
-    // nothing spinning.
-    //
-    // Ciphertext a read delivered → SSL → plaintext in conn->partial, where
-    // RESP detection and the line parser already look for it.  A close_notify
-    // lands in tls_peer_closed instead of closing here, so the command it
-    // arrived with still gets an answer.
+    // OpenSSL does no I/O here, so the handshake is one call per completion
+    // with nothing blocking, and a close_notify lands in tls_peer_closed so
+    // the command it arrived with still gets an answer.
     void tls_feed(client_connection* conn, const char* data, size_t len);
 
-    // Queued plaintext → SSL → one write submission of ciphertext, and the
-    // only way a byte leaves a TLS connection.  Same contract as the two
-    // flushes above: false means nothing reached the ring and no completion is
-    // owed.  True with nothing submitted is legitimate and common — a
-    // handshake still running, or a write already in flight.
+    // Queued plaintext to one write submission of ciphertext, the only way a
+    // byte leaves a TLS connection, where true with nothing submitted is
+    // legitimate and common.
     bool tls_flush(client_connection* conn);
 
-    // Whether this connection still owes the wire anything.  On a TLS
-    // connection the write queue is only half the answer — a handshake flight,
-    // an alert or a session ticket is output with an empty queue, and asking
-    // only about the queue is how a handshake stalls one round short.
+    // Whether this connection still owes the wire anything, which for TLS the
+    // queue only half answers, because asking only about it is how a handshake
+    // stalls one round short.
     bool conn_has_output(const client_connection* conn) const;
 
-    // A TLS connection that is closing, owes the wire nothing more, and is
-    // waiting on nothing but its own read.
-    //
-    // The cleartext paths close such a connection the moment they mark it,
-    // because they have nothing left to send.  A session does: the alert that
-    // says why a handshake failed is the only diagnosis the peer will ever
-    // get, so the close waits for that write to land — and by then the read is
-    // the one operation still outstanding.  Nothing is going to complete it.
-    // The peer here is the one being refused; it is sitting on an open socket
-    // waiting for an answer that is never coming, and a multishot recv stays
-    // armed until the socket itself moves.  That is a client that hangs
-    // instead of being refused, which is the opposite of failing closed.
-    //
-    // shutdown() makes the read complete now, and the ordinary teardown runs
-    // from that completion — where freeing the struct is safe, and where every
-    // other close in this runtime already happens.
+    // A closing TLS connection waiting on nothing but its own read is shut
+    // down so that read completes now, because the alert saying why a
+    // handshake failed is the peer's only diagnosis and a multishot recv stays
+    // armed until the socket moves.
     void tls_close_when_read_is_all(client_connection* conn, int fd);
 
-    // Arm the read that fits the configured mode.  Returns false when nothing
-    // reached the ring, with read_pending left clear so no one waits on it.
+    // Arm the read that fits the configured mode, false when nothing reached
+    // the ring, with read_pending left clear so no one waits on it.
     bool submit_client_read(client_connection* conn, int fd);
 
     // Re-arm the listener, falling back to the backoff timer when the
-    // submission does not reach the ring.  Without that the cache stops taking
-    // connections silently — there is no completion left to report it.
+    // submission does not reach the ring, or the cache stops taking
+    // connections silently.
     void rearm_accept();
     void rearm_cluster_accept();
     void schedule_accept_backoff();
 
-    // One listener, opened and bound.  Both of this runtime's listeners are the
-    // same socket with the same options; the only thing that differs is the
-    // port and whether SO_REUSEPORT is set, so they are one function with two
-    // arguments rather than two copies that drift.
+    // One listener opened and bound, as one function with two arguments
+    // because the two differ only in the port and whether SO_REUSEPORT is set.
     bool open_listener(uint16_t port, bool reuseport, int& out_fd);
 
     // ─── The cluster view ───────────────────────────────────────────────────
-    //
-    // Enough of Redis's CLUSTER surface that an off-the-shelf cluster client
-    // bootstraps against this cache and routes for itself.  Everything here is
-    // derived from two numbers this shard already holds — the shard count and
-    // the base port — so N processes that never speak to each other publish the
-    // same map, which is the same property cache_shard_of() is built on.
+    // Enough of Redis's CLUSTER surface for an off-the-shelf client to
+    // bootstrap and route, derived from two numbers every shard already holds
+    // so N processes publish the same map without speaking.
     void     emit_cluster(client_connection* conn, std::string_view sub,
                           std::string_view arg, bool resp);
-    // 40 lowercase hex, stable across restarts, distinct per shard: what every
-    // client uses as the identity of a node.  Derived from the runtime name and
-    // the shard index rather than drawn at random, so a client that reconnects
-    // to a restarted cache sees the topology it already knows.
+    // 40 lowercase hex, stable across restarts and distinct per shard, derived
+    // from the runtime name and shard index so a reconnecting client sees the
+    // topology it knows.
     std::string cluster_node_id(uint32_t shard) const;
-    // The address to tell a client to go to.  Taken from getsockname() on the
-    // connection that asked, so it is by construction an address that reached
-    // us: the listener is bound to INADDR_ANY and has no opinion, while the
-    // socket knows which of this host's addresses the client actually used.
+    // The address to tell a client to go to, taken from getsockname() on the
+    // asking connection, so it is by construction an address that reached us.
     std::string cluster_host(const client_connection* conn) const;
     uint16_t cluster_port_of(uint32_t shard) const;
     // -MOVED, the answer that teaches a client to stop coming here for this
-    // key.  Only ever sent on the per-shard port; see client_connection.
+    // key, only ever sent on the per-shard port.
     void emit_moved(client_connection* conn, std::string_view key,
                     uint32_t owner, bool resp);
-    // The verdict on a multi-key command that arrived on the per-shard port.
-    // True means it has been answered here — -MOVED or -CROSSSLOT — and the
-    // caller must stop.  See the note at the implementation for why a mixed
-    // command cannot be answered with -MOVED.
+    // The verdict on a multi-key command that arrived on the per-shard port,
+    // where true means it has been answered here and the caller must stop.
     bool cluster_multi_verdict(client_connection* conn,
                                const std::vector<std::string_view>& keys,
                                bool resp);
 
 
     // ─── Retired I/O ───────────────────────────────────────────────────────
-    //
-    // One rule, applied everywhere: nothing io_uring may still be reading from
-    // or writing into is freed, reused or re-armed.  It is retired instead —
-    // moved out of the running state into m_retired, which owns the memory and
-    // leaves the io_requests inside it pointing at this instance, so the
-    // completion that is still owed lands in absorb_retired() instead of on
-    // whatever has taken the object's place.
-    //
-    // A stop/start cycle used to get this wrong in half a dozen places at once.
-    // teardown() deliberately kept connections, followers and timers alive
-    // because the kernel still held their addresses, and then setup() freed
-    // them or armed a second operation on the very same request — a completion
-    // arriving in that gap was dispatched through a pointer into memory that
-    // had already been handed to somebody else.
+    // One rule everywhere: nothing io_uring may still be reading from is
+    // freed, reused or re-armed, but retired into m_retired with its
+    // io_requests still pointing here, so the completion lands in
+    // absorb_retired().
     struct retired_op
     {
         // Released as soon as the last request below has completed; anything
@@ -765,42 +599,32 @@ private:
     // still be holding a provided buffer that has to go back to the ring.
     event_loop* m_retired_loop{nullptr};
 
-    // Every descriptor this runtime gives back to the kernel goes through here.
-    // A close does not withdraw an SQE that already carries the number; it only
-    // frees the number for the next accept, and the queued operation then lands
-    // on that connection instead.  See event_loop::close_fd, which holds the
-    // number until nothing in the ring still names it.
-    //
-    // m_retired_loop and not m_loop, for the same reason retire() uses it:
-    // descriptors are still closed after teardown has cleared m_loop, and that
-    // is exactly when the ring is most likely to be holding something.
+    // Every descriptor this runtime gives back goes through here, because a
+    // close does not withdraw an SQE that carries the number -- through
+    // m_retired_loop, since descriptors are closed after teardown has cleared
+    // m_loop.
     void close_tracked(int fd);
 
-    // Retire `storage`, waiting for the `count` requests in `owed` whose
-    // completions the ring still owes us.  With nothing owed the object is
-    // released here and now.
+    // Retire `storage`, waiting for the `count` requests in `owed`, releasing
+    // it here and now when nothing is owed.
     void retire(std::shared_ptr<void> storage, io_request* const* owed, size_t count);
-    // Consume a completion that belongs to a retired object.  True means the
-    // request was one of those, and the caller must not look at it again.
+    // Consume a completion belonging to a retired object, where true means the
+    // caller must not look at the request again.
     bool absorb_retired(io_request* req, struct io_uring_cqe* cqe);
 
-    // A timeout and the request that carries it, allocated per run.
-    //
-    // io_uring keeps both addresses for the life of the operation, and an
-    // interval timer is nearly always in flight when a runtime stops — the TTL
-    // sweep fires twice a second.  Timeouts are not attached to an fd either,
-    // so no shutdown() or cancel reaches them.  Re-arming the same request on
-    // restart therefore leaves two self-perpetuating chains driving one piece
-    // of state; a fresh object per run keeps the old completion recognisable.
+    // A timeout and its request allocated per run, because an interval timer
+    // is nearly always in flight when a runtime stops and reaches no shutdown
+    // or cancel, so re-arming the same request leaves two chains driving one
+    // piece of state.
     struct timer_op
     {
         io_request req{};
         struct __kernel_timespec ts{};
     };
 
-    // The accept request together with the address the kernel fills in through
-    // it.  Same reasoning as timer_op: a stale accept completion landing on a
-    // re-armed request arms the listener twice.
+    // The accept request together with the address the kernel fills in, on the
+    // same reasoning as timer_op: a stale accept completion on a re-armed
+    // request arms the listener twice.
     struct accept_op
     {
         io_request req{};
@@ -808,58 +632,41 @@ private:
         socklen_t addrlen{sizeof(struct sockaddr_in)};
     };
 
-    // Declared here rather than beside rearm_accept(): both take an accept_op,
-    // and the struct is defined immediately above.
-    //
-    // Arm `op` on `fd`, choosing multishot the same way for both listeners.
-    // `multishot` is written, not read: it records what was actually armed.
+    // Arm `op` on `fd`, choosing multishot the same way for both listeners,
+    // with `multishot` written rather than read because it records what was
+    // actually armed.
     void arm_listener(int fd, accept_op& op, bool& multishot);
     void rearm_accept_on(int fd, accept_op* op, bool multishot);
 
     int m_listen_fd;
-    // The path the CURRENT listener actually bound, empty for a TCP one.
-    // Deliberately not get_listen_path(): teardown() has to unlink exactly the
-    // node this run created, and the configuration may have been edited
-    // between start and stop.  Same member, same reason, as the server's.
+    // The path the current listener actually bound, deliberately not
+    // get_listen_path(), because the configuration may have been edited
+    // between start and stop.
     std::string m_bound_listen_path;
     std::unique_ptr<accept_op> m_accept;
     bool m_multishot_active{false};
 
     // ── The port this shard alone binds ─────────────────────────────────────
-    //
-    // `base + 1 + shard index`, bound in addition to the shared one and only
-    // when the cache is sharded.  It is the whole mechanism behind the client
-    // routing: a cluster-aware client reads the map out of CLUSTER SLOTS and
-    // opens one connection per shard, and a connection to THIS port can only
-    // have come from a client that meant this shard.
-    //
-    // Not under SO_REUSEPORT, deliberately, and this is the difference that
-    // matters.  The shared port is joined by every shard and the kernel picks
-    // one by 4-tuple hash — which is exactly why the client cannot choose.  If
-    // this port carried SO_REUSEPORT too, a second process binding it would be
-    // ACCEPTED and would silently take a share of connections meant for this
-    // shard, answering -MOVED for keys it does not hold.  Without it the second
-    // bind fails, loudly, at start.
+    // `base + 1 + shard index`, bound only when sharded and deliberately
+    // without SO_REUSEPORT, because with it a second process binding this port
+    // would be accepted and answer -MOVED for keys it does not hold.
     int m_cluster_listen_fd{-1};
     std::unique_ptr<accept_op> m_cluster_accept;
     bool m_cluster_multishot_active{false};
     uint16_t m_cluster_port{0};
-    // What --cluster asked for, and what this run actually does about it.
-    // m_cluster_ports is the second one: a cluster of a single shard publishes
-    // a map and binds no extra port, because its one node IS the shared port.
+    // What --cluster asked for and what this run does about it, which differ
+    // for a cluster of a single shard: it publishes a map and binds no extra
+    // port.
     bool m_cluster_forced{false};
     bool m_cluster_ports{false};
-    // The port the operator configured — shard i's own port is this + 1 + i, and
-    // the map published by CLUSTER SLOTS is that formula for every i.  Kept
-    // because get_port() is not inline and the answer has to be identical in
-    // every shard.
+    // The port the operator configured, from which every shard's own port is
+    // derived, kept because get_port() is not inline and the answer has to be
+    // identical in every shard.
     uint16_t m_base_port{0};
 
-    // The listener's TLS context, or null when this cache serves cleartext.
-    // Rebuilt on every start rather than kept: `reload` is a stop followed by
-    // a start, and it is how an operator installs a renewed certificate.
-    // Sessions handed out by the previous context hold their own reference and
-    // are unaffected.
+    // The listener's TLS context, rebuilt on every start so `reload` installs
+    // a renewed certificate, with existing sessions holding their own
+    // reference.
     std::unique_ptr<tls_context> m_tls;
 
     cache_store m_store;
@@ -885,40 +692,20 @@ private:
     std::string m_replicate_target;
     repl_role m_repl_role{repl_none};
 
-    // A follower socket plus whatever has not reached it yet.
-    //
-    // Replication output cannot be written synchronously.  A follower may live
-    // in the same daemon as its leader, sharing this event loop, so blocking
-    // until the socket drains deadlocks: the follower cannot read while the loop
-    // is stuck inside the leader's write.  Everything therefore goes through an
-    // io_uring write and the unsent tail waits here.
-    //
-    // Keeping the tail also protects the command stream.  A short write would
-    // otherwise splice two commands together, which the follower has no way to
-    // detect.
-    //
-    // This buffer is the *only* writer on the descriptor once the promotion has
-    // happened — the acknowledgement, the dump and every replicated command
-    // leave through it, in that order.  The client_connection the socket came
-    // from stops answering commands at the same moment, because two writers on
-    // one socket cannot be ordered against each other; see
-    // handle_replicate_request() and client_connection::is_follower.
+    // A follower socket plus whatever has not reached it yet, because a
+    // follower sharing this event loop would deadlock a synchronous write and
+    // a short write would splice two commands together -- and this buffer is
+    // the only writer on the descriptor once promotion has happened.
     struct follower_conn
     {
-        // Borrowed, never owned.  A follower reaches the leader as an ordinary
-        // client, so this descriptor belongs to that client_connection and is
-        // closed by close_client() alone.  Closing it here as well handed the
-        // number back to the kernel twice; worse, keeping it after the client
-        // had gone meant the next accepted connection inherited it and received
-        // the replication stream — dataset dump included — while the writes
-        // succeeded, so the follower was never even noticed as gone.
-        // close_client() sets this back to -1 as it goes.
+        // Borrowed and never owned, because the descriptor belongs to the
+        // client_connection the follower reached the leader as, and keeping it
+        // after that client had gone gave the next accepted connection the
+        // replication stream.
         int fd{-1};
         // Two buffers, because the kernel reads directly out of `out` for the
-        // duration of a write.  Appending to it meanwhile can reallocate the
-        // string and leave the operation pointing at freed memory, so anything
-        // produced while a write is in flight waits in `queued` and moves over
-        // once `out` has drained.
+        // duration of a write and appending could reallocate it under the
+        // operation.
         std::string out;            // kernel owns out[0..in_flight) while writing
         std::string queued;         // produced since the current write started
         size_t in_flight{0};
@@ -928,22 +715,18 @@ private:
 
         size_t backlog() const { return out.size() + queued.size(); }
     };
-    // Cap on buffered-but-unsent replication data per follower.  A follower that
-    // falls this far behind is dropped: an explicit disconnect is recoverable,
-    // an unbounded buffer or a corrupted command stream is not.
+    // Cap on buffered-but-unsent replication data per follower, past which it
+    // is dropped, because an explicit disconnect is recoverable and a
+    // corrupted command stream is not.
     static constexpr size_t MAX_FOLLOWER_PENDING = 8 * 1024 * 1024;
 
     // unique_ptr because the kernel holds a pointer to each write_req for the
     // lifetime of its operation; vector growth would move the elements.
     std::vector<std::unique_ptr<follower_conn>> m_followers;
 
-    // The link to the leader, allocated per connect.
-    //
-    // The read armed on it is not cancelled by closing the socket — the
-    // operation holds its own reference to the file and completes on its own
-    // terms — so neither the request nor the buffer may be handed to the next
-    // link.  Reconnecting usually lands on the same fd number, and two reads
-    // into one buffer produce a replication stream with holes in it.
+    // The link to the leader allocated per connect, because the read armed on
+    // it is not cancelled by closing the socket and reconnecting usually lands
+    // on the same fd number.
     struct master_link
     {
         io_request read_req{};
@@ -956,15 +739,15 @@ private:
 
     // Start a write if nothing is in flight, moving queued data into out.
     void follower_kick(follower_conn& f);
-    // Queue data for a follower and start writing if nothing is in flight.
-    // Returns false when the follower must be dropped.
+    // Queue data for a follower and start writing if nothing is in flight,
+    // false when the follower must be dropped.
     bool follower_write(follower_conn& f, std::string_view data);
     // Continue or finish a follower write after its completion arrives.
     void handle_follower_write(struct io_uring_cqe* cqe, follower_conn& f);
     // Drop followers marked dead and ask their client connections to close.
     void reap_followers();
-    // Give up the follower that was promoted from this descriptor, if any.
-    // Called from close_client(), which is the only owner of the socket.
+    // Give up the follower promoted from this descriptor, called from
+    // close_client(), which is the only owner of the socket.
     void detach_follower(int fd);
 
     // The follower promoted from this descriptor, or nullptr.
@@ -983,50 +766,18 @@ private:
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 3;
-    // ─── MEASURED, 2026-08-25, AND 4096 IS NOT THE OPTIMUM ──────────────────
-    //
-    // 4096 stood here unexamined since the first commit.  Crossed against
-    // buffer size, RECVSEND_BUNDLE and the allocator, twenty arms alive at
-    // once, every cell paired against 4K/bundle-on/glibc inside one tool
-    // invocation with the order flipped per round.  glibc, ops/s:
-    //
-    //            16 KB values, P=8          64 B values, P=128
-    //          bundle off   bundle on     bundle off   bundle on
-    //   1 KB      61,107      57,303      2,368,462   2,456,763
-    //   2 KB      81,354     120,820      2,626,029   3,088,313
-    //   4 KB     107,937     120,295      2,578,310   3,241,110
-    //   8 KB     123,381     130,851      2,928,423   2,920,642
-    //  16 KB     120,576     135,002      3,301,223   3,104,270
-    //
-    // The reference against ITSELF spread -5.7..+14.0% (P=8) and -3.5..+9.9%
-    // (P=128), so single steps are inside the noise and only large effects and
-    // monotone runs mean anything.  What survives that bar:
-    //
-    //   - 1 KB is a real penalty and bundles do not rescue it (-6%): at that
-    //     granularity the cost is per BUFFER, and a bundle removes cost per
-    //     COMPLETION.
-    //   - Bundling's clearest win is 2 KB, +48%, which lifts 2 KB level with
-    //     4 KB.  It flattens the curve rather than moving its peak.
-    //   - Bundle-on rises monotonically 4K -> 8K -> 16K (120,295 / 130,851 /
-    //     135,002).  Each step alone is inside the band; three in one
-    //     direction are not nothing.
-    //
-    // 4096 is therefore KEPT under protest, not confirmed.  Raising it costs
-    // nothing in memory here only if BUF_COUNT falls with it (this sweep held
-    // every runtime at constant total), and the case for 8-16 KB needs more
-    // rounds than five to clear a 14% band.  Do that before changing it.
-    //
-    // The allocator does not matter: mimalloc and jemalloc were measured in
-    // every cell and neither produced an effect that survived the control.
-    // An earlier +19.7% at P=128 did NOT reproduce here.
+    // 4096 is kept under protest rather than confirmed: measured across buffer
+    // size, bundling and allocator, 1 KB is a real penalty, bundling's
+    // clearest win is 2 KB, and bundle-on rises monotonically to 16 KB -- but
+    // each step is inside a 14% self-noise band, and the allocator did not
+    // matter.
     static constexpr uint32_t BUF_COUNT = 512;
     static constexpr uint32_t BUF_SIZE = 4096;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
-    // Bundled multishot recv: one completion per burst instead of one per
-    // 4 KB buffer.  Only a preference — a submit refused (cursor tripped, SQ
-    // full) falls back to the plain multishot arm, and handle_read consumes
-    // both through the loop's span API so the two are indistinguishable there.
+    // Bundled multishot recv, one completion per burst instead of one per
+    // buffer, and only a preference: a refused submit falls back to the plain
+    // arm, which handle_read consumes identically.
     bool m_recv_bundle{false};
     bool m_send_zc{false};
 
@@ -1041,35 +792,23 @@ private:
     // TTL sweep short-circuit: skip m_expiry scan when no TTL keys exist
     bool m_has_ttl_keys{false};
 
-    // Whether a TTL sweep timeout is currently outstanding.
-    //
-    // The sweep used to rearm itself unconditionally, so every cache runtime
-    // kept submitting an SQE ten times a second whether or not a single key had
-    // an expiry.  With io_uring in SQPOLL mode that is enough to keep the kernel
-    // poller from ever reaching its idle timeout, which costs a full core at
-    // zero traffic.  The timer now stops when there is nothing to expire and is
-    // restarted by mark_ttl_keys() when a TTL first appears.
+    // Whether a TTL sweep timeout is outstanding, because rearming
+    // unconditionally kept the SQPOLL poller from ever reaching its idle
+    // timeout and cost a full core at zero traffic.
     bool m_ttl_timer_armed{false};
 
     // Submit the sweep timeout unless one is already pending.
     void arm_ttl_timer();
 
-    // Record that at least one key now carries an expiry, restarting the sweep
-    // if it had stopped.  Use this instead of assigning m_has_ttl_keys directly:
-    // setting the flag without arming the timer leaves expired keys to be
-    // reclaimed only when something happens to touch them.
+    // Record that at least one key now carries an expiry and restart the
+    // sweep, because setting the flag without arming the timer leaves expired
+    // keys until something touches them.
     void mark_ttl_keys();
 
-    // The connection serve_request() and execute() answer through.
-    //
-    // A client_connection carries a 4 KB read buffer and half a dozen strings,
-    // and both of those entry points used to build one on the stack per call.
-    // That was fine while the only caller was an interactive CLI command; the
-    // server's `--cache` auto-store now comes through here once per message, so
-    // the object is made once and reset instead.  m_serving is the re-entrancy
-    // guard: a command that publishes reaches Lua, and Lua can ask this cache
-    // another question from inside the first one, which would otherwise write
-    // two answers into one buffer.
+    // The connection serve_request() and execute() answer through, made once
+    // and reset because the server's --cache auto-store comes here per
+    // message, with m_serving the re-entrancy guard for a command that
+    // publishes into Lua.
     std::unique_ptr<client_connection> m_request_conn;
     bool m_serving{false};
 
@@ -1077,27 +816,20 @@ private:
     static constexpr size_t CONN_POOL_INIT = 32;
     std::vector<std::unique_ptr<client_connection>> m_conn_pool;
     std::unique_ptr<client_connection> pool_acquire(int fd);
-    // Hand a connection back for reuse — or retire it, when the ring still owes
-    // it a completion.  The pool gives structs straight to the next accepted
-    // connection, so this is the one place that has to decide, and every close
-    // path goes through it.
+    // Hand a connection back for reuse, or retire it when the ring still owes
+    // it a completion, in the one place every close path goes through.
     void pool_release(std::unique_ptr<client_connection> conn);
 
-    // Full teardown of a client connection.  Every close path must go through
-    // this rather than open-coding the steps: dropping the fd without clearing
-    // its subscriptions leaves it in the store's channel map forever, and the
-    // next connection that happens to get the same fd number inherits the dead
-    // client's channels.
+    // Full teardown of a client connection, which every close path must go
+    // through, because dropping the fd without clearing its subscriptions
+    // leaves it in the store's channel map forever.
     void close_client(client_connection* conn, int fd, const char* reason);
 
-    // The one place a connection nothing is going to finish is finished.
-    // Called from on_cqe() after every completion, for the connection that
-    // completion named; see the call site for the reasoning and for why an
-    // armed read does not count as something that will finish it.
+    // The one place a connection nothing is going to finish is finished,
+    // called after every completion for the connection it named.
     void finish_unreachable_client(int fd);
 
-    // The same flags, sorted by who is obliged to report them.  See
-    // shared/conn_reachability.h; this function is the seam between that
-    // classification and this runtime's connection struct.
+    // The same flags sorted by who is obliged to report them, which is the
+    // seam between conn_reachability.h and this runtime's connection struct.
     socketley::reach::owed conn_owed(const client_connection* conn) const;
 };
