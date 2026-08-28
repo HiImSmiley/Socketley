@@ -2,44 +2,20 @@
 # Integration test: a runtime's record is not readable by the rest of the machine.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
-#
-# Both writers in state_persistence.cpp used std::ofstream, which creates with
-# 0666 & ~umask.  That is not a mode, it is whatever the daemon inherited — and
-# the file it applies to is the runtime's whole record: --master-pw verbatim,
-# the paths of the TLS and mTLS private keys, the --lua script the daemon runs
-# with its own privileges.
-#
-# Measured on the parent commit, packaged shape — daemon as `socketley`,
-# /var/lib/socketley/runtimes at 0755 as packaging/install.sh created it:
-#
-#     daemon's umask 002   file 0664   uid nobody read  "master_pw": "s3cr3t..."
-#     daemon's umask 0     file 0666   uid nobody REWROTE the record
-#
-# The second line is why this is not merely disclosure.  The daemon restores
-# every runtime from these files at startup, so a writable record is a way to
-# choose what the daemon runs — the same escalation the IPC socket's 0666 was,
-# closed in 8e4cff7, arriving through the filesystem instead.
-#
+# Both writers used std::ofstream, so the mode of a runtime's whole record --
+# --master-pw verbatim, the TLS private key paths, the script the daemon runs
+# with its own privileges -- was whatever umask the daemon inherited, and at
+# umask 0 another uid could rewrite the record the daemon restores from at
+# startup.
 # ─── WHAT IS PINNED, AND WHY EACH ONE ───────────────────────────────────────
-#
-#   1. The mode of a file the daemon just wrote.  0600.
-#   2. The same file after a start and a stop.  set_was_running rewrites the
-#      whole record on every transition through a second writer; a fix that
-#      covered only write_json would pass assertion 1 and undo itself here.
-#   3. The daemon is started with `umask 0` on purpose.  If the mode came from
-#      the umask again this is the assertion that says so, and it is the one
-#      the 0666 case above needs.
-#   4. A second uid cannot read the password out of it.  Skipped, loudly, where
-#      the machine has no second account to lend.
-#   5. The upgrade path: files an older version already wrote at 0644 are
-#      narrowed at startup, and the runtime still loads afterwards.
-#
+# Five assertions: the mode of a fresh file, the mode after a transition
+# through set_was_running's second writer, a daemon started under umask 0 on
+# purpose, a second uid unable to read the password, and files an older version
+# wrote at 0644 narrowed at startup with the runtime still loading.
 # ─── THE CONTROL ────────────────────────────────────────────────────────────
-#
 # "The password cannot be read" is also true of a daemon that stopped storing
-# it, and that would be a broken daemon rather than a fixed one.  So the last
-# assertion reads the record back as its owner and requires the password to
-# still be in it, with the right value, after a restart.
+# it, so the last assertion reads the record back as its owner and requires the
+# password to still be there after a restart.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -70,15 +46,9 @@ trap cleanup EXIT
 
 echo "=== Integration: a runtime's record is not the machine's to read ==="
 
-# The daemon is started under the worst umask there is.  The whole point is
-# that the mode must not come from it.
-#
-# In this shell rather than in a `( umask 0; daemon_start )` subshell.  The
-# subshell form was written first and is wrong twice: daemon_start's bookkeeping
-# — the pid it records, the binary it remembers — would be set inside it and
-# lost, and the daemon it backgrounds becomes a job of a shell that is about to
-# exit, which killed it about half the time.  A test that fails half the time is
-# not a stricter test.
+# The daemon is started under the worst umask there is, in this shell rather
+# than in a subshell, because a subshell loses daemon_start's bookkeeping and
+# backgrounds the daemon as the job of a shell about to exit.
 OLD_UMASK=$(umask)
 umask 0
 daemon_start "$BIN"
@@ -93,11 +63,9 @@ if [ -z "$STATE_DIR" ] || [ ! -d "$STATE_DIR" ]; then
     exit 2
 fi
 
-# Everything above the file is opened on purpose.  daemon_isolate works in a
-# mktemp 0700, so a second uid cannot reach the path at all — and a test that
-# stopped there would pass against the 0644 build for a reason that has nothing
-# to do with the file.  The deployed shape is a 0755 state directory, which is
-# what this reproduces.
+# Everything above the file is opened on purpose, because daemon_isolate works
+# in a mktemp 0700 that a second uid cannot reach at all -- while the deployed
+# shape is a 0755 state directory, which is what this reproduces.
 chmod 0711 "$SOCKETLEY_TMPD" "$SOCKETLEY_TMPD/home" 2>/dev/null || true
 chmod -R o+rX "$SOCKETLEY_TMPD/home/.local" 2>/dev/null || true
 chmod 0755 "$STATE_DIR" 2>/dev/null || true
@@ -117,9 +85,8 @@ if [ "$MODE" = "600" ]; then pass; else
 fi
 
 # ── 2. and after a start and a stop ─────────────────────────────────────────
-#
-# Separate because it is a separate writer.  set_was_running rewrites the whole
-# record — password included — through its own path.
+# Separate because it is a separate writer: set_was_running rewrites the whole
+# record, password included, through its own path.
 "$BIN" start sp_srv >/dev/null 2>&1 || true
 sleep 0.8
 MODE_START=$(stat -c '%a' "$REC" 2>/dev/null || echo "?")
@@ -158,10 +125,9 @@ else
 fi
 
 # ── 4. the upgrade path ─────────────────────────────────────────────────────
-#
-# A record an older version wrote, at the mode an older version wrote it.  The
-# .tmp beside it is a write a killed daemon never finished — same record, same
-# password, and nothing else ever cleans it up.
+# A record an older version wrote at the mode an older version wrote it, with
+# the .tmp beside it being a write a killed daemon never finished and nothing
+# else ever cleans up.
 cat > "$STATE_DIR/sp_legacy.json" <<J
 {
     "name": "sp_legacy",
@@ -176,38 +142,23 @@ J
 cp "$STATE_DIR/sp_legacy.json" "$STATE_DIR/sp_leftover.json.tmp"
 chmod 644 "$STATE_DIR/sp_legacy.json" "$STATE_DIR/sp_leftover.json.tmp"
 
-# ── and a symlink, which the repair must not follow ─────────────────────────
-#
-# The repair walks this directory and changes the mode of what it finds.  Done
-# through the path — stat() then chmod(), which is how it was first written —
-# a name here pointing anywhere else is a mode change of whatever it points at,
-# and the daemon runs as root under `sudo socketley daemon`.
-#
-# It is not reachable while the packaged directory is 0750, because nobody else
-# can create a name in it.  That is the reason to pin it rather than to leave
-# it: the file layer would be resting on the directory mode, and a later
-# loosening of that mode — or a state directory somewhere else — moves the
-# whole risk back here with nothing watching.
-#
-# The target is deliberately outside the state directory and deliberately not
-# valid runtime JSON, so the only thing that could change its mode is the
-# repair following the link.
+# The repair must not follow a symlink, because through the path it is a mode
+# change of whatever the name points at and the daemon runs as root --
+# unreachable while the packaged directory is 0750, which is the reason to pin
+# it rather than leave the file layer resting on a directory mode.
 SYM_TARGET="$SOCKETLEY_TMPD/not-a-runtime.txt"
 echo "this file is not socketley's" > "$SYM_TARGET"
 chmod 644 "$SYM_TARGET"
 ln -sf "$SYM_TARGET" "$STATE_DIR/sp_link.json"
 
 # The daemon goes down and comes back on the same state directory, which is
-# what an upgrade is.  daemon_stop is not used here: it deletes the directory.
+# what an upgrade is, so daemon_stop is not used -- it deletes the directory.
 kill "$SOCKETLEY_DPID" 2>/dev/null || true
 for _ in $(seq 1 50); do kill -0 "$SOCKETLEY_DPID" 2>/dev/null || break; sleep 0.1; done
 
-# The log is emptied first, and that is load-bearing rather than tidiness.
-# daemon_start waits by grepping this file for "daemon started", and the line
-# the FIRST daemon wrote is still in it — so without this the wait returns
-# immediately, the assertions below race a daemon that has not bound yet, and
-# the file fails about half the time it is run.  Measured: 3 FATALs in 6 runs
-# before this line existed, 0 in 12 after.
+# The log is emptied first because daemon_start waits by grepping it for a line
+# the first daemon already wrote, and without this the assertions race a daemon
+# that has not bound yet.
 : > "$SOCKETLEY_DLOG"
 daemon_start "$BIN"
 
@@ -221,10 +172,9 @@ if [ "$L_MODE" = "600" ] && [ "$T_MODE" = "600" ]; then pass; else
 fi
 
 # ── the symlink was not followed ────────────────────────────────────────────
-#
-# Two things, because either alone is weak.  The target's mode is what a
-# followed link would have changed; the link still being a link is what says
-# the daemon did not replace it with a regular file on the way past.
+# Two things, because the target's mode is what a followed link would have
+# changed while the link still being a link says the daemon did not replace it
+# with a regular file on the way past.
 S_MODE=$(stat -c '%a' "$SYM_TARGET" 2>/dev/null || echo "?")
 if [ "$S_MODE" = "644" ] && [ -L "$STATE_DIR/sp_link.json" ]; then pass; else
     fail "a symlink in the state directory is not followed" \
@@ -242,9 +192,9 @@ if grep -qa "symlink(s) in" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
          "worth one line to whoever has to explain it later"
 fi
 
-# And that the repair is what did it, rather than the modes having arrived at
-# 0600 by some other route.  The log was emptied above, so this line can only
-# have come from the daemon that just started.
+# And that the repair is what did it rather than the modes arriving at 0600 by
+# some other route, which the emptied log makes attributable to the daemon that
+# just started.
 if grep -qa "state: tightened 2 file(s)" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
     fail "the repair says what it did" \
          "no 'state: tightened 2 file(s)' line in this daemon's log" \
@@ -252,11 +202,8 @@ if grep -qa "state: tightened 2 file(s)" "$SOCKETLEY_DLOG" 2>/dev/null; then pas
          "startup has no other way to find that out"
 fi
 
-# ── 5. control: the record still says what it is for ────────────────────────
-#
-# Read as its owner, which the daemon's user always could.  Without this, a
-# daemon that had simply stopped persisting master_pw would pass every
-# assertion above — and would be a broken daemon, not a fixed one.
+# Read as its owner, without which a daemon that had simply stopped persisting
+# master_pw would pass every assertion above and be broken rather than fixed.
 if grep -qF "\"master_pw\": \"$PW\"" "$STATE_DIR/sp_srv.json" 2>/dev/null &&
    "$BIN" ls 2>/dev/null | grep -qa sp_legacy
 then pass; else

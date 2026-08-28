@@ -1,58 +1,18 @@
 #!/usr/bin/env bash
-# suite: quiet -- fails under a parallel group run ('no LISTEN socket in the
-# worker's fd table') and passes alone, 2 of 2.  The mechanism is NOT
-# established; most likely it inspects the fd table before the worker has
-# bound.  Marked so the group runner is usable, not because this is diagnosed.
-# Integration test: an out-of-process proxy worker inherits four descriptors and
-# no others.
-#
-# The daemon forks and execs itself for every proxy created with
-#.  Four descriptors are meant to cross that exec — /dev/null
-# on stdin, the daemon's stdout and stderr so a worker's log lines land where
-# the operator is already looking, and the control socket on fd 3.  Everything
-# else the daemon holds was inheritable as well, because SOCK_CLOEXEC was set at
-# exactly one socket() call in the tree and the io_uring accepts passed a
-# trailing 0 where the flags argument goes.
-#
-# Read out of a live worker on the broken build:
-#
-#     fd 5 -> unix .../daemon.sock  SO_ACCEPTCON   the daemon's IPC listener
-#     fd 6 -> tcp 0.0.0.0:4CEA      LISTEN         a DIFFERENT runtime's port
-#     fd 8 -> unix .../daemon.sock                 an accepted CLI connection
-#     fd 9 -> tcp 0.0.0.0:4CEC      LISTEN         19692, its own — legitimate
-#
-# ─── WHY THE CONSEQUENCES ARE ASSERTED AND NOT JUST THE FD TABLE ────────────
-#
-# An fd table is a fact about a process; what it costs is two facts about the
-# operator, and both are asserted here because either could be fixed on its own
-# by a change that left the other in place.
-#
-#   THE SOCKET.  A worker holding the daemon's IPC listener answers "is a daemon
-#   serving this socket" in the affirmative.  That question is asked by inode in
-#   lib_daemon.sh's daemon_pids, which 81dcf4a rewrote precisely so that a
-#   renamed binary copy could not make it say no; this made it say yes with no
-#   daemon in existence, which is the same false report arriving by the other
-#   door.  Measured on the broken build with both processes up, daemon_pids
-#   returned two pids for one serving process.
-#
-#   THE PORT.  A worker holding another runtime's listening socket keeps that
-#   port bound after the runtime is gone.  On the ordinary stop path this is
-#   invisible: teardown() calls shutdown() on the listener, which unhashes the
-#   socket for every duplicate of it at once.  A daemon that is killed rather
-#   than stopped never reaches that line — and then the port is held by a
-#   process with no runtime and no daemon to account for it, and the next
-#   `create` on it fails with an address in use that nothing on the machine
-#   explains.
-#
+# suite: quiet -- fails under a parallel group run and passes alone, most
+# likely inspecting the fd table before the worker has bound. A proxy worker
+# inherits exactly four descriptors and no others, because SOCK_CLOEXEC was set
+# at one socket() call in the tree and the io_uring accepts passed a trailing 0
+# where the flags go -- with the two consequences asserted as well as the
+# table, since either could be fixed alone: a worker holding the daemon's IPC
+# listener makes daemon_pids answer yes with no daemon in existence, and a
+# worker holding another runtime's listening socket keeps that port bound after
+# a daemon that was killed never reached teardown's shutdown.
 # ─── AND WHY THE WORKER IS MADE TO SERVE ────────────────────────────────────
-#
-# The opposite mistake is the expensive one.  SOCK_CLOEXEC on something the
-# worker genuinely needs would break the split silently — the daemon would fork,
-# the child would exec, and the runtime would be gone with the fd table looking
-# tidier than ever.  So the last assertion is an end-to-end request through the
-# worker to a backend, after the change: the worker's own listener is not
-# inherited, it is opened after the exec from the port in its config frame, and
-# that claim is worth nothing unless something has gone through it.
+# The opposite mistake is the expensive one, so the last assertion is an
+# end-to-end request through the worker: its own listener is opened after the
+# exec from the port in its config frame, and that claim is worth nothing
+# unless something has gone through it.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -72,18 +32,10 @@ BEPID=""
 WPID=""
 
 cleanup() {
-    # `|| true` on both, like every other line in this function.
-    #
-    # It was not needed while the worker was guaranteed to still be there: the
-    # test SIGSTOPped it precisely so that it would outlive its daemon, so both
-    # kills found a live process and returned 0.  A worker cannot outlive its
-    # daemon any more, so both now fail -- and under `set -euo pipefail` a
-    # failing command in an EXIT trap replaces the script's exit status.
-    #
-    # The symptom was a test that printed "12/12 passed, 0 failed" and exited 1,
-    # which the runner counts as a failure and the report denies.  Worth the
-    # comment because that shape is invisible from the log: every assertion the
-    # file makes was green.
+    # `|| true` on both, because a worker can no longer outlive its daemon and
+    # under pipefail a failing command in an EXIT trap replaces the script's
+    # exit status -- printing 12/12 passed and exiting 1, which is invisible
+    # from the log.
     [ -n "$WPID" ] && kill -CONT "$WPID" 2>/dev/null || true
     [ -n "$WPID" ] && kill -9 "$WPID" 2>/dev/null || true
     for n in "$PX_NAME" "$SRV_NAME"; do
@@ -148,10 +100,9 @@ ready_tcp 127.0.0.1 "$BE_PORT" 15 || { echo "  SKIP: backend did not start"; exi
 daemon_start "$BIN"
 DPID=$SOCKETLEY_DPID
 
-# The unrelated runtime, started FIRST so that its listener is already open in
-# the daemon when the worker is forked.  That ordering is the whole point: a
-# listener opened after the fork could not be inherited however the flags are
-# set, so a test that creates it second would pass on the broken build.
+# The unrelated runtime is started first so its listener is already open in the
+# daemon when the worker is forked, since a listener opened after the fork
+# could not be inherited however the flags are set.
 create_ok "unrelated server created" "$BIN" create server "$SRV_NAME" -p "$SRV_PORT" -s
 ready_tcp 127.0.0.1 "$SRV_PORT" 15 || fail "setup" "the unrelated server never listened"
 
@@ -159,11 +110,9 @@ create_ok "out-of-process proxy created" \
     "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" --backend "127.0.0.1:$BE_PORT" \
     --protocol http -s
 
-# The worker, found by executable identity rather than by name: agents copy the
-# binary into their worktrees under other names, and lib_daemon.sh documents at
-# length why nothing here may match on one.  `proxy-worker` in the command line
-# is the daemon's own argv for the child, not a user-typed string, so matching
-# it cannot hit a shell.
+# Found by executable identity rather than by name, because agents copy the
+# binary into their worktrees, and `proxy-worker` is the daemon's own argv for
+# the child rather than a user-typed string, so matching it cannot hit a shell.
 find_worker() {
     local d p r=""
     for d in /proc/[0-9]*; do
@@ -194,14 +143,9 @@ fi
 ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
 
 # ── 1. THE FD TABLE ─────────────────────────────────────────────────────────
-#
 # Classified from /proc/net rather than from the number, because the numbers
-# move: with the leak closed the worker's own listener is fd 6, and on the
-# broken build fd 6 was another runtime's.  What is asserted is what each
-# descriptor IS.
-#
-# The daemon's socket path and the two ports are all known here, so each of the
-# three leaks has its own assertion and a failure says which one came back.
+# move and what is asserted is what each descriptor is -- one assertion per
+# leak, so a failure says which one came back.
 DSOCK=$SOCKETLEY_SOCKET
 hex_port() { printf '%04X' "$1"; }
 SRV_HEX=$(hex_port "$SRV_PORT")
@@ -242,8 +186,8 @@ else
     pass
 fi
 
-# (b) an accepted connection on the daemon's IPC socket — same path, no
-#     SO_ACCEPTCON.  This is one CLI process's private channel to the daemon.
+# An accepted connection on the daemon's IPC socket -- same path, no
+# SO_ACCEPTCON -- which is one CLI process's private channel.
 if printf '%s\n' "$FDS" | awk -v s="$DSOCK" '$2=="unix" && $3==s && $4!="00010000"{f=1}
                                              END{exit !f}'; then
     fail "an accepted CLI connection does not cross the exec" \
@@ -252,9 +196,8 @@ else
     pass
 fi
 
-# (c) any LISTEN socket that is not the worker's own port.  Stated this way
-#     rather than as "not $SRV_PORT" so that a fourth listener nobody thought
-#     of is caught by the same line.
+# Any LISTEN socket that is not the worker's own port, stated this way so a
+# fourth listener nobody thought of is caught by the same line.
 STRAY=$(printf '%s\n' "$FDS" \
         | awk -v px=":$PX_HEX" '$2=="tcp" && $4=="0A" && $3 !~ px" *$" {print $1" -> "$3}')
 if [ -n "$STRAY" ]; then
@@ -265,9 +208,8 @@ else
     pass
 fi
 
-# (d) and the positive half of (c): its own listener IS there.  Without this,
-#     (c) passes on a worker that never bound anything at all — an identity
-#     assertion that a no-op satisfies.
+# The positive half, without which the assertion above passes on a worker that
+# never bound anything at all.
 if printf '%s\n' "$FDS" | awk -v px=":$PX_HEX" '$2=="tcp" && $4=="0A" && $3 ~ px" *$"{f=1}
                                                 END{exit !f}'; then
     pass
@@ -307,31 +249,11 @@ fi
 # ── 3. THE TWO CONSEQUENCES ─────────────────────────────────────────────────
 #
 # ─── WHY THIS SECTION CHANGED SHAPE ─────────────────────────────────────────
-#
-# It used to freeze the worker with SIGSTOP so that it OUTLIVED the kill -9 on
-# its daemon, and then read the two consequences off the survivor: a survivor
-# holding the daemon's listener is one that answers "yes, a daemon is here", and
-# a survivor holding an unrelated runtime's port is one that keeps that port
-# bound.  The setup guard below insisted the survivor existed, and said so
-# plainly: without it "nothing below discriminates".
-#
-# A worker cannot outlive its daemon any more.  It asks the kernel for
-# PR_SET_PDEATHSIG(SIGKILL) before it does anything else, precisely because
-# SO_REUSEPORT lets a survivor go on serving its share of a port from a build
-# nobody believes is running — see the note above claim_current_daemon() in
-# proxy_worker.cpp.  SIGKILL and not SIGTERM for the reason this test's own
-# SIGSTOP demonstrates: a stopped process runs no handler.
-#
-# So the survivor is gone, and with it the discriminating power of (e) and (f).
-# That is not a loss of coverage, because it is not where the coverage was: the
-# fd table in section 1 asserts each of the three leaks DIRECTLY, on a live
-# worker, by what each descriptor is — and those assertions are untouched and
-# still fail on a broken build.  (e) and (f) were always the consequences of
-# what (a)-(d) measure.
-#
-# What replaces the old setup guard is the assertion that the new guarantee
-# holds, which is the one thing here that a regression could now break: freeze
-# the worker, kill the daemon, and require the worker to be gone anyway.
+# A worker cannot outlive its daemon any more -- it asks for
+# PR_SET_PDEATHSIG(SIGKILL) first thing, because SO_REUSEPORT lets a survivor
+# go on serving from a build nobody believes is running -- so what stood here
+# is replaced by the assertion that the new guarantee holds: freeze the worker,
+# kill the daemon, and require the worker to be gone anyway.
 kill -STOP "$WPID" 2>/dev/null || true
 kill -9 "$DPID" 2>/dev/null || true
 SOCKETLEY_DPID=""
@@ -345,8 +267,8 @@ else
     PASS=$((PASS+1))
 fi
 
-# A frozen worker cannot act on the EOF its control socket just got, so nothing
-# it could DO would end it.  Only the kernel can, and this asserts that it did.
+# A frozen worker cannot act on the EOF its control socket just got, so only
+# the kernel can end it and this asserts that it did.
 for _ in $(seq 1 60); do kill -0 "$WPID" 2>/dev/null || break; sleep 0.25; done
 TOTAL=$((TOTAL+1))
 if kill -0 "$WPID" 2>/dev/null; then
@@ -358,13 +280,9 @@ else
     PASS=$((PASS+1))
 fi
 
-# (e) no daemon exists, so nothing may claim to be serving its socket.
-#
-# Weaker than it was, and deliberately kept: with the worker killed alongside
-# its daemon this can no longer fail by the route it was written for, and (a)
-# above is what catches that leak now.  It still answers a question worth
-# asking — that a killed daemon leaves nothing behind claiming to serve its
-# socket — and it costs one connect().
+# Weaker than it was and deliberately kept: it can no longer fail by the route
+# it was written for, but a killed daemon leaving nothing behind claiming to
+# serve its socket is still worth asking and costs one connect.
 if daemon_alive "$DSOCK"; then
     fail "nothing is left claiming to serve the dead daemon's socket" \
          "daemon_alive says a daemon is serving $DSOCK after kill -9 on $DPID" \
@@ -373,10 +291,8 @@ else
     pass
 fi
 
-# (f) the unrelated runtime's port comes back.  The daemon was killed, so
-#     nothing ran teardown()'s shutdown() — a leaked duplicate is the only thing
-#     that can still be holding this.  Same caveat as (e): (c)/(d) above are
-#     what discriminate now, and this is the consequence they imply.
+# The unrelated runtime's port comes back, and since the daemon was killed a
+# leaked duplicate is the only thing that could still be holding it.
 BINDMSG=$(python3 - "$SRV_PORT" <<'PY'
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -3,33 +3,20 @@
 # nothing, and something measurable when they should.
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
-#
-# --circuit-threshold already appeared in two test files before this one, and
-# both of them asserted that the breaker OPENS.  Neither asserted that it stays
-# SHUT, and two faults sat in that gap: a clean backend close after an answer,
-# and a client aborting mid-exchange, each charged to the breaker as a backend
-# failure.  Five of either took a perfectly healthy backend out of rotation and
-# every later client was answered with an instant EOF.  A test that only watches
-# a limiter fire cannot see a limiter that fires when nothing is wrong.
-#
-# So every refusal below is asserted next to a case that must keep working. That
-# pairing is the whole design: "the breaker opened" passes on a build that
-# refuses everything, and "the request was served" passes on a build with no
-# breaker at all.  Only the two together say the policy is a policy.
-#
+# Two earlier files asserted that the breaker opens and neither that it stays
+# shut, so a clean backend close and a client aborting mid-exchange were each
+# charged to it as backend failures -- and every refusal here is asserted next
+# to a case that must keep working, because "the breaker opened" passes on a
+# build that refuses everything and "the request was served" on a build with no
+# breaker at all.
 # ─── WHAT IS PINNED HERE ────────────────────────────────────────────────────
-#
-#   1. the breaker stays shut for four things that are not backend failures,
-#      and opens for the one that is
-#   2. --retry replays idempotent methods and refuses non-idempotent ones, which
-#      is a data-integrity question rather than an availability one: a POST that
-#      reaches two backends because the first died after reading it is a
-#      duplicate side effect nobody asked for
-#   3. --retry-all replays them anyway, which is what it is for — pinned so that
-#      it stays a deliberate decision and not an accident
-#   4. --max-connections refuses past the limit and releases when connections go
-#   5. --rate-limit and --global-rate-limit limit to the configured rate, are
-#      measured rather than eyeballed, and let a compliant client through
+# Five sections: the breaker stays shut for four things that are not backend
+# failures and opens for the one that is, --retry replays idempotent methods
+# and refuses the rest because a duplicate POST is a data-integrity question,
+# --retry-all replays them anyway as a pinned deliberate decision,
+# --max-connections refuses past the limit and releases afterwards, and the
+# rate limiters are measured rather than eyeballed and let a compliant client
+# through.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -68,7 +55,7 @@ assert_eq() {
 }
 
 # For the rate limiters, where the answer is a number in a range rather than a
-# value.  The range is stated at each call site with why it is that wide.
+# value, with the range stated at each call site.
 assert_range() {
     TOTAL=$((TOTAL+1))
     local got="$1" lo="$2" hi="$3" label="$4"
@@ -90,12 +77,9 @@ fi
 TMPD=$(mktemp -d)
 
 # ── the backend ─────────────────────────────────────────────────────────────
-#
-# One script, several behaviours, because the scenarios differ only in what the
-# backend does after it has read the request.  It counts what it received and
-# writes that to a file, which is how "the request reached this backend" is
-# asserted separately from "the client got an answer" — the two come apart in
-# exactly the cases this file is about.
+# One script with several behaviours, counting what it received into a file, so
+# "the request reached this backend" is asserted separately from "the client
+# got an answer" -- which come apart in exactly the cases this file is about.
 cat > "$TMPD/be.py" <<'PY'
 import socket, sys, threading, time
 port = int(sys.argv[1]); mode = sys.argv[2]
@@ -216,8 +200,8 @@ except Exception: pass
 print(ok)
 PY
 
-# A client that stays inside the limit must never be refused.  Without this the
-# rate-limit assertions would pass on a build that closes every connection.
+# A client that stays inside the limit must never be refused, without which the
+# rate-limit assertions pass on a build that closes every connection.
 cat > "$TMPD/paced.py" <<'PY'
 import socket, sys, time
 port = int(sys.argv[1]); rate = float(sys.argv[2]); secs = float(sys.argv[3])
@@ -299,12 +283,8 @@ make_proxy() {      # backends flags...
 count_of() { cat "$TMPD/$1.count" 2>/dev/null || echo 0; }
 circuits() { "$BIN" stats pn_px 2>/dev/null | grep -c "circuit:open" || true; }
 
-# ─── 1. the breaker stays shut for what is not a backend failure ────────────
-#
-# circuit_threshold is 5, so ten provocations is twice what it takes.  Each
-# scenario ends by asking the proxy to serve one ordinary request: an open
-# circuit is invisible until somebody asks, so that final request is the
-# assertion and the count beside it is the diagnosis.
+# Ten provocations against a threshold of five, each scenario ending with one
+# ordinary request, because an open circuit is invisible until somebody asks.
 
 echo "  -- breaker: what must not open it --"
 
@@ -324,9 +304,8 @@ assert_eq "$(circuits)" "0" "clients aborting mid-exchange do not open the circu
 assert_eq "$(python3 "$TMPD/req.py" "$PX" /pn_px/b2)" "HTTP/1.1 200 OK" "and the proxy still serves"
 stop_backends
 
-# Slow but answering.  --backend-timeout defaults to 2s and the backend takes
-# 0.35s, so this is a backend doing its job slowly rather than one failing; a
-# breaker that charged latency would take it out of rotation for being busy.
+# Slow but answering, well inside the 2s backend timeout, so a breaker that
+# charged latency would take a working backend out of rotation for being busy.
 start_backend b3 "$BE1" slow 0.35
 make_proxy "127.0.0.1:$BE1"
 SLOW_OK=0
@@ -337,8 +316,6 @@ assert_eq "$SLOW_OK" "10" "a slow backend that answers is served every time"
 assert_eq "$(circuits)" "0" "and being slow does not open the circuit"
 stop_backends
 
-# ─── 2. …and opens for the one thing that IS a backend failure ──────────────
-#
 # Without this the four assertions above are satisfied by deleting the breaker.
 echo "  -- breaker: what must open it --"
 start_backend b4 "$BE1" close_before
@@ -350,12 +327,10 @@ assert_eq "$(python3 "$TMPD/req.py" "$PX" /pn_px/d2)" "HTTP/1.1 503 Service Unav
           "and an open circuit answers 503 rather than trying anyway"
 stop_backends
 
-# ─── 3. --retry: which methods may be replayed ──────────────────────────────
-#
-# The first backend reads the request and dies without answering, so the request
-# HAS reached it.  Whether the second backend sees it too is the whole question:
-# for a POST that is a duplicate side effect, and no amount of availability
-# makes that a good trade.
+# The first backend reads the request and dies without answering, so it has
+# reached one -- and whether the second sees it too is the whole question,
+# since for a POST that is a duplicate side effect no availability makes a good
+# trade.
 echo "  -- retry: only idempotent methods are replayed --"
 
 retry_case() {   # method expect_second expect_status label
@@ -388,12 +363,8 @@ EXTRA=""
 stop_backends
 
 # ─── 4. --max-connections ───────────────────────────────────────────────────
-#
-# What a caller past the limit experiences is the point: refused is retryable
-# and visible, silently accepted and dropped is not.  The proxy accepts at the
-# TCP level and closes at once, so the client sees a reset when it writes — and
-# the assertion is on how many are SERVED, which is the only part a caller can
-# act on.
+# The assertion is on how many are served, because refused is retryable and
+# visible while silently accepted and dropped is not.
 echo "  -- max-connections --"
 start_backend b5 "$BE1" ok
 make_proxy "127.0.0.1:$BE1" --max-connections 3
@@ -406,23 +377,21 @@ assert_eq "$(python3 "$TMPD/conns.py" "$PX" 3)" "3" "the limit releases when con
 stop_backends
 
 # ─── 5. --rate-limit and --global-rate-limit ────────────────────────────────
-#
-# Measured, not eyeballed.  A proxy accepted --rate-limit, reported it back from
-# `show`, and never applied it: 40 requests on one connection were all answered
-# at 5497/sec against a configured 2/sec.  So the burst assertion is a count,
-# and the paced one beside it is what stops "closes everything" from passing.
+# Measured rather than eyeballed, because a proxy accepted --rate-limit,
+# reported it back from `show` and never applied it -- so the burst assertion
+# is a count and the paced one beside it stops "closes everything" from
+# passing.
 echo "  -- rate limits --"
 start_backend b6 "$BE1" ok
 make_proxy "127.0.0.1:$BE1" --rate-limit 5
-# The bucket starts full, so a burst gets the allowance and no more.  The range
-# is 5..7 rather than exactly 5: the refill is continuous, so a burst that takes
-# a couple of milliseconds legitimately earns a fraction of a token back.
+# The bucket starts full so a burst gets the allowance and no more, with the
+# range 5..7 because the refill is continuous and a burst legitimately earns a
+# fraction of a token back.
 assert_range "$(python3 "$TMPD/burst.py" "$PX" 60)" 5 7 "a burst of 60 under --rate-limit 5 is cut to the allowance"
 sleep 1.2
-# 3/sec for 2s under a limit of 5, plus the 5 the initial bucket allows: a
-# compliant client is never refused, which is the control the whole check rests
-# on.  Floor 9 rather than 11 because the pacing is a sleep loop and the last
-# tick may not fit in the window.
+# A compliant client is never refused, which is the control the whole check
+# rests on, with a floor of 9 rather than 11 because the pacing is a sleep loop
+# whose last tick may not fit in the window.
 assert_range "$(python3 "$TMPD/paced.py" "$PX" 3 2)" 9 14 "a client inside --rate-limit 5 is never refused"
 
 make_proxy "127.0.0.1:$BE1" --global-rate-limit 5

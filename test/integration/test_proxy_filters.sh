@@ -1,37 +1,10 @@
 #!/usr/bin/env bash
-# Integration test: the proxy's Lua filter chain runs before a backend is chosen.
-#
-# `on_route` answers "where does this go".  Authentication, per-user rate
-# limiting and header rewriting are not that question, and having nowhere else
-# to live they ended up inside route selection — which runs *after* the proxy has
-# already committed to a backend for the request.  The filter chain runs before
-# that commitment and may end the request outright.
-#
-# The claim being tested is an ordering claim, and a status code cannot test it.
-# A 403 proves the client was refused; it says nothing whatever about whether a
-# backend socket was opened, a pooled one was spent, or the request was forwarded
-# and its answer discarded.  So the oracle is the backend's own bookkeeping: it
-# records every accept and every byte it reads, and a rejected request must move
-# neither number.  A proxy that connects first and refuses second fails here
-# while answering exactly what a correct one answers.
-#
-# Both counters, not just accepts.  Accepts alone would miss the case that
-# matters most on this proxy — a *pooled* backend socket, already accepted for an
-# earlier request, carrying the rejected one.  The accept count would sit still
-# and the request would reach the backend anyway.
-#
-# And the rejection is measured over a RUN, not over one request, for the same
-# reason.  Measured against a build with the chain deliberately moved below the
-# connect: one rejected request cost zero accepts, because the pool still held
-# the socket the readiness probe had left there and the proxy spent that instead
-# of opening a new one.  A single-request oracle passes that build — it is a
-# proof about an empty pool, not about ordering.  MAX_POOL_PER_BACKEND is 32, so
-# forty rejections cannot be covered by any pool this proxy is willing to keep,
-# and the same broken build turned forty rejections into forty accepts.
-#
-# The vacuity guard is phase 2: an allowed request must move both counters.
-# Without it every "did not reach the backend" assertion here would pass against
-# a proxy that reaches no backend at all.
+# The filter chain runs before a backend is chosen, which a status code cannot
+# test, so the oracle is the backend's own accept and byte counters -- both,
+# because a pooled socket would carry a rejected request without moving the
+# accept count -- measured over forty rejections rather than one, since
+# MAX_POOL_PER_BACKEND is 32 and a single-request oracle is a proof about an
+# empty pool, with an allowed request in phase 2 as the vacuity guard.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -71,15 +44,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet starts one of its own, detached from this shell; killing
-    # $DPID would leave that one running for good, holding this test's ports.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket as well as by pid and matched on exact process name,
+    # because a CLI command against an absent daemon starts a detached one
+    # $DPID would never reach, and a `pgrep -f` pattern also matches the shell
+    # doing the matching.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -96,10 +64,9 @@ trap cleanup EXIT
 
 echo "=== Integration: a filter answers before a backend is chosen ==="
 
-# Backend.  One line in $ACCEPTS per accepted connection and every byte it reads
-# appended to $RAW — those two files are the whole oracle.  Answers with
-# Content-Length and keep-alive so the proxy reaches its pooling path, which is
-# the case the accept counter alone cannot see.
+# The backend's accept log and raw byte capture are the whole oracle, and it
+# answers with Content-Length and keep-alive so the proxy reaches its pooling
+# path -- the case the accept counter alone cannot see.
 python3 - "$BE_PORT" "$RAW" "$ACCEPTS" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
 import socket, sys, threading
 
@@ -177,15 +144,10 @@ while True:
 PYEOF
 BEPID=$!
 
-# The chain under test.  Three filters, and each one is here to make a different
-# statement falsifiable:
-#
-#   1. carries on, and rewrites a header on the way through
-#   2. answers /denied — the request this test follows to the backend that never
-#      sees it
-#   3. answers /denied differently, and would be reached only if filter 2's
-#      answer did NOT end the chain; and answers /throttled, which filter 2
-#      ignores, so a chain that stops after its first entry fails here
+# Three filters, each making a different statement falsifiable: one carries on
+# and rewrites a header, one answers /denied, and one would only be reached if
+# the second's answer did not end the chain while also answering a path the
+# second ignores.
 cat > "$LUA" <<'LUAEOF'
 filters = {
     function(req)
@@ -245,10 +207,8 @@ filters = {
 }
 LUAEOF
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet, so
-# polling with one races the daemon this test has just launched and spawns a
-# second, orphaned one that survives cleanup.
+# Wait on the daemon's IPC socket directly and never by polling with a CLI
+# command, which auto-starts a second orphaned daemon that survives cleanup.
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -276,14 +236,11 @@ SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart.
+# The daemon that answers is the one this test launched, since a zombie $DPID
+# has an empty /proc/<pid>/fd that `kill -0` cannot tell from a live process.
 TOTAL=$((TOTAL+1))
-# `|| true` because of `set -o pipefail`: when the pid really is gone — the
-# case this check exists for — `ls` fails, the pipeline fails, and the script
-# dies right here with no output at all.  The one check that can report a
-# dead daemon could never report one.
+# `|| true` because under pipefail the failing `ls` in exactly the case this
+# check exists for would kill the script with no output at all.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -302,9 +259,8 @@ else
     echo "  FAIL [setup]: the HTTP backend never came up on $BE_PORT"
 fi
 
-# No --strategy lua: the chain is not a routing strategy and must run whatever
-# picks the backend afterwards.  A chain that only fired under 'lua' would be a
-# routing feature wearing a different name.
+# No --strategy lua, because the chain is not a routing strategy and one that
+# only fired under 'lua' would be a routing feature wearing a different name.
 create_ok "proxy with the filter chain created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$LUA" -s
 ready_http 127.0.0.1 "$PX_PORT" "/$PX_NAME/ready" 20 || true
@@ -502,9 +458,8 @@ print("P5 AFTER %s %s" % (st, body))
 print("DONE")
 PYEOF
 
-# The harness has to have reached its last line.  Without this an aborted run
-# would only show up as a pile of confusing per-phase failures, and any check
-# phrased as "compare what we read" would have nothing to compare and pass.
+# The harness has to have reached its last line, or a check phrased as "compare
+# what we read" would have nothing to compare and pass.
 TOTAL=$((TOTAL+1))
 if grep -qx 'DONE' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -618,10 +573,8 @@ else
 fi
 
 TOTAL=$((TOTAL+1))
-# -i, because a header a filter set is emitted with a lowercased name.  This
-# grep was case-sensitive at first and passed against a build with the ban
-# removed — the desync was there, in the file, and the oracle read straight past
-# it.
+# -i, because a header a filter set is emitted with a lowercased name and a
+# case-sensitive grep read straight past the desync it was there to catch.
 if grep -qai 'content-length: 999' "$RAW" 2>/dev/null; then
     FAIL=$((FAIL+1))
     echo "  FAIL [a filter may not set the request framing]: a Content-Length a filter"
@@ -653,9 +606,8 @@ check "the request a filter stripped headers from is still served" \
     '^P4 REMOVED HTTP/1\.1 200 ' \
     "$(grep -m1 '^P4 REMOVED' "$OUT" 2>/dev/null || echo 'no result')"
 
-# The control first: this is what makes the two assertions after it mean
-# anything.  Without it, "the header is not in the capture" is equally true of a
-# header nobody ever sent.
+# The control first, because "the header is not in the capture" is equally true
+# of a header nobody ever sent.
 TOTAL=$((TOTAL+1))
 if grep -qai 'X-Internal-Trust: kept-me' "$RAW" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -693,9 +645,8 @@ else
     echo "        nothing about is missing from what the backend read"
 fi
 
-# The bans, on the removal side.  Same rule as set_headers and the same reason:
-# a filter must not be able to change how a message is framed or where it is
-# addressed.
+# The bans on the removal side, for the same reason as set_headers: a filter
+# must not be able to change how a message is framed or where it is addressed.
 TOTAL=$((TOTAL+1))
 if grep -qai 'content-length: 5' "$RAW" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -719,8 +670,8 @@ else
 fi
 
 # A self-answered request is torn down through the paths every other answered
-# request uses.  A leaked descriptor or a socket returned to the pool off a
-# message boundary shows up here as a proxy that has stopped working.
+# request uses, so a leaked descriptor or a socket returned off a message
+# boundary shows up here as a proxy that has stopped working.
 check "the proxy still serves after forty rejections" \
     '^P5 AFTER HTTP/1\.1 200 .* after-storm$' \
     "$(grep -m1 '^P5 AFTER' "$OUT" 2>/dev/null || echo 'no result')"

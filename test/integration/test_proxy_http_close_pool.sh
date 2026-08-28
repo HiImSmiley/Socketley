@@ -3,41 +3,14 @@
 # backend connection.
 #
 # ─── WHAT WAS WRONG ─────────────────────────────────────────────────────────
-#
-# `Connection` is hop-by-hop.  A client sending `Connection: close` is talking
-# about its own connection to the proxy and says nothing whatever about the
-# proxy's connection to the backend.  The proxy treated it as though it did, in
-# two places at once: rewrite_http_request copied the token onto the request it
-# wrote upstream, so the backend closed and its socket was then unpoolable by
-# its own instruction; and handle_backend_read refused the pool detach outright
-# for such a client.  Either alone is a backend connection per client request.
-#
-# Measured on this tree, 12,000 requests at concurrency 8 through one `--http`
-# backend, a fresh daemon per arm: 16-18 backend sockets with a keep-alive
-# client, 11,992 with a connection-per-request one, and 9,593 of those still
-# sitting in TIME-WAIT the instant the run ended.  This box has 28,231 ephemeral
-# ports and the run does 24,000 requests a second, so that shape empties the
-# range in about a second and the proxy then cannot reach its backend at all.
-#
-# ─── WHAT IS ASSERTED, AND WHY IT IS THE SOCKET COUNT ───────────────────────
-#
-# The number of backend connections, counted by the backend itself, and never
-# the request rate.  A rate assertion cannot tell a pool from a fast handshake:
-# on loopback a fresh connect costs tens of microseconds, so a build that pools
-# nothing still answers quickly and passes any threshold loose enough not to
-# flake.  The backend here stamps its own connection ordinal into every response
-# body, so each request carries the evidence of which backend socket served it,
-# and the count is read out of the answers rather than out of `ss`.
-#
-# Against the broken build every request comes back stamped with a new ordinal
-# and the accept count equals the request count.  Watched red there: 6 backend
-# connections for 6 requests, ordinals 1..6.
-#
-# The third proxy is the control that keeps the fix from becoming a sweep.  Its
-# backend answers `Connection: close` on every response, and that socket must
-# still NOT be pooled — the backend's own token is a fact about the backend and
-# is the one of the three refusals that was never the bug.  A build that removed
-# that refusal too passes every other assertion in this file and fails this one.
+# `Connection` is hop-by-hop, so a client's `close` says nothing about the
+# proxy's socket to the backend -- and the proxy honoured it in two places at
+# once, which is a backend connection per client request and empties this box's
+# ephemeral range in about a second; asserted on the number of backend sockets
+# rather than a request rate, because on loopback a build that pools nothing
+# still answers quickly, with the backend stamping its connection ordinal into
+# every response and a third proxy as the control whose backend sends `close`
+# itself and must still not be pooled.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -81,10 +54,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Matched by exact process name and then by this run's own socket path.
-    # `pgrep -f` also matches the shell that merely carries the string on its
-    # command line — including this one — and the environ test cannot rule that
-    # out, because such a shell exports the very variable being matched.
+    # Matched by exact process name and then by this run's own socket path,
+    # because `pgrep -f` also matches the shell that carries the string on its
+    # command line.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -102,17 +74,10 @@ trap cleanup EXIT
 echo "=== Integration: a close-mode client must not cost a backend connection ==="
 
 # ─── The backend ────────────────────────────────────────────────────────────
-#
-# An HTTP/1.1 origin that stamps its own accepted-connection ordinal into every
-# response body, alongside the marker taken from the request path.  The ordinal
-# is what makes the pool visible from the client side: two requests answered
-# with the same ordinal were carried by one backend socket, and no build can
-# produce that by being fast.
-#
-# It answers `Connection: keep-alive` (or `close`, in the control instance) and
-# always sends a Content-Length, because a response whose framing the proxy
-# cannot resolve is refused by the pool for that reason instead and the test
-# would then be measuring the wrong refusal.
+# An HTTP/1.1 origin stamping its accepted-connection ordinal into every
+# response, which is what makes the pool visible from the client side, and
+# always sending a Content-Length because a response whose framing the proxy
+# cannot resolve is refused by the pool for that reason instead.
 cat > "$TMPDIR_T/backend.py" <<'PYEOF'
 import os, socket, sys, threading, time
 
@@ -305,9 +270,8 @@ python3 "$TMPDIR_T/backend.py" "$BEC_PORT" close     "$TMPDIR_T/accepts.cl" \
     "$ACCLOG_CL" >"$TMPDIR_T/backend_ctl.log" 2>&1 &
 BECPID=$!
 
-# The accept log is a timeline and an accept alone does not say where in the run
-# it landed, so the phases mark themselves in it.  A stray connection is then
-# placed without having to reason backwards from a bare timestamp.
+# The phases mark themselves in the accept log, because an accept alone does
+# not say where in the run it landed.
 mark() { printf 'MARK %s t=%s\n' "$1" "$(date +%s.%N)" >>"$ACCLOG_KA"; }
 
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
@@ -336,8 +300,8 @@ PYEOF
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# A zombie $DPID has an empty /proc/<pid>/fd while an orphaned daemon serves the
-# run, and `kill -0` cannot tell the two apart.  The descriptor table can.
+# A zombie $DPID has an empty /proc/<pid>/fd while an orphaned daemon serves
+# the run, which `kill -0` cannot tell apart and the descriptor table can.
 TOTAL=$((TOTAL+1))
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
@@ -365,9 +329,9 @@ create_ok "proxy created" "$BIN" create proxy "$PX_NAME" -p "$PX_PORT" \
 create_ok "control proxy created" "$BIN" create proxy "$PXC_NAME" -p "$PXC_PORT" \
     --backend "127.0.0.1:$BEC_PORT" --protocol http -s
 
-# A real request through each proxy, not an accepted connection and a guess.
-# These land on the backend and are counted, so the counts are read AFTER this
-# point rather than from zero — see the baselines below.
+# A real request through each proxy rather than an accepted connection and a
+# guess, which lands on the backend and is counted, so the baselines below are
+# taken after this point.
 ready_http 127.0.0.1 "$PX_PORT"  "/$PX_NAME/ready"  20 || true
 ready_http 127.0.0.1 "$PXC_PORT" "/$PXC_NAME/ready" 20 || true
 
@@ -385,12 +349,9 @@ CL_BASE=$(read_count "$TMPDIR_T/accepts.cl"); CL_BASE=${CL_BASE:-0}
 mark "BASELINE ka_base=$KA_BASE cl_base=$CL_BASE daemon_pid=$DPID"
 
 # ─── The client ─────────────────────────────────────────────────────────────
-#
-# One fresh TCP connection per request, each carrying `Connection: close`, which
-# is what curl, wget, every health checker and every `requests` call without a
-# Session does.  Sequential and spaced, because the question is whether the
-# backend socket comes BACK — a burst would open several legitimately and could
-# not distinguish "pooled" from "not yet returned".
+# One fresh connection per request each carrying `Connection: close`,
+# sequential and spaced, because the question is whether the backend socket
+# comes back and a burst would open several legitimately.
 cat > "$TMPDIR_T/client.py" <<'PYEOF'
 import socket, sys, time
 
@@ -510,9 +471,8 @@ CL_NEW=$((CL_NOW - CL_BASE))
 
 # ─── Assertions ─────────────────────────────────────────────────────────────
 
-# The harness has to have reached its last line.  Without this an aborted run
-# shows up only as a pile of per-request failures, and a check phrased as
-# "compare what we read" would have nothing to compare and pass.
+# The harness has to have reached its last line, or a check phrased as "compare
+# what we read" would have nothing to compare and pass.
 TOTAL=$((TOTAL+1))
 if grep -q '^DONE ' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -531,20 +491,10 @@ else
     grep '^RESP ' "$OUT" 2>/dev/null | sed 's/^/        /' || true
 fi
 
-# ── the assertion this file exists for ──
-#
-# $NREQ requests, each on its own client connection.  A pooling proxy serves all
-# of them on the socket the readiness probe already left in the pool and opens
-# none; the broken build opened $NREQ.  Counted from a baseline taken after that
-# probe, so zero is the expected value and not an absence of traffic — that the
-# requests happened at all is asserted separately, above and below, and both of
-# those checks fail outright if they did not.
-#
-# 2 rather than 0 as the ceiling because the detach is asynchronous: the socket
-# goes back to the pool on the completion of a cancelled read, and a request
-# arriving inside that window legitimately opens one of its own.  Measured over
-# nine runs on the fixed build the count was 0 every time; the ceiling is
-# headroom, and it is still four short of the defect, which produced 6 of 6.
+# Counted from a baseline taken after the readiness probe, so zero is the
+# expected value rather than an absence of traffic -- with a ceiling of 2
+# because the detach is asynchronous and a request arriving inside that window
+# legitimately opens one, still four short of the defect.
 TOTAL=$((TOTAL+1))
 if [ "$KA_NEW" -le 2 ]; then
     PASS=$((PASS+1))
@@ -554,14 +504,10 @@ else
     echo "        a client's Connection: close is hop-by-hop and must not reach the backend leg"
 fi
 
-# Whenever this run opened a backend connection at all -- failing or not, since
-# the measured value on a healthy build is 0 and the ceiling of 2 is headroom --
-# the accept log is printed with the client's own timeline beside it.  On
-# 2026-08-21 this assertion read 7 for 6 requests and nothing recorded could say
-# where the seventh came from; it is a count of connections to a PORT, so a
-# dialler that has nothing to do with this test inflates it just as well as a
-# proxy that stopped pooling.  These lines name the peer and its owning process,
-# which separates those two.
+# Whenever this run opened a backend connection at all the accept log is
+# printed with the client's timeline beside it, because this counts connections
+# to a port and a dialler with nothing to do with this test inflates it just as
+# well as a proxy that stopped pooling.
 if [ "$KA_NEW" -gt 0 ]; then
     echo "  NOTE: $KA_NEW backend connection(s) opened after the baseline; who dialled:"
     sed -n "/MARK BASELINE/,\$p" "$ACCLOG_KA" 2>/dev/null | sed 's/^/        /' || true
@@ -569,9 +515,8 @@ if [ "$KA_NEW" -gt 0 ]; then
     grep -E '^(RESP|EOF) ' "$OUT" 2>/dev/null | sed 's/^/        /' || true
 fi
 
-# The same fact read off the answers instead of off the backend's counter, so a
-# backend that miscounted cannot make this pass on its own.  Every response must
-# carry the ordinal of the same backend socket.
+# The same fact read off the answers rather than off the backend's counter, so
+# a backend that miscounted cannot make this pass on its own.
 TOTAL=$((TOTAL+1))
 ORDINALS=$(grep -oE '^RESP [0-9]+ OK conn=[0-9]+' "$OUT" 2>/dev/null | grep -oE 'conn=[0-9]+' | sort -u | tr '\n' ' ' || true)
 NORD=$(printf '%s\n' $ORDINALS | grep -c 'conn=' || true)
@@ -583,13 +528,9 @@ else
     echo "        each request was carried by a backend connection of its own"
 fi
 
-# The client asked for close and must get it.  Written as the guard against
-# trading a backend leak for a client leak, and it turned out to discriminate on
-# its own: on the broken build 0 of 6 saw EOF.  Refusing the detach meant
-# reset_client_for_next_request was never reached, so nothing ever closed the
-# client either — it was answered in full and then held, with the backend socket
-# and the splice pipes behind it, until the runtime stopped.  Both halves of
-# that are the same missing call.
+# The client asked for close and must get it -- written as the guard against
+# trading a backend leak for a client leak, and it discriminates on its own,
+# because refusing the detach meant nothing ever closed the client either.
 TOTAL=$((TOTAL+1))
 NEOF=$(grep -c '^EOF [0-9]* YES$' "$OUT" 2>/dev/null || true)
 if [ "${NEOF:-0}" -eq "$NREQ" ]; then
@@ -600,12 +541,9 @@ else
     grep '^EOF ' "$OUT" 2>/dev/null | sed 's/^/        /' || true
 fi
 
-# ── the control ──
-#
-# The backend behind $PXC_NAME answers `Connection: close`.  That token IS about
-# the backend socket, so it still forbids pooling and every request must cost a
-# new backend connection.  A build that swept all three refusals away instead of
-# the one that was wrong passes everything above and fails here.
+# The backend's own `Connection: close` is a fact about the backend socket and
+# still forbids pooling, so a build that swept all three refusals away passes
+# everything above and fails here.
 TOTAL=$((TOTAL+1))
 if grep -qx "DONE $NREQ/$NREQ" "$OUTC" 2>/dev/null; then
     PASS=$((PASS+1))
