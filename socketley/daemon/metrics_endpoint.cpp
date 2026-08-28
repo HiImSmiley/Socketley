@@ -33,11 +33,9 @@ metrics_endpoint::~metrics_endpoint()
 
 bool metrics_endpoint::start(uint16_t port)
 {
-    // SOCK_CLOEXEC because the daemon forks proxy workers.  This listener sets
-    // SO_REUSEADDR and *not* SO_REUSEPORT, so an inherited copy is the one kind
-    // of leak that cannot be worked around: the metrics port stays bound by a
-    // worker after the daemon is gone, and the next daemon's start() fails on
-    // bind with nothing on the machine to explain what holds the port.
+    // SOCK_CLOEXEC because the daemon forks proxy workers, and with
+    // SO_REUSEADDR but not SO_REUSEPORT an inherited copy keeps the metrics
+    // port bound after the daemon is gone.
     m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listen_fd < 0)
         return false;
@@ -68,12 +66,9 @@ bool metrics_endpoint::start(uint16_t port)
         return false;
     }
 
-    // The listener is polled, not blocked on, so accept() must be able to say
-    // "nothing after all": a connection reset between poll() reporting it and
-    // accept() collecting it takes the pending connection away again, and on a
-    // blocking listener that leaves the thread stuck in accept() until the next
-    // client happens along — which is exactly the state stop() must not have to
-    // wait for.
+    // The listener is polled rather than blocked on, so accept() must be able
+    // to say nothing after all when a reset takes the pending connection away
+    // again.
     int flags = fcntl(m_listen_fd, F_GETFL, 0);
     if (flags < 0 || fcntl(m_listen_fd, F_SETFL, flags | O_NONBLOCK) < 0)
     {
@@ -93,10 +88,9 @@ bool metrics_endpoint::start(uint16_t port)
         return false;
     }
 
-    // From here on there is a second thread reading runtimes, and it must not
-    // touch a runtime's live connection tables — the event loop rewrites those
-    // with no synchronisation.  Ask the manager to start publishing the figures
-    // this endpoint needs; everything below reads only what it published.
+    // From here a second thread reads runtimes, so the manager is asked to
+    // publish the figures this endpoint needs and nothing below reads a live
+    // connection table.
     m_manager.enable_offthread_stats();
 
     m_running.store(true, std::memory_order_release);
@@ -109,25 +103,9 @@ void metrics_endpoint::stop()
 {
     bool was = m_running.exchange(false, std::memory_order_acq_rel);
 
-    // Ring the bell, then wait, then close.  In that order, and the order is
-    // the point.
-    //
-    // This used to close m_listen_fd here to break serve_loop() out of the
-    // accept() it was blocked in, and only then join.  Closing a descriptor
-    // another thread is inside a syscall on does not reliably end that syscall
-    // — and worse, it frees the number immediately.  A runtime starting its
-    // listener in the same moment is handed that very number by the kernel,
-    // whose accept() then resolves to the runtime's socket: the metrics thread
-    // takes a connection meant for a server or a cache, reads the client's
-    // first bytes, answers with an HTTP 404, and closes it.  Nothing on either
-    // side can see why.  Plain descriptor reuse; the io_uring loop is not
-    // involved and neither is close_fd(), which is for descriptors the ring
-    // names and cannot help a thread blocked in a syscall of its own.
-    //
-    // The eventfd is the thing serve_loop() waits on alongside the listener, so
-    // this wakes it rather than pulling anything out from under it.  After the
-    // join nothing can be naming either descriptor, and closing them is
-    // ordinary.
+    // Ring the bell, wait, then close, because closing a descriptor another
+    // thread is inside a syscall on frees the number at once and a runtime
+    // starting its listener is handed it.
     if (m_wake_fd >= 0)
     {
         const uint64_t one = 1;
@@ -181,9 +159,8 @@ void metrics_endpoint::serve_loop()
 {
     while (m_running.load(std::memory_order_acquire))
     {
-        // Both, always.  The listener alone is what left this thread parked in
-        // accept() with no way for stop() to reach it but closing the
-        // descriptor underneath it — see stop().
+        // Both, always, because the listener alone left this thread parked in
+        // accept() with no way for stop() to reach it.
         struct pollfd fds[2];
         fds[0] = { m_listen_fd, POLLIN, 0 };
         fds[1] = { m_wake_fd,   POLLIN, 0 };
@@ -196,8 +173,8 @@ void metrics_endpoint::serve_loop()
             break;
         }
 
-        // stop() rang.  m_running is already false; leaving now is what lets it
-        // join, and only after that join does it close either descriptor.
+        // stop() rang, and leaving now is what lets it join before it closes
+        // either descriptor.
         if (fds[1].revents != 0)
             break;
 
@@ -207,12 +184,9 @@ void metrics_endpoint::serve_loop()
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        // accept4 rather than accept: this is the only accept() syscall in the
-        // daemon — every other connection arrives through io_uring, where the
-        // same flag is an SQE field — and it runs on its own thread, so a fork
-        // for a proxy worker can land between the accept and any fcntl that
-        // tried to set FD_CLOEXEC afterwards.  Set at creation, there is no
-        // such window.
+        // accept4 rather than accept, because this runs on its own thread and
+        // a fork for a proxy worker can land between the accept and any later
+        // fcntl.
         int client_fd = accept4(m_listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
                                 &client_len, SOCK_CLOEXEC);
         if (client_fd < 0)
@@ -296,19 +270,9 @@ void metrics_endpoint::serve_loop()
             }
         }
 
-        // Raw close, and the right one.  This whole endpoint is deliberately
-        // outside the event loop: the descriptor came from an accept() on this
-        // thread, was read with read() and written with write_all(), and no SQE
-        // has ever named it — there is nothing queued that a reissued number
-        // could be redirected onto.
-        //
-        // Routing it through event_loop::close_fd() would also be wrong rather
-        // than merely unnecessary.  close_fd() reads and writes the loop's
-        // per-descriptor tables with no synchronisation, because everything else
-        // that touches them runs on the event-loop thread; calling it from here
-        // would be a plain data race against that thread for a descriptor the
-        // tables have no entry for.  metrics_endpoint holds no event_loop
-        // reference at all, and this is the reason to keep it that way.
+        // Raw close and the right one, because no SQE has ever named this
+        // descriptor and close_fd() would be a plain data race against the
+        // event-loop thread's own tables.
         close(client_fd);
     }
 }
@@ -349,20 +313,10 @@ std::string metrics_endpoint::build_metrics() const
         snapshots.reserve(runtimes.size());
         for (const auto& [name, rt] : runtimes)
         {
-            // The published count, not get_connection_count().  This runs on
-            // m_thread, and that call walks the runtime's own connection tables
-            // — a server's m_upstreams and m_active_fds, a cache's m_clients —
-            // which the event loop mutates without synchronising at all.  The
-            // lock held here is the manager's, and it covers the runtime map,
-            // not the insides of a runtime: reading one of those maps while the
-            // event loop rehashes it is undefined, not just out of date.
-            // Published every 2 s by the event-loop thread, so this is up to
-            // that much older than the truth on top of the response cache.
-            //
-            // For a runtime in a WORKER it is neither: worker_figures() sums
-            // that runtime's shared table on this call, which is as safe on this
-            // thread as reading an atomic and is what the worker stored at the
-            // end of its last loop turn.
+            // The published count and not get_connection_count(), which walks
+            // tables the event loop rewrites unsynchronised -- except for a
+            // runtime in a worker, where worker_figures() sums a shared table
+            // as safely as reading an atomic.
             const shard_stats::figures f = rt->worker_figures();
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
                 f.total_connections,
@@ -507,8 +461,8 @@ std::string metrics_endpoint::build_json_overview() const
         runtimes_total = runtimes.size();
         for (const auto& [name, rt] : runtimes)
         {
-            // Published, not live — see build_metrics().  For a runtime in a
-            // worker, summed out of its shared table at this instant.
+            // Published, not live, and for a runtime in a worker summed out of
+            // its shared table at this instant.
             const shard_stats::figures f = rt->worker_figures();
             total_connections += f.total_connections;
             total_messages    += f.total_messages;
@@ -630,8 +584,8 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += "\",\"port\":";
     json_append_uint(j, rt->get_port());
     j += ",\"connections\":";
-    // Published, not live — see build_metrics().  For a runtime in a worker,
-    // summed out of its shared table at this instant.
+    // Published, not live, and for a runtime in a worker summed out of its
+    // shared table at this instant.
     const shard_stats::figures f = rt->worker_figures();
     json_append_uint(j, f.active_connections);
     j += ",\"messages_total\":";
@@ -643,15 +597,9 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += ",\"bytes_out\":";
     json_append_uint(j, f.bytes_out);
 
-    // Add detailed stats if available.
-    //
-    // The published text, for the same reason as the count above and rather more
-    // urgently: get_stats() is overridden per type, and server_instance's
-    // override iterates m_upstreams outright while cache_instance's reads the
-    // store's key count, its channel count and its follower list — every one of
-    // them a container the event loop rewrites underneath this thread.  Empty
-    // until the first sweep after the endpoint started, which is the same thing
-    // this already prints nothing for.
+    // The published text, because get_stats() is overridden per type and every
+    // override reads a container the event loop rewrites underneath this
+    // thread.
     std::string stats = rt->stat_detail_snapshot();
     if (!stats.empty())
     {

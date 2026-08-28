@@ -26,10 +26,9 @@ private:
     runtime_manager& m_manager;
     int m_listen_fd{-1};
 
-    // How stop() reaches a thread that is parked waiting for a connection.
-    // serve_loop() waits on this and the listener together, so stopping is a
-    // byte written here and a join — never a close of a descriptor the other
-    // thread is still naming.  See stop() for what that was.
+    // How stop() reaches a thread parked waiting for a connection, so stopping
+    // is a byte and a join rather than a close of a descriptor the other
+    // thread is still naming.
     int m_wake_fd{-1};
 
     std::atomic<bool> m_running{false};

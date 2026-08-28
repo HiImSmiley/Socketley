@@ -9,11 +9,9 @@
 #include "../cli/command_hashing.h"
 #include "../shared/runtime_definitions.h"
 
-// Integer parsing from string_view, without allocating.
-//
-// parse_double below is the exception and says so where it stands: std::stod
-// takes a std::string, so it builds one.  from_chars for double is not
-// available everywhere this has to compile.
+// Integer parsing from string_view without allocating, of which parse_double
+// is the exception, because std::stod takes a std::string and from_chars for
+// double is not available everywhere.
 inline bool parse_uint16(std::string_view sv, uint16_t& out)
 {
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
@@ -26,13 +24,9 @@ inline bool parse_uint32(std::string_view sv, uint32_t& out)
     return ec == std::errc{} && ptr == sv.data() + sv.size();
 }
 
-// The same contract as the two above: the whole string, or nothing.
-//
-// std::stod stops at the first character it cannot use and reports success for
-// what it read, so `--rate-limit 5abc` was accepted as 5 and `--rate-limit 0x10`
-// as 16.  It also throws, which is why it is wrapped — and the wrapper is the
-// reason this one allocates a std::string under a comment promising
-// allocation-free parsing.  The position stod reports is what closes the gap.
+// The whole string or nothing, because std::stod reports success for a prefix
+// and accepted `5abc` as 5, and the position it reports is what closes the
+// gap.
 inline bool parse_double(std::string_view sv, double& out)
 {
     if (sv.empty()) return false;
@@ -49,33 +43,9 @@ inline bool parse_double(std::string_view sv, double& out)
     }
 }
 
-// Parse size with optional K/M/G suffix (e.g. "100M" -> 104857600)
-//
-// ─── TWO THINGS THIS DID NOT CHECK, AND WHAT THEY COST ──────────────────────
-//
-// The two parsers above both end with `ptr == sv.data() + sv.size()` — the
-// whole string had to be consumed.  This one did not, and from_chars reports
-// success for a prefix.  So a suffix it does not know was simply left on the
-// end and the number in front of it taken:
-//
-//     --maxmemory 100M    ->  104857600     correct
-//     --maxmemory 100MB   ->        100     accepted
-//     --maxmemory 100X    ->        100     accepted
-//
-// `100MB` is the likeliest typo there is for a size, and it configured a cache
-// to a hundred bytes — one that runs, accepts connections and stores nothing.
-//
-// The multiplication was unchecked as well, and that one is worse for being
-// plausible: 2^34 G is exactly 2^64, so it wraps to zero —
-//
-//     --maxmemory 17179869184G  ->  0
-//
-// and 0 is documented as "unlimited" (socketley.1, MEMORY).  Asking for an
-// absurdly high cap therefore removed the cap, which is the one direction a
-// misread limit must never fail in.
-//
-// Both are refusals now rather than corrections: there is no reading of `100MB`
-// that is safe to guess at, and the flag's own error names the suffixes.
+// The whole string or nothing here too, with a checked multiplication, because
+// `100MB` configured a cache to a hundred bytes and `17179869184G` wrapped to
+// 0, which is documented as unlimited.
 inline bool parse_size_suffix(std::string_view sv, size_t& out)
 {
     if (sv.empty()) return false;
@@ -92,15 +62,9 @@ inline bool parse_size_suffix(std::string_view sv, size_t& out)
     // The whole of it, digits and one known suffix and nothing else.
     if (ptr != num_part.data() + num_part.size()) return false;
 
-    // Checked before it is done, not after: the wrapped value is
-    // indistinguishable from a legitimate small one.
-    //
-    // size_t is the accumulator rather than uint64_t, so the bound is the one
-    // the caller will actually store into.  On this target they are the same
-    // width and the static_assert says so out loud — written the other way
-    // round, a `bytes > size_t::max()` after the fact would be an always-false
-    // comparison here and a real one on a 32-bit build, which is the sort of
-    // check that reads as covered and is not.
+    // Checked before it is done, in size_t so the bound is the width the
+    // caller stores into, because a check made afterwards would be
+    // always-false here and real on a 32-bit build.
     static_assert(sizeof(size_t) >= sizeof(uint32_t),
                   "parse_size_suffix accumulates into size_t");
     if (val > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / multiplier)
@@ -121,12 +85,8 @@ enum server_mode : uint8_t;
 enum client_mode : uint8_t;
 enum cache_mode : uint8_t;
 
-// Result codes: 0 = handled, 1 = error, -1 = not handled (try type-specific)
-//
-// `lua_script` is an out-parameter and not something this function acts on, and
-// that is the whole point of it — see the --lua case for why loading a script
-// in the middle of a flag loop made `create` depend on the order the flags were
-// typed.  The caller loads it once every flag has been seen.
+// 0 = handled, 1 = error, -1 = not handled, with `lua_script` an out-parameter
+// so the caller loads it once every flag has been seen rather than mid-loop.
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script);
 
@@ -142,18 +102,9 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
 int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                       std::string_view name);
 
-// A `--listen` value -- "unix:/abs/path.sock" and nothing else, today.
-//
-// One function because two things read the same value and must judge it the
-// same way: the flag, and the "listen" field of an `import` document.  The
-// second is where a rule kept only in the flag parser would have been missed,
-// and the field is one where being wrong is silent -- an unprefixed path is
-// simply not a unix listener, so a document saying `"listen": "/run/x.sock"`
-// would have configured a server with no listener at all.
-//
-// Returns an empty string when the value is acceptable, and writes the bare
-// path (prefix stripped) to `out`.  Otherwise returns the reason to report and
-// leaves `out` untouched.
+// A `--listen` value, one function because the flag and an `import` document's
+// "listen" field must judge it the same way, returning an empty string on
+// success with the bare path in `out` and the reason otherwise.
 std::string validate_listen_value(std::string_view value, std::string& out);
 
 // Mode parsing helpers
