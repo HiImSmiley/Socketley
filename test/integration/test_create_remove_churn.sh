@@ -1,93 +1,12 @@
 #!/usr/bin/env bash
-# Integration test: creating and removing runtimes in a loop gives everything back.
-#
-# A runtime is not just an object in a map — it owns a listener descriptor, a
-# set of io_uring registrations, a provided-buffer ring, preallocated connection
-# structs, and a state file.  'remove' has to unwind all of it, and it does so
-# through a deferred delete that holds the object alive for one event loop tick
-# because in-flight completions still point into it.  Anything that path forgets
-# does not fail once: it accumulates, and the suite's other tests each create
-# one or two runtimes and never notice.
-#
-# So: forty-five create/serve/remove cycles over three runtime types, all on the
-# same port, with real concurrent traffic in each cycle.  The port is
-# deliberately reused.  Listeners are bound with SO_REUSEPORT, so a listener
-# that outlived its runtime does not fail to bind — it stays in the kernel's
-# balancing set and silently takes a share of the next runtime's connections.
-# Reusing the port is what turns that leak into a visible wrong answer instead
-# of a slow drift.
-#
-# WHAT IT CATCHES
-#   - a listener, io_uring registration or connection descriptor that 'remove'
-#     never releases: the descriptor count is compared against a baseline taken
-#     after a warm-up round, so one leaked descriptor per cycle is 45 against a
-#     tolerance of 6
-#   - one whole leaked runtime instance per cycle.  See the sizing note below:
-#     that is ~226 MB against a bound of 12 MB
-#   - a removed runtime that keeps accepting: 'closed' counts cycles where the
-#     port actually stopped answering afterwards
-#   - a removed runtime still listed by 'ls'
-#   - the daemon under test dying and being silently replaced.  Any CLI call
-#     fork+execs a fresh daemon when the socket does not answer (cli.cpp,
-#     ensure_daemon), so a daemon that crashes mid-churn is replaced between two
-#     cycles and every counter below still reads perfect.  The identity check
-#     compares the pid and its /proc start time across the whole run
-#   - both removal paths: even cycles call 'remove' on a running runtime (which
-#     stops it itself), odd cycles 'stop' first and then 'remove'
-#
-# SIZING THE MEMORY BOUND
-#   A leaked instance only costs RSS for the pages something actually touched,
-#   so the traffic below exists to make that footprint real: each cycle drives
-#   8 concurrent connections carrying 2 KB payloads, which faults in the buffer
-#   ring and grows the connection pool past its initial reservation.  With the
-#   single sequential 8-byte exchange this test used to drive, a leaked cache
-#   instance was worth 258 kB; with the traffic below it is worth 466 kB, and
-#   that is the difference between hiding inside the noise and not.
-#
-#   What one live instance holds, measured on this build at exactly the traffic
-#   below by creating instances and never removing them — which is what the leak
-#   looks like to the allocator:
-#
-#       cache   466 kB     server  8849 kB     proxy  6089 kB
-#
-#   Fifteen cycles of each is 15 * (466 + 8849 + 6089) = 231060 kB.  So a leak
-#   of one whole runtime instance per cycle shows up here as ~226 MB of growth.
-#   A leak confined to one type is 132 MB (server), 91 MB (proxy) or 6.8 MB
-#   (cache).
-#
-#   Healthy growth is what this script itself printed over 22 consecutive clean
-#   runs: 2756, 2840, 2844, 2864, 2884, 2892, 2956, 4640, 4672, 4688, 4692,
-#   4696, 4696, 4700, 4712, 4716, 4716, 4716, 4728, 4732, 4752 kB and one run at
-#   64 kB.  It is bimodal — one cluster near 2.9 MB and one near 4.7 MB, each
-#   only ~100 kB wide — which is allocator retention differing by which arena
-#   the run happened to reuse, not a leak; it does not grow with repetition.
-#
-#   The bound is 12288 kB.  That is 2.6x the worst healthy observation, so
-#   normal variation would have to be more than half again as large as anything
-#   yet seen to reach it, and 18x below the 226 MB a per-cycle instance leak
-#   produces.  The two constraints are "at least ~2.5x the worst healthy run"
-#   (11.9 MB) and "no more than a tenth of the leak it must catch" (22.6 MB);
-#   12 MB is the low end of that window, which is where a leak detector belongs
-#   — the cost of being slightly too tight is a rerun, the cost of being too
-#   loose is a leak that ships.
-#
-# WHAT IT DOES NOT CATCH
-#   - a leak much smaller than one instance per cycle.  Healthy growth is about
-#     100 kB per cycle, so anything under that per-cycle scale is invisible to
-#     RSS here; the descriptor check is the sharp instrument for small leaks
-#   - a leak of *only* cache instances, which is 6.8 MB and sits under the
-#     bound.  Raising the payload past the cache's 4 KB buffer would lift it,
-#     at the cost of a bound that no longer has 2.6x headroom
-#   - anything about removing a runtime that is *busy*: traffic here is finished
-#     before the remove.  Removal under concurrent load is the restart test's
-#     territory
-#   - Lua, TLS, UDP and cluster runtimes: three plain TCP types are created
-#
-# The 'both empty' trap is guarded explicitly: a sentinel runtime is created up
-# front and never removed, and the final 'ls' check requires the sentinel to be
-# present *and* the churn names to be absent.  An 'ls' that returned nothing at
-# all — because the daemon died — fails the first half instead of passing the
-# second.
+# Forty-five create/serve/remove cycles over three runtime types on one
+# deliberately reused port, because SO_REUSEPORT means a listener that outlived
+# its runtime silently takes a share of the next one's connections rather than
+# failing to bind -- with descriptors compared against a post-warm-up baseline,
+# RSS bounded at 12 MB where healthy runs grow 2.8-4.8 MB and a per-cycle
+# instance leak is ~226 MB, the daemon's identity checked so a
+# crash-and-respawn cannot read as a clean run, and both removal paths
+# exercised.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -122,65 +41,20 @@ ROUNDTRIPS=3        # verified exchanges per connection per cycle
 CONNS=8             # concurrent connections per cycle
 PAYLOAD=2048        # bytes per exchange; see the sizing note above
 
-# See the long note in test_restart_under_load.sh: both samples are taken at the
-# same point in the lifecycle (no churn runtime existing, after a settle), so
-# only transient descriptors — the IPC connection serving the sampling command,
-# a state file being rewritten — can differ.  A leak here is one per cycle.
+# Both samples are taken at the same point in the lifecycle, so only transient
+# descriptors can differ and a leak here is one per cycle.
 FD_TOLERANCE=6
 
-# Measured, not guessed.  See SIZING THE MEMORY BOUND above: healthy runs land
-# at 2.8-4.8 MB, a per-cycle instance leak at ~226 MB.  Release figures — see
-# the sanitizer note below for why this bound is not asserted in an instrumented
-# build.
+# Measured rather than guessed, on Release figures -- see the sanitizer note
+# below for why this bound is not asserted in an instrumented build.
 RSS_BOUND_KB=12288
 
-# ─── ONE CHECK THAT MEASURES THE SANITIZER, NOT THE PRODUCT ─────────────────
-#
-# This file runs in the nightly under ASan+UBSan as well as under Release, and
-# RSS_BOUND_KB has no defined meaning in an instrumented build.
-#
-# Every number in SIZING THE MEMORY BOUND above — the 466/8849/6089 kB an
-# instance holds, the 2.8-4.8 MB a healthy run grows, the 226 MB a per-cycle
-# leak produces — was measured against a daemon with no sanitizer in it.  An
-# ASan daemon keeps eight bytes of shadow for every byte of application memory
-# and a redzone around every allocation, so it starts an order of magnitude
-# higher and every page the churn faults in costs its shadow as well:
-#
-#     Release   base 18216 kB   growth   2804 kB   (2026-08-02, this machine)
-#     ASan      base 96424 kB   growth 313448 kB   (2026-08-02, this machine)
-#
-# The base alone is five times the whole Release run, and the growth is
-# twenty-five times a bound that was chosen to sit an order of magnitude BELOW
-# the leak it catches.  The nightly's first ASan run in five weeks, on the same
-# commit, reported base 95772 kB and growth 313576 kB — the two agree to within
-# a tenth of a percent, which is what a sanitizer's fixed overhead looks like
-# and not what a leak looks like.  Widening the bound to cover it would put it
-# above the 226 MB it exists to catch, i.e. it would stop bounding anything.
-#
-# So it is printed and not asserted in a sanitized build, loudly, with the
-# numbers, so nobody reads a quiet log as a checked one.  EVERYTHING ELSE STAYS
-# ASSERTED IN EVERY BUILD — created, served, ops, removed, closed, the daemon
-# identity check, the 'ls' pair, that the daemon still serves a fresh runtime,
-# and the descriptor count.  Those are what running this file under ASan is FOR,
-# and all of them passed under ASan in the run above (descriptors: delta=0).
-#
-# THE DAEMON BEING GONE IS STILL A FAILURE, in every build.  'unreadable' is
-# rejected before the exemption below is ever reached: "this build cannot answer
-# the question" and "there was no daemon left to ask" are different statements
-# and only the first one is excused here.
-#
-# Detected from the binary rather than from an environment variable, using the
-# idiom the nightly's own "Verify the build" step uses: a build that lost its
-# sanitizer flags must not be able to claim this exemption.  A stripped Release
-# binary yields nothing and is treated as not sanitized, which is the safe way
-# round — unknown keeps the strict bound.
-#
-# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
-# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
-# then reports 141 and the `if` takes the branch for "no match" precisely when
-# there was one.  grep without -q reads its input to the end, so the pipeline's
-# status is grep's.  (The same idiom in the nightly's "Verify the build" step is
-# safe only because GitHub Actions does not set pipefail; it is not safe here.)
+# RSS has no defined meaning under ASan, whose fixed overhead alone is
+# twenty-five times a bound chosen to sit an order of magnitude below the leak
+# it catches, so it is printed loudly with the numbers while every other
+# assertion stays live in every build -- with the sanitizer detected from the
+# binary rather than the environment, and without `grep -q`, which under
+# pipefail takes the no-match branch precisely when it matched.
 SANITIZED=""
 if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
     SANITIZED="TSan"
@@ -192,12 +66,10 @@ PASS=0; FAIL=0; SKIP=0; TOTAL=0
 SUBPID=""
 DAEMON_SURVIVED=0   # set once the identity check confirms it lived through the churn
 
-# Printed, counted in its own column, and deliberately NOT added to FAIL: unlike
-# NOT MEASURABLE in test_restart_under_load.sh, which means "this run could not
-# put the question and might next time", this means "this build cannot answer
-# this question and never will".  A job that is red every single night for a
-# reason nobody can act on gets ignored, which is the same end state as a check
-# that cannot fail.
+# Counted in its own column and deliberately not added to FAIL, because "this
+# build cannot answer this question and never will" is not the same as "this
+# run could not put the question" and a job that is red every night for a
+# reason nobody can act on gets ignored.
 not_asserted() {  # label reason
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
     echo "  NOT ASSERTED [$1]: $2"
@@ -214,17 +86,9 @@ cleanup() {
         done
         kill -9 "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet — or not up any more — starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket rather than only by pid, because a CLI command run
+    # against an absent daemon starts one of its own that $DPID would never
+    # reach.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -235,21 +99,16 @@ cleanup() {
             kill -9 "$p" 2>/dev/null || true
         fi
     done
-    # The reaping subshell (see below) exits normally, so waiting on it prints
-    # nothing.  Its recorded status is how a signal death gets reported here —
-    # in words, after the verdict.
+    # The reaping subshell exits normally, so its recorded status is how a
+    # signal death gets reported here -- in words, after the verdict.
     [ -n "$SUBPID" ] && wait "$SUBPID" 2>/dev/null || true
     local st
     st=$(cat "$TMPDIR_T/daemon.status" 2>/dev/null || true)
     case "$st" in
         ''|*[!0-9]*) ;;
         *)
-            # 143 = our SIGTERM, 137 = our SIGKILL.  Anything else above 128 is
-            # the daemon dying of its own accord while being shut down.
-            # Only worth saying when the daemon was still alive at the last
-            # assertion.  If it died during the churn the identity check has
-            # already reported that, in more detail, and repeating it here as a
-            # shutdown problem would misdescribe when it happened.
+            # 143 is our SIGTERM and 137 our SIGKILL, so anything else above
+            # 128 is the daemon dying of its own accord while being shut down.
             if [ "$st" -gt 128 ] && [ "$st" -ne 143 ] && [ "$st" -ne 137 ] \
                && [ "$DAEMON_SURVIVED" = 1 ]; then
                 echo "  NOTE: the daemon survived the churn but died of signal"
@@ -266,10 +125,9 @@ trap cleanup EXIT
 echo "=== Integration: create/remove churn ==="
 
 # ── Resource sampling ───────────────────────────────────────────────────────
-# Every reader returns the literal string 'unreadable'/'gone' rather than an
-# empty string, and every assertion rejects it before comparing anything.  Two
-# empty values compare equal, so a dead daemon would otherwise satisfy
-# "before == after" and report a clean run.
+# Every reader returns a literal 'unreadable'/'gone' rather than an empty
+# string, because two empty values compare equal and a dead daemon would
+# satisfy "before == after".
 fd_count() {
     local n
     n=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l 2>/dev/null) || n=""
@@ -290,10 +148,9 @@ rss_kb() {
     esac
 }
 
-# pid plus the kernel's start time for that pid.  The start time is what makes
-# this an identity and not just a liveness check: pids get reused, and the CLI
-# spawns replacement daemons on its own, so "a daemon is running" proves
-# nothing about it being *the* daemon whose memory we sampled.
+# The kernel's start time is what makes this an identity rather than a liveness
+# check, since pids get reused and the CLI spawns replacement daemons on its
+# own.
 daemon_ident() {
     local st
     st=$(sed 's/.*) //' "/proc/$DPID/stat" 2>/dev/null | awk '{print $20}') || st=""
@@ -656,12 +513,10 @@ while True:
 PYEOF
 BEPID=$!
 
-# The daemon is started inside a subshell that reaps it, with that subshell's
-# stderr discarded.  Job control announces a child that dies by a signal, and a
-# bare "Segmentation fault" printed across the results reads like the test
-# harness broke rather than the thing under test; cleanup() reports the same
-# fact deliberately instead.  The pid is published through a file because $! in
-# here would name the subshell, and every /proc sample below needs the daemon.
+# The daemon is started inside a subshell that reaps it with stderr discarded,
+# because a bare "Segmentation fault" from job control reads like the harness
+# broke, and the pid is published through a file since $! would name the
+# subshell.
 (
     # set +e matters: 'wait' reports the daemon's death as a non-zero status,
     # and under the script's errexit that would kill this subshell before it
@@ -685,14 +540,10 @@ if [ -z "$DPID" ]; then
     echo "  FAILED"
     exit 1
 fi
-# Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
-# command auto-starts a daemon when the socket does not answer yet — cli.cpp's
-# ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
-# 'ps' against the daemon this test has just launched races it and spawns a
-# second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run: BASE_IDENT is then taken from a corpse and every /proc sample below reads
-# 'unreadable'.  Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the IPC socket itself and never by polling with a CLI command,
+# because every CLI command auto-starts a daemon when the socket does not
+# answer and when the loser of the bind is $DPID every /proc sample below reads
+# 'unreadable'.
 python3 "$H" waitsock "$SOCKETLEY_SOCKET" 8 || true
 BASE_IDENT=$(daemon_ident)
 
@@ -704,10 +555,9 @@ else
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
 fi
 
-# ...and the daemon answering is the one this test launched.  Without this a
-# zombie $DPID is only noticed at the very end, by the identity check and the
-# resource samples, which would describe it as "the daemon died during the
-# churn" when in fact it never survived its own startup.
+# ...and the daemon answering is the one this test launched, without which a
+# zombie $DPID is only noticed at the end and described as a death during the
+# churn.
 TOTAL=$((TOTAL+1))
 if [ "$BASE_IDENT" != "gone" ]; then
     PASS=$((PASS+1))
@@ -725,8 +575,8 @@ else
     echo "  FAIL [setup]: the echo backend never came up on $BE_PORT"
 fi
 
-# The sentinel is created once and never removed.  It is what stops the final
-# 'ls' assertion from passing because 'ls' printed nothing at all.
+# The sentinel is created once and never removed, so the final 'ls' assertion
+# cannot pass because 'ls' printed nothing at all.
 create_ok "sentinel created" "$BIN" create cache sentinel_keep -p "$SENTINEL_PORT" -s
 wait_port "$SENTINEL_PORT" 5 || true
 TOTAL=$((TOTAL+1))
@@ -797,12 +647,9 @@ assert_field_eq ops     "$((CYCLES * ROUNDTRIPS * CONNS))"    "every round trip 
 assert_field_eq removed "$CYCLES"                             "every remove reported success"
 assert_field_eq closed  "$CYCLES"                             "the port stopped answering after every remove"
 
-# ── The daemon we measured is the daemon we started ────────────────────────
-# This has to be asserted, not assumed.  Every CLI call fork+execs a fresh
-# daemon when the socket does not answer (cli.cpp, ensure_daemon), so a daemon
-# that crashes in the middle of the churn is replaced before the next 'create'
-# and all five counters above still come out perfect against a process that has
-# only existed for a few milliseconds.
+# Asserted rather than assumed, because a daemon that crashes mid-churn is
+# replaced before the next 'create' and all five counters still come out
+# perfect against a process a few milliseconds old.
 NOW_IDENT=$(daemon_ident)
 TOTAL=$((TOTAL+1))
 if [ "$BASE_IDENT" != "gone" ] && [ "$NOW_IDENT" = "$BASE_IDENT" ]; then
@@ -840,23 +687,13 @@ else
     PASS=$((PASS+1))
 fi
 
-# The daemon is not merely alive: it still creates and serves a runtime that
-# never existed during the churn.
-# Deliberately not create_ok.  Here the create is not setup, it is the
-# measurement: the claim is that the daemon still creates *and serves* after the
-# churn, and the round trip below is the oracle for both halves.  Counting the
-# create separately would report one defect as two.  What the create said is
-# kept, so that when the round trip fails the report can say whether the runtime
-# was ever made.
+# Deliberately not create_ok, because here the create is the measurement rather
+# than setup and counting it separately would report one defect as two.
 FINAL_CRC=0
 FINAL_CREATE=$("$BIN" create cache final_probe -p "$FINAL_PORT" -s 2>&1) || FINAL_CRC=$?
-# Wait for the success signal — a completed round trip — and not for a deadline.
-# 'wait_port' alone proves nothing here: it returns as soon as the kernel accepts
-# a connection out of the listen backlog, which is true from the instant listen()
-# ran, while an event loop still winding down 45 cycles' worth of teardown may
-# not reach the new runtime's first read for a while.  Trying once after that
-# wait was a timing assumption; retrying until it answers is not, and a wedged or
-# dead daemon never answers and still fails, only later.
+# Retried until it answers rather than tried once after wait_port, because the
+# kernel accepts from the backlog the instant listen ran while an event loop
+# unwinding 45 cycles of teardown may not reach the first read for a while.
 FINAL_RT=""
 for _ in $(seq 1 60); do
     FINAL_RT=$(python3 "$H" serve "$FINAL_PORT" 2>/dev/null || true)
@@ -888,8 +725,7 @@ if [ "$FAIL" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
 fi
 
 # Every assertion is accounted for in exactly one column, or the summary cannot
-# be acted on and nobody re-checks the arithmetic by eye.  Same guard as
-# test_restart_under_load.sh and test_abrupt_client_abort.sh.
+# be acted on.
 if [ "$((PASS+FAIL+SKIP))" -ne "$TOTAL" ]; then
     echo "  FAIL [counters]: $PASS passed + $FAIL failed + $SKIP not asserted"
     echo "        does not equal $TOTAL counted — this summary is wrong, not just the run"

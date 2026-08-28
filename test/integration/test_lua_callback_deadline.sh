@@ -1,58 +1,13 @@
 #!/usr/bin/env bash
-# suite: quiet -- times a 400ms block against a 1500ms budget.  Its own
-# comment records this going red under the sanitizer while three other jobs
-# were running; six parallel workers is that, deliberately.
-# Integration test: a Lua callback that never returns is stopped, and only it.
-#
+# suite: quiet -- times a 400ms block against a 1500ms budget.
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
-#
-# Nothing used to bound a script's execution.  `while true do end` in any
-# callback froze the single event-loop thread that serves every runtime in the
-# daemon — all traffic, the metrics endpoint, the IPC socket — and the only way
-# out was SIGKILL.  Measured on the parent commit, one server spinning inside
-# on_message and a second server that had done nothing at all:
-#
-#     stats <the other runtime>      no answer, exit 2 after 5s
-#     traffic to the other runtime   not served
-#     the daemon                     80% of a core, until killed -9
-#     the daemon's log               nothing
-#
-# One script, and the whole process is gone.  What replaces it is a wall-clock
-# deadline per callback invocation, enforced through a LUA_MASKCOUNT hook: the
-# hook fires every few thousand VM instructions, reads a clock, and raises a Lua
-# error when the invocation has outrun its budget.  The callback fails the way
-# any other failing callback does; the runtime keeps serving.
-#
-# ─── WHY THE ASSERTIONS ARE THE ONES BELOW ──────────────────────────────────
-#
-# "The daemon did not die" is not enough, and is the assertion this file most
-# had to avoid: it passes just as well against a build that reacted by killing
-# the runtime, which would be a much heavier answer than the one intended and
-# would lose every connection the runtime was holding.  So there are four
-# claims, and the last two are what separate this from that build:
-#
-#   * the daemon answers `stats` for a DIFFERENT runtime while the runaway is
-#     still inside its budget — the operator is not locked out either
-#   * the runaway said so, in the daemon's log, naming itself and the bound
-#   * the offending runtime is still serving afterwards — send it a message and
-#     it answers
-#   * a callback that is merely slow, and finishes inside its budget, is not
-#     touched.  A deadline that fires on working code is worse than none
-#
-# ─── THE KNOBS, EXERCISED RATHER THAN DESCRIBED ─────────────────────────────
-#
-# The daemon here runs with SOCKETLEY_LUA_TIMEOUT_MS=1500 rather than the
-# built-in 10000.  Two reasons, and neither is only speed: the operator's knob
-# is a claim this file has to test, and 1500ms is under the CLI's own five
-# second receive timeout — so `stats` issued in the middle of the stall waits it
-# out and answers, which is the thing an operator most wants back and which the
-# 10000ms default deliberately does not promise.
-#
-# The script's own `callback_timeout_ms` is tested against the same daemon: one
-# runtime declares 300, and the log has to name 300 for that one and 1500 for
-# the one that declared nothing.  Counting the lines is what makes the
-# no-false-positive control real — a build that stopped the merely-slow callback
-# too would produce a third line and fail here rather than passing quietly.
+# A callback that never returns is stopped by a wall-clock deadline enforced
+# through a LUA_MASKCOUNT hook, and the four claims are chosen so a build that
+# answered by killing the whole runtime would fail: the daemon answers for
+# another runtime during the stall, the runaway names itself and its bound in
+# the log, the offending runtime still serves afterwards, and a merely slow
+# callback is untouched -- with the daemon run at SOCKETLEY_LUA_TIMEOUT_MS=1500
+# because the operator's knob is itself a claim under test.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -104,11 +59,9 @@ trap cleanup EXIT
 echo "=== Integration: a Lua callback that does not return is stopped ==="
 
 # ── The scripts ─────────────────────────────────────────────────────────────
-#
-# Every one of them echoes, so "is this runtime still serving" is a question
-# with an answer on the wire rather than an inference from the absence of a
-# crash.  The runaway is behind a keyword, so the runtime can be proved working
-# before and after the callback that hangs.
+# Every runtime echoes and the runaway is behind a keyword, so "is this runtime
+# still serving" has an answer on the wire both before and after the callback
+# that hangs.
 mk_echo_spinner() {
     # $1 = path, $2 = extra top-level line (may be empty)
     cat > "$1" <<LUAEOF
@@ -133,42 +86,11 @@ mk_echo_spinner "$SPIN" ""
 mk_echo_spinner "$BYST" ""
 mk_echo_spinner "$OWN"  "callback_timeout_ms = 300"
 
-# The control: a callback that takes real time and finishes.
-#
-# The delay is a socketley.http call at a listener that accepts the connection
-# and then does nothing at all — never answers, never closes — so the block is
-# socketley.http waiting out its own 400ms timeout.  WALL time, spent asleep in
-# the kernel.
-#
-# ─── THE SINK CANNOT BE A SOCKETLEY RUNTIME, AND USED TO BE ─────────────────
-#
-# It was `create server dl_sink --mode in`, described here as a runtime that
-# "accepts and answers nothing".  That was never true.  A --mode in server
-# answers 404 to any HTTP request, immediately — probed at 109 bytes back
-# inside a millisecond.  The 400ms was never poll() waiting for an answer that
-# did not come; the answer came at once, and socketley.http then sat waiting
-# for EOF because it ignores the response framing.  The delay was the server
-# NOT closing the connection.
-#
-# So this control was measuring a defect.  When --http learned to honour the
-# `Connection: close` that socketley.http sends, the server began closing at
-# once, the EOF arrived immediately, and the 400ms evaporated: the round trip
-# fell from >2.3s to 2.006s, which is nc's 2s linger with the block gone.  The
-# fixture has to be a listener that really does stay silent, and nothing built
-# out of this daemon can be one.
-#
-# This was a `while os.clock() - t < 0.4` busy loop and that is a trap worth
-# recording.  os.clock() is CPU time and the deadline is wall-clock, so on a
-# machine under load the loop waits for 0.4s of CPU that takes two seconds to
-# arrive, blows a 1500ms budget, and the control fails against a build with
-# nothing wrong with it.  Watched: green on an idle machine, red under the
-# sanitizer build while three other jobs were running.  A control whose result
-# depends on how busy the machine is cannot distinguish the two things it exists
-# to distinguish.
-#
-# 400ms against the 1500ms budget also says something the busy loop could not:
-# socketley.http's timeout is clamped to what is left of the callback's, and
-# 400 out of 1500 must come back untouched.
+# The control is a callback that blocks 400ms in socketley.http against a
+# listener that accepts and then says nothing -- which cannot be a socketley
+# runtime, because every one of them answers or closes -- and it is wall time
+# rather than an os.clock busy loop, whose result depended on how busy the
+# machine was.
 cat > "$SLOW" <<LUAEOF
 function on_message(msg)
     if msg == "slow" then
@@ -178,14 +100,13 @@ function on_message(msg)
 end
 LUAEOF
 
-# A top level that never returns.  This one runs synchronously inside `create`,
-# which is why it gets its own assertion: the create has to be refused with a
-# reason rather than blocking the operator's terminal on a command that will
-# never answer.
+# A top level that never returns runs synchronously inside `create`, so it gets
+# its own assertion: the create is refused with a reason rather than blocking
+# the operator's terminal forever.
 printf 'local n = 0\nwhile true do n = n + 1 end\n' > "$TOP"
 
-# 1500ms rather than the built-in 10000 — see the header.  Exported before the
-# daemon is started, because this is the daemon's environment, not the CLI's.
+# Exported before the daemon is started, because this is the daemon's
+# environment and not the CLI's.
 export SOCKETLEY_LUA_TIMEOUT_MS=1500
 
 daemon_start "$BIN"
@@ -194,11 +115,9 @@ create_ok "spinner created"    "$BIN" create server dl_spin -p "$SPIN_PORT" --mo
 create_ok "bystander created"  "$BIN" create server dl_byst -p "$BYST_PORT" --mode inout --lua "$BYST" -s
 create_ok "own-budget created" "$BIN" create server dl_own  -p "$OWN_PORT"  --mode inout --lua "$OWN" -s
 create_ok "slow one created"   "$BIN" create server dl_slow -p "$SLOW_PORT" --mode inout --lua "$SLOW" -s
-# The sink: accepts, and from there on says and does nothing.  Not a socketley
-# runtime — see the block above $SLOW for why one cannot serve here.  The
-# accepted sockets are kept in a list on purpose: dropping the last reference
-# lets the garbage collector close them, and a close is an EOF, which is the
-# one thing this must never send.
+# The sink accepts and then says nothing, keeping its sockets in a list on
+# purpose because dropping the last reference lets the collector close them and
+# a close is the one thing this must never send.
 cat > "$SOCKETLEY_TMPD/sink.py" <<'SINKEOF'
 import socket, sys
 port = int(sys.argv[1])
@@ -281,31 +200,11 @@ if [ "$STATS_RC" = "0" ]; then pass; else
          "stats said: ${STATS_OUT:-<nothing>}"
 fi
 
-# ── The control for it, and the one assertion in this file that INVERTED ────
-#
-# It used to read `ELAPSED > 0.3` on the STATS call: that command had to have
-# waited behind the stall, and the elapsed time was the evidence that a callback
-# was really holding the event loop.  Correct while dl_spin ran in the daemon,
-# which is what --daemon-process was doing for it.
-#
-# With every runtime in its own process the stall is in dl_spin's worker and the
-# daemon is not blocked -- so the old assertion demanded the very lock-out this
-# arrangement exists to prevent, and would now go green only on a build that had
-# lost the split.  Measured after the flag was removed: .0083s against a 0.3s
-# floor.
-#
-# What it guarded against is still real: a build where the callback never ran --
-# a broken dispatch, a script that failed to load -- answers stats instantly too
-# and would read as the split working.  So the same instrument is pointed at the
-# runtime that IS blocked.  dl_spin's own loop is inside the callback, so a
-# client of dl_spin waits; dl_byst answers throughout.  Two runtimes, one clock,
-# opposite answers -- which is a sharper claim than the original, because it
-# names the loop that is stalled instead of inferring it from one number.
-#
-# The first attempt at this asserted that dl_spin gave NO answer, and that was
-# wrong for a reason worth recording: the deadline is 1500ms, so a client that
-# waits longer than that gets its reply once the callback is stopped.  It has to
-# be the elapsed time, not the presence of a reply.
+# One clock pointed at two runtimes for opposite answers -- a client of the
+# stalled one waits while the bystander answers throughout -- because with
+# every runtime in its own process the daemon is no longer blocked, and the
+# elapsed time rather than the presence of a reply is the measurement since a
+# client waiting past the deadline does get its reply.
 S0=$(date +%s.%N)
 SPIN_DURING=$(printf 'hello-during\n' | timeout 8 nc -q 2 127.0.0.1 "$SPIN_PORT" 2>/dev/null || true)
 S1=$(date +%s.%N)
@@ -322,16 +221,9 @@ fi
 wait "$SPIN_CLIENT" 2>/dev/null || true
 
 # ── 2. The runaway reported itself ──────────────────────────────────────────
-#
-# Read out of the daemon's log and not out of the CLI, because a callback error
-# happens on traffic with no command in flight to carry it anywhere.
-#
-# This is the hook's own line, written before it raises, and that is deliberate:
-# `sol::function` is sol2's unsafe function in Release and its protected one in
-# any build without NDEBUG, so the raise is caught and printed in Release and
-# comes back as an unread result value — silently — under Sanitize.  Asserting
-# the "[lua] on_message error: ..." line instead would make this file pass in
-# Release and fail in the sanitizer build for a mechanism that worked in both.
+# Read out of the daemon's log rather than the CLI, and asserted on the hook's
+# own line, because sol2's raise is caught and printed in Release but comes
+# back as an unread result under Sanitize.
 wait_log() {
     local pattern=$1 timeout=${2:-12}
     local deadline=$(( $(date +%s) + timeout ))
@@ -342,10 +234,9 @@ wait_log() {
     return 1
 }
 
-# The runtime's name is part of the claim now.  The hook's line used to say
-# "[lua] on_message ...", which does not tell an operator with forty servers
-# which one stopped — and a deadline is exactly the diagnostic somebody reads
-# in a hurry.
+# The runtime's name is part of the claim, because a deadline is the diagnostic
+# somebody reads in a hurry and "[lua] on_message ..." does not say which of
+# forty servers stopped.
 if wait_log '\[lua dl_spin\] on_message hit its 1500ms deadline and was stopped'; then pass; else
     fail "the callback that outran its budget said so, naming the runtime" \
          "no '[lua dl_spin] on_message hit its 1500ms deadline and was stopped' in" \
@@ -353,17 +244,10 @@ if wait_log '\[lua dl_spin\] on_message hit its 1500ms deadline and was stopped'
          "a bound nobody is told about is a support ticket"
 fi
 
-# ...and it arrived at the call site as a failure, not only at the hook.
-#
-# Two different claims, and the second is the one that has to be re-checked
-# every time the invocation sites move.  2a1e135..df02e6f replaced every
-# `catch (const sol::error&)` in this tree with a protected call whose
-# `!valid()` branch reports — a deadline is raised as an ordinary Lua error, so
-# it has to travel that same route and be diagnosed there, with the script and
-# line attached, which the hook's own line cannot know.  If this goes red while
-# the one above stays green, the deadline is being reported by the mechanism
-# that raises it and by nothing that observes it, which is the arrangement the
-# sweep exists to have ended.
+# A second claim: the deadline also arrived at the call site as a failure with
+# script and line attached, so this going red while the one above stays green
+# means the deadline is reported by the mechanism that raises it and by nothing
+# that observes it.
 if wait_log '\[lua dl_spin\] on_message error: .*exceeded the 1500ms deadline'; then pass; else
     fail "the deadline reaches the call site's !valid() branch too" \
          "no '[lua dl_spin] on_message error: ... exceeded the 1500ms deadline' line" \
@@ -392,11 +276,9 @@ case "$BYST_AFTER" in
             "sent 'hello-bystander' to 127.0.0.1:$BYST_PORT, got: ${BYST_AFTER:-<nothing>}" ;;
 esac
 
-# ── 4. The script's own budget is the one used ──────────────────────────────
-#
-# dl_own declares callback_timeout_ms = 300 at its top level.  Asserted by the
-# number in the message rather than by timing the stall, so it says which budget
-# was applied and not merely that something eventually stopped.
+# Asserted by the number in the message rather than by timing the stall, so it
+# says which budget was applied and not merely that something eventually
+# stopped.
 printf 'spin\n' | timeout 10 nc -q 0 127.0.0.1 "$OWN_PORT" >/dev/null 2>&1 || true
 
 if wait_log '\[lua dl_own\] on_message hit its 300ms deadline and was stopped'; then pass; else
@@ -413,12 +295,9 @@ case "$OWN_AFTER" in
             "sent 'hello-own' to 127.0.0.1:$OWN_PORT, got: ${OWN_AFTER:-<nothing>}" ;;
 esac
 
-# ── 5. Control: a slow callback that finishes is not touched ────────────────
-#
-# 400ms of blocking socketley.http inside a 1500ms budget.  A deadline that
-# fires on this is worse than no deadline, because it breaks code that works —
-# and this particular shape is the documented use of the one blocking primitive
-# this tree ships.
+# 400ms of blocking socketley.http inside a 1500ms budget, because a deadline
+# that fires on the documented use of the one blocking primitive this tree
+# ships is worse than no deadline.
 SLOW_T0=$(date +%s.%N)
 SLOW_OUT=$(say dl_slow "$SLOW_PORT" slow)
 SLOW_T1=$(date +%s.%N)
@@ -431,9 +310,8 @@ case "$SLOW_OUT" in
             "a bound that fires on working code is not a fix" ;;
 esac
 
-# ...and it really did block, rather than the http call failing instantly and
-# leaving nothing for the deadline to have fired on.  `say` lingers 2s after
-# EOF, so the floor is that plus the block.
+# ...and it really did block rather than the http call failing instantly, with
+# the floor being `say`'s 2s linger plus the block.
 if [ "$(echo "$SLOW_ELAPSED > 2.3" | bc)" = "1" ]; then pass; else
     fail "the slow callback really did hold the loop for its 400ms" \
          "the round trip took ${SLOW_ELAPSED}s, and 2s of that is nc's linger" \
@@ -441,10 +319,8 @@ if [ "$(echo "$SLOW_ELAPSED > 2.3" | bc)" = "1" ]; then pass; else
          "and the control above proved nothing"
 fi
 
-# ...and exactly two on_message callbacks were stopped in this whole run:
-# dl_spin at 1500 and dl_own at 300.  A count, not a presence check: a build
-# that also stopped the slow one would satisfy every assertion above and fail
-# only here.
+# A count rather than a presence check, because a build that also stopped the
+# slow callback would satisfy every assertion above and fail only here.
 STOPS=$(grep -c "on_message hit its .*ms deadline and was stopped" "$SOCKETLEY_DLOG" 2>/dev/null || true)
 if [ "${STOPS:-0}" = "2" ]; then pass; else
     fail "exactly the two runaway on_message callbacks were stopped" \
@@ -452,22 +328,9 @@ if [ "${STOPS:-0}" = "2" ]; then pass; else
          "$(grep 'deadline and was stopped' "$SOCKETLEY_DLOG" 2>/dev/null || true)"
 fi
 
-# ── 5b. The proxy byte hooks, whose contract has four cases ─────────────────
-#
-# on_proxy_request tells four outcomes apart, and 213143c/bccfbea settled the
-# newest of them: an error refuses the request and closes, an explicit nil
-# drops, a string replaces, and RETURNING NOTHING AT ALL forwards the bytes
-# unchanged — because a hook that only watches traffic ends without a return
-# and used to have that read as "drop".
-#
-# A deadline landing in that function has to be the first of those and not the
-# fourth.  Both are, in a sense, "the hook did not produce a value": the
-# difference is that one of them is a hook that finished with no opinion and the
-# other is a hook that never finished at all, and forwarding the bytes of a
-# request whose policy hook was stopped mid-decision would admit exactly what
-# the hook exists to be able to refuse.  It comes back as `!r.valid()`, which
-# is the refusal branch — asserted here rather than reasoned about, because the
-# two cases are one enum value apart in code that was rewritten under me.
+# A deadline inside on_proxy_request has to be the refusal case and not the
+# returns-nothing case, because forwarding the bytes of a request whose policy
+# hook was stopped mid-decision admits exactly what the hook exists to refuse.
 PX_SEEN="$SOCKETLEY_TMPD/px.seen"
 PX_SEEN2="$SOCKETLEY_TMPD/px2.seen"
 : > "$PX_SEEN"; : > "$PX_SEEN2"
@@ -536,8 +399,8 @@ if grep -q "PAYLOAD-THROUGH-SPIN" "$PX_SEEN" 2>/dev/null; then
          "the admission the hook was written to prevent"
 else pass; fi
 
-# Control: the fourth case still works with the deadline installed.  Without
-# this, the assertion above passes against a build where NOTHING reaches a
+# Control: the fourth case still works with the deadline installed, without
+# which the assertion above passes against a build where nothing reaches a
 # backend through a Lua-hooked proxy.
 if grep -q "PAYLOAD-THROUGH-WATCH" "$PX_SEEN2" 2>/dev/null; then pass; else
     fail "control: a hook that returns nothing still forwards unchanged" \
@@ -547,11 +410,8 @@ if grep -q "PAYLOAD-THROUGH-WATCH" "$PX_SEEN2" 2>/dev/null; then pass; else
          "around the call must not have disturbed it"
 fi
 
-# ── 6. A top level that never returns refuses the create ────────────────────
-#
-# It runs inside the `create` command, so its failure has to come back as a
-# refusal with a reason.  Exit 1 specifically: 2 is the fatal code and would
-# also be what a daemon that had stopped answering produced.
+# Exit 1 specifically, because 2 is the fatal code and would also be what a
+# daemon that had stopped answering produced.
 TOP_RC=0
 TOP_OUT=$(timeout 30 "$BIN" create server dl_top -p "$TOP_PORT" --mode inout \
               --lua "$TOP" -s 2>&1) || TOP_RC=$?
@@ -571,14 +431,8 @@ case "$TOP_OUT" in
             "a refusal with no reason in it sends whoever reads it to the log" ;;
 esac
 
-# ── 7. A callback_timeout_ms that is not a number ───────────────────────────
-#
-# The global is read out of a table the script controls, and f956524 is the
-# commit that made every such read in this tree the checked form after an
-# unchecked one took the daemon down with std::terminate.  This one is checked,
-# and the assertion is on the behaviour rather than the spelling: a value that
-# cannot be a millisecond count refuses the create and says so, on the terminal
-# that asked, in every build.
+# A callback_timeout_ms that cannot be a millisecond count refuses the create
+# and says so on the terminal that asked, in every build.
 BADCTO="$SOCKETLEY_TMPD/badcto.lua"
 printf 'callback_timeout_ms = "soon"\nfunction on_message(m) end\n' > "$BADCTO"
 BC_RC=0
