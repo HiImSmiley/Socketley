@@ -44,11 +44,8 @@ struct remote_daemon
     std::vector<remote_runtime> runtimes;
 };
 
-// Who wrote a cluster file.
-//
-// The name in the filename says which node the entry is for; this says which
-// *process* put it there, and it is the whole basis of telling "me, restarted"
-// from "somebody else with my name".  See the comment above claim_is_ours().
+// Which PROCESS wrote a cluster file, which is how "me, restarted" is told from
+// "somebody else with my name".
 struct node_claim
 {
     std::string host;   // advertised address — gethostname(2)
@@ -66,11 +63,8 @@ public:
                       runtime_manager& manager);
     ~cluster_discovery() override;
 
-    // Start the publish/scan timer cycle.
-    //
-    // Returns false when the name is held by a daemon this one cannot prove is
-    // itself, in which case nothing has been written or deleted and
-    // last_error() says who holds it and why the claim was not honoured.
+    // False when the name is held by a daemon this one cannot prove is itself;
+    // nothing is written or deleted and last_error() says who holds it.
     bool start(event_loop& loop);
 
     // Why the last start() refused, as one line and no trailing newline.
@@ -80,22 +74,9 @@ public:
     // Stop and unpublish (graceful shutdown)
     void stop();
 
-    // Stop, and hand back the identity the loop knew this object by, so that
-    // whoever is about to free it can ask when the ring is finished with its
-    // storage — event_loop::token_inflight(), and the quarantine in
-    // daemon_handler that this is the first half of.
-    //
-    // stop() cannot answer that and never could.  The publish timer is an
-    // io_request living INSIDE this object, so a timeout still counting down
-    // names storage the delete is about to release, and the loop reads the
-    // owner token out of that request to decide whether the completion is
-    // stale.  stop() did not even reach the deciding: it cleared m_loop and
-    // returned without deregistering, so the token still matched and the
-    // completion was DISPATCHED — a virtual call on a freed cluster_discovery,
-    // two seconds after `daemon --cluster` was pointed somewhere new.
-    //
-    // Returns 0 for an object that was never started, which has nothing in the
-    // ring and can be freed on the spot.
+    // Hands back the loop token so a caller can ask when the ring is done with
+    // this storage -- the publish timer is an io_request living INSIDE the
+    // object.  Zero means never started and safe to free now.
     uint32_t retire();
 
     // Get remote runtimes matching a group (thread-safe, returns snapshot)
@@ -140,10 +121,8 @@ private:
     // Parse a remote daemon's JSON file into remote_daemon struct
     bool parse_daemon_json(const std::string& json, remote_daemon& out) const;
 
-    // Read <dir>/<name>.json's claim and heartbeat.  False when there is no
-    // readable file there; a file with none of the claim fields (written by a
-    // daemon from before they existed) yields an empty claim, which is never
-    // ours.
+    // False when there is no readable file; one without claim fields yields an
+    // empty claim, which is never ours.
     bool read_claim_file(const std::string& path, node_claim& out, int64_t& heartbeat) const;
 
     // True when this daemon can prove the claim is one of its own earlier
@@ -170,10 +149,8 @@ private:
     io_request m_timer_req{};
     struct __kernel_timespec m_timer_ts{};
 
-    // "The ring owes us this timeout."  Raised only when the submission was
-    // really queued and lowered only by its completion, so retire() withdraws a
-    // timer that is actually there rather than spending an SQE on -ENOENT.
-    // Same rule and the same wording as request_channel::m_wake_armed.
+    // Raised only on a queued submission and lowered by its completion, so
+    // retire() withdraws a timer that is there rather than spending an SQE.
     bool m_timer_armed{false};
 
     // What register_owner() handed back.  Kept because deregister_owner()

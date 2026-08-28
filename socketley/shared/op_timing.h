@@ -1,32 +1,7 @@
 #pragma once
-// Where the time goes: submit-to-complete latency, per operation type.
-//
-// Build with:  make config=release_x64 CPPFLAGS=-DSOCKETLEY_TIMING
-//
-// Separate from -DSOCKETLEY_TRACE on purpose.  That one counts conservation —
-// bytes read against responses made against bytes written — and answers "was
-// something lost".  This one answers "what took how long", and it costs a clock
-// read on every submission and every completion, so the two must be payable
-// independently.  Without the define everything here compiles to nothing.
-//
-// ─── WHY THIS BOUNDARY ──────────────────────────────────────────────────────
-//
-// Every unit of work in this process has exactly one submission and at least
-// one completion.  That makes the SQE-to-CQE interval the natural frame: it is
-// the same thing a graphics profiler measures between present calls, and it
-// needs no guessing about where a "unit of work" begins.
-//
-// ─── WHAT A MULTISHOT COMPLETION MEASURES ───────────────────────────────────
-//
-// A multishot submission completes many times.  The interval from the original
-// submit is only meaningful for the first of them; after that it would grow
-// without bound and say nothing.  So the stamp is reset on every completion,
-// which makes the second and later intervals *inter-arrival* times — how long
-// between one delivery and the next — rather than latencies.  Those are two
-// different quantities and the histogram cannot tell them apart, so read
-// multishot rows as "gap between deliveries" and one-shot rows as "how long the
-// kernel took".  Said here because a histogram that silently mixes them is
-// worse than none.
+// Submit-to-complete latency per op type, under -DSOCKETLEY_TIMING.
+// A multishot row is NOT latency: the stamp resets per completion, so the
+// second and later intervals are gaps between deliveries.
 
 #ifdef SOCKETLEY_TIMING
 
@@ -37,10 +12,8 @@
 
 namespace skl_timing {
 
-// CLOCK_MONOTONIC through the vDSO: ~20ns, no syscall.  rdtsc would be cheaper
-// and would need calibration and a guarantee about invariant TSC that this can
-// do without — at 10M ops/s the difference is measurable but this is a
-// diagnostic build, not the one that ships.
+// vDSO CLOCK_MONOTONIC, ~20ns; rdtsc would need calibration this can do
+// without, in a build that does not ship.
 inline uint64_t now_ns()
 {
     struct timespec ts;
@@ -49,10 +22,8 @@ inline uint64_t now_ns()
            static_cast<uint64_t>(ts.tv_nsec);
 }
 
-// Log2 buckets, so one array covers a nanosecond to eleven seconds without
-// deciding in advance where the interesting range is — which is the mistake a
-// linear histogram makes when it turns out the answer is three orders of
-// magnitude from where it was expected.
+// Log2 buckets, so one array spans a nanosecond to eleven seconds without
+// deciding in advance where the interesting range is.
 inline constexpr int BUCKETS = 34;
 
 struct histogram
@@ -62,12 +33,8 @@ struct histogram
     uint64_t ops[op_type_count]{};
     uint64_t max_ns[op_type_count]{};
 
-    // Time spent inside on_cqe, per op type.  A different quantity from
-    // everything above and the one that answers "where does this thread burn
-    // its core": submit-to-complete is latency and includes queueing, so
-    // summing it across overlapping operations exceeds the wall clock — 707 ms
-    // of writev latency over 95 ms of work simply means 7.5 were outstanding
-    // at a time.  This one is in-process and does add up.
+    // Time inside on_cqe, which unlike latency above does add up: summing
+    // overlapping latencies exceeds the wall clock and means nothing.
     uint64_t handler_ns[op_type_count]{};
 
     void add_handler(uint8_t type, uint64_t ns)
@@ -90,10 +57,8 @@ struct histogram
             max_ns[type] = ns;
     }
 
-    // Percentile from the buckets: the value at the low edge of the bucket the
-    // nth operation falls in.  Deliberately not interpolated — a log2 bucket is
-    // a factor of two wide and pretending otherwise would invent precision the
-    // measurement does not have.
+    // The low edge of the bucket, not interpolated: a log2 bucket is a factor
+    // of two wide and interpolating invents precision.
     uint64_t percentile(uint8_t type, double p) const
     {
         const uint64_t want = static_cast<uint64_t>(ops[type] * p);

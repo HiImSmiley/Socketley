@@ -474,13 +474,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
             const auto r = std::from_chars(start, p, n);
             if (r.ec != std::errc{})
             {
-                // Out of int64 range — 20 digits is not a malformed document,
-                // it is a large number.  The old code ignored this result and
-                // returned the untouched 0, so a counter past 9.2e18 came back
-                // as zero.  Lua numbers are doubles anyway, so the integer path
-                // is only ever an exactness optimisation; falling back to the
-                // float parse loses precision and keeps the magnitude, which is
-                // the right way round.
+                // Out of int64 range is a large number, not a bad document:
+                // fall back to the float parse, which keeps the magnitude.
                 std::string num_str(start, static_cast<size_t>(p - start));
                 double d = 0;
                 try { d = std::stod(num_str); } catch (...) {}

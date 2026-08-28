@@ -1,23 +1,8 @@
 #pragma once
 
-// A pending-write queue bounded by the memory it holds, not by the number of
-// entries it holds.
-//
-// Every runtime capped its write queue at 4096 entries and closed the
-// connection on reaching the cap. An entry is one message, and messages are not
-// one size, so that cap meant two different things depending on the traffic:
-//
-//   4096 pending 1 MB responses is four gigabytes of resident memory, and the
-//   cap does nothing about it — the limit it was written to enforce is exactly
-//   the one it misses
-//
-//   4096 pending 30-byte pub/sub notifications is 123 KB, and the cap drops the
-//   subscriber over it
-//
-// Counting bytes makes the bound mean what it was meant to mean. Each entry is
-// additionally charged a fixed overhead so that a flood of empty messages is
-// bounded too — the queue node and its allocation are real memory even when the
-// payload is not.
+// Bounded by the memory it holds, not the entries: a cap of 4096 entries is
+// four gigabytes of 1 MB responses and 123 KB of pub/sub notifications.
+// Each entry is charged a fixed overhead so empty messages are bounded too.
 
 #include <cstddef>
 #include <memory>
@@ -60,10 +45,8 @@ public:
     size_t size()  const noexcept { return m_queue.size(); }
     size_t bytes() const noexcept { return m_bytes; }
 
-    // Read-only, deliberately: taking a mutable reference and moving out of it
-    // would leave pop() subtracting the size of an emptied string, and the
-    // counter would drift upward until the connection was closed for a backlog
-    // it no longer had. Call sites that need to move use take_front().
+    // Read-only: moving out of it leaves pop() subtracting an emptied string,
+    // and the counter drifts up until the connection is closed.  Use take_front().
     const T& front() const { return m_queue.front(); }
     const T& back()  const { return m_queue.back(); }
 

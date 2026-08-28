@@ -14,13 +14,8 @@ enum log_level : uint8_t
     log_error = 3
 };
 
-// The spelling used in the daemon's config file, in both directions.
-//
-// It lived in daemon.cpp as a private helper while the daemon was the only
-// process with a level to set.  A worker is a second one — see
-// inherit_log_level() below — and the one thing worse than a worker that cannot
-// be asked for debug output is two tables of names that disagree about what
-// "warn" means.
+// The config file's spelling, both directions -- shared so the daemon and a
+// worker cannot disagree about what "warn" means.
 inline bool log_level_from_string(const char* s, log_level& out)
 {
     if (!s)                          return false;
@@ -43,15 +38,8 @@ inline const char* log_level_name(log_level l)
     return "info";
 }
 
-// ── A worker logs at the level its daemon does ──────────────────────────────
-//
-// It did not, and could not.  A worker is a fork+exec of the daemon that reads
-// no configuration file of its own, so logger::g_level was `info` in every
-// worker that has ever run — which means every LOG_DEBUG in the worker, in the
-// runtimes it holds, and in the event loop underneath them has been dead code
-// since runtimes started living out there.  Turning debug logging on in the
-// daemon's config produced debug output for the runtimes that stayed behind and
-// silence from the ones that moved, with nothing saying so.
+// A worker reads no config of its own, so without this every LOG_DEBUG out
+// there is dead code.
 //
 // The level travels in the environment because that is the one channel that is
 // already inherited across the fork and read after the exec: the control socket

@@ -1,16 +1,8 @@
 #pragma once
 
-// Write a whole buffer to a blocking fd, or report how far it got.
-//
-// write() and writev() returning fewer bytes than they were given is ordinary
-// behaviour, not an error, and every caller that checked only for a negative
-// return treated a short write as a complete one. On a message stream that is
-// not a lost byte or two — the reader sees the tail of one message glued to the
-// head of the next, and every message after it is misframed.
-//
-// The distinction between "nothing was written" and "some of it was" is the one
-// callers act on: the first can be retried or skipped, the second has already
-// put a fragment on the wire and left the stream unusable.
+// Write a whole buffer to a blocking fd, or report how far it got: a short
+// write is ordinary, and treating it as complete misframes every message after.
+// "Nothing written" can be retried; "some of it" has already broken the stream.
 
 #include <cerrno>
 #include <cstddef>

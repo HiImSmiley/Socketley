@@ -64,12 +64,8 @@ daemon_identity daemon_probe(const char*   socket_path,
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
-        // EACCES/EPERM is not "nothing is there".  The socket exists and this
-        // uid has no write permission on it, which since the mode was tightened
-        // is what a second user on one machine, or an operator who is not in
-        // the `socketley` group, gets.  Reported as `absent` it became "failed
-        // to start daemon" after the CLI forked a daemon that could not bind —
-        // a message that names neither the cause nor the fix.
+        // EACCES is not "nothing is there": reported as `absent` the CLI forks
+        // a daemon that cannot bind and blames the wrong thing.
         const int err = errno;
         close(fd);
         if (err == EACCES || err == EPERM)
@@ -91,16 +87,8 @@ daemon_identity daemon_probe(const char*   socket_path,
         return daemon_identity::mute;
     }
 
-    // The reply frame is one exit-code byte, then the text, then a NUL.  Read
-    // until the NUL rather than trusting one read() to hold the lot: the
-    // identifying line is short enough that it always does in practice, but
-    // "in practice" is the reasoning that put this defect here.
-    //
-    // Sized past PATH_MAX because the reply now ends in the daemon's executable
-    // path.  The classification below does not depend on the frame fitting
-    // anyway — see there — but a buffer that a legitimate path could overrun is
-    // not a thing to leave standing in the function that decides whether to
-    // trust the peer.
+    // Read to the NUL rather than trusting one read(), and sized past PATH_MAX
+    // because the reply ends in the daemon's executable path.
     char   buf[4160];
     size_t total = 0;
     bool   framed = false;
@@ -121,12 +109,8 @@ daemon_identity daemon_probe(const char*   socket_path,
     if (total == 0)
         return daemon_identity::mute;
 
-    // The identification is the exit byte and the prefix, and nothing else.
-    // Deliberately not gated on the frame being complete: a reply too long for
-    // the buffer would otherwise fall through to `foreign` and the CLI would
-    // refuse to talk to a daemon that had just named itself correctly.  A
-    // truncated reply is still a daemon; it is only a daemon we know less
-    // about, and the fields below are what get skipped.
+    // The exit byte and the prefix, not gated on the frame being complete: a
+    // truncated reply is still a daemon, only one we know less about.
     if (total >= 1 + daemon_ident_prefix.size() && buf[0] == 0 &&
         memcmp(buf + 1, daemon_ident_prefix.data(), daemon_ident_prefix.size()) == 0)
     {
@@ -176,13 +160,8 @@ daemon_identity daemon_probe(const char*   socket_path,
         return daemon_identity::daemon;
     }
 
-    // A daemon built before `ping` existed routes it to the `default:` arm of
-    // process_command(), which writes its complaint to the daemon's own stdout
-    // and leaves the reply body empty — so the frame on the wire is exactly
-    // {1, 0}.  Measured against the build this check was added to.  Nothing
-    // about it depends on the wording of a message, which is what makes it a
-    // safe thing for a compatibility shim to rest on; when no such daemon can
-    // still be running, the arm can go.
+    // A pre-`ping` daemon answers exactly {1, 0}, which depends on no message
+    // wording; the arm can go when no such daemon can be running.
     if (total == 2 && buf[0] == 1 && buf[1] == 0)
         return daemon_identity::predates_ping;
 
@@ -227,12 +206,9 @@ static int daemon_ipc(const char* cmd)
 
 bool daemon_attach(std::string_view name, std::string_view type, uint16_t port)
 {
-    // The same question the CLI asks, for the same reason.  An attach names this
-    // process, its type, its port and its pid — everything an operator's
-    // inventory is built from — and it was written to whatever happened to be
-    // bound to the socket path.  A managed program has no operator watching its
-    // startup, so an attach delivered to a stranger is a program that believes
-    // it is registered and is not.
+    // An attach names this process, its port and its pid, and had been written
+    // to whatever was bound -- with no operator watching a managed program's
+    // startup to notice it registered with a stranger.
     {
         auto paths = socketley_paths::resolve();
         const daemon_identity who = daemon_probe(paths.socket_path.string().c_str());
