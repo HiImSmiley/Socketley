@@ -796,41 +796,17 @@ inline bool decode_cluster_view(std::string_view payload, cluster_view& v)
     return r.ok;
 }
 
-// ── The floor on how often a worker may publish ─────────────────────────────
-//
-// Not a timer any more.  A worker publishes when the part of `stats` it alone
-// can compute has CHANGED, and this is the shortest interval two such publishes
-// may be — so a runtime under continuous traffic rebuilds its detail text four
-// times a second rather than once per completion, and an idle one publishes
-// nothing at all.
-//
-// It is also the floor the daemon coalesces its runtime-map pushes to, and that
-// is why the number is here rather than in proxy_worker.cpp: the map carries
-// the connection counts, and a daemon coalescing on a different period than the
-// one figures move at is either sending the same numbers twice or holding new
-// ones back.
+// The shortest interval two publishes may be, which is also the floor the
+// daemon coalesces its map pushes to, because the map carries the connection
+// counts and two different periods either resend numbers or hold new ones
+// back.
 inline constexpr int stats_interval_ms = 250;
 
 // ── Stats payload ───────────────────────────────────────────────────────────
-//
-// The four counters plus the active-connection count and the detail text —
-// which is precisely what runtime_instance publishes for off-thread readers
-// already.  That is not a coincidence: a reader in another process is a reader
-// off the event-loop thread, with the same prohibition on walking the
-// runtime's containers and more reason to respect it.
-//
-// ─── WHY THERE IS NO LONGER A MOMENT TRAVELLING WITH THE FIGURES ────────────
-//
-// This frame used to carry the instant its counters were read, because `stats`
-// printed how old they were and only the worker could answer that honestly.
-// The counters are in shared memory now — see shard_stats.h — and are summed by
-// whoever prints them, so there is no interval between reading and printing and
-// nothing to date.  `figures:pushed` and `figures_age_ms` went with it.
-//
-// The counters that remain in this struct are the fallback for a runtime whose
-// region could not be created, and the reason the change test in push_stats()
-// notices a counter moving.  `detail` is the part of `stats` no shared counter
-// can carry: a walk of one process's own tables.
+// The four counters, the active count and the detail text -- which is what
+// runtime_instance already publishes for off-thread readers -- with no moment
+// travelling alongside them, because the counters are summed out of shared
+// memory at print time and the ones here are only the fallback.
 
 struct stats_wire
 {
@@ -863,30 +839,16 @@ inline bool decode_stats(std::string_view payload, stats_wire& s)
     s.bytes_out          = r.u64();
     s.active_connections = r.u64();
     s.detail             = std::string(r.str());
-    // Trailing bytes a newer sender appended are left where they are: the frame
-    // header carries the length, so take_frame() has already consumed them and
-    // ignoring them costs this reader no synchronisation.  That is what the
-    // timestamp this frame used to end with relied on, and it is still what a
-    // field added after `detail` would rely on.
+    // Trailing bytes a newer sender appended are left where they are, because
+    // the frame header carries the length and take_frame() has already
+    // consumed them.
     return r.ok;
 }
 
 // ── Published message payload ───────────────────────────────────────────────
-//
-// A cache's PUBLISH reaches every runtime's subscribe callbacks, and the daemon
-// used to deliver it by calling into each instance.  A worker is not an
-// instance the daemon can call into, so the three strings travel instead —
-// which is all a subscriber is ever handed anyway.
-//
-// One-way and best-effort, like every other frame on this socket.  A subscriber
-// is told what was published, not asked about it: there is no reply, nothing
-// waits, and a frame dropped because the child is not reading is a message that
-// subscriber does not see — the same outcome as a subscriber that was not
-// running yet.  Unlike the endpoint table there is nothing to re-send it from,
-// because a publish is an event and not a state.
-//
-// All three strings are length-prefixed, so a message with a NUL or a newline
-// in it is not a parsing problem: a cache value is arbitrary bytes.
+// A publish travels as its three length-prefixed strings, one-way and
+// best-effort like every frame on this socket, with nothing to re-send it from
+// -- because a publish is an event rather than a state.
 
 struct publish_wire
 {
@@ -916,28 +878,9 @@ inline bool decode_publish(std::string_view payload, publish_wire& p)
     return r.ok;
 }
 
-// ── A request one runtime makes of another, across the process boundary ─────
-//
-// request_channel has always promised that a target on the other side of a
-// process boundary would be reached by a socket-backed sink "and nothing on the
-// asking side changes".  This is the wire that carries it, and it is
-// deliberately this one rather than the target's own client protocol.
-//
-// NOT the cache's text protocol: its replies are not self-delimiting — ten
-// commands answer over several lines ending in `end\n` — so a client could only
-// find the end of a reply by knowing which command produced it, which puts the
-// cache's command table in a second place.
-//
-// NOT RESP either, though RESP is self-delimiting: producing it is the problem.
-// process_command() splits a line positionally, command to the first space, key
-// to the second, and the rest is the value with its spaces intact, so
-// `SET k hello world` stores "hello world".  Turning that into arrays needs an
-// arity table per command — the same duplication by another road.
-//
-// A length-prefixed frame has neither difficulty.  The payload is whatever
-// would have arrived on the target's own port and is passed through untouched;
-// the ticket is what pairs an answer with its question, and it is the channel's
-// own, so nothing here has to understand a single command.
+// A length-prefixed frame carrying whatever would have arrived on the target's
+// own port, rather than the cache's text protocol, whose replies are not
+// self-delimiting, or RESP, which needs an arity table per command to produce.
 struct chan_request_wire
 {
     uint64_t    ticket{0};

@@ -1573,15 +1573,9 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
-        // The mesh client-certificate flags, taken here as they are on the
-        // create path.  They live with the proxy rather than in the common
-        // edit handler because that is where they exist at all: a server or
-        // client runtime has no mesh_config, so "unknown flag" is the true
-        // answer there.
-        //
-        // Like every other TLS option the change takes effect at the next
-        // start — certificates are read in setup(), so a running proxy keeps
-        // the identity it handshook with until it is restarted.
+        // The mesh client-certificate flags live with the proxy because that
+        // is where they exist at all, and like every TLS option they take
+        // effect at the next start.
         case fnv1a("--client-ca"):
         case fnv1a("--client-cert"):
         case fnv1a("--client-key"):

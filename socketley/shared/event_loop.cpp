@@ -2032,25 +2032,10 @@ bool event_loop::submit_splice(int fd_in, int fd_out, uint32_t len, io_request* 
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
-    // off_in = off_out = -1 for pipes/sockets (no seekable offset)
-    //
-    // Still no SPLICE_F_NONBLOCK — the EAGAIN-and-resubmit hazard the previous
-    // comment named is a real reason to leave it off, and nothing here has
-    // tested the empty-socket case that would trigger it.
-    //
-    // What that comment got wrong is the other half: it said io_uring "handles
-    // the operation asynchronously, so the kernel waits for data internally",
-    // which reads as though this were an ordinary poll-driven submission that
-    // merely sleeps until data arrives.  It is not.  Every splice is handed to
-    // an io-wq worker, and that happens whether or not the data is already
-    // there: with the pipe pre-filled and room at the far end, so that blocking
-    // was impossible, it still measured 17.19 us against 0.72 us for a read()
-    // from that same ready pipe — and 17.32 us for a send() deliberately forced
-    // async with IOSQE_ASYNC.  Setting NONBLOCK does not change that number
-    // either (17.18 us), because the punt happens before the flag is consulted.
-    //
-    // See submit_splice in the header for the full table and for the payload
-    // size at which the punt stops mattering.
+    // off_in and off_out are -1 for pipes and sockets, and still no
+    // SPLICE_F_NONBLOCK, because the punt to an io-wq worker happens before
+    // the flag is consulted -- measured at 17.19 us with the pipe pre-filled
+    // against 0.72 us for a read from the same ready pipe.
     io_uring_prep_splice(sqe, fd_in, -1, fd_out, -1, len, SPLICE_F_MOVE);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_splice;
@@ -2090,18 +2075,13 @@ bool event_loop::submit_poll_remove(io_request* target)
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
-    // Keyed on the user_data the poll was submitted with, which is the address
-    // of its io_request — the same key submit_timeout_remove uses, and for the
-    // same reason.  The kernel only compares the value; it never dereferences
-    // it, so a request whose storage has since been retired is still a safe key.
+    // Keyed on the user_data the poll was submitted with, which the kernel
+    // compares without ever dereferencing, so a retired request's address is
+    // still a safe key.
     io_uring_prep_poll_remove(
         sqe, static_cast<__u64>(reinterpret_cast<std::uintptr_t>(target)));
-    // No request of its own, exactly like submit_timeout_remove: the removal's
-    // answer is only "found it" or "-ENOENT", nothing acts on either, and run()
-    // skips a completion that names no request without dispatching or counting
-    // it.  So there is no arm() here and no disarm() owed for it.  The poll
-    // being withdrawn keeps the one it already had — it still reports, with
-    // -ECANCELED, and that completion is what balances its submit_poll_add().
+    // No request of its own, so no arm() and no disarm() owed, while the poll
+    // being withdrawn keeps the one it already had and reports -ECANCELED.
     io_uring_sqe_set_data(sqe, nullptr);
     m_pending_submissions++;
     return true;
@@ -2151,8 +2131,8 @@ void event_loop::unregister_files()
     }
 }
 
-// Bitmap-based fixed file slot allocator.
-// Returns the index of a free slot, or -1 if full.
+// Bitmap-based fixed file slot allocator, returning the index of a free slot
+// or -1 when full.
 int event_loop::alloc_fixed_file_slot()
 {
     if (!m_files_registered)
@@ -2168,12 +2148,10 @@ int event_loop::alloc_fixed_file_slot()
             int bit = __builtin_ctzll(~m_file_bitmap[w]);
             uint32_t idx = w * 64 + static_cast<uint32_t>(bit);
 
-            // The bitmap spans MAX_FIXED_FILES, but only m_registered_file_count
-            // entries actually exist in the kernel's table.  Handing out anything
-            // past that produces a slot update_registered_file always rejects,
-            // and the caller then has a number it cannot use and cannot give
-            // back — the bit stayed set for the lifetime of the loop, so the
-            // table filled up with slots that were never really in use.
+            // The bitmap spans MAX_FIXED_FILES but only
+            // m_registered_file_count entries exist, so handing out anything
+            // past that gives the caller a slot it can neither use nor give
+            // back.
             if (idx >= m_registered_file_count)
                 return -1;
 
@@ -2192,38 +2170,11 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     uint32_t w = idx / 64;
     uint32_t bit = idx % 64;
 
-    // WITH SOMETHING STILL ARMED, THE CANCEL GOES FIRST AND THE UNREGISTER LAST.
-    //
-    // Until this existed, an operation armed on a fixed index had no way to be
-    // withdrawn at all.  close_fd() cancels by descriptor number and a fixed
-    // submission is not counted against one — arm(req, fixed_target(idx)) puts
-    // it in a different table — so a multishot recv on a direct connection
-    // could only ever end by itself, and a multishot recv holds its own
-    // reference to the file, so "by itself" means the peer or the socket.  On
-    // this project's development machine shutdown() ends it through the socket
-    // wait queue every time.  On the nightly runner's kernel it does not, and
-    // the harness reported the result there for months in the only words it
-    // had: "1 operation(s) still owed at end of input: recv-multishot=1", after
-    // 1970 rounds of polling in 2010 ms — a ring being serviced and an
-    // operation that was never going to report.
-    //
-    // The ORDER is the whole of it, and getting it wrong looks exactly like not
-    // cancelling.  A cancel naming a fixed index is matched when the kernel
-    // consumes the SQE; register_files_update() is a syscall that takes effect
-    // immediately.  Submitting the cancel and unregistering on the next line
-    // therefore hands the kernel an index pointing at nothing by the time it
-    // looks — measured, on the seed this was found with:
-    //
-    //     [trace] fixed cancel idx=0 -> res=-9 (Bad file descriptor)
-    //
-    // with the recv it was meant to withdraw still armed afterwards.  Same
-    // shape as the flush-then-close hazard this file documents for descriptor
-    // numbers, one level up.
-    //
-    // So the unregister is deferred to settle_deferred(), where it runs once
-    // the operations have reported.  Nothing is lost by waiting: the point of
-    // unregistering is to drop the kernel's last reference to the socket, and
-    // an operation still in flight is that reference.
+    // With something still armed the cancel goes first and the unregister is
+    // deferred, because a cancel naming a fixed index is matched when the SQE
+    // is consumed while register_files_update() takes effect at once --
+    // measured as "fixed cancel idx=0 -> res=-9" with the recv still armed
+    // afterwards.
     if (m_fixed_armed[idx] > 0)
     {
         submit_cancel_fixed(idx);
@@ -2232,28 +2183,19 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
         return;
     }
 
-    // Nothing armed: unregister now, as this always did.  This is what drops
-    // the kernel's reference to the socket; until it runs the descriptor's own
-    // close() has not really closed anything.
+    // Nothing armed, so unregister now: this is what drops the kernel's
+    // reference, and until it runs the descriptor's own close() has not really
+    // closed anything.
     int neg = -1;
     if (m_files_registered)
     {
         if (io_uring_register_files_update(&m_ring, idx, &neg, 1) < 0) {}
     }
 
-    // The index itself is a different matter.  Handing it straight back to the
-    // allocator while an SQE still names it is the redirection this whole file
-    // is about, one level up from descriptor numbers: the next accept takes the
-    // slot, points it at its own socket, and the previous connection's queued
-    // read is delivered from — or its write into — a stranger.  Neither the
-    // unregister above nor the connection's close() prevents it; the SQE
-    // carries the index and the kernel looks it up when it consumes it.
-    //
-    // So the bit stays set until the count says nothing names it.  Callers are
-    // not asked to check: release_fixed_slot() runs on the teardown path with
-    // reads still armed by design, and every one of them had reasoned that the
-    // request "took its own reference when it was issued" — true of a submission
-    // the kernel has consumed, and the entire question is the ones it has not.
+    // The index stays claimed until the count says nothing names it, because
+    // an SQE carries the index and the next accept would otherwise point the
+    // slot at its own socket -- and callers are not asked to check, having all
+    // reasoned about submissions the kernel had already consumed.
     m_file_bitmap[w] &= ~(1ULL << bit);
     // Update hint to this word since it now has a free slot
     m_file_bitmap_hint = w;
