@@ -1,10 +1,7 @@
 #pragma once
 // A request one runtime makes of another, answered on a later turn, so an
-// asking side cannot tell "computed here" from "written to a socket".
-//
-// One queue drained front to back; it owns copies, and an origin must call
-// drop_origin() before it dies.  Background work has a lower cap so a --cache
-// auto-store cannot starve the `cache get` a client is waiting on.
+// asking side cannot tell "computed here" from "written to a socket".  One
+// queue, in order; an origin must call drop_origin() before it dies.
 
 #include <cstddef>
 #include <cstdint>
@@ -95,10 +92,8 @@ public:
     void register_sink(std::string_view name, request_sink* sink);
     void drop_sink(const request_sink* sink);
 
-    // Where a request goes when nobody here holds the name.  Unset in the
-    // daemon, which holds the whole map; a worker points it at the control
-    // socket and also registers its OWN name, or a request for itself would go
-    // to the daemon and come straight back.
+    // Where a request goes when nobody here holds the name; a worker also
+    // registers its OWN name, or a request for itself would round-trip.
     void set_default_sink(request_sink* sink) { m_default_sink = sink; }
     request_sink* default_sink() const { return m_default_sink; }
 
