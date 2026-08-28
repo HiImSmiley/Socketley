@@ -16,12 +16,8 @@ server_instance* local_server(runtime_manager* mgr, std::string_view name)
     if (!rt)
         return nullptr;
 
-    // The whole point of the file, in one line.  A placeholder for a runtime
-    // living in a worker IS a server_instance and answers as_server() with
-    // itself, so as_server() alone is not the question "may I call into this".
-    // Without this test the daemon's half of every verb below runs against an
-    // object with no connections, no script and no ring, and reports that it
-    // worked.
+    // A placeholder IS a server_instance and answers as_server() with itself,
+    // so as_server() alone is not the question "may I call into this".
     if (rt->is_out_of_process())
         return nullptr;
 
@@ -40,10 +36,7 @@ void post_or_drop(runtime_manager* mgr, std::string_view to, std::string_view fr
 {
     if (auto* sink = mgr ? mgr->route_sink() : nullptr)
         sink->post(to, from, op, ref, payload);
-    // No sink is a manager with no daemon around it -- a unit test, or a
-    // process that genuinely holds every runtime there is.  Dropping is then
-    // the correct answer and the same one this code gave before the sink
-    // existed, which is what makes installing it a strictly additive change.
+    // No sink means no daemon around it, where dropping is the right answer.
 }
 
 }   // namespace
@@ -103,11 +96,8 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
     if (auto* sink = mgr ? mgr->route_sink() : nullptr)
     {
         sink->post(to, from, worker_proto::route_op::write, ref, msg);
-        // "Queued", which is what a write answers on this tree's in-process
-        // path too: send_to() can still drop the connection for exceeding its
-        // write-queue bound, and the caller learns that from the connection
-        // going away rather than from this call.  Upgrading the remote answer
-        // would make it stronger than the local one.
+        // "Queued", as the in-process path answers: upgrading the remote one
+        // would make it stronger than the local.
         return true;
     }
     return false;

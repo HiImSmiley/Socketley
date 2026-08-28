@@ -14,13 +14,8 @@ namespace conn_transfer
 namespace
 {
 
-// The handover's own payload, ahead of any backlog:
-//   [conn_ref][u32 origin_len][origin][u32 backlog_len][backlog]
-//
-// Sent as one sendmsg with the descriptor attached, so a receiver either has
-// the whole thing and the descriptor or has neither.  Splitting it would open a
-// window where the descriptor has arrived and the name of what it is has not,
-// and there is nothing useful a receiver could do with that.
+// [conn_ref][u32 origin_len][origin][u32 backlog_len][backlog], sent as one
+// sendmsg with the descriptor, so a receiver has all of it or none.
 void put_u32(std::string& out, uint32_t v)
 {
     for (int i = 0; i < 4; ++i)
@@ -63,11 +58,8 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd)
         return false;
     }
 
-    // Length-prefixed on the wire as well, because a stream socket may coalesce
-    // two handovers into one read even though each was one sendmsg.  The
-    // control message is not coalesced — the kernel truncates a read at the
-    // boundary of a message carrying one — but the receiver still has to know
-    // where the body ends before it can trust the next descriptor it sees.
+    // Length-prefixed too: a stream socket may coalesce two handovers into one
+    // read even though each was one sendmsg.
     std::string framed;
     framed.reserve(4 + body.size());
     put_u32(framed, static_cast<uint32_t>(body.size()));
@@ -94,11 +86,8 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd)
     cm->cmsg_len   = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cm), &payload_fd, sizeof(int));
 
-    // One sendmsg, retried only on EINTR.  A short write here would split the
-    // body from its descriptor, so a partial send is treated as a failed
-    // handover and the caller keeps the connection it still owns — which is the
-    // safe direction to fail in: a connection served by the wrong runtime is
-    // recoverable, a connection served by neither is not.
+    // A partial send is a failed handover and the caller keeps the connection:
+    // served by the wrong runtime is recoverable, served by neither is not.
     for (;;)
     {
         const ssize_t n = ::sendmsg(channel_fd, &msg, MSG_NOSIGNAL);
@@ -121,10 +110,8 @@ bool recv_handover(int channel_fd, handover& h, int& out_fd)
     if (channel_fd < 0)
         return false;
 
-    // Read the length first, without the control message, so the body can be
-    // sized before it is taken.  MSG_PEEK is what makes that possible without a
-    // buffer that has to survive between calls: the descriptor stays queued
-    // with its message until the real recvmsg below.
+    // MSG_PEEK sizes the body before taking it, and leaves the descriptor
+    // queued with its message until the real recvmsg.
     uint32_t body_len = 0;
     {
         char lenbuf[4];
@@ -241,11 +228,8 @@ void withdraw(event_loop* loop, int fd)
     if (loop->fd_inflight(fd) == 0)
         return;
 
-    // Once.  See the header: a cancel submitted every turn is the completion
-    // the next drain consumes, so the read being cancelled is never given a
-    // turn to report and the descriptor is never released.  That was measured
-    // rather than reasoned — fifty drains, fifty cancel completions, the read
-    // still armed at the end of them.
+    // Once: a cancel every turn is the completion the next drain consumes, so
+    // the read being cancelled never gets a turn to report.
     loop->submit_cancel_fd(fd);
 }
 
