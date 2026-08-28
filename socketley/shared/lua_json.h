@@ -1,24 +1,7 @@
 #pragma once
-// JSON for the Lua API: socketley.json_encode and socketley.json_decode.
-//
-// ─── WHY THIS IS A HEADER AND NOT STILL IN lua_context.cpp ──────────────────
-//
-// It was file-static in lua_context.cpp, reachable only through
-// register_bindings(), which is private and needs a live runtime_instance.  So
-// the two functions could not be called from a test at all — no unit test, and
-// no fuzz target, for the one binding in this API that is written to be pointed
-// at data from the network.
-//
-// That mattered.  Neither had a depth limit: a cyclic table crashed the encoder
-// and a few hundred kilobytes of `[[[[` crashed the decoder, taking the whole
-// daemon with it.  Measured, 40 KB survived and 200 KB was a SIGSEGV with a
-// core file.  Both are fixed and both are now reachable, which is the point of
-// moving them: a defect in a parser that cannot be driven from a test is a
-// defect that gets found in production.
-//
-// Header-only and templated on nothing: these need sol2 and the standard
-// library, so a header costs the includers nothing they do not already have.
-// resp_parser.h is the same arrangement for the same reason.
+// JSON for socketley.json_encode and socketley.json_decode.
+// A header rather than file-static in lua_context.cpp so a parser pointed at
+// network data can be reached by a test and a fuzz target.
 
 #include <sol/sol.hpp>
 
@@ -30,66 +13,13 @@
 
 namespace socketley::lua_json {
 
-// ─── JSON encode/decode for Lua ───────────────────────────────────────────────
-//
-// ─── HOW DEEP EITHER SIDE MAY GO, AND WHY THERE IS A LIMIT AT ALL ────────────
-//
-// Both functions below are recursive, in C++, over a structure a script hands
-// them — and until this constant existed neither had a bottom.
-//
-// The encoder's was reachable by accident.  `t.self = t` is a typo every
-// scripting language forgives, and Lua forgives it too; this encoder followed
-// the reference forever.  Measured, one runtime whose on_start built exactly
-// that table:
-//
-//     [INFO] [lua jc] about to encode a cyclic table
-//     Segmentation fault (core dumped)
-//
-// The decoder's was reachable on purpose, and from outside.  socketley.json_decode
-// is written to be pointed at a request body — that is what the API is for — so
-// the nesting depth is chosen by whoever sent the request.  Measured, a runtime
-// decoding string.rep("[", n) .. string.rep("]", n):
-//
-//     n =   1000  (  2 KB)   survived
-//     n =   5000  ( 10 KB)   survived
-//     n =  20000  ( 40 KB)   survived
-//     n = 100000  (200 KB)   Segmentation fault (core dumped)
-//
-// 200 KB is an ordinary request body.  That made every script calling
-// json_decode on network input a way for an unauthenticated client to take the
-// whole daemon down, which is the only such path anybody found in this tree.
-//
-// The callback deadline does not help and was never going to: it is a
-// lua_sethook on Lua instructions plus a wall clock, and this recursion is C++
-// frames on the C stack.  The stack is gone long before ten seconds are.
-//
-// 128 is Redis's limit for the same job.  A document nested deeper than that is
-// not something a handler builds by hand, and the two failures above are both
-// well past it.
+// Both sides recurse in C++ over a structure the caller chooses, so both need a
+// bottom; the callback deadline hooks Lua instructions, not the C stack.
 inline constexpr int json_max_depth = 128;
 
-// ─── WHAT A DECODE ANSWERS ───────────────────────────────────────────────────
-//
-// The decoder used to answer one thing — a sol::object — and there was no way
-// to ask whether it had meant it.  `null`, an empty string, `nul`, `garbage`
-// and a document exhausted mid-value all returned nil, and every structural
-// mistake returned a value built out of the part it had understood:
-//
-//     json_decode('{{{{')       →  a table          (not JSON at all)
-//     json_decode('[1,')        →  a table  {1}     (truncated mid-array)
-//     json_decode('"x')         →  the string "x"   (unterminated)
-//     json_decode('{"a":}')     →  a table  {}      (the field silently gone)
-//     json_decode('nul')        →  nil              (indistinguishable from null)
-//
-// A handler doing `local body = socketley.json_decode(req.body)` therefore
-// could not tell a truncated request body from a complete one, and got a table
-// with the fields that happened to arrive before the truncation.  That is worse
-// than an error: the script proceeds, on data it believes is whole.
-//
-// So a decode reports which of three things happened, and the returned object
-// is the document only when it says `ok`.  Two of the three were already
-// distinct in the binding's contract for the encoder and for the depth refusal
-// — this makes the third one, by far the most common, distinct too.
+// A decode says which of three things happened, and the object is the document
+// only on `ok` -- otherwise a truncated body is indistinguishable from a whole
+// one, and the script proceeds on data it believes is complete.
 enum class json_status
 {
     ok,          // the object is the document
@@ -97,13 +27,8 @@ enum class json_status
     malformed,   // not a JSON document; the object is nothing
 };
 
-// `path` holds the tables currently being encoded, innermost last — an
-// ancestor chain, not a visited set.  The difference matters: a table that
-// appears twice as a SIBLING is ordinary and must still encode (two fields
-// pointing at one shared config table), while a table that appears twice on one
-// path is a cycle and cannot terminate.
-//
-// False means nothing was appended for this value and `err` says why.
+// `path` is an ancestor chain, not a visited set: a table repeated as a SIBLING
+// is ordinary, one repeated on a path is a cycle.  False appends nothing.
 inline bool json_encode_value(std::string& out, const sol::object& val,
                               int depth, std::vector<const void*>& path,
                               std::string& err);
@@ -134,17 +59,9 @@ inline void json_encode_string(std::string& out, const std::string& s)
     out += '"';
 }
 
-// The element count when `t` is exactly the dense set {1..n}, and 0 otherwise —
-// 0 meaning "encode this as an object", which is also the right answer for an
-// empty table.
-//
-// The keys are collected rather than matched against a running counter.  The
-// old version compared each key to `expected` as lua_next produced it, so it
-// answered "array" only if the traversal happened to arrive in index order.
-// LuaJIT's array part does arrive in order today; nothing promises it, and the
-// consequence of it not doing so is not a wrong answer but a DIFFERENT answer
-// between two runs over equal data — the same class of bug as the key order
-// below, and invisible until it matters.
+// The count when `t` is exactly {1..n}, else 0 meaning "encode as an object".
+// Keys are collected, not matched against a running counter: nothing promises
+// lua_next arrives in index order, and depending on it makes the answer vary.
 inline int array_length(const sol::table& t)
 {
     int    count = 0;
@@ -225,9 +142,7 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
             }
 
             path.push_back(id);
-            // Every `return false` below leaves the pop to this guard: the
-            // early exits are the whole point of the ancestor chain, and a
-            // path that grows on the way in and not back out would report a
+            // A path that grows on the way in and not back out reports a
             // cycle for the next sibling.
             struct pop_guard
             {
@@ -237,10 +152,7 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
 
             if (const int n = array_length(t); n > 0)
             {
-                // By index, not by traversal.  An array's elements have an
-                // order that is part of the value — [1,2] and [2,1] are
-                // different documents — so it is read from the indices rather
-                // than from whatever order lua_next hands them back.
+                // By index: [1,2] and [2,1] are different documents.
                 out += '[';
                 for (int i = 1; i <= n; ++i)
                 {
@@ -252,31 +164,8 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
             }
             else
             {
-                // ─── The keys are sorted, and that is a fix ─────────────────
-                //
-                // A Lua table has no order to preserve: measured, a table
-                // filled alpha, beta, gamma, delta iterates beta, gamma, delta,
-                // alpha.  So whatever order lua_next produces is arbitrary —
-                // and it is not even the same arbitrary order for two tables
-                // holding equal data.  The fuzz target found it as
-                //
-                //     once : {"b":[1,2,{"c":"x"}],"e":3}
-                //     twice: {"e":3,"b":[1,2,{"c":"x"}]}
-                //
-                // — one table, encoded, decoded, encoded again, and the two
-                // strings differ.  json_encode was therefore not a function of
-                // its argument, which breaks every use that compares its
-                // output: an ETag, a cache key, a signature, a dedup hash, a
-                // diff of two logged documents, a script asserting that two
-                // tables match.  None of those fail loudly; they just stop
-                // being right, occasionally.
-                //
-                // Sorting by the rendered key makes the output a function of
-                // the value, and costs a vector and a sort per object.  The one
-                // case still unordered is two distinct keys that render to the
-                // same text — t[1] and t["1"] — which produces a duplicate JSON
-                // key whichever way round it goes, and was already not
-                // expressible.
+                // Sorted, so the output is a function of the value: lua_next's
+                // order is not stable even between equal tables.
                 struct field { std::string key; sol::object val; };
                 std::vector<field> fields;
 
@@ -284,45 +173,16 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
                 {
                     std::string key_text;
 
-                    // ─── The key is not necessarily a string ────────────────
-                    //
-                    // This branch takes every table that is not a dense array,
-                    // and the commonest of those is a SPARSE one — {[1]=1,
-                    // [3]=3} — whose keys are numbers.  `as<std::string>()` on
-                    // a number was two bugs at once.
-                    //
-                    // sol2's safety checks follow NDEBUG, so they are off in
-                    // Release and on in every Debug and Sanitize build.  With
-                    // them on, this does not convert: it throws, the throw
-                    // leaves through sol2's handler as "[sol2] An exception
-                    // occurred: caught (...) exception", and the callback that
-                    // called json_encode never returns.  Measured, one script
-                    // encoding {[1]=1,[3]=3} and replying with the result:
-                    //
-                    //     Release   ->  j={"3":3,"1":1}
-                    //     Sanitize  ->  (no reply at all; connection times out)
-                    //
-                    // With them off it is worse than an error.  as<std::string>
-                    // on a number is lua_tolstring, which does not read the
-                    // value — it REPLACES it, in the table, in the middle of a
-                    // lua_next traversal.  The Lua manual forbids exactly that:
-                    // modifying a key during traversal is undefined, and the
-                    // Release build has been doing it on every sparse table.
-                    //
-                    // So the key is formatted here and the table is not
-                    // touched.  A JSON object's keys are strings, so a
-                    // non-string key is rendered and then quoted, which is the
-                    // same text Release produced by coercion.
+                    // Formatted here rather than coerced: as<std::string>() on
+                    // a number is lua_tolstring, which REPLACES the key in the
+                    // table mid-traversal, which the Lua manual forbids.
                     if (kv.first.get_type() == sol::type::string)
                     {
                         key_text = kv.first.as<std::string>();
                     }
                     else
                     {
-                        // A key is a scalar in every case this branch can see —
-                        // a table key would be one more place a cycle could
-                        // hide, so it goes through the same guarded call rather
-                        // than a bare one.
+                        // Guarded anyway: a table key would hide a cycle.
                         if (!json_encode_value(key_text, kv.first, depth + 1, path, err))
                             return false;
                     }
@@ -355,16 +215,9 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
     return true;
 }
 
-// `st` is set only on failure, and never cleared: a caller passes one status in
-// and reads it once at the end, so a failure deep inside a container survives
-// the unwinding rather than being overwritten by the frames above it.
-//
-// Every successful return carries a lua_State — including `null`, which returns
-// a nil made against `lua` rather than the free-standing sol::nil.  A
-// free-standing one has no state, and get_type() on it dereferences a null
-// lua_State*: harmless while the only caller handed the object straight back to
-// Lua, and an immediate segfault for the first C++ caller that looked at it.
-// That first caller was the fuzz target below this file's own tests.
+// `st` is set only on failure and never cleared, so one deep in a container
+// survives the unwinding; every return carries a lua_State, because get_type()
+// on a free-standing sol::nil segfaults.
 inline sol::object json_decode_value(sol::state& lua, const char*& p, const char* end,
                                      int depth, json_status& st);
 
@@ -374,12 +227,8 @@ inline void json_skip_ws(const char*& p, const char* end)
         ++p;
 }
 
-// `ok` is false when the bytes are not a complete string: no opening quote, or
-// no closing one before the input ran out.  The escapes stay deliberately
-// lenient — an unknown one is kept verbatim, `\uZZZZ` too — because a decoder
-// that rejects a document over one odd escape is less useful than one that
-// carries it through, and neither can hand back a truncated value the way an
-// unterminated string can.  Structure is what is strict here.
+// False only for an incomplete string; escapes stay lenient and are kept
+// verbatim, because structure is what can hand back a truncated value.
 inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
 {
     if (p >= end || *p != '"') { ok = false; return {}; }
@@ -404,13 +253,8 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
                 {
                     if (p + 4 < end)
                     {
-                        // The four digits are checked now.  A non-hex character
-                        // matched none of the three branches and contributed a
-                        // silent zero, so `\uZZZZ` decoded to U+0000 and
-                        // `\u00g0` to something no reader intended.  Malformed
-                        // input is kept verbatim instead, which is what the
-                        // `default` arm of this switch already does for every
-                        // other unknown escape.
+                        // Checked, or a non-hex digit contributes a silent zero
+                        // and `\uZZZZ` decodes to U+0000.
                         unsigned cp = 0;
                         bool hex_ok = true;
                         const char* const digits = p + 1;
@@ -431,20 +275,8 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
                         }
                         p += 4;
 
-                        // ─── A surrogate is half a character ────────────────
-                        //
-                        // JSON has no way to write a codepoint above the BMP
-                        // except as a surrogate PAIR — \uD83D\uDE00 is one
-                        // emoji, not two characters.  Encoding each half on its
-                        // own produces bytes that are not valid UTF-8, and they
-                        // went straight into a Lua string that a handler then
-                        // wrote to a socket or a file.
-                        //
-                        // The pair is joined here.  A high surrogate with no low
-                        // one behind it, or a lone low surrogate, is not
-                        // repairable and becomes U+FFFD — the replacement
-                        // character exists for exactly this and is what every
-                        // other decoder answers.
+                        // A surrogate pair is one codepoint; encoding each half
+                        // alone is not valid UTF-8.  An unpaired one is U+FFFD.
                         if (cp >= 0xD800 && cp <= 0xDBFF)
                         {
                             unsigned lo = 0;
@@ -492,11 +324,7 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
                         }
                         else
                         {
-                            // Four bytes, reachable only now that a surrogate
-                            // pair is joined above.  Before that this branch
-                            // could not be entered — cp came from four hex
-                            // digits and stopped at 0xFFFF — which is why the
-                            // three-byte form was the whole of it.
+                            // Reachable only because the pair is joined above.
                             result += static_cast<char>(0xF0 | (cp >> 18));
                             result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
                             result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
@@ -525,10 +353,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
     json_skip_ws(p, end);
     if (p >= end) { st = json_status::malformed; return sol::nil; }
 
-    // Checked once, before the switch, so it covers both containers and every
-    // container added later.  A scalar cannot recurse and is let through
-    // whatever the depth, which keeps the limit about nesting rather than about
-    // where in a document a value happens to sit.
+    // Once, before the switch, so it covers every container added later; a
+    // scalar cannot recurse and passes at any depth.
     if ((*p == '{' || *p == '[') && depth >= json_max_depth)
     {
         st = json_status::too_deep;
@@ -554,10 +380,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
             {
                 json_skip_ws(p, end);
 
-                // A key has to be a quoted string.  When it was not, the old
-                // decoder took the empty string json_decode_string returns for
-                // "this is not a string" and carried on, so `{a:1}` and `{,,,}`
-                // both produced a table with a "" field.
+                // A key must be a quoted string, or `{a:1}` and `{,,,}` both
+                // produce a table with a "" field.
                 bool key_ok = true;
                 std::string key = json_decode_string(p, end, key_ok);
                 if (!key_ok) { st = json_status::malformed; return sol::nil; }
@@ -626,10 +450,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
             const char* start = p;
             if (*p == '-') ++p;
 
-            // At least one digit, checked separately from `p == start`.  A lone
-            // "-" moved p without consuming a digit, so the old check passed and
-            // from_chars then failed and left n at its initial 0: the document
-            // "-" decoded to the number 0.
+            // At least one digit, separately from `p == start`: a lone "-"
+            // otherwise decodes to 0.
             const char* const int_digits = p;
             while (p < end && *p >= '0' && *p <= '9') ++p;
             if (p == int_digits) { st = json_status::malformed; return sol::nil; }
