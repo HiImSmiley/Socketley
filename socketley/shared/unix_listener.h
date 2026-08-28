@@ -1,42 +1,15 @@
 #pragma once
 
-// The AF_UNIX rules, stated once.
+// The AF_UNIX rules, stated once: path_refusal(), fill_addr(), bind_listener().
 //
-// Three decisions live here, because each used to have more than one home and
-// this tree has counted what that costs — the same pattern as its neighbours in
-// shared/: conn_reachability.h, http_framing.h.  Before this header the path
-// rules were decided in three places (the flag parser, the server's setup
-// re-check, the proxy's backend configuration), the sockaddr_un construction
-// in two (the server's bind, the proxy's connect), and the listener mechanism
-// existed only in the server while the cache and client had no AF_UNIX at all.
+// The connect side is fill_addr() plus connect(2) and is in this same header,
+// because what the two sides share is how a path becomes an address and how
+// many bytes of it the kernel reads -- a second copy is how the server and the
+// proxy came to disagree.  A dialler gets none of the stale-node machinery.
 //
-//   path_refusal()    — is this string allowed to name a socket node at all?
-//   fill_addr()       — the one correct sockaddr_un, with the one correct length.
-//   bind_listener()   — the stale-node probe, the bind, the 0600, the listen.
-//
-// THE CONNECT SIDE IS fill_addr() PLUS connect(2), AND IT IS DELIBERATELY IN
-// THIS SAME HEADER rather than a second one.  What the two sides share is the
-// load-bearing fact — how a path becomes an address and how many bytes of it
-// the kernel is to read — and a connect header with its own copy of that is
-// how the server and the proxy came to disagree about it in the first place.
-// What the connect side does NOT get is any of the stale-node machinery below:
-// a dialler that unlinked or probed would be taking decisions that belong to
-// whoever owns the node.
-//
-// ─── THE ABSTRACT NAMESPACE, CONSIDERED AND REFUSED ─────────────────────────
-//
-// A sun_path beginning with '\0' names a socket in no filesystem: the whole
-// stale-node problem below disappears, and cleanup is automatic on process
-// exit.  It is refused anyway, by the absolute-path rule in path_refusal(),
-// and the proxy's backend side already refused it for the same reason: an
-// abstract name is bounded by nothing but the network namespace, so ANY uid
-// in it may connect.  Everything this file does about access control — the
-// 0600 chmod, the parent-directory escape hatch — is filesystem permissions,
-// which an abstract socket does not have; replacing them would mean a
-// per-accept SO_PEERCRED check that every runtime would have to remember to
-// make.  The stale-node problem, meanwhile, is already solved once, below.
-// Trading a solved problem for an unsolved one is not an improvement.
-
+// The abstract namespace is refused by the absolute-path rule: it is bounded by
+// the network namespace, so any uid in it may connect, and the 0600 chmod this
+// file relies on does not exist there.
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -51,13 +24,9 @@
 namespace socketley::unix_sock
 {
 
-// Why `path` may not name a unix socket, or empty if it may.
-//
-// Every refusal here is a configuration-time one on purpose.  The kernel
-// truncates a path of sizeof(sun_path) bytes or more without saying so, and a
-// trimmed path names a DIFFERENT socket — very possibly a real one that
-// something else is serving — so the earliest caller is the last point at
-// which the operator can be told which socket they actually asked for.
+// Why `path` may not name a unix socket, or empty if it may.  Configuration
+// time on purpose: the kernel truncates an over-long sun_path silently, and a
+// trimmed path names a different socket that something else may be serving.
 //
 // Asked from the flag parser AND from every runtime's setup(), and the second
 // asking is not redundancy: setup() is the one function every route to a
@@ -89,17 +58,9 @@ inline std::string path_refusal(std::string_view path)
     return {};
 }
 
-// The address `path` names, and how many bytes of it the kernel is to read.
-//
-// The caller has already refused a path that would not fit (path_refusal), so
-// this cannot truncate.  size() + 1 bytes, so the terminator goes with it:
-// sun_path is a C string to the kernel, and copying the NUL is what makes this
-// correct whether or not the caller's buffer arrived zeroed.
-//
-// offsetof rather than sizeof for the length: passing the whole structure
-// works, but the kernel then compares the full sun_path against a bound
-// socket's, and a length that stops at the terminator is what makes the
-// address say exactly what was configured.
+// The address `path` names, and how many bytes the kernel reads.  size() + 1 so
+// the terminator goes with it, and offsetof rather than sizeof so the length
+// stops there -- otherwise the kernel compares the whole sun_path.
 inline socklen_t fill_addr(std::string_view path, struct sockaddr_un& out)
 {
     out.sun_family = AF_UNIX;
@@ -122,38 +83,14 @@ struct bind_result
 
 // The AF_UNIX listener, for `--listen unix:/path/to.sock`.
 //
-// ─── THE NODE THAT IS ALREADY THERE ─────────────────────────────────────────
+// A node outlives the process that made it, so bind() fails EADDRINUSE whether
+// or not anyone is serving.  Unlinking unconditionally would also let a second
+// copy take the path from a live one, so the node is probed by connecting: a
+// refusal means stale and it is removed, a success means this start is refused.
 //
-// bind() on a path that exists fails EADDRINUSE whether or not anything is
-// serving it, and a unix socket node outlives the process that made it: a
-// daemon killed with SIGKILL, a machine that lost power, a container image
-// with a socket committed into it all leave one behind.  Unlinking
-// unconditionally would answer that — and would also let a second copy of a
-// runtime take the path away from the first while it is serving traffic, with
-// the first left holding a socket no client can reach and no error anywhere.
-//
-// So the node is asked whether anyone is home, by connecting to it.  A refusal
-// means the node is stale and it is removed; a connection that succeeds means
-// somebody is serving this path and this start is refused, which is the answer
-// a second bind to a live TCP port would get.  There is a race in that — a
-// server could bind between the probe and ours — and it is the same race
-// `unlink` before `bind` has always had; the probe converts the common case
-// (nobody there) from a failure into a start, and the dangerous case
-// (somebody there) from a silent theft into a refusal.
-//
-// ─── WHO MAY CONNECT ────────────────────────────────────────────────────────
-//
-// The node is chmod'ed 0600 rather than left to the umask.  Connecting to a
-// unix socket needs write permission on the node, so the umask normally
-// decides who may — and a daemon running under `umask 0` publishes a listener
-// anybody on the machine can talk to, which is the same defect this tree
-// already has recorded against its 0666 control socket and its 0644 state
-// files.  0600 is the conservative end of that: the sidecar case this flag
-// exists for is a proxy and a backend under one daemon, which is one uid.
-//
-// NOT DONE, and worth saying rather than discovering: there is no flag to
-// widen it.  A peer running as another user cannot connect, and the way round
-// it today is a parent directory the operator owns and controls.
+// chmod 0600 rather than the umask, because connecting needs write permission
+// on the node and `umask 0` would otherwise publish it to the whole machine.
+// There is no flag to widen it; use a parent directory the operator controls.
 inline bind_result bind_listener(const std::string& path)
 {
     bind_result r;
@@ -162,13 +99,8 @@ inline bind_result bind_listener(const std::string& path)
     const socklen_t addr_len = fill_addr(path, addr);
 
     {
-        // SOCK_NONBLOCK, and that matters rather than being tidy.  A blocking
-        // connect() to a unix socket whose listener has a FULL backlog waits
-        // for room -- and this runs on the daemon's event loop thread, the one
-        // thread that serves every runtime in the process.  A busy server on
-        // that path would have stalled the whole daemon for as long as it
-        // stayed busy.  Non-blocking, the same case answers EAGAIN, which is
-        // still "somebody is serving this" and is read as such.
+        // SOCK_NONBLOCK: a blocking connect to a full backlog waits for room,
+        // on the loop thread.  EAGAIN is still "somebody is serving this".
         const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe >= 0)
         {
@@ -238,16 +170,9 @@ inline bind_result bind_listener(const std::string& path)
     return r;
 }
 
-// The configuration set a unix listener excludes, judged wherever a listening
-// runtime's setup() runs — the chokepoint the path rules above name.  The
-// members every listening runtime shares are here; the ones only some carry
-// (--udp on a server, --cluster on a cache) stay next to the runtime that has
-// them, with their own stated reason.
-//
-// Deliberately NOT --shards: that pair is refused by shards_config_refusal
-// (runtime_definitions.h), which the create, edit, import and worker paths
-// already all ask, and a second home for the same rule is how the two homes
-// come to disagree.
+// What a unix listener excludes, judged at every listening runtime's setup().
+// Flags only some types carry (--udp, --cluster) stay with that runtime, and
+// --shards is deliberately absent: shards_config_refusal owns that pair.
 inline std::string listen_config_refusal(std::string_view listen_path,
                                          uint16_t port, bool tls)
 {

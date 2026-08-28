@@ -19,193 +19,21 @@ enum runtime_type : uint8_t
     runtime_cache  = 3
 };
 
-// The most worker processes one runtime may be split into; see --shards in
-// flag_handlers.cpp and runtime_instance::set_shards().
-//
-// 64 is a bound on the typo, not a recommendation.  Past the machine's core
-// count an extra shard is another process competing for the cores already in
-// use, plus its own ring, its own control socket and its own idle cost — so a
-// number far above it is never what was meant, and forking it is a worse answer
-// than refusing it.  Here rather than in the parser because the state file is a
-// second way in: a document written by another build, or edited by hand, has to
-// meet the same bound as a command line.
+// A bound on the typo, not a recommendation.  Here rather than in the parser
+// because a state file is a second way in and must meet the same bound.
 inline constexpr uint32_t max_shards = 64;
 
-// ─── Which of the two processes this code is running in ─────────────────────
-//
-// The daemon and a worker run the same binary, and almost everything in this
-// tree is deliberately identical on both sides — that is the property the
-// process split was built to have.  A handful of rules are not, because they
-// are about the daemon's decision to FORK, and a worker asking one of them gets
-// a wrong answer: a worker's runtime is in-process by construction, so
-// "is this runtime out of process?" is false in the one place where it means
-// "yes, it is a worker".
-//
-// lua_context has a bit of its own with the same name and a different job — it
-// decides what an interpreter is built with — and it is compiled out entirely
-// under SOCKETLEY_NO_LUA, where its stub answers false.  A placement rule that
-// read it would come back wrong in a no-Lua worker, so this one is here instead
-// and both are set on adjacent lines in proxy_worker's entry point.
-//
-// runtime_manager carries a per-OBJECT flag for the same distinction --
-// m_replica, set on the worker's copy of the map -- and it is deliberately not
-// what this reads.  A worker starts its runtime by calling
-// runtime_instance::start() directly (proxy_worker.cpp:1336), never through
-// runtime_manager::start(), which refuses on a replica; so on the one path that
-// has to answer this question there is no manager in the call at all, and the
-// instance's own pointer to one is not guaranteed to be set by then.  A bit
-// that belongs to the process is the honest shape for a fact about the process.
-//
-// Written once, before any runtime exists, and read-only afterwards.
+// Which of the two processes this is; only the rules about the daemon's
+// decision to FORK differ.  Not lua_context's flag of the same name, and not
+// runtime_manager::m_replica -- a worker starts its runtime without a manager.
 inline bool g_worker_process = false;
 inline void set_worker_process(bool on) { g_worker_process = on; }
 inline bool in_worker_process()         { return g_worker_process; }
 
-// ─── May this runtime be split into this many processes? ────────────────────
-//
-// The whole of the --shards rule, in the one place every way in has to pass.
-// It returns the refusal text, newline-terminated, or an empty string when the
-// configuration is one this build can honour.
-//
-// Here rather than in the flag parser for the reason max_shards is here: a
-// command line is not the only way a shard count arrives.  A state file written
-// by another build, a `show | import` round trip, `socketley.create` from a
-// script and a worker rebuilding itself from a config frame all set the same
-// field without going near flag_handlers.cpp, and a rule that lives only in the
-// parser is one every other route walks around in silence.  So the parser asks
-// this, `create` asks it again once every flag has been seen, `edit` and
-// `import` ask it, and runtime_instance::start() asks it last of all.
-//
-// ─── WHAT IS BEING DECLARED ─────────────────────────────────────────────────
-//
-// Sharding is correct exactly when nothing is shared between connections, and
-// nothing can detect that.  So it is asked for and never inferred, and the
-// question this function answers is not "is it correct" but "is the operator in
-// a position to declare it".
-//
-// A PROXY: yes.  "Nothing is shared between connections" is a property of this
-// tree's proxy — audited, fixed, and true by construction — so the operator is
-// asserting something about code they can read here.
-//
-// A SERVER, WITH OR WITHOUT A SCRIPT: yes.  Without --lua it always could —
-// a server with no script has no cross-connection state to lose.  With one it
-// was refused, and the refusal named the reason: "a message from a client on
-// one shard never reaches a client on another, and nothing reports it."
-//
-// ─── THAT REFUSAL WAS ON THE WRONG RUNTIME ──────────────────────────────────
-//
-// The failure it described was real and it was never fixed; it was only made
-// unreachable on ONE of the two types that could reach it.  proxy + --lua +
-// --shards has been accepted by this build all along, and it was answering a
-// fraction: measured on the tip, `self.connections()` on a four-shard proxy
-// holding forty clients reported between 5 and 13, and a `self.broadcast`
-// reached 15 of 40.  So the refusal protected a scripted server from a defect
-// that a scripted proxy was shipping.
-//
-// What removes it is that the three shapes a script can ask for now cross a
-// shard boundary, each proved against its own measured red:
-//
-//   aggregate   self.connections() sums every shard's own published counter
-//               out of a shared mapping -- wait-free, ~10 ns over eight shards
-//               against ~10 us for one AF_UNIX round trip.  shard_stats.h.
-//   fan out     self.broadcast reaches every shard's clients, once each: the
-//               local delivery happens where it stands and the daemon fans the
-//               rest, excluding the shard that asked.
-//   route       self.clients() lists the whole runtime -- this shard's
-//               descriptors plus a stable handle per sibling's client -- and
-//               self.send(id) reaches the owning shard in one hop, because a
-//               conn_ref carries its minting shard in its serial.
-//
-// What a script does NOT get, and this is a property of sharding rather than a
-// gap in it: per-connection state is per SHARD.  on_connect for a sibling's
-// client fired in that sibling, so a script holds no state for the ids
-// clients() hands it from elsewhere.  That is what sharding means, and it is
-// unambiguously better than being told a fraction with no way to know.
-//
-// self.route is still refused in a worker — sharded or not, and for a reason
-// that predates shards: route_client() reaches into another runtime's private
-// maps and calls its on_connect on this thread's stack.  Nothing here lifts
-// that.
-//
-// A CACHE: yes, and this is the refusal that took the most to remove.
-//
-// It said: N shards are N separate stores behind one port, so a SET lands in
-// whichever process the kernel gave that connection to and a later GET on a new
-// connection asks a different one — a miss for data that was stored, 1/N of the
-// time, without an error anywhere.  Every word of that was true.
-//
-// What makes it false now is OWNERSHIP BY KEY HASH.  `shard = hash(key) mod N`,
-// computed from shared/cache_shard_map.h so that N processes which never speak
-// to each other cannot disagree, and a command naming somebody else's key is
-// answered by them.  Each shard stays the sole reader AND sole writer of its own
-// slice, which is what keeps "no lock in cache_store" true by construction
-// rather than by care.
-//
-// Four command classes, each with its own answer, all decided at TWO sites — the
-// top of each interpreter's dispatch — in front of 54 handlers that know nothing
-// about shards:
-//
-//   one key        routed to its owner, and a pipeline is grouped by owner so a
-//                  run of commands crosses once per shard, not once per command
-//   several keys   exploded into one single-key command each and reassembled in
-//                  the order the CALLER wrote them
-//   keyspace-wide  every shard's slice, merged: dbsize sums, keys concatenates
-//                  with one terminator for the runtime
-//   scan           one shard per call, the cursor naming its own shard in the
-//                  top six bits; the iteration is sequential and a cursor is
-//                  only valid for the shard set that issued it
-//
-// publish reaches every shard's subscribers and reports the total; subscribe
-// stays where the socket is, because a subscription is a descriptor and means
-// nothing in another process.
-//
-// --persistent works across a CHANGED shard count: each dump records the split
-// it was written under and a fingerprint of the ownership function, and a set
-// that does not match is redistributed rather than trusted.  A set with a gap,
-// or one whose files disagree about the split, refuses the start.
-//
-// The one thing a sharded cache still will not do is BE A REPLICATION LEADER;
-// see the refusal in handle_replicate_request() for why the follower protocol
-// cannot carry N streams.  A sharded cache may be a follower.
-//
-// Measured, four clients against one runtime at pipeline depth 1:
-// 172k ops/s at one shard against 289k at four — 1.68x.
-//
-// A CLIENT: no.  There is no listening socket to share.  A client dials out; N
-// of them would be N connections to the peer, which is a different feature
-// wearing this flag's name.
-//
-// ─── AND TWO CONFIGURATIONS THAT WOULD DO NOTHING, OR WORSE ─────────────────
-//
-// --listen unix:/path is refused above one shard because SO_REUSEPORT is not
-// what a unix socket does.  bind() on a path that exists fails, so the listener
-// setup unlinks a stale node first — and with N shards that is N-1 processes
-// unlinking each other's node and binding their own.  The last one to bind owns
-// the path and the rest hold a listening socket nothing can reach: a server
-// that reports N shards, Up, and serves 1/N of nothing.
-//
-// --daemon-process was refused above one shard because a shard IS a worker
-// process, and that pair is gone with the flag.  The trap it named is worth
-// keeping written down, because it is the shape a future flag could recreate:
-// reconcile_proxy_workers() only forks for a runtime that is out of process, so
-// `--shards 4 --daemon-process` was accepted, persisted, and reported by `show`
-// as four while exactly one event loop served the port.  The operator asked for
-// four and got one, reported by nothing as wrong.
-//
-// The `served_by_workers` parameter went with it.  It was the sharper half of
-// that rule and is worth recording too: it was NOT simply is_out_of_process(),
-// because there are three objects a shard count can be attached to and only two
-// of them agree -- the daemon's placeholder, which is out of process and is the
-// thing that forks; the daemon's own in-daemon runtime, which was the
-// misconfiguration; and a WORKER's runtime, which is in-process by construction
-// and is itself one of the shards.  Asking is_out_of_process() in a worker
-// answered false and refused a configuration the daemon had just accepted --
-// measured, before the parameter had its name: all four shards of
-// `create server ss -p P --shards 4 -s` exited config_refused and the command
-// reported "the worker did not accept its configuration".
-//
-// With one answer to where a runtime runs, the middle of those three no longer
-// exists and the other two agree, so there is no question left to ask.
+// The whole --shards rule, returning the refusal text or an empty string; a
+// command line is not the only way a shard count arrives, so every route asks.
+// --listen is refused above one shard: N processes would unlink each other's
+// socket node and only the last to bind would be reachable.
 inline std::string shards_config_refusal(runtime_type type,
                                          uint32_t    shards,
                                          std::string_view listen_path)
