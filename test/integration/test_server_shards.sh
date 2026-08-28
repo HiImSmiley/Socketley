@@ -2,85 +2,14 @@
 # Integration test: --shards N on a server, and the rule that decides who gets it.
 #
 # ─── WHAT CHANGED, AND WHAT THE RULE IS ─────────────────────────────────────
-#
-# --shards was refused on everything but a proxy, then widened to a server with
-# NO script, and is now open to a scripted server as well.  What removed the
-# last refusal is that the three shapes a script can ask for cross a shard
-# boundary: self.connections() sums every shard's counter, self.broadcast
-# reaches every shard's clients once each, and self.clients()/self.send(id)
-# name and reach a client whichever shard holds it.
-#
-# The behaviour is asserted by test_shard_lua_fanout.sh and
-# test_shard_lua_route.sh.  What THIS file asserts is that the door is open at
-# every one of the five places the rule is asked — create in both flag orders,
-# edit, import, and a state file that never sees a parser — because a rule
-# removed from four of five is the shape 2cf7a4e was.
-#
-# ─── WHAT IS BEING ASSERTED, AND WHICH BROKEN BUILD EACH ONE CATCHES ────────
-#
-# THE RULE
-#   server + --shards, no script     accepted.   Broken build: the old blanket
-#                                                refusal, so the flag does
-#                                                nothing for anybody.
-#   --shards 4 --lua x               accepted.   Broken build: the refusal left
-#   --lua x --shards 4               accepted.   in one of the five doors.  The
-#                                                PAIR is still the assertion, and
-#                                                still for the order reason: a
-#                                                check left in the --shards case
-#                                                label alone would refuse only
-#                                                one of these two, and one
-#                                                runtime with two answers is the
-#                                                same defect whichever way the
-#                                                answer falls.
-#   the shard count is stored        Broken build: accepted and dropped, so `ls`
-#                                                says Up and one process serves.
-#                                                Acceptance alone cannot see
-#                                                that; the count is read back.
-#   edit --shards onto a script      accepted.   Broken build: the removed rule
-#                                                still standing in cmd_edit.
-#   import shards onto a script      accepted.   Broken build: the same, through
-#                                                the door that never sees a flag
-#                                                parser — 2cf7a4e's shape.
-#   a state file with both           starts.     Broken build: the last gate, in
-#                                                runtime_instance::start(), still
-#                                                refusing what every command
-#                                                above it now accepts — and
-#                                                failing it at BOOT, where no
-#                                                operator is watching.
-#
-# TWO CONFIGURATIONS THAT WOULD DO NOTHING, OR WORSE
-#   --shards + --listen unix:        refused.    Broken build: N processes
-#                                                unlink each other's socket node
-#                                                and only the last to bind is
-#                                                reachable — `ls` says Up, N
-#                                                shards, and 1/N of nothing is
-#                                                served.
-#   (--shards + --daemon-process was the third row here.  The flag is gone; see
-#   the note where its five assertions were, further down.)
-#
-# A SHARD IS AN IMPLEMENTATION DETAIL OF A RUNTIME, NOT A RUNTIME
-#   ls           one line, not N.    Broken build: N lines.
-#   listeners    N on the port.      Broken build: one — the flag was stored and
-#                                    never acted on, which is what --rate-limit
-#                                    did on a proxy for a year.
-#   CONN         the sum over them.  Broken build: whichever shard published
-#                                    last, which for 8 connections over 4 shards
-#                                    is 1, 2 or 3 and never 8.  Paired with an
-#                                    oracle that no single shard holds all 8, or
-#                                    the assertion could pass on a build that
-#                                    happened to put every connection on one.
-#   stop/remove  take all down.      Broken build: a port still bound by the
-#                                    shards nobody stopped.
-#   restart      brings back N.      Broken build: one worker and a quarter of
-#                                    the throughput that was configured,
-#                                    reported by `ls` as Up and by nothing as
-#                                    wrong.
-#   daemon restart brings back N.    Broken build: the count is in the runtime
-#                                    and not in the state file.
-#
-# AND THE TWO TYPES THAT STILL REFUSE IT OUTRIGHT
-#   cache, client                    refused.    Broken build: a cache split into
-#                                                N stores behind one port.
+# --shards is now open to a scripted server, and what this file asserts is that
+# the door is open at every one of the five places the rule is asked -- create
+# in both flag orders, edit, import, and a state file that never sees a parser
+# -- because a rule removed from four of five is the shape the defect had, with
+# the shard count read back rather than inferred from an exit code, a unix
+# listener still refused because N processes would unlink each other's socket
+# node, `ls` and the counters proving a shard is an implementation detail
+# rather than a runtime, and cache and client still refused outright.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -123,21 +52,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# A script that does nothing.  Its CONTENT is deliberately irrelevant: the rule
-# is "has a script at all", not "has a script that broadcasts", because whether
-# a table at file scope is shared state cannot be detected — which is the whole
-# reason the flag is declared rather than inferred.
+# A script whose content is deliberately irrelevant, because the rule is "has a
+# script at all" -- whether a table at file scope is shared state cannot be
+# detected, which is why the flag is declared rather than inferred.
 cat > "$LUA" <<'LUAEOF'
 function on_connect(conn)
 end
 LUAEOF
 
-# The daemon goes down and comes back on the same state directory, which is what
-# a restart is.  daemon_stop is not used: it deletes the directory, and the whole
-# question here is what the directory brings back.  The log is emptied first
-# because daemon_start waits by grepping it for "daemon started" and the first
-# daemon's line is still in it -- without that the wait returns immediately and
-# the assertions race a daemon that has not bound yet.
+# daemon_stop is not used because it deletes the state directory and the
+# question here is what the directory brings back, and the log is emptied first
+# because daemon_start waits by grepping it for a line the first daemon already
+# wrote.
 daemon_restart() {
     kill "$SOCKETLEY_DPID" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$SOCKETLEY_DPID" 2>/dev/null || break; sleep 0.1; done
@@ -146,10 +72,8 @@ daemon_restart() {
     daemon_start "$BIN"
 }
 
-# Wait until this many workers exist, or give up.  Not a fixed sleep: the daemon
-# forks a restored runtime's children from reconcile_proxy_workers(), which runs
-# on the two-second health tick, so any single number is a race against a timer
-# -- and a sleep long enough to be safe is one every run pays.
+# Not a fixed sleep, because a restored runtime's children are forked on the
+# two-second health tick and any single number is a race against a timer.
 await_workers() {
     local want=$1 i
     for i in $(seq 1 60); do
@@ -159,16 +83,12 @@ await_workers() {
     return 1
 }
 
-# Every worker process of THIS binary.  Never `pgrep -f`: -f matches the whole
-# command line, so it also matches the shell carrying the string in its own
-# arguments -- including the one doing the matching.
+# Every worker process of this binary, never `pgrep -f`, which also matches the
+# shell carrying the string in its own arguments.
 worker_pids() {
-    # Scoped to THIS run's daemon, not to the binary.  Matching the binary was
-    # enough while the suite ran one file at a time; it counts the siblings'
-    # workers the moment two files run together, and the failure reads as a
-    # product defect -- "four worker processes: expected '4', got '14'".  The
-    # socket path is in every worker's environ because the daemon inherited it
-    # and the fork carries it.
+    # Scoped to this run's daemon rather than to the binary, because matching
+    # the binary counts the siblings' workers the moment two files run together
+    # and the failure reads as a product defect.
     for p in $(pgrep -x socketley 2>/dev/null); do
         [[ "$(readlink /proc/$p/exe 2>/dev/null)" == "$BIN" ]] || continue
         grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
@@ -185,10 +105,9 @@ n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"shards": 4')
 check "the count was stored" "$n" "1"
 
 echo "== a server with a script may too, in either flag order =="
-# The count is read back, not just the exit code.  A build that accepted the
-# flag and dropped it would pass an rc check and serve one process for a
-# runtime `ls` reports as four — which is the trap the --daemon-process pair
-# used to pin, arriving through a different door and now the only door left.
+# The count is read back rather than just the exit code, because a build that
+# accepted the flag and dropped it would serve one process for a runtime `ls`
+# reports as four.
 out=$("$BIN" create server ss_lua -p $P_A --shards 4 --lua "$LUA" 2>&1); rc=$?
 check "--shards before --lua accepted" "$rc" "0"
 [[ -z "$out" ]] && ok "and said nothing (silence is success)" || bad "unexpected output: $out"
@@ -240,31 +159,15 @@ check "the refused edit rolled the listen path back" "$n" "0"
 n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"shards": 4')
 check "and left the shard count alone" "$n" "1"
 
-# ── Five assertions stood here and are gone with the flag ───────────────────
-#
-# They checked that `--shards N --daemon-process` was refused, on a server and
-# on a proxy, with a control that either flag alone was accepted.  A
-# contradiction between two flags cannot be tested when one of them does not
-# exist, and the two halves that could be kept would each pass on any build:
-# "--shards alone is accepted" is asserted a dozen times above, and "the
-# refusal names --daemon-process" has nothing left to name.
-#
-# The trap they were about is kept in shards_config_refusal's own comment,
-# because it is a shape a future flag could recreate:
-# reconcile_proxy_workers() only forks for a runtime that is out of process, so
-# `--shards 4 --daemon-process` was accepted, persisted, and reported by `show`
-# as four while exactly one event loop served the port -- the operator asked
-# for four and got one, reported by nothing as wrong.
+# Five assertions about `--shards N --daemon-process` are gone with that flag,
+# because a contradiction between two flags cannot be tested when one does not
+# exist and the halves that could be kept would pass on any build.
 
 echo "== a cache may shard now; a client still may not =="
-# The cache's refusal is gone: ownership by key hash makes N shards one store,
-# so the SET/GET miss it named cannot happen.  Its own behaviour is held down by
-# test_cache_shard_*.sh -- what matters here is that the FLAG's type rule moved.
-#
-# A distinct name, and removed straight away.  This create used to FAIL, so the
-# name it asked for stayed free for the client create below; now that it
-# succeeds, reusing it made the client create fail with "runtime already exists"
-# and read as a client defect.
+# The cache's refusal is gone because ownership by key hash makes N shards one
+# store, and this create takes a distinct name that is removed straight away --
+# it used to fail, so reusing the name now makes the client create below fail
+# as "runtime already exists" and read as a client defect.
 out=$("$BIN" create cache ss_shcache -p $P_F --shards 4 2>&1); rc=$?
 check "cache accepts --shards" "$rc" "0"
 "$BIN" remove ss_shcache >/dev/null 2>&1
@@ -300,13 +203,10 @@ sleep 2.5
 CONN=$("$BIN" ls 2>/dev/null | awk '$2=="ss_ok" {print $5}')
 check "CONN is the sum over shards" "$CONN" "8"
 
-# The oracle for the assertion above: no single shard is holding all eight, so
-# a build that reports one shard's figure cannot report 8 by accident.
-# `shard_connections`, one line per shard, and NOT `connections`: that one is now
-# the runtime's own line and is the SUM, so an awk that matched it would read
-# busiest == 8 and fail this every time, on a build whose shards are sharing the
-# work perfectly.  The two names exist to keep the runtime's figure and a
-# shard's from being mistaken for one another — see aggregate_worker_stats().
+# The oracle for the assertion above is that no single shard holds all eight,
+# read from `shard_connections` rather than `connections`, which is now the
+# runtime's own summed line and would fail this on a build whose shards share
+# the work perfectly.
 MAXSHARD=$("$BIN" stats ss_ok 2>/dev/null | awk -F: '/^shard_connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
 [[ "$MAXSHARD" -gt 0 && "$MAXSHARD" -lt 8 ]] \
     && ok "no single shard holds all 8 (busiest has $MAXSHARD) — the sum is a real sum" \
@@ -342,16 +242,10 @@ n=$(worker_pids | grep -c .)
 check "no worker processes after remove" "$n" "0"
 
 echo "== and every shard actually serves, rather than merely binding =="
-# The assertion the four above cannot make.  Four listeners on a port and four
-# pids prove the forks happened; they do not prove a shard answers.  A build
-# where each shard binds and then sits on its accept would pass every count
-# assertion in this file and serve nothing.
-#
-# --http, because it has a reply that can be checked without a script -- which
-# is the only kind of server this flag is offered on.  30 requests over 30
-# separate connections, so SO_REUSEPORT spreads them: with four shards the
-# chance of all thirty landing on one is (1/4)^29, and every one of them has to
-# come back 200.
+# Four listeners and four pids prove the forks happened but not that a shard
+# answers, so 30 requests over 30 connections have to come back 200 -- with
+# --http because it has a reply checkable without a script, and with the chance
+# of all thirty landing on one shard at (1/4)^29.
 mkdir -p "$SOCKETLEY_TMPD/docroot"
 echo "sharded" > "$SOCKETLEY_TMPD/docroot/index.html"
 "$BIN" create server ss_http -p $P_H --shards 4 \
@@ -366,23 +260,9 @@ for _ in $(seq 1 30); do
 done
 check "30 requests over 30 connections all answered 200" "$OK200" "30"
 
-# ...and they were not all answered by one process.  Without this the assertion
-# above is satisfied by a build where three shards bind and never accept: the
-# kernel would hand every connection to the one that does.
-#
-# `shard_total_connections`, one line per shard, and NOT `total_connections`:
-# that one is now the runtime's own line and is the SUM, so an awk that matched
-# it would read busiest == total and fail this every time.  The distinction is
-# the point of the two names -- see aggregate_worker_stats().
-#
-# Still polled, though it no longer has to be.  A worker-backed runtime's
-# figures used to be PUSHED on a 250 ms timer, so a read taken the instant the
-# last request returned answered from the snapshot before any of them: measured,
-# busiest=0 total=0 with all thirty already answered 200.  They are summed out
-# of shared memory at print time now and that window is gone; the loop is kept
-# because it also covers a shard whose last accept has not yet been counted by
-# its own loop turn, and because a bound that ends on the counter costs nothing
-# when the counter is already right.
+# ...and not all answered by one process, read from `shard_total_connections`
+# rather than the runtime's summed line, and still polled because a shard's
+# last accept may not yet have been counted by its own loop turn.
 BUSIEST=0; TOTAL=0
 for _ in $(seq 1 60); do
     S=$("$BIN" stats ss_http 2>/dev/null)
@@ -399,21 +279,15 @@ done
 sleep 0.8
 
 echo "== a state file is the one door with no parser behind it =="
-# Written by hand, which is exactly how a document from another build arrives:
-# a scripted server carrying a shard count no command line ever produced.  The
-# gate is the last one, in runtime_instance::start(), and it is the only place
-# the three command-level checks cannot speak for.
-#
-# It used to have to REFUSE this.  It now has to accept it and fork, and that
-# is the sharper assertion of the two: a gate left refusing here fails at BOOT,
-# on the auto-restart path, where no operator is watching and the only trace is
-# a line in the daemon log.
+# Written by hand, which is how a document from another build arrives, because
+# the gate in runtime_instance::start() is the only one the three command-level
+# checks cannot speak for -- and a gate left refusing here fails at boot, where
+# no operator is watching.
 "$BIN" create server ss_state -p $P_A --lua "$LUA" >/dev/null 2>&1
 rc=$?
 check "the scripted server was created unsharded" "$rc" "0"
-# Polled rather than read once.  State files are written on
-# state_persistence's own writer thread, so `create` returns before the rename
-# lands and a single read catches ss_state.json.tmp about half the time.
+# Polled rather than read once, because state files are written on their own
+# writer thread and a single read catches the .tmp about half the time.
 SF=""
 for _ in $(seq 1 50); do
     SF=$(find "$HOME/.local/share/socketley" -name 'ss_state.json' 2>/dev/null | head -1)
@@ -434,9 +308,9 @@ if [[ -n "$SF" ]]; then
     sleep 1.0
     out=$("$BIN" start ss_state 2>&1); rc=$?
     check "start of a hand-edited sharded scripted server accepted" "$rc" "0"
-    # Four processes, not "it did not error".  The last gate accepting and the
-    # daemon forking are two different things, and only the second is what the
-    # operator asked for.
+    # Four processes rather than "it did not error", because the last gate
+    # accepting and the daemon forking are two different things and only the
+    # second is what the operator asked for.
     for _ in $(seq 1 50); do
         [[ "$(worker_pids | grep -c .)" == "4" ]] && break
         sleep 0.2

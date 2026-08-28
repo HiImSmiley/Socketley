@@ -1,65 +1,17 @@
-# A daemon of one's own.
-#
-# Not a test — run_all.sh globs test_*.sh, so this file is only ever sourced.
-#
+# A daemon of one's own -- not a test, since run_all.sh globs test_*.sh and
+# this file is only ever sourced.
 # ─── WHAT THIS REPLACES ─────────────────────────────────────────────────────
-#
-# Twenty-four tests in this directory opened with some spelling of
-#
-#     "$BIN" daemon 2>/dev/null &
-#     sleep 0.3
-#
-# and set no SOCKETLEY_SOCKET at all, so they resolved the default path.  In a
-# dev tree that is /tmp/socketley.sock — one path, shared by every checkout,
-# every worktree and every hand-started daemon on the machine.  What that line
-# actually does is therefore not "start a daemon": if anything already holds
-# that socket, the new process exits immediately and the test spends the rest of
-# its life driving somebody else's daemon.
-#
-# The bill for that is not hypothetical.  A foreign daemon holding
-# /tmp/socketley.sock turns test_cache.sh into this:
-#
-#     runtime already exists: testcache      <- create refused, swallowed by || true
-#       FAIL [SET]: got '', expected 'ok'    <- nothing was ever listening on 19150
-#       ... 20 more ...
-#     (foreign daemon's inventory afterwards: empty)
-#
-# Every assertion red against a binary with nothing wrong with it, and — worse —
-# the trap at the end ran `stop testcache; remove testcache` against the foreign
-# daemon and destroyed a runtime this test did not create.  A suite that can
-# delete another workload's runtimes is not measuring anything; it is a hazard
-# that occasionally reports numbers.
-#
-# So each test gets its own socket, its own state directory and its own daemon
-# process, and none of them can see any of the others.  This is the same
-# arrangement the proxy tests already make inline (test_proxy_routing.sh has the
-# long form and the reasoning); it is a library because twenty-four copies of a
-# cleanup sweep is twenty-four chances to get one of them subtly wrong.
-#
-# A daemon of one's own is half of it.  The other half is ports, which are not
-# private to a daemon: two runs of this suite each start their own daemons and
-# then ask the same kernel for the same 19200.  That is lib_ports.sh, and a test
-# that binds anything sources it too.
-#
-# Usage:
-#
-#     . "$(dirname "$0")/lib_daemon.sh"
-#     . "$(dirname "$0")/lib_ports.sh"
-#     daemon_isolate cache            # before anything touches the daemon
-#     PORT=$((SL_PORT_BASE + 150))    # never a literal
-#     cleanup() { ...; daemon_stop; } # daemon_stop LAST: it deletes the state dir
-#     trap cleanup EXIT
-#     daemon_start "$BIN"
+# Each test gets its own socket, state directory and daemon process, because
+# twenty-four tests used to resolve the shared default path and would then
+# drive -- and in cleanup destroy runtimes belonging to -- whatever daemon
+# already held it; ports are the other half and live in lib_ports.sh, so a test
+# that binds anything sources both, calls daemon_isolate before touching the
+# daemon, and puts daemon_stop last in cleanup because it deletes the state
+# directory.
 
-# daemon_isolate TAG
-#
-# Claim a private socket, state directory and log.  Must be called before the
-# first CLI command, because every CLI command except `daemon`, `version` and
-# `help` auto-starts a daemon against whatever SOCKETLEY_SOCKET says at the time.
-#
-# HOME is part of the isolation, not decoration: the state directory is derived
-# from it, and two tests sharing one state directory share runtime names, the
-# was_running auto-restart, and each other's leftovers.
+# Claim a private socket, state directory and log, before the first CLI command
+# auto-starts a daemon against whatever SOCKETLEY_SOCKET says -- HOME included,
+# because the state directory is derived from it.
 daemon_isolate() {
     local tag=${1:-test}
     SOCKETLEY_TMPD=$(mktemp -d "/tmp/socketley-$tag-XXXXXX")
@@ -68,26 +20,15 @@ daemon_isolate() {
     mkdir -p "$HOME"
     SOCKETLEY_DLOG="$SOCKETLEY_TMPD/daemon.log"
     SOCKETLEY_DPID=""
-    # Which executable this run's daemons are, by path — see daemon_starting_pids.
     # Set here so a file that never calls daemon_start still clears any value
     # inherited from the environment.
     SOCKETLEY_DBIN=""
 }
 
-# daemon_start BIN [daemon args...]
-#
-# Start this test's daemon and wait until it is actually serving.
-#
-# The wait is on the daemon's own "daemon started" line, never on a poll with a
-# CLI command: a CLI command issued before the socket answers starts a second
-# daemon of its own, which is a race against the one just launched and a leaked
-# process when it loses.  The line is printed after the IPC socket is bound and
-# after any persisted state is restored, so it means ready rather than alive.
-#
-# A daemon that never comes up is fatal, not a failed assertion.  Everything
-# after this point would otherwise be measuring the machine rather than the
-# build, which is the failure mode this whole file exists to remove — and an
-# assertion can be counted, argued with, and waved through as flaky.
+# Wait on the daemon's own "daemon started" line, which is printed after the
+# socket is bound and state restored, never on a CLI poll that would start a
+# second daemon -- and a daemon that never comes up is fatal rather than a
+# failed assertion, because an assertion can be waved through as flaky.
 daemon_start() {
     local bin=$1; shift
     SOCKETLEY_DBIN=$bin
@@ -107,25 +48,11 @@ daemon_start() {
     return 0
 }
 
-# daemon_stop
-#
-# Kill this test's daemon and delete everything it owned.  Call it last in
-# cleanup: it removes the state directory, so anything that still wants to talk
-# to the daemon has to have run already.
-#
-# Killing $SOCKETLEY_DPID is not enough on its own.  Every CLI command except
-# `daemon`, `version` and `help` auto-starts a daemon when the socket does not
-# answer, forking and setsid-ing one detached from this shell — so a `stop` or
-# `remove` in a cleanup that runs after the daemon has already gone resurrects
-# it, and that copy outlives the test for good.  The sweep below is what catches
-# it.
-#
-# Matched by exact process name and by this run's socket, never by a
-# command-line pattern: `pgrep -f 'socketley daemon'` also matches any shell
-# whose own command line carries that string — including the test runner — and
-# an -f match one character too broad kills the run doing the matching.  The
-# socket path comes from mktemp, so the environ check can only ever hit daemons
-# belonging to this run.
+# Kill this test's daemon and delete everything it owned, last in cleanup
+# because it removes the state directory -- with a sweep matched on exact
+# process name and this run's socket, since killing $SOCKETLEY_DPID alone
+# leaves behind the copy a late `stop` resurrected, and a `pgrep -f` pattern
+# one character too broad kills the run doing the matching.
 daemon_stop() {
     if [ -n "${SOCKETLEY_DPID:-}" ]; then
         kill "$SOCKETLEY_DPID" 2>/dev/null || true
@@ -136,58 +63,22 @@ daemon_stop() {
     fi
     daemon_sweep "${SOCKETLEY_SOCKET:-}"
 
-    # ── surface what the daemon said before deleting where it said it ───────
-    #
-    # An invariant violation is reported by skl_inv::fail on the PROCESS's
-    # stderr, which for every test here is the daemon's, which daemon_start
-    # sends to $SOCKETLEY_DLOG.  A test's own stdout never carries it: with the
-    # half-close hold deliberately broken, test_proxy_half_close_hold.sh printed
-    # six FAILs and daemon.log held 43 `[invariant]` lines, none of which
-    # appeared in the suite output.
-    #
-    # That matters beyond debugging.  The nightly's invariants job greps its
-    # suite log for `[invariant]` and fails the job on a hit — and under
-    # -DSOCKETLEY_INVARIANTS_WARN_ONLY a violation only prints, so the grep was
-    # the whole enforcement.  Against a stream the line cannot reach, that step
-    # could not fail, and the deletion below is what put it out of reach.
-    #
-    # Sited here rather than in each test for the reason the proxy's answer-owed
-    # check is sited in close_pair: 102 of the 128 files in this directory reach
-    # this function, and none of them has to know about it.  The 26 that do not
-    # call daemon_isolate at all are the ones that never start a daemon.
-    #
-    # Printed, not asserted.  What a violation means is the job's decision --
-    # the nightly fails on it, an interactive run wants to see it and carry on --
-    # and turning 102 tests red from one library function is the kind of change
-    # that gets a useful check switched off within the week.
+    # Surface what the daemon said before deleting where it said it, because
+    # skl_inv::fail writes to the daemon's stderr and the nightly's enforcement
+    # is a grep over this log -- printed rather than asserted, since turning
+    # 102 tests red from one library function gets a useful check switched off
+    # within the week.
     if [ -n "${SOCKETLEY_DLOG:-}" ] && [ -f "$SOCKETLEY_DLOG" ]; then
         if grep -F '[invariant]' "$SOCKETLEY_DLOG" >/dev/null 2>&1; then
             echo "  --- invariant violations from this test's daemon ---"
             grep -F '[invariant]' "$SOCKETLEY_DLOG" | sort | uniq -c | head -20
         fi
 
-        # ── and what the sanitizers said, for the same reason ───────────────
-        #
-        # A Sanitize build compiles with -fno-sanitize-recover=all, so an ASan
-        # or UBSan finding kills the process: the daemon dies, the next CLI call
-        # fails, and the test goes red.  Those are already visible.
-        #
-        # LeakSanitizer is not.  It runs at exit, and the daemon exits cleanly
-        # on the SIGTERM above -- measured, "daemon stopped" then status 0 -- so
-        # LSan does run and does report.  It reports to the daemon's stderr,
-        # which is this log, and it signals through the exit status, which the
-        # `wait ... || true` twenty lines up deliberately discards because a
-        # daemon killed in cleanup is not a failure.  Then the tmpdir goes.
-        #
-        # So a leak in the daemon passed the whole Sanitize suite without
-        # leaving a trace anywhere, which makes the leak half of that suite an
-        # assertion that cannot fail.  Verified before writing this: a program
-        # built with these flags reports `LeakSanitizer: detected memory leaks`
-        # and exits non-zero, and this tree's own daemon exits 0 at idle.
-        #
-        # Printed, not asserted, exactly as the invariant block above: what a
-        # leak means is the job's decision, and turning 102 tests red from one
-        # library function is how a useful check gets switched off.
+        # LeakSanitizer runs at exit and reports to this log while signalling
+        # through an exit status the `wait ... || true` above deliberately
+        # discards, so a leak in the daemon passed the whole Sanitize suite
+        # without a trace -- printed, not asserted, exactly as the invariant
+        # block above.
         if grep -qE 'Sanitizer:|runtime error:' "$SOCKETLEY_DLOG" 2>/dev/null; then
             echo "  --- sanitizer reports from this test's daemon ---"
             grep -E 'Sanitizer:|runtime error:' "$SOCKETLEY_DLOG" \
@@ -206,60 +97,16 @@ daemon_stop() {
 }
 
 # ─── NOT BY THE PROCESS'S NAME ──────────────────────────────────────────────
-#
-# Both functions below used to open with `pgrep -x socketley`, which asks the
-# wrong question in a way that is expensive to be wrong about.
-#
-# Agents working in this tree routinely copy the binary into their own worktree
-# so a concurrent rebuild cannot truncate the file out from under a running
-# test.  The copy does not have to keep its name, and the moment it does not,
-# `pgrep -x socketley` cannot see the daemon at all: daemon_alive returns false
-# for a daemon that is up and serving, and daemon_required then stops the run
-# with "this test's daemon is no longer serving its socket" — a sentence that
-# sends whoever reads it looking for a daemon crash that never happened.  It
-# cost an agent a confusing run.  Measured, with the binary copied to
-# `sockletey-worktree-copy`:
-#
-#     daemon pid=4015933  socket=/tmp/socketley-lookup-Pm7tea/d.sock
-#     pgrep -x socketley -> 3979889 4015559 4015569      (ours is not there)
-#     /proc/net/unix     -> ... 60881938 /tmp/.../d.sock
-#     holder of inode    -> 4015933                      (ours, exactly)
-#
-# So the question is asked of the socket instead.  "Is a daemon serving this
-# socket" has an exact answer that owes nothing to what anything is called, and
-# it is also a stricter answer than the old one: the old form matched a daemon
-# whose *environment* named the socket, which stays true for a process that
-# never managed to bind.
+# The question is asked of the socket rather than of a process name, because
+# agents copy the binary into their worktree under another name and `pgrep -x
+# socketley` then reports a live daemon dead -- and it is the stricter
+# question, since the old form also matched a process that never managed to
+# bind.
 
-# daemon_pids SOCKET
-#
-# The pids actually serving SOCKET, space separated, empty if none.
-#
-# `[ -S "$sock" ]` is not the same question and never was: the socket file
-# outlives the process that bound it, so a test that cleans up with a CLI
-# command "because the socket is still there" reaches a dead daemon and
-# auto-starts a live one in its place.  A killed daemon leaves the file on disk
-# and its /proc/net/unix row goes away in the same instant — measured both ways
-# — which is exactly the distinction wanted here.
-#
-# In /proc/net/unix the columns are Num RefCount Protocol Flags Type St Inode
-# Path, so field 8 is the bound path and field 7 the inode; the pid is then
-# whoever holds that inode as an open descriptor.  A full /proc walk costs about
-# half a second on this machine, and it happens in cleanup and on the
-# already-failing daemon_required path, never in a measurement window.
-#
-# The Flags test is what makes this the *listening* socket rather than merely a
-# socket with that path.  Once a client is connected, the path appears on more
-# than one row — measured, with one CLI client attached:
-#
-#     ... 00000003 00000000 00000000 0001 03 60910290 /tmp/.../d.sock   accepted
-#     ... 00000002 00000000 00010000 0001 01 60912247 /tmp/.../d.sock   listening
-#
-# and taking simply the first would mean asking about whichever accepted
-# connection happened to sort first — an fd the daemon may already have closed,
-# whereupon daemon_alive reports a live daemon dead.  00010000 is SO_ACCEPTCON:
-# exactly one row per bound path carries it, and it is the row that means
-# "serving".
+# The pids actually serving SOCKET, read out of /proc/net/unix rather than
+# tested with `[ -S ]`, because the socket file outlives the process that bound
+# it -- and the SO_ACCEPTCON flag picks the listening row, since once a client
+# is connected the path appears on more than one.
 daemon_pids() {
     local sock=$1 ino fd p pids=""
     [ -n "$sock" ] || return 0
@@ -279,32 +126,19 @@ daemon_pids() {
     printf '%s' "${pids# }"
 }
 
-# daemon_starting_pids SOCKET
-#
-# The other half: a daemon that has been forked but has not bound yet owns no
-# socket, so daemon_pids cannot see it, and a sweep that misses it leaves it
-# running for good on this run's ports.  Those are found by environment instead
-# — but an environment match alone would also hit the test script itself, whose
-# SOCKETLEY_SOCKET is the very variable being matched, and killing the shell
-# doing the killing is the accident this whole file exists to prevent.
-#
-# So the gate is `/proc/<pid>/exe -ef` the daemon binary: a device+inode
-# comparison through the symlink, which a shell can never satisfy and a binary
-# copied under another name always will.  Nothing here looks at a name.
+# A daemon forked but not yet bound owns no socket, so it is found by
+# environment instead -- gated on `/proc/<pid>/exe -ef` the daemon binary,
+# which a shell can never satisfy and a binary copied under another name always
+# will.
 daemon_starting_pids() {
     local sock=$1 dbin=${SOCKETLEY_DBIN:-${BIN:-}} d p pids=""
     [ -n "$sock" ] && [ -n "$dbin" ] && [ -e "$dbin" ] || return 0
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
         [ "/proc/$p/exe" -ef "$dbin" ] || continue
-        # NOT `grep -q`.  These files are sourced into scripts that run under
-        # `set -o pipefail`, and `grep -q` exits at its first match, which hands
-        # the writer a SIGPIPE; the pipeline then reports 141 and this takes the
-        # "no match" branch precisely when it matched.  An environ is small
-        # enough that tr is usually finished before grep looks, so the bug is
-        # only latent here — but "latent" is not a property worth relying on in
-        # the function that decides what to kill.  grep without -q reads to the
-        # end, so the status is grep's.
+        # Not `grep -q`: it exits at its first match and under pipefail the
+        # pipeline reports 141, taking the no-match branch precisely when it
+        # matched.
         { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
             | grep -x "SOCKETLEY_SOCKET=$sock" >/dev/null || continue
         case " $pids " in *" $p "*) ;; *) pids="$pids $p" ;; esac
@@ -321,11 +155,9 @@ daemon_alive() {
     [ -n "$(daemon_pids "$sock")" ]
 }
 
-# daemon_sweep SOCKET
-#
-# Kill every daemon serving SOCKET, and every one on its way to serving it.
-# Split out from daemon_stop because the cluster tests run several daemons on
-# several sockets and kill one of them mid-test on purpose.
+# Kill every daemon serving SOCKET and every one on its way to serving it,
+# split out from daemon_stop because the cluster tests run several daemons and
+# kill one mid-test on purpose.
 daemon_sweep() {
     local sock=$1 p
     [ -n "$sock" ] || return 0
@@ -336,33 +168,13 @@ daemon_sweep() {
 }
 
 # ─── STOPPING WITHOUT VANISHING ─────────────────────────────────────────────
-#
-# The other half of "a refused create must be visible".  Under `set -euo
-# pipefail` a lone `VAR=$(cmd)` is a simple command whose exit status *is* the
-# substitution's, so when cmd fails the file ends at that line: no assertion, no
-# `Results`, no `OK`/`FAILED`.  What a broken test_cache.sh printed was
-#
-#     FAIL [cache created]: create refused, exit 2 …    <- c76e965 added this
-#     FAIL [SET]: got '', expected 'ok'
-#     … 20 more …
-#     (nothing — the file is gone, at `TTL=$(send_cmd 'ttl ttlkey')`)
-#
-# and it exited 1 rather than 26, because the status that escaped was nc's.  Five
-# assertions after that line never ran and the counts never printed, so a run
-# that broke twenty-six things is indistinguishable from one that broke one.
-#
-# Most such sites should simply survive: the assertion underneath is the thing
-# with something to say about a command that failed, and it can only say it if
-# the file is still running.  Those are guarded where they stand.
-#
-# The rest are what these two are for.
+# Under pipefail a lone `VAR=$(cmd)` ends the file at that line with no
+# assertions and no counts, so a run that broke twenty-six things is
+# indistinguishable from one that broke one.
 
-# daemon_bail LABEL REASON [DETAIL...]
-#
-# End the run here — but end it *reporting*.  Counts the bail-out as the failure
-# it is and prints the same two closing lines every test in this directory ends
-# with, so a file that stops early still answers the only question the summary
-# exists to answer: was it one thing or twenty?
+# End the run here, but end it reporting: the bail-out is counted as the
+# failure it is and the closing lines still print, so a file that stops early
+# still says whether it was one thing or twenty.
 daemon_bail() {
     local label=$1 reason=$2; shift 2
     TOTAL=$(( ${TOTAL:-0} + 1 ))
@@ -375,24 +187,11 @@ daemon_bail() {
     exit "$FAIL"
 }
 
-# daemon_required LABEL [SOCKET]
-#
-# Decide, at a CLI command that has just failed, which of the two kinds of
-# failure it was — and return 0 either way so it can be written as the `||`
-# branch of the capture itself:
-#
-#     OUT=$("$BIN" stats mesh_proxy 2>&1) || daemon_required "stats mesh_proxy"
-#
-# A daemon that is still serving means the command failed on its own merits —
-# usually a runtime that a refused create never built.  That is not fatal: $OUT
-# holds whatever the CLI said, the assertion below judges it, and the file goes
-# on to test the four unrelated things it also covers.  Returning 0 is what lets
-# it, and it hides nothing, because something below is looking.
-#
-# A daemon that is gone is the other case.  Twenty assertions about the
-# behaviour of a socket nobody is serving are not twenty findings; they are one
-# finding printed twenty times, and they bury it.  So that stops — via
-# daemon_bail, which is the whole point: stopping is fine, disappearing is not.
+# Decide at a failed CLI command which kind of failure it was, returning 0
+# either way so it can be the `||` branch of the capture: a live daemon means
+# the command failed on its own merits and the assertion below judges it, while
+# a daemon that is gone bails, because twenty assertions about an unserved
+# socket are one finding printed twenty times.
 daemon_required() {
     daemon_alive "${2:-${SOCKETLEY_SOCKET:-}}" && return 0
     daemon_bail "$1" "this test's daemon is no longer serving its socket" \
