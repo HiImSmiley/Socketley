@@ -1,50 +1,7 @@
 #pragma once
-// What a runtime says it will answer: a path, and the methods allowed on it.
-//
-// ─── WHY THIS EXISTS ────────────────────────────────────────────────────────
-//
-// A proxy in front of an HTTP handler can refuse a request the handler was
-// always going to refuse — a DELETE on a login endpoint that takes POST and GET
-// — and refusing it at the edge costs no connect, no pooled socket, no round
-// trip and no work in the handler.  What the proxy cannot do is *know* which
-// methods those are.
-//
-// Configured on the proxy, that method list is a second copy of something the
-// handler already states in its own code: one truth written down in two
-// runtimes, and soon in two processes.  Two copies drift.  The handler grows
-// PATCH, the proxy goes on refusing it, and what the operator sees is a 405
-// that neither side can explain alone — the handler's code plainly accepts
-// PATCH, and the proxy is plainly doing what it was told.
-//
-// So the declaration belongs to the handler and is *published* to the proxy.
-// That is the move shared/endpoint_table.h already makes for "where is this
-// runtime": the answer is handed over as data instead of being derived
-// independently in two places.  A route table travels inside that same snapshot
-// rather than beside it, because a proxy holding new endpoints and stale routes
-// would be precisely the drift this exists to end.
-//
-// ─── WHAT IT DELIBERATELY DOES NOT HOLD ─────────────────────────────────────
-//
-// A path and a set of methods.  Not content types, not schemas, not roles, not
-// parameter types, not rate limits.  The two it holds are the two the proxy can
-// check from the request line it has already parsed, without reading a body and
-// without knowing anything about the application.  Everything past them is a
-// rule that has to be kept right in two runtimes at once, and a declaration that
-// grows enough of them is a gateway configuration language whose every sentence
-// is a second place to be wrong.  Policy that needs more than the request line
-// has somewhere to live already: the filter chain (proxy_instance::
-// run_request_filters), which runs in the proxy and is written once.
-//
-// ─── AND IT IS NOT INPUT VALIDATION ─────────────────────────────────────────
-//
-// The proxy can confirm the method is one the handler declared.  It cannot
-// confirm the body is a well-formed login, and it is not the only way in: a
-// socketley server listens on its own port, and a request that arrives there
-// never passed an edge at all.  A handler that stops checking because "the
-// gateway checks" is safe only for as long as every request comes through the
-// gateway, which is a property of the deployment and not of the code.  The
-// declaration is an optimisation and a statement of intent; the handler is
-// still the authority on its own input.
+// A path and the methods allowed on it, declared by the handler and published
+// to the proxy so the two cannot drift.  Path and methods only.
+// An optimisation, not input validation -- a server listens on its own port.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -53,14 +10,8 @@
 
 #include "endpoint_table.h"   // runtime_string_hash / runtime_string_equal
 
-// One declared route.
-//
-// `prefix` is a path declared with a trailing '*' — "/static/*" — and `path`
-// then holds what comes before it.  That is the whole of the pattern language,
-// on purpose: exact, or a literal prefix.  Anything richer (captures, regular
-// expressions, typed segments) is a second parser to keep in step with whatever
-// the handler's own router does, and a mismatch between the two is a request
-// refused at the edge that the handler would have served.
+// Exact, or a literal prefix ("/static/*") -- anything richer is a second
+// parser to keep in step with the handler's own router.
 struct route_decl
 {
     std::string              path;
@@ -73,10 +24,7 @@ struct route_decl
 class route_table
 {
 public:
-    // Bounds, not tuning knobs.  A declaration is walked once per publication
-    // and looked up once per request; these exist so that a script with a
-    // generated routing table cannot turn either into unbounded work, and so
-    // that a refusal names a number rather than being a mystery.
+    // Bounds, not tuning knobs: a generated table must not become unbounded work.
     static constexpr size_t MAX_ROUTES  = 512;
     static constexpr size_t MAX_METHODS = 16;
     static constexpr size_t MAX_PATH    = 512;
@@ -128,12 +76,8 @@ public:
                 d.methods.push_back(std::move(up));
         }
 
-        // Twice in one script is a typo, and the two are usually different —
-        // that is the point of writing it twice.  Silently unioning them would
-        // make the wider of the two win with nothing on screen to say so, so
-        // this is refused where the operator can still see it.  Across
-        // runtimes it is not a typo but a group with two members that answer
-        // the same path, and merge() below unions those deliberately.
+        // Twice in one script is a typo; across runtimes it is a group, which
+        // merge_alternative() unions deliberately.
         if (find_exact(d.path, d.prefix) != nullptr)
             return add_result::duplicate;
 
@@ -146,28 +90,9 @@ public:
         return add_result::ok;
     }
 
-    // Fold in another runtime that could receive the same request: a second
-    // member of the same group, or a second backend of the same proxy.  The
-    // result describes both, and both halves of it follow from one rule —
-    // nothing may be refused that *either* of them might have served.
-    //
-    //   A path only one of them declares is DROPPED.  A declaration speaks
-    //   about the paths it names and says nothing about the others, so a
-    //   runtime that never mentioned /login may well serve /login; refusing a
-    //   method there because its neighbour declared the path would refuse at
-    //   the edge what the request's actual target was going to answer.  This is
-    //   why folding in a runtime that declares nothing leaves nothing behind,
-    //   which is exactly right: it has told us nothing, so nothing can be
-    //   refused on its account.
-    //
-    //   A path both declare keeps the UNION of their methods.  Selection picks
-    //   a target per connection and this side cannot know which — that is what
-    //   round-robin means — so only a method neither would take may be refused.
-    //
-    // Order matters only for the Allow header, which lists this table's methods
-    // before the ones folded in.  Callers fold in a deterministic order (backend
-    // configuration order; group members by name) so that the header a client
-    // gets does not depend on the order a hash map happened to be walked in.
+    // Fold in a runtime that could receive the same request; nothing may be
+    // refused that either might have served, so a path only one declares is
+    // dropped and a path both declare keeps the union of their methods.
     void merge_alternative(const route_table& other)
     {
         std::vector<route_decl> kept;
@@ -211,18 +136,8 @@ public:
     // number nobody can see is a feature nobody can debug.
     size_t size()  const { return m_routes.size(); }
 
-    // The route a request path falls under, or nullptr for a path nobody
-    // declared.
-    //
-    // nullptr means "no declaration covers this", and the caller forwards — it
-    // does NOT mean "not found".  A declaration is a statement about the paths
-    // it names and says nothing whatever about the ones it does not: a handler
-    // is free to answer paths it never declared, and a gateway that turned
-    // silence into a 404 would make declaring one route the act of hiding every
-    // other.  Enforcement is opt-in per path, one path at a time.
-    //
-    // `path` must already have had its query string removed; see
-    // route_path_only().
+    // nullptr means no declaration covers this and the caller FORWARDS, not
+    // 404.  `path` must already have its query string removed.
     const route_decl* find(std::string_view path) const
     {
         if (const auto it = m_exact.find(path); it != m_exact.end())
@@ -239,23 +154,8 @@ public:
         return nullptr;
     }
 
-    // Whether this route admits this method.
-    //
-    // Two methods are admitted beyond what was declared, and both are RFC
-    // 9110, not politeness:
-    //
-    //   HEAD, wherever GET is declared (§9.3.2).  A HEAD is a GET whose
-    //   response body is dropped; a handler that serves GET serves HEAD
-    //   whether or not it thought about it, and refusing HEAD at the edge
-    //   breaks every cache validator and link checker there is.
-    //
-    //   OPTIONS, always (§9.3.7).  A route that declares only POST would
-    //   otherwise have the proxy answer 405 to the CORS *preflight* a browser
-    //   sends before the POST — and the POST is then never sent at all.  What
-    //   the operator sees is a CORS error on a request their code never made,
-    //   and nothing in either runtime's logs mentions a preflight.  The gate
-    //   never refuses OPTIONS; proxy_instance decides separately whether to
-    //   answer it from the declaration or forward it.
+    // HEAD wherever GET is declared and OPTIONS always, both RFC 9110 -- a 405
+    // on a CORS preflight means the real request is never sent at all.
     static bool method_allowed(const route_decl& r, std::string_view method)
     {
         if (method == "OPTIONS")
@@ -270,13 +170,7 @@ public:
         return false;
     }
 
-    // The value of the Allow header a 405 carries.  RFC 9110 §15.5.6 requires
-    // one, and it is free here: the declaration *is* the list.  Without it a
-    // client is told no and not told what would have worked, which is the
-    // difference between a diagnosable failure and an afternoon.
-    //
-    // The two implied methods above are listed too — a client that is told GET
-    // is allowed and HEAD is not has been told something untrue.
+    // Required by RFC 9110 and free here; lists the two implied methods too.
     static std::string allow_header(const route_decl& r)
     {
         std::string out;
@@ -342,10 +236,7 @@ private:
         for (char c : p)
         {
             const unsigned char u = static_cast<unsigned char>(c);
-            // Control bytes and space would make the declaration unmatchable
-            // against a request line, which is split on spaces; '?' and '#'
-            // are not part of a path at all and a declaration carrying one
-            // would never match anything.
+            // A request line is split on spaces, and '?'/'#' are not path.
             if (u <= 0x20 || u == 0x7F || c == '?' || c == '#')
                 return false;
         }
@@ -401,10 +292,8 @@ private:
     std::vector<uint32_t>                         m_prefixes;   // longest first
 };
 
-// The path part of a request target, which is the only part a declaration
-// speaks about.  "/endpoint/login?next=/home" is the login route; a gate that
-// compared the whole target would forward every request that carried a query
-// string, which is most of them.
+// The path part of a request target; comparing the whole target would forward
+// every request carrying a query string.
 inline std::string_view route_path_only(std::string_view target)
 {
     const auto q = target.find_first_of("?#");
