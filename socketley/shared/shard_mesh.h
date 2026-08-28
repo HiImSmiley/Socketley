@@ -1,138 +1,9 @@
 #pragma once
-// A crossing between two shards of one runtime, without the daemon in the
-// middle.
-//
-// ─── WHAT THIS CHANGES, AND WHAT IT DELIBERATELY DOES NOT ───────────────────
-//
-// It changes WHO a crossing goes to.  It does not change what one looks like.
-//
-// A shard posts to `name#j` through its own request_channel exactly as before;
-// the ticket, the chan_request/chan_reply codec, the parked-request bookkeeping
-// and the framing cache_instance puts inside the payload are all untouched.
-// The only difference is that `name#j` now resolves in this process's own sink
-// table to a mesh_sink, instead of missing it and falling through to the sink
-// that writes to the daemon.
-//
-// cache_instance does not change by one line for this.  That is the test of
-// whether the seam was in the right place.
-//
-// ─── WHY, WITH THE NUMBER THAT DECIDED IT ───────────────────────────────────
-//
-// The daemon relay is two round trips instead of one, and that was the cost
-// that was expected.  The cost that was measured is different and worse: every
-// shard's foreign traffic funnels through ONE process, so the relay is a
-// serialisation point, and a serialisation point does not care how fast one hop
-// is.  Throughput at depth 1, four arms, one client:
-//
-//     N = 1   103,270      N = 2   101,010      N = 4   93,167      N = 8   83,333
-//
-// Losses of 2%, 10% and 19% against crossing fractions of 50%, 75% and 87.5%.
-// If the cost were per-crossing latency the losses would be about 4%, 6% and 7%
-// -- proportional to the fraction.  They grow faster than it, which is
-// contention rather than latency.
-//
-// The same reasoning does NOT apply to a sharded server, where routing is rare
-// and `--lua` measures 2.46x at eight shards: there the funnel is never hot.
-// This is a cache, where routing is the normal case.
-//
-// ─── THE RELAY IS NOT REMOVED.  IT IS THE FLOOR. ────────────────────────────
-//
-// A mesh_sink with no usable link delegates to the sink it was given, which is
-// the daemon.  Four things follow, and the design rests on all four:
-//
-//   * correctness never depends on the mesh existing;
-//   * a shard posting to a sibling that has not finished starting is a relay,
-//     not an error;
-//   * a link that dies degrades this runtime to slower, not to broken;
-//   * and the two routes are one binary apart, so the measurement that decides
-//     whether any of this was worth it is an A/B on the same build.
-//
-// The cost of that safety is that a mesh which never works looks exactly like a
-// mesh that made no difference.  So every crossing is counted by ROUTE, and the
-// counters are reported -- see stat_direct()/stat_relayed().  "The mesh made no
-// difference" and "the mesh was never used" have to be distinguishable or the
-// benchmark means nothing.
-//
-// ─── LIFETIME ───────────────────────────────────────────────────────────────
-//
-// Written down before the code was, because N**2 links is the shape this tree
-// has paid the most for -- the half-close hold was fixed four times.
-//
-// N**2 is the number of LINKS, not the number of PATHS.  Each process holds
-// N-1 of them, every one identical, with ONE way to die and one function that
-// does it.  The number that has ever hurt here is how many places can tear
-// something down, and for a link it is one: die().
-//
-//   WHO NOTICES A DEAD PEER.  The reader, and nothing else.  One recv per
-//   link, re-armed once per turn -- the same arrangement the worker's control
-//   socket uses, and for the same reason: a link drained on a timer instead of
-//   a completion inherits that timer's latency, which cost a cross-process
-//   `cache set` a measured 20.00 ms before the control socket was armed.
-//
-//   THE RECV USED TO BE A POLL, AND THAT IS THE WHOLE OF THIS FILE'S COST.
-//   submit_poll_add() for readiness, a blocking ::read() to take the bytes, and
-//   a bare ::write() to send them -- the epoll pattern, and once the mesh
-//   landed EVERY cross-shard request travelled it.  Counted on one shard of
-//   four, 200,000 GETs, strace -f -qq -c: 52,486 write() and 18,165 read()
-//   against 5,526 io_uring_enter, which is 1.41 blocking syscalls per GET that
-//   shard served.  A recv is not a claim about a socket that this process can
-//   be wrong about -- the bytes are IN the completion -- so the read that
-//   followed the poll has nothing left to do and the safety pump such a claim
-//   needs never has to be written.
-//
-//   The send moves with it, through frame_writer::use_ring().  What that costs
-//   to get wrong is stated at use_ring() and repeated here because this file is
-//   its second caller: an owner on the ring MUST call flush() once per turn of
-//   its loop, and submitting per frame instead of once per turn is what turned
-//   5,920 ring entries into 61,221 the first time this change was made on the
-//   control socket.  pump() below is this link's once-per-turn, and the worker
-//   calls it beside its own m_writer.flush().
-//
-//   WHAT A HALF-OPEN LINK DOES.  Nothing legitimate, and this is an invariant
-//   rather than an observation.  Both directions carry traffic for the whole
-//   life of a link, so this protocol has no graceful half-close: ANY end of
-//   input is the peer going away.  That deletes the "is this a tidy shutdown or
-//   a failure" question outright -- the question that produced four fixes for
-//   one hold -- and it is stated at the point the end of input is read so that
-//   nobody reintroduces it by being careful.
-//
-//   A CROSSING IN FLIGHT WHEN A SHARD DIES.  The moment a link is marked dead
-//   it sweeps its OWN parked tickets and completes each `no_target`.  The
-//   channel then delivers on_request_reply to the asking runtime, which already
-//   knows how to render that into the reply it owes its client.  No timer, no
-//   deadline, no hang.  A ticket is parked on exactly one link and only that
-//   link can complete it, so the sweep is bounded by what that link owed.
-//
-//   WHO CLOSES THE DESCRIPTOR.  die(), after the sweep, through the loop --
-//   close_fd(), which submits a cancel for whatever still names the number and
-//   holds the number until that cancel has landed.  A completion that arrives
-//   afterwards finds the link dead and drops, the same "retire, then let the
-//   completion land" the supervisor uses for a worker it is replacing.  Note
-//   that poll_remove() would not do this job any more: it withdraws a poll by
-//   naming its request, and a recv and a send are withdrawn by descriptor.
-//
-// ─── WHAT IS NOT HERE, NAMED RATHER THAN LEFT TO BE FOUND ───────────────────
-//
-// TLS is not here, and does not belong here.  The links are socketpair ends
-// between sibling processes of one runtime on one host under one uid -- there
-// is no network path to encrypt and no second party to authenticate.  Note
-// that runtime_instance::get_mesh_tls_paths() is NOT about this file: it is
-// the PROXY's backend leg (--client-ca / --client-cert / --client-key), a
-// different feature that happens to share the word "mesh".  Reading that
-// virtual as coverage this file lacks is the mistake this paragraph exists to
-// prevent.
-//
-// A link cannot be re-established.  The descriptors are socketpair ends placed
-// at fork, and a socketpair cannot be re-attached to a process that did not
-// inherit it -- so a shard that dies and is restarted by its supervisor comes
-// back with no links, and its crossings relay through the daemon until the
-// whole runtime restarts.  Correct, slower for one shard's share of the
-// traffic, and visible in the route counters rather than silent.
-//
-// The eventual answer is passing new ends over the control socket, for which
-// shared/conn_transfer.h is already the mechanism.  It is a separate step with
-// its own tests, and it is only worth buying if the measurement says the mesh
-// earns its keep.
+// A crossing between two shards of one runtime without the daemon in the
+// middle, as a mesh_sink that resolves `name#j` in this process's own sink
+// table and delegates to the daemon relay whenever no link is usable, so
+// correctness never depends on the mesh and every crossing is counted by
+// route.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -149,8 +20,8 @@
 #include "request_channel.h"
 #include "worker_protocol.h"
 
-// What a link hands a request to once it has arrived from a sibling.  The
-// worker supplies this; the link knows nothing about runtimes.
+// What a link hands a request to once it has arrived from a sibling, supplied
+// by the worker because the link knows nothing about runtimes.
 using shard_mesh_server = bool (*)(void* ctx, std::string_view target,
                                    std::string_view payload, std::string& reply);
 
@@ -163,9 +34,8 @@ public:
         : m_writer(fd), m_fd(fd), m_peer(peer_index),
           m_channel(channel), m_server(server), m_ctx(server_ctx)
     {
-        // Non-blocking, because every write goes through frame_writer's backlog
-        // and every read happens on a poll completion.  A blocking descriptor
-        // here would stall this shard's event loop on a sibling's scheduling.
+        // Non-blocking, because a blocking descriptor here would stall this
+        // shard's event loop on a sibling's scheduling.
         const int fl = ::fcntl(m_fd, F_GETFL, 0);
         if (fl >= 0)
             if (::fcntl(m_fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
@@ -180,27 +50,16 @@ public:
     shard_link(const shard_link&)            = delete;
     shard_link& operator=(const shard_link&) = delete;
 
-    // ── The order here is the whole of it, and it has been got wrong ───────
-    //
-    // register_owner() FIRST, then the writer, then the arm.  A submission
-    // carries its owner's token, and one made before the registration is not
-    // merely unowned: its completion is DROPPED.  For this link that means the
-    // recv never reports, m_armed never clears, and every crossing parked on it
-    // waits for ever.  That is not hypothetical -- it is how this file behaved
-    // before the owner was set, and the loop now warns once when it sees a
-    // submission with no owner precisely because the symptom is otherwise
-    // silent.
-    //
-    // There are N-1 links per shard, so this is N-1 chances to get it wrong
-    // rather than one, which is why it is a single function that all of them go
-    // through and there is no early return above the registration.
+    // register_owner() first, then the writer, then the arm, because a
+    // submission made before the registration has its completion dropped and
+    // the recv then never reports.
     bool attach(event_loop& loop)
     {
         m_loop = &loop;
         loop.register_owner(this);
 
-        // Nothing is queued on a link this new, so this only installs the ring.
-        // From here write() queues and pump() is what puts it on the wire.
+        // Nothing is queued on a link this new, so this only installs the
+        // ring.
         m_writer.use_ring(&loop, this);
 
         arm();
@@ -210,9 +69,8 @@ public:
     bool alive() const { return !m_dead && m_fd >= 0 && !m_writer.dead(); }
     uint32_t peer() const { return m_peer; }
 
-    // Send one request to the sibling.  False means it did not go — the caller
-    // relays it instead, which is why this returns a fact rather than logging
-    // one.
+    // Send one request to the sibling, returning false so the caller can relay
+    // it instead.
     bool send_request(uint64_t ticket, std::string_view target,
                       std::string_view payload)
     {
@@ -223,8 +81,8 @@ public:
                 worker_proto::frame_type::chan_req,
                 worker_proto::encode_chan_request(ticket, target, payload))))
         {
-            // The backlog is full or the socket is gone.  Either way this link
-            // is not carrying anything more; the relay is still there.
+            // The backlog is full or the socket is gone, and either way this
+            // link is not carrying anything more.
             die("the backlog to a sibling filled or its socket went");
             return false;
         }
@@ -239,11 +97,9 @@ public:
         return true;
     }
 
-    // ── The two things a link has on the ring ───────────────────────────────
-    //
-    // Its recv and its writer's send, told apart by the request ADDRESS and not
-    // by the op type: a type is a shape, and the moment there are two
-    // submissions of the same shape a type cannot separate them.
+    // The recv and the writer's send, told apart by the request address rather
+    // than the op type, which cannot separate two submissions of the same
+    // shape.
     void on_cqe(struct io_uring_cqe* cqe) override
     {
         auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
@@ -268,37 +124,24 @@ public:
         const int res = cqe->res;
         if (res > 0)
         {
-            // A recv, not a readiness notification.  The bytes are already
-            // here; the ::read() that used to follow the poll is what this
-            // replaces, and with it the only reason this link ever needed a
-            // second syscall per arrival.
+            // A recv and not a readiness notification, so the bytes are
+            // already here and no second syscall follows.
             m_in.append(m_rbuf, static_cast<size_t>(res));
             take_frames();
             return;                    // re-armed by pump(), at the end of the turn
         }
 
-        // ─── ANY END OF INPUT IS THE PEER GOING AWAY ────────────────────────
-        //
-        // Not "is this a tidy half-close or a failure".  That question does not
-        // exist on this link and must not be invented here: both directions
-        // carry traffic for the whole life of a link, so a peer that has
-        // stopped writing has stopped, and there is nothing a half-open mesh
-        // link could still be for.
-        //
-        // Written at the point the end of input is read rather than in the
-        // header alone because this is the line somebody would otherwise "fix"
-        // into a graceful-shutdown path, and that is the shape that cost this
-        // tree four fixes for one hold.
+        // Any end of input is the peer going away, because both directions
+        // carry traffic for the whole life of a link and this protocol has no
+        // graceful half-close.
         if (res == 0)
         {
             die("a sibling closed its end");
             return;
         }
 
-        // Nothing arrived and nothing is wrong.  -ECANCELED is this ring going
-        // down or close_fd() withdrawing the arm, neither of which is the peer.
-        // Re-armed by pump(), and the wait before it is clamped because
-        // m_armed is false — see needs_wake().
+        // Nothing arrived and nothing is wrong, since -ECANCELED is this ring
+        // going down or close_fd() withdrawing the arm.
         if (res == -EAGAIN || res == -EWOULDBLOCK || res == -EINTR ||
             res == -ECANCELED)
             return;
@@ -307,18 +150,10 @@ public:
     }
 
     // ── Once per turn of the owner's loop ───────────────────────────────────
-    //
-    // The two things a completion cannot do for itself: put the frames this
-    // turn wrote on the wire, and replace a recv that is no longer standing.
-    //
-    // Both are here rather than in on_cqe() and that is what makes the change
-    // pay.  Flushing per frame submits a send per crossing, a send produces a
-    // completion, and a completion arriving on its own ends the ring's wait —
-    // so the loop takes a whole turn, and one io_uring_enter, to learn that a
-    // send it needed no answer to has finished.  Measured on the control
-    // socket, which is the same code: per-frame submission turned 5,920 ring
-    // entries into 61,221, about one per crossing.  Everything one turn wrote
-    // goes out in ONE send instead.
+    // The two things a completion cannot do for itself -- put this turn's
+    // frames on the wire and replace a recv that is no longer standing -- done
+    // once per turn, because per-frame submission turned 5,920 ring entries
+    // into 61,221.
     void pump()
     {
         if (m_dead)
@@ -333,25 +168,17 @@ public:
         arm();
     }
 
-    // States the ring cannot end on its own: no recv standing, or bytes queued
-    // with no send standing — both of them a submission get_sqe() refused.  An
-    // in-flight send needs no clamp, it ends with a completion.  The owner's
-    // loop asks this to decide whether it may sleep to its own deadline.
+    // States the ring cannot end on its own -- no recv standing, or bytes
+    // queued with no send standing -- which the owner's loop asks before it
+    // sleeps.
     bool needs_wake() const
     {
         return !m_dead && (!m_armed || m_writer.needs_retry());
     }
 
-    // Give up this link and answer everything it owed.
-    //
-    // The one function that ends a link.  Everything below is ordered so that
-    // no step can be reached twice: the flag first, then the tickets, then the
-    // descriptor.
-    // `expected` is the ordinary shutdown of a healthy link, which is the one
-    // reason a link ends that is not worth a warning: at stop time every shard
-    // retires N-1 of them, so an unconditional LOG_WARN would put N*(N-1) lines
-    // about nothing into the log of every clean stop and teach the next reader
-    // to ignore the line that matters.
+    // The one function that ends a link, ordered flag then tickets then
+    // descriptor so no step can be reached twice, with `expected` covering the
+    // N-1 links every clean stop retires.
     void die(const char* why, bool expected = false)
     {
         if (m_dead)
@@ -360,9 +187,7 @@ public:
         m_writer.mark_dead();
 
         // Every crossing this link was carrying, answered now rather than left
-        // for a deadline that does not exist.  The channel delivers each one to
-        // the runtime that asked, which renders it as the error it owes its
-        // client.
+        // for a deadline that does not exist.
         if (m_channel)
             for (const uint64_t t : m_owed)
                 m_channel->complete_deferred(t, request_status::no_target, {});
@@ -371,18 +196,9 @@ public:
 
         if (m_fd >= 0)
         {
-            // Through the loop, which holds the number until every operation
-            // naming it has reported: a plain close() here would free it for the
-            // next accept while a completion still names it.
-            //
-            // close_fd() and not poll_remove().  A poll is withdrawn by naming
-            // the request; a recv and a send are not, and close_fd() is the one
-            // that submits a cancel for the descriptor and then holds the number
-            // until that cancel and everything it withdrew has landed.  The
-            // writer is left on the ring on purpose: mark_dead() above makes
-            // every later flush() a no-op, so nothing is submitted against a
-            // number that is on its way out, and the buffer an in-flight send is
-            // reading from outlives the cancel because this object does.
+            // close_fd() and not poll_remove(), because a recv and a send are
+            // withdrawn by descriptor, and the writer is left on the ring
+            // since mark_dead() makes every later flush() a no-op.
             if (m_loop)
                 m_loop->close_fd(m_fd);
             else
@@ -407,26 +223,16 @@ private:
     {
         if (m_dead || !m_loop || m_armed || m_fd < 0 || !m_loop->ring_open())
             return;
-        // The request carries its own owner: the loop dispatches a completion
-        // by the handler named in it, and one left empty matches no live
-        // registration, so the completion is dropped.  Measured before this
-        // line existed: the mesh built its links, sent its requests, and every
-        // crossing hung — the completion never came back because nothing was
-        // waiting for it.
+        // The request carries its own owner, and one left empty matches no
+        // live registration, so the completion is dropped and every crossing
+        // hangs.
         m_req   = { this, nullptr, m_fd, sizeof(m_rbuf), op_read };
         m_armed = m_loop->submit_read(m_fd, m_rbuf, sizeof(m_rbuf), &m_req);
-        // A submission the ring refused is not a dead link.  needs_wake() says
-        // so, the owner's loop clamps its wait on it, and pump() tries again
-        // next turn — which is the same treatment the control socket's recv
-        // gets, and it is why this no longer die()s here: get_sqe() coming back
-        // empty under load would have retired a link that had nothing wrong
-        // with it and sent its shard's crossings through the daemon for good.
+        // A submission the ring refused is not a dead link, so needs_wake()
+        // clamps the wait and pump() tries again next turn.
     }
 
     // Act on every whole frame the recv completions have delivered so far.
-    //
-    // What used to be here as well was the ::read() loop that filled m_in.  It
-    // is gone with the poll it followed: the bytes arrive in the completion.
     void take_frames()
     {
         worker_proto::frame_type type{};
@@ -447,11 +253,9 @@ private:
 
     void handle(worker_proto::frame_type type, const std::string& payload)
     {
-        // Two frame types and no others.  The ticket in a chan_req belongs to
-        // the SIBLING and goes back with the answer; the ticket in a chan_rep
-        // belongs to this process.  The two spaces never meet, which is the
-        // same arrangement the worker and the daemon already rely on and the
-        // reason neither needs a tag.
+        // Two frame types and no others, where a chan_req's ticket belongs to
+        // the sibling and a chan_rep's to this process, so the two spaces
+        // never meet.
         if (type == worker_proto::frame_type::chan_req)
         {
             worker_proto::chan_request_wire q;
@@ -500,19 +304,16 @@ private:
     bool        m_armed{false};
     bool        m_dead{false};
 
-    // What a standing recv writes into.  One at a time and named by m_req, so
-    // there is never a second completion that could be writing here.
+    // What a standing recv writes into, one at a time and named by m_req.
     char        m_rbuf[16 * 1024];
     std::string m_in;
 
     std::unordered_set<uint64_t> m_owed;
 };
 
-// What `name#j` resolves to in a shard's own sink table.
-//
-// Registered under the qualified name shared/shard_target.h defines, so the
-// lookup that used to miss and fall through to the daemon now hits here first.
-// Everything about the request is the same on both routes.
+// What `name#j` resolves to in a shard's own sink table, registered under the
+// qualified name so the lookup hits here instead of falling through to the
+// daemon.
 class mesh_sink : public request_sink
 {
 public:
@@ -535,8 +336,8 @@ public:
             return true;
         }
 
-        // No link, or a link that has just given up.  The relay is the route
-        // that always exists; a crossing is slower here, never lost.
+        // No link, or a link that has just given up, so the crossing is slower
+        // here and never lost.
         if (m_relay && m_relay->serve_deferred(ticket, target, payload))
         {
             ++m_relayed;

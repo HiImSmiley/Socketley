@@ -16,11 +16,8 @@
 #include <cstring>
 #include <iostream>
 
-// ─── TLS configuration gate ───
-// See the header for what this build honours and what it still refuses.  It
-// deliberately lives next to the OpenSSL wrapper: whoever wires up the next
-// role — a server runtime's upstream leg, a cache's replication link — will be
-// reading this file, and narrowing the gate is part of that work.
+// The TLS configuration gate, next to the OpenSSL wrapper because whoever
+// wires up the next role will be reading this file.
 
 std::string tls_not_implemented_error(std::string_view option)
 {
@@ -50,20 +47,9 @@ std::string tls_config_refusal(runtime_type type,
     if (!anything_asked)
         return {};   // no TLS asked for, nothing to refuse
 
-    // A datagram socket has no handshake to put TLS on; that would be DTLS, and
-    // there is none here.
-    //
-    // The rule lived in server_instance::setup() and client_instance::setup(),
-    // written out twice, and a placeholder for a runtime in a worker never runs
-    // either — start() returns as soon as the child is forked, because binding
-    // and dialling happen over there.  So `create client x --udp --tls -s` was
-    // refused and unwound in the daemon and accepted out of process, where the
-    // worker discovered it a moment later and the runtime was left `failed`
-    // instead of never existing.  Two answers to one impossible configuration,
-    // decided by where it was going to run.
-    //
-    // It is a question about two flags. It needs no socket, so it belongs with
-    // the other questions about flags, and it is asked once.
+    // A datagram socket has no handshake to put TLS on, asked once here rather
+    // than in each setup(), which a placeholder never runs -- so the same
+    // configuration was refused in the daemon and accepted out of process.
     if (tls && udp)
         return "--tls on a UDP socket would need DTLS, which is not implemented\n"
                "  drop --udp to dial over TLS, or drop --tls to send datagrams\n";
@@ -85,19 +71,13 @@ std::string tls_config_refusal(runtime_type type,
     return "--tls: this binary was built without the OpenSSL development "
            "headers, so it has no record layer to speak TLS with\n";
 #else
-    // ── a client runtime: one leg, and it dials ──
-    //
-    // Handled before the listener rules below because it has no listener at
-    // all, and every one of them would ask this configuration for something it
-    // has no place to put.  --tls on its own is the complete configuration
-    // here: create_ssl_client pins the host from -t and verifies the chain
-    // against the system store, and neither of those is optional.
+    // A client runtime is handled before the listener rules because it has no
+    // listener, and --tls alone is complete: create_ssl_client pins the host
+    // from -t and verifies against the system store.
     if (type == runtime_client)
     {
-        // The mesh options configure a proxy: --client-ca verifies certificates
-        // presented by clients, which needs a listener, and
-        // --client-cert/--client-key name a second leg this role does not have.
-        // The certificate a client presents is --cert/--key, below.
+        // The mesh options configure a proxy, and the certificate a client
+        // presents is --cert/--key below.
         if (!mesh_client_ca.empty())
             return "--client-ca: verifies the certificates clients present, and a "
                    "client runtime has no listener for one to arrive on -- it "
@@ -125,10 +105,9 @@ std::string tls_config_refusal(runtime_type type,
             return msg;
         }
 
-        // The certificate this client presents is a pair.  Half of one loads
-        // nothing, so the dial would present nothing at all and a peer
-        // requiring mutual TLS would refuse it -- after the flags said it was
-        // configured.
+        // The certificate this client presents is a pair, and half of one
+        // loads nothing, so the dial would present nothing after the flags
+        // said it was configured.
         if (cert_path.empty() != key_path.empty())
             return cert_path.empty()
                 ? std::string("--key: needs --cert <file> as well -- a key with no "
@@ -139,11 +118,9 @@ std::string tls_config_refusal(runtime_type type,
         return {};
     }
 
-    // The mesh client-certificate options describe a *backend* leg, and
-    // neither a server nor a cache runtime has one: it would store them,
-    // report them and dial nothing.  (The flag handlers do not offer them on
-    // either at all; this catches a state file or an imported document that
-    // carries them.)
+    // The mesh client-certificate options describe a backend leg, which
+    // neither a server nor a cache has, so this catches a state file or an
+    // imported document that carries them.
     if ((type == runtime_server || type == runtime_cache) &&
         (!mesh_client_ca.empty() || !mesh_client_cert.empty() || !mesh_client_key.empty()))
     {
@@ -157,16 +134,9 @@ std::string tls_config_refusal(runtime_type type,
         return msg;
     }
 
-    // ── the listener half, identical for both roles ──
-    //
-    // A listener that terminates TLS needs something to terminate it with.
-    // Half a configuration is refused rather than half-honoured, in both
-    // directions: --tls without a key pair could only ever fall back to
-    // cleartext, and a certificate without --tls is an operator who believes
-    // the port is encrypted and has not turned it on.
-    //
-    // --ca is the exception on a proxy, and only there: it is that role's
-    // trust store for the *backend* leg (see below), not a listener option.
+    // Half a listener configuration is refused rather than half-honoured in
+    // both directions, with --ca the exception on a proxy, where it is the
+    // backend leg's trust store.
     const bool ca_is_listener_option = (type != runtime_proxy);
     if (!tls && (!cert_path.empty() || !key_path.empty() ||
                  (ca_is_listener_option && !ca_path.empty())))
@@ -183,34 +153,9 @@ std::string tls_config_refusal(runtime_type type,
     if (tls && key_path.empty())
         return "--tls: a TLS listener needs --key <file> to go with --cert\n";
 
-    // ── a cache that encrypts its port and replicates out of it ──
-    //
-    // The listener above is honoured; the replication link is not encrypted by
-    // anything and cannot be, so the two together describe a cache that
-    // encrypts what clients send it and then puts the identical data on the
-    // wire in the clear.
-    //
-    // Two separate cleartext paths, neither of which is the listener:
-    //
-    //   * this cache as a *follower* — connect_to_master() opens the socket
-    //     itself, sends "replicate\n" with a bare write(2) and reads the
-    //     leader's whole dump back.  No session, no verification, and no name
-    //     to verify against: --replicate is parsed with inet_pton, so the
-    //     target is always an address literal and there is no trust store on a
-    //     cache to check a chain against — its --ca is the *client* CA for its
-    //     own listener, exactly as a server's is.
-    //   * this cache as a *leader* — a promoted follower is written to by
-    //     follower_conn, which submits raw bytes straight at the descriptor
-    //     around the record layer that owns it.  That second writer is
-    //     deliberate and load-bearing (see handle_replicate_request), and it is
-    //     what makes "encrypted for clients, cleartext for replicas" the
-    //     default outcome rather than a corner case.
-    //
-    // So the configuration is refused rather than half-honoured.  The leader
-    // half cannot be caught here at all — a cache becomes a leader when a
-    // client sends REPLICATE, long after any configuration was validated — so
-    // that one is refused at the command, in handle_replicate_request().  This
-    // covers the half that *is* configuration.
+    // A cache that encrypts its port and replicates out of it puts the
+    // identical data on the wire in the clear, so the configuration is refused
+    // here and the leader half at handle_replicate_request().
     if (type == runtime_cache && tls && !cache_replicate_target.empty())
         return "--replicate: a cache's replication link is not encrypted -- it "
                "dials its leader in cleartext and would stream this cache's "
@@ -221,20 +166,15 @@ std::string tls_config_refusal(runtime_type type,
     if (type != runtime_proxy)
         return {};
 
-    // ── the proxy's own options ──
-    //
-    // --client-ca verifies certificates presented *by clients*, which only a
-    // listener that speaks TLS can ask any client for.  On a cleartext port it
-    // would authenticate nobody while inspect reported mutual TLS.
+    // --client-ca verifies certificates presented by clients, which only a
+    // listener that speaks TLS can ask for.
     if (!mesh_client_ca.empty() && !tls)
         return "--client-ca: verifies the certificates clients present, which "
                "needs --tls --cert --key on this proxy's own listener -- on a "
                "cleartext port it would authenticate nobody\n";
 
-    // A client certificate is a pair.  Half of one loads nothing, so the
-    // backend leg would connect without presenting anything at all and a
-    // backend requiring mutual TLS would refuse it — after the flags said it
-    // was configured.
+    // A client certificate is a pair, and half of one leaves the backend leg
+    // presenting nothing after the flags said it was configured.
     if (mesh_client_cert.empty() != mesh_client_key.empty())
         return mesh_client_cert.empty()
             ? std::string("--client-key: needs --client-cert <file> as well -- a "
@@ -272,16 +212,9 @@ static const char* ssl_error_name(int err)
     }
 }
 
-// Drain OpenSSL's error queue to stderr, one line per queued reason.
-//
-// Every failure below used to report a bare "handshake failed" / "failed to
-// load certificate".  The half of the message that matters -- expired cert,
-// unknown CA, no shared cipher, a client speaking plain HTTP at a TLS port,
-// wrong passphrase on the key file -- was already sitting on OpenSSL's
-// thread-local error queue and nobody popped it, so an operator got a symptom
-// and no cause.  Draining is not optional bookkeeping either: the queue is
-// per-thread and persistent, so an entry left behind resurfaces later and is
-// reported as the diagnosis for some unrelated connection's failure.
+// Drain OpenSSL's error queue to stderr, because the queue is per-thread and
+// persistent, so an entry left behind is reported as the cause of an unrelated
+// failure.
 static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
 {
     char buf[256];
@@ -305,31 +238,18 @@ static void log_ssl_errors(const char* what, int ssl_err = SSL_ERROR_NONE)
     std::cerr << "\n";
 }
 
-// Apply performance-critical SSL_CTX options common to both server and client.
-// Called once at context initialization — all per-connection SSL objects inherit these.
+// Apply SSL_CTX options common to server and client, once, which every
+// per-connection SSL object inherits.
 static void apply_ctx_performance_options(SSL_CTX* ctx)
 {
-    // ── Session resumption ──
-    // Enable session tickets for stateless TLS resumption (avoids full handshake
-    // on reconnect). Server-side: tickets are generated and sent to clients.
-    // Client-side: tickets are stored and presented on reconnect.
-    // SSL_OP_NO_TICKET is OFF by default, but explicitly clear it for clarity.
+    // Session tickets for stateless resumption, with SSL_OP_NO_TICKET cleared
+    // explicitly although it is off by default.
     long opts = SSL_CTX_get_options(ctx);
     opts &= ~SSL_OP_NO_TICKET;
 
-    // ── No kernel TLS here, by design ──
-    // SSL_OP_ENABLE_KTLS used to be set on this line. It could never do
-    // anything: KTLS requires the SSL object to sit on a socket BIO so OpenSSL
-    // can hand the kernel the file descriptor and the traffic keys, and this
-    // wrapper deliberately gives every connection a memory BIO pair instead
-    // (see create_ssl). That choice is the whole point of the design -- with
-    // memory BIOs OpenSSL is a codec and nothing else, every network byte is
-    // still moved by an io_uring submission, and there is exactly one place in
-    // the daemon that talks to sockets. A socket BIO would take reads and
-    // writes back into OpenSSL's own blocking syscalls, behind the event
-    // loop's back. So the option was a no-op that advertised an optimisation
-    // the transport is not built for: don't put it back without moving off
-    // memory BIOs first.
+    // No kernel TLS here, because KTLS needs a socket BIO and this wrapper
+    // gives every connection a memory BIO pair so OpenSSL is a codec and
+    // io_uring moves every byte.
 
     // Prefer server cipher order for better security/performance control
     opts |= SSL_OP_CIPHER_SERVER_PREFERENCE;
@@ -341,11 +261,9 @@ static void apply_ctx_performance_options(SSL_CTX* ctx)
 
     SSL_CTX_set_options(ctx, opts);
 
-    // ── SSL modes ──
-    // SSL_MODE_RELEASE_BUFFERS: free internal read buffers after each SSL_read,
-    // reducing per-connection memory when many connections are idle.
-    // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER: allow SSL_write retry with different
-    // buffer pointer (same data), needed when io_uring may return short writes.
+    // SSL_MODE_RELEASE_BUFFERS frees read buffers between reads, and
+    // ACCEPT_MOVING_WRITE_BUFFER allows the retry io_uring's short writes
+    // require.
     long mode = SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
 
     // SSL_MODE_AUTO_RETRY: retry internal reads/writes automatically on
@@ -354,11 +272,8 @@ static void apply_ctx_performance_options(SSL_CTX* ctx)
 
     SSL_CTX_set_mode(ctx, mode);
 
-    // ── Max send fragment ──
-    // Set max TLS record size to 16KB (the TLS max). Larger records amortize
-    // the ~29-byte TLS record header overhead. For high-throughput scenarios
-    // this is optimal. For latency-sensitive small messages, the kernel/OpenSSL
-    // will split into smaller records automatically on partial writes.
+    // 16 KB records, the TLS maximum, which amortises the record header and
+    // still splits automatically on partial writes.
     SSL_CTX_set_max_send_fragment(ctx, 16384);
 }
 #endif
@@ -376,9 +291,8 @@ bool tls_context::init_server(std::string_view cert_path, std::string_view key_p
     }
     SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
-    // ── Session caching for TLS resumption ──
-    // Enable server-side session cache. Returning clients can resume with a
-    // cached session, skipping the expensive RSA/ECDHE key exchange.
+    // Server-side session cache, so a returning client resumes without the key
+    // exchange.
     SSL_CTX_set_session_cache_mode(m_ctx, SSL_SESS_CACHE_SERVER);
     SSL_CTX_sess_set_cache_size(m_ctx, 20480);
 
@@ -518,20 +432,15 @@ SSL* tls_context::create_ssl() const
         return nullptr;
     }
 
-    // Memory BIO pair, not a socket BIO: OpenSSL only ever encodes and decodes
-    // here, and every byte on the wire is carried by an io_uring submission.
-    // See apply_ctx_performance_options for what that costs us (KTLS) and why
-    // it is worth it.
+    // Memory BIO pair and not a socket BIO, so OpenSSL only encodes and
+    // decodes and every byte on the wire is carried by an io_uring submission.
     BIO* rbio = BIO_new(BIO_s_mem());
     BIO* wbio = BIO_new(BIO_s_mem());
     if (!rbio || !wbio)
     {
-        // Never hand SSL_set_bio a half-allocated pair. Which side it takes
-        // ownership of when the other is NULL has changed between OpenSSL
-        // releases, so the survivor either leaks or gets freed twice -- and the
-        // one situation that makes BIO_new fail is the situation where leaking
-        // matters. Refuse the connection instead; the caller sees nullptr and
-        // drops the socket.
+        // Never hand SSL_set_bio a half-allocated pair, because which side it
+        // takes ownership of when the other is NULL has changed between
+        // OpenSSL releases.
         if (rbio) BIO_free(rbio);
         if (wbio) BIO_free(wbio);
         SSL_free(ssl);
@@ -545,19 +454,8 @@ SSL* tls_context::create_ssl() const
     // SSL_free() frees both BIOs from here on; do not free them separately.
     SSL_set_bio(ssl, rbio, wbio);
 
-    // What this actually does: decide what BIO_read returns from an *empty*
-    // memory BIO. -1 plus the retry flag means "nothing yet, ask again", which
-    // is what an empty buffer means in a non-blocking design; 0 would mean EOF,
-    // and OpenSSL would read a drained buffer as a closed connection -- which
-    // it did, on the value that was here. A peer that really has gone is
-    // signalled by the caller tearing the connection down after its io_uring
-    // read returns 0; it is never inferred from this buffer being empty.
-    //
-    // What it does not do: limit anything. The comment that stood here claimed
-    // it capped buffering at 512KB. It never has -- BIO_set_mem_eof_return has
-    // no size argument and no relation to the buffer's growth -- so the daemon
-    // carried a documented protection that did not exist. The real cap is
-    // max_bio_buffered, enforced in bio_write_in and ssl_write below.
+    // What BIO_read returns from an empty memory BIO: -1 with the retry flag
+    // means ask again, where 0 would be read as a closed connection.
     BIO_set_mem_eof_return(rbio, -1);
     BIO_set_mem_eof_return(wbio, -1);
 
@@ -581,14 +479,9 @@ SSL* tls_context::create_ssl_server() const
 SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
 {
 #if SOCKETLEY_HAS_TLS
-    // ── Hostname verification ──
-    // init_client sets SSL_VERIFY_PEER, which proves only that some trusted CA
-    // signed the chain. It says nothing about *who* the chain was issued to, so
-    // a certificate for any unrelated host -- one anybody can buy for a domain
-    // they own -- satisfied it, and a peer that redirected the connection to
-    // itself was accepted as the intended backend. The name has to be pinned
-    // per connection, before the handshake, which is why it arrives here as an
-    // argument instead of a setter someone can skip.
+    // SSL_VERIFY_PEER proves only that some trusted CA signed the chain, so
+    // the name is pinned per connection before the handshake and arrives as an
+    // argument rather than a skippable setter.
     if (expected_hostname.empty())
     {
         std::cerr << "[tls] refusing client connection: no expected peer name given\n";
@@ -601,12 +494,9 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
 
     const std::string name(expected_hostname);
 
-    // An address literal has to be checked against the certificate's iPAddress
-    // SAN, and must not be sent as SNI at all (RFC 6066 allows host names
-    // there only; some servers reject the handshake outright when it is). The
-    // probe is inet_pton rather than just trying the IP form first, because a
-    // failed parse in there pushes a reason onto the error queue that would
-    // then be drained and reported as the cause of an unrelated failure.
+    // An address literal is checked against the iPAddress SAN and never sent
+    // as SNI, probed with inet_pton so no failed parse leaves a reason on the
+    // error queue.
     unsigned char ip_probe[16];
     const bool is_ip = inet_pton(AF_INET,  name.c_str(), ip_probe) == 1 ||
                        inet_pton(AF_INET6, name.c_str(), ip_probe) == 1;
@@ -658,10 +548,8 @@ int tls_context::do_handshake(SSL* ssl)
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         return 0;
 
-    // A rejected certificate reaches here as a generic protocol error. The
-    // useful half of the diagnosis -- expired, self-signed, name mismatch -- is
-    // in the verify result and is not on the error queue at all, so report both
-    // or an operator is left guessing which of the two went wrong.
+    // A rejected certificate reaches here as a generic protocol error, so the
+    // verify result is reported too or an operator is left guessing.
     long verify = SSL_get_verify_result(ssl);
     if (verify != X509_V_OK)
         std::cerr << "[tls] handshake failed: peer certificate rejected: "
@@ -687,9 +575,9 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
 
     if (err == SSL_ERROR_ZERO_RETURN)
     {
-        // close_notify: an orderly shutdown by the peer, not a failure. Still
-        // empty the queue -- a leftover entry would be blamed on the next
-        // connection that does fail.
+        // close_notify is an orderly shutdown and not a failure, but the queue
+        // is still emptied so a leftover entry is not blamed on the next
+        // connection.
         ERR_clear_error();
         return -1;
     }
@@ -704,13 +592,9 @@ int tls_context::ssl_read(SSL* ssl, char* buf, int len)
 int tls_context::ssl_write(SSL* ssl, const char* buf, int len)
 {
 #if SOCKETLEY_HAS_TLS
-    // Outbound half of the buffer cap. SSL_write appends ciphertext to the
-    // write BIO whether or not anyone is draining it, so a peer that stops
-    // reading would otherwise let a fast producer buffer without limit -- the
-    // same unbounded growth as the inbound side, just driven from our end.
-    // Report 0 ("want more data") rather than an error: the contract for 0 is
-    // that the caller retries this same buffer once it has flushed, which is
-    // exactly the right answer to backpressure, and the connection survives.
+    // Outbound half of the buffer cap, reported as 0 rather than an error
+    // because the contract for 0 is that the caller retries the same buffer
+    // once it has flushed.
     BIO* wbio = SSL_get_wbio(ssl);
     if (wbio && BIO_ctrl_pending(wbio) >= max_bio_buffered)
         return 0;
@@ -758,22 +642,10 @@ int tls_context::bio_write_in(SSL* ssl, const char* buf, int len)
     if (len <= 0)
         return 0;
 
-    // ── Inbound buffer cap ──
-    // A memory BIO grows to hold whatever is written into it; nothing in
-    // OpenSSL bounds it, and BIO_set_mem_eof_return -- which the comment in
-    // create_ssl used to claim did -- has nothing to do with size. Handshake
-    // records are the cheap way to abuse that: SSL only consumes a record once
-    // it is whole, so a peer that sends a few hundred bytes at a time and never
-    // finishes leaves every byte of it sitting here. One connection, no
-    // authentication needed, unlimited allocation, inside a daemon that goes to
-    // the trouble of capping connection counts everywhere else.
-    //
-    // 512KB is far above any legitimate need: a TLS record maxes out at 16KB
-    // and a large certificate chain is a few tens of KB, so a connection that
-    // reaches this is either broken or hostile. Either way it does not recover
-    // by being fed more, so this is fatal rather than backpressure -- the
-    // caller's contract for -1 is free_ssl() plus close, and nothing is
-    // allocated here to leak on the way out.
+    // Inbound buffer cap, because SSL consumes a record only once it is whole
+    // and a peer that never finishes one would allocate without limit; 512 KB
+    // is far above any legitimate need, so this is fatal rather than
+    // backpressure.
     const long buffered = static_cast<long>(BIO_ctrl_pending(rbio));
     if (buffered + static_cast<long>(len) > max_bio_buffered)
     {

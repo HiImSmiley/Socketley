@@ -1,7 +1,6 @@
 #pragma once
 // HANDOVER gives the descriptor away with SCM_RIGHTS; RELAY tags the bytes
 // with a conn_ref for a middle that must keep seeing them.
-// SCM_RIGHTS duplicates: a handover is complete only once relinquish() has run.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -32,12 +31,12 @@ bool send_handover(int channel_fd, const handover& h, int payload_fd);
 // is gone; a partial read cannot strand a descriptor, this is one sendmsg.
 bool recv_handover(int channel_fd, handover& h, int& out_fd);
 
-// Asks back everything armed on `fd`.  CALL IT ONCE: calling it every turn
-// never progresses, because the cancel is the completion the next drain eats.
+// Asks back everything armed on `fd`, exactly once, because the cancel is the
+// completion the next drain eats.
 void withdraw(event_loop* loop, int fd);
 
-// True once the descriptor is gone; false means retry on a later turn.  Never
-// write to it after send_handover() succeeds, whatever this answers.
+// True once the descriptor is gone, false means retry later, and never write
+// to it after send_handover() succeeds whatever this answers.
 bool relinquish(event_loop* loop, int fd);
 
 // [u32 len][u8 op][conn_ref][payload]; the prefix lets a receiver skip an
@@ -52,15 +51,14 @@ enum class relay_op : uint8_t
 
 inline constexpr size_t relay_header_size = 4 + 1 + conn_ref_wire_size;
 
-// Refuse rather than allocate.  A relay payload is one read off a socket, which
-// this project caps at 16 KB, plus room for a rewritten header.
+// Refuse rather than allocate: far above the 16 KB one socket read this
+// project caps at, far below anything that would hurt to reject.
 inline constexpr uint32_t relay_max_payload = 1u * 1024u * 1024u;
 
 std::string relay_frame(relay_op op, const conn_ref& ref, std::string_view payload);
 
-// Pulls one whole frame off the front of `buf`.  False with `fatal` clear means
-// "not yet, keep reading" and leaves `buf` alone.  False with `fatal` set means
-// the stream is not a relay stream and there is no resynchronisation point.
+// Pulls one whole frame off the front of `buf`; `fatal` clear means not yet
+// and leaves `buf` alone, `fatal` set means the stream is not a relay stream.
 bool take_relay_frame(std::string& buf, relay_op& op, conn_ref& ref,
                       std::string& payload, bool& fatal);
 

@@ -33,8 +33,7 @@ bool take_u32(const char*& p, const char* end, uint32_t& out)
     return true;
 }
 
-// A handover message is a name, a runtime name and one socket read.  Anything
-// larger is not one.
+// A handover message is a name, a runtime name and one socket read.
 constexpr size_t max_handover_message = 2u * 1024u * 1024u;
 
 }   // namespace
@@ -161,9 +160,8 @@ bool recv_handover(int channel_fd, handover& h, int& out_fd)
     ssize_t n;
     for (;;)
     {
-        // MSG_CMSG_CLOEXEC on the way in, always.  A descriptor received here
-        // and then inherited by a fork/exec is a socket the child holds open
-        // for ever, and the peer's close never becomes an EOF for anybody.
+        // MSG_CMSG_CLOEXEC always, because a received descriptor inherited
+        // across a fork/exec is a socket the child holds open for ever.
         n = ::recvmsg(channel_fd, &msg, MSG_CMSG_CLOEXEC);
         if (n < 0 && errno == EINTR) continue;
         break;
@@ -206,9 +204,8 @@ bool recv_handover(int channel_fd, handover& h, int& out_fd)
 
     if (!ref.valid())
     {
-        // A descriptor with no name is a descriptor nothing can ever route to
-        // or close on purpose.  Closing it is the only answer that does not
-        // leak it.
+        // A descriptor with no name can never be routed to or closed on
+        // purpose, so closing it is the only answer that does not leak it.
         LOG_WARN("conn transfer: handover carried no connection name, dropping it");
         ::close(fd);
         return false;
@@ -240,16 +237,9 @@ bool relinquish(event_loop* loop, int fd)
 
     if (loop)
     {
-        // The whole reason this is not just close().  An SQE holds the
-        // descriptor NUMBER and the kernel resolves it when it consumes the
-        // SQE; closing before that happens does not cancel the operation, it
-        // aims it at whatever takes the number next.  After a handover the
-        // receiver is writing to this socket, so a read still armed here would
-        // also be stealing bytes that belong to it.
-        //
-        // No cancel is submitted here.  Withdrawing is the caller's decision
-        // and has to happen exactly once; this only reports whether it has
-        // taken effect yet.
+        // Not close(), because an SQE holds the descriptor NUMBER and the
+        // kernel resolves it on consumption, so closing first aims the
+        // operation at whatever takes the number next.
         if (loop->fd_inflight(fd) > 0)
             return false;
 

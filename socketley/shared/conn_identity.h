@@ -1,6 +1,7 @@
 #pragma once
-// Names a connection across processes, where a reissued descriptor cannot.
-// `owner` is the minting runtime, `serial` the connection, top six bits its shard.
+// Names a connection across processes, where a reissued descriptor cannot:
+// `owner` is the minting runtime, `serial` the connection, top six bits its
+// shard.
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -37,9 +38,8 @@ struct conn_ref
     uint64_t owner{0};
     uint64_t serial{0};
 
-    // A ref with either half zero names nothing.  Resolving one must fail, not
-    // fall through to a default — that fall-through is what a descriptor
-    // number gave us.
+    // A ref with either half zero names nothing, so resolving one must fail
+    // rather than fall through to a default the way a descriptor number did.
     bool valid() const { return owner != 0 && serial != 0; }
 
     bool operator==(const conn_ref& o) const
@@ -62,9 +62,8 @@ struct conn_ref_hash
     }
 };
 
-// Mints the serial half, one per runtime instance.  Seeded from
-// CLOCK_MONOTONIC rather than 1, so a restart of the same runtime cannot mint
-// serials a peer still holds -- and monotonic because NTP cannot move it back.
+// Mints the serial half, seeded from CLOCK_MONOTONIC rather than 1 so a
+// restart of the same runtime cannot mint serials a peer still holds.
 class conn_serial_source
 {
 public:
@@ -79,8 +78,8 @@ public:
             m_counter = 1;          // serial 0 is not a valid ref
     }
 
-    // Not a constructor argument: the shard index arrives in a config frame,
-    // read long after this is built.  Call it before the first next().
+    // Not a constructor argument because the shard index arrives in a config
+    // frame; call it before the first next().
     void set_shard(uint32_t shard_index)
     {
         m_shard = shard_index & conn_serial_shard_mask;
@@ -101,9 +100,8 @@ private:
     uint32_t m_shard{0};
 };
 
-// Which shard minted this ref.  Meaningful for any ref this build produced;
-// a ref from an unsharded runtime reads 0, which is correct — it is shard 0
-// of one.
+// Which shard minted this ref, reading 0 for an unsharded runtime, which is
+// correct because that is shard 0 of one.
 inline uint32_t conn_ref_shard(const conn_ref& r)
 {
     return static_cast<uint32_t>(r.serial >> conn_serial_shard_shift);
@@ -122,8 +120,7 @@ inline void put_conn_ref(std::string& out, const conn_ref& r)
 }
 
 // Returns false and leaves `r` untouched when there are not sixteen bytes at
-// `p`.  The caller advances `p` itself only on success, so a truncated frame
-// cannot half-consume a name.
+// `p`, so a truncated frame cannot half-consume a name.
 inline bool take_conn_ref(const char*& p, const char* end, conn_ref& r)
 {
     if (end - p < static_cast<ptrdiff_t>(conn_ref_wire_size))
@@ -141,9 +138,8 @@ inline bool take_conn_ref(const char*& p, const char* end, conn_ref& r)
     return true;
 }
 
-// Lua gets a descriptor for a runtime's own clients and a handle for a routed
-// one, from a range no descriptor can occupy -- so the two can never collide.
-// A handle is per-runtime; what travels is the conn_ref it maps to.
+// Lua gets a descriptor for a runtime's own clients and a per-runtime handle
+// for a routed one, from a range no descriptor can occupy.
 inline constexpr int conn_handle_base = 1 << 24;      // 16777216
 
 inline bool is_conn_handle(int id) { return id >= conn_handle_base; }

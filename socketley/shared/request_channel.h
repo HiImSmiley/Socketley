@@ -1,7 +1,7 @@
 #pragma once
-// A request one runtime makes of another, answered on a later turn, so an
-// asking side cannot tell "computed here" from "written to a socket".  One
-// queue, in order; an origin must call drop_origin() before it dies.
+// A request one runtime makes of another, answered on a later turn from one
+// queue in order, so an asking side cannot tell "computed here" from "written
+// to a socket".
 
 #include <cstddef>
 #include <cstdint>
@@ -45,15 +45,15 @@ public:
     // say so and the channel parks the request against a ticket.
     virtual bool serves_inline() const { return true; }
 
-    // False means it could not even accept it, and the origin is answered
-    // `no_target`.  The name is passed because the default sink is registered
-    // under none and forwards for every name.
+    // False means it could not even accept it and the origin is answered
+    // `no_target`, with the name passed because the default sink forwards for
+    // every name.
     virtual bool serve_deferred(uint64_t /*ticket*/, std::string_view /*target*/,
                                 std::string_view /*payload*/)
     { return false; }
 };
 
-// What asks.  The reply carries the cookie and nothing else, because by then
+// What asks, whose reply carries the cookie and nothing else, because by then
 // the connection that asked may be gone.
 class request_origin
 {
@@ -66,8 +66,8 @@ public:
 class request_channel : public io_handler
 {
 public:
-    // Generous on purpose: one 16 KB read is over a thousand requests, and a
-    // client may pipeline all of it.  These stop the client that keeps doing it.
+    // Generous on purpose, since one 16 KB read is over a thousand requests a
+    // client may pipeline.
     static constexpr size_t MAX_PENDING            = 32768;
     static constexpr size_t MAX_PENDING_BYTES      = 16u << 20;
     static constexpr size_t MAX_PENDING_BACKGROUND = (MAX_PENDING * 3) / 4;
@@ -75,14 +75,12 @@ public:
 
     ~request_channel() override;
 
-    // Give the channel the ring it wakes itself with.  Until this is called
-    // post() refuses everything, which is what a manager with no event loop
-    // behind it should do.
+    // Give the channel the ring it wakes itself with, until which post()
+    // refuses everything.
     void attach(event_loop& loop);
 
-    // Stop using the ring.  Every queued request is answered `dropped` — an
-    // origin that is told nothing waits for ever — and the owner registration
-    // is given back.  Call before the ring is shut down.
+    // Stop using the ring, answering every queued request `dropped` because an
+    // origin that is told nothing waits for ever.
     void detach();
 
     // ── The sink table ──────────────────────────────────────────────────────
@@ -103,12 +101,12 @@ public:
               std::string_view target, std::string_view payload,
               request_class cls = request_class::client);
 
-    // Revoke an origin: its queued requests are discarded and no reply is
-    // delivered to it again.  Must be called before the origin is destroyed.
+    // Revoke an origin, discarding its queued requests, and call it before the
+    // origin is destroyed.
     void drop_origin(const request_origin* origin);
 
-    // Finishes a deferred request if its origin is still alive.  An unknown
-    // ticket is ignored: answering twice is nothing the channel cannot absorb.
+    // Finishes a deferred request if its origin is still alive, ignoring an
+    // unknown ticket.
     void complete_deferred(uint64_t ticket, request_status st,
                            std::string_view reply);
 
@@ -116,8 +114,8 @@ public:
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 
-    // Diagnostics.  Counters rather than gauges where a gauge would only ever
-    // read zero from outside a drain.
+    // Diagnostics, as counters rather than gauges where a gauge would only
+    // ever read zero from outside a drain.
     size_t   pending()        const { return m_queue.size(); }
     size_t   pending_bytes()  const { return m_bytes; }
     size_t   sink_count()     const { return m_sinks.size(); }
@@ -151,9 +149,8 @@ private:
     // change and the fallback is a property of the process, not of the map.
     request_sink* m_default_sink{nullptr};
 
-    // Bounded so a remote that never answers cannot grow this.  No deadline
-    // yet: a parked ticket is swept when its origin goes, which covers the
-    // common case and not an origin that outlives the request for ever.
+    // Bounded so a remote that never answers cannot grow this, with no
+    // deadline yet because a parked ticket is swept when its origin goes.
     static constexpr size_t MAX_PARKED = 4096;
     struct parked_request
     {
@@ -163,9 +160,8 @@ private:
     std::unordered_map<uint64_t, parked_request> m_parked;
     uint64_t m_next_ticket{1};
 
-    // Origins allowed to receive a reply.  A flat vector because there is one
-    // entry per runtime that asks anything of another — a handful — and the
-    // check runs once per reply, not per byte.
+    // Origins allowed to receive a reply, as a flat vector because there is
+    // one entry per runtime that asks anything of another.
     std::vector<request_origin*> m_origins;
     bool origin_live(const request_origin* o) const;
 

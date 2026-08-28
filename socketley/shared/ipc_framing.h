@@ -3,19 +3,17 @@
 #include <string>
 #include <string_view>
 
-// One command per line meant a payload carrying a newline ended the command and
-// the rest was executed.  A frame is 0x00 [u32 length] [bytes], and 0x00 cannot
-// begin a legacy command -- sent only when a line cannot carry it, so an old
-// daemon sees what it always saw in every case that worked.
+// A frame is 0x00 [u32 length] [bytes], sent only when a line cannot carry the
+// payload, because 0x00 cannot begin a legacy command.
 namespace ipc_frame
 {
 
 inline constexpr char     marker      = '\0';
 inline constexpr size_t   header_size = 5;          // marker + u32
 
-// Refuse absurd lengths rather than trying to allocate them.  16 MB is far
-// above any command this protocol carries — the largest by a distance is an
-// `import` document — and far below anything that would hurt to reject.
+// Refuse absurd lengths rather than allocate them: 16 MB is far above the
+// largest command this protocol carries and far below anything that hurts to
+// reject.
 inline constexpr uint32_t max_payload = 16u * 1024u * 1024u;
 
 // A newline forces it, and so does a carriage return: the daemon strips a
@@ -41,9 +39,8 @@ inline std::string encode(std::string_view command)
 
 enum class take { need_more, ok, fatal };
 
-// Without consuming: erasing per command makes a batched read quadratic, which
-// the replication link on a busy leader is.  `payload` points INTO buf, and
-// `next` is only meaningful on ok.
+// Without consuming, because erasing per command makes a batched read
+// quadratic; `payload` points INTO buf and `next` is only meaningful on ok.
 inline take peek_frame(std::string_view buf, size_t off,
                        std::string_view& payload, size_t& next)
 {

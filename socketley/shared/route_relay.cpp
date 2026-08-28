@@ -55,9 +55,8 @@ bool open(runtime_manager* mgr, std::string_view to, std::string_view from,
     auto* sink = mgr ? mgr->route_sink() : nullptr;
     if (!sink)
     {
-        // Reached when the target is in another process and this one has no way
-        // to speak to it.  Says which of the two it is, because "there is no
-        // runtime called x" would be a different and wrong diagnosis.
+        // Says which of the two it is, because "there is no runtime called x"
+        // would be a different and wrong diagnosis.
         err = "\"" + std::string(to) + "\" is not in this process and there is "
               "no channel to reach it";
         return false;

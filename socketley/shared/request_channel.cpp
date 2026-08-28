@@ -18,11 +18,9 @@ const char* request_status_text(request_status st)
 
 request_channel::~request_channel()
 {
-    // Deliberately does not touch the loop.  The daemon's event_loop and its
-    // runtime_manager are both objects with static storage duration in the same
-    // translation unit, and the loop is destroyed first — so by the time this
-    // runs there is no ring to deregister from.  detach() is what gives the
-    // registration back, and the daemon calls it while the ring is still there.
+    // Deliberately does not touch the loop, which has static storage duration
+    // in the same translation unit and is destroyed first; detach() is what
+    // gives the registration back.
     m_queue.clear();
     m_origins.clear();
     m_sinks.clear();
@@ -33,17 +31,9 @@ void request_channel::attach(event_loop& loop)
     m_loop = &loop;
     m_wake = { this, nullptr, -1, 0, op_nop };
 
-    // A wakeup that was in flight across a detach never reported — the loop
-    // drops a completion whose owner has deregistered — so the flag survived
-    // with nothing left to lower it, and every later post() would queue behind
-    // a wakeup that is not coming.  The loop is the only thing that knows:
-    // owner_inflight() counts what is still in the ring for this handler over
-    // every registration it has held.  Zero means the request is free.
-    //
-    // owner_table_full() is the case it cannot answer — a handler that never
-    // got a slot reads zero whatever it has outstanding — so a full table
-    // leaves the flag alone rather than clearing it on a zero that means
-    // "unknown".
+    // A wakeup in flight across a detach never reports, so the flag is cleared
+    // from owner_inflight(), except when the owner table is full and zero
+    // would mean unknown.
     if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
         m_wake_armed = false;
 
@@ -52,9 +42,8 @@ void request_channel::attach(event_loop& loop)
 
 void request_channel::detach()
 {
-    // Everything queued is answered rather than forgotten.  An origin that was
-    // told a reply is coming and never gets one waits for ever, and on a client
-    // connection that is a socket held open until the runtime stops.
+    // Everything queued is answered rather than forgotten, because an origin
+    // promised a reply that never comes waits for ever.
     while (!m_queue.empty())
     {
         entry e = std::move(m_queue.front());
@@ -127,10 +116,9 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
         return false;
     }
 
-    // Background work stops short of the cap so that a request somebody is
-    // actually waiting on still has room.  Counted separately, because the two
-    // are different events: a refused client request is a connection about to
-    // be closed, a dropped store is a message that will not be in the cache.
+    // Background work stops short of the cap so a request somebody is waiting
+    // on still has room, counted separately because the two are different
+    // events.
     const size_t limit = (cls == request_class::background)
                        ? MAX_PENDING_BACKGROUND : MAX_PENDING;
     const size_t byte_limit = (cls == request_class::background)
@@ -145,9 +133,8 @@ bool request_channel::post(request_origin* origin, uint64_t cookie,
         return false;
     }
 
-    // Before the entry goes in, not after.  An entry queued behind a submission
-    // that never reached the ring is one nothing will ever come back for, and
-    // the origin has already been promised a reply by then.
+    // Before the entry goes in, because an entry queued behind a submission
+    // that never reached the ring is one nothing will come back for.
     if (!kick())
     {
         if (cls == request_class::background)
@@ -193,9 +180,8 @@ void request_channel::complete_deferred(uint64_t ticket, request_status st,
 
 void request_channel::drop_origin(const request_origin* origin)
 {
-    // Parked requests first.  A ticket whose origin is gone can never be
-    // delivered, and leaving it in the table is the one way this map grows
-    // without bound.
+    // Parked requests first, since a ticket whose origin is gone can never be
+    // delivered and is the one way this map grows without bound.
     for (auto it = m_parked.begin(); it != m_parked.end(); )
         it = (it->second.origin == origin) ? m_parked.erase(it) : std::next(it);
 
@@ -222,9 +208,8 @@ void request_channel::drop_origin(const request_origin* origin)
 
 void request_channel::on_cqe(struct io_uring_cqe* /*cqe*/)
 {
-    // The one submission this handler ever makes.  Lowered first, so a post()
-    // from inside a reply callback arms a fresh wakeup instead of queueing
-    // behind one that has already reported.
+    // The one submission this handler ever makes, lowered first so a post()
+    // from inside a reply callback arms a fresh wakeup.
     m_wake_armed = false;
     drain();
 }
@@ -235,14 +220,9 @@ void request_channel::drain()
         return;
     m_draining = true;
 
-    // Exactly the batch that was queued when the wakeup was armed, up to the
-    // per-drain limit.  Two reasons for the ceiling and both matter: a reply
-    // callback may post again — a Lua on_client_message can, and so can a cache
-    // command that publishes — and without a fixed budget a drain could feed
-    // itself for ever; and a burst of tens of thousands of stores would
-    // otherwise be served in one completion handler, with every other
-    // connection on the loop waiting behind it.  What is left is re-armed
-    // below, so nothing is lost, it just takes another turn.
+    // Exactly the batch queued when the wakeup was armed, capped so a reply
+    // callback that posts again cannot feed the drain itself and a burst
+    // cannot hold the loop.
     size_t budget = std::min(m_queue.size(), MAX_DRAIN_BATCH);
 
     while (budget-- > 0 && !m_queue.empty())
@@ -254,20 +234,16 @@ void request_channel::drain()
         request_status st = request_status::no_target;
         std::string    reply;
 
-        // Looked up now and not at post() time: a cache that stopped in between
-        // is answered rather than reached through a pointer the manager has
-        // already withdrawn.
-        // Taken out of the table before the call, not held across it: serving a
-        // request can reach Lua, Lua can create or remove a runtime, and that
-        // republishes the whole sink table underneath this iterator.
+        // Looked up now and taken out of the table before the call, because
+        // serving a request can reach Lua, which can create or remove a
+        // runtime and republish this table.
         auto  sit  = m_sinks.find(e.target);
         auto* sink = (sit == m_sinks.end()) ? m_default_sink : sit->second;
         if (sink && !sink->serves_inline())
         {
-            // The sink is on the other side of something — a socket, another
-            // process — and cannot fill `reply` before returning.  Park the
-            // request against a ticket and let it answer on its own turn.
-            // Nothing here waits, which is the entire reason this path exists.
+            // The sink is on the other side of a socket and cannot fill
+            // `reply` before returning, so the request parks against a ticket
+            // and nothing here waits.
             if (m_parked.size() >= MAX_PARKED)
             {
                 m_stat_deferred_refused++;
@@ -282,8 +258,8 @@ void request_channel::drain()
                     m_stat_deferred++;
                     continue;      // the reply comes from complete_deferred()
                 }
-                // It would not even take it.  Nothing is going to complete this
-                // ticket, so it must not stay parked.
+                // It would not even take it, so nothing is going to complete
+                // this ticket and it must not stay parked.
                 m_parked.erase(ticket);
                 m_stat_no_target++;
                 st = request_status::no_target;
@@ -300,21 +276,18 @@ void request_channel::drain()
             m_stat_no_target++;
         }
 
-        // Re-checked after the sink has run, not before.  Serving a request can
-        // reach Lua, and Lua can stop or remove the runtime that asked; the
-        // pointer taken off the entry would then be into storage the manager
-        // has retired.
+        // Re-checked after the sink has run, because Lua can stop or remove
+        // the runtime that asked and the pointer taken off the entry would be
+        // into retired storage.
         if (e.origin && origin_live(e.origin))
             e.origin->on_request_reply(e.cookie, st, reply);
     }
 
     m_draining = false;
 
-    // What the batch limit left behind, plus anything a callback posted.  The
-    // second already armed its own wakeup through post(); the first has not, so
-    // this is where a bounded drain becomes a complete one.  A queue left
-    // non-empty with nothing armed is a set of origins waiting for replies that
-    // are not coming, which is the one failure mode this whole arrangement has.
+    // What the batch limit left behind plus anything a callback posted,
+    // because a queue left non-empty with nothing armed is a set of origins
+    // waiting for replies that are not coming.
     if (!m_queue.empty() && !kick())
     {
         LOG_WARN("request channel: no wakeup could be queued — answering the "

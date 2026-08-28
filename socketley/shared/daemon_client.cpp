@@ -73,9 +73,8 @@ daemon_identity daemon_probe(const char*   socket_path,
         return daemon_identity::absent;
     }
 
-    // Both directions.  A peer that accepts and then never reads would
-    // otherwise block the write instead of the read, and the deadline has to
-    // cover the whole exchange rather than half of it.
+    // Both directions, because a peer that accepts and never reads would block
+    // the write instead of the read.
     struct timeval tv{ timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

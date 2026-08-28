@@ -43,9 +43,9 @@ inline std::string path_refusal(std::string_view path)
     return {};
 }
 
-// The address `path` names, and how many bytes the kernel reads.  size() + 1 so
-// the terminator goes with it, and offsetof rather than sizeof so the length
-// stops there -- otherwise the kernel compares the whole sun_path.
+// The address `path` names, size() + 1 so the terminator goes with it and
+// offsetof rather than sizeof so the kernel does not compare the whole
+// sun_path.
 inline socklen_t fill_addr(std::string_view path, struct sockaddr_un& out)
 {
     out.sun_family = AF_UNIX;
@@ -64,7 +64,7 @@ struct bind_result
 };
 
 // A stale node is probed by connecting rather than unlinked blind, so a second
-// copy cannot take the path from a live one.  chmod 0600, not the umask.
+// copy cannot take the path from a live one.
 inline bind_result bind_listener(const std::string& path)
 {
     bind_result r;
@@ -73,8 +73,8 @@ inline bind_result bind_listener(const std::string& path)
     const socklen_t addr_len = fill_addr(path, addr);
 
     {
-        // SOCK_NONBLOCK: a blocking connect to a full backlog waits for room,
-        // on the loop thread.  EAGAIN is still "somebody is serving this".
+        // SOCK_NONBLOCK, because a blocking connect to a full backlog waits
+        // for room on the loop thread.
         const int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe >= 0)
         {
@@ -136,9 +136,8 @@ inline bind_result bind_listener(const std::string& path)
     return r;
 }
 
-// What a unix listener excludes, judged at every listening runtime's setup().
-// Flags only some types carry (--udp, --cluster) stay with that runtime, and
-// --shards is deliberately absent: shards_config_refusal owns that pair.
+// What a unix listener excludes, judged at every listening runtime's setup(),
+// without --shards: shards_config_refusal owns that pair.
 inline std::string listen_config_refusal(std::string_view listen_path,
                                          uint16_t port, bool tls)
 {
@@ -156,7 +155,7 @@ inline std::string listen_config_refusal(std::string_view listen_path,
                "handshake on a peer that cannot be anywhere else";
 
     // The path rules, re-checked at setup because the flag parser is not on
-    // the restore or import path.  sun_path truncates silently.
+    // the restore or import path.
     if (std::string why = path_refusal(listen_path); !why.empty())
         return "--listen \"" + std::string(listen_path) + "\": " + why;
 

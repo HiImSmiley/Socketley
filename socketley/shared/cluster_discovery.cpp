@@ -145,9 +145,8 @@ const char* state_str(runtime_state s)
     }
 }
 
-// The kernel's boot id: one value per boot of the machine, the same in every
-// container on it.  Empty when /proc is not there, which makes every claim
-// foreign and every conflict a refusal — the safe direction.
+// The kernel's boot id, empty when /proc is not there, which makes every claim
+// foreign and every conflict a refusal.
 std::string read_boot_id()
 {
     std::ifstream f("/proc/sys/kernel/random/boot_id");
@@ -209,42 +208,9 @@ bool cluster_discovery::read_claim_file(const std::string& path,
 }
 
 // ─── "me, again" versus "somebody else" ─────────────────────────────────────
-//
-// The hazard a duplicate name creates is two LIVE daemons publishing one file:
-// their peers then see an endpoint set that belongs to neither, and traffic for
-// `api1` splits between two machines that both believe they are api1.  So the
-// question a restarting node has to answer is not "is this file mine" in some
-// sentimental sense — it is "can the daemon that wrote it still be running".
-//
-// Three fields answer that, and they only have to answer it for a file whose
-// heartbeat is FRESH; anything older than the staleness threshold is dropped by
-// every peer anyway and is not a claim on anything.
-//
-//   boot   The machine's current boot id.  A fresh file with a different one
-//          was written seconds ago by a kernel that is not this one, so it is
-//          another machine — a reboot cannot have happened inside the window.
-//
-//   host   The address the writer advertised, which is what peers dial.  In the
-//          documented deployment this is the container's hostname and it
-//          survives a restart, a redeploy and a crash loop.
-//
-//   sock   The writer's control socket path.  This is the load-bearing one: a
-//          unix socket path can be bound by exactly one process at a time, and
-//          every other way into this daemon connects to that path rather than
-//          binding it.  So on one machine, under one hostname, whoever holds
-//          that path IS the daemon — and we hold it, or we would not be here.
-//          A fresh file carrying our triple was therefore written by a process
-//          that no longer exists.
-//
-// pid is published for the operator and for the message below, never for the
-// decision: a restarted container's pid namespace is new, so the old pid is
-// both meaningless and likely to have been handed to us.
-//
-// What this cannot tell apart: two containers on ONE host that were both given
-// the SAME hostname and both run on the default socket path.  Their triples are
-// identical and no file on the volume can separate them.  It is also the case
-// where the distinction has no meaning to a peer, since both advertise the same
-// address — the two would be interchangeable to every proxy in the cluster.
+// A fresh file under our name is this node restarted or a second daemon, told
+// apart by boot id, advertised host and control socket path, of which the
+// socket path is load-bearing because only one process can hold it.
 bool cluster_discovery::claim_is_ours(const node_claim& c) const
 {
     if (c.host.empty() || c.sock.empty() || c.boot.empty())
@@ -264,12 +230,9 @@ bool cluster_discovery::start(event_loop& loop)
     std::error_code ec;
     fs::create_directories(m_cluster_dir, ec);
 
-    // A file under our name with a fresh heartbeat is either this node's own
-    // previous incarnation — a restart inside the staleness window, which is
-    // what every container restart, redeploy and crash loop looks like — or a
-    // second daemon claiming a name that is taken.  The first must rejoin; the
-    // second must be refused, and refused without touching the file, because
-    // the holder is live and deleting it would blind its peers.
+    // A restart inside the staleness window must rejoin and a second daemon
+    // must be refused without touching the file, because deleting a live
+    // holder's file would blind its peers.
     const std::string our_path = m_cluster_dir + "/" + m_daemon_name + ".json";
     node_claim held;
     int64_t hb = 0;
@@ -306,13 +269,9 @@ bool cluster_discovery::start(event_loop& loop)
     publish();
     scan();
 
-    // Here and not at the top: every refusal above returns without having
-    // submitted anything, and a slot claimed by a handler that then goes away
-    // without deregistering is a slot register_owner() will never hand out
-    // again.  Explicit rather than left to the implicit registration inside
-    // schedule_timer(), because retire() has to hand this value on after
-    // deregistering — which is the moment it can no longer be read back off
-    // the handler.
+    // Here and not at the top, because every refusal above returns having
+    // submitted nothing and a slot claimed by a handler that never deregisters
+    // is never handed out again.
     m_owner_token = loop.register_owner(this);
 
     // Start the timer cycle
@@ -330,11 +289,8 @@ uint32_t cluster_discovery::retire()
 {
     event_loop* const loop = m_loop;
 
-    // Before stop(), which clears m_loop.  Withdrawing does not make the
-    // timeout stop being owed a completion — it still reports, with -ECANCELED
-    // — it only stops that report being up to two seconds away, which is two
-    // seconds this object would otherwise sit in the quarantine.  Exactly the
-    // argument server_instance makes for withdrawing its own two timers.
+    // Before stop(), which clears m_loop, so the timeout's -ECANCELED is not
+    // up to two seconds away.
     if (loop && m_timer_armed)
         if (!loop->submit_timeout_remove(&m_timer_req)) {}
 
@@ -346,10 +302,9 @@ uint32_t cluster_discovery::retire()
     const uint32_t tok = m_owner_token;
     m_owner_token      = 0;
 
-    // Last, and only after m_loop is null: from here every completion still on
-    // its way for this handler is dropped rather than dispatched.  Dropping one
-    // still reads the request it names, which is why the caller must wait for
-    // token_inflight() before freeing and may not treat this call as licence.
+    // Last, and only after m_loop is null, after which completions are dropped
+    // rather than dispatched -- which still reads the request, so the caller
+    // must wait for token_inflight() before freeing.
     loop->deregister_owner(this);
     return tok;
 }
@@ -397,8 +352,9 @@ std::string cluster_discovery::build_publish_json() const
     json += "\",\"host\":\"";
     json += json_escape(m_cluster_addr);
 
-    // The claim.  A reader of this directory needs none of it; the daemon that
-    // finds this file under its own name on the next boot needs all of it.
+    // The claim, which a reader of this directory needs none of and this
+    // daemon needs all of when it finds the file under its own name on the
+    // next boot.
     json += "\",\"sock\":\"";
     json += json_escape(m_socket_path);
     json += "\",\"boot\":\"";
@@ -447,10 +403,9 @@ std::string cluster_discovery::build_publish_json() const
             json += "\",\"connections\":";
 
             char conn_buf[16];
-            // The reported figure, not the local tables: this runtime's
-            // connections may be in a worker process, and publishing 0 to the
-            // rest of the cluster is worse than publishing nothing — a peer
-            // choosing by load would read an idle member.
+            // The reported figure and not the local tables, because this
+            // runtime's connections may be in a worker and a peer choosing by
+            // load would read an idle member.
             auto [cend, cec] = std::to_chars(conn_buf, conn_buf + sizeof(conn_buf),
                                               inst->reported_connection_count());
             json.append(conn_buf, static_cast<size_t>(cend - conn_buf));
@@ -505,20 +460,9 @@ void cluster_discovery::scan()
     {
         std::string_view fname(entry->d_name);
 
-        // Only process .json files.
-        //
-        // This one test is also what keeps a half-written file out.  publish()
-        // writes "<name>.json" + ".tmp" and renames it into place, so the
-        // temporary is "<name>.json.tmp" — it does not end in ".json" and never
-        // reaches the line below.  A guard for ".tmp.json" used to stand here
-        // as if it were the thing doing that; it was the suffix written
-        // backwards, no writer in the tree produces that spelling, and the
-        // branch had never been taken.  Traced against a running daemon: the
-        // only names that ever appear in the cluster directory are
-        // "<name>.json" and, for the moment between the write and the rename,
-        // "<name>.json.tmp".  If the temporary file is ever renamed — say to
-        // "<name>.tmp.json" — this test stops hiding it and something here has
-        // to change with it.
+        // Only .json files, which is also what keeps a half-written
+        // "<name>.json.tmp" out, so renaming the temporary would mean changing
+        // this test with it.
         if (fname.size() < 6 || fname.substr(fname.size() - 5) != ".json")
             continue;
 
@@ -670,18 +614,9 @@ void cluster_discovery::scan()
         m_event_callback(events);
 }
 
-// Delete this daemon's file — and only this daemon's file.
-//
-// Two ways in, and both used to be wrong.  A refused start() left the caller
-// holding an object it then reset, and ~cluster_discovery() came here and
-// unlinked the entry of the live peer the refusal had just declined to
-// overwrite.  The peer republished two seconds later, so the damage looked like
-// a blip; the real cost was that the very next attempt found no file and was
-// allowed in, which is how a guard against two daemons sharing a name let two
-// daemons share a name on the second try.
-//
-// So: nothing to remove unless we wrote something, and nothing to remove if the
-// name has meanwhile been taken by someone whose claim is not ours.
+// Delete this daemon's file and only this daemon's: nothing to remove unless
+// we wrote something, and nothing to remove if the name has since been taken
+// by a claim that is not ours.
 void cluster_discovery::unpublish()
 {
     if (!m_published)

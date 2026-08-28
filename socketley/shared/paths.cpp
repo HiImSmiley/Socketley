@@ -47,8 +47,7 @@ socketley_paths socketley_paths::resolve()
     socketley_paths p;
 
     // A development affordance for several daemons in one namespace, not how
-    // clustering works.  The default path is an identity: binding it means
-    // being the daemon for that namespace.
+    // clustering works.
     const char* env_socket = std::getenv("SOCKETLEY_SOCKET");
 
     bool installed = access("/usr/bin/socketley", X_OK) == 0;

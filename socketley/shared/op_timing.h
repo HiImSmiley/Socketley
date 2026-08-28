@@ -1,7 +1,7 @@
 #pragma once
-// Submit-to-complete latency per op type, under -DSOCKETLEY_TIMING.
-// A multishot row is NOT latency: the stamp resets per completion, so the
-// second and later intervals are gaps between deliveries.
+// Submit-to-complete latency per op type under -DSOCKETLEY_TIMING, except a
+// multishot row, whose stamp resets per completion and so measures gaps
+// between deliveries.
 
 #ifdef SOCKETLEY_TIMING
 

@@ -1,8 +1,7 @@
 #pragma once
 
-// Bounded by the memory it holds, not the entries: a cap of 4096 entries is
-// four gigabytes of 1 MB responses and 123 KB of pub/sub notifications.
-// Each entry is charged a fixed overhead so empty messages are bounded too.
+// Bounded by the memory it holds rather than the entries, each charged a fixed
+// overhead so empty messages are bounded too.
 
 #include <cstddef>
 #include <memory>
@@ -15,12 +14,10 @@ namespace socketley
 {
 
 // Per-entry bookkeeping charged on top of the payload: the queue node, the
-// string header, and allocator rounding. The exact figure matters less than
-// that it is nonzero.
+// string header, and allocator rounding.
 inline constexpr size_t write_queue_entry_overhead = 64;
 
-// Closing threshold. A connection holding more than this in unsent data is not
-// going to catch up, and keeping the memory helps nobody.
+// Closing threshold, past which a connection is not going to catch up.
 inline constexpr size_t write_queue_max_bytes = 8u * 1024 * 1024;
 
 // Stop reading from the peer at this point, while there is still room to absorb
@@ -45,14 +42,13 @@ public:
     size_t size()  const noexcept { return m_queue.size(); }
     size_t bytes() const noexcept { return m_bytes; }
 
-    // Read-only: moving out of it leaves pop() subtracting an emptied string,
-    // and the counter drifts up until the connection is closed.  Use take_front().
+    // Read-only, because moving out of it leaves pop() subtracting an emptied
+    // string; use take_front().
     const T& front() const { return m_queue.front(); }
     const T& back()  const { return m_queue.back(); }
 
-    // Grow the tail entry in place. Only the tail may be grown — entries ahead
-    // of it may already have been handed to the kernel — and going through the
-    // queue is what keeps the byte count honest while doing it.
+    // Grow the tail entry in place, only the tail, since entries ahead of it
+    // may already have been handed to the kernel.
     void append_back(std::string_view extra)
     {
         m_queue.back().append(extra);

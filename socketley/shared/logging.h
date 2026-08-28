@@ -38,18 +38,9 @@ inline const char* log_level_name(log_level l)
     return "info";
 }
 
-// A worker reads no config of its own, so without this every LOG_DEBUG out
-// there is dead code.
-//
-// The level travels in the environment because that is the one channel that is
-// already inherited across the fork and read after the exec: the control socket
-// is not open yet at the moment this has to be known — the worker logs before
-// its first frame arrives — and putting it in argv would mean a parser in the
-// one place this file's own comment says has nothing to parse.
-//
-// export_log_level() is called by whoever decided the level, in the parent, at
-// startup: a setenv() between the fork and the exec would be an allocation in a
-// child that must not allocate.
+// The level travels in the environment because that is the one channel already
+// inherited across the fork and readable after the exec, before the worker's
+// first frame arrives.
 inline constexpr const char* log_level_env = "SOCKETLEY_LOG_LEVEL";
 
 inline void export_log_level(log_level l)
@@ -90,8 +81,7 @@ struct logger
     }
 };
 
-// Take the level the parent exported, or leave the default alone.  Called once,
-// at the top of a child process's main, before anything it might want to say.
+// Take the level the parent exported, or leave the default alone.
 inline void inherit_log_level()
 {
     log_level l;

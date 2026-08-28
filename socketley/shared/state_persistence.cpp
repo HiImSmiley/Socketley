@@ -39,10 +39,7 @@ std::string json_escape(std::string_view s)
             case '\t': out += "\\t";  break;
             default:
                 // Everything below 0x20 has to go as \u00xx or the document is
-                // not JSON.  Three of them were named above and the other
-                // twenty-six were emitted raw — reachable through any path
-                // field, which is operator text nothing validates.  The Lua
-                // encoder in lua_context.cpp has had this for longer.
+                // not JSON.
                 if (static_cast<unsigned char>(c) < 0x20)
                 {
                     char hex[8];
@@ -71,10 +68,7 @@ void json_escape_into(std::string& out, std::string_view s)
             case '\t': out += "\\t";  break;
             default:
                 // Everything below 0x20 has to go as \u00xx or the document is
-                // not JSON.  Three of them were named above and the other
-                // twenty-six were emitted raw — reachable through any path
-                // field, which is operator text nothing validates.  The Lua
-                // encoder in lua_context.cpp has had this for longer.
+                // not JSON.
                 if (static_cast<unsigned char>(c) < 0x20)
                 {
                     char hex[8];
@@ -233,17 +227,9 @@ uint8_t str_to_eviction(std::string_view s)
     }
 }
 
-// Is this key named anywhere in the document.
-//
-// The same scan as json_get_string below, stopping at the question it is asked
-// rather than going on to read a value — because "the key is there" and "the
-// value is non-empty" are different things, and `import` needs the first to
-// tell a field that was set to its default from one that was left out.
-//
-// Deliberately a second walk rather than a flag threaded through the getters:
-// the getters are called forty times from one function and each one already
-// walks the document, so a second walk per key is the same order of work and
-// keeps both functions doing one thing.
+// Is this key named anywhere in the document, which `import` needs to tell a
+// field set to its default from one left out, as a second walk rather than a
+// flag threaded through the getters.
 bool json_has_key(const std::string& json, std::string_view key)
 {
     size_t pos = 0;
@@ -256,9 +242,8 @@ bool json_has_key(const std::string& json, std::string_view key)
             json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
             json[pos + 1 + key.size()] == '"')
         {
-            // A key is followed by a colon.  Without this check the scan also
-            // matches a VALUE that happens to read like a key name — `"mode":
-            // "port"` would answer yes to "port".
+            // A key is followed by a colon, without which the scan also
+            // matches a value that reads like a key name.
             const size_t after = pos + 1 + key.size() + 1;
             const size_t colon = json.find_first_not_of(" \t\n\r", after);
             if (colon != std::string::npos && json[colon] == ':')
@@ -269,17 +254,8 @@ bool json_has_key(const std::string& json, std::string_view key)
     return false;
 }
 
-// Every key the document names, collected in one walk.
-//
-// Enumerated rather than asked field by field, because parse_json_string reads
-// sixty-one of them: a hand-written list is a list that goes stale the first
-// time somebody adds a field, and the failure mode would be that the new field
-// is silently cleared by every partial import — which is the defect this is
-// being added to fix.
-//
-// A key is a quoted token followed by a colon.  That is enough for this schema:
-// it is flat apart from arrays of plain strings, and an array element is
-// followed by a comma or a bracket, never a colon.
+// Every key the document names, enumerated in one walk rather than from a
+// hand-written list that goes stale the first time somebody adds a field.
 void json_collect_keys(const std::string& json, std::set<std::string, std::less<>>& out)
 {
     size_t pos = 0;
@@ -374,29 +350,9 @@ bool json_get_bool(const std::string& json, std::string_view key, bool default_v
     return default_val;
 }
 
-// ─── A VALUE THAT IS ONLY PARTLY A NUMBER IS NOT A NUMBER ───────────────────
-//
-// The four below all wrapped a std::sto* in a try/catch and returned the
-// default when it threw — which covered "abc" and did nothing at all for
-// "80abc", because stoi stops at the first character it cannot use and returns
-// what it read.  A field whose value had a typo in the tail was silently taken
-// as the digits in front of it:
-//
-//     "port": "80abc"          ->  80
-//     "max_memory": "4mb"      ->  4
-//
-// The same defect the flag parsers had, one layer in.  parse_uint16 and
-// parse_uint32 in flag_handlers.h are the shape this follows: the whole of the
-// token, or nothing.
-//
-// "Or nothing" means the default, which is what an ABSENT key already gives —
-// so a malformed value now behaves exactly like a missing one, and that is the
-// point.  It is also no change at all for a value that will not parse in any
-// part: `stoi("abc")` already threw and already fell back here.  What changes is
-// only the half-parsed case, and there the default is the honest answer.
-//
-// These read files this daemon wrote, so in practice the input is clean.  They
-// also read whatever `import` was handed, which is a document a person edited.
+// The whole of the token or nothing, because std::sto* stops at the first
+// character it cannot use and read "80abc" as 80, where the default is the
+// honest answer.
 template <typename T, typename Fn>
 T json_get_number(const std::string& json, std::string_view key, T default_val, Fn convert)
 {
@@ -519,19 +475,9 @@ state_persistence::state_persistence(const fs::path& state_dir)
 // Where this runtime's state file goes, or an empty path if it may not have one.
 //
 // ─── A SHARED BIN IS NOT A REFUSAL ──────────────────────────────────────────
-//
-// The traversal guard was here and it worked — but it answered by routing every
-// rejected name to one `invalid.json`, so two runtimes with unusable names
-// overwrote each other's state.  Measured: a daemon holding `q"uote/../x` and
-// `second/../bad` had one file, with the second name in it, and the first
-// runtime did not come back after a restart.  Nothing said so.
-//
-// Names are validated at both doors now — create() and rename() share
-// runtime_manager::valid_name() — so nothing that reaches this function should
-// fail it.  It stays as the second line, because it guards the filesystem and a
-// state directory can hold files an older daemon wrote.  What changes is the
-// answer: an empty path, which every caller reports rather than silently
-// sharing one file.
+// Names are validated at both doors now, but this stays as the second line
+// because it guards the filesystem, and it answers with an empty path rather
+// than routing every rejected name to one shared file.
 fs::path state_persistence::config_path(std::string_view name) const
 {
     for (char c : name)
@@ -579,10 +525,8 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
     cfg.shards = instance->get_shards();
-    // Only a request that was actually made is written.  Storing the default
-    // value of a flag nobody typed would turn every plain `create` into an
-    // explicit --no-sqpoll on the next restart, and a runtime that asked for
-    // nothing would start being refused by a daemon whose ring carries a poller.
+    // Only a request that was actually made is written, or every plain
+    // `create` would become an explicit --no-sqpoll on the next restart.
     if (instance->has_cpus_request())
         cfg.cpus = instance->get_cpus().to_string();
     cfg.sqpoll_set = instance->has_sqpoll_request();
@@ -713,10 +657,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     append_str_field("id", cfg.id);
     append_str_field("type", type_str(cfg.type));
     append_int_field("port", cfg.port);
-    // Written only when there is one, so every state file that ever existed
-    // reads back as the TCP listener it is.  The `unix:` prefix stays on it:
-    // this is the field an operator edits and re-imports, and it has to say
-    // the same thing the flag said.
+    // Written only when there is one, with the `unix:` prefix kept because
+    // this is the field an operator edits and re-imports.
     if (!cfg.listen_path.empty())
         append_str_field("listen", "unix:" + cfg.listen_path);
     append_bool_field("was_running", cfg.was_running);
@@ -769,19 +711,15 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     // state file that differs from the one the previous build wrote for it.
     if (cfg.shards > 1)
         append_int_field("shards", static_cast<int>(cfg.shards));
-    // Above zero only, and that is not merely tidiness: read_from_instance()
-    // describes the daemon's placeholder, which is not any shard and reads 0,
-    // so a state file never gains this key.  Shard 0's own config frame does
-    // not carry it either and does not need to — absent parses as 0, which is
-    // what shard 0 is.
+    // Above zero only, because the daemon's placeholder reads 0 and absent
+    // parses back as 0, which is what shard 0 is.
     if (cfg.shard_index > 0)
         append_int_field("shard_index", static_cast<int>(cfg.shard_index));
     if (!cfg.cpus.empty())
         append_str_field("cpus", cfg.cpus);
-    // Written for both values and omitted only when nothing was asked for, so
-    // that absence and `false` stay distinguishable in the file itself.  Every
-    // other boolean here is written only when true, which is fine for a flag
-    // whose absence and whose false mean the same thing; this one's do not.
+    // Written for both values and omitted only when nothing was asked for,
+    // because unlike every other boolean here absence and `false` do not mean
+    // the same thing.
     if (cfg.sqpoll_set)
         append_bool_field("sqpoll", cfg.sqpoll);
     if (cfg.external_runtime)
@@ -901,10 +839,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
 {
     using namespace sp_detail;
 
-    // Before any value is read: which keys the document actually names.  Every
-    // field below has a default, so without this a document that omitted a
-    // field was indistinguishable from one that set it to that default — and
-    // `import` applied all of them either way.  See runtime_config::present.
+    // Before any value is read, because every field has a default and `import`
+    // cannot otherwise tell an omitted field from one set to it.
     cfg.present.clear();
     json_collect_keys(json, cfg.present);
 
@@ -914,10 +850,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.port = static_cast<uint16_t>(json_get_int(json, "port"));
     {
         // The prefix is stripped here and stored bare, so nothing downstream
-        // has to know that "listen" is a family plus an address rather than an
-        // address.  A value without it is refused by the flag reader and by
-        // import alike; accepting it here would let a document say
-        // `"listen": "/run/x.sock"` and mean something the flag cannot.
+        // has to know that "listen" is a family plus an address.
         const std::string listen = json_get_string(json, "listen");
         if (listen.rfind("unix:", 0) == 0)
             cfg.listen_path = listen.substr(5);
@@ -946,20 +879,16 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.group = json_get_string(json, "group");
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
-    // Absent means one, not zero: the field is omitted for every runtime that
-    // did not ask for shards, which is every runtime written by a build older
-    // than this one.  Reading a missing key as zero would restore them all with
-    // no worker at all.
+    // Absent means one and not zero, because the field is omitted for every
+    // runtime that did not ask for shards.
     if (const uint32_t s = json_get_uint32(json, "shards"); s > 0)
         cfg.shards = s;
-    // Absent means shard 0, which is a real answer and not a missing one.  See
-    // the note on runtime_config::shard_index.
+    // Absent means shard 0, which is a real answer and not a missing one.
     cfg.shard_index = json_get_uint32(json, "shard_index");
     cfg.cpus = json_get_string(json, "cpus");
-    // Read through json_get_string rather than json_get_bool: the question here
-    // is whether the key is there at all, and json_get_bool answers false to
-    // both "absent" and "false".  Anything that is neither spelling reads as no
-    // request, which is what a file hand-edited into nonsense should get.
+    // Read through json_get_string rather than json_get_bool, because the
+    // question is whether the key is there and json_get_bool answers false to
+    // both absent and false.
     {
         const std::string v = json_get_string(json, "sqpoll");
         cfg.sqpoll_set = (v == "true" || v == "false");
@@ -1019,42 +948,10 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     return !cfg.name.empty();
 }
 
-// ─── EVERY STATE FILE IS WRITTEN HERE, AND NOWHERE ELSE KNOWS HOW ───────────
-//
-// A state file is not a note about a runtime, it is the runtime.  The record
-// carries a server's --master-pw verbatim, the paths of the TLS and mTLS
-// private keys, and the --lua script the daemon runs with its own privileges;
-// and the daemon restores every runtime from these files at startup, so
-// whoever can write one chooses what the daemon runs next time it comes up.
-//
-// Both writers used std::ofstream, which creates with 0666 & ~umask.  That is
-// not a mode, it is whatever the daemon inherited.  Measured on the parent
-// commit, packaged shape — daemon as `socketley`, /var/lib/socketley/runtimes
-// at 0755 as packaging/install.sh creates it:
-//
-//     daemon's umask 002    state file 0664   uid nobody read master_pw
-//     daemon's umask 022    state file 0644   uid nobody read master_pw
-//     daemon's umask 0      state file 0666   uid nobody REWROTE the record
-//
-// The third line is the one that matters.  Disclosure of a password is bad;
-// a world-writable file that the daemon reads back as a runtime definition is
-// the same privilege escalation that the IPC socket's 0666 was — the socket
-// was closed in 8e4cff7 and this is the same door in the filesystem.
-//
-// So the mode is stated, not inherited, and it is stated at creation rather
-// than fixed afterwards.  A chmod after the write has a window that is
-// genuinely reachable here: unlike the daemon's listening socket, which
-// refuses connect() until listen(), a file is readable the instant it exists,
-// and the content is written into it before any chmod could run.  A umask
-// around the write would work and was rejected for the same reason it was
-// rejected for the socket, only more so: umask is process-wide and this code
-// runs on state_persistence's own writer thread, so the narrow window would
-// apply to whatever any other thread created inside it.
-//
-// O_EXCL on a path that was just unlinked is what makes 0600 a guarantee.
-// O_CREAT does not touch the mode of a file that already exists, and the .tmp
-// name is deterministic per runtime, so a leftover from a killed daemon would
-// otherwise donate its old mode to every write that followed it.
+// Every state file is written here, at a mode stated rather than inherited
+// from the umask, created O_EXCL on a just-unlinked path -- because the record
+// carries --master-pw, the TLS key paths and the --lua script the daemon runs,
+// so whoever can write one chooses what the daemon runs next.
 static bool write_state_file(const fs::path& path, std::string_view bytes)
 {
     fs::path tmp_path = path;
@@ -1082,15 +979,8 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
         off += static_cast<size_t>(n);
     }
 
-    // fsync before rename to guarantee data is on disk — prevents
-    // partial/empty state files on power loss or kernel crash.
-    //
-    // Its failure is ignored, exactly as it was before this function existed.
-    // That is a durability question and this change is about the mode; turning
-    // a spurious fsync error into a failed save would be a different decision
-    // wearing this one's clothes.  It is now the descriptor that wrote the
-    // file rather than a second open() of the same path, which is one fewer
-    // moment in which the path could have become something else.
+    // fsync before the rename, through the descriptor that wrote the file,
+    // with its failure ignored as it was before this function existed.
     if (::fsync(fd) < 0) {}
 
     // Checked, where the fsync is not: close is where a deferred write error
@@ -1112,9 +1002,8 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
 
 bool state_persistence::write_json(const runtime_config& cfg) const
 {
-    // An empty path is config_path() refusing the name — see there.  Reported
-    // rather than written somewhere shared: a runtime whose state cannot be
-    // stored is a runtime that will not come back, and that is worth a line.
+    // An empty path is config_path() refusing the name, reported because a
+    // runtime whose state cannot be stored will not come back.
     const fs::path path = config_path(cfg.name);
     if (path.empty())
     {
@@ -1140,10 +1029,8 @@ void state_persistence::save_runtime(const runtime_instance* instance)
 {
     if (instance->is_lua_created())
         return;
-    // Read off the instance HERE, on the caller's thread.  The writer must not
-    // touch a runtime_instance: by the time it runs, a `create` followed by a
-    // `remove` may already have freed it.  A runtime_config is a value and
-    // survives the crossing.
+    // Read off the instance here on the caller's thread, because a `create`
+    // followed by a `remove` may have freed it before the writer runs.
     job j;
     j.k = job::write_cfg;
     j.cfg = read_from_instance(instance);
@@ -1205,19 +1092,9 @@ void state_persistence::writer_loop()
 
 void state_persistence::drain()
 {
-    // Waits for the work to be DONE, not for it to have been picked up.
-    //
-    // This waited on m_queue.empty(), which the writer satisfies the moment it
-    // pops a job — before write, before fsync, before the rename that publishes
-    // the file.  So drain() returned while the state directory still did not
-    // contain what had been saved, which is the one thing a caller can want from
-    // it: `save_runtime(x); drain(); load_all()` came back without x about one
-    // time in ten, and read as a persistence bug rather than as a wait that did
-    // not wait.  m_done has been sitting here for this, with a comment saying so.
-    //
-    // The target is read under the lock and fixed: jobs enqueued after this call
-    // are somebody else's to wait for, and including them would let a busy
-    // daemon hold a caller here indefinitely.
+    // Waits for the work to be done and not merely picked up, on a target read
+    // under the lock and fixed so jobs enqueued later cannot hold a caller
+    // here indefinitely.
     std::unique_lock<std::mutex> lk(m_mx);
     const uint64_t target = m_queued;
     m_cv.wait(lk, [&]{ return m_done >= target; });
@@ -1256,8 +1133,8 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
     if (path.empty())
         return;   // no file was ever written for this name; see config_path()
 
-    // Fast path: read file, find "was_running" key, flip in-place, atomic rewrite.
-    // Avoids full JSON parse + re-serialization for a single boolean toggle.
+    // Fast path that flips the "was_running" literal in place, avoiding a full
+    // parse and re-serialization for one boolean.
     std::ifstream f(path);
     if (!f.is_open())
         return;
@@ -1268,34 +1145,9 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
     std::string json = ss.str();
 
     // ─── THE VALUE IS FOUND, NOT COUNTED ────────────────────────────────────
-    //
-    // This searched for `"was_running": <old>` and then wrote the new literal
-    // at `pos + 16`.  `"was_running": ` is FIFTEEN characters, so every flip
-    // landed one byte into the value and one byte past its end:
-    //
-    //     "was_running": true,    ->    "was_running": tfalse
-    //     "was_running": false,   ->    "was_running": ftrue
-    //
-    // — the first character of the old value kept, the trailing comma eaten.
-    // And it was self-sealing: the next flip searched for `": true` or
-    // `": false`, found neither in `tfalse`, and returned having changed
-    // nothing.  So one `stop` corrupted the field permanently and every later
-    // start and stop was a silent no-op on it.
-    //
-    // What that cost is the whole was_running feature, which the man page
-    // states as "Runtimes that were running when the daemon last stopped are
-    // auto-started".  Measured on a plain TCP server with nothing unusual about
-    // it: create -s, stop, start, restart the daemon — and `ls` reports
-    // Created.  Any runtime ever stopped once stopped coming back, for the rest
-    // of that install, with nothing anywhere saying so.  Reproduced on `main`,
-    // which has the same line.
-    //
-    // Rewritten to find the value rather than to count to it, which also heals
-    // a record an older build corrupted: the whole alphabetic token after the
-    // key is replaced, so `tfalse` and `ftrue` become the literal they should
-    // have been.  The comma that flip ate does not come back here — this
-    // parser looks up keys by name and does not need one — and the next full
-    // write of the record restores it.
+    // Finds the value rather than counting to it, which also heals a record an
+    // older build corrupted by replacing the whole alphabetic token after the
+    // key.
     static constexpr std::string_view key = "\"was_running\":";
     const auto kpos = json.find(key);
     if (kpos == std::string::npos)
@@ -1321,19 +1173,9 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
     }
     else
     {
-        // A record an older build damaged.  Patching the value alone is not
-        // enough to recover one: the comma the off-by-one ate is load-bearing,
-        // because json_get_string reads a non-string value up to the next `,`,
-        // `]` or `}` — so `"was_running": true` with no comma is read as
-        // `true\n    "shards": 4`, which is not "true", and the
-        // whole field silently reverts to its default of false.  Every
-        // auto-restart stayed broken with the value looking right in the file.
-        //
-        // So a damaged record is parsed and written out whole rather than
-        // patched.  It costs a full serialization exactly once per damaged
-        // file: the record that comes out of it takes the fast path from then
-        // on.  Every other field survives the damage, because each of them
-        // still has the comma that ends it.
+        // A damaged record is parsed and written out whole rather than
+        // patched, because the comma an off-by-one ate is load-bearing to
+        // json_get_string.
         runtime_config cfg;
         if (!parse_json_string(json, cfg))
             return;
@@ -1341,65 +1183,17 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
         json = format_json_pretty(cfg);
     }
 
-    // Through the same writer as write_json, and that is the point rather than
-    // tidiness.  This path rewrites the whole record — master_pw and all — on
-    // every start and every stop, so an ofstream here would have handed the
-    // mode back to the umask the first time a runtime was started, and a fix
-    // that only covered write_json would have looked correct on a fresh
-    // `create` and quietly undone itself on the next `start`.
+    // Through the same writer as write_json, because this path rewrites the
+    // whole record on every start and stop and an ofstream here would hand the
+    // mode back to the umask.
     if (!write_state_file(path, json)) {}
 }
 
 // ─── THE FILES THAT WERE ALREADY THERE ──────────────────────────────────────
-//
-// Writing new files at 0600 does nothing for an install that already has a
-// directory full of 0644 ones, and those are the files with the passwords in
-// them.  Nor does the problem age out on its own: a record is rewritten only
-// when its runtime changes, so a server created once and left running keeps
-// the mode it was born with for as long as the install lasts, and nothing
-// anywhere tells the operator to look.
-//
-// So the daemon repairs what it finds, once, when it takes ownership of the
-// directory at startup.  It only ever narrows — a file that is already
-// owner-only is not touched — it is idempotent, and it costs one stat per
-// runtime on a path that already walks every one of them.
-//
-// FILES ONLY, NOT THE DIRECTORY.  The mode on the files is what protects the
-// contents; the mode on the directory is a deployment decision, set by
-// packaging/install.sh and the deb postinst to 0750, and a daemon that
-// silently renarrowed a directory an operator had widened on purpose would be
-// changing a configuration it was not asked about.  The files it owns
-// outright.
-//
-// .tmp is included because a daemon killed mid-write leaves one, with the same
-// record and the same password in it, under a name nothing else cleans up
-// until that runtime is next written.
-// ─── THROUGH A DESCRIPTOR, NEVER THROUGH THE PATH ───────────────────────────
-//
-// This began as stat() then chmod() on entry.path(), and both follow symlinks.
-// A name in this directory pointing at /etc/shadow would have been a chmod of
-// /etc/shadow, and the daemon runs as root under `sudo socketley daemon`.
-//
-// It was not exploitable as written, because the same change puts the packaged
-// state directory at 0750 and nobody else can create a name in it.  That is
-// precisely the objection: the defence was the directory mode, and the file
-// layer was leaning on it.  A later loosening of that mode, or a state
-// directory somewhere else, would have moved the whole risk here with nothing
-// to see it coming — and the cache dump twenty lines' worth of file away
-// already does this correctly with fchmod, so the tree would have disagreed
-// with itself about the same hazard.
-//
-// So the file is opened once and every decision is made on that descriptor:
-//
-//   O_NOFOLLOW  a symlink fails the open with ELOOP instead of being followed.
-//               That is counted and reported rather than silently skipped —
-//               a symlink in this directory is not something socketley puts
-//               there, and an operator should hear that it is present.
-//   O_NONBLOCK  a FIFO named x.json would otherwise block open(O_RDONLY) until
-//               somebody wrote to it, which is a daemon that never finishes
-//               starting.  On a regular file the flag does nothing.
-//   fstat       the type and mode come from the object actually opened, so
-//               there is no window between the test and the change.
+// The daemon narrows the state files it finds, once, at startup -- files only
+// and never the directory, which is a deployment decision -- and every
+// decision is made on a descriptor opened O_NOFOLLOW|O_NONBLOCK rather than on
+// the path, which both stat() and chmod() would follow.
 static size_t tighten_dir_files(const fs::path& dir, size_t& symlinks)
 {
     size_t fixed = 0;
@@ -1454,19 +1248,14 @@ size_t state_persistence::tighten_existing() const
 
 std::vector<runtime_config> state_persistence::load_all()
 {
-    // Everything asked for before this call has to be visible to it.  The
-    // writes are on another thread now, so read-after-write on the same object
-    // would otherwise be a race — and it is not a theoretical one: a unit test
-    // that saved a runtime and loaded it back caught this immediately.
-    //
-    // Blocking here is free.  load_all() runs at startup and in tests, never on
-    // the event loop thread, which is the only place the stall mattered.
+    // Everything asked for before this call has to be visible to it, and
+    // blocking here is free because load_all() never runs on the event loop
+    // thread.
     drain();
 
-    // Before anything is read out of them.  Said out loud when it does
-    // something, because "your state files were readable by every user on this
-    // machine until just now" is news, and because an operator who sees it
-    // twice knows something is putting the modes back.
+    // Before anything is read out of them, and said out loud when it does
+    // something, because an operator who sees it twice knows something is
+    // putting the modes back.
     if (const size_t fixed = tighten_existing(); fixed > 0)
         LOG_INFO(("state: tightened " + std::to_string(fixed) +
                   " file(s) in " + m_state_dir.string() +

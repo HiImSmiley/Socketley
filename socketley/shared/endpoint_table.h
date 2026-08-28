@@ -1,33 +1,8 @@
 #pragma once
-// Where the runtimes a proxy forwards to actually are: a snapshot of
-// name → endpoint and group → endpoints, built by the daemon and handed to the
-// runtimes that need it.
-//
-// ─── WHY THIS EXISTS ────────────────────────────────────────────────────────
-//
-// An @group backend used to be resolved by calling into runtime_manager on the
-// connection path: take its mutex, walk every runtime in the daemon, keep the
-// ones whose group tag matches, and read get_port() off each *live instance
-// pointer*.  Two things are wrong with that, and only one of them is about
-// speed.
-//
-// The first is that a proxy reaches into other runtimes' objects to do it.
-// Nothing crosses that boundary except a host and a port — the pointer exists
-// solely to fetch a number — and holding one is what makes the daemon a single
-// address space rather than a supervisor.  A pointer cannot be sent over a
-// socket; a host and a port can.  So the proxy is handed the answer instead of
-// the means to compute it, and with that it needs no manager at all.
-//
-// The second is that the answer is rebuilt from scratch every time although it
-// changes only when a runtime starts, stops, is created, removed or renamed, or
-// when the cluster's view of a remote daemon changes.  Those are the moments
-// the table is republished — a few per minute at most — and between them the
-// proxy reads its own copy with no lock in sight.
-//
-// The snapshot is shared, not copied per runtime: it is immutable once
-// published, so every reader can hold the same one, and a reader that is
-// mid-request when a new table arrives keeps the one it started with rather
-// than watching endpoints appear underneath it.
+// Where the runtimes a proxy forwards to actually are, as a snapshot of name
+// and group to endpoint that the daemon republishes on the few events that
+// change it, immutable and shared so no reader takes a lock or reaches into
+// another runtime's objects.
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -36,15 +11,12 @@
 #include <unordered_map>
 #include <vector>
 
-// Declared routes travel in this snapshot too — see the second half of the
-// class.  Held by pointer so that this header does not have to know what a
-// route is; shared/route_table.h owns that, and includes this one for the
-// transparent hash below.
+// Declared routes travel in this snapshot too, held by pointer so this header
+// need not know what a route is.
 class route_table;
 
-// Transparent hash for heterogeneous lookup (avoids string copies on find).
-// Lives here rather than in runtime_manager.h because the lookups on the
-// connection path are the ones that must not allocate, and they are here.
+// Transparent hash for heterogeneous lookup, here rather than in
+// runtime_manager.h because the lookups that must not allocate are here.
 struct runtime_string_hash
 {
     using is_transparent = void;
@@ -114,20 +86,9 @@ public:
     size_t name_count()  const { return m_by_name.size(); }
     size_t group_count() const { return m_by_group.size(); }
 
-    // ── What each of those endpoints says it will answer ────────────────────
-    //
-    // The same snapshot, because it is the same question asked one step
-    // further: not "where is this runtime" but "which requests will it take".
-    // Both change at exactly the same moments — a runtime starting, stopping,
-    // being created, removed, renamed or reloaded — and publishing them apart
-    // would let a proxy hold this table's endpoints beside the last table's
-    // routes, which is the drift the whole design exists to prevent.
-    //
-    // A shared_ptr because one declaration is read by every proxy that names
-    // the runtime, and none of them modifies it: the pointer is what makes
-    // "immutable once published, shared not copied" true of the routes as well.
-    // A runtime whose script declares nothing has no entry here at all, which
-    // is what tells a proxy to forward as it always did.
+    // The same snapshot asked one step further -- which requests an endpoint
+    // will take -- published together so no proxy holds this table's endpoints
+    // beside the last table's routes.
     void set_name_routes(std::string name, std::shared_ptr<const route_table> rt)
     {
         m_routes_by_name.insert_or_assign(std::move(name), std::move(rt));
@@ -155,17 +116,14 @@ public:
         return !m_routes_by_name.empty() || !m_routes_by_group.empty();
     }
 
-    // For a reader that has to send the whole table somewhere rather than ask
-    // it questions — the daemon encoding it onto a worker's control socket.
-    // Const throughout: the table is immutable once published, and a caller
-    // able to walk it mutably could change what another runtime is already
-    // routing from.
+    // For a reader that has to send the whole table somewhere, const
+    // throughout because a mutable walk could change what another runtime is
+    // already routing from.
     const transparent_map<runtime_endpoint>& names() const { return m_by_name; }
     const transparent_map<std::vector<runtime_endpoint>>& groups() const { return m_by_group; }
 
-    // The declarations too, for the same reader and the same reason.  Without
-    // these the encoder could only carry hosts and ports, and a proxy in a
-    // worker enforced nothing while `stats` reported declared_routes:0.
+    // The declarations too, without which the encoder could only carry hosts
+    // and ports.
     const transparent_map<std::shared_ptr<const route_table>>& name_routes() const
     { return m_routes_by_name; }
     const transparent_map<std::shared_ptr<const route_table>>& group_routes() const

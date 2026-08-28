@@ -9,9 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-// Consecutive barren completions before a connection is called a loop.
-// Measured, not chosen: on working traffic the longest run is zero, so eight is
-// all cushion.  Re-derive it with SOCKETLEY_INV_PROGRESS_REPORT=1.
+// Consecutive barren completions before a connection is called a loop,
+// measured rather than chosen and re-derivable with
+// SOCKETLEY_INV_PROGRESS_REPORT=1.
 #ifndef SOCKETLEY_INV_BARREN_LIMIT
 #define SOCKETLEY_INV_BARREN_LIMIT 8
 #endif
@@ -29,15 +29,14 @@ struct half
     int  fd{-1};
 };
 
-// What the pair waits FOR, which cannot be read off the ring, so the runtime
-// states it.  `stated` is the opt-in: false gets invariant (1) alone.
+// What the pair waits for, which cannot be read off the ring, so the runtime
+// states it and `stated` is the opt-in.
 struct exchange
 {
     bool stated{false};
 
-    // The half that initiates has shut its write side.  It will never send
-    // another request, so the only completion that can still finish this pair is
-    // the answer to the one it already sent.
+    // The half that initiates has shut its write side, so only the answer to
+    // the request it already sent can finish this pair.
     bool half_closed{false};
 
     // NOT "the ring owes the peer a completion": under multishot recv that is
@@ -45,8 +44,8 @@ struct exchange
     bool answer_owed{false};
 };
 
-// The progress ledger for one half, invariant (3).  Lives on the connection
-// struct, so it is reset with the struct and travels with it through a pool.
+// The progress ledger for one half, on the connection struct so it is reset
+// with the struct and travels with it through a pool.
 struct progress
 {
     uint64_t digest{0};     // the runtime's account of this connection's state
@@ -74,8 +73,8 @@ inline bool progress_report_on()
     return on;
 }
 
-// Lets a fuzz target print its reproducer before the abort; it adds output and
-// cannot stop the abort.  Null in a daemon, where the core dump is the report.
+// Lets a fuzz target print its reproducer before the abort, and is null in a
+// daemon, where the core dump is the report.
 inline void (*&pre_abort_hook())()
 {
     static void (*fn)() = nullptr;
@@ -98,9 +97,8 @@ inline void fail(const char* what, const char* where)
 #endif
 }
 
-// (1) Reachability and (1b) progress-reachability, both over the pair.  A pair
-// with neither half present is one that has already been torn down, which is the
-// good case, not a violation.
+// (1) and (1b) over the pair, where a pair with neither half present has
+// already been torn down and is the good case.
 inline void check_pair(const char* where, const half& a, const half& b,
                        const exchange& x = exchange{})
 {
@@ -128,9 +126,8 @@ inline void check_pair(const char* where, const half& a, const half& b,
         return;
     }
 
-    // (1b) Something is in flight and none of it can finish this pair.  All
-    // five terms guard against a false report -- see AGENTS.md for what each
-    // rules out.
+    // (1b) Something is in flight and none of it can finish this pair; see
+    // AGENTS.md for what each of the five terms rules out.
     if (!x.stated || !a.present || !x.half_closed || x.answer_owed ||
         a.in_flight || a.closing)
         return;
@@ -152,9 +149,8 @@ inline void check_pair(const char* where, const half& a, const half& b,
 #endif
 }
 
-// (3) Progress, once per completion charged to a connection.  `bytes` is added
-// rather than compared, so a connection carrying traffic is never suspected;
-// `op` and `res` only name the operation that is turning.
+// (3) Progress, once per completion charged to a connection, with `bytes`
+// added rather than compared so traffic is never suspected.
 inline void check_progress(const char* where, progress& p, uint64_t digest,
                            uint64_t bytes, int fd, const char* op, int res)
 {
@@ -208,9 +204,8 @@ inline void check_progress(const char* where, progress& p, uint64_t digest,
 #endif
 }
 
-// (2) Pool safety.  `pending` is "the ring still owes this struct something",
-// `owner_set` is "a completion that arrives anyway would be dispatched rather
-// than dropped".  Either one alone is enough to make the reuse unsafe.
+// (2) Pool safety, where either the ring still owing this struct something or
+// a completion still being dispatchable makes the reuse unsafe.
 inline void check_poolable(const char* where, int fd, bool pending, bool owner_set)
 {
     if (!pending && !owner_set)
@@ -236,9 +231,8 @@ inline void check_poolable(const char* where, int fd, bool pending, bool owner_s
     ::skl_inv::check_progress((where), (p), (d), (n), (fd), (op), (res))
 #define SKL_INV_FAIL(what, where)             ::skl_inv::fail((what), (where))
 
-// The progress ledger, on a connection struct.  Same arrangement as
-// SKL_TRACE_FIELD in trace.h: the member does not exist at all in a build
-// without the checks, so nothing about the struct's layout depends on them.
+// The progress ledger on a connection struct, arranged like SKL_TRACE_FIELD so
+// the member does not exist at all in a build without the checks.
 #define SKL_INV_FIELD(name)                   ::skl_inv::progress name;
 #define SKL_INV_RESET(obj)                    ((obj).pr = ::skl_inv::progress{})
 

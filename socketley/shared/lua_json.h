@@ -1,7 +1,7 @@
 #pragma once
-// JSON for socketley.json_encode and socketley.json_decode.
-// A header rather than file-static in lua_context.cpp so a parser pointed at
-// network data can be reached by a test and a fuzz target.
+// JSON for socketley.json_encode and json_decode, a header rather than
+// file-static so a parser pointed at network data can be reached by a test and
+// a fuzz target.
 
 #include <sol/sol.hpp>
 
@@ -27,8 +27,8 @@ enum class json_status
     malformed,   // not a JSON document; the object is nothing
 };
 
-// `path` is an ancestor chain, not a visited set: a table repeated as a SIBLING
-// is ordinary, one repeated on a path is a cycle.  False appends nothing.
+// `path` is an ancestor chain and not a visited set, because a table repeated
+// as a sibling is ordinary and one repeated on a path is a cycle.
 inline bool json_encode_value(std::string& out, const sol::object& val,
                               int depth, std::vector<const void*>& path,
                               std::string& err);
@@ -59,9 +59,9 @@ inline void json_encode_string(std::string& out, const std::string& s)
     out += '"';
 }
 
-// The count when `t` is exactly {1..n}, else 0 meaning "encode as an object".
-// Keys are collected, not matched against a running counter: nothing promises
-// lua_next arrives in index order, and depending on it makes the answer vary.
+// The count when `t` is exactly {1..n}, else 0 meaning encode as an object,
+// with keys collected because nothing promises lua_next arrives in index
+// order.
 inline int array_length(const sol::table& t)
 {
     int    count = 0;
@@ -76,9 +76,8 @@ inline int array_length(const sol::table& t)
         if (d > highest) highest = d;
         ++count;
     }
-    // Dense: n keys and the largest is n.  {1,2,4} has three keys and a largest
-    // of 4, so it is a sparse table and encodes as an object, which is what it
-    // did before and the only thing JSON can express.
+    // Dense means n keys whose largest is n, so {1,2,4} is sparse and encodes
+    // as an object, the only thing JSON can express.
     return (count > 0 && highest == count) ? count : 0;
 }
 
@@ -275,8 +274,9 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
                         }
                         p += 4;
 
-                        // A surrogate pair is one codepoint; encoding each half
-                        // alone is not valid UTF-8.  An unpaired one is U+FFFD.
+                        // A surrogate pair is one codepoint, so encoding each
+                        // half alone is not valid UTF-8 and an unpaired one is
+                        // U+FFFD.
                         if (cp >= 0xD800 && cp <= 0xDBFF)
                         {
                             unsigned lo = 0;
@@ -340,8 +340,8 @@ inline std::string json_decode_string(const char*& p, const char* end, bool& ok)
             result += *p;
         ++p;
     }
-    // The loop ends either on the closing quote or on running out of input.
-    // Only the first is a string.
+    // The loop ends on the closing quote or on running out of input, and only
+    // the first is a string.
     if (p >= end) { ok = false; return result; }
     ++p;
     return result;
@@ -420,9 +420,8 @@ inline sol::object json_decode_value(sol::state& lua, const char*& p, const char
                 if (p < end && *p == ',') { ++p; continue; }
                 break;
             }
-            // The closing bracket is required.  Without this check `[1,2` — a
-            // request body cut off by a dropped connection — decoded to a
-            // perfectly ordinary two-element table.
+            // The closing bracket is required, or `[1,2` from a dropped
+            // connection decodes to an ordinary two-element table.
             json_skip_ws(p, end);
             if (p >= end || *p != ']') { st = json_status::malformed; return sol::nil; }
             ++p;

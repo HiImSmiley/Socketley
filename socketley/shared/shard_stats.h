@@ -1,7 +1,7 @@
 #pragma once
-// What N shards publish so any one can answer for all without a round trip;
-// one aligned slot each, so it carries only counters a reader SUMS.
-// memfd, not a file: survives exec, has no path, dies with the last child.
+// What N shards publish so any one can answer for all without a round trip,
+// one aligned slot each of counters a reader sums, in a memfd that survives
+// exec and dies with the last child.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,22 +21,20 @@ namespace shard_stats
 {
 
 // A fallback lock would live in each process's own address space, so this must
-// be lock-free or the guarantee is nothing.  Fails the build, not the run.
+// be lock-free or the guarantee is nothing.
 static_assert(std::atomic<uint64_t>::is_always_lock_free,
               "shard_stats needs lock-free 64-bit atomics to cross a process boundary");
 
-// The name memfd_create() is given, and the reason it is a constant rather than
-// a literal at the call: it is also how a reader decides whether a descriptor
-// it was handed is one of these.  See looks_like_region().
+// The name memfd_create() is given, a constant because it is also how a reader
+// decides whether a descriptor it was handed is one of these.
 inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
 inline constexpr uint32_t format_version = 2u;
 
-// One shard's line, written by it alone.  `generation` is not a seqlock -- it
-// counts attachments, which is how a reader tells an unused slot from one whose
-// legitimate count is zero.
+// One shard's line, written by it alone, where `generation` counts attachments
+// so a reader can tell an unused slot from a legitimate zero.
 struct alignas(line_size) slot
 {
     std::atomic<uint64_t> generation;
@@ -49,8 +47,8 @@ struct alignas(line_size) slot
 };
 static_assert(sizeof(slot) == line_size);
 
-// One struct so the writer cannot publish four of five; every field must be a
-// number a reader only ADDS.  Not a snapshot -- that is what wait-free costs.
+// One struct so the writer cannot publish four of five, every field a number a
+// reader only adds.
 struct figures
 {
     uint64_t active_connections{0};
@@ -102,9 +100,8 @@ inline bool looks_like_region(int fd)
         return false;
     link[len] = '\0';
 
-    // "/memfd:<name> (deleted)".  Prefix-matched: the suffix is the kernel's
-    // and has changed shape between versions, and the name is what identifies
-    // it.
+    // "/memfd:<name> (deleted)", prefix-matched because the suffix is the
+    // kernel's and has changed shape between versions.
     static const std::string want = std::string("/memfd:") + region_name;
     return std::string_view(link, static_cast<size_t>(len)).substr(0, want.size()) == want;
 }
@@ -153,9 +150,8 @@ public:
         m_index = invalid_index;
         m_count = shard_count;
 
-        // ftruncate gives zeroed pages, so the counters are already zero.  The
-        // header is written last and the magic last of all, so a reader that
-        // sees the magic sees a complete header.
+        // ftruncate gives zeroed pages, and the magic is written last, so a
+        // reader that sees the magic sees a complete header.
         m_table->h.version.store(format_version, std::memory_order_relaxed);
         m_table->h.shard_count.store(shard_count, std::memory_order_relaxed);
         m_table->h.magic.store(magic_value, std::memory_order_release);
@@ -190,7 +186,7 @@ public:
 
     int fd() const { return m_fd; }
 
-    // Map the region and take slot `index`.  Takes the descriptor either way,
+    // Map the region and take slot `index`, taking the descriptor either way
     // or a refused config leaks one.
     bool adopt(int fd, uint32_t index)
     {
@@ -235,9 +231,8 @@ public:
         m_index = index;
         m_count = count;
 
-        // Whatever the previous occupant of this slot last said is not about
-        // this process.  Cleared before the generation is bumped, so a reader
-        // never sees a live generation over a dead count.
+        // Whatever the previous occupant of this slot said is not about this
+        // process, and is cleared before the generation is bumped.
         m_table->slots[index].active_connections.store(0, std::memory_order_relaxed);
         m_table->slots[index].total_connections.store(0, std::memory_order_relaxed);
         m_table->slots[index].total_messages.store(0, std::memory_order_relaxed);
@@ -247,9 +242,8 @@ public:
         return true;
     }
 
-    // Read-only attach for the placeholder, which is what `stats` and every Lua
-    // binding ask.  Not adopt(): that claims a slot, and the daemon is no
-    // shard.  The descriptor is DUPLICATED, or two objects close one number.
+    // Read-only attach for the placeholder, not adopt(), which claims a slot,
+    // and the descriptor is duplicated or two objects close one number.
     bool attach_reader(int fd)
     {
         close();
@@ -298,8 +292,8 @@ public:
     uint32_t index()   const { return m_index; }
     uint32_t count()   const { return m_table ? m_count : 0; }
 
-    // This shard's own figure.  One store, no barrier heavier than a release,
-    // and no call at all for a runtime that is not sharded.
+    // This shard's own figure, one store with no barrier heavier than a
+    // release.
     void publish_active(uint64_t n)
     {
         if (!writable())
@@ -337,9 +331,8 @@ public:
         return total;
     }
 
-    // Every shard's whole line, added up.  Same wait-free property and the same
-    // reason it is one call: a reader that summed four of the five fields would
-    // print a runtime whose bytes_out did not match its own bytes_in.
+    // Every shard's whole line added up in one call, so no reader prints a
+    // runtime whose bytes_out did not match its own bytes_in.
     figures sum() const
     {
         figures f;
@@ -370,9 +363,8 @@ public:
         return false;
     }
 
-    // One named shard's whole line.  `stats` prints these under a [shard i]
-    // heading so that an operator can see how the work is spread, which is a
-    // question the sum deliberately cannot answer.
+    // One named shard's whole line, which `stats` prints so an operator can
+    // see how the work is spread.
     figures at(uint32_t i) const
     {
         figures f;
@@ -387,8 +379,8 @@ public:
         return f;
     }
 
-    // What one named shard last said.  For diagnostics and for the tests; the
-    // sum above is what production reads.
+    // What one named shard last said, for diagnostics and tests, where the sum
+    // above is what production reads.
     uint64_t active_at(uint32_t i) const
     {
         if (!m_table || i >= m_count)
@@ -423,6 +415,5 @@ private:
 
 }   // namespace shard_stats
 
-// `self.clients()` is deliberately not here: ids are descriptors, so summing is
-// meaningless and concatenating hands one shard's id to another.  It needs
-// conn_refs, which makes it a consumer of routing rather than of this.
+// `self.clients()` is deliberately not here, because ids are descriptors:
+// summing is meaningless and concatenating hands one shard's id to another.

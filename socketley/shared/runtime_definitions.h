@@ -19,13 +19,12 @@ enum runtime_type : uint8_t
     runtime_cache  = 3
 };
 
-// A bound on the typo, not a recommendation.  Here rather than in the parser
-// because a state file is a second way in and must meet the same bound.
+// A bound on the typo, here rather than in the parser because a state file is
+// a second way in.
 inline constexpr uint32_t max_shards = 64;
 
-// Which of the two processes this is; only the rules about the daemon's
-// decision to FORK differ.  Not lua_context's flag of the same name, and not
-// runtime_manager::m_replica -- a worker starts its runtime without a manager.
+// Which of the two processes this is, for the daemon's decision to fork; not
+// lua_context's flag of the same name, nor runtime_manager::m_replica.
 inline bool g_worker_process = false;
 inline void set_worker_process(bool on) { g_worker_process = on; }
 inline bool in_worker_process()         { return g_worker_process; }
@@ -36,9 +35,8 @@ inline std::string shards_config_refusal(runtime_type type,
                                          uint32_t    shards,
                                          std::string_view listen_path)
 {
-    // The unsharded case, which is every runtime that never typed the flag.
-    // Nothing below may fire for it: a rule that refuses a default is a rule
-    // that refuses everything.
+    // The unsharded case, which every runtime that never typed the flag is, so
+    // nothing below may fire for it.
     if (shards <= 1)
         return {};
 

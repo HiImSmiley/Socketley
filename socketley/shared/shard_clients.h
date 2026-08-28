@@ -1,7 +1,6 @@
 #pragma once
-// Which connections each shard holds, by name, behind a seqlock -- a list is a
-// length and N entries that must agree, so unlike shard_stats.h a reader retries.
-// max_clients_per_shard is server_instance::MAX_FDS, so nothing truncates.
+// Which connections each shard holds, by name, behind a seqlock a reader
+// retries, because a list is a length and N entries that must agree.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -102,9 +101,8 @@ public:
         return true;
     }
 
-    // A shard has gone.  Its block must stop being read, and the count is what
-    // says so — the entries themselves are left alone, because a reader that
-    // has already passed the count check is holding a version it will re-check.
+    // A shard has gone, so the count stops it being read; the entries are left
+    // alone because a reader past that check holds a version it will re-check.
     void clear_block(uint32_t i)
     {
         if (!m_base || i >= m_count) return;
@@ -233,8 +231,8 @@ public:
         return block(m_index)->count.load(std::memory_order_relaxed);
     }
 
-    // `skip` is this process's own block; invalid_index reads all.  False means
-    // a block could not be read, and `out` holds the rest.
+    // `skip` is this process's own block and invalid_index reads all; false
+    // means a block could not be read and `out` holds the rest.
     bool read_others(std::vector<conn_ref>& out, uint32_t skip) const
     {
         out.clear();

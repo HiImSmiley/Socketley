@@ -18,8 +18,7 @@ struct owed
     bool connect{false};      // or the poll standing in for one
     bool promised_reply{false};   // one reply per request, back into this loop
 
-    // Only the peer or the socket can end this, so it is never owed.  A member
-    // rather than an omission, so the exclusion reads as the rule it is.
+    // Only the peer or the socket can end this, so it is never owed.
     bool read{false};
 };
 
@@ -33,13 +32,13 @@ enum class verdict : uint8_t
 {
     keep,     // not closing, or something owed is outstanding
 
-    // Closing, nothing owed, output still queued.  Flush, then ASK AGAIN: a
-    // flush that reached the ring becomes `keep`, one that submitted nothing
-    // becomes `finish`, because nothing would wake it either.
+    // Closing, nothing owed, output still queued: flush and ask again, because
+    // a flush that reached the ring is `keep` and one that submitted nothing
+    // is `finish`.
     flush,
 
-    // Closing and unreachable.  Taking the armed read back is the teardown's
-    // own job, and every runtime's teardown already does it.
+    // Closing and unreachable; taking the armed read back is the teardown's
+    // own job.
     finish
 };
 

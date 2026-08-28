@@ -1,7 +1,7 @@
 #pragma once
 // A qualified NAME rather than a new frame, so the request channel's tickets,
-// liveness and bounds still apply.  '#' cannot collide: runtime_manager admits
-// no such name, and parse() refuses a stray one rather than resolving to 0.
+// liveness and bounds still apply, and '#' cannot collide because
+// runtime_manager admits no such name.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -10,8 +10,7 @@
 
 inline constexpr char shard_target_sep = '#';
 
-// `name` + '#' + index.  Cheap enough to build per crossing — one crossing is
-// a round trip through two event loops.
+// `name` + '#' + index, cheap enough to build per crossing.
 inline std::string shard_target(std::string_view name, uint32_t index)
 {
     std::string out;

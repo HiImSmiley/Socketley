@@ -17,9 +17,9 @@ enum tls_conn_state : uint8_t {
     tls_conn_ready     = 2   // handshake complete, application data flowing
 };
 
-// The one question every place a TLS configuration takes effect asks.
-// A TLS cache carrying --replicate is refused: replication writes raw bytes
-// around the record layer.  `--tls` alone is complete only for a client.
+// The one question every place a TLS configuration takes effect asks,
+// including the refusal of a TLS cache with --replicate, whose replication
+// writes raw bytes around the record layer.
 std::string tls_config_refusal(runtime_type type,
                                bool tls,
                                bool udp,
@@ -65,8 +65,8 @@ public:
     // Create SSL in server mode (calls SSL_set_accept_state)
     SSL* create_ssl_server() const;
 
-    // `expected_hostname` is required, not a setter: SSL_VERIFY_PEER proves only
-    // that some trusted CA signed it.  Literal address for an IP peer.
+    // `expected_hostname` is required rather than a setter, because
+    // SSL_VERIFY_PEER proves only that some trusted CA signed it.
     SSL* create_ssl_client(std::string_view expected_hostname) const;
 
     // Accept a TLS handshake on an SSL object

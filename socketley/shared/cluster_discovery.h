@@ -67,16 +67,15 @@ public:
     // nothing is written or deleted and last_error() says who holds it.
     bool start(event_loop& loop);
 
-    // Why the last start() refused, as one line and no trailing newline.
-    // Empty after a start() that succeeded.
+    // Why the last start() refused, as one line with no trailing newline,
+    // empty after a start() that succeeded.
     const std::string& last_error() const { return m_last_error; }
 
     // Stop and unpublish (graceful shutdown)
     void stop();
 
     // Hands back the loop token so a caller can ask when the ring is done with
-    // this storage -- the publish timer is an io_request living INSIDE the
-    // object.  Zero means never started and safe to free now.
+    // this storage, zero meaning never started and safe to free now.
     uint32_t retire();
 
     // Get remote runtimes matching a group (thread-safe, returns snapshot)
@@ -137,9 +136,8 @@ private:
     runtime_manager& m_manager;
     event_loop* m_loop = nullptr;
 
-    // This object wrote the name's file at least once.  unpublish() will not
-    // remove a file it never created: the refusal path resets the object, and
-    // that runs the destructor.
+    // This object wrote the name's file at least once, so unpublish() will not
+    // remove a file it never created.
     bool m_published = false;
 
     // One line saying why start() refused.
@@ -153,9 +151,8 @@ private:
     // retire() withdraws a timer that is there rather than spending an SQE.
     bool m_timer_armed{false};
 
-    // What register_owner() handed back.  Kept because deregister_owner()
-    // clears the handler's own copy as its first act, and retire() has to
-    // deregister before it can hand the token on.
+    // What register_owner() handed back, kept because deregister_owner()
+    // clears the handler's own copy first.
     uint32_t m_owner_token{0};
 
     // Cached remote daemons (protected by mutex)

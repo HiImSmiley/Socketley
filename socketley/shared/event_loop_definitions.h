@@ -15,9 +15,8 @@
 
 class event_loop;
 
-// Which CPUs a loop's I/O may run on, covering the ring's thread and its SQPOLL
-// poller.  `all` makes no sched_setaffinity call at all, which differs from a
-// full mask: that would pin to the CPUs online now and exclude later ones.
+// Which CPUs a loop's I/O may run on, where `all` makes no sched_setaffinity
+// call at all rather than pinning to the CPUs online now.
 struct cpu_set_spec
 {
     // A 65-CPU box is refused by parsing rather than losing its high half.
@@ -69,18 +68,16 @@ struct cpu_set_spec
     }
 };
 
-// How many CPUs this machine has.  The bound an impossible set is impossible
-// against; a separate function so the parser can be tested against a number the
-// caller chooses.
+// How many CPUs this machine has, separate so the parser can be tested against
+// a number the caller chooses.
 inline uint32_t online_cpu_count()
 {
     const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? static_cast<uint32_t>(n) : 1u;
 }
 
-// `max`, `0`, `0-3`, `0,1,2,3`, `0-1,3`.  A CPU this machine lacks and an empty
-// set are both refused rather than falling back to "all" -- an operator who
-// pins to CPU 7 on a four-core box must not read silence as success.
+// `max`, `0`, `0-3`, `0,1,2,3`, `0-1,3`, refusing an absent CPU and an empty
+// set rather than falling back to "all".
 inline bool parse_cpu_set(std::string_view spec, uint32_t ncpus,
                           cpu_set_spec& out, std::string& err)
 {
@@ -206,8 +203,8 @@ private:
     uint32_t m_loop_token{0};
 };
 
-// One counter for the whole process, because two live structs must never hold
-// the same value.  Zero is reserved for "never stamped" and skipped on wrap.
+// One counter for the whole process, since two live structs must never hold
+// the same value, with zero reserved for never stamped.
 inline uint32_t next_io_generation()
 {
     static uint32_t seq = 0;
@@ -216,8 +213,8 @@ inline uint32_t next_io_generation()
     return seq;
 }
 
-// io_request::buf_group for a submission that selected no provided buffer.
-// Outside every valid group id, so returning it is a no-op.
+// io_request::buf_group for a submission that selected no provided buffer,
+// outside every valid group id.
 inline constexpr uint8_t NO_BUF_GROUP = 0xFF;
 
 // Giving a descriptor number away before the kernel consumes the SQE REDIRECTS
@@ -259,9 +256,8 @@ enum op_type : uint8_t
 
 inline constexpr uint8_t op_type_count = 23;
 
-// For diagnostics only.  A count of outstanding operations says an owner cannot
-// be released yet; the kind says why, which is the difference between reading a
-// number and knowing where to look.
+// For diagnostics only, because a count says an owner cannot be released yet
+// and the kind says where to look.
 inline const char* io_op_name(uint8_t t)
 {
     switch (t)
@@ -315,9 +311,8 @@ struct io_request
     op_type type;
 
     // Tells a pooled struct's completion from its successor's, which
-    // owner_token cannot: same address, same fd, same owner.  From
-    // next_io_generation() only -- a per-struct counter is compared against a
-    // DIFFERENT object's after reuse and agrees by accident.
+    // owner_token cannot, and comes from next_io_generation() because a
+    // per-struct counter agrees by accident after reuse.
     uint32_t generation{0};
 
     // Submit-to-complete timing, -DSOCKETLEY_TIMING only; the field is absent
@@ -326,18 +321,15 @@ struct io_request
 
 
     // Compared against the owner table before dispatch, so a deregistered
-    // handler -- or an old registration on the same slot -- is dropped.
-    // Zero never matches a live registration.
+    // handler or an old registration on the same slot is dropped.
     uint32_t owner_token{0};
 
-    // So the loop can return the buffer when it drops a completion, by which
-    // time the owner that knew the group may be gone.  Read only when the CQE
-    // carries IORING_CQE_F_BUFFER, which only those helpers produce.
+    // So the loop can return the buffer when it drops a completion, read only
+    // when the CQE carries IORING_CQE_F_BUFFER.
     uint8_t buf_group{NO_BUF_GROUP};
 
-    // The numbers the SQE named -- not ::fd, which several helpers set to
-    // something else.  Two, because splice names a pipe and a socket.
-    // Read BEFORE dispatch: on_cqe may free this storage or re-arm it.
+    // The numbers the SQE named, two because splice names a pipe and a socket,
+    // read before dispatch since on_cqe may free this storage.
     uint32_t armed_target{IO_TARGET_NONE};
     uint32_t armed_target2{IO_TARGET_NONE};
 };

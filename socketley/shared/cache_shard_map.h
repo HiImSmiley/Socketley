@@ -1,7 +1,6 @@
 #pragma once
-// Which shard owns a key, as a pure function so N processes agree without
-// comparing notes -- Redis's keyHashSlot() exactly, because a client must be
-// able to compute it without asking.  The slot survives a change of N, not the shard.
+// Which shard owns a key, as Redis's keyHashSlot() exactly, so N processes
+// agree and a client can compute it without asking.
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -62,9 +61,8 @@ constexpr std::string_view cache_hash_tag(std::string_view key)
     return key.substr(open + 1, close - open - 1);
 }
 
-// The hash slot a key belongs to: 0..16383, and the same number Redis would
-// give it.  Independent of the shard count, which is what lets a client cache
-// a slot per key and a client library share one slot table across a resize.
+// The hash slot a key belongs to, 0..16383 and independent of the shard count,
+// which is what lets a client cache a slot per key across a resize.
 constexpr uint32_t cache_slot_of(std::string_view key)
 {
     return cache_crc16(cache_hash_tag(key)) & (cache_slot_count - 1);
@@ -79,7 +77,6 @@ constexpr uint32_t cache_shard_of_slot(uint32_t slot, uint32_t shard_count)
 }
 
 // The inverse, for CLUSTER SLOTS: the first and last slot of a shard's range.
-// An empty range would need shard_count > 16384 and max_shards is 64.
 constexpr uint32_t cache_shard_slot_first(uint32_t shard, uint32_t shard_count)
 {
     if (shard_count <= 1)
@@ -94,7 +91,7 @@ constexpr uint32_t cache_shard_slot_last(uint32_t shard, uint32_t shard_count)
     return cache_shard_slot_first(shard + 1, shard_count) - 1;
 }
 
-// Which of `shard_count` shards owns `key`.  Always 0 for an unsharded cache,
+// Which of `shard_count` shards owns `key`, always 0 for an unsharded cache,
 // which is shard 0 of one and not a special case.
 inline uint32_t cache_shard_of(std::string_view key, uint32_t shard_count)
 {
@@ -128,8 +125,8 @@ enum class cache_merge : uint8_t
     key_list    // keys: the per-shard lists concatenated
 };
 
-// What a command's parts are merged with.  `single` for everything that has one
-// part, which is every command step one routes.
+// What a command's parts are merged with, `single` for everything that has one
+// part.
 constexpr cache_merge cache_merge_for(uint32_t h)
 {
     switch (h)
@@ -151,8 +148,8 @@ constexpr cache_merge cache_merge_for(uint32_t h)
     }
 }
 
-// The command alone.  `del` and `exists` are multi_key for RESP and narrowed
-// for the text reading below -- one table, two readings, not two tables.
+// The command alone, with `del` and `exists` multi_key for RESP and narrowed
+// for the text reading below -- one table, two readings.
 constexpr cache_cmd_class cache_classify(uint32_t h)
 {
     switch (h)
@@ -223,9 +220,8 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
     }
 }
 
-// The text interpreter's reading.  `del k` and `exists k` are one key by
-// construction there — the multi-key spelling does not exist in that protocol,
-// so refusing it as multi_key would refuse a command that has one owner.
+// The text interpreter's reading, where `del k` and `exists k` are one key by
+// construction because the multi-key spelling does not exist in that protocol.
 constexpr cache_cmd_class cache_classify_text(uint32_t h)
 {
     if (h == fnv1a("del") || h == fnv1a("exists"))
@@ -233,8 +229,8 @@ constexpr cache_cmd_class cache_classify_text(uint32_t h)
     return cache_classify(h);
 }
 
-// RESP's reading, which allows several.  The narrowing follows this build's
-// implementation rather than the protocol, deliberately.
+// RESP's reading, which allows several, narrowed to follow this build's
+// implementation rather than the protocol.
 constexpr cache_cmd_class cache_classify_resp(uint32_t h, int argc)
 {
     if (h == fnv1a("exists"))
@@ -261,9 +257,9 @@ constexpr cache_text_parts cache_split_text(std::string_view line)
     return {line.substr(0, sp), line.substr(sp + 1)};
 }
 
-// Two rules, not one: seventeen commands take the WHOLE remainder as the key
-// and the rest take the first token.  Assuming either everywhere routes a key
-// with a space in it to a different shard than the store looks it up on.
+// Two rules, because seventeen commands take the whole remainder as the key
+// and the rest take the first token, and assuming either everywhere misroutes
+// a key with a space in it.
 constexpr bool cache_text_key_is_whole_args(uint32_t h)
 {
     switch (h)
@@ -290,16 +286,15 @@ constexpr std::string_view cache_text_key(uint32_t h, std::string_view args)
     return sp == std::string_view::npos ? args : args.substr(0, sp);
 }
 
-// N positions do not fit one stateless cursor, so SCAN walks shard by shard --
-// top six bits name the shard.  A cursor is only meaningful for the shard set
-// that issued it, so a change of N must REFUSE an old one rather than follow it.
+// SCAN walks shard by shard with the shard in the top six bits, so a change of
+// N must refuse an old cursor rather than follow it.
 inline constexpr int      cache_scan_shard_bits  = 6;          // max_shards == 64
 inline constexpr int      cache_scan_shard_shift = 64 - cache_scan_shard_bits;
 inline constexpr uint64_t cache_scan_store_mask  =
     (1ull << cache_scan_shard_shift) - 1ull;
 
-// Which shard a cursor is a position in.  0 for every cursor an unsharded cache
-// ever issues, which is what makes this a no-op there.
+// Which shard a cursor is a position in, 0 for every cursor an unsharded cache
+// issues.
 constexpr uint32_t cache_scan_cursor_shard(uint64_t cursor)
 {
     return static_cast<uint32_t>(cursor >> cache_scan_shard_shift);
@@ -317,9 +312,8 @@ constexpr uint64_t cache_scan_cursor_make(uint32_t shard, uint64_t store_cursor)
          | (store_cursor & cache_scan_store_mask);
 }
 
-// The ownership function fingerprinted over fixed probes, so a changed hash
-// takes the filter path rather than a fast path that misplaces every key.
-// Sixteen probes ALWAYS, or two sets written at different N would differ.
+// The ownership function fingerprinted over sixteen fixed probes always, so a
+// changed hash takes the filter path instead of misplacing every key.
 inline constexpr uint32_t cache_fingerprint_count = 16;
 
 inline constexpr std::string_view cache_fingerprint_probes[] = {
@@ -330,7 +324,7 @@ inline constexpr std::string_view cache_fingerprint_probes[] = {
 inline constexpr size_t cache_fingerprint_len =
     sizeof(cache_fingerprint_probes) / sizeof(cache_fingerprint_probes[0]);
 
-// Eight bytes, one shard index per probe.  Written into every dump header and
+// Eight bytes, one shard index per probe, written into every dump header and
 // compared on load.
 inline void cache_shard_fingerprint(unsigned char out[cache_fingerprint_len])
 {

@@ -25,9 +25,8 @@ struct runtime_config
     std::string id;
     runtime_type type = runtime_server;
     uint16_t port = 0;
-    // `--listen unix:/path` — an AF_UNIX listener instead of a port.  See
-    // runtime_instance::set_listen_path.  Mutually exclusive with `port`; the
-    // refusal is where the flag is read, not here.
+    // `--listen unix:/path`, an AF_UNIX listener instead of a port, mutually
+    // exclusive with `port` and refused where the flag is read.
     std::string listen_path;
     bool was_running = false;
 
@@ -65,14 +64,12 @@ struct runtime_config
     // the configured throughput, reported by nothing as wrong.
     uint32_t shards = 1;
 
-    // Which child this config frame is for, 0..shards-1 -- the only field that
-    // differs between the N frames, and a worker has no other way to learn it.
-    // Never written to a state file: a restore would give every shard index 0.
+    // Which child this config frame is for, never written to a state file
+    // because a restore would give every shard index 0.
     uint32_t shard_index = 0;
 
-    // A request, not a result: persisted because the refusal is the whole value
-    // of it, and a restore that drops it silently meets no requirement.
-    // Stored as typed (max | 0-3 | 0,1,2,3); empty means no request was made.
+    // A request rather than a result, persisted because a restore that drops
+    // the refusal silently meets no requirement.
     std::string cpus;
     bool sqpoll = false;
     bool sqpoll_set = false;
@@ -127,8 +124,8 @@ struct runtime_config
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
 
-    // Which keys the document actually named, so `import` can tell a field set
-    // to its default from one left out.  Filled only by parse_json_string.
+    // Which keys the document actually named, so `import` can tell a default
+    // from an omission, filled only by parse_json_string.
     std::set<std::string, std::less<>> present;
 
     bool has(std::string_view key) const { return present.find(key) != present.end(); }
@@ -187,8 +184,7 @@ private:
     bool write_json(const runtime_config& cfg) const;
 
     // Narrow any state file this directory already holds to 0600, returning
-    // how many were changed.  Called once from load_all(); see the reasoning
-    // there and at the definition.
+    // how many were changed.
     size_t tighten_existing() const;
 
     bool read_json(const std::filesystem::path& path, runtime_config& cfg) const;

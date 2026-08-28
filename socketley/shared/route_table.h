@@ -1,7 +1,7 @@
 #pragma once
 // A path and the methods allowed on it, declared by the handler and published
-// to the proxy so the two cannot drift.  Path and methods only.
-// An optimisation, not input validation -- a server listens on its own port.
+// to the proxy so the two cannot drift, as an optimisation and not as input
+// validation.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -38,9 +38,8 @@ public:
         duplicate,     // this path is declared twice in one script
     };
 
-    // `path` is as the *handler* sees it — the path a request carries after the
-    // proxy has stripped its own /<name>/ prefix.  A declaration is written in
-    // the handler's script, so it can only be about the handler's own paths.
+    // `path` is as the handler sees it, after the proxy has stripped its own
+    // /<name>/ prefix.
     add_result add(std::string_view path, const std::vector<std::string>& methods)
     {
         if (m_routes.size() >= MAX_ROUTES)
@@ -126,9 +125,8 @@ public:
         m_prefixes.clear();
     }
 
-    // Every declaration, in the order they were added.  Needed because a
-    // declaration made in a worker has to reach the daemon, which publishes it
-    // to whoever routes to that runtime — see worker_protocol's encode_routes.
+    // Every declaration in the order they were added, because one made in a
+    // worker has to reach the daemon that publishes it.
     const std::vector<route_decl>& all() const { return m_routes; }
 
     bool   empty() const { return m_routes.empty(); }
@@ -136,15 +134,13 @@ public:
     // number nobody can see is a feature nobody can debug.
     size_t size()  const { return m_routes.size(); }
 
-    // nullptr means no declaration covers this and the caller FORWARDS, not
-    // 404.  `path` must already have its query string removed.
+    // nullptr means no declaration covers this and the caller forwards rather
+    // than 404s, with `path` already stripped of its query string.
     const route_decl* find(std::string_view path) const
     {
         if (const auto it = m_exact.find(path); it != m_exact.end())
             return &m_routes[it->second];
         // Longest first, so "/api/v2/*" beats "/api/*" for a path under both.
-        // m_prefixes is kept in that order at insert time; there are few of
-        // them and this runs once per request.
         for (const uint32_t idx : m_prefixes)
         {
             const auto& r = m_routes[idx];
@@ -199,9 +195,9 @@ public:
         return out;
     }
 
-    // RFC 9110 §9 method names are tokens.  A declaration carrying anything
-    // else would end up in an Allow header this proxy emits, and a header value
-    // with a CR in it is response splitting with the gateway as the vehicle.
+    // RFC 9110 method names are tokens, and anything else would reach an Allow
+    // header, where a CR is response splitting with the gateway as the
+    // vehicle.
     static bool method_token_ok(std::string_view s)
     {
         if (s.empty() || s.size() > 24)
@@ -259,9 +255,8 @@ private:
         return nullptr;
     }
 
-    // Replace the routes and rebuild both lookup structures from them.  The
-    // index is by position, so nothing may edit m_routes without coming
-    // through here or through add().
+    // Replace the routes and rebuild both lookup structures, which the index
+    // by position requires nothing bypass.
     void reindex(std::vector<route_decl>&& routes)
     {
         m_routes = std::move(routes);

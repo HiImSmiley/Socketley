@@ -15,10 +15,9 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg)
     for (const auto& b : cfg.backends)
         prx.add_backend(b);
 
-    // The "!= default" tests are kept exactly as the restore path had them.
-    // They matter for backend_timeout in particular, where 0 means "no
-    // deadline" and is not the same answer as "not configured" — see the note
-    // on runtime_config::backend_timeout.
+    // The "!= default" tests are kept exactly as the restore path had them,
+    // which matters for backend_timeout, where 0 means no deadline rather than
+    // not configured.
     if (cfg.health_check > 0)
         prx.set_health_check(static_cast<mesh_config::health_type>(cfg.health_check));
     if (cfg.health_interval != 5)
@@ -47,10 +46,8 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg)
 
 void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
 {
-    // Guarded the way the worker's own list was: a setter called with an empty
-    // or zero value would overwrite a default that means something, and this
-    // function is used on a runtime that is already configured as well as on a
-    // fresh one.
+    // Guarded the way the worker's own list was, because a setter called with
+    // an empty value would overwrite a default that means something.
     if (cfg.port > 0)                rt.set_port(cfg.port);
     if (!cfg.listen_path.empty())    rt.set_listen_path(cfg.listen_path);
     if (!cfg.group.empty())          rt.set_group(cfg.group);
@@ -70,25 +67,16 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (!cfg.ca_path.empty())        rt.set_ca_path(cfg.ca_path);
     if (!cfg.target.empty())         rt.set_target(cfg.target);
     if (!cfg.cache_name.empty())     rt.set_cache_name(cfg.cache_name);
-    // Read by the daemon, which forks this many workers.  Carried into the
-    // worker too, so `inspect` describes the same runtime whichever side is
-    // asked — a shard itself does nothing with the number: it is one process
-    // serving one listening socket, and which of N it happens to be changes
-    // nothing about what it does.
+    // Read by the daemon, which forks this many workers, and carried into the
+    // worker so `inspect` describes the same runtime whichever side is asked.
     if (cfg.shards > 1)              rt.set_shards(cfg.shards);
-    // Unconditional, unlike every other line here.  Zero is a real value — it
-    // is shard 0 — and the guarded form would leave a restarted shard 0 holding
-    // whichever index this object last had.  Nothing else writes it, so there
-    // is no default underneath for this to overwrite.
+    // Unconditional, unlike every other line here, because zero is shard 0 and
+    // the guarded form would leave a restarted shard 0 holding whichever index
+    // this object last had.
     rt.set_shard_index(cfg.shard_index);
 
     // The ring request, recorded on the runtime so `stats` answers about what
-    // was asked for and not only about what the ring happens to be.  Applying
-    // it to an actual ring is the caller's: in the daemon every runtime shares
-    // one, built before any config was read, and in a worker there is one ring
-    // per runtime and it is built from exactly this — see proxy_worker's
-    // on_config, which has to do it before init() because io_uring fixes a
-    // ring's flags at creation.
+    // was asked for, with applying it to an actual ring left to the caller.
     if (!cfg.cpus.empty())
     {
         cpu_set_spec spec;
@@ -116,17 +104,10 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             srv.clear_upstream_targets();
             for (const auto& u : cfg.upstreams)
             {
-                // The worker's config frame carries what the daemon's state
-                // file holds, so this is the same situation as the boot restore
-                // in daemon.cpp and takes the same answer: log and skip.  There
-                // is no command in flight to refuse to, and dropping the whole
-                // runtime over one unreadable entry would take down a listener
-                // that the rest of the configuration can still serve.
-                //
-                // A configuration typed today cannot reach here — `create`,
-                // `edit` and `import` all refuse an unusable upstream before it
-                // is ever written down.  What reaches here is a file an older
-                // daemon wrote.
+                // Log and skip, as the boot restore does, because there is no
+                // command in flight to refuse to and dropping the runtime over
+                // one unreadable entry takes down a listener the rest of the
+                // configuration can serve.
                 if (!srv.add_upstream_target(u))
                     LOG_WARN(("dropping upstream \"" + u +
                               "\": the port is not a number between 1 and 65535").c_str());
@@ -138,19 +119,10 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             auto& cli = static_cast<client_instance&>(rt);
             cli.set_mode(static_cast<client_mode>(cfg.mode));
             cli.set_udp(cfg.udp);
-            // `>= 0`, not `!= 0`.  The field has three states — -1 disabled,
-            // 0 infinite attempts, N a limit — so 0 is a value, not an absence,
-            // and it is the one `--reconnect` produces when written without a
-            // number, which the man page gives as the default form.  Guarding
-            // on `!= 0` skipped exactly the spelling the flag is usually typed
-            // as, leaving m_reconnect at its -1 default: accepted by the CLI,
-            // stored, reported by `show`, and inert.
-            //
-            // state_persistence.cpp writes the field under `if (cfg.reconnect
-            // >= 0)`.  Writer and reader disagreed about what 0 meant, and only
-            // the worker path reads it back — which is why an in-daemon client
-            // reconnected in about a second and a worker one, the default since
-            // 8399bee, never did.
+            // `>= 0`, not `!= 0`, because -1 is disabled and 0 is infinite
+            // attempts -- the spelling `--reconnect` produces without a
+            // number, which state_persistence.cpp already writes under the
+            // same test.
             if (cfg.reconnect >= 0) cli.set_reconnect(cfg.reconnect);
             break;
         }

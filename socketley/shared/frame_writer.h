@@ -26,8 +26,8 @@ public:
     void set_fd(int fd) { m_fd = fd; }
     int  fd() const     { return m_fd; }
 
-    // Only after register_owner().  AFTERWARDS THE OWNER MUST flush() ONCE PER
-    // TURN: from here write() queues and does not submit.
+    // Only after register_owner(), after which the owner must flush() once per
+    // turn because write() only queues.
     void use_ring(event_loop* loop, io_handler* owner)
     {
         if (!loop || !owner || m_loop)
@@ -37,8 +37,8 @@ public:
         flush();
     }
 
-    // An in-flight send is abandoned, not rewritten -- a duplicated prefix is a
-    // malformed frame.  Unsubmitted bytes go back to the front of m_out.
+    // An in-flight send is abandoned rather than rewritten, since a duplicated
+    // prefix is a malformed frame.
     void leave_ring()
     {
         if (!m_loop)
@@ -56,9 +56,9 @@ public:
     bool on_ring()        const { return m_loop != nullptr; }
     bool send_in_flight() const { return m_send_armed; }
 
-    // Is this completion the one this writer submitted?  The owner dispatches
-    // on it rather than on the op type: the same handler has other submissions
-    // of its own and they must not be confused for a send that finished.
+    // Is this completion the one this writer submitted, asked instead of
+    // dispatching on the op type, which the owner's own submissions would also
+    // match.
     bool owns_request(const io_request* r) const { return r == &m_send_req; }
 
     // `res` is a count, not a verdict: short sends are ordinary here.
@@ -77,15 +77,14 @@ public:
             return;
         }
 
-        // Retried from the loop's next flush().  -EAGAIN is the socket being
-        // full, which is the case the backlog above exists for; -ECANCELED is
-        // this ring going down, and there is no next flush to do it any harm.
+        // Retried from the loop's next flush(): -EAGAIN is the socket being
+        // full and -ECANCELED is this ring going down.
         if (res == -EAGAIN || res == -EWOULDBLOCK || res == -EINTR ||
             res == -ENOBUFS || res == -ECANCELED)
             return;
 
-        // Everything else — including a zero-length send of a non-empty buffer
-        // — is the peer being gone.  The read side is what acts on it.
+        // Everything else, including a zero-length send of a non-empty buffer,
+        // is the peer being gone.
         m_dead = true;
     }
 
@@ -118,9 +117,8 @@ public:
             blocking_flush();
     }
 
-    // Everything this writer still owes the wire, in both buffers.  The caller
-    // uses it to decide whether its loop may sleep, so a byte sitting in an
-    // in-flight send counts: it has not been handed over yet.
+    // Everything this writer still owes the wire, in both buffers, so a byte
+    // sitting in an in-flight send counts.
     size_t pending() const
     {
         return (m_out.size() - m_off) + (m_wire.size() - m_wire_off);
@@ -139,9 +137,8 @@ public:
 private:
     void ring_flush()
     {
-        // One send at a time.  Two outstanding on one stream socket is not a
-        // faster writer, it is an unordered one: the kernel may take them in
-        // either order and the far side reads the frames interleaved.
+        // One send at a time, because two outstanding on one stream socket is
+        // not a faster writer but an unordered one.
         if (m_dead || m_send_armed)
             return;
 
@@ -202,8 +199,7 @@ private:
     io_request  m_send_req{};
     bool        m_send_armed{false};
 
-    // What a submitted send is reading from.  Never touched while m_send_armed
-    // — see the note at the top about a pointer the kernel reads through.
+    // What a submitted send is reading from, never touched while m_send_armed.
     std::string m_wire;
     size_t      m_wire_off{0};
 };

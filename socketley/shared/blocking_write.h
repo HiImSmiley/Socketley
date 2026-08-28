@@ -1,8 +1,7 @@
 #pragma once
 
-// Write a whole buffer to a blocking fd, or report how far it got: a short
-// write is ordinary, and treating it as complete misframes every message after.
-// "Nothing written" can be retried; "some of it" has already broken the stream.
+// Write a whole buffer to a blocking fd or report how far it got, because a
+// short write treated as complete misframes every message after it.
 
 #include <cerrno>
 #include <cstddef>
@@ -11,8 +10,8 @@
 namespace socketley
 {
 
-// Returns true when the entire buffer was written. `written`, if given, receives
-// the number of bytes that made it out — including on failure.
+// True when the entire buffer was written; `written`, if given, receives the
+// byte count even on failure.
 inline bool write_all(int fd, const char* data, size_t len, size_t* written = nullptr)
 {
     size_t off = 0;

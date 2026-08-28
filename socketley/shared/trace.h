@@ -1,18 +1,7 @@
 #pragma once
-// Opt-in tracing for connection-level accounting.
-//
-// Build with:  make config=release_x64 CPPFLAGS=-DSOCKETLEY_TRACE
-// (the generated makefiles already pass $(CPPFLAGS) through, so no build
-// system change is needed to turn this on).
-//
-// Everything here compiles to nothing unless SOCKETLEY_TRACE is defined — the
-// counters vanish from the connection struct and the call sites become empty
-// statements, so a release build carries no cost for having the hooks in place.
-//
-// The point is to make silent loss visible.  A connection that reads N commands
-// must produce N responses and write all of them out; when those numbers
-// disagree, or a connection closes while responses are still owed, something
-// was dropped without anyone reporting an error.
+// Opt-in connection accounting under -DSOCKETLEY_TRACE, which makes silent
+// loss visible: a connection that reads N commands must produce and write N
+// responses.
 
 #ifdef SOCKETLEY_TRACE
 
@@ -28,8 +17,8 @@ inline double now_ms()
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Per-connection accounting.  Attached to the connection struct so the numbers
-// travel with it and can be reported at close.
+// Per-connection accounting, on the connection struct so the numbers travel
+// with it and can be reported at close.
 struct conn_stats
 {
     uint64_t bytes_read{0};
@@ -43,28 +32,23 @@ struct conn_stats
     uint32_t multishot_ends{0};   // multishot recv had to be re-armed
     double   opened_ms{0.0};
 
-    // Why the connection ended.  A teardown with no reason recorded here was
-    // decided somewhere other than the read path, which is worth knowing on its
-    // own — "it just closed" is never a useful answer.
+    // Why the connection ended, since a teardown with no reason here was
+    // decided somewhere other than the read path.
     int      last_read_res{1};    // 1 = no read completion has failed yet
     unsigned last_read_flags{0};
 
-    // The splice pipeline moves bytes without them ever reaching userspace, so
-    // the read/write counters above stay at zero for a spliced connection.
-    // These make that path visible: how much the kernel moved, and what the
-    // last splice completion said.
+    // What the kernel moved and what the last splice completion said, because
+    // a spliced connection leaves the read/write counters above at zero.
     uint64_t spliced{0};
-    // The conservation law: what a connection takes off its socket into the
-    // pipe must come out of the pipe onto the peer's socket.  Any difference
-    // beyond what is still resident in the pipe is loss, and which of the two
-    // counters fell short names the hop it happened on.
+    // The conservation law: what a connection takes into the pipe must come
+    // out onto the peer's socket, and whichever counter fell short names the
+    // hop.
     uint64_t sp_in{0};    // socket -> pipe   (leg 1 on a client, leg 3 on a backend)
     uint64_t sp_out{0};   // pipe   -> socket (leg 2 on a client, leg 4 on a backend)
     int      last_splice_res{1};
     unsigned splice_leg{0};       // 1=c->pipe 2=pipe->be 3=be->pipe 4=pipe->c
-    // When a splice on this connection last completed.  A pipeline waiting on a
-    // peer and a pipeline nobody armed look identical from the flags alone; how
-    // long it has been since anything moved is what tells them apart.
+    // When a splice on this connection last completed, which is what tells a
+    // pipeline waiting on a peer from one nobody armed.
     double   splice_cqe_ms{0.0};
 };
 
@@ -84,8 +68,8 @@ struct conn_stats
         std::fputc('\n', stderr);                                              \
     } while (0)
 
-// Emitted for every connection teardown.  "owed" is the discrepancy that matters:
-// responses produced but never confirmed written.
+// Emitted for every teardown, where "owed" is responses produced but never
+// confirmed written.
 #define SKL_TRACE_CLOSE(conn, fd, reason)                                       \
     do {                                                                        \
         SKL_TRACE_LOG("close fd=%d reason=%s lifetime=%.1fms "                  \

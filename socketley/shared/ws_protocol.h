@@ -57,8 +57,8 @@ struct ws_frame
 
 // ─── SIMD / widened XOR unmask helpers ───
 
-// Unmask payload in-place using the fastest available method.
-// mask32 is the 4-byte mask key as a uint32_t (native byte order).
+// Unmask payload in place, with mask32 the 4-byte mask key in native byte
+// order.
 inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
 {
     const uint8_t* mask_bytes = reinterpret_cast<const uint8_t*>(&mask32);
@@ -172,9 +172,8 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
 
 // ─── SHA-1 for WS accept key (EVP API, no deprecated calls) ───
 
-// Compute Sec-WebSocket-Accept from client key.
-// Uses EVP_Digest (non-deprecated single-call API) + stack buffer.
-// RFC 6455 keys are always 24 bytes, but we handle up to 88 bytes safely.
+// Compute Sec-WebSocket-Accept from a client key, handling up to 88 bytes
+// though RFC 6455 keys are always 24.
 inline std::string ws_accept_key(std::string_view client_key)
 {
     // Stack fast path (covers all valid WS keys: 24 + 36 = 60 bytes)
@@ -230,8 +229,8 @@ inline std::string ws_handshake_response(std::string_view client_key)
 
 // ─── Frame encoding (stack-buffer headers, memcpy payload) ───
 
-// Write WS frame header into hdr[]. Returns header length (2, 4, or 10).
-// opcode should already include FIN bit (e.g. 0x81 for FIN+text).
+// Write a WS frame header into hdr[] and return its length, with the FIN bit
+// already in `opcode`.
 inline int ws_write_header(char* hdr, uint8_t opcode_with_fin, size_t payload_len)
 {
     hdr[0] = static_cast<char>(opcode_with_fin);
@@ -352,8 +351,8 @@ inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
     return true;
 }
 
-// Parse one frame from buffer. Returns false if incomplete.
-// Handles masked client frames (RFC 6455 requires clients to mask).
+// Parse one frame from the buffer, false when incomplete, unmasking the client
+// frames RFC 6455 requires be masked.
 inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
 {
     ws_header hdr;
@@ -393,8 +392,8 @@ struct ws_frame_view
     size_t consumed;
 };
 
-// In-place unmask parse -- modifies data buffer, sets view pointers into it.
-// Uses SIMD (AVX2/SSE2) or uint64_t-widened XOR for fast unmasking.
+// In-place unmask parse that modifies the data buffer and points the views
+// into it.
 inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
 {
     ws_header hdr;
@@ -455,8 +454,8 @@ inline void ws_frame_close_into(std::string& buf)
     std::memcpy(&buf[off], WS_CLOSE_FRAME_DATA, 4);
 }
 
-// Compute Sec-WebSocket-Accept and append to buf (no intermediate string).
-// Uses EVP_Digest (single-call, non-deprecated) instead of SHA_CTX.
+// Compute Sec-WebSocket-Accept and append it to buf, with no intermediate
+// string.
 inline void ws_accept_key_into(std::string& buf, std::string_view client_key)
 {
     constexpr size_t STACK_LIMIT = 92;
@@ -499,8 +498,8 @@ inline void ws_handshake_response_into(std::string& buf, std::string_view client
 
 // ─── Broadcast helpers (encode once, share across all clients) ───
 
-// Create a pre-encoded WS text frame as a shared_ptr for broadcast.
-// Encodes the frame once; all recipients share the same buffer (zero-copy on send).
+// A pre-encoded WS text frame encoded once and shared by every recipient of a
+// broadcast.
 inline std::shared_ptr<const std::string> ws_frame_text_shared(std::string_view payload)
 {
     char hdr[14];
