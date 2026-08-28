@@ -311,6 +311,20 @@ private:
     // children are forked by a single reconcile_proxy_workers() before any of
     // these waits, so they come up concurrently: a `start` of twenty pays about
     // one child's startup, and only a wedged child can reach the bound.
+    // ── THIS CAN FREE RUNTIMES.  DO NOT HOLD A POINTER ACROSS IT. ──────────
+    //
+    // The wait drains the child's control plane and SERVES what comes off it
+    // inline -- which is what lets a script's on_start call socketley.create at
+    // all.  socketley.remove is in the same set, including for the caller's own
+    // name, and the daemon serves it: out of the map, into retire(), which for
+    // a placeholder that never reached setup() frees on the spot.
+    //
+    // cmd_create held `instance` across this and read a field off it
+    // afterwards.  AddressSanitizer found it; the Release suite was 199/0 at
+    // the time.  The other two callers were correct by accident of style --
+    // they work from names and call on_start_error(n), which re-resolves.
+    //
+    // Take a NAME across this call, not a pointer, and re-resolve after it.
     int await_worker_startup(std::string_view name, std::string& out,
                              std::chrono::steady_clock::time_point deadline);
 
