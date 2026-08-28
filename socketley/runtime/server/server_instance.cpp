@@ -1,14 +1,9 @@
 #include "server_instance.h"
 #include "../../shared/conn_reachability.h"
 
-// The HTTP header-line helpers: http_whole_decimal, http_trim_ows,
-// http_list_has_token.  Shared rather than copied — a second implementation of
-// "is this a whole decimal" is a second place for the answer to differ.
-//
-// This was "../proxy/http_response_framing.h" until the header moved to
-// shared/, which is to say this runtime reached into another runtime's
-// directory for it — the exact thing the note on cache_instance.h below exists
-// to prevent, eight lines apart and going unremarked.
+// The HTTP header-line helpers, shared rather than copied, because a second
+// implementation of "is this a whole decimal" is a second place for the answer
+// to differ.
 #include "../../shared/http_framing.h"
 #include "../../shared/unix_listener.h"
 #include "../../shared/blocking_write.h"
@@ -20,9 +15,8 @@
 #include "../../shared/invariants.h"
 #include "../../shared/logging.h"
 #include "../../cli/command_hashing.h"
-// Deliberately not cache_instance.h.  Everything this runtime needs of a cache
-// now goes through shared/request_channel.h as bytes; the day it included the
-// other runtime's header was the day it could hold a pointer to one.
+// Deliberately not cache_instance.h, because everything this runtime needs of
+// a cache goes through the request channel as bytes.
 #include "../cache/resp_parser.h"
 
 #include <unistd.h>
@@ -61,10 +55,9 @@ server_instance::server_instance(std::string_view name)
 
 server_instance::~server_instance()
 {
-    // The last word on the cache requests this server made.  teardown() already
-    // does it, but a runtime can be destroyed without ever having been stopped
-    // — `create` then `remove` — and the channel would then be holding a
-    // pointer into this object's storage with a reply still to deliver.
+    // The last word on the cache requests this server made, because a runtime
+    // can be destroyed without ever having been stopped and the channel would
+    // hold a pointer into this object.
     if (auto* mgr = get_runtime_manager())
         mgr->requests().drop_origin(this);
 
@@ -104,11 +97,8 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
     // the descriptor number of the one before it.
     conn->generation = next_io_generation();
 
-    // The name another runtime is allowed to hold.  Minted here rather than at
-    // the first route, so that a connection has one identity for its whole life
-    // and not one that appears when somebody first asks: `routed` can be set
-    // and cleared several times, and a name that came and went with it would
-    // let two spells of routing share a name.
+    // The name another runtime is allowed to hold, minted here rather than at
+    // the first route, so a connection has one identity for its whole life.
     conn->ref_serial = next_serial();
     if (fd >= 0)
         m_conn_by_serial[conn->ref_serial] = fd;
@@ -116,26 +106,14 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
 }
 
 // The shard field in a conn_ref serial has to be wide enough for every shard a
-// build allows.  conn_identity.h cannot check this itself — it does not include
-// runtime_definitions.h, deliberately, because it is included by things that
-// have no notion of a runtime — so the check lives here, where both are already
-// in scope.  Raising max_shards past 64 fails this rather than silently minting
-// refs whose shard index has been truncated into a sibling's.
+// build allows, checked here because conn_identity.h deliberately does not
+// include runtime_definitions.h.
 static_assert(max_shards <= (1u << conn_serial_shard_bits),
               "conn_ref's serial cannot name every shard --shards allows");
 
-// Mints a serial, having first told the source which shard it is minting for.
-//
-// Lazy for exactly the reason owner_key() below is lazy, and the two are
-// deliberately adjacent: both need a value the daemon supplies after this
-// object is constructed.  The shard index arrives in the config frame, and the
-// first connection cannot be accepted before that frame has been read — the
-// listener is bound from it — so "before the first mint" and "after the config"
-// are never in the wrong order.
-//
-// One flag rather than comparing the index to zero: shard 0 is a real shard,
-// and a source rebased every time it minted for shard 0 would work but would
-// invite somebody to write the comparison the other way round.
+// Mints a serial having first told the source which shard it is minting for,
+// lazily because the index arrives in the config frame -- and with a flag
+// rather than a comparison, since shard 0 is a real shard.
 uint64_t server_instance::next_serial()
 {
     if (!m_serials_shard_set)
@@ -148,11 +126,9 @@ uint64_t server_instance::next_serial()
 
 uint64_t server_instance::owner_key() const
 {
-    // get_id() is assigned after construction — daemon.cpp does it when the
-    // runtime is created or restored — so this cannot be a constructor's job.
-    // Recomputed while it is still zero rather than cached unconditionally, so
-    // a runtime that is asked for a ref before it has an id does not cache the
-    // invalid answer for ever.
+    // get_id() is assigned after construction, so this cannot be a
+    // constructor's job, and it is recomputed while still zero rather than
+    // caching the invalid answer.
     if (m_owner_key == 0)
         m_owner_key = conn_owner_key(get_id());
     return m_owner_key;
@@ -165,34 +141,19 @@ conn_ref server_instance::ref_for_fd(int fd) const
     return conn_ref{owner_key(), m_conn_idx[fd]->ref_serial};
 }
 
-// "Anything at all is outstanding on this connection."
-//
-// Two different questions are asked of this, and only one of them is answered
-// correctly by it.  As "may this struct be reused / released" — release_conn(),
-// pool_release(), reap_retired() — it is exactly right: a read still armed means
-// the ring still names this memory, whether or not the read will ever report.
-//
-// As "may the teardown be deferred" it is not, because an armed read makes no
-// promise to come back.  That question now has its own answer in
-// shared/conn_reachability.h and its own caller at the tail of on_cqe(); the 16
-// guards in this file that ask it through this predicate are deliberately left
-// alone, because a teardown they decline is picked up there one dispatch later
-// rather than never.  See finish_unreachable_client().
+// Exactly right as "may this struct be reused" and wrong as "may the teardown
+// be deferred", because an armed read makes no promise to come back -- the 16
+// guards asking it are left alone, since a teardown they decline is picked up
+// one dispatch later.
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
     return conn->read_pending || conn->write_pending || conn->zc_notif_pending
         || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending;
 }
 
-// Every flag this connection can carry, sorted by who is obliged to report it.
-// The sorting is shared/conn_reachability.h's business and the flags are this
-// runtime's, so this function is the whole of the seam between them: a flag
-// added to server_connection has to appear here to be counted anywhere.
-//
-// cache_pending is a promised reply rather than a ring operation — the request
-// sits in a channel, which guarantees exactly one reply per request, `dropped`
-// included, and delivers it back into this loop.  close_conn() defers on it for
-// that reason and says so.
+// Every flag this connection can carry sorted by who must report it, which is
+// the whole seam between conn_reachability.h and this runtime -- with
+// cache_pending a promised reply rather than a ring operation.
 socketley::reach::owed server_instance::conn_owed(const server_connection* conn) const
 {
     socketley::reach::owed o;
@@ -208,39 +169,17 @@ socketley::reach::owed server_instance::conn_owed(const server_connection* conn)
 
 void server_instance::release_conn(std::unique_ptr<server_connection> conn)
 {
-    // The fixed-file slot belongs to the descriptor, not to the struct, and the
-    // descriptor is already closed by the time anything gets here — so the slot
-    // goes back now, whether or not the struct itself is free to be reused.
-    //
-    // Leaving it to pool_release() meant a connection with anything in flight
-    // carried its slot into the retired list, and a stop deregisters the runtime
-    // from the loop, after which its completions are dropped rather than
-    // dispatched — so reap_retired() never ran and pool_release() never
-    // happened.  The slot then survives the instance itself.  That costs more
-    // than a table entry: free_fixed_file_slot() is what unregisters the file,
-    // so until it runs the kernel still holds a reference to that socket and
-    // close() did not really close it.  The table is 8192 entries and shared by
-    // every server and cache on this loop, so one runtime bleeds all of them.
-    //
-    // Doing this while a request is still in flight was justified as safe "for
-    // the same reason closing the socket is: the request took its own reference
-    // to the file when it was issued".  That is true of a submission the kernel
-    // has already consumed and false of one it has not, which is the entire
-    // hazard — a fixed-file SQE carries the slot *index*, and an index handed
-    // straight back to the allocator is claimed by the next accept before the
-    // kernel ever looks at the SQE.  The call stays here, because the slot does
-    // have to go back on this path or a stopped runtime keeps it forever; what
-    // changed is that free_fixed_file_slot() now unregisters the file at once
-    // and releases the index only when nothing in the ring still names it.
+    // The fixed-file slot goes back now rather than at pool_release(), because
+    // a stopped runtime's dropped completions meant the slot outlived the
+    // instance and the kernel still held a reference to the socket -- safe
+    // because free_fixed_file_slot() now releases the index only when nothing
+    // in the ring names it.
     release_fixed_slot(conn.get());
 
     if (SOCKETLEY_UNLIKELY(conn_ops_pending(conn.get())))
     {
-        // The kernel is still working on something that names this struct: its
-        // read buffer, its write batch, one of its io_requests.  Reusing it now
-        // gives the next client a second writer into its own buffers; freeing it
-        // gives the loop a dangling request.  It waits instead — see
-        // reap_retired(), which puts it back once the last completion lands.
+        // The kernel is still working on something that names this struct, so
+        // it waits rather than being reused or freed.
         m_conn_retired.push_back(std::move(conn));
         return;
     }
@@ -249,14 +188,9 @@ void server_instance::release_conn(std::unique_ptr<server_connection> conn)
 
 void server_instance::pool_release(std::unique_ptr<server_connection> conn)
 {
-    // A splice that was still armed when the connection was closed kept
-    // splice_cleanup() from running — it would have closed the file the kernel
-    // was reading from and handed the shared pipe to somebody else mid-transfer.
-    // Nothing is armed by the time a struct reaches here, so this is where that
-    // deferred cleanup finally happens.  Without it the file descriptor rode
-    // into the pool, held until the struct happened to be reused and lost for
-    // good if it never was — and m_splice_busy stayed true, which takes the
-    // splice path out of service for the rest of the runtime's life.
+    // A splice armed at close time kept splice_cleanup() from running, so this
+    // is where that deferred cleanup happens -- without it the file descriptor
+    // rode into the pool and m_splice_busy stayed true for the runtime's life.
     if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0 || conn->splice_pending ||
                            conn->splice_remaining))
         splice_cleanup(conn.get());
@@ -265,15 +199,9 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     // up; this covers reap_retired(), which reaches the pool directly.
     release_fixed_slot(conn.get());
 
-    // The TLS session dies with the connection that owned it.  No completion
-    // can ever land on one — every byte is copied into or out of a buffer this
-    // struct owns before an SQE is built, so the kernel never holds an address
-    // inside the SSL or its BIOs — which is why this needs none of the "wait
-    // until the ring is finished" care the write batch beside it does.  The one
-    // rule is that it must not survive into whoever takes this struct next: an
-    // inherited session would decrypt the newcomer's bytes with the previous
-    // peer's keys, and the newcomer's first read would look like a protocol
-    // error rather than the leak it is.
+    // The TLS session dies with the connection that owned it, needing none of
+    // the ring's care because no completion can name it, and it must not
+    // survive into whoever takes this struct next.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
         tls_context::free_ssl(conn->ssl);
@@ -282,10 +210,9 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->tls_state = tls_conn_none;
     conn->tls_peer_closed = false;
 
-    // Nothing is in flight for this struct (release_conn checked), but the
-    // requests still carry a live owner pointer.  Clearing it means a completion
-    // that reaches the loop anyway is dropped there instead of being dispatched
-    // into whichever connection took the struct over.
+    // Nothing is in flight but the requests still carry a live owner pointer,
+    // so clearing it makes a completion that reaches the loop anyway get
+    // dropped there.
     conn->read_req.owner = nullptr;
     conn->write_req.owner = nullptr;
     conn->file_read_req.owner = nullptr;
@@ -343,29 +270,15 @@ void server_instance::return_provided_buf(struct io_uring_cqe* cqe)
         static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
 }
 
-// One teardown for a client connection, reached from every path that closes
-// one.  They used to do the same ten steps in their own order and with their
-// own idea of what made a release unsafe, which is how the zero-copy
-// notification came to be checked in three of them and forgotten in two.
+// One teardown for a client connection reached from every path that closes
+// one, because ten steps in each path's own order is how the zero-copy
+// notification came to be checked in three and forgotten in two.
 void server_instance::close_conn(server_connection* conn, bool notify_disconnect)
 {
-    // An answer from the cache is still owed to this client.
-    //
-    // Every caller here has already asked whether the ring still names the
-    // struct, and it does not — a cache request is queued in the channel, not
-    // in the ring, so nothing on this connection's behalf is armed while it
-    // waits.  That is exactly the case a request/response client produces: ask,
-    // shut down the write side, wait for the line.  Closing now throws away an
-    // answer the client is still holding its socket open for, which the
-    // synchronous version of this path could not do because it had already
-    // written the answer before it ever saw the FIN.
-    //
-    // This always ends.  The channel promises exactly one reply for every
-    // request it accepted, `dropped` included if it is torn down underneath us,
-    // and the reply that brings the count to zero comes back here to finish the
-    // close it deferred.  A runtime that stops first revokes its queued
-    // requests and empties m_clients itself, so nothing is left waiting on a
-    // reply that is no longer coming.
+    // An answer from the cache is still owed, and closing now throws away what
+    // the client is holding its socket open for -- and this always ends,
+    // because the channel promises exactly one reply per request, `dropped`
+    // included.
     if (SOCKETLEY_UNLIKELY(conn->cache_pending > 0))
     {
         conn->closing = true;
@@ -374,16 +287,14 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
 
     const int fd = conn->fd;
 
-    // This connection may still be holding the shared splice pipe.  No splice op
-    // is armed (the caller checked conn_ops_pending), so handing the pipe on is
-    // safe here and nowhere else.
+    // This connection may still hold the shared splice pipe, and with no
+    // splice armed handing it on is safe here and nowhere else.
     if (SOCKETLEY_UNLIKELY(conn->splice_file_fd >= 0 || conn->splice_pending || conn->splice_remaining))
         splice_cleanup(conn);
 
-    // Authority and group membership are keyed by fd, and the kernel reissues
-    // that number to the next accepted connection.  Leaving either behind hands
-    // the newcomer what belonged to the client that just left — for m_master_fd
-    // that is broadcast authority granted without the password.
+    // Authority and group membership are keyed by fd and the kernel reissues
+    // that number, so leaving either behind grants the newcomer broadcast
+    // authority without the password.
     if (SOCKETLEY_UNLIKELY(fd == m_master_fd))
         m_master_fd = -1;
     unroute_client(fd);
@@ -391,18 +302,14 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
         invoke_on_disconnect(fd);
     remove_from_all_groups(fd);
 
-    // Before the index entry goes, not after: remove_active_fd() finds the
-    // connection through m_conn_idx to learn its slot, so clearing the index
-    // first turned every one of these calls into a no-op and left closed
-    // descriptors in the broadcast list for the rest of the run.
+    // Before the index entry goes, because remove_active_fd() finds the
+    // connection through m_conn_idx and clearing the index first made every
+    // call a no-op.
     remove_active_fd(fd);
 
-    // The serial stops resolving here, and this is the moment that matters:
-    // close_tracked() below hands the number back to the kernel, which will
-    // reissue it to the next accept.  Anyone still holding this connection's
-    // name — a sub-server's Lua that kept the id it was given — now gets a
-    // clean refusal from write_to_ref() instead of a write into whoever
-    // inherited the number.
+    // The serial stops resolving here, before close_tracked() hands the number
+    // back, so anyone still holding this connection's name gets a clean
+    // refusal rather than a write into whoever inherited it.
     if (conn->ref_serial != 0)
         m_conn_by_serial.erase(conn->ref_serial);
 
@@ -410,14 +317,9 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
         m_conn_idx[fd] = nullptr;
     close_tracked(fd);
 
-    // The file a response is being served out of is this connection's, not the
-    // pool's.  pool_release() closes it — but a connection with anything in
-    // flight never reaches pool_release(), it is retired, so the descriptor was
-    // held for as long as the struct was, and for good once the runtime stopped
-    // and the completion that would have released it was dropped.  Closing it
-    // here ends the read armed on it exactly as closing the socket above ends
-    // the read armed on that; file_buf deliberately stays where it is, because
-    // that is where the kernel is writing.
+    // The file a response is served out of is this connection's and a retired
+    // struct never reaches pool_release(), so it is closed here -- while
+    // file_buf stays, because that is where the kernel is writing.
     if (SOCKETLEY_UNLIKELY(conn->file_fd >= 0))
     {
         close_tracked(conn->file_fd);
@@ -434,10 +336,8 @@ void server_instance::close_conn(server_connection* conn, bool notify_disconnect
     }
 }
 
-// A completion whose request lives inside a retired struct.  There is no index
-// to find it through any more — the fd is closed and may already belong to
-// somebody else — so it is found by the one thing the kernel hands back
-// unchanged: the address of the request itself.
+// A completion whose request lives inside a retired struct, found by the one
+// thing the kernel hands back unchanged: the address of the request itself.
 bool server_instance::reap_retired(struct io_uring_cqe* cqe, io_request* req)
 {
     const auto* r = reinterpret_cast<const char*>(req);
@@ -579,21 +479,9 @@ bool server_instance::get_http_cache() const
     return m_http_cache_enabled;
 }
 
-// ─── AN UPSTREAM WITHOUT A USABLE PORT IS NOT AN UPSTREAM ───────────────────
-//
-// The from_chars result was discarded, so `--upstream host:abc`, `--upstream
-// host:` and any port above 65535 all left resolved_port at 0 and were stored
-// anyway.  A target that can never be connected to sat in the list looking
-// exactly like one that could, and `upstream_try_connect` discovered it at
-// traffic time — the same shape as the proxy's backend, one runtime over.
-//
-// The address with no colon at all is a different thing and stays: it is the
-// documented spelling for a target whose port comes from elsewhere, and it has
-// always stored 0 deliberately.  Only an address that ASKED for a port and gave
-// an unusable one is refused.
-//
-// Returns false without storing anything, so a caller that can refuse has a
-// list it did not half-fill.
+// An upstream that asked for a port and gave an unusable one is refused
+// without storing anything, because a target that can never be connected to
+// sat in the list looking exactly like one that could.
 bool server_instance::add_upstream_target(std::string_view addr)
 {
     upstream_target t;
@@ -753,21 +641,9 @@ static bool header_list_has_token(std::string_view v, std::string_view lower_tok
     return false;
 }
 
-// ─── THE CLIENT'S `Connection` HEADER DECIDES, NOT THE VERSION ──────────────
-//
-// This was `req.version.find("1.1")` and nothing else, written out at 2 places
-// and read at 26.  The version only supplies the *default* (RFC 9112 §9.3); an
-// explicit `Connection: close` overrides it and an explicit
-// `Connection: keep-alive` overrides an HTTP/1.0 default.  Neither was
-// consulted, so a client that asked to close was answered
-// `Connection: keep-alive`, was never closed on, and had to perform the active
-// close itself — which is what put the TIME-WAIT on the client's *ephemeral*
-// port instead of on our fixed listening port.
-//
-// It lives here, on its own, because 2 deciders against 26 readers is how the
-// two deciders came to disagree in the first place: the cached-response path
-// and the Lua path each grew their own copy.  There is one now, and
-// conn->http_keep_alive is the only place its answer is kept.
+// The client's `Connection` header decides and the version only supplies the
+// default, in one place, because two deciders against 26 readers is how the
+// cached-response path and the Lua path came to disagree.
 static bool http_request_keep_alive(const http_request& req)
 {
     for (const auto& [k, v] : req.headers)
@@ -800,14 +676,9 @@ static const std::shared_ptr<const std::string>& http_404_response(bool keep_ali
     return keep_alive ? resp_ka : resp_close;
 }
 
-// ─── THE TWO WAYS A REQUEST IS REFUSED BEFORE IT IS A REQUEST ───────────────
-//
-// Both are `Connection: close` unconditionally, and that is not politeness.
-// Refusing means this end could not decide where the message ends; carrying on
-// would mean deciding exactly that, so the next request on the socket could
-// start.  The connection goes with the refusal, and handle_read drops whatever
-// is still buffered so that nothing already on the wire is picked up as a
-// fresh request while the error is on its way out.
+// Both refusals are `Connection: close` unconditionally, because refusing
+// means this end could not decide where the message ends and carrying on would
+// mean deciding exactly that.
 static const std::shared_ptr<const std::string>& http_400_response()
 {
     static const auto resp = std::make_shared<const std::string>(
@@ -819,20 +690,10 @@ static const std::shared_ptr<const std::string>& http_400_response()
     return resp;
 }
 
-// A Transfer-Encoding this server does not implement — which is all of them.
-// RFC 9112 Section 6.1 asks for 501 here rather than 400: the request is
-// well-formed, it is this recipient that cannot follow it.  The distinction is
-// worth keeping because it is the honest one, and because a client that gets a
-// 400 for a legal chunked request has been told something untrue about its own
-// message.
-//
-// The alternative was to implement chunked framing, and it was rejected for
-// this change rather than forgotten: it is a body-reading feature with its own
-// buffer limits, its own trailer handling and its own size cap, and none of
-// that belongs in a change whose subject is where a header block ends.  What is
-// NOT defensible is the third option, which is what stood here — a chunked body
-// read as a body of length zero, so the chunk data was parsed as the next
-// request on the connection.
+// A Transfer-Encoding this server does not implement is 501 rather than 400
+// (RFC 9112 Section 6.1), because the request is well-formed -- and reading a
+// chunked body as one of length zero parses the chunk data as the next
+// request.
 static const std::shared_ptr<const std::string>& http_501_response()
 {
     static const auto resp = std::make_shared<const std::string>(
@@ -887,11 +748,9 @@ void server_instance::rebuild_http_cache()
         if (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"))
             content = inject_ws_script(content);
 
-        // Store pre-built responses as shared_ptrs (zero-copy on cache hit).
-        // Both, not just the keep-alive one: this map used to hold a single
-        // string built with keep_alive=true, so `--http-cache` answered
+        // Both variants stored, because a single keep-alive string answered
         // `Connection: keep-alive` to every request including the ones that
-        // asked to close — and, unlike disk mode, even to HTTP/1.0.
+        // asked to close.
         m_http_cache[url_path] = {
             std::make_shared<const std::string>(build_http_response(ct, content, true)),
             std::make_shared<const std::string>(build_http_response(ct, content, false))
@@ -899,26 +758,23 @@ void server_instance::rebuild_http_cache()
     }
 }
 
-// One entry, or none.  Called only from handle_file_read, and only for a read
-// that completed in full through the openat2(RESOLVE_BENEATH) path.
+// One entry or none, called only for a read that completed in full through the
+// openat2(RESOLVE_BENEATH) path.
 void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
                                        std::shared_ptr<const std::string> ka,
                                        std::shared_ptr<const std::string> cl)
 {
     size_t cost = (ka ? ka->size() : 0) + (cl ? cl->size() : 0);
     // What this key already costs is reclaimed before the cap is tested, or a
-    // file edited repeatedly near the limit would stop being kept the moment
-    // its own entry pushed the total over -- refused on the strength of the
-    // bytes it is about to give back.
+    // file edited near the limit is refused on the strength of bytes it is
+    // about to give back.
     auto old_it = m_http_reval.find(url_path);
     size_t reclaimed = (old_it != m_http_reval.end()) ? old_it->second.bytes : 0;
     if (m_http_reval_bytes - reclaimed + cost > HTTP_REVAL_MAX_TOTAL)
     {
-        // Full: stop taking new files rather than evicting one.  What is in the
-        // map stays correct either way -- every hit is revalidated -- so the
-        // only thing at stake is which files are fast, and an operator whose
-        // document root is larger than the cap is better served by a stable
-        // answer than by a cache that thrashes.  Said once, not per request.
+        // Full: stop taking new files rather than evicting one, because every
+        // hit is revalidated so only speed is at stake and a stable answer
+        // beats a cache that thrashes.
         if (!m_http_reval_full_logged)
         {
             m_http_reval_full_logged = true;
@@ -940,10 +796,9 @@ void server_instance::http_reval_store(const std::string& url_path, const struct
     m_http_reval_bytes += cost;
 }
 
-// The directory every --http request is opened relative to.  Opened once, here,
-// because openat2(RESOLVE_BENEATH) needs a descriptor to be beneath and because
-// re-opening it per request would put back the syscall this exists to remove.
-// O_PATH is deliberately NOT used: openat2 resolves against a real directory fd.
+// The directory every --http request is opened relative to, opened once
+// because openat2(RESOLVE_BENEATH) needs a real directory fd and re-opening it
+// per request restores the syscall this removes.
 void server_instance::open_http_root()
 {
     if (m_http_root_fd >= 0)
@@ -1056,21 +911,9 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             }
         }
 
-        // ─── ONE statx INSTEAD OF open + fstat + read + close ───────────────
-        //
-        // The bytes of a file already served are kept, exactly as --http-cache
-        // keeps them, and this decides whether they are still the file's bytes.
-        // A hit is a refcount bump and one syscall; a miss falls through to the
-        // path below, which is the only code that ever admits bytes into the
-        // map.  So the map cannot serve anything that path would refuse: a hit
-        // requires dev+ino to equal an inode that openat2(RESOLVE_BENEATH)
-        // already accepted, and a symlink pointing somewhere else is a
-        // different inode and therefore a miss.
-        //
-        // dev+ino is in the comparison for a second, independent reason: `mv`
-        // into place puts a new inode at the same path, and `touch -r` gives it
-        // the old mtime to the nanosecond.  On (mtime, size) alone that request
-        // is a hit and the old bytes are served forever.
+        // One statx decides whether the kept bytes are still the file's, and
+        // dev+ino is in the comparison because `mv` into place plus `touch -r`
+        // makes an (mtime, size) check serve the old bytes forever.
         std::string rel_path(url_path.substr(1));
         if (rel_path.empty())
             rel_path = ".";
@@ -1102,39 +945,18 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
                         conn->proto = proto_unknown;
                     return;
                 }
-                // Stale, replaced or gone.  Dropped rather than left to be
-                // re-checked: a file deleted from the tree would otherwise hold
-                // its bytes in the map for the life of the process.
+                // Stale, replaced or gone, dropped rather than left to be
+                // re-checked, or a deleted file would hold its bytes for the
+                // life of the process.
                 m_http_reval_bytes -= rit->second.bytes;
                 m_http_reval.erase(rit);
             }
         }
 
-        // ─── THE ESCAPE CHECK IS THE KERNEL'S, NOT A STRING COMPARISON ──────
-        //
-        // This was fs::canonical(requested) followed by "does the result still
-        // begin with the canonical root".  Correct, and it cost a readlink per
-        // path component on EVERY request: measured with strace on a root nine
-        // directories deep, 9.01 readlink calls per connection — more than every
-        // other syscall on the path put together, and 43.9 us of the 42.5 us a
-        // connection costs beyond its own connect and its own request work.
-        // The cost scaled with how deep the operator's document root happened
-        // to be, which is not a property anyone would expect to pay per request.
-        //
-        // openat2(RESOLVE_BENEATH) asks the kernel for the same guarantee inside
-        // the open itself: the resolution may not leave the directory the fd
-        // names, by `..`, by an absolute path, or by a symlink.  One syscall,
-        // no readlinks, and the check cannot be raced — fs::canonical() and the
-        // open() that followed it were two syscalls against a path that could
-        // change in between, which this also closes.
-        //
-        // RESOLVE_NO_MAGICLINKS as well: /proc/self/fd/N is not a path this
-        // server has any business following, and the old prefix check only
-        // caught it after the fact.
-        //
-        // ENOSYS means a kernel older than 5.6.  The old path is still here for
-        // that case and is exercised by the same test file, which pins the
-        // behaviour rather than the implementation.
+        // openat2(RESOLVE_BENEATH) asks the kernel for the escape guarantee
+        // inside the open, replacing 9.01 readlinks per connection that could
+        // also be raced -- with RESOLVE_NO_MAGICLINKS, and the old path kept
+        // for ENOSYS.
         int ffd = -1;
         bool used_beneath = false;
         fs::path resolved;
@@ -1149,17 +971,10 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             {
                 ffd = static_cast<int>(r);
                 used_beneath = true;
-                // The path is still needed below — `resolved.extension()` picks
-                // the Content-Type — and leaving it empty here served every file
-                // with the wrong type.  Under keep-alive that desynchronised the
-                // connection rather than merely mislabelling it: measured, 1 to
-                // 4 failures per 20,000 requests and the run's rate collapsing
-                // from 74,000 to 4,000 when it happened.
-                //
-                // A join, not a canonicalisation: this is only ever read for the
-                // extension, and for that the path as asked for is the right
-                // answer.  It costs no syscall, which is the entire point of the
-                // branch it sits in.
+                // The path is still needed for the extension, and leaving it
+                // empty served every file with the wrong type -- which under
+                // keep-alive desynchronised the connection rather than merely
+                // mislabelling it.
                 resolved = m_http_base / rel;
             }
             else if (errno != ENOSYS)
@@ -1198,9 +1013,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             return;
         }
 
-        // Open file and get size.  O_CLOEXEC: this is on the request path, so a
-        // proxy worker forked while a file is being served would otherwise
-        // inherit a descriptor on a file it has no business holding open.
+        // O_CLOEXEC, because this is on the request path and a worker forked
+        // while a file is being served would inherit a descriptor on it.
         ffd = open(resolved.c_str(), O_RDONLY | O_CLOEXEC);
         }
         if (ffd < 0)
@@ -1239,27 +1053,17 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         auto ct = http_content_type(ext);
 
-        // Whether this miss may be turned into a map entry.  Storing needs the
-        // bytes in user space, which the splice path never has, so a small
-        // non-HTML file is deliberately routed to the read path below: it pays
-        // one read once and one statx thereafter, instead of a splice every
-        // time.  Nothing is lost by that -- IORING_OP_SPLICE is prepped
-        // REQ_F_FORCE_ASYNC and measured 17.19 us against read's 0.72 us, and
-        // is only ahead above ~128 KB, which is well over the per-file cap.
-        // Files over the cap keep today's behaviour exactly.
+        // Whether this miss may become a map entry, which needs the bytes in
+        // user space, so a small non-HTML file takes the read path -- splice
+        // measured 17.19 us against read's 0.72 and only wins above the
+        // per-file cap.
         const bool reval_take = reval_ok && used_beneath &&
                                 fsize <= HTTP_REVAL_MAX_FILE &&
                                 m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
 
-        // Splice path: zero-copy file→pipe→socket for non-HTML files.
-        //
-        // Never on a TLS connection.  A splice moves the file's bytes into the
-        // socket without OpenSSL ever seeing them, so the peer would be handed
-        // plaintext in the middle of an encrypted stream — a silent downgrade
-        // of exactly the kind this whole feature is gated to prevent, and one
-        // that reads as a protocol error rather than as a leak.  The
-        // read-and-encrypt path below serves the same file correctly; the cost
-        // is one copy on a connection that is already paying for a cipher.
+        // Splice path for non-HTML files, never on a TLS connection, because
+        // it would hand the peer plaintext in the middle of an encrypted
+        // stream.
         if (!is_html && !conn->ssl && !m_splice_busy && m_splice_pipe[0] >= 0 && !reval_take)
         {
             conn->splice_file_fd = ffd;
@@ -1300,10 +1104,9 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         conn->file_content_type = std::string(ct);
         conn->file_is_html = is_html;
         conn->file_read_pending = true;
-        // Non-empty only when the completion may keep the bytes.  The identity
-        // is the one fstat() reported on this very descriptor, so it describes
-        // the inode the bytes actually came from and not whatever is at the
-        // path by the time the read completes.
+        // Non-empty only when the completion may keep the bytes, with the
+        // identity fstat() reported on this very descriptor rather than
+        // whatever is at the path later.
         if (reval_take)
         {
             conn->file_url_path = url_path;
@@ -1320,9 +1123,9 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (SOCKETLEY_UNLIKELY(!m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0,
                                                          &conn->file_read_req)))
         {
-            // No completion will arrive for a read that was never queued.  The
-            // teardown closes file_fd and frees file_buf, both already recorded
-            // on the connection above.
+            // No completion will arrive for a read that was never queued, and
+            // the teardown closes file_fd and frees file_buf, both already
+            // recorded on the connection.
             conn->file_read_pending = false;
             conn->closing = true;
         }
@@ -1404,10 +1207,9 @@ static std::string_view http_reason(int status)
 void server_instance::refuse_http_request(server_connection* conn,
                                           const std::shared_ptr<const std::string>& resp)
 {
-    // The buffer goes first.  Everything in it was measured against a header
-    // block this end could not frame, so its boundaries are exactly what is in
-    // doubt; leaving it for the reparse loop at the bottom of handle_read would
-    // hand the client the second answer the refusal exists to withhold.
+    // The buffer goes first, because everything in it was measured against a
+    // header block this end could not frame, so its boundaries are exactly
+    // what is in doubt.
     conn->partial.clear();
 
     conn->write_queue.push(resp);
@@ -1428,27 +1230,10 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
 
 #ifndef SOCKETLEY_NO_LUA
     // ─── The Lua handler ────────────────────────────────────────────────────
-    //
-    // Protected, like every other callback in this tree since 2a1e135..df02e6f,
-    // and this was the last one to come across.  It used to be a sol::function
-    // called inside `try { ... } catch (const std::exception&)`, and the result
-    // was read with no check at all:
-    //
-    //     sol::object result = lua()->on_http_request()(lua_req);
-    //
-    // Two things were wrong with that.  The catch only fires when sol2's panic
-    // handler throws AND the throw unwinds out of the interpreter, which it does
-    // not in this repository's Sanitize configuration — so the one diagnostic
-    // this path had was dead in the build the nightly job uses.  And reading
-    // index 0 without asking valid() is the read df02e6f records the cost of on
-    // the cache path: on a failed call index 0 is the error object.
-    //
-    // A raise is answered with 500, not with the fall-through below.  `return
-    // nil` from this callback is documented as "I have no answer, serve the
-    // static file or 404"; answering a raise the same way made a handler that
-    // broke indistinguishable at the client from one that declined, and left
-    // the operator nothing to read either.  The proxy hook settled the same
-    // question the same way — a hook that raises has not said carry on.
+    // Protected like every other callback, because the catch was dead in the
+    // Sanitize build and reading index 0 without valid() reads the error
+    // object -- and a raise is answered with 500, since returning nil is
+    // documented as declining.
     if (lua() && lua()->has_on_http_request())
     {
         // Build Lua request table
@@ -1492,11 +1277,9 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
             return;
         }
 
-        // return_count() before get(), for the same reason valid() came before
-        // both: a handler that ends without a `return` — which is how anyone
-        // writes one that only handles some paths — returns nothing, and index 0
-        // of nothing is not a value to ask about.  Falling through is the right
-        // answer for it and is what the documentation promises.
+        // return_count() before get(), because a handler that ends without a
+        // `return` returns nothing and index 0 of nothing is not a value to
+        // ask about.
         if (r.return_count() > 0)
         {
             sol::object result = r;
@@ -1566,18 +1349,9 @@ size_t server_instance::get_connection_count() const
     return m_active_fds.size() + m_forwarded.size() + upstream_connected;
 }
 
-// The TCP listener, lifted out of setup() unchanged so that the address family
-// is one branch there rather than a second copy of everything after it.
-//
-// SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
-// daemon forks a worker for every runtime there is.  Without the flag every
-// such worker inherits this port —
-// measured, as fd 6 of a worker whose own port was a different one — and holds
-// it after this runtime is stopped and after the daemon exits.  The shutdown()
-// in teardown() unhashes the socket for every dup at once and so hides it on
-// the ordinary stop path; a daemon that is killed rather than stopped never
-// reaches that line, and then the port is bound by a process with no runtime
-// and no daemon to account for it.
+// The TCP listener lifted out of setup() so the address family is one branch,
+// with SOCK_CLOEXEC because every worker would otherwise inherit this port and
+// hold it after the daemon exits.
 bool server_instance::setup_tcp_listener(uint16_t port)
 {
     m_listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1592,68 +1366,11 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    // ─── NO TCP_DEFER_ACCEPT, AND THAT IS THE POINT ─────────────────────────
-    //
-    // This set it with a one-second timeout, "eliminating the empty-accept +
-    // read round-trip on the hot path".  What it actually does is tell the
-    // kernel not to complete a connection until the CLIENT sends data — so a
-    // connection that has not spoken yet is not a connection this server has,
-    // and everything downstream of accept() is simply not running for it.
-    //
-    // Measured on Release, one idle client against a --mode inout server:
-    //
-    //     t=0.5s   server side SYN-RECV,  `ls` says CONN=0, client connected
-    //     t=2.0s   server side ESTAB,     `ls` says CONN=0
-    //     t=5.0s                          `ls` says CONN=1
-    //
-    // Five seconds during which the client believes it is connected and the
-    // server does not know it exists.  on_connect has not fired, the connection
-    // is in no count and no listing, and a server whose protocol speaks first —
-    // a greeting, a banner, a push — cannot, because there is nobody to speak
-    // to yet.  Without the option the same connection is CONN=1 at 0.5s.
-    //
-    // And the failure mode is worse than the delay.  A connection still in
-    // SYN-RECV is a request sock, not a socket; when the listener closes, the
-    // kernel drops it SILENTLY — no FIN, no RST.  The client is left
-    // ESTABLISHED against a peer that no longer exists, with nothing to notice:
-    // there is no SO_KEEPALIVE on either end, so it holds that dead connection
-    // until it next tries to write.  That is how test_client_reconnect.sh fails
-    // on a Sanitize build, where the window is wide enough to remove a server
-    // inside it: four clients reporting a live connection to a server that was
-    // deleted, indefinitely.
-    //
-    // WHAT IT COSTS TO REMOVE IT, and this number was got wrong once.
-    //
-    // The first measurement said "nothing": 17,064/s with the option against
-    // 16,842/s without.  That was `server conn` at 20,000 connections a run,
-    // which on this box is past the 28,231 ephemeral ports it has -- both arms
-    // were bottlenecked on TIME-WAIT and the figure was the port pool, not the
-    // listener.  The same test at 2,000 connections with the pool drained
-    // between runs, twelve interleaved passes, three builds:
-    //
-    //     server burst   main                       104,488/s
-    //                    main, this line removed     86,870/s   -17%
-    //                    this tree                   88,156/s   -16%
-    //
-    // main-minus-this-line lands on this tree, so the whole difference is this
-    // option and nothing else in the branch regressed.  Checked further, 800
-    // connections opened and held: both builds accept all 800, so the loss is
-    // real establishment cost and not a listener declining to answer -- 9.7 us
-    // per connection with the option, 13.0 without.  The deferral lets connect()
-    // return before the server is involved, so the client can fire the next one
-    // sooner.
-    //
-    // Removed anyway, and the trade is worth stating plainly rather than hiding
-    // behind a wrong number: about a sixth of the connection-establishment rate
-    // on a connection-storm workload, against a connection that is visible to
-    // the server when it happens instead of up to five seconds later, an
-    // on_connect that fires, a server that can speak first, and a client that is
-    // told when its connection dies instead of holding it forever.
-    //
-    // Not kept for HTTP mode either, where the client does speak first: the
-    // deferral would be free there, but a mode-dependent branch in listener
-    // setup is a second configuration of the accept path to keep correct, and
-    // the failure it would reintroduce is the silent one above.
+    // No TCP_DEFER_ACCEPT, because a connection in SYN-RECV is one this server
+    // does not know exists -- no on_connect, no count, and silently dropped
+    // without FIN or RST when the listener closes -- at a measured cost of
+    // about a sixth of the connection-establishment rate on a connection
+    // storm.
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -1663,18 +1380,9 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     if (bind(m_listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
         // ─── Say which port and why ─────────────────────────────────────────
-        //
-        // setup_unix_listener(), fifteen lines below and chosen from the same
-        // `if`, reports "--listen <path> could not be bound: <strerror>".  This
-        // path reported nothing at all, and the two are the only ways a server
-        // acquires a listener.
-        //
-        // What that silence cost is a whole sentence being untrue: the CLI
-        // answers `runtime <n> could not start: the worker did not accept its
-        // configuration (the reason is in the daemon log)`, and the daemon log
-        // then held only "proxy worker: proxy failed to start".  For the single
-        // most common startup failure there is -- a port already in use -- the
-        // message named a place to look and there was nothing there.
+        // Said out loud, because this path reported nothing at all while its
+        // unix sibling reported a reason -- so for a port already in use the
+        // CLI named a log that held nothing.
         LOG_ERROR(("server: port " + std::to_string(port) + " could not be bound: " +
                    std::string(std::strerror(errno))).c_str());
         close_tracked(m_listen_fd);
@@ -1693,12 +1401,9 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     return true;
 }
 
-// The AF_UNIX listener, for `--listen unix:/path/to.sock`.
-//
-// The mechanism — the stale-node probe, the bind, the 0600, the listen — is
-// shared/unix_listener.h now, with the reasoning that used to live here.  This
-// wrapper is what stays a server's own: which member holds the fd, and the
-// record of which path was actually bound.
+// The AF_UNIX listener, whose mechanism is shared/unix_listener.h's; what
+// stays here is which member holds the fd and the record of which path was
+// bound.
 bool server_instance::setup_unix_listener(const std::string& path)
 {
     auto r = socketley::unix_sock::bind_listener(path);
@@ -1709,63 +1414,36 @@ bool server_instance::setup_unix_listener(const std::string& path)
     }
     m_listen_fd = r.fd;
 
-    // Remembered so teardown() removes exactly the node this bind created, and
-    // not whatever the configuration happens to say by then.  A runtime edited
-    // between start and stop would otherwise unlink a path it never bound.
+    // Remembered so teardown() removes exactly the node this bind created,
+    // because a runtime edited between start and stop would unlink a path it
+    // never bound.
     m_bound_listen_path = path;
     return true;
 }
 
 bool server_instance::setup(event_loop& loop)
 {
-    // Nothing is freed here.  teardown() emptied m_clients into the pool and the
-    // retired list, and a retired struct is one the kernel has not finished
-    // with: this used to call m_clients.clear() and destroy exactly the structs
-    // the teardown had deliberately kept, so a completion that arrived in the
-    // gap read a freed io_request.  What is left over is a restart's business
-    // only in so far as it must not be touched.
+    // Nothing is freed here, because teardown() deliberately kept the structs
+    // the kernel has not finished with, and clearing them read a freed
+    // io_request.
     m_active_fds.clear();
     m_active_fds.reserve(256);  // Pre-allocate to avoid reallocs on first connections
-    // And the shared view of it.  A restart that left the previous lifetime's
-    // names in place would have siblings routing to connections that no longer
-    // exist -- resolved to nothing at the far end, but reported to the script
-    // as clients it has.
+    // And the shared view of it, or a restart leaves siblings routing to
+    // connections that no longer exist and reported to the script as clients
+    // it has.
     shard_clients_table().clear_own();
 
     m_loop = &loop;
     m_ring_loop = &loop;
 
-    // Fix this runtime's half of every conn_ref it is about to mint.  The id it
-    // is derived from is assigned at construction and replaced only once, by
-    // the restore path, immediately after — long before a listener exists.
-    // Resolving it here rather than on first use means every name this runtime
-    // hands out over one run carries the same owner, even if something were to
-    // change the id underneath it.
+    // Fix this runtime's half of every conn_ref it is about to mint, so every
+    // name handed out over one run carries the same owner.
     owner_key();
 
-    // ── requests an earlier run armed and never saw the end of ──────────────
-    //
-    // The flags below say "this request is occupied, do not arm it again", and
-    // they are set when a request is armed and lowered by its completion.  Only
-    // by a completion the loop *delivers*, though — and stop() deregisters this
-    // owner, so from that moment the loop drops them instead.  on_cqe does not
-    // run, the flag is never lowered, and it survives into the next run: the
-    // start that follows declines to arm a request that is in fact free, and the
-    // thing it belongs to is off for the life of the process.  A client that
-    // comes up connected and permanently deaf is the same defect on the client
-    // runtime; here it is an idle sweep that never runs again, an accept backoff
-    // that can never re-arm, and a UDP socket nothing ever receives on.
-    //
-    // Leaving them standing across a stop is still right — the request really is
-    // occupied until its completion lands, delivered or dropped.  What was
-    // missing is anything that lowers them once it has.  The loop is the only
-    // thing that knows: owner_inflight() counts what is still in the ring for
-    // this handler over every registration it has ever held, whatever became of
-    // the completions.  Zero means every one of these requests is free.
-    //
-    // owner_table_full() is the case it cannot answer: a handler that never got
-    // a slot reads zero whatever it has outstanding, so a full table leaves the
-    // flags alone rather than clearing them on a zero that means "unknown".
+    // The occupied flags survive a stop because a deregistered owner's
+    // completions are dropped and never lower them, so this asks the loop --
+    // zero means every request is free, and a full owner table leaves them
+    // alone rather than acting on an unknown.
     if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
     {
         m_accept_armed         = false;
@@ -1793,24 +1471,10 @@ bool server_instance::setup(event_loop& loop)
     }
 
     // ── TLS listener ────────────────────────────────────────────────────────
-    //
-    // Certificates are read and parsed here, at setup, before a single
-    // completion is armed.  That is file I/O and it blocks, which is exactly
-    // why it happens here and nowhere near the event loop's hot path: the
-    // handshake itself never touches a file, and never touches a socket
-    // either — see tls_feed/tls_flush.
-    //
-    // Rebuilt on every start rather than kept.  `reload` is a stop followed by
-    // a start, and it is how an operator installs a renewed certificate; an
-    // SSL_CTX that outlived the file would go on serving the expired one.
-    // Sessions handed out by the previous context keep it alive through their
-    // own reference, so dropping ours here cannot pull the ground from under a
-    // connection that is still talking.
-    //
-    // Every refusal below returns false, which puts the runtime in the failed
-    // state.  None of them may fall through to a plaintext listener: a config
-    // that asked for encryption and got a cleartext port is the one outcome
-    // the operator cannot see.
+    // Certificates are read here at setup because that is blocking file I/O
+    // the handshake never does, rebuilt on every start so `reload` installs a
+    // renewed one -- and every refusal returns false rather than falling
+    // through to a plaintext listener.
     m_tls.reset();
     if (get_tls())
     {
@@ -1825,7 +1489,7 @@ bool server_instance::setup(event_loop& loop)
         if (!ctx->init_server(get_cert_path(), get_key_path(), get_ca_path()))
         {
             // init_server has already said which file and what OpenSSL made of
-            // it.  This says what it cost.
+            // it, so this says what it cost.
             LOG_ERROR("server: TLS listener not started -- the certificate, key or "
                       "client CA could not be loaded");
             return false;
@@ -1834,12 +1498,8 @@ bool server_instance::setup(event_loop& loop)
     }
 
     // ─── --listen unix:/path/to.sock ────────────────────────────────────────
-    //
-    // Checked here rather than only in the flag parser because this is the one
-    // function every route to a listening socket passes through: create, the
-    // daemon's restore of a persisted runtime, a worker rebuilding from its
-    // config frame, `import`, and a restart after `edit`.  A rule kept in the
-    // flag parser alone is one that import and restore never hear about.
+    // Checked here rather than only in the flag parser, because this is the
+    // one function every route to a listening socket passes through.
     const std::string listen_path(get_listen_path());
     if (!listen_path.empty())
     {
@@ -1862,9 +1522,8 @@ bool server_instance::setup(event_loop& loop)
         }
     }
 
-    // Internal-only server (port=0, used for Lua-managed sub-servers).  A
-    // listen path is a listener, so a runtime that has one is not this case
-    // however its owner is set.
+    // Internal-only server, where a listen path is a listener, so a runtime
+    // that has one is not this case however its owner is set.
     if (listen_path.empty() && get_port() == 0 && !get_owner().empty())
         return true;
 
@@ -1896,21 +1555,10 @@ bool server_instance::setup(event_loop& loop)
             return false;
         }
 
-        // The previous run's recvmsg reads into this struct's buffer and writes
-        // the sender into its sockaddr, and a stop does not end it: the socket
-        // holds a reference of its own, so close() does not, and the completion
-        // that would lower m_udp_recv_armed is dropped rather than dispatched
-        // once stop() has deregistered this owner.  Arming a second recvmsg on
-        // the same msghdr would give the kernel two writers into one buffer and
-        // one address, and answers would go to whichever peer landed there last;
-        // declining to arm one at all — which is what the flag used to make this
-        // do — left the restarted server bound to the port and receiving
-        // nothing, for good.
-        //
-        // So the old chain keeps its struct and this run takes a fresh one.  The
-        // old one is not freed: the kernel may still be writing into it, and the
-        // loop reads the request inside it to drop the completion.  setup()
-        // releases the spent ones once owner_inflight() says nothing is left.
+        // The old recvmsg keeps its struct and this run takes a fresh one,
+        // because a stop does not end it: arming a second on the same msghdr
+        // gives the kernel two writers, and declining to arm left the
+        // restarted server receiving nothing.
         if (m_udp_recv_armed)
         {
             m_udp_recv_spent.push_back(std::move(m_udp_recv));
@@ -1932,9 +1580,8 @@ bool server_instance::setup(event_loop& loop)
         return true;
     }
 
-    // The listener itself, in whichever family this runtime was configured for.
-    // Everything below this line is the same for both: one accept chain, one
-    // buffer ring, one set of connection tables.
+    // The listener in whichever family this runtime was configured for, with
+    // everything below the same for both.
     if (!(listen_path.empty() ? setup_tcp_listener(port)
                               : setup_unix_listener(listen_path)))
         return false;
@@ -1942,55 +1589,24 @@ bool server_instance::setup(event_loop& loop)
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    // Bundled recv: one completion carries as many provided buffers as the
-    // socket queue could fill.  Probed by a real submission inside
-    // recv_bundle_enabled() and off under SOCKETLEY_RECV_BUNDLE=0, which is
-    // also the A/B switch -- same binary, same pool geometry, only the arm
-    // differs.  Measured on the cache: nothing at 1 KB buffers, +48% at 2 KB,
-    // and it flattens the buffer-size curve rather than moving its peak.
+    // Bundled recv, probed by a real submission and switchable by
+    // SOCKETLEY_RECV_BUNDLE=0, which is also the A/B switch on one binary.
     m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();
-    // Not send_zc_supported(): the kernel having the opcode is not the
-    // question.  A pending zero-copy notification is not a cancellable request
-    // and only the peer can release it, so it would hold this instance in
-    // retire()'s graveyard for as long as one client declines to read.  See
-    // event_loop::send_zc_enabled().
+    // Not send_zc_supported(), because a pending zero-copy notification is not
+    // cancellable and only the peer can release it, which would hold this
+    // instance in the graveyard.
     m_send_zc = loop.send_zc_enabled();
 
-    // Use multishot accept if supported (kernel 5.19+)
-    // Note: direct-descriptor accept (kernel 6.0+) is NOT used because
-    // cqe->res returns a fixed file index, not a real fd — setsockopt,
-    // getpeername, and other syscalls require a real fd.  Instead, we
-    // register the accepted fd into the fixed file table post-accept.
+    // Multishot accept where supported, but not direct descriptors, because
+    // cqe->res would be a fixed index and setsockopt and getpeername need a
+    // real fd.
     m_direct_accept = false;
     m_multishot_active = event_loop::supports_multishot_accept();
 
-    // The previous run's accept chain does NOT reliably end before this line.
-    //
-    // teardown() shuts the listener down and close_fd() submits a cancel for
-    // it, both of which make the chain report — but reporting means a CQE in
-    // the ring, and nothing reaps the ring between a stop and the start that
-    // follows it.  `restart` is exactly that order, and so is any Lua callback
-    // that stops and starts a server: both run inside a single completion
-    // handler, and the ring is not looked at again until it returns.
-    //
-    // Arming a second submission on a request the ring is still carrying one for
-    // is the one thing that must not happen to any request here.  arm() stamps
-    // the owner identity into the request and there is one field for it, so the
-    // second submission overwrites the first's: the *old* completion then passes
-    // the check meant for the new one and the disarm it triggers lands on the new
-    // registration's slot.  Both halves of that are wrong and one of them is
-    // fatal.  The old slot is left owing a completion for ever, and
-    // runtime_manager waits on that count before it frees a removed runtime —
-    // about six megabytes per restart, held until the daemon exits, with one of
-    // the loop's 1024 owner slots gone each time.  Worse, the new slot has been
-    // discounted for an operation that is still in the ring: it can read zero
-    // while the accept is live, and an instance freed on the strength of that
-    // zero is a use-after-free the next time the chain reports.
-    //
-    // So the old chain keeps its request and this run takes a fresh one.  The
-    // old one is not freed here — the loop reads it to drop its completion, so
-    // it has to outlive the ring's interest in it, which is what m_accept_spent
-    // is for and what the sweep at the top of this function releases.
+    // The old accept chain keeps its request and this run takes a fresh one,
+    // because nothing reaps the ring between a stop and the start that follows
+    // -- and a second submission on one request overwrites its owner token,
+    // leaving one slot owing a completion for ever and discounting the other.
     if (m_accept_armed)
     {
         m_accept_spent.push_back(std::move(m_accept_req));
@@ -2012,8 +1628,8 @@ bool server_instance::setup(event_loop& loop)
                                             m_accept_req.get());
     }
 
-    // SOCKETLEY_HTTP_REVALIDATE=0 puts disk mode back on an open+read per
-    // request.  Read here rather than at construction so a restart picks it up.
+    // SOCKETLEY_HTTP_REVALIDATE=0 puts disk mode back on an open and read per
+    // request, read here so a restart picks it up.
     if (const char* rv = ::getenv("SOCKETLEY_HTTP_REVALIDATE"))
         m_http_reval_enabled = !(rv[0] == '0' && rv[1] == '\0');
     else
@@ -2026,10 +1642,9 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
-    // A timeout hangs off no fd, so a stop cannot cancel one: the sweep armed by
-    // the previous run is still counting down on this very request.  Arming
-    // another gave the server a second self-perpetuating chain, one more per
-    // restart.  The one still in flight re-arms itself when it fires.
+    // A timeout hangs off no fd, so the previous run's sweep is still counting
+    // down on this very request and arming another gives the server a second
+    // chain per restart.
     if (m_idle_timeout_cached > 0 && !m_idle_sweep_armed)
     {
         m_idle_sweep_ts.tv_sec = 30;
@@ -2050,9 +1665,9 @@ bool server_instance::setup(event_loop& loop)
     }
     m_splice_busy = false;
 
-    // Connect to upstreams.  Nothing to clear: teardown() either dropped the
-    // previous run's structs or moved the ones with work still in the ring to
-    // m_upstream_retired.  Clearing here destroyed both kinds alike.
+    // Connect to upstreams with nothing to clear, because teardown() either
+    // dropped the previous structs or retired the ones with work still in the
+    // ring.
     m_upstream_by_fd.clear();
     m_next_upstream_id = 1;
     for (const auto& target : m_upstream_targets)
@@ -2071,21 +1686,9 @@ bool server_instance::setup(event_loop& loop)
 
 void server_instance::teardown(event_loop& loop)
 {
-    // The requests this server is owed answers for go first.  Everything below
-    // closes the connections those replies would have gone to, so a queued
-    // request whose origin has stopped is discarded rather than served: the
-    // answer has nowhere to go, and computing it is work the cache does not
-    // have to do.
-    //
-    // Then, and deliberately after, whatever the last read produced for the
-    // cache.  A stop is not a reason to throw away messages that arrived before
-    // it, and posting on this side of the revocation is what keeps the batch
-    // out of the sweep that has just run.  The store is performed on the next
-    // turn of the loop whether or not this runtime is still up — the channel
-    // serves the request before it asks whether anyone is left to answer.  A
-    // `remove` in the same loop iteration as the `stop` does take it back with
-    // the instance, which is the one message this can lose and the only place
-    // it can lose one.
+    // The requests this server is owed go first, because their answers have
+    // nowhere to land -- and the last read's cache batch is posted afterwards,
+    // so a stop does not throw away messages that arrived before it.
     if (auto* mgr = get_runtime_manager())
     {
         mgr->requests().drop_origin(this);
@@ -2097,22 +1700,10 @@ void server_instance::teardown(event_loop& loop)
     {
         if (m_udp_fd >= 0)
         {
-            // The recvmsg holds a reference to the socket, so close() does not
-            // end it — it stays armed on m_udp_recv->buf and m_udp_recv->addr.
-            // SO_REUSEPORT then makes that matter: once a restart binds a new
-            // socket to the same port the kernel delivers datagrams to the old
-            // one as well, and the completion used to arm a second recvmsg on
-            // the same msghdr.
-            //
-            // This used to cancel, flush and close, in that order, and the order
-            // was the whole defence.  It is not one: flush() hands the SQE to
-            // the ring and returns — under SQPOLL without even a syscall — so
-            // the close could and did run before the kernel had looked at either
-            // the cancel or the recvmsg.  A recvmsg consumed after this number
-            // was reissued reads a stranger's datagram into m_udp_recv->buf, and
-            // a cancel consumed after it takes back a stranger's I/O.  close_fd
-            // submits the cancel itself and holds the number until both have
-            // reported.
+            // The recvmsg holds a reference to the socket, and
+            // cancel-flush-close was never a defence because flush() does not
+            // enter the kernel under SQPOLL -- close_fd submits the cancel and
+            // holds the number until both have reported.
             close_tracked(m_udp_fd);
             m_udp_fd = -1;
         }
@@ -2122,28 +1713,10 @@ void server_instance::teardown(event_loop& loop)
         return;
     }
 
-    // Shut down, then close — and the close is close_fd's, which is where the
-    // cancel now comes from.
-    //
-    // The cancel is what ends the accept chain.  A multishot accept holds its
-    // own reference to the socket, so close() does not end it and the
-    // terminating completion never arrives, which leaves the loop counting one
-    // operation this owner still owes, forever.  reap_retired waits for that
-    // count to reach zero, so the whole instance was never freed: about 6 MB
-    // per removed runtime, held until the daemon exited.
-    //
-    // Submitting it before the close was necessary but never sufficient: after
-    // close(), fget(fd) answers NULL and the cancel fails -ENOENT, but a cancel
-    // the SQPOLL thread has not consumed *yet* is no better off — by the time it
-    // is, the number belongs to the next accepted connection and the cancel
-    // takes that connection's read away instead.  Holding the number until both
-    // the accept and the cancel have reported is what actually makes the order
-    // hold, and close_fd does that.
-    //
-    // shutdown() stays, and stays first: it ends the listen state — which is
-    // what takes this socket out of the SO_REUSEPORT group, so a restart's bind
-    // is not competing with it — and completes what the cancel did not reach,
-    // synchronously inside the syscall via the socket wait queue.
+    // Shut down and then close through close_fd, because the cancel is what
+    // ends a multishot accept and holding the number until both it and the
+    // accept have reported is what makes the order hold -- with shutdown()
+    // first, since it is what leaves the SO_REUSEPORT group.
     if (m_listen_fd >= 0)
     {
         shutdown(m_listen_fd, SHUT_RDWR);
@@ -2151,16 +1724,9 @@ void server_instance::teardown(event_loop& loop)
         m_listen_fd = -1;
     }
 
-    // And the socket node, for a unix listener.  Closing the descriptor does
-    // not remove it — the path is a filesystem entry, not a socket state — so
-    // without this every stopped server leaves one behind, and the next start
-    // meets its own leftovers.  setup_unix_listener probes those and recovers,
-    // so the cost of missing this is not a failure to start; it is a directory
-    // filling up with dead nodes that nothing ever accounts for.
-    //
-    // After the close, deliberately.  Unlinking first would leave a live
-    // listener bound to a path no longer in the filesystem, which is a
-    // perfectly legal state and an invisible one.
+    // And the socket node for a unix listener, after the close, because
+    // unlinking first leaves a live listener bound to a path no longer in the
+    // filesystem.
     if (!m_bound_listen_path.empty())
     {
         if (unlink(m_bound_listen_path.c_str()) < 0) {}
@@ -2174,14 +1740,10 @@ void server_instance::teardown(event_loop& loop)
         {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
             {
-                // The same drain, through the record layer.  The obvious
-                // shortcut — write the queue straight to the socket, as the
-                // loop below does — would put plaintext on a connection whose
-                // peer is decrypting, so the client sees corruption and the
-                // message is on the wire in the clear regardless.
-                //
-                // A session that never finished its handshake has no keys to
-                // encrypt with, so its queue is dropped rather than sent.
+                // The same drain through the record layer, because writing the
+                // queue straight to the socket puts plaintext on a connection
+                // whose peer is decrypting -- and an unfinished handshake has
+                // no keys, so its queue is dropped.
                 if (conn->tls_state != tls_conn_ready)
                     continue;
                 while (!conn->write_queue.empty())
@@ -2225,67 +1787,35 @@ void server_instance::teardown(event_loop& loop)
 
         conn->closing = true;
 
-        // The cache requests this connection was waiting on were revoked above,
-        // so nothing is owed to it any more.  Clearing the count says so.
-        //
-        // Leaving it standing put a struct in the pool still counting replies
-        // that were never coming, and the next client to be handed that struct
-        // inherited the backlog: it would be closed at MAX_CACHE_PENDING for
-        // traffic somebody else sent, sooner the more often the server had been
-        // restarted.  reset() clears it on the way out of the pool, which is why
-        // this was invisible until a fuzz run walked the pool at rest.
+        // The cache requests were revoked above so nothing is owed, and
+        // leaving the count standing put a struct in the pool whose backlog
+        // the next client inherited.
         conn->cache_pending = 0;
 
-        // The slot first, which is what unregisters the file — and until that
-        // runs the kernel still holds a reference to this socket, so the
-        // close() below does not really close it.  release_conn() and
-        // pool_release() both call it; this path, the one a stop takes, did
-        // not, so it was the only way a connection could reach the end of its
-        // life with its file still registered.
-        //
-        // What that costs is a read the socket can no longer end.  A multishot
-        // recv armed through submit_recv_multishot_fixed_file() is counted on
-        // the fixed index, not on the descriptor number, so close_fd() sees
-        // m_fd_armed[fd] == 0, takes its fast path and submits no cancel — and
-        // a multishot recv holds its own reference to the file, so nothing else
-        // is going to end it either.  On this machine shutdown() does: the
-        // socket's wait queue completes the recv before close_tracked() runs.
-        // The nightly runner's kernel does not, and the fuzz harness has been
-        // reporting the result there since June, in the only words it has for
-        // it — "1 operation(s) still owed at end of input: recv-multishot=1",
-        // on no descriptor the loop can name, because the operation was never
-        // counted against one.
-        //
-        // Before the shutdown and the close, which is the order
-        // cache_instance::teardown() has always used for the same three calls.
-        // The sibling runtime doing exactly this is also the reason to read the
-        // omission here as an oversight rather than a difference somebody meant.
+        // The slot first, because it is what unregisters the file and until
+        // then the close does not really close it -- and a multishot recv on a
+        // fixed index is counted on the index, so close_fd() sees nothing
+        // armed and submits no cancel.
         release_fixed_slot(conn.get());
 
-        // Shutdown the connection before closing it.  Like for the listen fd,
-        // shutdown() completes any pending io_uring read/write ops synchronously
-        // (the kernel wakes up the socket wait queue, completing the ops and
-        // placing their CQEs in the ring before we return from shutdown()).
-        // This avoids the cancel-SQE fd-closed race described above.
+        // Shutdown before closing, because it completes pending reads and
+        // writes synchronously through the socket's wait queue and avoids the
+        // cancel-after-close race.
         shutdown(fd, SHUT_RDWR);
         close_tracked(fd);
 
-        // The file read and the file→pipe splice target the file fd, not the
-        // socket, so the shutdown above does not touch them.  Closing the file
-        // ends them; the ops themselves keep the struct out of the pool until
-        // their completions arrive, and file_buf stays allocated until then
-        // because that is where the kernel is writing.
+        // The file read and the file-to-pipe splice target the file fd, so
+        // closing the file ends them while file_buf stays allocated, being
+        // where the kernel writes.
         if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
         if (conn->splice_file_fd >= 0) { close_tracked(conn->splice_file_fd); conn->splice_file_fd = -1; }
         conn->splice_remaining = 0;
         conn->splice_pipe_pending = 0;
         conn->splice_pending = false;
 
-        // The queue is ours to drop.  The batch is not: a write that has reached
-        // the ring is reading out of write_batch[0] right now, and a zero-copy
-        // send is doing so long after write_pending went down.  Those refs are
-        // released where every other path releases them — when the completion
-        // says the kernel is finished with them.
+        // The queue is ours to drop and the batch is not, because a write that
+        // reached the ring is reading out of write_batch[0] and a zero-copy
+        // send does so after write_pending went down.
         conn->write_queue.clear();
         if (!conn->write_pending && !conn->zc_notif_pending)
         {
@@ -2326,16 +1856,9 @@ void server_instance::teardown(event_loop& loop)
             uc->write_batch_count = 0;
         }
 
-        // The reconnect timer is attached to no fd, so nothing above reached it
-        // and it can still be counting down thirty seconds from here.  Its owner
-        // stays set on purpose: the completion is the only thing that can tell
-        // us this struct is free, and the struct is kept for it to arrive in.
-        //
-        // Withdrawing it does not change that — the timeout still reports, with
-        // -ECANCELED, and timeout_pending is still cleared by that completion
-        // and by nothing else.  It only stops the wait being thirty seconds
-        // long, which is thirty seconds this whole instance spends in the
-        // manager's graveyard.
+        // The reconnect timer is attached to no fd, so its owner stays set and
+        // it is withdrawn only to stop the wait being thirty seconds this
+        // instance spends in the graveyard.
         if (uc->timeout_pending)
             timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
 
@@ -2349,23 +1872,14 @@ void server_instance::teardown(event_loop& loop)
     if (m_splice_pipe[1] >= 0) { close_tracked(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
     m_splice_busy = false;
 
-    // The timers this server armed.  Everything above closed a descriptor and
-    // was done; a timeout is attached to none, so shutdown() and
-    // submit_cancel_fd() both walked straight past these and the ring went on
-    // owing this owner a completion for as long as thirty seconds — long enough
-    // that reap_retired() never saw the count reach zero on any pass, and the
-    // whole instance stayed in the graveyard: about 6 MB per removed runtime.
-    // Withdrawing them is the only way to end one early.
-    //
-    // The armed flags decide, not a guess: they say "this request is occupied",
-    // and withdrawing a timeout that is not there would submit a removal for a
-    // request the ring is not carrying, which answers -ENOENT and wastes an SQE.
+    // The timers this server armed, withdrawn because a timeout reaches no
+    // shutdown or cancel and left the instance in the graveyard for as long as
+    // thirty seconds -- decided by the armed flags rather than by a guess.
     if (m_idle_sweep_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_idle_sweep_req);
-    // 250 ms rather than thirty seconds, so this one would end the retirement
-    // on its own soon enough — but "soon enough" is not the contract, and a
-    // timer left in the ring is a completion this owner is still owed however
-    // short its fuse.
+    // 250 ms would end the retirement soon enough on its own, but a timer left
+    // in the ring is a completion this owner is still owed however short its
+    // fuse.
     if (m_relay_deadline_armed)
         timers_withdrawn &= loop.submit_timeout_remove(&m_relay_deadline_req);
     if (m_accept_backoff_armed)
@@ -2376,38 +1890,17 @@ void server_instance::teardown(event_loop& loop)
         LOG_WARN("server: a timer withdrawal did not reach the ring — this instance "
                  "stays retired until the timer fires on its own");
 
-    // The armed flags are deliberately left standing.  A withdrawn timeout is
-    // still owed exactly one completion, and that completion has not landed yet
-    // — it cannot, nothing reaps the ring until this call returns.  Clearing the
-    // flags here would let a start() in this same loop iteration, which is what
-    // `restart` does, submit a fresh timeout on a request the kernel is still
-    // carrying one for: the new submission overwrites owner_token, the old
-    // completion then passes the check meant for the new one, and the disarm it
-    // triggers lands on the wrong slot — leaving the old slot owing a completion
-    // for ever, which is the leak this whole change is about.
-    //
-    // What clears them is on_cqe below, but only for a completion the loop still
-    // delivers.  After stop() has deregistered this owner it drops them instead,
-    // so across a stop the flags survive and the next start() declines to re-arm
-    // a sweep it believes is still occupied.  That was equally true when the
-    // timer simply ran its thirty seconds out, so it is not something this
-    // withdrawal introduces — but it is why the flags cannot be cleared here to
-    // fix it either.
-    //
-    // m_idle_sweep_req keeps its owner for the same reason.  Nulling it made the
-    // loop drop the sweep's completion, which left m_idle_sweep_armed true for
-    // ever and the next start() unable to tell an armed timer from a lost one.
-    // The request lives in this instance, and an instance that ever armed I/O is
-    // retired rather than freed, so the loop reading it is reading valid memory.
+    // The armed flags are left standing because a withdrawn timeout is still
+    // owed a completion that cannot have landed yet, and m_idle_sweep_req
+    // keeps its owner because nulling it made the loop drop the sweep's
+    // completion and leave the flag true for ever.
     m_loop = nullptr;
     m_multishot_active = false;
     m_master_fd = -1;
 
-    // Tell every origin that what it routed here has nowhere to go.  This used
-    // to reach into the origin's private route table and delete an entry by
-    // descriptor number, which worked only because both runtimes were the same
-    // class in the same process; it is a message now, named by the same
-    // conn_ref the route was made with.
+    // Tell every origin that what it routed here has nowhere to go, as a
+    // message named by the same conn_ref rather than a reach into the origin's
+    // private table.
     for (auto& [handle, fc] : m_forwarded)
     {
         (void)handle;
@@ -2416,16 +1909,9 @@ void server_instance::teardown(event_loop& loop)
     m_forwarded.clear();
     m_forwarded_by_ref.clear();
 
-    // And the other direction: every connection this runtime had routed away is
-    // being closed by the stop, so the runtime holding its name has to be told.
-    //
-    // Nothing told it before.  A stop does not go through close_conn — it walks
-    // m_clients and clears the index directly — so unroute_client never ran for
-    // any of these, and the target kept an entry per routed connection naming a
-    // runtime that had gone.  Harmless in that owner_send answered false on
-    // them, and unbounded: a parent restarted a hundred times left a hundred
-    // connections' worth of them behind, and its own connection count reported
-    // them as live.
+    // And every connection this runtime routed away, which nothing told
+    // before, so a target kept an entry per routed connection naming a runtime
+    // that had gone -- unbounded across restarts and counted as live.
     {
         auto* mgr = get_runtime_manager();
         for (const auto& [serial, target_name] : m_routes)
@@ -2433,10 +1919,8 @@ void server_instance::teardown(event_loop& loop)
                                conn_ref{owner_key(), serial});
     }
 
-    // Our own side: whatever we had routed away, and the serial index that
-    // resolves a name to a descriptor.  Both describe connections that are
-    // being closed as this runtime stops, so a name minted before the stop must
-    // not resolve after it.
+    // Our own side too, so a name minted before the stop does not resolve
+    // after it.
     m_routes.clear();
     m_conn_by_serial.clear();
     m_groups.clear();
@@ -2467,10 +1951,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
 
     if (SOCKETLEY_UNLIKELY(!m_loop))
     {
-        // Stopped.  Nothing may be submitted from here, but the completion is
-        // not nothing: the buffer it carries belongs to a group shared with
-        // every other server on this loop, and a timer that completes here is
-        // no longer armed, which is what the next start() needs to know.
+        // Stopped, so nothing may be submitted, but the buffer this completion
+        // carries belongs to a shared group and a timer that completes here is
+        // no longer armed.
         return_provided_buf(cqe);
         if (req == &m_idle_sweep_req)          m_idle_sweep_armed = false;
         else if (req == &m_relay_deadline_req) m_relay_deadline_armed = false;
@@ -2480,9 +1963,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         return;
     }
 
-    // Remembered before the dispatch, because the handler may release the
-    // struct and the request with it.  Only per-connection operations are worth
-    // asking about; an accept or a timer names no connection.
+    // Remembered before the dispatch because the handler may release the
+    // struct and the request with it; an accept or a timer names no
+    // connection.
     const int cqe_fd = (req->type == op_accept || req->type == op_multishot_accept ||
                         req->type == op_timeout || req->type == op_recvmsg)
                        ? -1 : req->fd;
@@ -2535,11 +2018,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         {
             const bool is_read = is_read_op(req->type);
 
-            // The descriptor says where to look; the request address and the
-            // generation say whether what we found is who submitted it.  An
-            // upstream's fd can be reissued to an accepted client, and the
-            // client index is consulted first — without this the upstream's
-            // completion was applied to a client connection.
+            // The descriptor says where to look and the request address and
+            // generation say whether what we found is who submitted it,
+            // because an upstream's fd can be reissued to a client.
             auto* conn = (req->fd >= 0 && req->fd < MAX_FDS) ? m_conn_idx[req->fd] : nullptr;
             if (SOCKETLEY_LIKELY(conn && (req == &conn->read_req || req == &conn->write_req)
                                  && req->generation == conn->generation))
@@ -2590,11 +2071,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (m_idle_timeout_cached > 0)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
-            // Relay-hold deadline.  Lowered before the sweep and not after it,
-            // because the sweep re-arms this very request for whatever is still
-            // waiting; clearing the flag afterwards would clear the arming the
-            // sweep had just done, and the timer would stop for good the first
-            // time two listeners were holding at once.
+            // The relay-hold flag is lowered before the sweep and not after,
+            // because the sweep re-arms this very request and clearing
+            // afterwards would stop the timer for good.
             else if (req == &m_relay_deadline_req)
             {
                 m_relay_deadline_armed = false;
@@ -2640,19 +2119,9 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
     }
 
     // ── The chokepoint ──────────────────────────────────────────────────────
-    //
-    // Every teardown in this runtime runs out of a completion handler, and every
-    // completion handler runs from here.  Each handler decides for itself whether
-    // the connection it just touched may be finished, and all 16 of those
-    // decisions ask conn_ops_pending(), which counts an armed read as a
-    // completion that is owed.  It is not one: see shared/conn_reachability.h for
-    // why, and for the two runtimes this has now been found in.
-    //
-    // So the rule goes here, after the dispatch, for the connection the
-    // completion named — the one place every path already goes through.  The 16
-    // guards keep their own answer and are not touched; a teardown one of them
-    // declines for the wrong reason is picked up here on the same dispatch
-    // instead of never.
+    // The reachability rule goes here, after the dispatch, for the connection
+    // the completion named, because all 16 guards count an armed read as a
+    // completion that is owed and it is not one.
     finish_unreachable_conn(cqe_fd);
 
 #ifdef SOCKETLEY_INVARIANTS
@@ -2660,9 +2129,8 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
 #endif
 }
 
-// See the call site in on_cqe() for why this exists.  Everything before the
-// verdict is a guard: a descriptor with no connection on it, or one that is not
-// closing, is somebody else's business.
+// Everything before the verdict is a guard: a descriptor with no connection,
+// or one that is not closing, is somebody else's business.
 void server_instance::finish_unreachable_conn(int fd)
 {
     if (fd < 0 || fd >= MAX_FDS)
@@ -2680,13 +2148,9 @@ void server_instance::finish_unreachable_conn(int fd)
             return;
 
         case verdict::flush:
-            // Bytes the client already handed us and considers answered are not
-            // "nothing left".  flush_write_queue() marks the connection closing
-            // on any failure it cannot recover from, so the only thing to do
-            // afterwards is ask again — which is what the second classify below
-            // is.  A flush that reached the ring answers `keep` and its
-            // completion finishes the teardown; one that submitted nothing
-            // answers `finish`, because nothing would wake it either.
+            // Bytes the client already handed us are not nothing left, so the
+            // flush is followed by asking again -- one that reached the ring
+            // answers `keep` and one that submitted nothing answers `finish`.
             flush_write_queue(conn);
             if (socketley::reach::classify(conn->closing, conn_owed(conn),
                                            /*has_output=*/false) == verdict::keep)
@@ -2701,10 +2165,8 @@ void server_instance::finish_unreachable_conn(int fd)
 }
 
 #ifdef SOCKETLEY_INVARIANTS
-// Invariant (1) from invariants.h, in the form this runtime takes: a client
-// connection is normally its own pair — nothing else drives it — except while
-// it is piped to another connection for zero-copy forwarding, where the peer's
-// read is what will wake both of them.
+// Invariant (1) in this runtime's form: a client connection is its own pair
+// except while piped to another, where the peer's read wakes both.
 void server_instance::inv_check_reachable(int fd, const char* where)
 {
     if (fd < 0 || fd >= MAX_FDS)
@@ -2718,11 +2180,9 @@ void server_instance::inv_check_reachable(int fd, const char* where)
         skl_inv::half h{};
         if (!c) return h;
         h.present   = true;
-        // A cache request counts.  Nothing of this connection's is in the ring
-        // while one is outstanding — the request lives in the channel's queue —
-        // but the channel's own wakeup is, and the reply it produces comes back
-        // here.  So the connection has something that will wake it, which is
-        // what the invariant is about.
+        // A cache request counts, because the channel's own wakeup is in the
+        // ring and the reply comes back here, which is what the invariant is
+        // about.
         h.in_flight = c->read_pending || c->write_pending || c->zc_notif_pending ||
                       c->file_read_pending || c->splice_in_pending || c->splice_out_pending ||
                       c->cache_pending > 0;
@@ -2740,8 +2200,8 @@ void server_instance::inv_check_reachable(int fd, const char* where)
 }
 #endif
 
-// O(1) removal from active_fds using the index stored in the connection.
-// The swapped-in element's connection gets its index updated.
+// O(1) removal from active_fds using the index stored in the connection, with
+// the swapped-in element's index updated.
 inline void server_instance::remove_active_fd(int fd)
 {
     auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
@@ -2754,22 +2214,15 @@ inline void server_instance::remove_active_fd(int fd)
     if (back_fd != fd && back_fd >= 0 && back_fd < MAX_FDS && m_conn_idx[back_fd])
         m_conn_idx[back_fd]->active_idx = idx;
 
-    // The same swap-remove, at the same index, in the table this runtime's
-    // sibling shards read.  Here rather than rebuilt from m_active_fds on a
-    // timer, because `active_idx` IS the index into both and doing the same
-    // operation to both is what keeps them aligned — a second structure
-    // rebuilt from the first is how the two come to disagree, and a
-    // disagreement here is a script sending to a connection that closed.
-    //
-    // A no-op for every unsharded runtime: the table is not mapped.
+    // The same swap-remove at the same index in the shared table, because
+    // `active_idx` is the index into both and a second structure rebuilt from
+    // the first is how they come to disagree.
     shard_clients_table().swap_remove(idx);
 }
 
 inline void server_instance::submit_conn_read(server_connection* conn)
 {
-    // Bundle first, plain multishot behind it.  A refused bundle is not an
-    // error -- the group's cursor may have tripped -- and the plain arm serves
-    // the same bytes one buffer per completion.  Both are consumed through
+    // Bundle first and plain multishot behind it, both consumed through
     // for_each_cqe_buf, which cannot tell them apart.
     bool queued = false;
     if (conn->direct_fd)
@@ -2795,10 +2248,8 @@ inline void server_instance::submit_conn_read(server_connection* conn)
             queued = m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
     }
 
-    // The flag goes up only once the read is actually queued.  Setting it first
-    // and submitting into a full ring left the connection believing a read was
-    // in flight when nothing was: no completion would ever arrive and it hung
-    // until the runtime stopped.
+    // The flag goes up only once the read is queued, because setting it first
+    // left the connection believing a read was in flight when nothing was.
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->read_pending = false;
@@ -2824,10 +2275,9 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 {
     int client_fd = cqe->res;
 
-    // A listener that was shut down completes its accepts with one of these, and
-    // a stop does exactly that.  Such a completion can arrive after the start()
-    // that followed, and resubmitting on the strength of it would arm a second
-    // accept chain on the listener that start() created.
+    // A shut-down listener completes its accepts with one of these, and
+    // resubmitting would arm a second chain on the listener that start()
+    // created.
     if (SOCKETLEY_UNLIKELY(client_fd == -ECANCELED || client_fd == -EBADF
                            || client_fd == -EINVAL || client_fd == -ENOTSOCK))
         return;
@@ -2873,9 +2323,9 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             }
             else
             {
-                // The slot is already marked used in the bitmap.  If it cannot be
-                // pointed at this fd it has to go back immediately: the connection
-                // never learns its number, so no close path can ever release it.
+                // The slot is already marked used, so a slot that cannot be
+                // pointed at this fd has to go back at once: the connection
+                // never learns its number.
                 m_loop->free_fixed_file_slot(static_cast<uint32_t>(slot));
             }
         }
@@ -2886,27 +2336,20 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
         m_active_fds.push_back(client_fd);
 
-        // And into the shared table, at the same position.  The ref is minted
-        // above in pool_acquire(), so it exists by now and is this connection's
-        // name for its whole life.
+        // And into the shared table at the same position, with the ref minted
+        // in pool_acquire() as this connection's name for its whole life.
         shard_clients_table().push(conn_ref{owner_key(), ptr->ref_serial});
 
-        // A TLS listener gives every accepted socket a session before anybody
-        // else touches the connection, and in particular before on_auth and
-        // on_connect below: whatever those queue is plaintext that must go out
-        // through the record layer, and a message queued on a connection that
-        // did not know it was encrypted would be written in the clear.
-        //
-        // The session is created here and the handshake starts on the first
-        // read completion.  Nothing is written yet — the client speaks first.
+        // A TLS listener gives every accepted socket a session before on_auth
+        // and on_connect, because what those queue is plaintext that must go
+        // through the record layer.
         if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
         {
             ptr->ssl = m_tls->create_ssl_server();
             if (SOCKETLEY_UNLIKELY(!ptr->ssl))
             {
-                // No session, no encryption, so no connection.  Serving this
-                // client in cleartext is the one alternative and it is worse
-                // than dropping it.
+                // No session, no encryption, so no connection, because serving
+                // this client in cleartext is worse than dropping it.
                 shutdown(client_fd, SHUT_RDWR);
                 ptr->closing = true;
                 close_conn(ptr, false);
@@ -2933,30 +2376,10 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->rl_last = now_tp;
         }
 
-        // Check per-IP auth failure rate.
-        //
-        // The term is the failure table itself, not a configuration value.  It
-        // used to be `!m_master_pw.empty()`, and --master-pw is documented on
-        // its own man-page entry as one of two ways to authenticate a master:
-        // "Alternatively, use the on_master_auth(client_id, password) Lua
-        // callback", which "if defined, overrides --master-pw".  A server that
-        // takes the documented alternative has an empty m_master_pw, so this
-        // block never ran on it — and the per-connection MAX_AUTH_FAILURES cap
-        // is no answer, because it is per connection: an attacker gets five
-        // guesses, hangs up, reconnects and gets five more, for ever.  The
-        // lockout an operator can see working with --master-pw was silently
-        // absent in the one configuration where the password is not a constant
-        // in the state file.
-        //
-        // m_auth_ip_failures is written by the failure path for its own reasons
-        // (mode_master's deny branch records every rejected attempt, whichever
-        // authenticator rejected it) and nothing in the configuration can switch
-        // that off.  Asking it directly is also cheaper than what stood here: an
-        // empty table means no getpeername syscall per accept at all, where
-        // before every accepted connection on a --master-pw server paid for one.
-        //
-        // Use getpeername() instead of m_accept_addr because multishot accept
-        // passes nullptr for addr — m_accept_addr is never populated per-connection.
+        // The term is the failure table itself, because `!m_master_pw.empty()`
+        // skipped the whole lockout for a server using the documented
+        // on_master_auth callback -- and an empty table also means no
+        // getpeername per accept.
         if (SOCKETLEY_UNLIKELY(!m_auth_ip_failures.empty()))
         {
             struct sockaddr_in peer{};
@@ -2986,11 +2409,9 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         // on_auth fires before on_connect; a rejected client never triggers on_connect
         if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
         {
-            // A Lua on_auth that answers before rejecting leaves a write in the
-            // ring, reading out of this connection's batch.  close_conn hands
-            // the struct on through release_conn, which keeps it out of the pool
-            // until that write completes — it used to go straight back and be
-            // handed to the next client with the kernel still reading it.
+            // A Lua on_auth that answers before rejecting leaves a write in
+            // the ring, so the struct goes through release_conn rather than
+            // straight back to the pool.
             shutdown(client_fd, SHUT_RDWR);
             ptr->closing = true;
             close_conn(ptr, false);
@@ -3042,17 +2463,13 @@ resubmit_accept:
     }
 }
 
-// Ciphertext in, plaintext into conn->partial.  One call per read completion,
-// which is what makes the handshake asynchronous: OpenSSL is handed the bytes
-// that have arrived and asked what it makes of them, and whatever it wants to
-// say back is drained by tls_flush at the end of handle_read.  Several rounds
-// of that is a handshake; there is no loop here waiting for one.
+// Ciphertext in and plaintext into conn->partial, one call per read
+// completion, which is what makes the handshake asynchronous with no loop
+// waiting for one.
 void server_instance::tls_feed(server_connection* conn, const char* data, size_t len)
 {
-    // Inbound ciphertext into the read BIO.  A refusal is fatal by contract —
-    // the peer is over the per-connection buffer cap, or the BIO failed — and
-    // it has to be: there is nowhere to hold what was not taken, and handing a
-    // record layer a stream with a hole in it is worse than closing.
+    // Inbound ciphertext into the read BIO, whose refusal is fatal by contract
+    // because there is nowhere to hold what was not taken.
     size_t off = 0;
     while (off < len)
     {
@@ -3071,11 +2488,9 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
         const int r = tls_context::do_handshake(conn->ssl);
         if (SOCKETLEY_UNLIKELY(r < 0))
         {
-            // Closing, but not silently: what OpenSSL produced on its way to
-            // failing is the alert that tells the peer why, and it is the only
-            // diagnosis the other end will ever get.  tls_flush at the end of
-            // handle_read puts it on the wire, and the connection is torn down
-            // when that write completes.
+            // Closing but not silently, because the alert is the only
+            // diagnosis the other end gets and tls_flush puts it on the wire
+            // before the teardown.
             conn->closing = true;
             return;
         }
@@ -3083,11 +2498,9 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
             return;   // another round; its records go out at the end of the read
 
         conn->tls_state = tls_conn_ready;
-        // Deliberately falling through rather than returning: the same read can
-        // already carry application data behind the handshake's last flight —
-        // under TLS 1.3 a client's Finished and its first request routinely
-        // arrive in one packet, and returning here would leave that request
-        // sitting in the BIO until the client sent something else.
+        // Deliberately falling through rather than returning, because under
+        // TLS 1.3 a client's Finished and its first request routinely arrive
+        // in one packet.
     }
 
     // Plaintext into partial, where every protocol above reads it from.
@@ -3099,9 +2512,8 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
         {
             conn->partial.append(plain, static_cast<size_t>(n));
             // The same ceiling the cleartext path applies, checked inside the
-            // loop rather than after it: one read completion can decrypt
-            // everything the inbound BIO had buffered, so "one read cannot
-            // produce more than one buffer's worth" is not true here.
+            // loop, because one read completion can decrypt everything the
+            // inbound BIO had buffered.
             if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
             {
                 conn->closing = true;
@@ -3111,10 +2523,9 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
         }
         if (n < 0)
         {
-            // Either the peer's close_notify or a record we cannot use.  Both
-            // end the connection, and neither ends it here: the bytes decrypted
-            // above may be a request that deserves an answer, so this is
-            // recorded and applied once handle_read has parsed them.
+            // Either the peer's close_notify or an unusable record, recorded
+            // and applied once handle_read has parsed the bytes decrypted
+            // above.
             conn->tls_peer_closed = true;
         }
         break;
@@ -3122,51 +2533,20 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
 }
 
 // ─── THE PARSE, MADE RE-DRIVABLE ────────────────────────────────────────────
-//
-// Lifted out of handle_read() unchanged except for the loop at the end of the
-// HTTP arm, because a read completion is not the only moment at which
-// `conn->partial` can hold a request nobody has answered.
-//
-// The guard in the HTTP arm below declines to parse while this connection is
-// still finishing its last response, and said "the bytes stay in partial and
-// are parsed when the next read completes".  Nothing re-parsed them.  A
-// multishot recv is already armed, so it has ALREADY moved the next request out
-// of the socket and into `partial`; the response completion then armed a read
-// and waited for bytes the client had sent long before, while the client waited
-// for a response that was never going to be produced.  Both sides waited.
-//
-// Counted before choosing where to put the rule: `partial` is parsed for HTTP
-// in 1 place, and 15 places set conn->proto = proto_unknown to mean "this
-// connection has finished its response and may have another".  None of the 15
-// can resume a parse, and a rule that fifteen call sites have to remember is
-// one that the sixteenth will not.  So it goes in the loop and in the three
-// completion arms that own an async response -- handle_splice_out()'s
-// keep-alive arm and handle_file_read()'s two -- rather than at the fifteen.
+// Lifted out of handle_read() because a read completion is not the only moment
+// `partial` can hold an unanswered request, and put in the loop and the three
+// async-response arms rather than at the fifteen sites that mean "may have
+// another".
 void server_instance::parse_partial(server_connection* conn)
 {
 reparse:
     // Multi-protocol auto-detection
     if (conn->proto == proto_unknown)
     {
-        // Four bytes is what the tests below need: every HTTP method here is
-        // matched on four characters, and the RESP markers on two.
-        //
-        // Waiting for a fourth byte is right while the client is still mid-line
-        // and wrong the moment a whole line has arrived.  A line-protocol client
-        // writes "hi\n" and then waits to be answered, so the bytes that would
-        // end this wait are the ones it will not send until the wait ends.  That
-        // is a deadlock, and it was a silent one: three bytes sat in `partial`,
-        // no callback ran, nothing was logged, and the connection was
-        // indistinguishable from a client that had sent nothing at all.  It has
-        // been here since the first implementation — see the test.
-        //
-        // A completed short line is not ambiguous, so this decides rather than
-        // guesses or refuses.  Every HTTP method prefix above is four characters
-        // and none contains a newline, so a line that ended inside four bytes
-        // cannot be one; the RESP markers are read out of the first two bytes
-        // and are still applied when they are there.  What remains is TCP, which
-        // is what such a line was always eventually classified as once some
-        // later byte happened to unblock it.
+        // Four bytes is what the tests below need, but a completed short line
+        // is not ambiguous and is decided rather than waited on -- because a
+        // line-protocol client writing "hi\n" will not send the fourth byte
+        // until it is answered.
         if (conn->partial.size() < 4)
         {
             if (conn->partial.find('\n') == std::string::npos)
@@ -3207,9 +2587,9 @@ reparse:
             else
             {
                 conn->proto = proto_http;
-                // Out of the relay set from here on, and stickily: see
-                // relay_targetable().  Set at the same statement that decides
-                // the protocol so the two cannot drift apart.
+                // Out of the relay set from here on and stickily, set at the
+                // same statement that decides the protocol so the two cannot
+                // drift.
                 conn->http_seen = true;
             }
         }
@@ -3312,22 +2692,10 @@ reparse:
             }
             else
             {
-                // ─── THE THIRD REQUEST-PARSE REGION, AND THE SAME GATE ──────
-                //
-                // A GET that turns out NOT to be an upgrade falls through to
-                // proto_http above and is judged there.  One that IS an upgrade
-                // used to be answered 101 without its header block having been
-                // framed by anybody, so the same obs-fold and bare-LF blocks the
-                // proxy refuses outright would have opened a WebSocket here.
-                //
-                // It is a weaker case than the pipelined one and worth saying
-                // why: an upgrade consumes exactly hdr_end + 4 and then reads
-                // frames, so a malformed block cannot produce a second answer —
-                // no smuggle.  What it can do is let this end and a proxy in
-                // front read the handshake's own fields differently, which is
-                // the disagreement the rest of this change exists to remove.
-                // The scan is not run on the fall-through path, so a plain GET
-                // pays nothing for it.
+                // The upgrade path's header block is framed too, because
+                // although a malformed block here cannot produce a second
+                // answer it can still let this end and a proxy in front read
+                // the handshake's fields differently.
                 if (SOCKETLEY_UNLIKELY(
                         !http_eol_framing_ok(std::string_view(conn->partial.data(), hdr_end), true)))
                 {
@@ -3400,15 +2768,9 @@ reparse:
                 continue;
             }
 
-            // Data frame: compact payload into partial[ws_frag_len..], but only
-            // when this frame is actually part of a reassembly.
-            //
-            // The unfragmented fast path below reads straight from
-            // frame.payload_ptr, which points into partial past this frame's
-            // header and mask.  Compacting first moves the payload down over
-            // that very region, so the fast path then read the payload shifted
-            // by header+mask — corrupting every message longer than those 6
-            // bytes while leaving shorter ones intact.
+            // Compact only when this frame is part of a reassembly, because
+            // the unfragmented fast path reads from payload_ptr into partial
+            // and compacting first shifts the payload by header and mask.
             const bool needs_compaction = !frame.fin || conn->ws_frag_len > 0;
             if (frame.payload_len > 0 && needs_compaction)
             {
@@ -3441,10 +2803,9 @@ reparse:
                     process_message(conn, payload);
             }
 
-            // Once the connection is marked closing, everything still
-            // buffered belongs to a conversation that is over.  Parsing it
-            // produces responses the teardown below discards, so the peer
-            // waits for answers that were computed and thrown away.
+            // Once the connection is marked closing everything still buffered
+            // belongs to a conversation that is over, so parsing it produces
+            // responses the teardown discards.
             if (conn->closing)
                 break;
         }
@@ -3469,29 +2830,11 @@ reparse:
     // proto_http: full HTTP request handling
     if (conn->proto == proto_http)
     {
-        // Not while this connection is still serving the last request.
-        //
-        // A static response lives in state this connection has exactly one of:
-        // one file_buf, one file_read_req, one splice pair, one shared pipe.
-        // Starting a second while the first is in flight overwrites all of it.
-        // serve_http() mallocs a new file_buf over the one the kernel is
-        // writing into — the old block is leaked and the buffer the kernel
-        // holds is no longer the one anybody will read — and it re-arms
-        // conn->file_read_req while a completion is still owed on it, which
-        // gives one request two live submissions and puts the loop's accounting
-        // out by one in each direction.  Then the first completion to land frees
-        // file_buf and nulls it, and the second builds a string_view over a null
-        // pointer: std::string throws logic_error out of a completion handler
-        // and the daemon terminates.  A client that pipelines two requests for a
-        // static file is all that takes.
-        //
-        // The guard has to be here and not at submit_next_read.  That one
-        // declines to arm a *one-shot* read while a file read is pending, which
-        // is enough for a one-shot read and nothing at all for a multishot recv:
-        // that is already armed and goes on delivering whatever the client sends
-        // for as long as the kernel keeps it alive.
-        //
-        // The bytes stay in partial and are parsed when the next read completes.
+        // Not while this connection is still serving the last request, because
+        // a static response lives in state there is exactly one of and
+        // starting a second overwrites all of it -- and the guard has to be
+        // here rather than at submit_next_read, which a multishot recv walks
+        // past.
         if (SOCKETLEY_UNLIKELY(conn->file_read_pending || conn->splice_pending ||
                                conn->splice_in_pending || conn->splice_out_pending))
             return;
@@ -3508,20 +2851,10 @@ reparse:
             return;
         }
 
-        // ─── THE BLOCK IS JUDGED BEFORE ANYTHING IS PARSED OUT OF IT ─────
-        //
-        // A bare LF in the header block is a line ending only one of the two
-        // ends of a keep-alive conversation may honour, and the loop at the
-        // bottom of this arm makes that a live boundary rather than a cosmetic
-        // one: "Host: x\nContent-Length: 38\r\n" splits on CRLF into ONE line
-        // whose name is Host, so the Content-Length is never seen, the body is
-        // taken as empty, and the 38 bytes behind it are read as the NEXT
-        // request.  Measured on c218738: two answers to one message, the second
-        // one the client's to choose.  The proxy has refused this since it
-        // learned to; the server did not, and the two sit in the same pipeline.
-        //
-        // `complete` is true: this runs only once "\r\n\r\n" has been found, so
-        // a trailing CR is a real bare CR and not a CRLF split across reads.
+        // The block is judged before anything is parsed out of it, because a
+        // bare LF makes "Host: x\nContent-Length: 38\r\n" one line whose
+        // Content-Length is never seen and whose body bytes are read as the
+        // next request.
         if (SOCKETLEY_UNLIKELY(!http_eol_framing_ok(
                 std::string_view(conn->partial.data(), hdr_end), true)))
         {
@@ -3561,39 +2894,11 @@ reparse:
             hreq.path = raw_path;
         }
 
-        // ─── WHERE THIS MESSAGE ENDS: ONE DECISION, SHARED WITH THE PROXY ───
-        //
-        // This used to be a Content-Length lookup and nothing else, and every
-        // shape it did not know about resolved the same way — length zero, body
-        // empty, and whatever followed read as the next request on the
-        // connection.  Four of those shapes were measured against this server
-        // and the proxy side by side on one binary (c218738), one write each,
-        // with a distinct file behind the smuggled request:
-        //
-        //     Content-Length : 38          proxy 400   server 2 answers, leaked
-        //     Content-Length twice         proxy 400   server 2 answers, leaked
-        //     obs-fold hiding the length   proxy 400   server 2 answers, leaked
-        //     bare LF in the block         proxy 400   server 2 answers, leaked
-        //
-        // The comment that used to stand a few lines below said there was "no
-        // second framing party here the way there is in the proxy".  There is:
-        // ours, one hop in front, and it is the pipeline the proxy tests build.
-        // So the rules moved to shared/http_framing.h and both runtimes ask the
-        // same function.  What differs is the answer given back — the proxy
-        // drops the connection with a 400, this server answers first — and that
-        // difference is the runtime's own business, which is why only the
-        // decision is shared.
-        // first_crlf is the first "\r\n" and hdr_end the first "\r\n\r\n", and the
-        // latter BEGINS with the former — so the two are equal for a request
-        // that carries no header fields at all.  "GET / HTTP/1.0\r\n\r\n" is
-        // eighteen legal bytes, and the subtraction then wraps to SIZE_MAX-1,
-        // string_view::substr clamps it to the terminator itself, and the scan
-        // sees an empty line and refuses a request nothing is wrong with.  The
-        // proxy has carried this guard since a fuzzer walked the same
-        // subtraction off the end of the address space; this call site is new
-        // and needed it too.  Nothing in test/integration sends a header-less
-        // request, so the suite did not catch it — test_http_request_framing.sh
-        // now does.
+        // Where this message ends is one decision shared with the proxy
+        // through http_framing.h, because four framing shapes this server did
+        // not know produced two answers to one message -- and first_crlf
+        // equals hdr_end for a request with no header fields, which the
+        // subtraction below has to survive.
         const size_t hdr_len =
             (hdr_end > first_crlf + 2) ? (hdr_end - first_crlf - 2) : 0;
         const http_request_framing_scan framing =
@@ -3605,11 +2910,9 @@ reparse:
             return;
         }
 
-        // A transfer coding this server does not implement — grep this file for
-        // "transfer-encoding" before this change and the count was zero, so a
-        // chunked request was framed by a Content-Length that was not there.
-        // Refusing is not the only defensible answer; treating the chunk data
-        // as the next request is the one that is not.
+        // A transfer coding this server does not implement, refused rather
+        // than framed by a Content-Length that is not there -- treating the
+        // chunk data as the next request is the answer that is not defensible.
         if (SOCKETLEY_UNLIKELY(framing.transfer_encoding))
         {
             refuse_http_request(conn, http_501_response());
@@ -3618,11 +2921,9 @@ reparse:
 
         const size_t content_length = framing.content_length;
 
-        // The header pairs, for the Lua API and for handle_http_request.  This
-        // loop deliberately decides nothing: the block above has already ruled
-        // on the framing, and a second walk that came to its own conclusions
-        // about Content-Length is exactly the arrangement that produced the
-        // table above.  It reads names and values and stops there.
+        // The header pairs for the Lua API, deciding nothing, because a second
+        // walk that came to its own conclusions about Content-Length is what
+        // produced the table above.
         {
             size_t line_start = first_crlf + 2;
             while (line_start < hdr_end)
@@ -3633,12 +2934,10 @@ reparse:
                 auto colon = line.find(':');
                 if (colon != std::string_view::npos)
                 {
-                    // OWS is SP or HTAB (RFC 9110 Section 5.6.3).  Skipping only
-                    // spaces left the tab on the front of the value, and every
-                    // consumer downstream then compared against a value that
-                    // began with one — which is how "Content-Length:\t4", an
-                    // ordinary legal request the proxy accepts, got this server
-                    // to hang up without answering at all.
+                    // OWS is SP or HTAB, and skipping only spaces left the tab
+                    // on the front of the value -- which made
+                    // "Content-Length:\t4" get this server to hang up without
+                    // answering.
                     hreq.headers.emplace_back(line.substr(0, colon),
                                               http_trim_ows(line.substr(colon + 1)));
                 }
@@ -3654,27 +2953,11 @@ reparse:
 
         handle_http_request(conn, hreq, total_expected);
 
-        // ─── ROUND AGAIN, RATHER THAN WAITING FOR A READ THAT IS NOT COMING ──
-        //
-        // This is the whole fix.  Every other arm in this function already
-        // consumes everything it can -- proto_tcp loops on '\n', proto_resp
-        // loops on a frame -- and HTTP took exactly one request per read
-        // completion and left the rest of `partial` for "the next read", which
-        // for a multishot recv is a read that only arrives if the client sends
-        // MORE bytes.  It has none to send: it is waiting for the answer to the
-        // request already sitting here.
-        //
-        // Deliberately a jump back to the protocol detection above and not a
-        // second parse in place.  A pipelined GET may be a WebSocket upgrade,
-        // and deciding that here would duplicate the sniff -- and duplicating
-        // it is how the two copies come to disagree.  Detection is idempotent
-        // on a fresh `partial`, so this is exactly what the next read
-        // completion would have done, minus the wait.
-        //
-        // It terminates: handle_http_request() erases at least the four bytes
-        // of one header terminator before returning, so every trip round is
-        // strictly shorter, and the three exits above -- busy, need-more,
-        // closing -- are unchanged.
+        // Round again rather than waiting for a read that is not coming,
+        // because a multishot recv has already moved the pipelined request
+        // into `partial` while the client waits for its answer -- and back to
+        // detection rather than a second parse, since duplicating the sniff is
+        // how the copies disagree.
         if (!conn->closing && !conn->partial.empty())
             goto reparse;
         return;
@@ -3715,10 +2998,9 @@ reparse:
                 process_message(conn, cmd);
             }
 
-            // Once the connection is marked closing, everything still
-            // buffered belongs to a conversation that is over.  Parsing it
-            // produces responses the teardown below discards, so the peer
-            // waits for answers that were computed and thrown away.
+            // Once the connection is marked closing everything still buffered
+            // belongs to a conversation that is over, so parsing it produces
+            // responses the teardown discards.
             if (conn->closing)
                 break;
         }
@@ -3749,10 +3031,9 @@ reparse:
 
             scan_from = pos + 1;
 
-            // Once the connection is marked closing, everything still
-            // buffered belongs to a conversation that is over.  Parsing it
-            // produces responses the teardown below discards, so the peer
-            // waits for answers that were computed and thrown away.
+            // Once the connection is marked closing everything still buffered
+            // belongs to a conversation that is over, so parsing it produces
+            // responses the teardown discards.
             if (conn->closing)
                 break;
         }
@@ -3799,13 +3080,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             conn->read_pending = true;
-            // Reset the request type: the fallback is a plain read into the
-            // connection's own buffer, not a provided-buffer one.  Leaving it
-            // as a recv/provided type makes the completion handler treat the
-            // result as a buffer-ring delivery — it then appends whatever sits
-            // in ring buffer 0 instead of the bytes just read, discards those
-            // bytes, and returns a buffer it never took, corrupting the ring's
-            // free list.
+            // Reset the request type, because leaving it as a provided-buffer
+            // type makes the handler append ring buffer 0's contents and
+            // return a buffer it never took.
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
@@ -3820,13 +3097,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error.  A zero-copy send clears write_pending on
-        // its first completion and keeps DMA-ing out of write_batch[0] until the
-        // notification arrives, so the old guard here — which did not look at
-        // zc_notif_pending — released the struct while the kernel was still
-        // reading the pages, and another connection's bytes went out on the
-        // wire.  Splices were not tracked at all.  conn_ops_pending() is now the
-        // one answer to that question.
+        // Connection closed or error, asked through conn_ops_pending(),
+        // because the old guard ignored the zero-copy notification and
+        // released the struct while the kernel was still reading the pages.
         conn->closing = true;
         if (!conn_ops_pending(conn))
             close_conn(conn);
@@ -3842,12 +3115,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // same buffer it always did and knows nothing about TLS.
     if (is_provided)
     {
-        // Reading the buffer id straight out of the CQE flags was correct only
-        // while every completion carried exactly one buffer.  A bundle names
-        // only its FIRST, so that form silently dropped every buffer after it
-        // -- both the bytes and the buffer itself, which the group never got
-        // back.  for_each_cqe_buf is the loop's rule for naming and slicing
-        // them; what stays here is where the bytes go.
+        // Reading the buffer id out of the CQE flags was correct only while
+        // every completion carried one buffer, and a bundle names only its
+        // first.
         m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
                 tls_feed(conn, p, static_cast<size_t>(n));
@@ -3864,15 +3134,10 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->partial.append(conn->read_buf, cqe->res);
     }
 
-    // This client has said something, and from here on it is one that is owed
-    // an answer rather than one that is only listening.  Here rather than in
-    // each of the three branches above because this is where they meet, and on
-    // `partial` rather than on cqe->res because on a TLS connection the bytes
-    // that just arrived may be a handshake record the session answers by
-    // itself: a client is not waiting on the relay for that.  Sticky — a
-    // connection does not become a listener again by falling silent, and the
-    // sticky part is what keeps a keep-alive HTTP client, whose protocol is
-    // reset to unknown between requests, out of the deadline's reach.
+    // This client has said something and is now owed an answer rather than
+    // only listening, judged on `partial` rather than cqe->res because a
+    // handshake record is not a client waiting -- and sticky, which keeps a
+    // keep-alive HTTP client out of the deadline's reach.
     if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
         conn->spoke = true;
 
@@ -3885,36 +3150,22 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     parse_partial(conn);
 
 submit_next_read:
-    // Relay traffic that arrived while this connection had no protocol yet.
-    //
-    // Here and not at any of the points above that decide one, because every
-    // path through this function reaches this label and only some of them
-    // classify: a read that leaves the connection mid-line or mid-header
-    // settles nothing, and proto_unsettled() is what tells those apart.  By
-    // this point whatever this read produced — a 101, an HTTP response, a pong
-    // — is already in the write queue, so the held bytes append behind it
-    // rather than in front of it, which was the entire defect.
+    // Relay traffic held across classification is released here, because every
+    // path through this function reaches this label and only some classify --
+    // and by now this read's own output is queued, so the held bytes append
+    // behind it.
     if (SOCKETLEY_UNLIKELY(!conn->relay_hold.empty()) && !proto_unsettled(conn))
         relay_hold_flush(conn);
 
-    // Everything this read produced for the cache goes now.  One post for the
-    // whole buffer instead of one per line, and — because every path above
-    // reaches this label — nothing is left sitting in the batch waiting for a
-    // message that may never come.
+    // Everything this read produced for the cache goes now, one post for the
+    // whole buffer, and nothing is left in the batch waiting for a message
+    // that may never come.
     if (SOCKETLEY_UNLIKELY(!m_cache_store_batch.empty()))
         flush_cache_store();
 
-    // ── the TLS half of the same idea ──
-    // The peer's close_notify is applied here rather than where it was read:
-    // the read that carried it can carry the last request ahead of it, and
-    // marking the connection closing any earlier would have made the parse
-    // above throw that request away with the answer half computed.
-    //
-    // Then one flush for everything the record layer owes the wire — the next
-    // handshake flight, an alert explaining a handshake that just failed, a
-    // session ticket, and whatever the parse above queued — as a single write.
-    // Every path through this function reaches this label, so nothing is left
-    // sitting in a BIO waiting for a completion that has no reason to come.
+    // close_notify is applied here because the read that carried it can carry
+    // the last request ahead of it, and then one flush covers everything the
+    // record layer owes -- at a label every path reaches.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
         if (conn->tls_peer_closed)
@@ -3929,18 +3180,17 @@ submit_next_read:
         if (!conn->read_pending && !conn->file_read_pending)
         {
             submit_conn_read(conn);
-            // A read that could not be queued marks the connection closing and
-            // leaves nothing in flight to notice that later — no completion is
-            // coming.  Without this it sits here until the runtime stops.
+            // A read that could not be queued marks the connection closing
+            // with nothing in flight to notice it later, so without this it
+            // sits here until the runtime stops.
             if (SOCKETLEY_UNLIKELY(conn->closing && !conn_ops_pending(conn)))
                 close_conn(conn);
         }
     }
     else if (conn->closing && !conn_ops_pending(conn))
     {
-        // Nothing left in the ring for this connection, so it can go now.
-        // Whichever operation is still outstanding owns the teardown instead:
-        // its completion handler asks the same question and finds it answered.
+        // Nothing left in the ring for this connection, so it can go now;
+        // otherwise whichever operation is outstanding owns the teardown.
         close_conn(conn);
     }
 }
@@ -3981,20 +3231,10 @@ static inline __attribute__((always_inline)) bool check_rate_limit(server_connec
 }
 
 // ─── Cache requests ─────────────────────────────────────────────────────────
-//
-// What the channel hands back with a reply is one 64-bit cookie and nothing
-// else, so everything needed to find the client that asked has to fit in it:
-// the descriptor in the low half and the identity the connection had when it
-// asked in the high half.  Both are required.  The descriptor alone finds a
-// connection; the generation is what says it is the *same* connection, because
-// a client that aborts mid-request has its number reissued by the next accept
-// and its struct handed on by the pool.  That is exactly the shape of the
-// completion-after-teardown defects this runtime has been finding all week, and
-// it is answered here the same way on_cqe answers it.
-//
-// A request made on nobody's behalf — the auto-store, or a UDP datagram, which
-// has no connection at all — uses a descriptor of -1, which no index can
-// resolve, so its reply is dropped without ever looking anything up.
+// The cookie carries the descriptor and the identity the connection had,
+// because a client that aborts has its number reissued and its struct handed
+// on -- and a request made on nobody's behalf uses -1, which no index
+// resolves.
 static constexpr uint64_t CACHE_COOKIE_NO_CONN = 0xFFFFFFFFull;
 
 static inline uint64_t cache_cookie(const server_connection* conn, bool silent)
@@ -4010,9 +3250,9 @@ void server_instance::flush_cache_store()
     if (SOCKETLEY_LIKELY(m_cache_store_batch.empty()))
         return;
 
-    // Cleared whatever happens.  A batch the channel would not take is lost —
-    // it is counted there as such — and holding on to it would only make the
-    // next flush larger and no more likely to be taken.
+    // Cleared whatever happens, because a batch the channel would not take is
+    // lost and holding it only makes the next flush larger and no more likely
+    // to be taken.
     post_cache_request(nullptr, m_cache_store_batch, true);
     m_cache_store_batch.clear();
 }
@@ -4028,11 +3268,9 @@ void server_instance::post_cache_request(server_connection* conn,
     if (SOCKETLEY_UNLIKELY(!mgr))
         return;
 
-    // The cap, and the one place it is enforced.  Charged only to requests the
-    // client asked for: the auto-store is the server's own doing and closing a
-    // connection over it would punish a client for a feature it never used.
-    // The store is still bounded — by the channel's own queue, which refuses
-    // below.
+    // The cap, charged only to requests the client asked for, because closing
+    // a connection over the server's own auto-store would punish a client for
+    // a feature it never used.
     if (!silent && conn)
     {
         if (SOCKETLEY_UNLIKELY(conn->cache_pending >= MAX_CACHE_PENDING))
@@ -4045,18 +3283,9 @@ void server_instance::post_cache_request(server_connection* conn,
     const auto cls = silent ? request_class::background : request_class::client;
     if (!mgr->requests().post(this, cache_cookie(conn, silent), cname, payload, cls))
     {
-        // The channel took nothing, so no reply is coming for this one.
-        //
-        // A command the client is waiting on cannot simply be dropped and
-        // cannot be answered here either — an error written now would arrive
-        // ahead of the answers already queued in front of it, and the client
-        // would match the wrong reply to the wrong question.  Closing says the
-        // same thing without lying about the order.
-        //
-        // The auto-store just goes.  Nobody asked for it and nobody is waiting
-        // on it, and it only reaches here once the channel's background share
-        // is full, which is a burst larger than the loop can drain in a turn.
-        // The channel counts every one of these; it is loss, not a no-op.
+        // The channel took nothing, so a command the client is waiting on is
+        // answered by closing -- an error written now would arrive ahead of
+        // the answers queued in front of it -- while the auto-store just goes.
         if (!silent && conn)
             conn->closing = true;
         return;
@@ -4083,12 +3312,9 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
     if (SOCKETLEY_LIKELY(conn->cache_pending > 0))
         --conn->cache_pending;
 
-    // Written even when the connection is marked closing.  That flag normally
-    // means "the conversation is over, anything produced now is thrown away",
-    // and for output this runtime decided to send that is right.  This is not
-    // that: the client asked for this line and its socket is open only because
-    // the answer is owed — a request/response client that half-closes after
-    // asking is marked closing by the FIN and is still sitting there reading.
+    // Written even when the connection is marked closing, because the client
+    // asked for this line and its socket is open only because the answer is
+    // owed.
     if (SOCKETLEY_LIKELY(m_loop != nullptr))
     {
         std::string text;
@@ -4098,9 +3324,9 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
         }
         else
         {
-            // Said out loud rather than swallowed.  A client whose `cache get`
-            // went to a runtime that has since stopped used to receive nothing
-            // at all and wait for a line that was never coming.
+            // Said out loud rather than swallowed, because a client whose
+            // `cache get` went to a stopped runtime used to receive nothing at
+            // all.
             const char* why = request_status_text(st);
             text.reserve(8 + std::char_traits<char>::length(why));
             text.append("error: ").append(why);
@@ -4115,9 +3341,8 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
     }
 
     // The close close_conn() deferred, if this was the last answer owed and
-    // nothing else is armed.  Whichever operation is still outstanding owns the
-    // teardown otherwise: its completion handler asks the same question and
-    // finds it answered, exactly as on every other path here.
+    // nothing else is armed; otherwise the outstanding operation owns the
+    // teardown.
     if (SOCKETLEY_UNLIKELY(conn->closing) && conn->cache_pending == 0
         && !conn_ops_pending(conn))
         close_conn(conn);
@@ -4152,18 +3377,10 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         auto rit = m_routes.find(sender->ref_serial);
         if (rit != m_routes.end())
         {
-            // The name, not the descriptor.  In one process this is the same
-            // call it always was; the argument is what changed, and it is the
-            // argument that decides whether the same call still means anything
-            // once the target is elsewhere.
-            //
-            // The running check went with the lookup.  It read the target's
-            // state out of THIS process's map, which for a worker is a replica
-            // one push interval old — so it could withhold a message from a
-            // runtime that is running and pass one to a runtime that has
-            // stopped.  Whoever holds the target decides now: deliver_routed
-            // resolves the ref against what was actually accepted there, and a
-            // ref that names nothing is dropped rather than delivered.
+            // The name and not the descriptor, with the running check gone
+            // from here because it read a replica one push interval old --
+            // whoever holds the target decides, and a ref that names nothing
+            // is dropped rather than delivered.
             route_relay::data(get_runtime_manager(), rit->second, get_name(),
                               conn_ref{owner_key(), sender->ref_serial}, msg);
             return;
@@ -4178,23 +3395,20 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     if (sender)
         invoke_on_client_message(sender->fd, msg);
 
-    // Cache command interception: "cache <cmd>" → asked of the linked cache and
-    // answered to the sender alone, one turn of the event loop later.  This
-    // used to run the cache's own interpreter here, on this stack, through a
-    // pointer to the cache object; see shared/request_channel.h for why it does
-    // not any more and what that costs.
+    // Cache command interception, asked of the linked cache and answered a
+    // turn later, rather than run on this stack through a pointer to the cache
+    // object.
     if (SOCKETLEY_UNLIKELY(sender && msg.size() > 6 && msg[0] == 'c' && msg.starts_with("cache ")))
     {
-        // Ahead of the command, so that a client which sends a message and then
-        // asks the cache for it by key sees its own write.  One queue, drained
-        // in order, so posting the batch first is all the ordering needs.
+        // Ahead of the command, so a client that sends a message and then asks
+        // the cache for it by key sees its own write.
         flush_cache_store();
         post_cache_request(sender, msg.substr(6), false);
         return; // Cache commands are never broadcast
     }
 
-    // Store in cache if configured.  Appended to the batch rather than posted;
-    // see m_cache_store_batch for why the granularity matters.
+    // Store in cache if configured, appended to the batch rather than posted,
+    // because the granularity matters.
     if (SOCKETLEY_UNLIKELY(!get_cache_name().empty()))
     {
         char key_buf[24];
@@ -4207,12 +3421,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         batch.append(msg);
         batch.push_back('\n');
 
-        // A newline inside the value would end the line early and turn the rest
-        // of the message into a command of its own.  The cache's own text
-        // protocol is line-based and cannot carry one either — a client typing
-        // `set k a<newline>b` at the cache's port stores "a" — so flattening is
-        // what going through the protocol means rather than around it.  Only
-        // the WebSocket and RESP paths can produce one; the line parser cannot.
+        // A newline inside the value would end the line early and turn the
+        // rest into a command, and the cache's own text protocol cannot carry
+        // one either, so flattening is what going through the protocol means.
         for (size_t i = line_start; i + 1 < batch.size(); i++)
             if (SOCKETLEY_UNLIKELY(batch[i] == '\n' || batch[i] == '\r'))
                 batch[i] = ' ';
@@ -4268,49 +3479,12 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 std::string_view pw = msg.substr(7);
                 bool auth_ok = false;
 
-                // ─── An auth hook is read strictly, and a failure is a denial ───
-                //
-                // The Lua hook comes first and the `else if` below is the whole
-                // point: a script that defines on_master_auth has REPLACED
-                // --master-pw, not supplemented it, so whatever this block
-                // decides is the entire gate on the master role.
-                //
-                // It used to be `result.get<bool>()`, which is lua_toboolean —
-                // and in Lua the only false values are `false` and `nil`.  So
-                // `return "denied"`, `return 0` and `return {}` all granted
-                // master: every spelling of "no" that a script might reach for
-                // except the two nobody writes by mistake.  Read as an optional
-                // <bool>, which is a type check rather than a truth test, so a
-                // hook that did not answer `true` has not authenticated anybody.
-                //
-                // The `result.valid()` guard it replaces could not fire.  The
-                // callback is an unprotected sol::function, and converting its
-                // unsafe_function_result to a protected_function_result stamps
-                // call_status::ok on the way — so `valid()` was constant true
-                // and the only thing standing between a raising hook and a
-                // granted master role was the catch below.
-                //
-                // Which said nothing.  `catch (...) {}` meant an auth callback
-                // with a typo in it denied in complete silence, indistinguishable
-                // from one that had considered the request and refused it — so
-                // the operator saw a gate that worked and had no way to learn
-                // their gate was not running.  Fail closed and say why.
-                //
-                // A PROTECTED call, and that is not a detail.  Written with a
-                // try/catch — the convention invoke_on_auth uses one file away —
-                // the denial still happened but the message did not, because the
-                // catch depends on sol2's panic handler throwing and on that
-                // throw being able to unwind out of the interpreter.  Measured
-                // in this repository's own Sanitize build: the hook ran, the
-                // request was denied, and no `on_master_auth error` line was
-                // ever written, while a `socketley.log` from the same callback
-                // reached the same log file.  The catch simply never ran.
-                //
-                // A silent auth hook is the exact defect this callback was being
-                // fixed for, so a reporting mechanism that stops working in a
-                // build configuration is not good enough.  Protected calls
-                // return the error as a value; see m_on_master_auth's note in
-                // lua_context.h and the on_route precedent in proxy_instance.
+                // The auth hook replaces --master-pw entirely, so it is read
+                // as an optional<bool> -- a type check rather than a truth
+                // test, because `return "denied"` granted master -- through a
+                // protected call, because the try/catch never ran in the
+                // Sanitize build and a silent auth hook is the defect being
+                // fixed.
                 auto* lctx = lua();
                 if (lctx && lctx->has_on_master_auth())
                 {
@@ -4327,10 +3501,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                     }
                     else
                     {
-                        // Read as an optional<bool>, which is a type check
-                        // rather than a truth test: only the boolean `true`
-                        // grants.  A hook that returned nothing has not
-                        // answered, and a non-answer is a denial.
+                        // Read as an optional<bool>, so only the boolean
+                        // `true` grants and a hook that returned nothing has
+                        // not answered.
                         sol::optional<bool> res = r.return_count() > 0
                                                   ? r.get<sol::optional<bool>>()
                                                   : sol::optional<bool>{};
@@ -4435,10 +3608,9 @@ void server_instance::lua_broadcast(std::string_view msg)
     auto full_msg = std::make_shared<const std::string>(std::move(buf));
     broadcast(full_msg, -1);  // -1 = don't exclude anyone
 
-    // Also reach the connections routed here, each through the runtime that
-    // owns it.  A ref that no longer resolves is dropped there rather than
-    // written somewhere — which is the difference between a broadcast that
-    // misses a departed client and one that reaches a stranger.
+    // Also reach the connections routed here through the runtime that owns
+    // each, so a ref that no longer resolves is dropped there rather than
+    // written to a stranger.
     for (auto& [handle, fc] : m_forwarded)
     {
         (void)handle;
@@ -4449,18 +3621,10 @@ void server_instance::lua_broadcast(std::string_view msg)
     }
 }
 
-// One pass over every connection, one submission each, and no return to the
-// event loop in between — the same shape as cache_instance::publish(), and it
-// had the same defect for the same reason.  get_sqe() used to report a full
-// submission queue as a permanent failure, so flush_write_queue() below dropped
-// the bytes and set `closing`: measured on this tree, SQPOLL on, 3000 connected
-// clients and a 2048-entry ring, one broadcast reached exactly 2048 of them and
-// 952 were marked closing and never told the message existed.  Fixed in
-// shared/event_loop.cpp, which is where it belongs — two runtimes had it.
-// test_server_broadcast_reaches_all.sh is the guard.
-//
-// Anything added here that submits per connection inherits that history: this
-// loop is bounded only by how many clients are connected.
+// One pass, one submission per connection and no return to the loop between,
+// which is why a full submission queue reported as permanent left 952 of 3000
+// clients marked closing and never told -- fixed in event_loop.cpp, and
+// anything added here inherits that history.
 void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
@@ -4476,24 +3640,16 @@ void server_instance::broadcast(const std::shared_ptr<const std::string>& msg, i
         if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
             continue;
 
-        // This client speaks a request/response protocol — HTTP or RESP — and
-        // no relayed line is well formed on one at any point in its life.
-        // Skipped rather than held: a hold implies there is a later moment at
-        // which these bytes would be correct, and for a connection whose
-        // replies are matched to its requests by their order on the stream
-        // there is not.  See relay_targetable().
-        //
-        // Ahead of the hold below, because an HTTP connection between two
-        // keep-alive requests reads as unclassified and would otherwise
-        // accumulate a hold that the next request's first read then flushes —
-        // in front of the response to that very request.
+        // An HTTP or RESP client is skipped rather than held, because no
+        // relayed line is well formed on one at any point -- and ahead of the
+        // hold, since a keep-alive gap reads as unclassified and would
+        // accumulate one.
         if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
             continue;
 
-        // Nothing is known yet about what this client speaks, and writing to it
-        // now would put these bytes in front of the response to a request it
-        // has already sent.  Hold them; handle_read releases them the moment
-        // the protocol is settled, behind that response and in this order.
+        // Nothing is known yet about what this client speaks, so writing now
+        // would put these bytes in front of the response to a request it has
+        // already sent.
         if (SOCKETLEY_UNLIKELY(proto_unsettled(conn)))
         {
             relay_hold_push(conn, msg);
@@ -4561,11 +3717,8 @@ void server_instance::send_to(server_connection* conn, const std::shared_ptr<con
 void server_instance::relay_hold_push(server_connection* conn,
                                       const std::shared_ptr<const std::string>& msg)
 {
-    // The deadline runs from the first message held, not from every one.  A
-    // listener on a busy relay would otherwise have its clock reset by each new
-    // broadcast and never reach the deadline at all — which is the "never
-    // classified, never served" behaviour this exists to end, restored exactly
-    // where it hurts most.
+    // The deadline runs from the first message held, or a listener on a busy
+    // relay would have its clock reset by each broadcast and never reach it.
     if (conn->relay_hold.empty())
     {
         conn->relay_hold_since = std::chrono::steady_clock::now();
@@ -4575,11 +3728,9 @@ void server_instance::relay_hold_push(server_connection* conn,
 
     conn->relay_hold.push(msg);
 
-    // A loop and not a single pop: one relayed message can be larger than the
-    // whole bound by itself, and popping once would leave the hold over its
-    // limit for as long as the connection stayed silent — which for a pure
-    // listener is for ever, and this bound is the only thing standing between
-    // that and unbounded growth.
+    // A loop and not a single pop, because one relayed message can be larger
+    // than the whole bound and popping once would leave the hold over its
+    // limit indefinitely.
     while (SOCKETLEY_UNLIKELY(conn->relay_hold.bytes() > RELAY_HOLD_MAX_BYTES)
            && !conn->relay_hold.empty())
         conn->relay_hold.pop();
@@ -4591,16 +3742,9 @@ void server_instance::relay_hold_flush(server_connection* conn)
         return;
 
     // What was held before the classification turned out to be a
-    // request/response protocol is dropped rather than delivered.  These bytes
-    // were held on the guess that the connection would turn out to be a relay
-    // target; it did not, and there is no framing on an HTTP or RESP
-    // connection that could carry them.  Both windows are real and not
-    // theoretical: a GET is classified proto_ws_upgrading, which holds, and
-    // only the header parse says whether it was an upgrade or a plain request;
-    // and a RESP client whose first write stops short of four bytes and of a
-    // newline — "*1\r" — is unclassified until the rest of the command
-    // arrives, so a broadcast in that gap is held and then flushed onto a
-    // connection that turned out to speak RESP.
+    // request/response protocol is dropped, because there is no framing that
+    // could carry it -- and both windows are real, a GET that is not an
+    // upgrade and a RESP client whose first write stops short.
     if (SOCKETLEY_UNLIKELY(!relay_targetable(conn)))
     {
         conn->relay_hold.clear();
@@ -4608,14 +3752,9 @@ void server_instance::relay_hold_flush(server_connection* conn)
         return;
     }
 
-    // send_to() rather than a push straight into the write queue, and that is
-    // the whole reason this is a function and not three lines at the call site:
-    // the connection has a protocol *now*, and for a WebSocket that means every
-    // one of these has to go out as a frame.  Flushing raw would trade one
-    // corrupted stream for another — the client reads the 101, switches to
-    // frame parsing, and is handed plain text.  send_to is where that framing
-    // decision already lives, so this path cannot drift away from the one
-    // broadcast() takes for a connection that was classified in time.
+    // send_to() rather than a push into the write queue, because the
+    // connection has a protocol now and a WebSocket needs every one of these
+    // framed.
     while (!conn->relay_hold.empty())
         send_to(conn, conn->relay_hold.take_front());
 
@@ -4624,11 +3763,8 @@ void server_instance::relay_hold_flush(server_connection* conn)
 
 void server_instance::relay_deadline_arm(uint32_t after_ms)
 {
-    // Not if it is already counting.  A timeout is attached to no descriptor,
-    // so a second submission on this request would leave the first one in the
-    // ring with nothing able to name it — the same defect the idle sweep's
-    // armed flag exists to prevent, and the reason that one is commented at
-    // such length in setup().
+    // Not if it is already counting, because a second submission on this
+    // request would leave the first in the ring with nothing able to name it.
     if (m_relay_deadline_armed || SOCKETLEY_UNLIKELY(!m_loop))
         return;
 
@@ -4643,16 +3779,14 @@ void server_instance::relay_deadline_sweep()
     const auto now = std::chrono::steady_clock::now();
     const auto deadline = std::chrono::milliseconds(RELAY_HOLD_DEADLINE_MS);
 
-    // The shortest wait any connection that is still holding has left.  Starts
-    // at the full deadline because nothing can be owed longer than that.
+    // The shortest wait any connection that is still holding has left,
+    // starting at the full deadline because nothing can be owed longer.
     auto next = deadline;
     bool still_waiting = false;
 
-    // The same shape broadcast() iterates m_active_fds with, for the same
-    // reason: the flush below writes, a write that never reaches the ring marks
-    // the connection closing, and re-reading size() each turn is what makes
-    // that safe.  Nothing here removes an fd from the vector — only a
-    // completion does that — so no entry is skipped.
+    // The same shape broadcast() iterates m_active_fds with, re-reading size()
+    // each turn because the flush below writes and a failed write marks the
+    // connection closing.
     for (size_t i = 0; i < m_active_fds.size(); i++)
     {
         const int fd = m_active_fds[i];
@@ -4661,10 +3795,8 @@ void server_instance::relay_deadline_sweep()
             continue;
 
         // Classified, spoken, or still handshaking: this hold is not the
-        // deadline's to release, and its connection is not what the timer
-        // should be re-armed for either.  A client mid-request is waiting for
-        // an answer, and flushing in front of that answer is the defect the
-        // hold exists to prevent.
+        // deadline's to release, because a client mid-request is waiting for
+        // an answer relay bytes would land in front of.
         if (!relay_deadline_applies(conn))
             continue;
 
@@ -4679,22 +3811,17 @@ void server_instance::relay_deadline_sweep()
             continue;
         }
 
-        // Out of time.  This client has sent nothing since it was accepted, so
-        // there is no response of its own for these bytes to arrive in front
-        // of, and raw line-delimited text is what a connection that has never
-        // announced anything else gets.  Settling the protocol rather than just
-        // emptying the queue is the point: everything relayed after this goes
-        // straight out, so the 250 ms is paid once per connection and not once
-        // per message.
+        // Out of time, so the protocol is settled as raw rather than the queue
+        // merely emptied, which is what makes the 250 ms a per-connection cost
+        // and not a per-message one.
         conn->proto = proto_tcp;
         relay_hold_flush(conn);
     }
 
     if (still_waiting)
     {
-        // A floor under the re-arm.  Without it a hold that is one microsecond
-        // short of its deadline arms a one-microsecond timeout, and a busy
-        // relay would spend more time in the timer wheel than in the sweep.
+        // A floor under the re-arm, or a hold one microsecond short of its
+        // deadline arms a one-microsecond timeout.
         static constexpr uint32_t MIN_REARM_MS = 5;
         auto ms = static_cast<uint32_t>(next.count());
         relay_deadline_arm(ms < MIN_REARM_MS ? MIN_REARM_MS : ms);
@@ -4705,70 +3832,24 @@ bool server_instance::conn_has_output(const server_connection* conn) const
 {
     if (!conn->write_queue.empty())
         return true;
-    // A TLS connection can owe the wire bytes with an empty queue: a handshake
-    // flight, an alert, a session ticket, or ciphertext that did not fit in
-    // the write that just completed.  Asking only about the queue is how a
-    // handshake stalls one round short of finishing.
+    // A TLS connection can owe the wire bytes with an empty queue, and asking
+    // only about the queue is how a handshake stalls one round short.
     return conn->ssl != nullptr && tls_context::has_pending_out(conn->ssl);
 }
 
 // ─── WE SEND THE FIN, NOT THE CLIENT ────────────────────────────────────────
-//
-// Whoever performs the active close holds TIME-WAIT for that 4-tuple for 60 s.
-// Ours sits on a fixed listening port and costs nothing scarce; the client's
-// sits on an ephemeral port, and this box has 28,231 of them.  Measured over
-// 2,000 connection-per-request requests before this existed: 0 closes from us,
-// 2,004 from the client — we were structurally second, every time, and the
-// client burned its cores in the port allocator finding a free one.
-//
-// Two things are load bearing:
-//
-//   shutdown(), not close().  close() on a socket that still has unread bytes
-//   in its receive queue sends RST rather than FIN, and an RST can destroy the
-//   answer just written.  The read stays armed; the client's own FIN completes
-//   it and close_conn() still runs on exactly one path, so the teardown
-//   bookkeeping is untouched.
-//
-//   Only from a write *completion*, never from where the write is queued.
-//   shutdown() is a syscall and a ring submission is not, so calling this with
-//   a write still in flight lets the FIN overtake the payload.  That is the
-//   half-close defect this tree has already fixed four times on the proxy side;
-//   the guard below is what keeps it from coming back here.  Every condition in
-//   it is "is anything still owed to the wire", and it is one function rather
-//   than a line repeated at each completion for the same reason.
-//
-// ─── DO NOT REPLACE THIS WITH A LINKED IORING_OP_SHUTDOWN ───────────────────
-//
-// It looks like the obvious improvement -- chain the FIN to the send with
-// IOSQE_IO_LINK and it leaves from inside the kernel, with no completion
-// crossing into userspace first.  It was built, and it is much WORSE.  Measured
-// as "the client closes the instant it has the whole response; was our FIN
-// already in its receive queue", 200 attempts, three repetitions, quiet box:
-//
-//     this function, from the write completion    200 / 182 / 200
-//     linked IORING_OP_SHUTDOWN + MSG_WAITALL       4 /   0 /   1
-//     linked, without MSG_WAITALL                   2 /   1 /   2
-//
-// The third row is there because MSG_WAITALL is the obvious suspect -- the
-// linked send needs it, or a short send lets the FIN out on top of an
-// unfinished response (measured directly: 6144 bytes of a 4 MB send delivered,
-// then a clean FIN).  It is not the suspect.  Dropping it changes nothing, so
-// the cost is the LINK itself: the kernel runs the second op out of the first
-// one's completion, and by then the data has already woken the client, which
-// closes before the FIN is issued.  An ordinary send completes inline and the
-// shutdown() syscall right behind it beats the client to it.
-//
-// Rate was identical between the two (-0.4%, six interleaved pairs).  CPU per
-// request could not be measured on this machine: kernel.sched_schedstats is 0,
-// and a run lasts 86 ms against a 10 ms clock tick.
+// We perform the active close so the client's ephemeral port is not held in
+// TIME-WAIT, through shutdown() rather than close() and only from a write
+// completion so the FIN cannot overtake the payload -- and not through a
+// linked IORING_OP_SHUTDOWN, which measured 4 of 200 against 200 of 200
+// because the data wakes the client before the linked op runs.
 void server_instance::maybe_shutdown_write(server_connection* conn)
 {
     if (SOCKETLEY_LIKELY(!conn->closing) || conn->wr_shutdown || conn->fd < 0)
         return;
 
-    // A TLS connection owes a close_notify record first, and tls_flush() owns
-    // that sequence.  Sending a bare FIN under it is a truncation attack as far
-    // as the peer is concerned.
+    // A TLS connection owes a close_notify record first, and a bare FIN under
+    // it is a truncation attack as far as the peer is concerned.
     if (conn->ssl != nullptr)
         return;
 
@@ -4783,10 +3864,9 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
     if (conn->cache_pending > 0)
         return;
 
-    // Nothing is armed to hold the connection open, so the caller's own
-    // `closing && !conn_ops_pending` branch is about to run close_conn() and do
-    // this properly.  Only the armed-read case needs a FIN of its own — that is
-    // the case that used to wait for the client.
+    // Nothing is armed to hold the connection open, so the caller's own branch
+    // is about to close it properly; only the armed-read case needs a FIN of
+    // its own.
     if (!conn->read_pending)
         return;
 
@@ -4795,26 +3875,20 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
 }
 
 // Every byte this connection sends is a TLS record, including the ones nobody
-// queued.  Called from flush_write_queue for a TLS connection and from the end
-// of handle_read; there is no other way onto the wire.
+// queued, and there is no other way onto the wire.
 void server_instance::tls_flush(server_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || !conn->ssl))
         return;
 
-    // One write in flight at a time, exactly as the cleartext path does — the
-    // ciphertext buffer built below is what the kernel reads out of, and a
-    // second submission would need a second buffer and would interleave two
-    // record streams on one socket.  Whatever does not go now stays in the
-    // queue or in the write BIO; handle_write comes back here when this write
-    // lands.
+    // One write in flight at a time, because a second submission would need a
+    // second buffer and would interleave two record streams on one socket.
     if (conn->write_pending || conn->zc_notif_pending)
         return;
 
-    // Application data only once the handshake is done.  A message queued by
-    // on_connect — which fires when the socket is accepted, before a single
-    // record has crossed — waits here rather than being handed to an SSL that
-    // would answer WANT_READ and leave the caller unsure what was consumed.
+    // Application data only once the handshake is done, so a message queued by
+    // on_connect waits rather than being handed to an SSL that answers
+    // WANT_READ.
     if (conn->tls_state == tls_conn_ready)
     {
         while (!conn->write_queue.empty())
@@ -4824,18 +3898,16 @@ void server_instance::tls_flush(server_connection* conn)
                                                  static_cast<int>(msg->size()));
             if (n <= 0)
             {
-                // 0 is backpressure: the write BIO is at its cap, and OpenSSL's
-                // contract is that the same buffer is offered again once it has
-                // drained — which is what leaving this message at the front of
-                // the queue arranges.  -1 is fatal for the session.
+                // 0 is backpressure and the same buffer is offered again once
+                // the write BIO drains, which leaving the message at the front
+                // of the queue arranges; -1 is fatal.
                 if (n < 0)
                     conn->closing = true;
                 break;
             }
-            // Partial writes are not enabled on this context, so SSL_write is
-            // all-or-nothing.  A short count would mean the record layer and
-            // this queue disagree about what has been sent, and a stream with a
-            // hole in it has no framing left to recover: close instead.
+            // Partial writes are not enabled on this context, so a short count
+            // would mean the record layer and this queue disagree about what
+            // has been sent.
             if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg->size()))
             {
                 conn->closing = true;
@@ -4848,16 +3920,9 @@ void server_instance::tls_flush(server_connection* conn)
     if (!tls_context::has_pending_out(conn->ssl))
         return;
 
-    // Ciphertext out of the write BIO and into a buffer this connection owns.
-    // It has to be copied rather than pointed at: an SQE names an address the
-    // kernel reads at its leisure, and the BIO's storage moves under it as
-    // OpenSSL writes the next record.  Copying is also what keeps the SSL free
-    // of anything the ring can name, which is what makes the session safe to
-    // release the moment the connection is torn down.
-    //
-    // The buffer then rides in write_batch[0] like any other message, so the
-    // short-write retry and the batch release in handle_write need no
-    // TLS-specific case at all.
+    // Ciphertext copied out of the write BIO into a buffer this connection
+    // owns, because the BIO's storage moves under an SQE -- and it rides in
+    // write_batch[0] so the short-write retry needs no TLS case.
     auto cipher = std::make_shared<std::string>();
     char buf[16384];
     for (;;)
@@ -4888,10 +3953,9 @@ void server_instance::tls_flush(server_connection* conn)
                                           len, &conn->write_req)
         : m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
 
-    // Nothing reached the ring, so no completion will arrive.  Undo the
-    // in-flight bookkeeping and drop the connection, as the cleartext path
-    // does: a write_pending that never clears keeps the teardown waiting for a
-    // completion that cannot come.
+    // Nothing reached the ring, so the in-flight bookkeeping is undone and the
+    // connection dropped, because a write_pending that never clears keeps the
+    // teardown waiting.
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
@@ -4903,10 +3967,9 @@ void server_instance::tls_flush(server_connection* conn)
 
 void server_instance::flush_write_queue(server_connection* conn)
 {
-    // A TLS connection's bytes go through the record layer, which is the only
-    // thing allowed to put them on the wire.  This branch is what keeps every
-    // caller above — Lua sends, HTTP responses, WebSocket frames, cache
-    // replies — from having to know which kind of connection it is holding.
+    // A TLS connection's bytes go through the record layer, which is what
+    // keeps every caller above from having to know which kind of connection it
+    // holds.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
         tls_flush(conn);
@@ -4965,10 +4028,9 @@ void server_instance::flush_write_queue(server_connection* conn)
             queued = m_loop->submit_writev(conn->fd, conn->write_iovs, count, &conn->write_req);
     }
 
-    // Nothing reached the ring, so no write completion will arrive.  Undo the
-    // in-flight bookkeeping and drop the connection — the batch is lost either
-    // way, and a write_pending that never clears keeps the teardown waiting
-    // forever for a completion that cannot come.
+    // Nothing reached the ring, so the in-flight bookkeeping is undone and the
+    // connection dropped, because a write_pending that never clears waits
+    // forever.
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
@@ -5018,10 +4080,9 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             conn->write_batch_count = 0;
         }
         conn->closing = true;
-        // splice_cleanup() declines while a splice is armed — it closes the file
-        // fd and hands the shared pipe on, and doing that under a running splice
-        // mixes one response's bytes into the next connection's.  The splice
-        // completion does the cleanup, and the close, when it arrives.
+        // splice_cleanup() declines while a splice is armed, because closing
+        // the file and handing the pipe on mixes one response's bytes into the
+        // next connection's.
         if (conn->splice_pending || conn->splice_remaining)
             splice_cleanup(conn);
         if (!conn_ops_pending(conn))
@@ -5041,12 +4102,9 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         size_t written = static_cast<size_t>(cqe->res);
         if (written < total_submitted && SOCKETLEY_UNLIKELY(conn->wr_shutdown))
         {
-            // Our write side is already closed, so the remainder cannot be sent
-            // and retrying it would only earn an EPIPE.  maybe_shutdown_write()
-            // only fires with the queue empty and nothing in flight, so getting
-            // here means something queued more output after the FIN — a Lua
-            // send, in practice.  Drop it rather than retry a truncated
-            // response forever against a socket that will not take it.
+            // Our write side is already closed so the remainder cannot be
+            // sent, and getting here means something queued output after the
+            // FIN -- dropped rather than retried forever.
             for (uint32_t i = 0; i < conn->write_batch_count; i++)
                 conn->write_batch[i].reset();
             conn->write_batch_count = 0;
@@ -5130,23 +4188,18 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->write_batch_count = 0;
     }
 
-    // The response is on the wire and the queue behind it is empty: this is the
-    // moment our write side is finished, and the only moment at which sending
-    // the FIN cannot overtake anything.  It declines by itself if either is
-    // untrue, so it goes before the branch rather than inside one arm of it.
+    // The response is on the wire with an empty queue behind it, which is the
+    // only moment sending the FIN cannot overtake anything; it declines by
+    // itself otherwise.
     maybe_shutdown_write(conn);
 
-    // Check if more messages to send.  conn_has_output and not the queue alone:
-    // a TLS connection owes the wire the next handshake flight or a session
-    // ticket with nothing queued at all, and asking only about the queue is how
-    // a handshake stalls one round short of finishing.
+    // conn_has_output and not the queue alone, because a TLS connection owes
+    // handshake records with nothing queued at all.
     if (SOCKETLEY_LIKELY(conn_has_output(conn) && !conn->zc_notif_pending))
     {
         flush_write_queue(conn);
-        // A flush can legitimately submit nothing — a TLS connection with
-        // application data queued while the handshake is still running has
-        // output and no way to send it yet.  Without this the connection would
-        // be left closing with nothing in flight and nothing to wake it.
+        // A flush can legitimately submit nothing, and without this the
+        // connection would be left closing with nothing to wake it.
         if (SOCKETLEY_UNLIKELY(conn->closing && !conn_ops_pending(conn)))
             close_conn(conn);
     }
@@ -5160,9 +4213,9 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             m_loop->submit_splice(conn->splice_file_fd, m_splice_pipe[1], chunk, &conn->splice_in_req);
         if (SOCKETLEY_UNLIKELY(!conn->splice_in_pending))
         {
-            // Nothing reached the ring, so no completion will finish this
-            // transfer.  Give the pipe back and drop the connection rather than
-            // leave the response half-sent and the pipe marked busy for ever.
+            // Nothing reached the ring, so the pipe goes back and the
+            // connection is dropped rather than left half-sent with the pipe
+            // marked busy.
             splice_cleanup(conn);
             conn->closing = true;
             if (!conn_ops_pending(conn))
@@ -5199,12 +4252,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         return;
     }
 
-    // Read error — send 404.  A null buffer is treated as one: the caller that
-    // could produce it is guarded in handle_read, and answering 404 is what this
-    // function does with a read it cannot use.  Building the response out of it
-    // instead means std::string_view(nullptr, n), and std::string throws
-    // logic_error on that — from inside a completion handler, with no catch
-    // anywhere above it, which ends the process.
+    // Read error, answered 404, treating a null buffer the same way, because
+    // building a response out of it means std::string_view(nullptr, n) and a
+    // logic_error from inside a completion handler.
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0 || !conn->file_buf))
     {
         if (conn->file_fd >= 0) { close_tracked(conn->file_fd); conn->file_fd = -1; }
@@ -5221,24 +4271,10 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
             conn->proto = proto_unknown;
             if (!conn->read_pending)
                 submit_conn_read(conn);
-            // ─── THE ERROR ARM OWES THE SAME DEBT AS THE SUCCESS ARM ─────
-            //
-            // The invariant is about the connection, not about the outcome: if
-            // this connection deferred a parse in order to get here, a request
-            // is sitting in conn->partial and somebody has to answer it.
-            // Answering 404 to the FIRST request does not discharge that, and
-            // an arm that returns without draining leaves the client waiting on
-            // a response that will never be produced -- the exact failure this
-            // whole change exists to remove, reintroduced on the path nobody
-            // reads because it is the error path.
-            //
-            // This is why the rule is not "remember to drain after a successful
-            // response".  A rule phrased that way is one every future arm has to
-            // know about, and 15 places in this file already mean "finished, may
-            // have another" without knowing anything of the sort.  Phrased as
-            // "every arm that finishes a response drains", the omission is
-            // visible as a missing line rather than invisible as a missing
-            // thought.
+            // The error arm owes the same drain as the success arm, because
+            // the invariant is about the connection rather than the outcome --
+            // phrased as "every arm that finishes a response drains", an
+            // omission is a missing line rather than a missing thought.
             parse_partial(conn);
         }
         return;
@@ -5261,12 +4297,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         ? std::string_view(body)
         : file_content;
 
-    // A short read is served, and is deliberately NOT stored: cqe->res below
-    // st_size means the bytes in hand are not the file, and an entry built from
-    // them would be revalidated against the full size forever after and always
-    // miss -- or, worse, match if the file were later truncated to exactly
-    // this length.  Storing only a complete read keeps the map's contents and
-    // its identity describing the same thing.
+    // A short read is served and deliberately not stored, because bytes below
+    // st_size are not the file and an entry built from them would miss forever
+    // or match a later truncation.
     const bool store = !conn->file_url_path.empty() &&
                        static_cast<uint64_t>(cqe->res) ==
                            static_cast<uint64_t>(conn->file_st.st_size);
@@ -5305,21 +4338,17 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         // Resubmit socket read for next HTTP request
         if (!conn->read_pending)
             submit_conn_read(conn);
-        // Last statement -- see handle_splice_out.  Reachable here only by a
-        // client that pipelines, because on the read path the client cannot
-        // have the response before the read completes and so has no reason to
-        // have sent anything; it is the same rule all the same.
+        // Last statement, reachable here only by a client that pipelines, but
+        // the same rule all the same.
         parse_partial(conn);
     }
 }
 
 void server_instance::splice_cleanup(server_connection* conn)
 {
-    // Not while a splice is armed.  This closes the file the kernel is reading
-    // from, hands the shared pipe to the next connection and drains it — under a
-    // running splice that mixes one response into another's socket.  The
-    // completion handler calls back in once the op is really finished; until
-    // then splice_in_pending / splice_out_pending keep the connection alive.
+    // Not while a splice is armed, because this closes the file the kernel is
+    // reading from and hands the shared pipe on; the completion calls back in
+    // once the op is finished.
     if (SOCKETLEY_UNLIKELY(conn->splice_in_pending || conn->splice_out_pending))
         return;
 
@@ -5441,21 +4470,16 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
         if (!conn->read_pending)
             submit_conn_read(conn);
 
-        // Last statement, and that is the whole contract: parse_partial() can
-        // dispatch a request that arms the next splice on this same connection,
-        // so anything after it would be operating on the next response's state.
-        // The request it finds here arrived while splice_out_pending was set --
-        // the pipe->socket completion lands after the client already holds the
-        // whole response, so its next request has had time to arrive and be
-        // deferred.  That is the one the client is waiting for.
+        // Last statement, because parse_partial() can arm the next splice on
+        // this connection and anything after it would operate on the next
+        // response's state.
         parse_partial(conn);
     }
 }
 
-// One recvmsg at a time, always.  It reads into m_udp_recv->buf and writes the
-// sender into m_udp_recv->addr, both single-instance, so a second one armed
-// beside it gives the kernel two writers into the same buffer and the same
-// sockaddr: datagrams interleave and replies go to the wrong peer.
+// One recvmsg at a time always, because a second armed beside it gives the
+// kernel two writers into the same buffer and sockaddr, so replies go to the
+// wrong peer.
 void server_instance::arm_udp_recv()
 {
     if (!m_loop || m_udp_fd < 0)
@@ -5499,9 +4523,8 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     if (!msg.empty())
         process_message(nullptr, msg);
 
-    // A datagram is its own read, so this is where its cache batch goes.  Not
-    // reachable through the label in handle_read: UDP has no connection and
-    // does not go near it.
+    // A datagram is its own read, so this is where its cache batch goes: UDP
+    // has no connection and never reaches the label in handle_read.
     if (SOCKETLEY_UNLIKELY(!m_cache_store_batch.empty()))
         flush_cache_store();
 
@@ -5532,11 +4555,9 @@ bool server_instance::lua_disconnect(int client_fd)
                  ? m_conn_idx[client_fd] : nullptr;
     if (!conn || conn->closing) return false;
     conn->closing = true;
-    // SHUT_RD only: keeps the write side open so any queued message
-    // (e.g. "AUTH FAIL" sent just before disconnect) still reaches the client.
-    // If a pending read CQE exists, SHUT_RD triggers its EOF so handle_read
-    // can clean up. If no ops are pending, handle_read's submit_next_read
-    // branch handles the cleanup when it sees closing=true, write_pending=false.
+    // SHUT_RD only, keeping the write side open so a queued message still
+    // reaches the client, and triggering the pending read's EOF so handle_read
+    // can clean up.
     shutdown(client_fd, SHUT_RD);
     return true;
 }
@@ -5604,29 +4625,16 @@ bool server_instance::lua_send_to(int client_id, std::string_view msg)
     if (!m_loop || m_udp)
         return false;
 
-    // This used to try its own connection table first and fall back to the
-    // forwarded one, which is only unambiguous while the two ranges cannot
-    // overlap — and they overlap by construction the moment the two runtimes
-    // are separate processes, because both number their descriptors from zero.
-    // A forwarded id that happened to equal one of this runtime's own
-    // descriptors delivered to the wrong client, silently.
-    //
-    // The two ranges cannot meet now, so there is no order to get right:
     // send_to_client() reads which kind of id this is and asks the right
-    // runtime.
+    // runtime, because trying the local table first was unambiguous only while
+    // the two ranges could not overlap -- which they do the moment the
+    // runtimes are separate processes.
     return send_to_client(client_id, msg);
 }
 
-// The server-specific half of `stats`.  peak_connections and the upstream
-// count are computed from a connection table that lives in whichever process
-// the runtime is in, so this is the part a worker still pushes; the counters
-// above it are summed out of shared memory by whoever prints them.
-//
-// The ring lines are in stats_ring() and are pushed with this one, which is
-// what keeps them the WORKER's: they depend on the worker being told the
-// daemon's ring policy — see proxy_supervisor::spawn().  Without that, the
-// worker reported its loop's configuration rather than the daemon's: pinned by
-// an inherited affinity mask while printing cpus:max.
+// The server-specific half of `stats`, which a worker still pushes because it
+// walks a connection table, together with the ring lines -- which depend on
+// the worker being told the daemon's ring policy.
 std::string server_instance::stats_extra() const
 {
     std::ostringstream out;
@@ -5642,11 +4650,9 @@ std::string server_instance::stats_extra() const
             if (uc->connected) ++connected;
         out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n";
     }
-    // The cross-runtime request queue, and in particular what it had to throw
-    // away.  Daemon-wide rather than per-server, but this is where anyone
-    // linked to a cache will look: a `--cache` auto-store batch that could not
-    // be queued is a run of messages that are not in the cache, and a figure
-    // nobody can see is a loss nobody can act on.
+    // The cross-runtime request queue and what it had to throw away, reported
+    // here because a dropped auto-store batch is messages that are not in the
+    // cache.
     if (!get_cache_name().empty())
     {
         if (const auto* mgr = get_runtime_manager())
@@ -5670,10 +4676,8 @@ bool server_instance::route_client(int client_id, std::string_view target_name,
 {
     const auto fail = [&](const char* why) { if (err) *err = why; return false; };
 
-    // A connection that was routed *here* is not ours to route on.  It used to
-    // be indistinguishable from one of our own — both were "an int" — so this
-    // was reachable and did something incoherent: it wrote a route for a
-    // descriptor number belonging to a third runtime.
+    // A connection routed here is not ours to route on, which used to be
+    // reachable because both kinds of id were "an int".
     if (is_conn_handle(client_id))
         return fail("that connection was routed here from another runtime, so "
                     "it is not this one's to route on");
@@ -5685,24 +4689,10 @@ bool server_instance::route_client(int client_id, std::string_view target_name,
     auto* mgr = get_runtime_manager();
     if (!mgr) return fail("this runtime has no runtime manager");
 
-    // Our own bookkeeping first, the notification second.  accept_routed runs
-    // the target's on_connect, and a script is allowed to answer that by
-    // closing the connection — which frees the struct m_conn_idx[client_id]
-    // points at.  Touching that pointer afterwards would be a read of a pooled
-    // connection at best.
-    //
-    // The two pre-checks that used to stand here — get(target_name), then
-    // as_server() — have moved INTO route_relay::open, and with them the case
-    // they could not decide.  In a worker every other runtime is a replica, so
-    // as_server() answered null for a target that exists and is perfectly
-    // reachable, and this returned false having touched nothing.  In the daemon
-    // it answered the target's PLACEHOLDER, and the route was written into an
-    // object with no connections and reported as made.
-    //
-    // What that costs here is that a bad target is now discovered after the two
-    // lines below rather than before them, so it takes the rollback path.  That
-    // path was written to be taken and is safe to take: it resolves by serial
-    // precisely because it must not trust a descriptor number.
+    // Our own bookkeeping first and the notification second, because
+    // accept_routed runs the target's on_connect and a script may close the
+    // connection -- and the two pre-checks moved into route_relay::open, which
+    // decides the case as_server() could not.
     m_routes[ref.serial] = std::string(target_name);
     m_conn_idx[client_id]->routed = true;
 
@@ -5711,9 +4701,8 @@ bool server_instance::route_client(int client_id, std::string_view target_name,
         return true;
     if (err) *err = std::move(route_err);
 
-    // Refused.  Undo, and find the connection by name rather than by the
-    // descriptor we were given: nothing ran in between here, but the rule that
-    // a descriptor is not an identity does not get suspended for rollback.
+    // Refused, so undo and find the connection by name, because the rule that
+    // a descriptor is not an identity is not suspended for rollback.
     m_routes.erase(ref.serial);
     if (auto it = m_conn_by_serial.find(ref.serial); it != m_conn_by_serial.end())
     {
@@ -5737,9 +4726,8 @@ bool server_instance::unroute_client(int client_id)
     if (it == m_routes.end()) return false;
 
     // Everything read out of the map and the map left consistent before
-    // anything else is called.  release_routed runs the target's on_disconnect,
-    // a script may answer that by unrouting again, and a second pass through
-    // here holding `it` would be using an erased iterator.
+    // anything else is called, because release_routed runs on_disconnect and a
+    // script may unroute again.
     const std::string target_name = it->second;
     m_routes.erase(it);
     m_conn_idx[client_id]->routed = false;
@@ -5760,13 +4748,8 @@ std::string_view server_instance::get_client_route(int client_id) const
     return it->second;
 }
 
-// Whether the bytes were handed to a connection.
-//
-// It was void, and every `return;` below was a message that went nowhere with
-// nothing said: a handle naming a connection that has since gone, an origin
-// runtime that has stopped, a descriptor that is not a connection, a
-// connection already closing.  self.send() reported none of them because it
-// had nothing to report with.
+// Whether the bytes were handed to a connection, which was void, so
+// self.send() reported none of the four ordinary refusals.
 bool server_instance::send_to_client(int client_id, std::string_view msg)
 {
     // A handle names a connection that lives somewhere else, so the write is
@@ -5778,34 +4761,23 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
         const conn_ref ref = it->second.ref;
 
         // ─── A sibling shard of THIS runtime ────────────────────────────────
-        //
-        // Checked before the manager, because the manager cannot answer it: in
-        // a worker every other runtime is a replica with no connections, and
-        // this runtime's own name resolves to the copy in THIS process — which
-        // does not hold the connection either.  What names the holder is the
-        // ref itself: same owner as ours, a different shard in its top six
-        // bits.  See conn_identity.h.
+        // Checked before the manager, because in a worker every other runtime
+        // is a replica and this runtime's own name resolves to the copy --
+        // what names the holder is the ref's own shard bits.
         if (ref.owner == owner_key()
             && conn_ref_shard(ref) != get_shard_index()
             && has_ref_sink())
         {
             send_to_ref(ref, msg);
-            // Queued, which is what "sent" means on this path everywhere else
-            // in this file — the in-process branch below says so in its own
-            // words.  What has been established is that the id named a
-            // connection this runtime has; whether the far shard still has it
-            // is answered there, by write_to_ref, exactly as it would be here.
+            // Queued, which is what "sent" means everywhere else here: what is
+            // established is that the id named a connection this runtime has.
             return true;
         }
 
-        // ─── ANOTHER RUNTIME'S CONNECTION, ROUTED HERE ──────────────────────
-        //
         // The eighth site of the same shape, and the one that made the feature
-        // look half-built: with the other seven moved to route_relay a routed
-        // client's on_connect fired, its messages arrived and owner_send got
-        // back to it, but `self.send(handle, msg)` -- the ordinary way a script
-        // answers -- still resolved the origin through as_server() and found a
-        // replica.  So the sub-server was reachable and could not reply.
+        // look half-built: a routed client could be reached and could not
+        // reply, because self.send resolved the origin through as_server() and
+        // found a replica.
         return route_relay::write(get_runtime_manager(), it->second.origin,
                                   get_name(), ref, msg);
     }
@@ -5820,21 +4792,17 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
     auto shared = std::make_shared<const std::string>(std::move(buf));
     send_to(conn, shared);
-    // Queued, which is what "sent" means on an async write path everywhere else
-    // in this file.  send_to() can still close the connection for exceeding the
-    // write-queue bound, and that is reported by the connection going away
-    // rather than by this call.
+    // Queued, which is what "sent" means on an async write path here, with a
+    // connection closed for exceeding the write-queue bound reported by the
+    // connection going away.
     return true;
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)
 {
-    // Resolved through what was actually routed here, not through get_owner()
-    // and a number.  The old form took any integer, looked up the configured
-    // owner, and wrote into that runtime's connection table at that index — so
-    // a sub-server could write to any of the owner's clients, including the one
-    // that had inherited the descriptor number of the client this id used to
-    // name.  A handle that names nothing here now answers false.
+    // Resolved through what was actually routed here rather than through
+    // get_owner() and a number, because the old form let a sub-server write to
+    // any of the owner's clients.
     auto it = m_forwarded.find(client_id);
     if (it == m_forwarded.end())
         return false;
@@ -5850,9 +4818,8 @@ int server_instance::accept_routed(const conn_ref& ref, std::string_view origin_
     if (!ref.valid())
         return -1;
 
-    // Idempotent.  A route asked for twice is one route, and answering with the
-    // handle already in use means a caller that lost the first answer can ask
-    // again — which is what a retry over a socket looks like.
+    // Idempotent, because a route asked for twice is one route and answering
+    // with the handle already in use is what a retry over a socket looks like.
     if (auto it = m_forwarded_by_ref.find(ref); it != m_forwarded_by_ref.end())
         return it->second;
 
@@ -5863,10 +4830,8 @@ int server_instance::accept_routed(const conn_ref& ref, std::string_view origin_
     m_forwarded.emplace(handle, forwarded_client{ref, std::string(origin_name)});
     m_forwarded_by_ref.emplace(ref, handle);
 
-    // The script hears about a client, and the integer it is handed is one it
-    // can hand back — to owner_send, to send_to, to anything taking a client
-    // id.  What it cannot do is collide with one of this runtime's own
-    // descriptors, which is what used to make the two indistinguishable.
+    // The script hears about a client and gets an integer it can hand back,
+    // which cannot collide with one of this runtime's own descriptors.
     invoke_on_connect(handle);
     return handle;
 }
@@ -5879,12 +4844,9 @@ void server_instance::release_routed(const conn_ref& ref)
 
     const int handle = it->second;
 
-    // The name goes first, so a second release for the same connection — which
-    // is what an origin retrying, or a script unrouting from inside its own
-    // on_disconnect, looks like — finds nothing and does not fire the callback
-    // twice.  The handle stays resolvable across the callback, so a script that
-    // answers a disconnect by writing gets a clean false out of write_to_ref
-    // rather than a lookup into an empty table.
+    // The name goes first so a second release finds nothing and does not fire
+    // the callback twice, while the handle stays resolvable across it so a
+    // script that writes gets a clean false.
     m_forwarded_by_ref.erase(it);
     invoke_on_disconnect(handle);
     m_forwarded.erase(handle);
@@ -5892,11 +4854,9 @@ void server_instance::release_routed(const conn_ref& ref)
 
 void server_instance::forget_runtime(std::string_view gone)
 {
-    // Collected before anything is released.  release_routed runs the script's
-    // on_disconnect, and a script is entitled to answer that by unrouting, by
-    // closing a connection, or by removing a runtime -- any of which mutates
-    // the two containers being walked.  This is the same rule unroute_client
-    // states one screen down and the same one the teardown loops follow.
+    // Collected before anything is released, because release_routed runs
+    // on_disconnect and a script may unroute, close or remove, any of which
+    // mutates the containers being walked.
     std::vector<conn_ref> incoming;
     for (const auto& [handle, fc] : m_forwarded)
     {
@@ -5907,12 +4867,9 @@ void server_instance::forget_runtime(std::string_view gone)
     for (const auto& ref : incoming)
         release_routed(ref);
 
-    // The other direction: routes this runtime made TO the departed one.  Not
-    // sent anywhere -- there is nobody left to tell -- so the entry and the
-    // cached flag on the connection go together.  Leaving the flag set is the
-    // defect drop_route's own comment describes: the read path keeps taking the
-    // routed branch, finding nothing, and falling through, once per message for
-    // the rest of the connection's life.
+    // The other direction, sent nowhere because there is nobody left to tell,
+    // with the entry and the cached flag dropped together -- a set flag makes
+    // the read path take the routed branch once per message forever.
     std::vector<uint64_t> outgoing;
     for (const auto& [serial, target] : m_routes)
         if (target == gone)
@@ -5934,10 +4891,8 @@ void server_instance::deliver_routed(const conn_ref& ref, std::string_view msg)
 
 bool server_instance::write_to_ref(const conn_ref& ref, std::string_view msg)
 {
-    // Someone else's name for one of our connections.  Three things have to
-    // hold and the descriptor version checked none of them: that the name is
-    // ours to resolve at all, that it still resolves, and that what it resolves
-    // to is the same connection it named when it was minted.
+    // Someone else's name for one of our connections, where three things have
+    // to hold and the descriptor version checked none of them.
     if (!ref.valid() || ref.owner != owner_key())
         return false;
 
@@ -5970,10 +4925,8 @@ void server_instance::drop_route(const conn_ref& ref)
     if (m_routes.erase(ref.serial) == 0)
         return;
 
-    // And the cached flag on the connection itself, which the previous version
-    // of this cleanup left set: the read path then took the routed branch on
-    // every message, found nothing, and fell through — a lookup per message for
-    // the rest of the connection's life, for a route that no longer existed.
+    // And the cached flag on the connection, which the previous cleanup left
+    // set, costing a lookup per message for a route that no longer existed.
     auto it = m_conn_by_serial.find(ref.serial);
     if (it == m_conn_by_serial.end())
         return;
@@ -5985,10 +4938,8 @@ void server_instance::drop_route(const conn_ref& ref)
 
 int server_instance::alloc_handle()
 {
-    // Handles are 32-bit and start high, so the counter has about two billion
-    // routes in it before it runs out.  A daemon that reaches that is still
-    // owed a correct answer rather than a negative handle that would read as
-    // "not a handle" everywhere it is tested.
+    // Handles are 32-bit and start high, so a daemon that exhausts two billion
+    // routes is still owed a correct answer rather than a negative handle.
     for (int tries = 0; tries < 1024; ++tries)
     {
         if (m_next_handle < conn_handle_base)
@@ -6009,10 +4960,8 @@ bool server_instance::owner_broadcast(std::string_view msg)
     if (!mgr) return false;
 
     // The one site of the nine reachable in a worker without a routed
-    // connection: a runtime's owner is a name it was created with, and a worker
-    // now holds a replica of every name in the daemon.  Before as_server() this
-    // found nothing at all out there and answered false; with the replica map
-    // and the old cast it would have run server_instance's code over a replica.
+    // connection, because a runtime's owner is a name and a worker now holds a
+    // replica of every name.
     auto* parent = mgr->get(owner_name);
     if (!parent) return false;
 
@@ -6026,18 +4975,9 @@ bool server_instance::owner_broadcast(std::string_view msg)
         return true;
     }
 
-    // Out of process.  It addresses a RUNTIME rather than one connection, so
-    // it is the one routing verb with no conn_ref -- but it is a routing verb,
-    // and the first draft of this sent it as a `deliver` instead.  Measured:
-    // an owner created `--mode in` received the frame and dropped it, because
-    // deliver honours that flag and must, while the in-process call had always
-    // gone straight to lua_broadcast().  `--mode in` says whether
-    // socketley.send reaches a runtime; it does not say a sub-server may not
-    // answer the clients that were routed from it.
-    //
-    // The gap it closes predates this branch either way: as_server() answered
-    // null for a parent that is merely elsewhere, and owner_broadcast returned
-    // false having reached nobody, for every runtime since 2313c26.
+    // Out of process it addresses a runtime rather than a connection, and it
+    // is a routing verb rather than a `deliver`, because deliver honours
+    // `--mode in` and dropped it for an owner created that way.
     return route_relay::broadcast(mgr, owner_name, get_name(), msg);
 }
 
@@ -6060,17 +5000,10 @@ int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
 
 // ─── Lua client enumeration ───
 
-// Every client of this RUNTIME, not of this process.
-//
-// The descriptors this shard owns come back unchanged, because every script in
-// existence treats them as opaque and they are what on_connect handed out.  A
-// sibling's client has no descriptor here to be, so it comes back as a handle
-// out of conn_identity.h's reserved range — the same mechanism a client routed
-// in from another runtime already uses, and the reason that range exists.
-//
-// Not const any more: a handle for a sibling's connection is minted the first
-// time it is asked for and kept, so the same client is the same number to a
-// script that calls this twice.
+// Every client of this runtime and not of this process, with a sibling's
+// client returned as a handle out of conn_identity.h's reserved range --
+// minted once and kept, so the same client is the same number to a script that
+// calls twice.
 std::vector<int> server_instance::lua_clients()
 {
     if (!shard_clients_table().mapped())
@@ -6080,10 +5013,9 @@ std::vector<int> server_instance::lua_clients()
     const bool complete = shard_clients_table().read_others(foreign, shard_clients_table().index());
     if (!complete)
     {
-        // A block that could not be read within its retry bound.  Said out
-        // loud: a script handed a short list with no indication is exactly the
-        // failure this whole step exists to remove, and the alternative to
-        // saying so is becoming the thing being fixed.
+        // A block that could not be read within its retry bound, said out
+        // loud, because a script handed a short list with no indication is the
+        // failure this step exists to remove.
         LOG_WARN(("self.clients() on " + std::string(get_name())
                   + " could not read one shard's client list; the list below "
                     "is missing it").c_str());
@@ -6101,13 +5033,9 @@ std::vector<int> server_instance::lua_clients()
         out.push_back(handle_for_sibling_ref(r));
     }
 
-    // Handles for siblings' connections that have since gone.  Pruned here
-    // rather than never, because m_forwarded would otherwise grow for the life
-    // of the runtime — one entry per connection any sibling ever accepted.
-    //
-    // Only the ones minted HERE: an entry whose origin is another runtime
-    // belongs to route(), which owns its own lifetime, and dropping one of
-    // those would unroute a client nobody asked to unroute.
+    // Handles for siblings' connections that have gone, pruned here or
+    // m_forwarded grows for the life of the runtime -- and only the ones
+    // minted here, because route() owns its own lifetime.
     for (auto it = m_forwarded.begin(); it != m_forwarded.end();)
     {
         if (it->second.origin == get_name() && live.find(it->second.ref) == live.end())
@@ -6122,13 +5050,9 @@ std::vector<int> server_instance::lua_clients()
     return out;
 }
 
-// A stable local number for a connection a sibling shard owns.
-//
-// Stable is the whole point: a script that calls self.clients() twice and
-// compares must get the same number for the same client, or every id it stores
-// is worthless.  m_forwarded_by_ref is what makes it stable, and it is the same
-// table route() uses — the origin is this runtime's own name, which is what
-// tells the two apart when one is pruned and the other is not.
+// A stable local number for a connection a sibling shard owns, because a
+// script that calls self.clients() twice and compares must get the same number
+// for the same client.
 int server_instance::handle_for_sibling_ref(const conn_ref& r)
 {
     if (const auto it = m_forwarded_by_ref.find(r); it != m_forwarded_by_ref.end())
@@ -6142,13 +5066,9 @@ int server_instance::handle_for_sibling_ref(const conn_ref& r)
     return h;
 }
 
-// How many of the named connections the message was queued to.
-//
-// Ids that name nothing are still skipped, as they always were — what changes
-// is that the caller is told how many were skipped rather than having to
-// assume none were.  A malformed LIST is refused by the binding before this is
-// reached; this count is about ids that were well-formed and stale, which is
-// ordinary and not an error.
+// How many of the named connections the message was queued to, so the caller
+// is told how many stale ids were skipped rather than having to assume none
+// were.
 size_t server_instance::lua_multicast(const std::vector<int>& fds, std::string_view msg)
 {
     if (!m_loop || m_udp) return 0;
@@ -6249,12 +5169,9 @@ bool server_instance::lua_leave_group(int fd, std::string_view group)
     return true;
 }
 
-// How many connections the message was queued to.
-//
-// A count and not a bool, because the interesting failure is not "no such
-// group" — it is "the group exists and has nobody left in it", which is what a
-// misspelled group name looks like the moment its last real member leaves.
-// Zero says that; a bool cannot.
+// A count and not a bool, because the interesting failure is a group that
+// exists and has nobody left in it, which is what a misspelled group name
+// looks like.
 size_t server_instance::lua_group_send(std::string_view group, std::string_view msg)
 {
     if (!m_loop) return 0;
@@ -6327,11 +5244,9 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
     if (host.empty() || port == 0)
         return false;
 
-    // Resolve the endpoint once and keep it.  Two things matter here: a literal
-    // address needs no resolver at all, and a name that has been resolved once
-    // must not be looked up again on every reconnect.  Both lookups happen on
-    // the event loop thread, where they stall everything else this runtime is
-    // serving for as long as the resolver takes.
+    // Resolve the endpoint once and keep it, because a literal address needs
+    // no resolver and a name looked up on every reconnect stalls everything
+    // this runtime serves.
     if (!uc->has_cached_addr)
     {
         struct sockaddr_in addr{};
@@ -6526,25 +5441,10 @@ submit_next:
     }
 }
 
-// ─── UPSTREAMS ARE OUTSIDE THE CHOKEPOINT, AND THIS IS WHY ──────────────────
-//
-// The guard below is the same shape as the one on the client side that stranded
-// a connection: mark closing, then defer the teardown to an armed read.  It is
-// nevertheless left alone, and finish_unreachable_conn() cannot reach it anyway
-// — an upstream's fd lives in m_upstream_by_fd, never in m_conn_idx, which is
-// the only table that function looks in.
-//
-// That is a decision rather than an oversight, and it rests on the same property
-// that excuses the proxy and the client: an upstream read is armed with
-// submit_read(uc->fd, ...) — SINGLE-SHOT, on the DESCRIPTOR, never multishot and
-// never on a fixed-file index.  So close_fd() can withdraw it and the socket's
-// own error reaches it, which is exactly what a fixed-index multishot recv on an
-// accepted client cannot promise.  See shared/conn_reachability.h.
-//
-// NOT MEASURED.  Unlike the proxy and the client, no storm was aimed at an
-// upstream, so this rests on the structural argument alone.  A reproducer would
-// move it, and the chokepoint would then have to grow a second table lookup
-// rather than a second copy of the rule.
+// Upstreams are outside the reachability chokepoint deliberately, because an
+// upstream read is single-shot on the descriptor and close_fd() can withdraw
+// it -- but this rests on the structural argument alone and was never
+// measured.
 void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc)
 {
     uc->write_pending = false;
@@ -6562,13 +5462,9 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
 
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
-    // Short write handling: resubmit remaining bytes.
-    //
-    // The batch used to be released on any positive result, so a kernel that
-    // took part of it dropped the rest — the upstream then read a truncated
-    // message with the next one appended to it, and every message after that
-    // was misframed. The client path a few hundred lines up already did this;
-    // upstream connections go through the same writev and need the same care.
+    // Short write handling, because releasing the batch on any positive result
+    // dropped the rest and the upstream read a truncated message with the next
+    // one appended.
     if (uc->write_batch_count > 0)
     {
         size_t total_submitted = 0;
