@@ -26,51 +26,31 @@
 namespace
 {
 
-// The descriptor the child finds its control socket on.  Fixed rather than
-// passed in argv so there is nothing to parse and nothing to get wrong: the
-// child's very first action can be a read.
+// The descriptor the child finds its control socket on, fixed rather than
+// passed in argv so its very first action can be a read.
 constexpr int child_control_fd = 3;
 
-// The shared aggregation table, for a runtime that has one.  Four rather than
-// three for the reason three is three: a fixed number both sides agree on
-// without negotiating, immediately after the control socket, and below anything
-// the worker opens for itself.  A child of an unsharded runtime never has this
-// descriptor at all, and the worker treats its absence as "not sharded" rather
-// than as an error — see proxy_worker's on_config.
+// The shared aggregation table for a runtime that has one, at a fixed number
+// both sides agree on, whose absence a worker reads as "not sharded" rather
+// than as an error.
 constexpr int child_shard_fd = 4;
 
-// And the client-list region; see shard_clients.h.  Five for the reason four is
-// four.
+// And the client-list region, at five for the reason four is four.
 constexpr int child_clients_fd = 5;
 
-// The map socket: the child's half of the control plane, where
-// socketley.create/.start/.stop/.remove go and where their answers come back.
-// Six for the reason five is five, and separate from the control socket at 3
-// for the reason set out at proxy_supervisor::set_map_handler — a worker has to
-// BLOCK for these answers, and the control socket is the one descriptor in that
-// process it cannot block on.
-//
-// A child that finds nothing here keeps the refusals it always had: the worker
-// tests the descriptor rather than being told about it, so a new worker under
-// an old daemon degrades to the previous behaviour instead of hanging.
+// The map socket, separate from the control socket because a worker has to
+// block for these answers, and tested rather than announced so a new worker
+// under an old daemon degrades to its old refusals instead of hanging.
 constexpr int child_map_fd = 6;
 
-// And the shard mesh: one descriptor per SIBLING, at a fixed slot per sibling
-// index.  Eight rather than six so there is room between the single-purpose
-// descriptors above and a block whose width is the shard count.
-//
-// Slot j is the link to shard j, so shard i has nothing at slot i and both
-// sides do the same arithmetic — which is none.  A child of an unsharded
-// runtime, or of one whose mesh was not built, finds no descriptor at any of
-// them and relays through the daemon, which is the route that always exists.
-// See shared/shard_mesh.h.
+// And the shard mesh, one descriptor per sibling at slot j for shard j, so
+// both sides do the same arithmetic and a child that finds none relays through
+// the daemon.
 constexpr int child_mesh_base = 8;
 
-// A child that dies immediately and repeatedly is not going to be fixed by
-// forking it again — a bad port, a backend that cannot be resolved, a Lua
-// script that throws.  After this many restarts inside the window the runtime
-// is left `failed` so the operator sees it rather than watching the daemon
-// fork in a loop.
+// A child that dies immediately and repeatedly is not fixed by forking it
+// again, so after this many restarts inside the window the runtime is left
+// `failed`.
 constexpr unsigned restart_burst_limit  = 5;
 constexpr auto     restart_burst_window = std::chrono::seconds(10);
 
@@ -96,23 +76,9 @@ proxy_supervisor::proxy_supervisor(runtime_instance* placeholder, std::string ex
 
 proxy_supervisor::~proxy_supervisor()
 {
-    // Three things outlive a supervisor and all three can be holding it: the
-    // placeholder keeps it as its sink override, and the channel keeps it as a
-    // sink and — since a worker can ask as well as answer — as an origin.  A
-    // supervisor dies whenever its runtime is stopped while the runtime itself
-    // stays in the map, so this is an ordinary event, not a shutdown-only one.
-    //
-    // The sink table only holds running runtimes, which is what has kept the
-    // override from being dereferenced after the fact so far.  That is a
-    // property of another file's filter, not of this one, and it is not worth
-    // depending on.
-    //
-    // A backstop now rather than the real severance: retire() does this while
-    // the placeholder is still known to be alive, and nulls both pointers, so
-    // on every path that goes through it these two blocks are skipped.  They
-    // stay for a supervisor destroyed without ever being retired — one that
-    // failed to spawn and is dropped on the spot — which has nothing in the
-    // ring and nothing to wait for.
+    // A backstop for a supervisor destroyed without ever being retired, since
+    // retire() gives up the placeholder and the channel while both are still
+    // known to be alive.
     if (m_placeholder)
         m_placeholder->set_request_sink_override(nullptr);
     if (m_channel)
@@ -122,18 +88,10 @@ proxy_supervisor::~proxy_supervisor()
     }
     shutdown();
 
-    // After shutdown(), which closes the socket and cancels the arm with it.
-    // The registration is what makes the loop drop a completion that is still
-    // on its way for this handler, so it is given back last.
-    //
-    // Giving it back is NOT what makes this safe, and it never was.  A dropped
-    // completion is still a completion: the loop reads the owner token out of
-    // the io_request to decide whether to drop it, and m_poll_req is a member
-    // of this object, so that read lands in the storage the delete below is
-    // about to release.  retire() is the call that makes the wait possible, and
-    // reaching it first is what leaves nothing here to be found.
-    // Destroying a supervisor without it — through m_loop still being set at
-    // this point — is the path that used to abort the daemon.
+    // After shutdown(), and giving the registration back is not what makes
+    // this safe: a dropped completion still reads the owner token out of
+    // m_poll_req, which is a member of the object being freed, so reaching
+    // retire() first is what leaves nothing to be found.
     if (m_loop)
         m_loop->deregister_owner(this);
 }
@@ -148,17 +106,9 @@ void proxy_supervisor::set_event_loop(event_loop* loop)
 uint32_t proxy_supervisor::retire()
 {
     // The three holders the destructor lists, given up at the moment they are
-    // all still known to exist.  The destructor is no longer that moment: it
-    // runs whenever the ring finishes, and cmd_remove frees the placeholder a
-    // few statements after retiring the supervisor for it — so a destructor
-    // clearing the override then reads a runtime_instance that is gone.
-    //
-    // Dropping the channel registrations here is the same argument in the other
-    // direction.  Between retirement and the free this object still answers to
-    // its name in the sink table, with a control socket that is closed and a
-    // child that has been signalled; a request routed to it in that window
-    // could only fail, and a caller would be told the write failed rather than
-    // that the runtime is gone.
+    // all still known to exist, because the destructor now runs whenever the
+    // ring finishes and cmd_remove frees the placeholder a few statements
+    // after retiring.
     if (m_placeholder)
     {
         m_placeholder->set_request_sink_override(nullptr);
@@ -171,16 +121,9 @@ uint32_t proxy_supervisor::retire()
         m_channel = nullptr;
     }
 
-    // Nothing may be delivered to this object once it is retired, and these are
-    // the holders that are not a pointer somebody else keeps — they are
-    // std::functions this object owns, capturing the handler that is about to
-    // put it in the quarantine.
-    //
-    // All three, not just the publish.  A retired supervisor still has whatever
-    // its child sent before the socket closed sitting in m_in, and ingest() can
-    // still walk it: a `deliver_to` would route a send for a runtime that is on
-    // its way out, and a stats frame would ask the daemon to rebuild and
-    // republish the runtime map on behalf of a child it no longer supervises.
+    // All three handlers, not just the publish, because a retired supervisor
+    // still has whatever its child sent sitting in m_in and ingest() can still
+    // walk it.
     m_on_publish = nullptr;
     m_on_deliver = nullptr;
     m_on_send_ref = nullptr;
@@ -190,20 +133,16 @@ uint32_t proxy_supervisor::retire()
     if (!m_loop)
         return 0;
 
-    // Cancel the arm and let the descriptor go.  The whole point of the token
-    // below is to wait out what is still in the ring, so submitting the
-    // withdrawal before asking is what makes the count able to reach zero at
-    // all — an arm nobody asked back never reports.
+    // Cancel the arm and let the descriptor go, because an arm nobody asked
+    // back never reports and the count would never reach zero.
     close_control();
 
     event_loop* const loop = m_loop;
     const uint32_t    tok  = m_owner_token;
 
-    // Cleared before the deregistration and never set again.  m_loop is what
-    // arm_control_poll() tests, so this is what stops a late poll() or
-    // flush_control() from putting this object back in the ring behind the
-    // quarantine's back — which would restart the wait the caller has already
-    // begun, on a count it has already read.
+    // Cleared before the deregistration and never set again, which stops a
+    // late arm putting this object back in the ring behind the quarantine's
+    // back.
     m_loop        = nullptr;
     m_owner_token = 0;
 
@@ -220,9 +159,8 @@ void proxy_supervisor::arm_control_poll()
     m_poll_req   = { this, nullptr, m_control_fd, 0, op_poll };
     m_poll_armed = m_loop->submit_poll_add(m_control_fd, m_poll_mask, &m_poll_req);
 
-    // Not an error worth failing the runtime over: the health tick still drains
-    // this socket, so a refused arm costs latency and nothing else.  Said out
-    // loud because that latency is two seconds and somebody will measure it.
+    // Not worth failing the runtime over, since the health tick still drains
+    // this socket, but said out loud because that latency is two seconds.
     if (!m_poll_armed)
         LOG_WARN("proxy supervisor: could not arm the control socket; its "
                  "replies now wait for the health tick");
@@ -233,10 +171,9 @@ void proxy_supervisor::disarm_control_poll()
     if (!m_loop)
         return;
 
-    // Cancel first, then let the loop drop whatever still reports: an armed
-    // poll names a descriptor this class is about to close, and a completion
-    // that arrives after the close would carry a token for an fd that may
-    // already belong to somebody else.
+    // Cancel first and let the loop drop whatever still reports, or a
+    // completion arriving after the close carries a token for an fd that may
+    // belong to somebody else.
     if (m_poll_armed)
     {
         if (!m_loop->submit_poll_remove(&m_poll_req)) {}
@@ -246,34 +183,27 @@ void proxy_supervisor::disarm_control_poll()
 
 void proxy_supervisor::on_cqe(struct io_uring_cqe* cqe)
 {
-    // ── Which of the two descriptors reported ───────────────────────────────
-    //
-    // By the address of the request and not by the op type, which is the rule
-    // proxy_worker states from the other side: both of these are op_poll, so a
-    // type tells them apart exactly as well as a coin would.  This used to
-    // ignore the completion entirely, which was correct while there was one
-    // thing to ignore it for.
+    // Which of the two descriptors reported, by the address of the request and
+    // not the op type, since both are op_poll.
     if (static_cast<io_request*>(io_uring_cqe_get_data(cqe)) == &m_map_poll_req)
     {
         m_map_armed = false;
         poll_map();
 
-        // Only if poll_map() did not close it.  A worker that has gone leaves
-        // its end at EOF, and re-arming there is a poll that reports readable
-        // for ever on a descriptor with nothing behind it.
+        // Only if poll_map() did not close it, because re-arming on a worker's
+        // EOF is a poll that reports readable for ever.
         arm_map_poll();
         return;
     }
 
-    // Whatever the result, this arm is spent.  Cleared before the drain so a
-    // frame that causes a write back into this socket can re-arm rather than
-    // queue behind an arm that has already reported.
+    // Whatever the result this arm is spent, cleared before the drain so a
+    // frame that writes back can re-arm rather than queue behind one that has
+    // reported.
     m_poll_armed = false;
     m_poll_mask  = 0;
 
-    // The backlog first: whatever the poll reported, the socket may have room
-    // now, and a request waiting in m_out is somebody's answer not yet asked
-    // for.  flush_control() re-arms with the mask the backlog calls for.
+    // The backlog first, because the socket may have room now and a request
+    // waiting in m_out is somebody's answer not yet asked for.
     flush_control();
 
     // Errors included: a poll that reports POLLHUP or an error is exactly the
@@ -284,57 +214,16 @@ void proxy_supervisor::on_cqe(struct io_uring_cqe* cqe)
     arm_control_poll();
 }
 
-// Through the loop, not ::close(), and the tension in that is worth writing
-// down because it looks like a reason not to.
-//
-// The rule first: a descriptor the ring may still name is not the caller's to
-// close.  An SQE carries a descriptor NUMBER that the kernel resolves when it
-// consumes the SQE — under SQPOLL on another thread, at a moment nothing here
-// observes — so closing between submission and consumption does not withdraw
-// the operation, it redirects it onto whatever inherits the number.  This class
-// arms exactly one thing on this descriptor, the readability poll above, and
-// disarm_control_poll() asks for it back — but a cancel is itself an SQE naming
-// the same number, and the poll it cancels is still owed one completion when
-// this line runs.  So there was a window here, and the number it hands away is
-// the one the NEXT worker's socketpair is most likely to be given.
-//
-// What it cost is smaller than the proxy's version of the same bug: a poll
-// watches, it does not read, so a redirected arm reports somebody else's
-// readability rather than putting bytes in the wrong stream, and the completion
-// is dropped for a deregistered owner.  Small is not none, and it is the same
-// mistake — the one this project has paid for more than once.
-//
-// The argument against was that shutdown() needs this close to be immediate: it
-// is the backstop that makes a worker which never reads its `shutdown` frame
-// see EOF and exit.  close_fd() holds the number while the ring still owes
-// something for it, so the peer does not see EOF until it lets go.
-//
-// That argument does not survive being measured against what close_fd()
-// actually holds for.  The wait is one turn of the loop, not an open-ended one:
-// the poll has just been cancelled, its -ECANCELED lands on the next drain, and
-// disarm() closes the descriptor from there.  In the commonest case — this
-// being called from inside the poll's own completion, on the read of zero bytes
-// that says the child is gone — it is not even a turn, because the loop disarms
-// as soon as this handler returns.  And EOF is not the only thing on that path:
-// shutdown() sends SIGTERM on the next line, and reap_orphan_workers() escalates
-// to SIGKILL five seconds later.  A worker wedged badly enough to need the EOF
-// is not going to notice a delay measured in microseconds.
-//
-// So the ownership rule wins on its own terms, and the immediacy requirement is
-// still met.  m_loop may be null for a supervisor that never had one, and there
-// is nothing to protect against then.
+// Through the loop and not ::close(), because a descriptor the ring may still
+// name is not the caller's to close -- and the immediacy shutdown() needs is
+// still met, since the cancel's -ECANCELED lands on the next drain and SIGTERM
+// follows on the next line.
 void proxy_supervisor::close_control()
 {
-    // Here rather than at the call sites, and the note below says why that
-    // matters: this is reached from 8 places, and an invariant every one of
-    // them has to remember is one the ninth will not.  The two descriptors have
-    // exactly one lifetime between them — they are two halves of the link to
-    // ONE child — so a child whose control socket is gone has no map socket
-    // worth keeping either.
-    //
-    // Not the converse: poll_map() closes the map socket on its own EOF and
-    // leaves the control socket standing, because that EOF is how an ordinary
-    // worker exit is first seen and the control socket is what reports it.
+    // Here rather than at the eight call sites, because the two descriptors
+    // have one lifetime between them -- though not the converse, since
+    // poll_map() closes on its own EOF and leaves the control socket to report
+    // it.
     close_map();
 
     if (m_control_fd >= 0)
@@ -346,35 +235,18 @@ void proxy_supervisor::close_control()
             ::close(m_control_fd);
         m_control_fd = -1;
 
-        // The outbound backlog dies with the socket it was addressed to.  Kept,
-        // it is written to the NEXT child ahead of that child's own config —
-        // frames a restarted worker parses as if they were meant for it.
-        //
-        // This is the chokepoint rather than the call sites because it has to
-        // be: close_control() is reached from 8 places and not one of them
-        // cleared m_out, while the only m_out.clear() in the file is the
-        // compaction below, which runs when the buffer is already empty.
-        //
-        // m_in deliberately does NOT go with it.  Two of those 8 sites are the
-        // read loop closing on EOF or error and then breaking to ingest(m_in) —
-        // bytes read before the child went away are complete frames and are
-        // still owed.  The two explicit m_in.clear() calls stay where they are:
-        // they sit at the points where the input is known garbage (a malformed
-        // frame) or the child has been reaped for good.
+        // The outbound backlog dies with the socket it was addressed to, or it
+        // is written to the next child ahead of that child's own config; m_in
+        // deliberately does not go with it, because bytes read before the
+        // child went away are complete frames still owed.
         m_out.clear();
         m_out_off = 0;
     }
 }
 
-// The same rule for the map socket, and a shorter body because this descriptor
-// carries no backlog: nothing is ever queued for it — answer_map_request()
-// writes straight through — so there is nothing here that could survive into a
-// restarted child's socket.
-//
-// m_map_in goes with it, unlike m_in above.  A partial map REQUEST from a child
-// that has gone is not a frame anybody is still owed: the only thing on the
-// other end of one is a worker blocked on the answer, and that worker is the
-// process that just died.
+// The same rule for the map socket, shorter because nothing is ever queued for
+// it, and m_map_in goes with it since the only thing waiting on a partial
+// request is the process that just died.
 void proxy_supervisor::close_map()
 {
     if (m_map_fd >= 0)
@@ -417,24 +289,17 @@ void proxy_supervisor::disarm_map_poll()
     }
 }
 
-// Whatever the child has asked for, handed on to be answered LATER.
-//
-// Nothing here decides anything: the handler is daemon_handler's, it queues the
-// request and returns, and the answer is written on a later turn of the loop.
-// That deferral is not a nicety — `socketley.remove` of this worker's own
-// runtime destroys THIS OBJECT, and doing that inside its own completion is a
-// free of the io_request the loop is still holding.  See set_map_handler().
+// Whatever the child has asked for, handed on to be answered later, because
+// `socketley.remove` of this worker's own runtime destroys this object inside
+// its own completion.
 void proxy_supervisor::poll_map()
 {
     if (m_map_fd < 0)
         return;
 
-    // MSG_DONTWAIT rather than O_NONBLOCK on the descriptor, and the write below
-    // names its own mode too.  The two ends of this pair are used in opposite
-    // ways — the worker blocks on it, this side must never — and a flag on the
-    // file description is shared by every dup of it, including the ones
-    // answer_map_request() is handed.  Naming the mode per call is the only way
-    // the two cannot be made to disagree by a change to either.
+    // MSG_DONTWAIT rather than O_NONBLOCK on the descriptor, because a flag on
+    // the file description is shared by every dup of it and the two ends are
+    // used in opposite ways.
     char buf[4096];
     for (;;)
     {
@@ -446,8 +311,8 @@ void proxy_supervisor::poll_map()
         }
         if (n == 0)
         {
-            // The child let go of its end.  Ordinary: it happens on every
-            // worker exit, and the control socket's own EOF is what reports it.
+            // The child let go of its end, which happens on every worker exit
+            // and is reported by the control socket's own EOF.
             close_map();
             return;
         }
@@ -474,15 +339,14 @@ void proxy_supervisor::poll_map()
         if (!worker_proto::decode_map_request(payload, ticket, op, name, config))
             continue;
 
-        // The dup the handler owns and closes.  Taken here, while the
-        // descriptor is certainly still open, rather than by the handler on a
-        // later turn when this object may be gone.
+        // The dup the handler owns and closes, taken here while the descriptor
+        // is certainly still open rather than on a later turn when this object
+        // may be gone.
         const int reply_fd = ::fcntl(m_map_fd, F_DUPFD_CLOEXEC, 3);
         if (reply_fd < 0)
         {
-            // Out of descriptors.  Answering on m_map_fd directly is the one
-            // thing that is still safe from here — nothing has been deferred
-            // yet, so this object is not going anywhere on this line.
+            // Out of descriptors, and answering on m_map_fd directly is still
+            // safe because nothing has been deferred yet.
             answer_map_request(m_map_fd, ticket, false,
                                "the daemon is out of file descriptors");
             continue;
@@ -510,19 +374,10 @@ void proxy_supervisor::answer_map_request(int reply_fd, uint64_t ticket,
         worker_proto::frame_type::map_rep,
         worker_proto::encode_map_reply(ticket, ok, err));
 
-    // ─── The one place in the daemon that waits on a worker, and its bound ──
-    //
-    // A socketpair buffer is over a hundred kilobytes and this frame is tens of
-    // bytes, so the send below completes on its first attempt for any worker
-    // that is behaving as workers behave: one request outstanding, and the
-    // process blocked reading for exactly this.
-    //
-    // The wait exists for the one that is not.  A child that writes requests and
-    // never reads answers would eventually fill the buffer, and an unbounded
-    // blocking write there would stop the daemon's event loop on behalf of a
-    // process it supervises — every other runtime in the daemon stalled by one
-    // bad script.  So this gives up instead, and the worker's own deadline
-    // reports it.
+    // The send completes on its first attempt for any worker behaving as
+    // workers behave, and the bound exists for one that writes requests and
+    // never reads answers, which would otherwise stop the daemon's loop on its
+    // behalf.
     static constexpr int reply_wait_ms = 250;
 
     size_t off = 0;
@@ -559,33 +414,14 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
-    // The daemon's ring policy, wherever this runtime asked for none of its own.
-    //
-    // Before runtimes moved out of the daemon they ran on its event loop, so
-    // `daemon --cpus 0-1` and `daemon --no-sqpoll` were theirs by construction.
-    // A worker has a loop of its own and learns nothing it is not told, and both
-    // settings then go wrong in a way that leaves no trace:
-    //
-    //   cpus   — the worker inherits the daemon's affinity mask through fork, so
-    //            it is pinned in fact while its loop believes every core is
-    //            available.  `stats` reported cpus:max for a runtime that could
-    //            only ever run on two, and the SQPOLL thread was placed against
-    //            a set that was not the real one.
-    //   sqpoll — the worker re-reads SOCKETLEY_SQPOLL out of the environment it
-    //            inherited, so a daemon started with --no-sqpoll in a shell that
-    //            exports it spawned workers with SQPOLL on, against the only
-    //            instruction anybody gave.
-    //
-    // Only where the runtime is silent.  `create --cpus` is a statement about
-    // that runtime and outranks the daemon's default, which is the order that
-    // already applied when the two shared a loop.
+    // The daemon's ring policy wherever this runtime asked for none of its
+    // own, because a worker inherits the affinity mask in fact while its loop
+    // believes otherwise, and re-reads SOCKETLEY_SQPOLL from the environment
+    // it inherited.
     runtime_config effective = cfg;
 
-    // Which of N this child is.  The ONLY field that differs between the N
-    // frames one runtime's shards are sent, and the one thing SO_REUSEPORT
-    // deliberately does not tell them.  Written into the copy that becomes
-    // m_config_json, so a restart replays the same index and the replacement
-    // takes the same slot in the shared table.
+    // Which of N this child is, the only field that differs between the N
+    // frames, written into m_config_json so a restart replays the same index.
     effective.shard_index = m_shard_index;
 
     if (m_loop)
@@ -603,21 +439,15 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         }
     }
 
-    // Keep the config so a restart can replay it without going back to disk.
-    // The state file is the daemon's record for the operator; this is the
-    // daemon's record for the child, and they are written at different moments.
+    // Keep the config so a restart can replay it without going back to disk,
+    // which is the daemon's record for the child rather than for the operator.
     {
         state_persistence sp{std::filesystem::path{}};
         m_config_json = sp.format_json_pretty(effective);
     }
 
     // A fresh socketpair starts with an empty outbound buffer, or the first
-    // thing the new child reads is frames addressed to the dead one.  spawn()
-    // is reached again on restart with THIS object reused, so the check is not
-    // a tautology at the point of the clear: it fails for any future path that
-    // queues before the socket exists, or that closes without going through
-    // close_control().  Measured against the defect it guards: a stopped worker
-    // that is then killed left 305,170 bytes here.
+    // thing the new child reads is frames addressed to the dead one.
     if (pending_out() != 0)
     {
         LOG_ERROR("proxy supervisor: outbound backlog survived into a new "
@@ -633,10 +463,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
-    // The control plane's own pair; see child_map_fd.  A failure to build it is
-    // NOT a failure to spawn: the worker treats an absent descriptor as "this
-    // daemon does not serve map calls" and keeps the refusals, which is a
-    // working proxy with four fewer script calls rather than none at all.
+    // The control plane's own pair, whose failure is not a failure to spawn:
+    // the worker keeps its refusals, which is a working proxy with four fewer
+    // script calls.
     int mv[2] = {-1, -1};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, mv) < 0)
     {
@@ -645,9 +474,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         mv[0] = mv[1] = -1;
     }
 
-    // Whatever this class was still holding from a previous child.  spawn() is
-    // reached again on restart with THIS object reused, and a map descriptor
-    // left over would be armed on the ring under a new child's number.
+    // Whatever this class was still holding from a previous child, because a
+    // leftover map descriptor would be armed on the ring under a new child's
+    // number.
     close_map();
 
     const pid_t child = ::fork();
@@ -664,65 +493,18 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (child == 0)
     {
         // ── child ───────────────────────────────────────────────────────────
-        //
-        // ─── WHAT CROSSES THE EXEC, AND NOTHING ELSE ────────────────────────
-        //
-        // Exactly four descriptors are meant to reach the worker.  The list is
-        // written down because for a long time it was not, and what actually
-        // crossed was every socket the daemon had open — read out of a live
-        // worker's /proc/<pid>/fd:
-        //
-        //     fd 5 -> unix .../daemon.sock  SO_ACCEPTCON   the IPC listener
-        //     fd 6 -> tcp 0.0.0.0:4CEA      LISTEN         another runtime's port
-        //     fd 8 -> unix .../daemon.sock                 an accepted CLI connection
-        //
-        // none of which this process has any use for, and all of which it then
-        // held for its whole life.  The listener made "is a daemon serving this
-        // socket" answer yes with no daemon left alive; the port stayed bound
-        // by a worker belonging to a different runtime.  The fix is at every
-        // creation site rather than here, because a descriptor that is
-        // inheritable for even a moment is inheritable during exactly the
-        // moment this function runs.
-        //
-        // The deliberate set:
-        //
-        //   0  /dev/null, opened below.  The worker must never read the
-        //      terminal the daemon was started from.
-        //   1  the daemon's stdout, inherited unchanged.
-        //   2  the daemon's stderr, inherited unchanged.  1 and 2 are the point
-        //      of the exercise: a worker's log lines have to land where the
-        //      operator is already looking, so these two are inherited on
-        //      purpose and are the reason no blanket close-range runs here.
-        //   3  the control socket, dup2'd onto child_control_fd below.
-        //
-        // The worker's own listening socket is NOT in this set and must not be:
-        // it binds its own port after the exec, from the port in the config
-        // frame, and nothing is passed with SCM_RIGHTS.  Verified rather than
-        // assumed — a worker started with the leak closed still binds and still
-        // serves, and its listener is a descriptor number that did not exist
-        // before the exec.
-        //
-        // Nothing here may allocate or take a lock that the parent could have
-        // held at fork time.  dup2 clears FD_CLOEXEC on the copy, which is what
-        // lets the control socket survive the exec.
+        // Exactly four descriptors are meant to reach the worker -- /dev/null,
+        // the daemon's stdout and stderr, and the control socket -- with the
+        // fix at every creation site rather than here, because a descriptor
+        // inheritable for a moment is inheritable during exactly this
+        // function.
         ::close(sv[0]);
         if (mv[0] >= 0)
             ::close(mv[0]);
 
-        // ─── Two fixed numbers, and the case where one is already taken ─────
-        //
-        // Both descriptors are placed by dup2, and dup2 destroys whatever was
-        // at the destination.  The control socket has always been moved to 3
-        // and there is now a second one to place at 4, so the ONE ordering
-        // hazard is a socketpair that came back holding 4 already: dup2ing the
-        // region onto it would close the control socket, and the child would
-        // exec into a process whose only link to the daemon is a memfd.
-        //
-        // Rare — the daemon holds stdio, its listener and its ring long before
-        // any worker is forked — and cheap to make impossible, which is the
-        // trade this file makes everywhere else.  Moved out of the way first,
-        // then the region, then the control socket, so no placement can undo
-        // one that has already happened.
+        // dup2 destroys its destination, so a socketpair that came back
+        // holding 4 is moved out of the way before either fixed number is
+        // placed.
         if ((m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
             || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd)
             || (mv[1] >= 0 && sv[1] == child_map_fd))
@@ -734,21 +516,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
             sv[1] = moved;
         }
 
-        // The fifth descriptor, and only for a runtime that has shards.  The
-        // memfd is MFD_CLOEXEC in the daemon precisely so that it reaches no
-        // child by accident; dup2 clears that flag on the copy, so this is the
-        // whole of what makes it reach the ones it should.
-        //
-        // A failure here is fatal to the child rather than survivable.  The
-        // alternative is a shard that serves connections and publishes them
-        // nowhere, which is the silent wrong answer this whole mechanism exists
-        // to remove — and the supervisor's restart path is the right response.
-        //
-        // Both regions are placed by the same three lines, because the hazard
-        // is the same one: dup2 destroys its destination, and a source that is
-        // already sitting on the OTHER region's destination would be destroyed
-        // by the placement that has not happened yet.  So each source is moved
-        // out of the way first if it collides, and only then are the two placed.
+        // The shared regions, whose MFD_CLOEXEC dup2 clears on the copy,
+        // placed by the same three lines and each moved out of the way first
+        // because a source sitting on the other's destination would be
+        // destroyed by a placement that has not happened yet.
         int region_src  = m_shard_region_fd;
         int clients_src = m_shard_clients_fd;
         if (clients_src >= 0 && region_src == child_clients_fd)
@@ -779,13 +550,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         place(region_src,  child_shard_fd);
         place(clients_src, child_clients_fd);
 
-        // ─── And the mesh, which is a BLOCK rather than two descriptors ─────
-        //
-        // The two placements above hand-check each source against each
-        // destination, which is readable for two and is not a method that
-        // survives sixty-three.  So every mesh source is moved above the whole
-        // destination block first, and only then placed: one rule instead of a
-        // case analysis that grows as N**2.
+        // The mesh is a block rather than two descriptors, so every source is
+        // moved above the whole destination block first -- one rule instead of
+        // a case analysis that grows as N**2.
         for (size_t j = 0; j < m_mesh_fds.size(); ++j)
         {
             if (m_mesh_fds[j] < 0)
@@ -802,18 +569,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         for (size_t j = 0; j < m_mesh_fds.size(); ++j)
             place(m_mesh_fds[j], child_mesh_base + static_cast<int>(j));
 
-        // ─── And the map socket, placed after everything except the control ─
-        //
-        // Last but one, deliberately.  Its destination sits between the shard
-        // pair and the mesh block, so a source already living on 6 belongs to a
-        // placement that has already happened — the dup2 that put it where it
-        // was going leaves the original readable at whatever number it had, and
-        // destroying that copy costs nothing.  Placing this FIRST would instead
-        // destroy a source before it had been placed.
-        //
-        // The control socket stays last for the same reason it always was: it
-        // is the descriptor whose loss cannot be recovered from, so nothing is
-        // allowed to be placed after it.
+        // The map socket is placed last but one, because a source already on 6
+        // belongs to a placement that has happened, and the control socket
+        // stays last as the descriptor whose loss cannot be recovered from.
         int map_src = mv[1];
         if (map_src >= 0 && map_src <= child_mesh_base + static_cast<int>(m_mesh_fds.size()))
         {
@@ -861,10 +619,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     m_control_fd = sv[0];
     m_map_fd     = mv[0];
 
-    // A new child has said nothing yet.  Without this a restart would inherit
-    // the previous one's report, and await_startup() would answer for a process
-    // that no longer exists — most sharply on the restart path, where the child
-    // being replaced is one that had reached `running` before it died.
+    // A new child has said nothing yet, or a restart would inherit the
+    // previous one's report and await_startup() would answer for a process
+    // that no longer exists.
     m_worker_state      = runtime_created;
     m_worker_state_seen = false;
 
@@ -876,39 +633,14 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     {
         m_placeholder->set_pid(child);
 
-        // Forked, not listening.  Everything below this line is a frame on its
-        // way to a child that has not run a line of its own yet, and the port
-        // is bound at the far end of it — so from here until the child says
-        // otherwise this runtime is not a group member anybody may be routed
-        // to.  See runtime_instance::endpoint_live().
-        //
-        // Lowered on every spawn and not only the first, which is what covers
-        // the restart path: a child that died and is being replaced re-enters
-        // exactly this window, and the endpoint table said it was serving
-        // throughout the old one.
+        // Forked and not listening, lowered on every spawn and not only the
+        // first, because a child being replaced re-enters exactly this window.
         m_placeholder->set_endpoint_live(false);
     }
 
-    // ─── What the child has to know BEFORE it reads its config ──────────────
-    //
-    // The config frame is what makes the worker load its script, and a script's
-    // top level runs inside that load.  Everything the top level can ask about
-    // therefore has to be in the worker's hands before the config frame is, and
-    // these two are the whole of what that means: the runtime map, which
-    // socketley.list() and socketley.get() are answered from, and the cluster
-    // view, which the four socketley.cluster.* calls are answered from.
-    //
-    // The cluster view is the one where the order is load-bearing rather than
-    // merely better.  Its bindings are refused unless a view is installed, and
-    // that decision is taken once, while the bindings are being built — so a
-    // view arriving one frame later than the config leaves the four calls
-    // refused for the life of that script, and the refusal says the worker
-    // cannot answer when it can.  One stream, delivered in order, so writing
-    // them first is all it takes.
-    //
-    // Both are also re-sent here rather than only on the next tick, which is
-    // what covers a RESTARTED child: it has a script to run immediately and
-    // nothing else would carry these to it until something moved.
+    // The runtime map and the cluster view go before the config frame, because
+    // the config frame runs the script and the cluster bindings decide once,
+    // while they are built, whether a view exists.
     if (!m_cluster_view.empty())
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::cluster,
                                              m_cluster_view))) {}
@@ -924,15 +656,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
-    // A child forked after the last publish would otherwise route from an empty
-    // table until the next membership change, which for a stable daemon may
-    // never come.
-    //
-    // After the config and not before it, unlike the two above: only a proxy is
-    // handed an endpoint table and the proxy does not exist until the config has
-    // been read, so a table arriving early is stashed rather than applied — see
-    // on_endpoints().  The map and the view go into objects that exist from the
-    // worker's construction, which is what lets them go first.
+    // After the config and not before it, unlike the two above, because only a
+    // proxy is handed an endpoint table and the proxy does not exist until the
+    // config has been read.
     if (!m_endpoints.empty())
         if (!write_frame(worker_proto::frame(worker_proto::frame_type::endpoints, m_endpoints))) {}
 
@@ -945,23 +671,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
 }
 
 // ─── writing to the child ───────────────────────────────────────────────────
-//
-// This used to write straight at the descriptor and drop the frame on EAGAIN,
-// which was defensible while the socket carried stats: the next push supersedes
-// the one that did not fit, and blocking the daemon's event-loop thread on a
-// process it does not control is not on the table.
-//
-// It stopped being defensible when requests went on the same socket.  A dropped
-// request frame is a false return, the channel reads a false return as "this
-// sink cannot take it", and the origin is answered `no such runtime` — for a
-// runtime that exists, is healthy, and is answering everything else.  Measured
-// before this buffer, with 10,000 pipelined `cache set` through one worker:
-// 298 of them answered no such runtime.  The socket held about 270 frames and
-// everything past that was a confident lie.
-//
-// So the frames are queued and flushed as the socket takes them.  The cap is
-// what makes it bounded, and reaching it is a real refusal rather than an
-// invented one — see serve_deferred, which turns it into `overloaded`.
+// Frames are queued and flushed as the socket takes them, because a dropped
+// request frame answered `no such runtime` for a healthy runtime -- 298 of
+// 10,000 pipelined `cache set` -- and the cap turns a real refusal into
+// `overloaded`.
 void proxy_supervisor::flush_control()
 {
     while (m_out_off < m_out.size() && m_control_fd >= 0)
@@ -1001,8 +714,8 @@ void proxy_supervisor::flush_control()
         }
     }
 
-    // A backlog means the next thing worth waking for is writability, not just
-    // readability.  Re-armed rather than adjusted: the arm is one-shot.
+    // A backlog means the next thing worth waking for is writability, re-armed
+    // rather than adjusted because the arm is one-shot.
     const unsigned want = POLLIN | (pending_out() ? POLLOUT : 0u);
     if (want != m_poll_mask)
     {
@@ -1053,20 +766,17 @@ void proxy_supervisor::send_stop()
 
 void proxy_supervisor::send_reload()
 {
-    // Cleared here rather than when the answer arrives: a worker that reloaded
-    // cleanly sends nothing, so "no reload_err since the ask" is the only shape
-    // success has, and a stale message from the previous reload would otherwise
-    // be reported as this one's.
+    // Cleared at the ask rather than at the answer, because a clean reload
+    // sends nothing and "no reload_err since the ask" is the only shape
+    // success has.
     m_reload_error.clear();
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::reload, {}))) {}
 }
 
 std::string proxy_supervisor::take_reload_error()
 {
-    // Cleared explicitly rather than left to the move.  A moved-from string is
-    // valid but unspecified, and this member's whole meaning is "empty means the
-    // reload loaded" — a second read finding something in it would report the
-    // previous reload's failure against a reload that worked.
+    // Cleared explicitly rather than left to the move, because a moved-from
+    // string is unspecified and empty here means the reload loaded.
     std::string out = std::move(m_reload_error);
     m_reload_error.clear();
     return out;
@@ -1098,30 +808,24 @@ void proxy_supervisor::send_endpoints(const std::string& encoded_payload)
 
 void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
 {
-    // Nothing has moved since this child was last told.  The comparison is what
-    // makes the health tick's unconditional push free on a quiet daemon, and it
-    // is a comparison of the ENCODED payload rather than of anything smarter on
-    // purpose: it is exactly "would this frame say anything new", with no second
-    // idea of what counts as a change to drift from the first.
+    // Nothing has moved since this child was last told, compared as encoded
+    // payload on purpose, so there is no second idea of what counts as a
+    // change to drift from the first.
     if (encoded_payload == m_runtime_map)
         return;
 
-    // No child to write to, so this is what the next one will be handed: spawn()
-    // writes the cache before the config frame.  Reached in two ways and right
-    // in both — a supervisor that has not forked yet, and one whose child has
-    // died and is about to be replaced.
+    // No child to write to, so this is what the next one is handed, which is
+    // right both for a supervisor that has not forked and for one whose child
+    // is about to be replaced.
     if (m_control_fd < 0)
     {
         m_runtime_map = encoded_payload;
         return;
     }
 
-    // Otherwise remembered only once it has been queued, which is what makes the
-    // dedupe above safe.  Storing it either way would record a payload this
-    // child was never sent — write_frame refuses when the backlog is full,
-    // meaning the child has stopped reading — and every later push of the same
-    // map would then be dropped as a duplicate of a frame that never went.  On a
-    // daemon whose membership is settled that is a replica left stale for good.
+    // Remembered only once it has been queued, or a payload the child never
+    // received would make every later push of the same map look like a
+    // duplicate.
     if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
                                         encoded_payload)))
         m_runtime_map = encoded_payload;
@@ -1137,13 +841,8 @@ void proxy_supervisor::send_cluster_event(const std::string& encoded_payload)
 
 void proxy_supervisor::send_cluster_view(const std::string& encoded_payload)
 {
-    // The same three rules as the map above, and for the same reasons: nothing
-    // that this child already holds, a cache rather than a write when there is
-    // no child yet, and otherwise remembered only once it has been queued.
-    //
-    // The middle rule is what makes the four cluster calls answerable at all in
-    // a script's top level: the cache is what spawn() writes ahead of the config
-    // frame, and the config frame is what runs the script.
+    // The same three rules as the map above, of which the middle one is what
+    // makes the four cluster calls answerable in a script's top level.
     if (encoded_payload == m_cluster_view)
         return;
 
@@ -1162,11 +861,9 @@ void proxy_supervisor::send_publish(const std::string& encoded_payload)
 {
     if (m_control_fd < 0)
         return;
-    // A dropped frame is a message this worker's subscribers do not see, which
-    // is what write_frame() already warns about.  Not retried and not queued:
-    // the alternative is the daemon growing an unbounded backlog on behalf of a
-    // child that is not reading, for messages whose whole value was being
-    // timely.
+    // A dropped frame is a message this worker's subscribers do not see, not
+    // retried and not queued, because the alternative is an unbounded backlog
+    // for messages whose value was being timely.
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::publish, encoded_payload))) {}
 }
 
@@ -1174,8 +871,9 @@ void proxy_supervisor::shutdown()
 {
     if (m_pid > 0)
     {
-        // Ask first.  The worker stops its proxy while it still has a ring to
-        // cancel into, which is the only way its connections close cleanly.
+        // Ask first, because the worker stops its proxy while it still has a
+        // ring to cancel into, which is the only way its connections close
+        // cleanly.
         if (m_control_fd >= 0)
             if (!write_frame(worker_proto::frame(worker_proto::frame_type::shutdown, {}))) {}
 
@@ -1185,16 +883,14 @@ void proxy_supervisor::shutdown()
 
         ::kill(m_pid, SIGTERM);
 
-        // Reaped here if it has already gone; otherwise the health timer's
-        // waitpid collects it.  Not waited on: the daemon's event-loop thread
-        // does not block on a child.
+        // Reaped here if it has already gone and otherwise by the health
+        // timer, because the daemon's event-loop thread does not block on a
+        // child.
         if (::waitpid(m_pid, nullptr, WNOHANG) > 0)
             m_pid = 0;
 
         // The placeholder stops naming a process the moment this supervisor
-        // stops owning one, whether or not the reap above succeeded: SIGTERM has
-        // been sent and the runtime is on its way out, so `stats` must not go on
-        // printing a pid as if the runtime were still there to look at.
+        // stops owning one, whether or not the reap succeeded.
         if (m_placeholder)
             m_placeholder->set_pid(0);
     }
@@ -1217,9 +913,8 @@ void proxy_supervisor::poll()
         }
         if (n == 0)
         {
-            // The child closed its end — it is on its way out.  Liveness is
-            // still decided by waitpid, not by this, so the policy runs in one
-            // place only.
+            // The child closed its end and is on its way out, though liveness
+            // is still decided by waitpid so the policy runs in one place.
             close_control();
             break;
         }
@@ -1234,31 +929,10 @@ void proxy_supervisor::poll()
     ingest(m_in);
 }
 
-// ─── Waiting for the child's verdict without pumping the ring ───────────────
-//
-// Three things can end this wait, and all three are read with plain syscalls:
-//
-//   serving   the child sent `state` carrying running, which on_start() writes
-//             only after m_rt->start() has bound the socket.
-//   refused   the placeholder is `failed`.  Two paths reach that and both are
-//             somebody else's already: ingest() adopts a `state` frame carrying
-//             failed, and check_liveness() adopts the exit status of a child
-//             that died -- including exit_config_refused, whose whole purpose is
-//             to say "not a crash, a configuration I will never accept".
-//   timeout   neither, before the bound.
-//
-// What is deliberately NOT here is a waitpid of its own.  check_liveness() is
-// the one place that reaps and the one place that applies the death policy;
-// a second reaper would take the child out from under it, and the pid
-// bookkeeping and the restart-burst counter would both be reading a corpse
-// somebody else buried.  So this calls check_liveness() and reads the result
-// off the placeholder, which keeps one writer for the state and one reaper for
-// the child.
-//
-// A restart during the wait is not an ending.  check_liveness() may fork a
-// replacement, which leaves the placeholder `running` and m_worker_state_seen
-// false; the loop simply goes round again against the new child, still inside
-// the same bound.
+// Three things end this wait -- serving, refused, timeout -- all read with
+// plain syscalls and none of them a waitpid of its own, because
+// check_liveness() is the one place that reaps and the one place that applies
+// the death policy.
 proxy_supervisor::startup
 proxy_supervisor::await_startup(std::chrono::milliseconds bound)
 {
@@ -1266,24 +940,15 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
 
     for (;;)
     {
-        // Whatever is already buffered, before deciding anything.  On the
-        // refusal path the child has usually exited before this is first
-        // called, so the frames and the EOF are both sitting in the socket.
+        // Whatever is already buffered, before deciding anything, because on
+        // the refusal path the frames and the EOF are both sitting in the
+        // socket.
         poll();
 
-        // ── And the map socket, which is what stops this being a deadlock ───
-        //
-        // The child's script runs its on_start INSIDE the start this is waiting
-        // for, and on_start is where socketley.create/.start/.stop/.remove are
-        // written.  So the ordinary case is a worker blocked on an answer from
-        // a daemon blocked in this loop, and neither moves until a timeout ends
-        // one of them: measured, `create -s` reporting "did not report back
-        // within 2s" for a script whose create had in fact reached the daemon
-        // and would be served two seconds later.
-        //
-        // Draining here is only half of it; daemon_handler serves what this
-        // hands it rather than deferring, for the same reason.  See
-        // queue_map_request().
+        // And the map socket, which is what stops this being a deadlock: the
+        // child's on_start is where the four map calls are written, so a
+        // worker blocked on an answer would face a daemon blocked in this
+        // loop.
         poll_map();
 
         if (m_placeholder && m_placeholder->get_state() == runtime_failed)
@@ -1293,7 +958,7 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
             return startup::serving;
 
         // Reaps, applies the policy, and may mark the placeholder failed or
-        // fork a replacement.  Checked again at the top of the next turn.
+        // fork a replacement, checked again at the top of the next turn.
         if (check_liveness())
             continue;
 
@@ -1301,12 +966,9 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         if (now >= deadline)
             return startup::pending;
 
-        // Sleep on the descriptor, not on the clock: the answer arrives as a
-        // frame, and a poll that ends on it costs the wait nothing it does not
-        // have to spend.  Capped so a child that dies without closing its end
-        // -- SIGKILL leaves nothing to read -- is still noticed by the
-        // check_liveness() above within a tick of the cap rather than at the
-        // deadline.
+        // Sleep on the descriptor rather than the clock, capped so a child
+        // killed without closing its end is still noticed within a tick of the
+        // cap.
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         int slice = static_cast<int>(std::min<std::chrono::milliseconds::rep>(
@@ -1316,11 +978,8 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
 
         if (m_control_fd >= 0 || m_map_fd >= 0)
         {
-            // Both descriptors, because either can end this wait: the control
-            // socket carries the child's verdict, and the map socket carries a
-            // request whose answer the child is waiting on before it can give
-            // one.  Waiting on only the first is what made the deadlock above
-            // cost the full slice on every turn.
+            // Both descriptors, because either can end this wait and watching
+            // only the control socket cost the full slice on every turn.
             struct pollfd pfds[2];
             nfds_t        n = 0;
             if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
@@ -1337,22 +996,10 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
     }
 }
 
-// The reload half of the same idea, and deliberately the same shape: drain what
-// is there, decide, then sleep on the descriptor rather than on the clock.
-//
-// It watches the declaration object the child's frame installs, rather than the
-// m_routes_changed flag beside it: that flag belongs to the health tick, which
-// consumes it, so a wait resting on it would end or not end depending on
-// whether a timer happened to fire first.  A fresh table is allocated for every
-// frame, so the pointer changing means "a declaration arrived" even when the
-// script's answer turned out identical to the one before it.
-//
-// Like await_startup() it does not reap.  check_liveness() is called for the
-// same reason -- a child that dies mid-reload must end the wait rather than run
-// it to the bound -- and it is still the only place that reaps and the only
-// place that writes the state.  A false here is not an error the caller has to
-// report: the declaration the daemon already holds is still the one in force,
-// and cmd_reload_lua publishes that.
+// The reload half of the same idea, watching the declaration object the child
+// installs rather than the flag beside it, which the health tick consumes --
+// and a false here is not an error, because the declaration already held is
+// still in force.
 bool proxy_supervisor::await_routes(const void* previous,
                                     std::chrono::milliseconds bound)
 {
@@ -1369,9 +1016,9 @@ bool proxy_supervisor::await_routes(const void* previous,
         if (m_placeholder && m_placeholder->worker_routes().get() != previous)
             return true;
 
-        // A child that has gone is one that will never answer.  Checked after
-        // the drain above, so a declaration sitting in the socket of a child
-        // that has since exited is still taken.
+        // A child that has gone will never answer, checked after the drain so
+        // a declaration sitting in the socket of an exited child is still
+        // taken.
         if (check_liveness())
             continue;
         if (m_control_fd < 0 || m_pid <= 0)
@@ -1409,10 +1056,9 @@ void proxy_supervisor::ingest(const std::string&)
         {
             case worker_proto::frame_type::stats:
                 apply_stats(payload);
-                // After the figures are in the placeholder and never before:
-                // the handler rebuilds the runtime map out of what every
-                // runtime reports, and this child's row has to be the one that
-                // has just arrived rather than the one before it.
+                // After the figures are in the placeholder and never before,
+                // because the handler rebuilds the runtime map out of what
+                // every runtime reports.
                 if (m_on_stats)
                     m_on_stats();
                 break;
@@ -1422,10 +1068,9 @@ void proxy_supervisor::ingest(const std::string&)
 
             case worker_proto::frame_type::routes:
             {
-                // The declaration this child's script made.  Kept on the
-                // placeholder, which is where publish_endpoints() looks, and a
-                // republish is asked for because membership has not changed —
-                // nothing else would carry it out to the proxies in front.
+                // The declaration this child's script made, kept where
+                // publish_endpoints() looks, with a republish asked for
+                // because membership has not changed.
                 auto rt = std::make_shared<route_table>();
                 if (worker_proto::decode_routes(payload, *rt) && m_placeholder)
                 {
@@ -1442,38 +1087,31 @@ void proxy_supervisor::ingest(const std::string&)
             }
 
             case worker_proto::frame_type::reload_err:
-                // Only sent when a reload failed, and only between the ask and
-                // the routes frame that ends the wait for it — so this is the
-                // answer to the reload cmd_reload_lua is holding, and it is
-                // read back there rather than logged: the worker has already
-                // logged it, and the point of the frame is the other terminal.
+                // Only sent when a reload failed and only between the ask and
+                // the routes frame, so this is the answer cmd_reload_lua is
+                // holding and it is read back there rather than logged.
                 m_reload_error = payload;
                 break;
 
             case worker_proto::frame_type::config_err:
-                // Written by a child that is about to exit rather than serve.
-                // Kept rather than logged for the reason the two above give:
-                // the worker has already logged it, and the point of the frame
-                // is the terminal that ran the command.
+                // Written by a child about to exit rather than serve, kept
+                // rather than logged because the point of the frame is the
+                // terminal that ran the command.
                 m_config_error = payload;
                 break;
 
             case worker_proto::frame_type::start_err:
-                // The same shape one command along: only sent when on_start
-                // raised, and only between the `start` frame and the `state`
-                // frame that ends await_startup(), so this is the answer to the
-                // start cmd_create is holding.  Read back there rather than
-                // logged, because the worker has already logged it and the
-                // point of the frame is the operator's terminal.
+                // The same shape one command along, sent only when on_start
+                // raised and only before the `state` frame, so this is the
+                // answer cmd_create is holding.
                 m_start_error = payload;
                 break;
 
             case worker_proto::frame_type::publish:
             {
-                // The same frame this supervisor writes downward, arriving from
-                // the other end.  A cache serving PUBLISH in a worker has no
-                // other way to reach a subscriber: every other runtime and every
-                // other worker's socket is held by the daemon.
+                // The same frame this supervisor writes downward, arriving
+                // from the other end, because a cache serving PUBLISH in a
+                // worker has no other way to reach a subscriber.
                 worker_proto::publish_wire p;
                 if (m_on_publish && worker_proto::decode_publish(payload, p))
                     m_on_publish(this, p.cache_name, p.channel, p.message);
@@ -1482,9 +1120,9 @@ void proxy_supervisor::ingest(const std::string&)
 
             case worker_proto::frame_type::chan_rep:
             {
-                // The answer to a request this supervisor put on the wire.  The
-                // ticket is the channel's own, so nothing here has to know what
-                // was asked or what came back.
+                // The answer to a request this supervisor put on the wire,
+                // whose ticket is the channel's own, so nothing here has to
+                // know what was asked.
                 worker_proto::chan_reply_wire r;
                 if (m_channel && worker_proto::decode_chan_reply(payload, r))
                     m_channel->complete_deferred(
@@ -1499,16 +1137,10 @@ void proxy_supervisor::ingest(const std::string&)
 
             case worker_proto::frame_type::deliver_to:
             {
-                // `socketley.send(name, msg)` from the worker's script, or —
-                // when `name` is the worker's OWN runtime — the sibling half of
-                // a broadcast on a sharded one.  Routed by the handler, which
-                // is the daemon and holds the map; nothing is answered, because
-                // nothing is waiting — see the frame's own note.
-                //
-                // `this` goes with it so the daemon can leave this shard out
-                // when the name is its own: the local delivery already
-                // happened out there, and a second copy would reach every one
-                // of this shard's clients twice.
+                // `socketley.send` from the worker's script, or the sibling
+                // half of a broadcast when the name is its own, routed by the
+                // daemon with `this` passed so the sending shard is left out
+                // of the fan-out.
                 std::string name, message;
                 if (m_on_deliver &&
                     worker_proto::decode_deliver_to(payload, name, message))
@@ -1518,9 +1150,9 @@ void proxy_supervisor::ingest(const std::string&)
 
             case worker_proto::frame_type::send_ref:
             {
-                // `self.send(handle, msg)` out there, for a client one of this
-                // shard's siblings is holding.  Routed by the handler, which is
-                // the daemon and holds every shard's socket.
+                // `self.send(handle, msg)` for a client one of this shard's
+                // siblings holds, routed by the daemon, which holds every
+                // shard's socket.
                 conn_ref    ref{};
                 std::string message;
                 if (m_on_send_ref &&
@@ -1532,8 +1164,8 @@ void proxy_supervisor::ingest(const std::string&)
             case worker_proto::frame_type::route_up:
             {
                 // A routing verb this child performed on a runtime it does not
-                // hold.  Decoded here and resolved by the handler, for the
-                // reason send_ref gives one line up: the daemon holds the map.
+                // hold, decoded here and resolved by the daemon, which holds
+                // the map.
                 std::string        to, frm, rp;
                 worker_proto::route_op op{};
                 conn_ref           ref{};
@@ -1544,53 +1176,22 @@ void proxy_supervisor::ingest(const std::string&)
             }
 
             case worker_proto::frame_type::state:
-                // created / running / stopped are still not acted on, and for
-                // the reason that was always given: the daemon's own record is
-                // what the CLI is promised, it is set by the command that
-                // caused the transition, and letting the child move it too
-                // would mean two writers for one value.
-                //
-                // `failed` is not one of those.  No command causes it and the
-                // daemon cannot observe it: start() on an out-of-process
-                // runtime stores `running` the moment the child is forked,
-                // because that is all this side knows — the port is bound in
-                // the worker, the TLS pair is checked in the worker, the script
-                // runs in the worker.  When any of that refuses, the child
-                // stays alive holding a runtime that will never serve, so
-                // check_liveness() never fires either.
-                //
-                // What that looked like, with a client whose TLS configuration
-                // cannot work:
-                //
-                //     in the daemon    ls: Failed   json: "status":"failed"
-                //     in a worker      ls: Up       json: "status":"running"
-                //
-                // A wrong answer rather than a missing one, to `ls`, to `ps -a`
-                // and to every script reading the JSON.
-                //
-                // Remembered either way, which is not the same as adopted.  The
-                // paragraph above is about who owns the placeholder's state; it
-                // does not say this side has to forget what the child said.
-                // await_startup() needs exactly that memory to tell a child that
-                // has bound its socket from one that has not answered yet, and
-                // it writes nothing on the strength of it.
+                // created/running/stopped are still not adopted because the
+                // daemon's record has one writer, but `failed` is: no command
+                // causes it and this side cannot observe it, so a client whose
+                // TLS cannot work read as Up in a worker and Failed in the
+                // daemon -- and every state is remembered either way, which
+                // await_startup() needs and writes nothing on.
                 if (!payload.empty())
                 {
                     m_worker_state =
                         static_cast<runtime_state>(static_cast<uint8_t>(payload[0]));
                     m_worker_state_seen = true;
 
-                    // The one thing only the child can tell us, and the reason
-                    // this frame is worth more than a state the daemon already
-                    // owns: the listener is up.  Written through to the
-                    // placeholder because the endpoint table is built from it
-                    // and this is the fact the group filter needs — which is
-                    // not the same as adopting the child's state, the value
-                    // the paragraph above says has one owner.
-                    //
-                    // Raised once per transition so the caller republishes: an
-                    // address that has become answerable is only useful to the
-                    // gateways once they are told.
+                    // The one thing only the child can tell us -- the listener
+                    // is up -- written through because the endpoint table is
+                    // built from it, and raised once per transition so the
+                    // caller republishes.
                     if (m_placeholder && m_worker_state == runtime_running &&
                         !m_placeholder->endpoint_live())
                     {
@@ -1629,12 +1230,9 @@ void proxy_supervisor::apply_stats(const std::string& payload)
     worker_proto::stats_wire s;
     if (!worker_proto::decode_stats(payload, s))
     {
-        // Not a silent return: a frame that will not decode means every later
-        // one from this worker is suspect too, and the placeholder freezes on
-        // its last good report — or, if this was the first, never reports and
-        // `stats` says worker_report:none for a runtime that is serving.  A
-        // reading like that was measured once with nothing at all in the log
-        // to distinguish it from a quiet cache.
+        // Not a silent return, because a frame that will not decode makes
+        // every later one suspect and the placeholder freezes on its last good
+        // report.
         const std::string msg =
             "proxy supervisor: stats frame did not decode ("
             + std::to_string(payload.size())
@@ -1643,23 +1241,11 @@ void proxy_supervisor::apply_stats(const std::string& payload)
         return;
     }
 
-    // Kept, not applied.  This used to write the six figures straight into the
-    // placeholder, which was right while a placeholder stood for exactly one
-    // process.  With --shards it stands for N, and N writers of one field means
-    // a reader sees whichever shard published most recently instead of the
-    // runtime: four shards serving 25 connections each reported 25.
-    //
-    // The sum is daemon_handler::aggregate_worker_stats()'s to make, and that
-    // is where it belongs rather than here: this object cannot reach its
-    // siblings and should not be given a way to, because the map that knows
-    // which supervisors serve one name is the daemon's.  The stats handler
-    // fires immediately after this returns, so the total is rewritten before
-    // anything gets the chance to read a stale one.
-    //
-    // No moment travels with them any more.  These figures are the fallback for
-    // a runtime whose shared region could not be created; the ordinary path is
-    // that nothing reads them at all, because the daemon sums the region when it
-    // prints.  See runtime_instance::worker_figures().
+    // Kept and not applied, because a placeholder stands for N processes and N
+    // writers of one field means a reader sees whichever shard published most
+    // recently; the sum is aggregate_worker_stats()'s to make, and these
+    // figures are only the fallback for a runtime whose region could not be
+    // created.
     m_last_stats.total_connections  = s.total_connections;
     m_last_stats.total_messages     = s.total_messages;
     m_last_stats.bytes_in           = s.bytes_in;
@@ -1690,11 +1276,9 @@ bool proxy_supervisor::check_liveness()
 
     LOG_WARN("proxy worker exited unexpectedly");
 
-    // The one thing a child can tell us about itself on the way out: this is not
-    // a crash, it is a configuration it will never accept.  Restarting is the
-    // right answer to a crash and produces nothing here but five more copies of
-    // the same refusal, so the runtime is left `failed` where the operator can
-    // see it — and the reason is already in the log, written by the child.
+    // The one thing a child can tell us on the way out -- not a crash but a
+    // configuration it will never accept -- so the runtime is left `failed`
+    // where the operator can see it.
     if (WIFEXITED(status) && WEXITSTATUS(status) == worker_proto::exit_config_refused)
     {
         LOG_ERROR("proxy worker refused its configuration; not restarting it");
@@ -1745,10 +1329,8 @@ bool proxy_supervisor::check_liveness()
     return true;
 }
 
-// The request goes out on the control socket the child is already reading.  A
-// write that does not queue means the child is gone or wedged; saying so here
-// is what keeps a ticket from being parked for something that will never
-// answer — the channel then tells the origin `no_target` instead.
+// A write that does not queue means the child is gone or wedged, and saying so
+// keeps a ticket from being parked for something that will never answer.
 bool proxy_supervisor::serve_deferred(uint64_t ticket, std::string_view target,
                                       std::string_view payload)
 {
@@ -1795,35 +1377,17 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
                     static_cast<uint8_t>(st), {})))) {}
     };
 
-    // The one cycle this arrangement can produce, cut here.
-    //
-    // A worker asking for its own name would be posted into the daemon's
-    // channel, whose sink for that name is this supervisor, which would put it
-    // straight back on the wire to the worker that asked.  The worker registers
-    // its own runtime precisely so this does not arise, and this is the second
-    // lock on the same door: a worker built by an older binary, or one whose
-    // runtime failed to build at all, must not be able to start the two
-    // processes handing one request back and forth for ever.
+    // The one cycle this arrangement can produce, cut here as the second lock
+    // on a door the worker's own registration already closes.
     if (m_placeholder && q.target == m_placeholder->get_name())
     {
         refuse(request_status::no_target);
         return;
     }
 
-    // The same door, one notch finer.
-    //
-    // A shard-qualified target (`c#3`, see shared/shard_target.h) is how one
-    // shard of a runtime reaches another, and the check above cannot see it —
-    // `c#3` is not `c`.  A shard naming its OWN index would be posted into the
-    // daemon's channel, resolve to this very supervisor, and go straight back
-    // down the socket it came from, for ever.
-    //
-    // The router never produces its own index: cache_instance only crosses when
-    // the owner is somebody else.  This is the second lock on that door, the
-    // same arrangement on_worker_send_ref makes for a shard asking the daemon
-    // to deliver to itself, and for the same reason — a worker built by an
-    // older binary must not be able to start two processes handing one request
-    // back and forth.
+    // The same door one notch finer, because `c#3` is not `c` and a shard
+    // naming its own index would go straight back down the socket it came
+    // from.
     {
         std::string_view base;
         uint32_t         idx = 0;
@@ -1839,9 +1403,8 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
     if (!m_channel ||
         !m_channel->post(this, q.ticket, q.target, q.payload, request_class::client))
     {
-        // Nothing was taken, so no on_request_reply() is coming and the worker
-        // would wait for ever.  Answering here is the whole difference between
-        // a refusal and a hang.
+        // Nothing was taken, so no reply is coming and answering here is the
+        // whole difference between a refusal and a hang.
         refuse(request_status::no_target);
     }
 }

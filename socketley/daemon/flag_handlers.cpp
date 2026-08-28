@@ -12,31 +12,10 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 
-// ─── Flags that describe inbound traffic, on a runtime that has none ────────
-//
-// The common flags are applied through a runtime_instance*, which does not know
-// what it is, so every one of them reached every runtime type.  Three of them
-// only mean something for a runtime that ACCEPTS connections, and a client does
-// not: it opens one connection outward and listens on nothing.
-//
-// They were taken, stored and reported.  `create client c -t host:port
-// --rate-limit 5` exited 0 and `show` answered `"rate_limit": 5`, while
-// client_instance.cpp contains no rate-limiting code at all — the same for
-// --max-connections and --idle-timeout.  An operator reading `show` was told a
-// control was in force that did not exist, which is worse than not having it.
-//
-// --maxmemory and --eviction were already refused here, so the shape of the
-// answer is the established one; these three simply escaped it.
-//
-// Refused rather than implemented, deliberately.  Each of them CAN be given a
-// meaning on a client, and each meaning is a decision rather than a
-// translation: an outbound throttle has to say what becomes of a message that
-// may not go yet — queue it (and report success for something that leaves in
-// ten seconds), fail the send, or drop it — and an idle timeout has to say what
-// happens next, since every connection loss in this runtime goes through
-// drop_connection() into schedule_reconnect(), so closing on idle reconnects
-// immediately and is churn rather than a saving.  Those are features to design,
-// not gaps to plug, and until one exists the honest answer is no.
+// Three flags that describe inbound traffic are refused on a client, which
+// accepts none, because they were stored and reported by `show` while no code
+// implemented them -- and giving each a meaning on a client is a feature to
+// design rather than a gap to plug.
 static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
                                           const char* flag, const char* why)
 {
@@ -56,60 +35,21 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
-        // Run this runtime inside the daemon rather than in a process of its
-        // own.  The only flag for where a runtime runs, and it names the
-        // non-default state — a runtime with no such flag gets its own worker
-        // process.
-        //
-        // There were two for a while, `--out-of-process` and `--in-daemon`, one
-        // per side of a boolean.  Two names for one bit means the pair has to be
-        // kept level in the create parser, the edit parser, the precedence rule
-        // and the documentation, and this file has already shown what happens
-        // when it is not: `--out-of-process` reached the common create parser
-        // while its edit refusal stayed behind in parse_proxy_flags, so
-        // `edit proxy x` answered a refusal and `edit server x` answered
-        // "unknown flag" for the same request against the same field.
-        //
-        // Create-time only — see parse_common_edit_flags.
-        //
-        // ─── An AF_UNIX listener instead of a port ──────────────────────────
-        //
-        // Here rather than in the per-type parsers, for the reason
-        // --out-of-process taught (see the comment above): a flag three of the
-        // four types accept, kept in three switches, is three copies that
-        // drift.  parse_listen_flag itself refuses the client, with a pointer
-        // at -t unix:, which is the connect side of the same socket.
+        // One flag for where a runtime runs, naming the non-default state,
+        // because two names for one bit have to be kept level in four places
+        // -- and --listen is here rather than in three per-type parsers for
+        // the same reason.
         case fnv1a("--listen"):
             return parse_listen_flag(instance, pa, i);
 
-        // ─── How many processes serve this one runtime ──────────────────────
-        //
-        // N workers sharing one listening socket through SO_REUSEPORT.  It
-        // exists for one measured reason: a runtime is one process and
-        // therefore one core, and at `concurrent 100x500` the worker sits at
-        // 100% of one core with the rest of the machine idle.  Below that
-        // ceiling there is nothing here to win — a single connection is
-        // platform-latency-bound — so this is a flag for the saturated case and
-        // for no other.
-        //
-        // ─── WHY IT IS ASKED FOR AND NEVER INFERRED ─────────────────────────
-        //
-        // Sharding is correct exactly when nothing is shared between
-        // connections, and that cannot be detected.  Not from the flags, and
-        // not from the script: a Lua table at file scope is the same object
-        // whether the operator meant it as per-connection scratch or as the
-        // room every connection publishes into, and the interpreter cannot tell
-        // those apart either.  So the operator declares it and owns what
-        // follows.
-        //
+        // N workers sharing one listening socket, for the saturated case and
+        // no other, asked for and never inferred, because sharding is correct
+        // exactly when nothing is shared between connections and nothing can
+        // detect that.
         // ─── WHO MAY DECLARE IT ─────────────────────────────────────────────
-        //
-        // The whole rule, with the reason for each half, is in
-        // shards_config_refusal (runtime_definitions.h) and not repeated here:
-        // it is asked from five places and a second copy of the reasoning is a
-        // copy that drifts.  In one line each — a proxy may and a server may,
-        // with or without --lua, because what a script can ask for now crosses
-        // a shard boundary; a cache and a client may not at all.
+        // The whole rule with the reason for each half is in
+        // shards_config_refusal, asked from five places, so a second copy of
+        // the reasoning is a copy that drifts.
         case fnv1a("--shards"):
         {
             if (i + 1 >= pa.count)
@@ -125,22 +65,9 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
 
-            // Bounded rather than trusted, and the type rule with it.  Both
-            // come from shards_config_refusal, which is the one place the
-            // question is answered -- see runtime_definitions.h.
-            //
             // Asked here with only the facts that cannot change further along
-            // the command line: the type, and the number just parsed.  The rest
-            // of what it wants -- a --listen path -- may be typed AFTER this
-            // flag, so asking about it here would make the answer depend on the
-            // order the operator typed.  The whole question is asked again in
-            // cmd_create once every flag has been seen, exactly where the TLS
-            // set is checked and for the same reason.
-            //
-            // --lua used to be one of those, and was the sharpest of them: a
-            // scripted server was refused, so `--shards 4 --lua x` and
-            // `--lua x --shards 4` had to reach the same answer.  It is no
-            // longer part of the question at all.
+            // the command line, because a --listen path may be typed after
+            // this flag and the whole question is asked again in cmd_create.
             if (const std::string msg = shards_config_refusal(
                     instance->get_type(), n, {}); !msg.empty())
             {
@@ -195,34 +122,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             instance->set_write_file(pa.args[++i]);
             return 0;
 
-        // ─── RECORDED HERE, LOADED BY THE CALLER ────────────────────────────
-        //
-        // This used to call load_lua_script() on the spot, and that made a
-        // create mean different things depending on where on the command line
-        // it was written.  Loading a script builds the interpreter, runs the
-        // file's top level and snapshots the `self` table — name, port, type,
-        // state — out of the instance AS IT IS AT THAT MOMENT.  So:
-        //
-        //     create server s --lua x.lua -p 9000    self.port == 0, forever
-        //     create server s -p 9000 --lua x.lua    self.port == 9000
-        //
-        // for the same runtime, with `socketley.get("s").port` answering 9000
-        // in both — so a script could not even detect the case by comparing.
-        // A script that binds its behaviour to self.port, which is what the
-        // field is for, silently did the wrong thing for one of the two
-        // spellings and nothing anywhere said so.
-        //
-        // The rule it breaks is stated in cmd_create, where a pre-scan for
-        // --daemon-process used to enforce it: "A create whose behaviour
-        // depends on argument order is a bug waiting for someone to reorder a
-        // command line."  That pre-scan is gone with its flag -- where a
-        // runtime runs has one answer now -- but this half remains, because
-        // loading the script is the only step in a create that reads the
-        // configuration back, and it is therefore the only flag that has to be
-        // acted on late.
-        //
-        // `edit` never had this: cmd_edit applies every field from its parsed
-        // config and only then reloads.
+        // Recorded here and loaded by the caller, because loading snapshots
+        // the `self` table as the instance is at that moment, so `--lua x.lua
+        // -p 9000` and `-p 9000 --lua x.lua` gave one runtime two different
+        // self.port values.
         case fnv1a("--lua"):
             if (i + 1 >= pa.count)
             {
@@ -357,21 +260,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // ── TLS ──
-        // Stored for the roles that perform a handshake — a server's and a
-        // cache's own listener, a client's outbound socket, a proxy's two legs
-        // — and refused for a runtime type that would answer cleartext on an
-        // endpoint `inspect` reports as encrypted.  Every type in the enum
-        // handshakes today; the gate stays because the next one added will not,
-        // and failing at the point the flag is typed is the only place the
-        // operator is still looking.
-        //
-        // Whether the *set* is complete — --tls with a key pair, a key pair
-        // with --tls, and on a cache whether it also replicates in cleartext —
-        // cannot be decided here, because the flag that completes it may be
-        // further along the command line.  cmd_create asks that once parsing is
-        // done, and runtime_instance::start() asks it again for configurations
-        // that never went through a command line at all.
+        // Stored for the roles that perform a handshake and refused for a type
+        // that would answer cleartext on an endpoint `inspect` calls
+        // encrypted, while whether the set is complete is decided once parsing
+        // is done.
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {
@@ -419,22 +311,10 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         }
 
         // ── Where this runtime's I/O runs ────────────────────────────────────
-        // --cpus takes `max`, a range, or a list: max | 0-3 | 0,1,2,3 | 0-1,3.
-        //
-        // A set this machine cannot satisfy is refused here rather than rounded
-        // up to "all".  Pinning to a CPU that does not exist is the mistake this
-        // flag makes easy — a config written for a 16-core box, deployed on a
-        // four-core one — and the silent version of it is worse than the loud
-        // one: the runtime runs, it just runs nowhere near where its operator
-        // believes, and every measurement taken afterwards is measuring
-        // something else.
-        //
-        // There is deliberately no --rings to go with this.  A ring is a queue
-        // between one thread and the kernel, so a count of rings is only ever a
-        // count of I/O threads wearing a disguise, and two rings on one thread
-        // are strictly worse than one — more submission state, no more
-        // parallelism.  The honest knob is which CPUs the thread may use, and
-        // that is this one.
+        // --cpus takes max, a range or a list, refusing a set this machine
+        // cannot satisfy rather than rounding up to "all" -- and there is
+        // deliberately no --rings, because a count of rings is a count of I/O
+        // threads in disguise.
         case fnv1a("--cpus"):
         {
             if (i + 1 >= pa.count)
@@ -453,13 +333,9 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Opt in to the io_uring submission poller for this runtime's ring.
-        //
-        // It costs a kernel thread that spins on the submission queue for as
-        // long as the ring exists, which is why it is not the default and why it
-        // is per runtime rather than per daemon: a runtime saturating a link
-        // wants its submissions to be a store to a tail pointer, and the three
-        // idle ones next to it want their core back.
+        // Opt in to the submission poller for this runtime's ring, per runtime
+        // rather than per daemon, because it costs a kernel thread that spins
+        // for as long as the ring exists.
         case fnv1a("--sqpoll"):
             instance->set_sqpoll(true);
             return 0;
@@ -507,17 +383,9 @@ bool parse_cache_mode(uint32_t hash, cache_mode& mode)
     }
 }
 
-// `--listen unix:/path/to.sock` — an AF_UNIX listener instead of a port.
-//
-// Shared by create and edit so the two cannot disagree about what the flag
-// accepts; the difference between them is only when it takes effect.  Returns
-// 0 on success, 1 with a message on refusal, and advances `i` past the value.
-//
-// Every refusal here is a configuration-time one on purpose.  The kernel
-// truncates a path of 108 bytes or more without saying so, and a trimmed path
-// names a different socket — very possibly a real one that something else is
-// serving — so this is the last point at which the operator can be told which
-// socket they actually asked for.
+// `--listen unix:/path`, shared by create and edit so the two cannot disagree,
+// refusing at configuration time because the kernel truncates a path of 108
+// bytes without saying so and a trimmed path names a different socket.
 std::string validate_listen_value(std::string_view value, std::string& out)
 {
     if (!value.starts_with("unix:"))
@@ -637,13 +505,9 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                 return 1;
             }
             std::string_view upstream_str = pa.args[++i];
-            // Parse semicolon-separated: "host1:port1;host2:port2"
-            //
-            // A refused address fails the whole flag rather than being skipped:
-            // `--upstream a:8080;b:abc` asked for two targets, and coming up
-            // with one of them is the silent half-configuration this refusal
-            // exists to stop.  The instance is discarded by the caller on a
-            // non-zero return, so the partly-filled list goes with it.
+            // A refused address fails the whole flag rather than being
+            // skipped, because coming up with one of two requested targets is
+            // a silent half-configuration.
             size_t start = 0;
             size_t semi;
             while ((semi = upstream_str.find(';', start)) != std::string_view::npos)
@@ -686,11 +550,9 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
                 std::cout << "-t requires a target address\n";
                 return 1;
             }
-            // A unix: target is judged now, not at dial time: the path rules
-            // are the listener's (shared/unix_listener.h), and this is the
-            // last point at which the operator is told which socket they
-            // actually asked for.  Anything else stays a free-form host:port
-            // — hostnames cannot be validated here.
+            // A unix: target is judged now and not at dial time, because this
+            // is the last point at which the operator is told which socket
+            // they asked for.
             ++i;
             if (std::string_view v = pa.args[i]; v.starts_with("unix:"))
             {
@@ -850,20 +712,10 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 return 1;
             }
             {
-                // The value is written into a GET request line as it stands, so
-                // anything that is not a path produces a request the backend
-                // cannot parse — which comes back as a failed health check, and
-                // every backend goes down for a reason that is a typo in a flag
-                // nobody thinks to re-read.
-                //
-                // Only the leading slash is checked, and that is deliberate:
-                // parsed_args splits the command line on whitespace before this
-                // runs, so `--health-path "/a b"` never arrives here as one
-                // argument — it arrives as `/a` followed by an unknown flag `b`,
-                // which is already refused one layer up.  A whitespace check
+                // Only the leading slash is checked, because parsed_args
+                // splits on whitespace before this runs, so a whitespace check
                 // here would be unreachable code with a comment claiming it
-                // guarded something.  Measured: the daemon answers
-                // "unknown flag: b".
+                // guarded something.
                 const std::string_view hp = pa.args[i + 1];
                 if (hp.empty() || hp.front() != '/')
                 {
@@ -928,12 +780,9 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             proxy->set_circuit_timeout(val);
             return 0;
         }
-        // How long a backend may take to produce the first byte of a response.
-        // Defaulted rather than opt-in: a backend that accepts and then stops
-        // answering is invisible to every other check the proxy has, so an
-        // operator who has never heard of this flag is exactly the one it has to
-        // protect.  0 is accepted and restores the old unbounded wait, but it is
-        // a decision someone has to take deliberately.
+        // How long a backend may take to produce the first byte, defaulted
+        // rather than opt-in because an operator who has never heard of this
+        // flag is the one it has to protect.
         case fnv1a("--backend-timeout"):
         {
             if (i + 1 >= pa.count)
@@ -973,17 +822,9 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
         case fnv1a("--retry-all"):
             proxy->set_retry_all(true);
             return 0;
-        // ── mTLS, both directions ──
-        //
-        // --client-ca is the listener's: the CA a certificate presented *by a
-        // client* has to be signed by, so it goes with --tls --cert --key.
-        // --client-cert/--client-key are the backend leg's: the certificate
-        // this proxy presents to a backend that asks for one.
-        //
-        // Which of those is complete, and whether the listener they describe
-        // is encrypted at all, is decided once parsing is done — the flag that
-        // completes a pair may be further along the command line.  See
-        // tls_config_refusal.
+        // --client-ca is the listener's and --client-cert/--client-key are the
+        // backend leg's, with completeness decided once parsing is done
+        // because the flag that completes a pair may be further along.
         case fnv1a("--client-ca"):
         case fnv1a("--client-cert"):
         case fnv1a("--client-key"):
@@ -1117,16 +958,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 {
     switch (pa.hashes[i])
     {
-        // Refused rather than ignored.  Honouring it would mean moving a
-        // configured runtime from one address space to another underneath
-        // whatever is already pointing at it, and quietly dropping it would
-        // leave the operator believing a runtime is isolated when it is not.
-        //
-        // Same rule as `-p`, and for a sharper reason: a running runtime is
-        // bound to the socket node it has, so moving it would mean binding a
-        // second path underneath whatever is already connected and leaving the
-        // first node for a teardown that never comes.  Common rather than
-        // per-type for the --out-of-process reason: three switches, one flag.
+        // Refused rather than ignored, because a running runtime is bound to
+        // the socket node it has and moving it would leave the first node for
+        // a teardown that never comes.
         case fnv1a("--listen"):
             if (is_running)
             {
@@ -1135,16 +969,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             }
             return parse_listen_flag(instance, pa, i);
 
-        // Editable, and refused while running like -p below.  The shard count
-        // is read once, when the workers are forked, so changing it on a
-        // stopped runtime is exactly as safe as changing its port and takes
-        // effect the same way — at the next start.
-        //
-        // Refused while running rather than applied, because applying it means
-        // forking or retiring workers under live connections, and there is no
-        // answer yet for what happens to the connections a retired shard is
-        // holding.  Whatever that answer turns out to be, it is a decision and
-        // not a side effect of an `edit`.
+        // Editable and refused while running, because applying it means
+        // forking or retiring workers under live connections and there is no
+        // answer yet for the connections a retired shard holds.
         case fnv1a("--shards"):
         {
             if (is_running)
@@ -1164,9 +991,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 return 1;
             }
             // --listen can be typed further along this same command line, so
-            // it is left to the set check in cmd_edit rather than read here,
-            // and this asks the half of the question whose inputs are already
-            // final.
+            // this asks only the half of the question whose inputs are final.
             if (const std::string msg = shards_config_refusal(
                     instance->get_type(), n, {}); !msg.empty())
             {
@@ -1331,21 +1156,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Same rule as the create path — and this is the path that matters
-        // most, because `edit` is where an operator goes to put TLS on
-        // something that is already serving traffic.  Every runtime type takes
-        // them today; a type that did not would be refused with the reason
-        // rather than falling through to the generic "unknown flag", which
-        // gave that operator the same exit status and a wrong explanation: it
-        // reads as a typo, so the answer to it is to try again with different
-        // spelling, not to go and terminate TLS somewhere else.
-        //
-        // The edit takes effect at the next start; the completeness check for
-        // the resulting set is made there, on whatever the runtime is carrying
-        // by then, and not on this one flag.  That is also where a cache that
-        // would end up encrypted *and* replicating is caught — cmd_edit
-        // re-asks tls_config_refusal with the whole configuration and puts the
-        // old values back if it refuses.
+        // Same rule as the create path, and the path that matters most,
+        // because a generic "unknown flag" reads as a typo and sends the
+        // operator to try a different spelling.
         case fnv1a("--tls"):
             if (!tls_role_has_handshake(instance->get_type()))
             {
@@ -1380,11 +1193,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Neither is editable, and the reason is not a policy this daemon
-        // chose: io_uring fixes a ring's flags and its poller's CPU when the
-        // ring is created and offers nothing to change them with afterwards.
-        // Accepting the edit would store a value that the next `stats` would
-        // then contradict.
+        // Neither is editable, because io_uring fixes a ring's flags at
+        // creation and accepting the edit would store a value the next `stats`
+        // contradicts.
         case fnv1a("--cpus"):
         case fnv1a("--sqpoll"):
         case fnv1a("--no-sqpoll"):
@@ -1480,10 +1291,8 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
                 return 1;
             }
             std::string_view upstream_str = pa.args[++i];
-            // Same contract as the create path above.  On `edit` the list has
-            // already been cleared by the time this runs, so a refusal here
-            // leaves the runtime with fewer upstreams than it started with —
-            // which is why it is reported rather than skipped, and why the
+            // Same contract as the create path, except that on `edit` the list
+            // is already cleared, so a refusal leaves fewer upstreams and the
             // message names the address that could not be read.
             size_t start = 0;
             size_t semi;
@@ -1656,20 +1465,9 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 return 1;
             }
             {
-                // The value is written into a GET request line as it stands, so
-                // anything that is not a path produces a request the backend
-                // cannot parse — which comes back as a failed health check, and
-                // every backend goes down for a reason that is a typo in a flag
-                // nobody thinks to re-read.
-                //
-                // Only the leading slash is checked, and that is deliberate:
-                // parsed_args splits the command line on whitespace before this
-                // runs, so `--health-path "/a b"` never arrives here as one
-                // argument — it arrives as `/a` followed by an unknown flag `b`,
-                // which is already refused one layer up.  A whitespace check
-                // here would be unreachable code with a comment claiming it
-                // guarded something.  Measured: the daemon answers
-                // "unknown flag: b".
+                // The value is written into a GET request line as it stands,
+                // so anything that is not a path fails every health check for
+                // what is a typo in a flag nobody re-reads.
                 const std::string_view hp = pa.args[i + 1];
                 if (hp.empty() || hp.front() != '/')
                 {

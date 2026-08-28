@@ -57,17 +57,9 @@ static uint16_t load_daemon_config(const std::string& config_path)
     sol::state lua;
     lua.open_libraries(sol::lib::base, sol::lib::string);
 
-    // Bounded like every other chunk in this process — see lua_deadline in
-    // lua_context.h.  This one runs before the socket is bound and before a
-    // single runtime exists, so a config file that does not return does not
-    // freeze a serving daemon; it stops one from ever starting, and under a
-    // service manager that is a start timeout and a restart loop with the log
-    // line missing.  With the bound it is a named error and a daemon that comes
-    // up on its defaults.
-    //
-    // The process default rather than a `callback_timeout_ms` of the config's
-    // own: this file configures the daemon, not a runtime, and the variable
-    // that would set it is read out of the same environment this is.
+    // Bounded like every other chunk in this process, against the process
+    // default rather than a `callback_timeout_ms` of the config's own, because
+    // this file configures the daemon and not a runtime.
     auto result = [&] {
         lua_deadline::install(lua.lua_state(), lua_deadline::default_ms());
         lua_deadline::scope guard("the daemon configuration file",
@@ -103,73 +95,11 @@ static uint16_t load_daemon_config(const std::string& config_path)
     return metrics_port;
 }
 
-// ─── ADOPTING WHAT AN UPGRADE WOULD OTHERWISE HAVE ORPHANED ─────────────────
-//
-// paths.cpp now keys the state directory to the socket path whenever that path
-// is not the default one.  For every deployed daemon that changes nothing —
-// they run on the default path and their directory is where it always was — but
-// a daemon that has been running for months behind a fixed SOCKETLEY_SOCKET,
-// with real runtimes behind it, would come up after the upgrade looking at a
-// directory that has never existed.  Every runtime gone, no error, nothing to
-// go and read.  That is not an acceptable way to ship a path change.
-//
-// So the first time a keyed directory is used, whatever was in the directory it
-// used to share is copied into it.  Once.
-//
-// WHY COPY RATHER THAN READ THROUGH.  Reading the old directory whenever the
-// new one is empty is the smaller change and it is worse in two ways.  It never
-// ends: the daemon keeps reading the old directory every boot, so the two
-// daemons sharing it keep seeing each other's runtimes for ever, which is the
-// defect this is supposed to close.  And it ends abruptly when it does end —
-// the first runtime created in the new directory makes it non-empty, and every
-// legacy runtime disappears in that instant, triggered by an unrelated action.
-// A copy has no cliff and leaves one directory to look at afterwards instead of
-// two.  The originals are not touched, so an older binary rolled back onto this
-// machine finds exactly what it has always found.
-//
-// EXACTLY ONCE, and marked on disk rather than inferred.  "The new directory is
-// empty" is not a safe trigger on its own: an operator who removes every
-// runtime empties it again, and the next restart would resurrect the very
-// runtimes they had just deleted.  The marker also cannot be inferred from the
-// directory not existing yet, because every CLI command resolves paths too and
-// creates it — `SOCKETLEY_SOCKET=... socketley ps` would have consumed the one
-// chance before the daemon it auto-starts ever looked.
-//
-// ─── AND ONLY WHEN NOBODY IS STILL USING THEM ───────────────────────────────
-//
-// Disk state cannot tell the upgrade apart from the disaster.  "Keyed directory
-// empty, legacy directory populated" describes the daemon that has been running
-// for months behind a fixed SOCKETLEY_SOCKET — adopt, that is the whole point —
-// and it equally describes a brand new second daemon started beside a live one,
-// where adopting means binding the running daemon's ports.
-//
-// Which is the arrangement an operator debugging next to production actually
-// has, and it took one command to reach.  Measured, before this check, on a box
-// whose default-path daemon was serving collide_a on :19781:
-//
-//     SOCKETLEY_SOCKET=$HOME/b.sock socketley ls
-//
-//     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458701,fd=6))
-//     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458349,fd=6))
-//
-// Two daemons on one port, and the second holding a copy of the first's state
-// file that `remove` would delete — which is the transcript this whole change
-// exists to prevent, produced by the repair for it.
-//
-// The discriminator is not on disk, it is on the socket: whoever is serving the
-// default path owns the legacy directory.  Anything other than `absent` there
-// means those runtimes are in use, and nothing is adopted.  A short deadline is
-// deliberate and safe in one direction only — a slow daemon degrades to `mute`,
-// never to `absent`, because `absent` means connect() was refused — so the
-// worst a busy box can do is decline an adoption it would have declined anyway.
-//
-// A DECLINE IS NOT A DECISION, so it does not write the marker.  A successful
-// adoption is permanent because the question has been answered; "somebody else
-// is using them right now" is a fact about this minute, and a daemon whose
-// upgrade happened to coincide with a stray default-path daemon deserves to
-// adopt on the next boot once that daemon is gone.  It says so, loudly, with
-// both directories named, because the operator reading it is the one whose
-// runtimes appear to have vanished.
+// The first time a keyed state directory is used, whatever was in the
+// directory it used to share is copied into it once -- marked on disk rather
+// than inferred, and only when nobody is serving the default socket, because
+// "keyed empty, legacy populated" equally describes a second daemon started
+// beside a live one.
 static void adopt_legacy_state(const socketley_paths& paths)
 {
     namespace fs = std::filesystem;
@@ -218,12 +148,8 @@ static void adopt_legacy_state(const socketley_paths& paths)
         return;
     }
 
-    // Asked before the socket is, and answered permanently.  An empty legacy
-    // directory is "nothing to adopt", full stop — not an error and not a
-    // reason to come back later.  It is also the ordinary state of a box that
-    // has only ever run keyed daemons, because resolve() creates the base
-    // directory whether or not anything will use it, so an empty one it made
-    // itself and an empty one a daemon emptied read the same and mean the same.
+    // An empty legacy directory is nothing to adopt, full stop, which is also
+    // the ordinary state of a box that has only ever run keyed daemons.
     const size_t available = count_json(paths.legacy_state_dir);
     if (available == 0)
     {
@@ -238,9 +164,8 @@ static void adopt_legacy_state(const socketley_paths& paths)
 
     if (owner != socketley::daemon_identity::absent)
     {
-        // Loud, and naming both directories: to the operator this looks exactly
-        // like the runtimes vanishing, and the log is the only place that can
-        // say otherwise.  No marker — see the note above.
+        // Loud and naming both directories, because to the operator this looks
+        // exactly like the runtimes vanishing, and no marker is written.
         LOG_WARN(("state: NOT adopting " + std::to_string(available) +
                   " runtime(s) from " + paths.legacy_state_dir.string() +
                   " into " + paths.state_dir.string() +
@@ -331,31 +256,15 @@ static void restore_runtimes(state_persistence& persistence,
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
                                   : runtime_instance::child_policy::stop);
 
-        // Every runtime comes back in a process of its own, whatever the state
-        // file says, because that is now the only place a runtime runs.
-        //
-        // Unconditional rather than `if (cfg.out_of_process)`, and the
-        // difference is what happens to a file written before the flag was
-        // removed: `"out_of_process": false` in it described a runtime that
-        // stayed in the daemon, and honouring that would restore an
-        // arrangement this build no longer has a way to create, test or
-        // support.  It comes back as a worker, which is what a fresh create of
-        // the same runtime would produce.
-        //
-        // Before start(), which reads it to decide whether to arm anything.
+        // Every runtime comes back in a process of its own whatever the state
+        // file says, unconditionally, because honouring `"out_of_process":
+        // false` would restore an arrangement this build cannot create or
+        // test.
         instance->mark_out_of_process();
 
-        // What this runtime asked its I/O to run as.  Restored before start(),
-        // which is where the request meets the ring: this daemon's ring was
-        // created from the environment it was launched with, and there is no
-        // reason that has to be the environment the request was accepted under.
-        //
-        // A set this machine no longer has is dropped with a warning rather
-        // than refused: the alternative is a daemon that will not restore a
-        // runtime because the box it was moved to has fewer cores, and the
-        // request is a requirement about the ring, not about this runtime's
-        // ability to exist.  Dropping it means start() checks nothing, which is
-        // the same position a runtime that never asked is in.
+        // What this runtime asked its I/O to run as, restored before start(),
+        // with a set this machine no longer has dropped with a warning rather
+        // than refused.
         if (!cfg.cpus.empty())
         {
             cpu_set_spec spec;
@@ -379,40 +288,14 @@ static void restore_runtimes(state_persistence& persistence,
                 instance->set_pid(static_cast<pid_t>(cfg.pid));
         }
 
-        // ─── THE COMMON FIELDS, FROM THE ONE LIST ───────────────────────────
-        //
-        // This was a second copy of apply_common_config's list, written out
-        // here.  runtime_config_apply.h opens by saying why there must not be
-        // one — "a second copy of this list would drift, and the failure when
-        // it drifts is a runtime that behaves differently depending on which
-        // side of the process boundary it happens to be running on" — and then
-        // this copy stayed behind, so the file that says the list lives in one
-        // place was wrong about the daemon.
-        //
-        // It had drifted, in both directions:
-        //
-        //   * `shards` was in apply_common_config and NOT here, so a proxy
-        //     created with --shards 4 came back from a daemon restart with one
-        //     worker.  Measured: 6 processes before the restart (daemon, four
-        //     shards, one server worker), 3 after, with `show` no longer
-        //     reporting the field at all.  A quarter of the throughput the
-        //     operator configured, reported by `ls` as running and by nothing
-        //     as wrong — which is word for word what runtime_config's own
-        //     comment on the field predicted.
-        //
-        //   * `listen_path` would have been the next one: it is applied in a
-        //     worker and would have been dropped here, so a server restored
-        //     with --listen unix:... bound nothing and still read as Up.
-        //
-        // `group`, `cpus` and `sqpoll` are set above with restore-specific
-        // handling and are re-applied here identically; that is idempotent and
-        // is cheaper than a rule about which of the two places owns them.
+        // The common fields from the one list, because the second copy that
+        // stood here had drifted -- `shards` was missing, so a four-shard
+        // proxy came back with one worker and `show` stopped reporting the
+        // field.
         apply_common_config(*instance, cfg);
 
-        // Not part of the common list: it belongs to a client, where
-        // apply_typed_config sets it.  This restore still has its own typed
-        // switch below rather than calling that, so the field is applied here.
-        // See the note there.
+        // Not part of the common list because it belongs to a client, and this
+        // restore still has its own typed switch below.
         if (cfg.reconnect >= 0) instance->set_reconnect(cfg.reconnect);
 
         if (!cfg.lua_script.empty())
@@ -421,14 +304,9 @@ static void restore_runtimes(state_persistence& persistence,
                 LOG_WARN("restore: could not load lua script");
         }
 
-        // Type-specific.
-        //
-        // Still a second copy, and knowingly: apply_typed_config deliberately
-        // touches nothing that needs a runtime_manager, and three of the four
-        // cases here wire exactly that.  Untangling it is a change to what a
-        // worker is handed, not to what a restore applies, so it is left where
-        // it is rather than folded in on the way past.  The common list above
-        // is the one that had drifted.
+        // Type-specific, and still a second copy knowingly, because
+        // apply_typed_config touches nothing that needs a runtime_manager and
+        // three of these four cases wire exactly that.
         switch (cfg.type)
         {
             case runtime_server:
@@ -448,11 +326,9 @@ static void restore_runtimes(state_persistence& persistence,
                     srv->set_http_cache(true);
                 for (const auto& u : cfg.upstreams)
                 {
-                    // The boot restore has nobody to refuse to — there is no
-                    // command in flight and refusing the runtime outright would
-                    // take a serving listener down over one bad entry in a file
-                    // an older daemon wrote.  So it is logged and skipped, which
-                    // is the same thing that used to happen without the log.
+                    // The boot restore has nobody to refuse to, so a bad entry
+                    // is logged and skipped rather than taking a serving
+                    // listener down.
                     if (!srv->add_upstream_target(u))
                         LOG_WARN(("restore: dropping upstream \"" + u +
                                   "\" of " + cfg.name +
@@ -471,9 +347,8 @@ static void restore_runtimes(state_persistence& persistence,
             {
                 auto* prx = static_cast<proxy_instance*>(instance);
                 prx->set_runtime_manager(&manager);
-                // Shared with the proxy worker, which rebuilds a proxy from the
-                // same runtime_config arriving over its control socket.  One
-                // list, so the two cannot drift.
+                // Shared with the proxy worker, which rebuilds a proxy from
+                // the same runtime_config, so the two cannot drift.
                 apply_proxy_config(*prx, cfg);
                 break;
             }
@@ -498,11 +373,9 @@ static void restore_runtimes(state_persistence& persistence,
         if (!cfg.was_running)
             continue;
 
-        // Named, because the reason start() gives is printed by start() and a
-        // daemon restoring several runtimes would otherwise report a refusal
-        // with nothing to attach it to.  The runtime is left in `failed`, where
-        // `ls` and `stats` show it — a restore that could not honour what a
-        // runtime asked for must not read as a restore that worked.
+        // Named, because a daemon restoring several runtimes would otherwise
+        // report a refusal with nothing to attach it to, and the runtime is
+        // left `failed` where `ls` shows it.
         if (!manager.start(cfg.name, loop))
             LOG_WARN(("restore: could not start runtime " + cfg.name).c_str());
         else
@@ -510,31 +383,14 @@ static void restore_runtimes(state_persistence& persistence,
     }
 }
 
-// The daemon's own command line: the ring policy, and nothing else yet.
-//
-// These are the process's settings rather than a runtime's, because a ring is
-// fixed when it is created and the process creates one before it has read a
-// single runtime's configuration.  Until now the only thing that could reach
-// init() in time was the environment, so SOCKETLEY_SQPOLL and SOCKETLEY_CPUS
-// were the whole interface — and `socketley daemon` dropped every argument it
-// was handed without a word.  `socketley daemon --sqpoll` started a daemon
-// with no poller and exited 0, which is the shape of trap this flag exists to
-// avoid one level down: a setting accepted and not applied.
-//
-// The environment still works and still means the same thing; the supervisor
-// forks workers with it and a worker has no command line of its own to carry
-// it.  A flag beats it when both are given, because a flag is typed for this
-// one run and an exported variable is usually not typed at all.
-//
-// Returns false when the command line cannot be honoured, having said why.
-// Unknown arguments are refused rather than ignored: an argument the daemon
-// does not understand is either a typo or a setting the operator believes is
-// in effect, and both are worth an exit code.
+// The daemon's own command line, which is the ring policy and nothing else
+// yet, because a ring is fixed at creation and only the environment could
+// reach init() in time -- and unknown arguments are refused rather than
+// ignored.
 static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
 {
-    // argv[0] is the binary and argv[1] is "daemon"; both are ours, not the
-    // operator's.  A daemon started with no arguments at all takes this loop
-    // once and decides nothing, which is what leaves the environment in charge.
+    // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
+    // no arguments decides nothing and leaves the environment in charge.
     for (int i = 2; i < argc; ++i)
     {
         const std::string_view arg = argv[i];
@@ -560,11 +416,9 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
                 std::string err;
                 if (!parse_cpu_set(argv[++i], cpus, err))
                 {
-                    // The same refusal `create --cpus` gives, for the same
-                    // reason: a set this machine cannot satisfy is never
-                    // rounded up to "all", because a daemon running nowhere
-                    // near where its operator believes makes every measurement
-                    // taken afterwards a measurement of something else.
+                    // The same refusal `create --cpus` gives, because a daemon
+                    // running nowhere near where its operator believes makes
+                    // every later measurement a measurement of something else.
                     std::cout << "invalid --cpus value: " << err << "\n";
                     return false;
                 }
@@ -600,40 +454,20 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
 
-    // ...and whether that path is the packaged deployment's, which is what
-    // decides who may open the socket.  Only here: the CLI resolves paths too,
-    // but the CLI never calls setup() and a value it set would be read by
-    // nothing.  See the block in daemon_handler::setup().
-    //
-    // system_mode ALONE is not the question, though it is the obvious spelling
-    // of this line.  It is decided in paths.cpp from the uid and from whether
-    // socketley is installed, and it is decided BEFORE SOCKETLEY_SOCKET moves
-    // the socket —
-    // so root on a machine with the package installed carries system_mode into
-    // a daemon whose socket is a mktemp path in /tmp, and that socket would
-    // then be handed to the `socketley` group.  A test daemon, or any second
-    // daemon, opened to a group nobody meant to invite.
-    //
-    // default_socket_path is the path this namespace resolves to with the
-    // variable out of the picture — the one the deployed daemon binds — so the
-    // two together say "this daemon is the packaged daemon" and nothing less.
-    // Compared as written rather than canonicalised: a deployment that spells
-    // the default path unusually falls to the owner-only side, which is the
-    // safe direction, and no deployment sets the variable at all.
+    // Whether this daemon is the packaged one, decided from system_mode and
+    // the default socket path together, because system_mode alone is settled
+    // before SOCKETLEY_SOCKET moves the socket and would open a temp-path
+    // daemon to the `socketley` group.
     daemon_handler::system_socket =
         paths.system_mode && paths.socket_path == paths.default_socket_path;
 
     // Load config file (sets log level, metrics port, etc.) before anything else
     uint16_t metrics_port = load_daemon_config(paths.config_path.string());
 
-    // And on to whatever this daemon forks.  A worker reads no configuration
-    // file, so until this line every LOG_DEBUG in a worker — and in the runtime
-    // it holds — was unreachable whatever the operator asked for.  Exported
-    // unconditionally, including the default: the rule is that a worker logs at
-    // its daemon's level, and an unset variable would leave the level of a child
-    // depending on what the shell that started the daemon happened to hold.
-    // Here, in the parent and at startup, because a setenv() between the fork
-    // and the exec would allocate in a child that must not.
+    // And on to whatever this daemon forks, exported unconditionally in the
+    // parent at startup, because a worker reads no configuration file and a
+    // setenv between the fork and the exec would allocate in a child that must
+    // not.
     export_log_level(logger::g_level);
 
     // If another daemon is already running on this socket, exit gracefully
@@ -646,18 +480,14 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         return 1;
     }
 
-    // Give the cross-runtime request channel its ring.  Until this happens it
-    // refuses every request, so it has to come before any runtime is restored
-    // — a server with --cache posts on its first message, and the first message
-    // can arrive inside restore.  See shared/request_channel.h.
+    // Give the cross-runtime request channel its ring before any runtime is
+    // restored, because a server with --cache posts on its first message and
+    // that message can arrive inside restore.
     manager.requests().attach(loop);
 
-    // Which directory this daemon's runtimes live in, said out loud, once, at
-    // startup.  "Where does my state live" is a question an operator asks
-    // exactly once and at the worst possible moment, and the daemon log is
-    // where they are already looking when they ask it.  Under the rule in
-    // paths.cpp the answer depends on the socket path, so it cannot be a
-    // constant in the man page any more — it has to come from the process.
+    // Which directory this daemon's runtimes live in, said once at startup,
+    // because the answer now depends on the socket path and cannot be a
+    // constant in the man page.
     LOG_INFO(("state directory: " + paths.state_dir.string()).c_str());
 
     // Before load_all(): an upgrade that keys this daemon's state directory to
@@ -708,26 +538,19 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     loop.run();
 
-    // Still with a live ring: every teardown cancels the operations hanging off
-    // its descriptors and withdraws its own timers, and all of that is
-    // submitted.  run() used to end the ring on its way out, so the first
-    // runtime this stopped submitted into an unmapped submission queue — a
-    // segfault on every SIGTERM that found a runtime still running.
+    // Still with a live ring, because every teardown submits, and run() ending
+    // the ring on its way out was a segfault on every SIGTERM that found a
+    // runtime running.
     manager.stop_all(loop);
 
-    // Still with a live ring, and after stop_all so that nothing can post
-    // again: every request the channel is still carrying is answered `dropped`
-    // and its owner registration goes back.  A request left queued here is an
-    // origin waiting on a reply that the ring, about to be unmapped, can no
-    // longer produce a wakeup for.
+    // Still with a live ring and after stop_all so nothing can post again,
+    // because a request left queued is an origin waiting on a wakeup the
+    // unmapped ring can no longer produce.
     manager.requests().detach();
 
-    // Nothing more will be submitted, so the ring can go — and it has to go
-    // before anything is freed, because until it does the kernel may still be
-    // writing into the read buffers of connections a retired instance is
-    // holding on to.  With it gone, no completion can reference a retired
-    // runtime's storage, which makes this the one point we can prove is safe to
-    // free the instances that removal deliberately kept alive.
+    // Nothing more will be submitted, so the ring goes before anything is
+    // freed, which is the one point we can prove is safe to release the
+    // instances removal kept alive.
     loop.shutdown_ring();
 
     manager.free_retired();
