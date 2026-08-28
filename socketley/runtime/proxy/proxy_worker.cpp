@@ -37,199 +37,70 @@
 namespace
 {
 
-// How often the worker publishes its figures.  Short enough that `stats` and
-// the metrics endpoint are answering about the present, long enough that a busy
-// proxy is not spending its event loop building strings: the detail text is
-// produced by get_stats(), which walks the connection tables.
-//
-// The number itself is in worker_protocol.h now, because the daemon needs it
-// too: these frames are where the connection counts in the runtime map come
-// from, and the daemon coalesces its map pushes to the same period.
-// The shared shard table, at the number proxy_supervisor::spawn dup2'd it onto.
-// Named twice on purpose — the daemon's constant is in proxy_supervisor.cpp and
-// this is the worker's — because the two sides are different processes and the
-// number is the whole of the contract between them; a header shared for one
-// integer would hide that.  If these ever disagree, the worker finds no
-// descriptor and reports that it will answer only for itself, which is the
-// loudest a mismatch here can be made without inventing a handshake.
+// How often the worker publishes its figures, defined in worker_protocol.h
+// because the daemon coalesces its map pushes to the same period -- and the
+// shard table's descriptor number, named on both sides on purpose, because the
+// number is the whole of the contract between two processes.
 constexpr int worker_shard_fd = 4;
 
-// And the client-list region; see shard_clients.h.  Same contract, same reason
-// it is named on both sides rather than shared through a header.
+// And the client-list region, on the same contract and named on both sides for
+// the same reason.
 constexpr int worker_clients_fd = 5;
 
-// The control plane, at the number proxy_supervisor::spawn dup2'd it onto.
-// socketley.create/.start/.stop/.remove travel here and their answers come
-// back; nothing else uses this descriptor and nothing arms it on the ring.
-//
-// ─── WHY THIS IS A SECOND SOCKET AND NOT THE CONTROL ONE ────────────────────
-//
-// Because this process has to BLOCK on the answer, and the control socket is
-// the one descriptor here it cannot block on.  Its writes are queued and
-// submitted by the ring at the end of a turn — see frame_writer::use_ring — so
-// a blocking wait mid-turn waits for an answer to a request still sitting in a
-// buffer, for ever.  Its reads are a standing ring recv into m_ctl_buf, so a
-// direct ::read racing that recv splits one frame between two consumers and the
-// halves reach take_frame() in whichever order the completions are dispatched.
-//
-// A descriptor nothing has armed has neither problem.
-//
-// Absent is not an error: an older daemon forks a worker without it, and the
-// four calls keep the refusal they have always had rather than hanging.  Tested
-// with fcntl rather than announced in a frame, for the reason worker_shard_fd
-// gives — the number IS the contract.
+// The control plane, a second socket because this process has to block on the
+// answer and the control socket's writes queue for the ring while its reads
+// are a standing recv -- absent is not an error but the refusal an older
+// daemon's worker has always had.
 constexpr int worker_map_fd = 6;
 
 // And the mesh block, which must agree with proxy_supervisor's
-// child_mesh_base: slot j is this shard's link to shard j, and the slot at its
-// own index is never placed.  Absent is the ordinary case — an unsharded
-// runtime, or one the daemon could not mesh — and it means "relay", not
-// "error".  See shared/shard_mesh.h.
+// child_mesh_base, where absent means relay rather than error.
 constexpr int worker_mesh_base = 8;
 
 constexpr auto stats_interval =
     std::chrono::milliseconds(worker_proto::stats_interval_ms);
 
-// ─── The ceiling on a wait that nothing is waiting for ──────────────────────
-//
-// Once the figures moved into shared memory the worker owes nobody a
-// heartbeat: the counters are summed by whoever prints them and the text that
-// is still pushed is pushed when it CHANGES.  A worker with an empty ring and
-// nothing to say therefore has no deadline at all, and the honest wait is
-// "until something happens".
-//
-// poll_completions() has no such argument — a non-positive timeout means peek
-// and return — so the wait is a long finite one instead.  Thirty seconds is
-// 0.03 wakeups a second, which is under a thousandth of the 50 Hz this loop
-// used to run at and under a hundredth of the 4 Hz that replaced it.
-//
-// It is a backstop and not a schedule.  Nothing is known to need it: every
-// state in which the ring cannot end this wait on its own is enumerated at the
-// wait itself and each one clamps to ctl_fallback_ms.  It is here because that
-// enumeration is a claim about code that will keep changing, and the cost of
-// being wrong about it — a worker that sleeps through a frame for ever — is
-// out of proportion to 0.03 wakeups a second.
+// A backstop and not a schedule: a worker with nothing to say has no deadline,
+// and poll_completions() has no infinite wait, so thirty seconds is 0.03
+// wakeups a second against the cost of sleeping through a frame for ever.
 constexpr int idle_wait_ms = 30000;
 
-// The longest the worker's loop will wait when it has no notification it can
-// trust — the two states named at the wait in run().  It is the constant that
-// wait used to use unconditionally; keeping it here rather than inlining it is
-// so the fallback and the thing it replaces are visibly the same number.
+// The longest the loop will wait when it has no notification it can trust,
+// kept as a constant so the fallback and the thing it replaces are visibly the
+// same number.
 constexpr int ctl_fallback_ms = 20;
 
-// ─── How long a map call may hold this worker's event loop ──────────────────
-//
-// socketley.create/.start/.stop/.remove block until the daemon answers.  What
-// bounds the answer is the daemon's own work, and the longest of it is known:
-// a `start` forks a child and waits for it to report that it is serving, under
-// worker_startup_bound — 2000 ms in daemon_handler.cpp.  This is that, with
-// room for the daemon to reach the request and for the reply to come back.
-//
-// It is a ceiling on a wrong answer, not on the daemon's work.  Timing out does
-// not cancel anything: the create still happens, and the script is told `false`
-// for something that succeeded a moment later.  That is the failure mode to
-// keep in mind if this number is ever tuned down — which is why it is above the
-// daemon's bound rather than level with it.
-//
-// The whole cost of a call that does NOT wait on a child is 9.95 / 10.20 /
-// 10.52 us over three runs of 20000; see encode_map_request in
-// worker_protocol.h for what that was measured against.
+// How long a map call may hold this worker's loop, above the daemon's own 2000
+// ms bound because timing out cancels nothing -- the create still happens and
+// the script is told false for something that succeeded.
 constexpr int map_wait_ms = 5000;
 
-// SIGTERM asked for, and not yet acted on.
-//
-// The supervisor's shutdown() writes a shutdown frame, closes the socket and
-// signals, in that order and without waiting — the daemon's event-loop thread
-// does not block on a child.  With the default disposition the signal won this
-// race: the worker died where it stood, mid-unwind, and everything stop() does
-// on the way out was skipped.  What that cost was visible from outside as a Lua
-// `on_stop` callback that never ran for a runtime in a worker and always ran
-// for one in the daemon, for the same `socketley stop`.
-//
-// Caught rather than ignored: the flag ends the loop on its next turn, which is
-// the same path the shutdown frame takes, so there is one way out and not two.
-// A worker that will not unwind is not left running — the supervisor escalates
-// to SIGKILL five seconds after the SIGTERM.
+// SIGTERM asked for and not yet acted on, caught rather than ignored so the
+// shutdown frame and the signal take one path out -- with the default
+// disposition the worker died mid-unwind and on_stop never ran.
 volatile sig_atomic_t g_term_requested = 0;
 
-// How long an unwind may take before this process stops waiting for itself.
-//
-// Five seconds because that is already the bound: reap_orphan_workers()
-// escalates a SIGTERM to SIGKILL five seconds later, so a worker that has not
-// finished by then is killed today.  What the alarm changes is who enforces it
-// — the daemon cannot, when the daemon is what died — and the note above
-// claim_current_daemon() is where the reason for needing that lives.
+// How long an unwind may take before this process stops waiting for itself,
+// five seconds because that is already the supervisor's escalation -- what the
+// alarm changes is who enforces it when the daemon is what died.
 constexpr unsigned worker_term_grace_sec = 5;
 
 extern "C" void worker_on_term(int)
 {
     g_term_requested = 1;
 
-    // The flag above is read at the top of run()'s loop, so it only ends a
-    // worker that reaches the top of its loop.  One that does not — wedged in a
-    // callback, or blocked — keeps its share of the listening socket, and after
-    // PR_SET_PDEATHSIG below that is precisely the case this signal is being
-    // used to answer: the daemon is gone and there is nobody left to escalate.
-    //
-    // alarm(2) is async-signal-safe and SIGALRM's default action terminates, so
-    // this needs no second handler and cannot itself wedge.  Re-arming on a
-    // repeated SIGTERM is deliberate: each ask restarts the grace period, which
-    // is what the supervisor's own escalation does.
+    // The flag only ends a worker that reaches the top of its loop, so a
+    // wedged one keeps its share of the listening socket, and alarm(2) is
+    // async-signal-safe with a default action that terminates.
     ::alarm(worker_term_grace_sec);
 }
 
 // ─── Whose worker is this ───────────────────────────────────────────────────
-//
-// SO_REUSEPORT shares a port between any number of sockets and does not ask
-// where they came from.  A worker that outlived the daemon which forked it
-// therefore goes on taking its share of the connections arriving at that port,
-// served by a build nobody believes is running.  With one worker per runtime
-// that shows up as "the proxy is serving the wrong thing"; with --shards N it
-// becomes "one request in N+1 is served by the wrong thing", which is the same
-// defect made quiet.
-//
-// The proof of ownership is the kernel's rather than the wire's.  SO_PEERCRED
-// on a socketpair reports the pid of the process that CREATED it — the daemon,
-// at the instant of the fork — and that is a credential this process cannot
-// forge, cannot inherit from anyone else's socket, and a dead daemon cannot
-// renew.  So the rule is: the creator of my control socket must still be my
-// parent.  A worker whose daemon has gone has been reparented, getppid() stops
-// matching, and it refuses to serve.
-//
-// Checked at two moments, for two different failures:
-//
-//   * at startup, immediately after the PR_SET_PDEATHSIG in worker_claim(),
-//     which is what makes that pair race-free — if the daemon died before the
-//     prctl the kernel will never signal us, and this is what notices;
-//   * immediately before the listening socket is bound, in on_start().  A fork
-//     that has not bound yet is harmless; the instant it binds it is in the
-//     REUSEPORT group and taking traffic, so that instant is the one worth
-//     gating, and everything between the fork and it is time the daemon can
-//     die in.
-//
-// PR_SET_PDEATHSIG then makes the rule hold for the rest of the worker's life
-// instead of only at those two instants.
-//
-// ─── WHY THE SIGNAL IS SIGKILL, WHICH IT WAS NOT AT FIRST ───────────────────
-//
-// It was SIGTERM, on the argument that the handler above turns one into a clean
-// unwind, so a daemon that crashed would still get on_stop run.  That argument
-// is wrong about the only case the guarantee exists FOR, and the test said so:
-// freeze one shard with SIGSTOP, SIGKILL its daemon, and fifteen seconds later
-// the shard is still there — state T, still bound, still in the REUSEPORT
-// group.  A stopped process runs no handler; the SIGTERM just queues behind the
-// stop.  The alarm above cannot save it either, because the alarm is armed BY
-// the handler that never ran.  Every mechanism that needs the target to execute
-// something fails on exactly the target that has stopped executing.  SIGKILL
-// asks nothing of it.
-//
-// What that would cost if nothing else changed is the graceful path: teardown()
-// signals its workers and the daemon exits, and a SIGKILL arriving as it goes
-// would end them mid-unwind.  So two things make it safe rather than one.  This
-// process clears the setting at the single point where it has ALREADY decided
-// to exit — see the end of run() — and teardown() waits for the children it
-// signalled instead of exiting out from under them.  Between them the kill can
-// only reach a worker that was never told to go, which is the case it is for.
+// The creator of my control socket must still be my parent, proved by
+// SO_PEERCRED against getppid() at startup and again before the bind, with
+// PR_SET_PDEATHSIG holding the rule for the rest of the worker's life -- and
+// the signal is SIGKILL because a SIGSTOPped shard runs no handler, made safe
+// by clearing it at the one point this process has decided to exit.
 pid_t control_socket_creator(int fd)
 {
     struct ucred cr{};
@@ -247,27 +118,13 @@ bool claim_current_daemon(int control_fd)
     return ::getppid() == creator;
 }
 
-// The worker's writer to the daemon is shared/frame_writer.h; the shard mesh
-// needs the same bounded-backlog behaviour for its links to siblings, and one
-// drop policy is what keeps the two from disagreeing about EAGAIN.  Lifted out
-// of this file whole: a bounded-backlog writer with a drop policy has two
-// places to get the EAGAIN case wrong if there are two of it, and the second is
-// always found months later.
+// The worker's writer and the shard mesh's links share one bounded-backlog
+// writer, because two of them is two places to get the EAGAIN case wrong.
 using control_writer = frame_writer;
 
-// Every runtime this process does not hold.
-//
-// The worker's own channel can serve exactly one name — the runtime in this
-// process — and until now that was the whole of its world: `server --cache c`
-// in a worker found no manager at all, so post_cache_request() returned before
-// posting anything and the client waited for an answer nobody was ever going to
-// write. Not an error, not a refusal. Silence, until the socket timed out.
-//
-// This is the mirror of proxy_supervisor's sink. Same wire, same ticket
-// discipline, opposite direction: the request goes out on the control socket,
-// the daemon looks the name up in the map only it holds, and the answer comes
-// back as a chan_rep. The asking runtime cannot tell — which is the property
-// the whole channel exists to provide, now finally true in both directions.
+// Every runtime this process does not hold, as the mirror of
+// proxy_supervisor's sink: the request goes out on the control socket, the
+// daemon resolves the name, and the answer comes back as a chan_rep.
 class remote_sink : public request_sink
 {
 public:
@@ -275,8 +132,8 @@ public:
 
     void serve_request(std::string_view, std::string& out) override
     {
-        // Unreachable: serves_inline() is false. If the channel ever calls it,
-        // an answer invented here would be worse than none.
+        // Unreachable because serves_inline() is false, and an answer invented
+        // here would be worse than none.
         out.clear();
     }
 
@@ -285,11 +142,10 @@ public:
     bool serve_deferred(uint64_t ticket, std::string_view target,
                         std::string_view payload) override
     {
-        // The name travels with the request rather than being resolved here,
-        // because this process cannot resolve it. A false return means the
-        // backlog is full — the daemon has stopped reading entirely — and the
-        // channel then answers the origin rather than parking a ticket nothing
-        // will complete.
+        // The name travels with the request because this process cannot
+        // resolve it, and false means the backlog is full, so the channel
+        // answers the origin rather than parking a ticket nothing will
+        // complete.
         return m_w->write(
             worker_proto::frame(worker_proto::frame_type::chan_req,
                 worker_proto::encode_chan_request(ticket, target, payload)));
@@ -299,47 +155,24 @@ private:
     control_writer* m_w;
 };
 
-// The worker's half of the same problem the supervisor has.
-//
-// Its loop waits on the ring for 20 ms and then drains the control socket, so a
-// request arriving from the daemon waited up to a full timeout before anything
-// looked at it.  With the daemon side armed that was the whole remaining cost:
-// a cross-process `cache set` measured 20.00 ms — the timeout, to the
-// hundredth — against 0.09 ms for the same command in the daemon.
-//
-// Arming the fd on this worker's own ring makes the wait end when the frame
-// arrives.  Everything else about the loop is unchanged: pump_control() still
-// runs every turn, so a missed arm costs latency, never a frame.
+// Arming the control fd on this worker's own ring makes the wait end when the
+// frame arrives, which took a cross-process `cache set` from 20.00 ms to the
+// cost of the command.
 class worker : public io_handler, public route_relay::sink
 {
 public:
     explicit worker(int control_fd)
         : m_fd(control_fd), m_writer(control_fd), m_remote(&m_writer)
     {
-        // Before the first frame is read, because a runtime_map frame can be the
-        // first frame: the manager's map is the daemon's, copied, and writing to
-        // it here would build a runtime that exists in this process and nowhere
-        // else.  See runtime_manager::mark_replica().
+        // Before the first frame is read, because a runtime_map frame can be
+        // the first and writing to that map here would build a runtime that
+        // exists in this process alone.
         m_manager.mark_replica();
 
-        // ── And the one way a write to that map can still happen ────────────
-        //
-        // Not here — over there.  The four calls that alter the map are asked
-        // of the daemon, which is the process that holds it, and this is the
-        // sink they travel through; see runtime_manager::set_map_sink.
-        //
-        // Installed in the constructor, before anything is read, because
-        // lua_context decides at BINDING TIME whether the four are refused —
-        // it asks has_map_sink() while it is building the table — and the
-        // script's table is built during the config frame's load_lua_script().
-        // Installing this beside the other sinks in on_config() would be a few
-        // lines too late for a script that calls socketley.create at its top
-        // level, which is the commonest place to call it.
-        //
-        // Absent descriptor, no sink, and the refusals stay: an old daemon
-        // forks a worker with nothing on 6, and the honest answer to
-        // socketley.create there is the refusal that names itself rather than a
-        // wait that ends in a timeout.
+        // The map sink is installed in the constructor rather than in
+        // on_config(), because lua_context decides at binding time whether the
+        // four calls are refused and the script's table is built during the
+        // config frame's load.
         if (::fcntl(worker_map_fd, F_GETFD, 0) >= 0)
         {
             m_map_fd = worker_map_fd;
@@ -350,27 +183,11 @@ public:
                     if (!map_request(op, name, config, err))
                         return false;
 
-                    // ─── A script that stops ITS OWN runtime ────────────────
-                    //
-                    // The daemon has stopped it, and this process does not know
-                    // yet: the placeholder moved, the worker's own object did
-                    // not.  So the very next line of the same handler armed a
-                    // timer and was answered with a live id --
-                    // `REARM interval=3 sub=2 timeout=4` -- for a timer that
-                    // can never fire, because this process is being retired.
-                    //
-                    // In the daemon socketley.stop() ran the stop on the way
-                    // through and the arming latch refused everything after it;
-                    // measured there as `interval=0 sub=0 timeout=0`.  A return
-                    // value that says "armed" for something that is not is the
-                    // accepted-but-not-applied shape, and it is the one this
-                    // whole boundary is written against.
-                    //
-                    // on_stop()'s body rather than a state flag, because the
-                    // script is entitled to the rest of what a stop does: its
-                    // on_stop runs, its timers are severed, its listener closes.
-                    // Same call the `stop` frame makes, and it guards on the
-                    // state, so the frame arriving afterwards is a no-op.
+                    // A script that stops its own runtime runs on_stop()'s
+                    // body here, because the daemon has stopped the
+                    // placeholder and this process's object has not -- so the
+                    // next line armed a timer that can never fire and was
+                    // answered with a live id.
                     if (m_rt && name == m_rt->get_name() &&
                         (op == "stop" || op == "remove"))
                         on_stop();
@@ -378,32 +195,17 @@ public:
                     return true;
                 });
 
-            // ── And routing, which needs BOTH descriptors ───────────────────
-            //
-            // Installed under the same condition as the map sink, and that is
-            // the whole reason it is inside this branch: four of its five verbs
-            // are frames on the control socket and would work without fd 6, but
-            // `open` is a question and has nowhere to ask it.  A route sink
-            // that could carry the traffic and not open the route would let a
-            // script start relaying into a connection the far end never
-            // accepted -- which is worse than the refusal, because it looks
-            // like it worked.
-            //
-            // Same binding-time reason for being here rather than in
-            // on_config(): lua_context asks route_sink() while it builds the
-            // table, and a script routes from on_connect, which can fire before
-            // anything else this worker does.
+            // And routing, under the same condition and for the same
+            // binding-time reason, because four of its five verbs are frames
+            // on the control socket and `open` is a question with nowhere else
+            // to ask it.
             m_manager.set_route_sink(this);
         }
     }
 
-    // ── The two things this worker has on the ring for itself ───────────────
-    //
-    // Its runtime's completions never arrive here: the runtime registers as its
-    // own owner.  What lands here is the control socket's recv and the control
-    // writer's send, and they are told apart by the request address rather than
-    // by the op type — a type is a shape, and two submissions of the same shape
-    // would be indistinguishable the moment a second one exists.
+    // The control socket's recv and the control writer's send, told apart by
+    // the request address rather than the op type, because two submissions of
+    // the same shape are otherwise indistinguishable.
     void on_cqe(struct io_uring_cqe* cqe) override
     {
         auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
@@ -419,8 +221,9 @@ public:
         if (req != &m_ctl_req)
             return;
 
-        // A recv, not a readiness notification.  The bytes are already here;
-        // the read that used to follow the poll is what this replaces.
+        // A recv and not a readiness notification, so the bytes are already
+        // here and the read that used to follow the poll is what this
+        // replaces.
         m_ctl_armed = false;
 
         const int res = cqe->res;
@@ -450,10 +253,9 @@ public:
 
     int run()
     {
-        // The daemon may die while we are serving.  Without this the worker
-        // keeps forwarding traffic for a proxy nobody is supervising any more;
-        // with it, a write to the closed control socket ends the process
-        // instead of raising SIGPIPE.
+        // The daemon may die while we are serving, and this makes a write to
+        // the closed control socket end the process instead of raising
+        // SIGPIPE.
         signal(SIGPIPE, SIG_IGN);
 
         // Before anything is bound, so the window between the fork and the
@@ -467,133 +269,29 @@ public:
             if (::sigaction(SIGTERM, &sa, nullptr) < 0) {}
         }
 
-        // No ring yet.  io_uring fixes a ring's flags when the ring is created
-        // and offers no way to change them afterwards, so whatever is going to
-        // decide this worker's ring — SQPOLL, a CPU set — has to have arrived
-        // before init() runs.  The only thing that ever tells a worker anything
-        // is its config frame, and this used to init() several hundred
-        // microseconds before the first byte of that frame was read: a
-        // per-runtime ring setting could be parsed, stored, and would then be
-        // silently ignored, because set_sqpoll()/set_cpus() on an open ring are
-        // no-ops by contract.  on_config() builds the ring now.
+        // No ring yet, because io_uring fixes a ring's flags at creation and
+        // the config frame is the only thing that tells a worker anything --
+        // so on_config() builds the ring.
         set_nonblocking(m_fd);
         send_hello();
 
         auto last_stats = std::chrono::steady_clock::now();
 
-        // ─── THE PUBLISH WAS THE LAST THING AN IDLE WORKER PAID FOR ─────────
-        //
-        // With the 20 ms poll gone, 93% of what an idle runtime cost was a 4 Hz
-        // publish: measured, 395.8 us/s per idle runtime of the 425 that
-        // remained.  Four frames a second, every one of them carrying the same
-        // numbers as the last, for a runtime with nothing connected to it.
-        //
-        // It was a heartbeat and not a report.  lib_ready.sh's ready_conns used
-        // to wait until `now - figures_age_ms >= start` — until a sample existed
-        // that was TAKEN after the caller asked — and it asked that of runtimes
-        // whose value was already what it wanted.  So the frame had to keep
-        // arriving even when it said nothing, and on-change publishing was not
-        // available.
-        //
-        // The counters are in shared memory now, stored once per turn at the
-        // bottom of this loop and summed by whoever prints them, so there is no
-        // sample to be after anything: the answer is computed when the question
-        // is asked.  That removes the heartbeat's only reader, and the frame
-        // becomes what it always should have been — the part of `stats` that is
-        // NOT a summable counter, sent when it changes.
-        //
-        // Which leaves the wakeup.  Nothing in this worker's address space can
-        // change while this worker is not running, so a turn in which the ring
-        // delivered no completion is a turn in which nothing can have become
-        // worth saying.  `stats_dirty` is that observation: the publish deadline
-        // exists only after a turn that did something, and an idle worker has no
-        // deadline and does not wake.
-        //
-        // WHAT THIS GIVES UP, stated because it is real: a figure that moves
-        // with the passage of time alone and without any completion would go
-        // unpublished until the next completion.  Every candidate was looked for
-        // and each one is driven by a timer that is itself an SQE in this ring —
-        // the Lua tick, health checks, key expiry, backend deadlines — so each
-        // arrives as a completion and marks the turn.  A future figure that is
-        // computed from the clock at read time would not, and would need to say
-        // so here.
+        // The publish is on-change now rather than a heartbeat, because the
+        // counters live in shared memory and an idle worker's turn that
+        // delivered no completion cannot have produced anything worth saying
+        // -- which gives up only a figure that moves with the clock alone, and
+        // every candidate is driven by an SQE in this ring.
         bool stats_dirty = true;
 
         while (!m_done && !g_term_requested)
         {
-            // One drain pass of the ring, waiting until the next thing this
-            // loop actually owes somebody.  run() is not usable here: it owns
-            // the thread until the ring stops, and the control socket has to be
-            // serviced between completions.
-            //
-            // ─── WHY THE TIMEOUT IS A DEADLINE AND NOT A CONSTANT ───────────
-            //
-            // This was a flat 20 ms, with the reasoning that a short wait keeps
-            // an idle worker from spinning.  It does — and it replaces the spin
-            // with a fixed 50 Hz clock that runs whether or not anything is
-            // happening.  Measured on an idle runtime: 50.0 context switches a
-            // second, 0.13% of a core, per runtime, for a process with nothing
-            // to do.  At a hundred idle runtimes that is a core and a third of
-            // wakeups against an empty ring.
-            //
-            // Nothing in the loop below is periodic except the stats publish.
-            // pump_control() is answered by the poll armed on the control
-            // socket, which ends the ring's wait the moment a frame arrives;
-            // the runtime's own timers — the Lua tick, health checks, backend
-            // deadlines — are timeouts in this same ring and complete into this
-            // same drain.  So the honest timeout is the time left until the
-            // next publish, and an idle worker then wakes at the publish rate
-            // rather than at fifty hertz.
-            //
-            // A worker with work is unaffected: io_uring_wait_cqe_timeout()
-            // returns on the first completion, so a longer ceiling adds nothing
-            // to a wait that ends early anyway.
-            //
-            // ─── THE STATES IN WHICH THE ARM DOES NOT COVER THIS WAIT ───────
-            //
-            // A long wait is only as good as the notification standing in the
-            // ring.  Every state in which an idle worker has none, found by
-            // walking every assignment to m_ctl_armed and every early return
-            // out of arm_control():
-            //
-            //   (a) There is no ring yet.  arm_control() returns at once while
-            //       ring_open() is false, from the fork until on_config()
-            //       builds the ring.  Covered by the else branch below, which
-            //       waits on the descriptor itself — the complete notification
-            //       for that state, and the reason this branch needs no
-            //       fallback.
-            //
-            //   (b) The submission did not reach the ring.  submit_poll_add()
-            //       answers false when get_sqe() has nothing to give, and the
-            //       flag is then false with nothing outstanding.  The same
-            //       state follows a completion that cleared the flag after
-            //       arm_control() had already run for the turn — the drain in
-            //       the publish branch below does exactly that.
-            //
-            //   (c) The arm is standing but blind to what is being waited for.
-            //       Its mask is fixed when it is placed, so an arm made while
-            //       the write queue was empty carries no POLLOUT, and the
-            //       daemon starting to read again does not end the wait.
-            //
-            //   (d) m_done — arm_control() is skipped once the worker has
-            //       decided to leave.  Not a wait state: m_done is the loop's
-            //       own condition, so there is no next wait to be uncovered.
-            //
-            // (b) and (c) fall back to the old constant, which is what that
-            // constant was always doing for them.  Neither can be true of an
-            // idle worker: it is armed and has nothing queued, so the fallback
-            // costs nothing in the case this change is about.
-            //
-            // What is NOT on this list, and was checked: a frame arriving
-            // between the drain's last EAGAIN and the arm reaching the kernel.
-            // A poll_add is level-triggered on submit, so it completes at once
-            // against a descriptor that is already readable, and no wakeup is
-            // lost there.
-            //
-            // (e) There is no deadline at all.  Nothing has happened since the
-            //     last publish, so there is nothing to publish and no clock to
-            //     wait for; the wait is idle_wait_ms, which is a backstop and
-            //     not a schedule.  See the constant.
+            // One drain pass waiting until the next thing this loop owes
+            // somebody, because a flat 20 ms was a 50 Hz clock costing 0.13%
+            // of a core per idle runtime -- with the fallback constant
+            // covering exactly the two states where no arm stands: a
+            // submission the ring refused, and an arm whose mask predates what
+            // is now being waited for.
             const auto turn_now = std::chrono::steady_clock::now();
             int wait_ms = idle_wait_ms;
             if (stats_dirty)
@@ -608,29 +306,20 @@ public:
                                                             // would spin
             }
 
-            // Before the ring exists poll_completions() returns at once no
-            // matter what timeout it is handed, so the wait has to come from
-            // somewhere else or this loop is a spinning core for as long as the
-            // config takes to arrive.  Waiting on the control socket is the
-            // right place for it anyway: the frame is the only thing that can
-            // happen to a worker in that window — and poll() on the fd is its
-            // own notification, so this branch needs no fallback, only the
-            // POLLOUT the arm would have carried.
+            // Before the ring exists poll_completions() returns at once
+            // whatever timeout it is handed, so the wait comes from a poll on
+            // the control socket, which is its own notification.
             if (m_loop.ring_open())
             {
-                // The two states the ring cannot end on its own: no recv
-                // standing (a submission get_sqe() refused), and bytes queued
-                // with no send standing for the same reason.  An in-flight send
-                // needs no clamp — it ends with a completion.
+                // The two states the ring cannot end on its own -- no recv
+                // standing, or bytes queued with no send standing -- since an
+                // in-flight send ends with a completion.
                 if (!m_ctl_armed || m_writer.needs_retry())
                     wait_ms = std::min(wait_ms, ctl_fallback_ms);
 
-                // The same two states, per mesh link.  A link whose recv is
-                // standing and whose writer is idle needs nothing: a sibling's
-                // frame ends the wait by itself, which is the whole reason the
-                // links are on the ring.  What has to be clamped is a
-                // submission get_sqe() refused, because nothing in the ring
-                // will come back to retry it.
+                // The same two states per mesh link, because a standing recv
+                // is ended by a sibling's frame and only a submission
+                // get_sqe() refused needs a clamp.
                 for (const auto& link : m_mesh_links)
                     if (link->needs_wake())
                     {
@@ -639,152 +328,73 @@ public:
                     }
 
                 // The turn did something exactly when the ring delivered
-                // something.  This is the whole of the activity test and it is
-                // taken HERE rather than inferred later from a counter that
-                // moved: a completion that changes nothing a reader can see —
-                // an accept immediately refused, a cancelled read — still ran
-                // code in this process, and the publish below is what decides
-                // whether it produced anything worth sending.
+                // something, taken here rather than inferred from a counter,
+                // because a completion that changes nothing visible still ran
+                // code in this process.
                 if (m_loop.poll_completions(wait_ms) > 0)
                     stats_dirty = true;
 
-                // The bytes are in m_in, put there by the recv completion.
-                // Dispatching them here rather than in on_cqe() is deliberate
-                // and is not a detail: on_config() is one of these frames and
-                // it BUILDS this ring, and the reload and stop handlers reach
-                // into the runtime.  Every one of them ran on a loop turn
-                // before the read moved onto the ring, and they still do.
+                // Dispatched here rather than in on_cqe(), because on_config()
+                // is one of these frames and it builds this ring, and the
+                // reload and stop handlers reach into the runtime.
                 if (!drain_frames())
                     break;
             }
             else
             {
-                // No ring yet, so the notification has to come from the
-                // descriptor itself.  This is the whole of what is left of the
-                // old pattern, and it costs nothing that can be measured: a
-                // worker is in this state from the fork until its config
-                // arrives, which is before it has a runtime, a port, or a
-                // sibling to cross to.
+                // No ring yet, so the notification comes from the descriptor
+                // itself, which costs nothing measurable in a window before
+                // this worker has a runtime, a port or a sibling.
                 wait_for_control(wait_ms, m_writer.pending());
                 if (!pump_control())
                     break;
 
-                // Unconditionally, for the window this branch covers: from the
-                // fork until on_config() builds the ring there is no runtime to
-                // have figures about, and the first publish is what tells the
-                // daemon this worker is answering for one.
+                // Unconditionally for the window this branch covers, because
+                // there is no runtime to have figures about and the first
+                // publish is what says this worker answers for one.
                 stats_dirty = true;
             }
 
-            // Whatever the socket would not take last turn.  A reply sitting
-            // here is somebody's answer, so it goes before anything else this
-            // turn does.
+            // Whatever the socket would not take last turn, because a reply
+            // sitting here is somebody's answer.
             m_writer.flush();
             if (m_writer.dead())
                 break;
 
-            // After the drain, not before: an arm placed while a frame is
-            // already buffered fires at once and the turn is wasted.  Skipped
-            // once the worker has decided to exit, so nothing is outstanding
-            // against the fd on the way down.
+            // After the drain and not before, because an arm placed while a
+            // frame is buffered fires at once and wastes the turn; skipped
+            // once the worker has decided to exit.
             if (!m_done)
                 arm_control();
 
-            // ── And the same two steps for every link to a sibling ──────────
-            //
-            // Beside m_writer.flush() and arm_control() rather than inside
-            // shard_link::on_cqe(), and that placement is the measurement, not
-            // a tidiness preference: a send submitted per frame produces a
-            // completion per crossing, and a completion arriving alone ends the
-            // ring's wait — so the loop spends a turn and an io_uring_enter
-            // learning that a send it needed no answer to has finished.  On the
-            // control socket, which is this same code, that was 5,920 ring
-            // entries against 61,221.  Once per turn, every crossing this turn
-            // answered leaves in one send.
-            //
-            // Unconditional, including while m_done: a link that is on its way
-            // out still owes its sibling whatever it has queued, and pump() is
-            // a no-op on a dead one.
+            // The same two steps per sibling link, once per turn because a
+            // send per frame produces a completion per crossing -- 5,920 ring
+            // entries against 61,221 on the control socket -- and
+            // unconditional, since a dying link still owes what it has queued.
             for (auto& link : m_mesh_links)
                 link->pump();
 
             const auto now = std::chrono::steady_clock::now();
             if (stats_dirty && now - last_stats >= stats_interval)
             {
-                // ─── THE SAFETY PUMP THAT USED TO BE HERE, AND WHY IT IS NOT ─
-                //
-                // A read once per interval, whatever the arm said, plus two
-                // extra ring drains and a warning around it.  All of it existed
-                // because the arm was a POLL: a readiness notification is a
-                // claim about the socket that the loop then had to act on, and
-                // "armed and unfired means not readable" was an invariant this
-                // process could be wrong about without anything saying so.
-                //
-                // A recv is not a claim.  The bytes are IN the completion, so
-                // there is no second step to skip and nothing to be stale about
-                // — a frame that arrives is either delivered by the standing
-                // recv or there is no standing recv, and that second case is
-                // visible directly in m_ctl_armed and is retried at the top of
-                // every turn with the wait clamped to ctl_fallback_ms.
-                //
-                // So the pump is gone with the invariant it was watching, and
-                // with it the last read() on this path.  What replaced its
-                // guarantee is not an interval — it is that arm_control() runs
-                // on every turn and the only way to have no recv standing is a
-                // submission the ring refused, which the next turn resubmits.
+                // The safety pump is gone with the poll it was watching,
+                // because a recv is not a claim about the socket: the bytes
+                // are in the completion, and the only way to have no recv
+                // standing is a submission the next turn resubmits.
 
-                // Cleared when nothing remains to publish.  push_stats()
-                // answers "was any of this new", and a turn whose work produced
-                // nothing a reader can see is a turn with nothing left to
-                // publish — asking again in 250 ms would only rebuild the same
-                // string and compare it against itself.  The next completion
-                // sets the flag again.
-                //
-                // NOT cleared for a frame the writer refused: the figures are
-                // still owed, and the flag staying up is what brings this loop
-                // back at the publish rate to retry — an idle worker with a
-                // clear flag waits idle_wait_ms, which for a runtime that has
-                // gone quiet after a burst is a report the daemon never gets.
+                // Cleared when nothing remains to publish, but never for a
+                // frame the writer refused, because the figures are still owed
+                // and the flag staying up is what brings this loop back to
+                // retry.
                 if (push_stats())
                     stats_dirty = false;
                 last_stats  = now;
             }
 
-            // ── This shard's line, once per turn ────────────────────────────
-            //
-            // The END of the turn and not the top of it, because that is what
-            // makes this one site instead of several: every drain this turn
-            // performs is above this line — the main one, the one after
-            // pump_control, and the one inside the stats block — so whatever
-            // any of them accepted or reaped is counted before the loop comes
-            // round again.
-            //
-            // Once per turn rather than at every place a connection count
-            // moves.  A count changes in accept and in teardown, and those are
-            // 34 call sites across four runtimes with nothing in common but
-            // the loop that dispatched them; putting the publish where every
-            // path already passes is the rule this tree states about the
-            // half-close hold, applied before rather than after the fourth fix.
-            //
-            // NOT on the 250 ms stats timer, which is the other thing already
-            // here and is the wrong clock: a script that is told a client
-            // connected and asks how many there are would be answered from a
-            // sibling's quarter-second-old figure.  A turn is microseconds.
-            //
-            // ─── AND NOT ONLY THE CONNECTION COUNT ──────────────────────────
-            //
-            // Every figure `stats` prints that is a summable counter is stored
-            // here, because this is the clock they all belong on for the same
-            // reason: the daemon reads them when it prints, so whatever they say
-            // when this turn ends is what the next question is answered with.
-            // Four extra relaxed stores into a line this turn is already
-            // writing.
-            //
-            // mapped() is now true for every worker-backed runtime and not only
-            // for a sharded one — a region is made for each of them, see
-            // reconcile_proxy_workers().  For one shard the "sum" is one slot,
-            // which is the same number by a longer route and is what makes the
-            // sharded and unsharded cases one path.
+            // This shard's line, once per turn and at the end of it, so every
+            // drain's work is counted before the loop comes round -- and every
+            // summable counter is stored here rather than at the 34 sites
+            // where one moves, because the daemon reads them when it prints.
             if (m_rt && m_rt->shard_stats_table().mapped())
             {
                 shard_stats::figures f;
@@ -800,70 +410,28 @@ public:
             }
         }
 
-        // ─── Past this line the guarantee has already done its job ──────────
-        //
-        // Every way out of the loop above arrives here: the shutdown frame, the
-        // SIGTERM flag, an EOF on the control socket, a dead writer.  That is
-        // what makes this the one place to give the parent-death kill back —
-        // this process is leaving, and the only thing PR_SET_PDEATHSIG could
-        // still do is interrupt the leaving.
-        //
-        // Putting it here rather than at each exit is the same rule this tree
-        // states about close_pair() and the half-close hold: a check every path
-        // has to remember is one a new path will not.  There are four ways out
-        // of that loop today and the unwind below is common to all four.
-        //
-        // What it costs to be wrong in the safe direction is nothing: a worker
-        // that clears this and then wedges during teardown is reaped by the
-        // daemon's own escalation, which is alive on every path that gets here
-        // deliberately.
+        // Every way out of the loop arrives here, which makes this the one
+        // place to give the parent-death kill back, because a check every path
+        // has to remember is one a new path will not.
         if (::prctl(PR_SET_PDEATHSIG, 0) < 0) {}
 
-        // Same order the daemon uses on its way down: stop the runtime while
-        // there is still a ring for teardown() to cancel into, and only then
-        // end the ring.  Reversing these two is what turned a clean shutdown
-        // into a segfault the last time it was got wrong.
+        // Same order the daemon uses: stop the runtime while there is still a
+        // ring for teardown() to cancel into, and only then end the ring.
         if (m_rt && m_rt->get_state() == runtime_running)
             m_rt->stop(m_loop);
 
-        // ── and the cancellations it just submitted have to be reaped here ──
-        //
-        // stop() reaches lua_context::cancel_timers(), which severs every armed
-        // timer: it nulls the timer's `ctx`, submits a timeout-remove, and hands
-        // the object to its own on_cqe, whose terminal branch is `delete this`.
-        // That is the only thing that frees a lua_timer, and it needs the
-        // completion to arrive.
-        //
-        // Below, the only draining is `while m_writer.send_in_flight()`, so on a
-        // shutdown where the writer has nothing queued the ring is closed with
-        // those cancellations still in the queue and every armed timer stays
-        // allocated.  Measured on this branch with a sharded scripted proxy:
-        // 10 worker processes, each leaking 176 bytes in 2 allocations -- the
-        // lua_timer and the shared_ptr<bool> it holds a reference to.
-        //
-        // Unconditional, and here rather than folded into the writer's loop,
-        // because the two wait for different things: that one waits for a send
-        // to leave, this one for cancellations the kernel posts immediately.
-        // A millisecond apiece and a bound of ten, for the same reason the loop
-        // below is bounded -- a worker that will not finish unwinding is killed
-        // by the supervisor five seconds after the SIGTERM regardless.
+        // The cancellations stop() just submitted have to be reaped here, or
+        // every armed timer stays allocated -- measured at 176 bytes per
+        // worker -- and it is bounded at ten milliseconds because the
+        // supervisor kills a worker that will not finish anyway.
         for (int i = 0; i < 10; ++i)
             if (m_loop.poll_completions(1) == 0)
                 break;
 
-        // ── The links come off the ring before the ring goes ───────────────
-        //
-        // Each of them holds a standing recv, may hold an in-flight send, and
-        // owns a registration of its own.  die() is the one function that ends
-        // a link and it does all three — it sweeps the crossings the link was
-        // carrying and answers them `no_target`, so a sibling's request that
-        // was in flight when this shard was told to stop is answered rather
-        // than left to a deadline that does not exist, and it closes the
-        // descriptor through the loop so the number outlives the cancel.
-        //
-        // Before requests().detach() for the same reason detach() is before the
-        // ring: the sweep completes tickets through the channel, and a detached
-        // channel answers them `dropped` instead.
+        // The links come off the ring before the ring goes, through die(),
+        // which sweeps the crossings each was carrying and answers them
+        // `no_target` -- before requests().detach(), which would answer them
+        // `dropped` instead.
         for (auto& link : m_mesh_links)
             link->die("this shard is shutting down", /*expected=*/true);
 
@@ -871,28 +439,17 @@ public:
         // whatever is still queued `dropped` and gives the owner token back.
         m_manager.requests().detach();
 
-        // ── The writer comes off the ring before the ring goes ──────────────
-        //
-        // stop() above can still have written a frame — a Lua on_stop that
-        // sends, a final state — and on the ring that frame is a submission
-        // rather than bytes on the wire.  So the in-flight send is given a
-        // bounded chance to complete, and then the writer goes back to the
-        // descriptor for whatever is left.  Bounded, and short: this is a
-        // socketpair whose peer is the daemon, and a worker that will not
-        // finish unwinding is killed by the supervisor five seconds from the
-        // SIGTERM regardless.
-        //
-        // leave_ring() is what refuses to guess: see its note on why a send
-        // that is still in flight when the drains run out ends the writer
-        // rather than being rewritten.
+        // The writer comes off the ring before the ring goes, with a bounded
+        // chance for an in-flight send because stop() can still have written a
+        // frame, and leave_ring() refuses to guess about one that does not
+        // finish.
         for (int i = 0; i < 20 && m_writer.send_in_flight(); ++i)
             m_loop.poll_completions(1);
         m_writer.leave_ring();
         m_writer.flush();
 
-        // A recv, so poll_remove no longer names it.  Cancelling by descriptor
-        // covers the recv and any send that outlived the drain above, which is
-        // the case leave_ring() has just given up on.
+        // A recv, so poll_remove no longer names it, and cancelling by
+        // descriptor covers both it and any send leave_ring() gave up on.
         if (m_ctl_armed || m_writer.send_in_flight())
         {
             if (!m_loop.submit_cancel_fd(m_fd)) {}
@@ -912,17 +469,9 @@ private:
             if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {}
     }
 
-    // Block until the control socket has something, or will take what is
-    // waiting to go out, or the timeout runs out.  Only used before there is a
-    // ring; afterwards the ring's own wait covers it, and the control socket is
-    // drained between completions.
-    //
-    // POLLOUT is not decoration.  This is the only wait a worker has before its
-    // config arrives, and it is also the wait that holds while the hello frame
-    // is going out; with the timeout no longer a flat 20 ms, a queue that the
-    // socket would not take would otherwise sit until the deadline rather than
-    // until the socket drained.  Asked for only when there is something to
-    // send, so an idle worker is not woken by a socket that is merely writable.
+    // Block until the control socket has something or will take what is
+    // waiting, used only before there is a ring, with POLLOUT asked for only
+    // when there is something to send.
     void wait_for_control(int timeout_ms, bool want_write) const
     {
         struct pollfd pfd{m_fd,
@@ -932,32 +481,11 @@ private:
     }
 
     // ── The recv that used to be a poll ─────────────────────────────────────
-    //
-    // This was submit_poll_add(POLLIN), and the bytes were then taken by a
-    // ::read() in the loop.  Two things for one arrival, one of them a
-    // syscall — the epoll pattern, on the one path in this tree that still had
-    // it.  What that cost is countable and was counted: on a four-shard cache,
-    // one shard over 200,000 GETs made 50,600 write() and 14,984 read() calls
-    // against 5,920 io_uring_enter, where the same run on one shard makes 7 and
-    // 9.  Every one of them is a crossing to a sibling.
-    //
-    // No POLLOUT half any more: the send is on the ring too, and it ends with
-    // its own completion rather than with a readiness report somebody has to
-    // act on.
-    //
-    // ── AND WHY THIS IS ONE-SHOT AND NOT MULTISHOT ──────────────────────────
-    //
-    // A multishot recv would take the re-arm away as well.  The re-arm is an
-    // SQE, which under SQPOLL is a store and no syscall at all — it is not on
-    // the axis this change is about, and the counting below says so: entries
-    // per GET did not rise when the reads and writes moved onto them.
-    //
-    // What it would cost is a provided-buffer group on the one socket in this
-    // process whose frames may not be lost: an ENOBUFS fallback path, a buffer
-    // that has to be handed back on every exit from the completion handler, and
-    // a second shape of "a frame arrived".  That is a trade worth making
-    // against a measured number and not against an expected one, and there is
-    // no number here asking for it.
+    // A recv rather than a poll plus a read, which took one shard from 50,600
+    // write() and 14,984 read() calls to 7 and 9 over 200,000 GETs -- and
+    // one-shot rather than multishot, because the re-arm is an SQE and a
+    // provided-buffer group on this socket is a trade with no number asking
+    // for it.
     void arm_control()
     {
         if (!m_loop.ring_open() || m_ctl_armed)
@@ -983,14 +511,9 @@ private:
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
-    // True when nothing remains to publish — either the frame was queued or
-    // there was nothing to say.  False only for a frame the writer REFUSED,
-    // which the caller must keep its dirty flag armed for: the refusal used to
-    // be swallowed here after m_last_pub had already been updated, so the lost
-    // frame was recorded as delivered and was never resent until a counter
-    // happened to move again — for a cache that went idle after a burst, never.
-    // The daemon then held the previous report indefinitely, with nothing in
-    // any log but frame_writer's one backlog warning.
+    // True when nothing remains to publish, false only for a frame the writer
+    // refused, because swallowing that after m_last_pub had been updated
+    // recorded a lost frame as delivered.
     bool push_stats()
     {
         // No runtime, so nothing published and nothing changed — and reporting
@@ -999,29 +522,11 @@ private:
         if (!m_rt)
             return true;
 
-        // On the event-loop thread, which is the only thread allowed to walk
-        // the proxy's connection tables.  Everything that leaves this process
-        // is a copy taken here.
-        //
-        // ─── WHAT IS IN THIS FRAME AND WHAT IS NOT ──────────────────────────
-        //
-        // Not the prefix of `stats`.  name, port and the five counters are
-        // written by the daemon out of the shared table at the moment it
-        // prints — see runtime_instance::stats_prefix() — so sending them here
-        // would be a second answer to a question that already has one, and the
-        // one that is older.
-        //
-        // What is here is everything the daemon CANNOT compute: the ring's
-        // granted flags and this runtime's own type-specific figures, each of
-        // them a walk of tables that exist only in this process.
-        //
-        // The five counters still travel, and this is the one place they are
-        // duplicated.  They are the fallback for a worker whose daemon could
-        // not create a memfd region — logged at the daemon, see
-        // reconcile_proxy_workers() — where without them `stats` would report a
-        // runtime with no figures at all.  They are also what makes the change
-        // test below cover a counter moving, which is what keeps that fallback
-        // fed.
+        // Built on the event-loop thread, the only one allowed to walk the
+        // connection tables, carrying what the daemon cannot compute -- the
+        // ring's granted flags and this runtime's own figures -- plus the five
+        // counters as the fallback for a worker whose region could not be
+        // made.
         worker_proto::stats_wire s;
         s.total_connections  = m_rt->m_stat_total_connections.load(std::memory_order_relaxed);
         s.total_messages     = m_rt->m_stat_total_messages.load(std::memory_order_relaxed);
@@ -1030,25 +535,10 @@ private:
         s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
         s.detail             = m_rt->stats_ring() + m_rt->stats_extra();
 
-        // The two numbers that make a mesh measurement mean anything.
-        //
-        // The relay fallback is what keeps a broken mesh from being an outage,
-        // and it is also what would let one go unnoticed: a mesh that never
-        // connects reports the same throughput as one that did not help.  These
-        // say which happened.  Appended to the detail the worker already sends
-        // rather than added to the frame, because the frame is a contract
-        // between two builds and this is a figure.
-        // Unconditionally, including the shard that has no links at all.
-        //
-        // These used to be inside `if (!m_mesh_sinks.empty())`, which made the
-        // ABSENCE of a line the signal for "this shard never connected" -- the
-        // one state the counters exist to expose, reported by silence.  Every
-        // reader that sums the lines, including this tree's own test, read a
-        // missing shard as a zero and could not tell it from a quiet one.
-        //
-        // mesh_links is here for the same reason: 0 says so out loud, where a
-        // reader would otherwise have to infer it from two counters that are
-        // also 0 on a mesh that is merely idle.
+        // The two numbers that make a mesh measurement mean anything, sent
+        // unconditionally including by a shard with no links, because the
+        // absence of a line made "never connected" indistinguishable from
+        // "quiet".
         {
             uint64_t direct = 0, relayed = 0;
             mesh_counts(direct, relayed);
@@ -1057,14 +547,8 @@ private:
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
         }
 
-        // Did anything the daemon can see actually move?
-        //
-        // This used to decide how far the publish backed off.  It now decides
-        // whether there is a publish at all: an idle worker that was woken by
-        // something which changed nothing sends no frame, and a worker that is
-        // idle in the ordinary sense is not woken and does not reach here.
-        // There is nothing left in this struct that changes by itself — the
-        // timestamp that did is gone with the age it was for.
+        // Did anything the daemon can see actually move, which now decides
+        // whether there is a publish at all rather than how far it backs off.
         const bool changed =
             !m_have_last
             || s.total_connections  != m_last_pub.total_connections
@@ -1074,10 +558,9 @@ private:
             || s.active_connections != m_last_pub.active_connections
             || s.detail             != m_last_pub.detail;
 
-        // Only when it changed.  The daemon's copy is a copy of the last thing
-        // that was true, and re-sending it says nothing that its own record does
-        // not already say — which is exactly why the heartbeat could be removed
-        // and not merely slowed down.
+        // Only when it changed, because the daemon's copy already says the
+        // last thing that was true -- which is why the heartbeat could be
+        // removed rather than slowed.
         if (!changed)
             return true;
 
@@ -1085,10 +568,9 @@ private:
                                                  worker_proto::encode_stats(s))))
             return false;
 
-        // Committed only once the frame is actually queued.  Recording it
-        // before the write is what made a refused frame permanent: the next
-        // interval compared against figures the daemon never received, found
-        // them equal, and had nothing left to resend.
+        // Committed only once the frame is queued, because recording it first
+        // made a refused frame permanent: the next interval compared against
+        // figures the daemon never received.
         m_last_pub  = std::move(s);
         m_have_last = true;
         return true;
@@ -1100,10 +582,8 @@ private:
     worker_proto::stats_wire m_last_pub{};
     bool m_have_last{false};
 
-    // Bytes off the descriptor, for the one window in which there is no ring to
-    // read them with: from the fork until on_config() builds it.  Under load
-    // this is not reached at all — the recv completion fills m_in and
-    // drain_frames() below is what runs.
+    // Bytes off the descriptor for the one window with no ring to read them
+    // with, which under load is not reached at all.
     bool pump_control()
     {
         char buf[4096];
@@ -1126,14 +606,9 @@ private:
         return drain_frames();
     }
 
-    // Whole frames out of m_in, dispatched.  False is the worker's instruction
-    // to exit: the socket is gone, or what came off it was not a frame.
-    //
-    // The EOF test is first and stops before dispatch, which is what the read
-    // loop above did — a zero-length read returned false without parsing what
-    // an earlier pass had appended.  Kept rather than improved: a worker that
-    // acts on a frame from a daemon that has already gone is a new behaviour,
-    // and this change is not the place to introduce one.
+    // Whole frames out of m_in, where false is the instruction to exit, with
+    // the EOF test first and stopping before dispatch because acting on a
+    // frame from a daemon that has gone would be a new behaviour.
     bool drain_frames()
     {
         if (m_ctl_eof)
@@ -1175,9 +650,9 @@ private:
             case worker_proto::frame_type::reload:    on_reload();           break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
 
-            // Anything else is either a frame this build predates or one that
-            // only travels the other way.  Skipped, not fatal — that is the
-            // whole point of the length in the header.
+            // Anything else is a frame this build predates or one that only
+            // travels the other way, skipped and not fatal, which is the point
+            // of the length in the header.
             default: break;
         }
     }
@@ -1194,33 +669,17 @@ private:
 
         // A second config for a proxy that is already up would have to rebuild
         // it, and the daemon does not send one: a change of backends is a stop
-        // and a start.  Saying so is better than half-applying it.
+        // and a start.
         if (m_rt)
         {
             LOG_WARN("proxy worker: ignoring config for an already-configured worker");
             return;
         }
 
-        // The ring, at the first and only moment where both halves hold: the
-        // config has been parsed, so anything in it that shapes a ring can be
-        // applied, and nothing has submitted yet, so applying it is still
-        // allowed.  Any set_sqpoll()/set_cpus() this worker is ever given goes
-        // between the parse above and the init below — that gap is the whole
-        // point of building the ring here instead of in run().
-        //
-        // This is where a worker's --cpus and --sqpoll are finally honoured.
-        // They were parsed, stored, persisted and reported, and then applied to
-        // nothing: the ring was built from whatever environment the daemon was
-        // launched with, so `create proxy p --cpus 0-1` pinned
-        // no thread anywhere while `stats` reported cpus:0-1.  Nothing said so
-        // — this is the shape of confidently-wrong the rest of this file is
-        // written against.
-        //
-        // It has to happen here and nowhere else: io_uring fixes a ring's flags
-        // when the ring is created, so set_sqpoll()/set_cpus() on an open ring
-        // are no-ops by contract.  Between the parse above and the init below is
-        // the only window that exists.
-        //
+        // The ring is built between the parse and the init, which is the only
+        // window where the config has been read and nothing has submitted --
+        // otherwise `--cpus 0-1` pinned no thread while `stats` reported
+        // cpus:0-1.
         if (!cfg.cpus.empty())
         {
             cpu_set_spec spec;
@@ -1232,11 +691,9 @@ private:
         }
         if (cfg.sqpoll_set)
             m_loop.set_sqpoll(cfg.sqpoll);
-        //
-        // Guarded on ring_open() rather than on reaching here once: a config
-        // that got as far as the ring and then failed to build a proxy leaves
-        // m_rt null, and a second config frame must not build a second ring
-        // over the first.
+        // Guarded on ring_open() rather than on reaching here once, because a
+        // config that built a ring and then failed to build a proxy must not
+        // get a second ring from the next frame.
         if (!m_loop.ring_open() && !m_loop.init())
         {
             LOG_ERROR("proxy worker: could not initialise io_uring");
@@ -1244,34 +701,18 @@ private:
             return;
         }
 
-        // ── Registered with the ring here, and not further down ─────────────
-        //
-        // The control socket's recv and the control writer's send are this
-        // handler's own submissions, and a submission carries its owner's
-        // token: made without a registration it is not merely unowned, its
-        // completion is DROPPED.  For the recv that means the arm never
-        // completes, m_ctl_armed never clears, and the worker is deaf to its
-        // daemon for the rest of its life.
-        //
-        // Everything below this line can fail and return without building a
-        // runtime — create_runtime() does, for a type this build does not have
-        // — and that exit used to be survivable because the loop read the
-        // socket once per stats interval whatever the arm said.  That read is
-        // gone with the poll it was covering for, so the registration moves to
-        // where the ring is, which is the fact it actually depends on.
-        //
-        // register_owner() is idempotent by contract, so a second config frame
-        // reaching here costs nothing and strands nothing.
+        // Registered with the ring here and not further down, because a
+        // submission made without a registration has its completion dropped --
+        // for the recv that means the worker is deaf to its daemon for the
+        // rest of its life.
         m_loop.register_owner(this);
 
-        // And the frames going the other way go on the ring too — after the
-        // registration and not before, for the reason just stated.  Whatever
-        // the hello frame left queued goes out from here on the ring.
+        // And the frames going the other way go on the ring too, after the
+        // registration and not before.
         m_writer.use_ring(&m_loop, this);
 
-        // The type comes from the frame the daemon sent, not from this file.
-        // Everything below is either a setter every runtime has or is guarded
-        // on the cast, so a worker is not a proxy worker any more.
+        // The type comes from the frame the daemon sent rather than from this
+        // file, so a worker is not a proxy worker any more.
         auto inst = create_runtime(cfg.type, cfg.name);
         if (!inst)
         {
@@ -1286,43 +727,17 @@ private:
         m_rt->set_event_loop(&m_loop);
         m_rt->set_id(cfg.id);
 
-        // Both halves, from the same file the daemon's restore path uses.
-        // This was a hand-written list here, and it was missing seventeen
-        // fields: a worker built a runtime the operator had not asked for and
-        // reported nothing, because there is nothing to report — every setter
-        // it did call succeeded.  See runtime_config_apply.h.
+        // Both halves from the same file the daemon's restore path uses,
+        // because the hand-written list here was missing seventeen fields and
+        // reported nothing, every setter it did call having succeeded.
         apply_common_config(*m_rt, cfg);
         apply_typed_config(*m_rt, cfg);
 
-        // ── This shard's line in the table its siblings share ───────────────
-        //
-        // Before the script is loaded, which is the constraint that decides
-        // where this goes: a script's top level runs inside load_lua_script()
-        // below and may call self.connections(), and a runtime that is not
-        // attached yet answers that with its own count — a fraction, silently,
-        // exactly the defect this exists to remove.
-        //
-        // The descriptor is at a fixed number the supervisor dup2'd it onto, or
-        // it is not there at all.  Absent is no longer the ordinary case — a
-        // region is made for every worker-backed runtime now, one shard or
-        // eight — but it is still not an error: it is a worker forked by a
-        // daemon that could not make one, which falls back to the figures in
-        // the stats frame.  fcntl is the cheapest way to ask whether a
-        // descriptor exists without disturbing it.
-        //
-        // No test on cfg.shards.  A one-shard runtime publishes into slot 0 of
-        // a one-slot table and the daemon sums one slot, which is the same
-        // number by a longer route and is the point: there is one path for the
-        // figures and not a sharded one beside an unsharded one.
-        //
-        // looks_like_region() and not fcntl(F_GETFD).  "Is fd 4 open" was a
-        // sufficient test while `shards > 1` stood in front of it, because that
-        // was the daemon saying it had placed one; with the region made for
-        // every worker-backed runtime there is no such signal left, and fd 4 is
-        // open in any process that has opened four things.  adopt() takes
-        // ownership of what it is handed, so a guess here CLOSES somebody
-        // else's descriptor — which is exactly what happened to a worker
-        // spawned outside the supervisor.  See the note on looks_like_region().
+        // Adopted before the script loads, because a top level may call
+        // self.connections() and an unattached runtime answers with a fraction
+        // -- and tested with looks_like_region() rather than "is fd 4 open",
+        // since adopt() takes ownership and a guess closes somebody else's
+        // descriptor.
         if (shard_stats::looks_like_region(worker_shard_fd))
         {
             if (!m_rt->shard_stats_table().adopt(worker_shard_fd,
@@ -1331,9 +746,8 @@ private:
                          "mapped; this shard will answer only for itself");
         }
 
-        // And the client list.  Adopted here for the same reason and with the
-        // same guard: a script's top level may call self.clients(), and a
-        // runtime that is not attached yet answers with its own connections.
+        // And the client list, adopted here with the same guard, because a top
+        // level may call self.clients().
         if (cfg.shards > 1 && ::fcntl(worker_clients_fd, F_GETFD, 0) >= 0)
         {
             if (!m_rt->shard_clients_table().adopt(worker_clients_fd,
@@ -1342,9 +756,9 @@ private:
                 LOG_WARN("proxy worker: the shared client list could not be "
                          "mapped; this shard will list only its own clients");
 
-            // Where a message for a sibling's connection goes.  The daemon
-            // reads the shard out of the ref itself, so this is one hop to one
-            // process and not an offer to all of them.
+            // Where a message for a sibling's connection goes, which the
+            // daemon resolves from the ref itself, so it is one hop to one
+            // process.
             m_rt->set_ref_sink(
                 [this](const conn_ref& r, std::string_view message)
                 {
@@ -1355,17 +769,10 @@ private:
         }
 
         // ── The shard mesh ─────────────────────────────────────────────────
-        //
-        // Built after the channel is attached below?  No — before it, because
-        // the sinks registered here have to be in the table by the time the
-        // first request is posted, and the config frame that reaches this point
-        // is followed by `start`.  The links themselves are armed on the ring,
-        // which exists from register_owner() a few lines down, so attach() is
-        // deferred until then.
-        //
-        // A descriptor that is not there is not an error: it is an unsharded
-        // runtime, a daemon that could not build the mesh, or a shard that was
-        // restarted and cannot inherit one.  All three relay.
+        // Built before the channel is attached, because these sinks must be in
+        // the table by the first request, with the links themselves attached
+        // once the ring exists -- and an absent descriptor means relay rather
+        // than error.
         if (cfg.shards > 1)
         {
             const uint32_t me = m_rt->get_shard_index();
@@ -1385,32 +792,19 @@ private:
         }
 
         // ── the channel, both directions ────────────────────────────────────
-        //
-        // A runtime asks through its manager, and a worker had none: every
-        // `cache` command a server in a worker was given died at the
-        // `if (!mgr) return;` in post_cache_request(), unanswered.  The map was
-        // empty on purpose then — this process holds one runtime and the manager
-        // was here for the channel — and it is not any more: the daemon pushes a
-        // replica of it, and the sink table below is still built by hand from
-        // this worker's own runtime, because a replica answers no requests.
-        //
-        // Its own name is registered so a request for it is served here rather
-        // than making a round trip through the daemon, which would route it
-        // back to this very worker.
-        // The ring, the owner registration and the writer are already up — see
-        // the block right after m_loop.init(), and the note there for why they
-        // cannot wait for a runtime that may never be built.
+        // The manager's map is a replica that answers no requests, so the sink
+        // table is built by hand from this worker's own runtime, with its own
+        // name registered so a request for it is served here rather than
+        // routed back through the daemon.
 
         m_manager.requests().attach(m_loop);
         if (auto* sink = m_rt->as_request_sink())
             m_manager.requests().register_sink(cfg.name, sink);
         m_manager.requests().set_default_sink(&m_remote);
 
-        // `name#j` for every sibling this process has a link to.  Registered
-        // AFTER the default sink and under the qualified name, so the lookup
-        // that used to miss and fall through to the daemon now resolves here —
-        // and a sibling with no link is simply absent from the table, which is
-        // the miss that still falls through.  See shared/shard_mesh.h.
+        // `name#j` for every sibling this process has a link to, registered
+        // after the default sink, so a sibling with no link is absent and
+        // falls through to the daemon.
         for (auto& link : m_mesh_links)
         {
             link->attach(m_loop);
@@ -1421,33 +815,10 @@ private:
         m_rt->set_runtime_manager(&m_manager);
 
         // ── and a send on its way out ───────────────────────────────────────
-        //
-        // The mirror of the daemon's own deliver sink, which is what
-        // socketley.send reaches for a runtime whose connections are in another
-        // process.  In a worker EVERY other runtime is in another process, and
-        // the daemon is the only one that knows where — so the message goes up
-        // and is routed there, by the same code that routes a `send` typed at
-        // the CLI.
-        //
-        // Its own runtime is answered here rather than on the wire.  The round
-        // trip would work — the daemon would route the name straight back to
-        // this socket — but it would make the commonest send in a worker's
-        // script the slowest one, and it would be delivered a turn of two event
-        // loops later than the call that asked for it.
-        // ── The other shards of this runtime, for anything that fans out ────
-        //
-        // One place, because two callers need it and they must not be able to
-        // disagree about what "everybody" means: `self.broadcast`, through
-        // runtime_instance::broadcast_all, and `socketley.send` addressed to
-        // this worker's own runtime, just below.
-        //
-        // The frame is the ordinary deliver_to naming this runtime's own name.
-        // The daemon reads that as the sibling fan-out and leaves this shard
-        // out of it — see on_worker_deliver — so nothing new goes on the wire.
-        //
-        // Guarded on the shard count inside fanout_to_siblings(), not here: a
-        // one-shard worker must write no frame at all rather than one the
-        // daemon fans out to nobody and then logs as undeliverable.
+        // The mirror of the daemon's deliver sink, answering this worker's own
+        // runtime locally rather than through a round trip -- with the sibling
+        // fan-out in one place, guarded on the shard count inside
+        // fanout_to_siblings() so a one-shard worker writes no frame at all.
         m_rt->set_sibling_sink(
             [this](std::string_view message)
             {
@@ -1462,16 +833,15 @@ private:
             {
                 if (m_rt && name == m_rt->get_name())
                 {
-                    // The local half stays local, for the reason it always
-                    // did: a round trip through the daemon would work and
-                    // would make the commonest send in a worker's script the
-                    // slowest one.
+                    // The local half stays local, because a round trip through
+                    // the daemon would make the commonest send in a worker's
+                    // script the slowest one.
                     deliver_local(message);
 
-                    // And the half that is NOT local, which did not exist
-                    // while a runtime was one process.  `socketley.send` to
-                    // one's own name reached this shard's clients and stopped
-                    // — a quarter of them on four shards, reported as sent.
+                    // And the half that is not local, which did not exist
+                    // while a runtime was one process: `socketley.send` to
+                    // one's own name reached a quarter of the clients on four
+                    // shards.
                     m_rt->fanout_to_siblings(message);
                     return true;
                 }
@@ -1481,19 +851,10 @@ private:
             });
 
         // ── and a publish on its way out ────────────────────────────────────
-        //
-        // The mirror of the frame this worker already receives.  A cache calls
-        // mgr->dispatch_publish(), which in the daemon writes the message to
-        // every worker and then runs every in-process subscriber.  In a worker
-        // that same call found a manager with an empty map and no sink, so a
-        // PUBLISH served by a cache out here reached nobody at all — not the
-        // subscribers in the daemon, not the ones in other workers, and not the
-        // one in this process either, because this runtime is not in this map.
-        //
-        // Out of the process first and the local runtime second, in that order
-        // and for the reason the daemon's copy gives: a subscriber may call
-        // straight back into the manager, and a frame already written to a
-        // socket cannot be affected by what it does.
+        // The mirror of the publish frame this worker receives, out of the
+        // process first and the local runtime second, because a subscriber may
+        // call back into the manager and a frame already written cannot be
+        // affected.
         m_manager.set_publish_sink(
             [this](std::string_view cache_name, std::string_view channel,
                    std::string_view message)
@@ -1510,45 +871,24 @@ private:
             });
 
         // A script that does not load is a configuration this worker cannot
-        // serve, not a warning to carry on past.
-        //
-        // It used to be one: the proxy started anyway, relaying with none of the
-        // filters, routes or callbacks the operator wrote, and the only trace
-        // was a WARN in the daemon's log.  The in-process path has never allowed
-        // that — `create --lua` refuses outright and exits 1 — so a proxy could
-        // be rejected by the daemon and silently accepted, gutted, by the same
-        // binary one flag later.
-        //
-        // Exiting is how a worker says so.  The supervisor already treats a dead
-        // child as the runtime's problem; exit_config_refused tells it not to
-        // fork a sixth copy of the same refusal.
-        // Sent after the load below, not before: there is no declaration until
-        // the script's top level has run.
+        // serve, so it exits with exit_config_refused rather than relaying
+        // with none of the filters, routes or callbacks the operator wrote.
         lua_diag::clear();
         if (!cfg.lua_script.empty() && !m_rt->load_lua_script(cfg.lua_script))
         {
             std::string why = lua_diag::text();
             if (why.empty())
                 why = "the script did not load";
-            // The reason is deliberately NOT repeated here.  It is already in
-            // this worker's stderr -- the script's own error, printed by the
-            // loader -- and it now travels up the control socket as well, so
-            // putting it in a third place made it appear twice in the daemon's
-            // log.  Measured: test_worker_lua_refusal counts that text to tell
-            // one fork from a fork loop, and read 2 for a single fork.
+            // The reason is deliberately not repeated here, because it is
+            // already in this worker's stderr and now travels up the control
+            // socket, and a third copy made it appear twice in the daemon's
+            // log.
             LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
                       "without it (the script's own error is above)");
 
-            // Up the control socket as well as into the log, which is the
-            // whole of the difference to an operator: the daemon answers a
-            // `create` with "the worker did not accept its configuration (the
-            // reason is in the daemon log)", and the reason is this string.
-            // Same shape as reload_err and start_err; see config_err.
-            //
-            // Written BEFORE m_done, so the frame is queued while the writer
-            // still runs, and flushed by the shutdown drain below.  The bytes
-            // outlive this process in the socket until the supervisor reads
-            // them.
+            // Up the control socket as well as into the log, written before
+            // m_done so the frame is queued while the writer still runs and
+            // outlives this process in the socket.
             if (!m_writer.write(worker_proto::frame(
                     worker_proto::frame_type::config_err, why))) {}
 
@@ -1557,15 +897,9 @@ private:
             return;
         }
 
-        // A table that arrived before the config is not lost: it is held and
-        // applied here.  The daemon publishes on every membership change, and
-        // nothing orders those against the config frame.
-        // What this runtime says it will answer, up to the daemon, which is the
-        // only process that can publish it to whoever routes here.  Sent once
-        // and only when there is something to send: a runtime that declares
-        // nothing leaves the gateway forwarding exactly as it did before route
-        // declarations existed, and an empty frame would say the same thing at
-        // the cost of a round of publishing.
+        // A table that arrived before the config is held and applied here, and
+        // the route declaration goes up once and only when there is something
+        // to send.
         if (const auto* lctx = m_rt->lua(); lctx && lctx->has_routes())
         {
             if (!m_writer.write(worker_proto::frame(
@@ -1583,41 +917,10 @@ private:
         send_state();
     }
 
-    // What runtimes the daemon has, arriving as a table rather than as a
-    // question this process would have to ask.
-    //
-    // The whole of the worker's half: decode, hand it to the manager, and every
-    // reader of the map — socketley.list(), socketley.get(), and anything else
-    // that goes through mgr->get() — works out here exactly as it does in the
-    // daemon, with no idea that what it found is a copy.  That is the point of
-    // putting the replica in the map instead of answering the two calls
-    // specially: there is one place that knows, and it is not the Lua layer.
-    //
-    // Not stashed when there is no runtime yet, unlike the endpoint table.  The
-    // table has to be held because only a proxy can be handed one and the proxy
-    // does not exist before the config frame; the map goes into the manager,
-    // which exists from construction.
-    //
-    // ─── This worker's OWN runtime is in here, and as a replica ─────────────
-    //
-    // It has to be in the map at all, because socketley.list() called from a
-    // runtime includes that runtime everywhere else: a worker that left itself
-    // out would answer three where the daemon answers four, which is a wrong
-    // answer rather than a missing feature.
-    //
-    // It is the replica and not m_rt, and that is the load-bearing half.
-    // Putting the live object in the map would deliver every PUBLISH to it
-    // twice: dispatch_publish() walks the map and skips only what is out of
-    // process, and this worker's publish sink ALSO calls
-    // m_rt->on_publish_dispatch() by hand — because that call is the only
-    // delivery this process gets for a message it published itself.  A replica
-    // is out of process by construction and has no interpreter, so the walk
-    // skips it twice over and the hand-written delivery stays the only one.
-    //
-    // What it costs is that socketley.get(self.name).connections is the
-    // daemon's copy of this worker's own figure, up to a push interval old,
-    // while self.connections() is exact.  Two calls, two answers, and the
-    // second one is the one a script asking about itself should be using.
+    // The daemon's map decoded into the manager, so every reader works out
+    // here exactly as it does in the daemon -- with this worker's own runtime
+    // present as a replica, because putting the live object in would deliver
+    // every PUBLISH to it twice.
     void on_runtime_map(const std::string& payload)
     {
         std::vector<worker_proto::runtime_wire> wire;
@@ -1631,12 +934,9 @@ private:
         entries.reserve(wire.size());
         for (const auto& w : wire)
         {
-            // A type or a state this build has no name for comes from a daemon
-            // newer than this worker — the case the version in every frame
-            // header exists for.  The entry is dropped rather than cast to
-            // whatever the number happens to land on: a runtime reported as the
-            // wrong kind is worse than one not reported at all, and the next
-            // upgrade of this binary makes it appear.
+            // A type or state this build has no name for comes from a newer
+            // daemon and is dropped rather than cast, because a runtime
+            // reported as the wrong kind is worse than one not reported.
             if (w.type > static_cast<uint8_t>(runtime_cache) ||
                 w.state > static_cast<uint8_t>(runtime_failed))
             {
@@ -1665,20 +965,9 @@ private:
         }
     }
 
-    // What the cluster looks like, as the daemon last scanned it.
-    //
-    // Installed on lua_context rather than on this runtime, because it is a
-    // property of the PROCESS: every interpreter in this worker is looking at
-    // the same cluster, and there is exactly one worker per runtime anyway.
-    // Held by shared_ptr and never mutated after publication, so a cluster call
-    // that is mid-iteration keeps the view it started with instead of watching
-    // daemons appear underneath it — the same arrangement the endpoint table
-    // uses, for the same reason.
-    //
-    // An empty daemon name is a WITHDRAWAL, not a cluster of one with no name:
-    // it is what the daemon sends when it no longer has a cluster_discovery, and
-    // taking it as a view would leave the four cluster calls answering out of a
-    // cluster this daemon has left.  Cleared, so they refuse again.
+    // The cluster view, installed on lua_context because it is a property of
+    // the process, held by shared_ptr and never mutated -- and an empty daemon
+    // name is a withdrawal that clears it so the four calls refuse again.
     void on_cluster_view(const std::string& payload)
     {
         auto view = std::make_shared<cluster_view>();
@@ -1727,12 +1016,9 @@ private:
         for (auto& [g, rt] : group_routes)
             tbl->set_group_routes(g, std::move(rt));
 
-        // Immutable from here, exactly as on the daemon side: a request that is
-        // already resolving keeps the table it started with.
-        // Three cases, and the braces are load-bearing.  Written without them
-        // the `else` bound to the inner `if` and a table arriving before the
-        // config frame was dropped instead of stashed — -Wdangling-else caught
-        // it, which is the whole reason that warning is not tolerated here.
+        // Immutable from here, exactly as on the daemon side, with the braces
+        // load-bearing: without them the `else` bound to the inner `if` and a
+        // table arriving before the config was dropped instead of stashed.
         if (!m_rt)
             m_pending_endpoints = std::move(tbl);   // no runtime yet; keep it
         else if (m_proxy)
@@ -1740,29 +1026,10 @@ private:
         // else: a runtime that does not route.  Nothing to hand it.
     }
 
-    // A cache somewhere in the daemon published, and this proxy's script asked to
-    // hear about it.  Delivered through the same entry point an in-process
-    // runtime's dispatch goes through, so a subscribe callback cannot tell which
-    // side of the boundary it is running on.
-    //
-    // Dropped when there is no proxy yet: a publish that arrives before the
-    // config frame has nowhere to go, and holding it the way a pending endpoint
-    // table is held would be storing an event to replay at a subscriber that did
-    // not exist when it happened.
-    // A request another runtime made of this one, arriving over the control
-    // socket instead of over this runtime's own port.
-    //
-    // The payload is whatever would have reached that port and is handed to the
-    // runtime untouched — nothing here parses a command, which is why this wire
-    // was chosen over the target's own protocol.  The ticket is the channel's,
-    // and it goes back with the answer so the daemon can pair them without
-    // understanding either.
-    // What a mesh link hands a sibling's request to.
-    //
-    // The same two lines on_chan_req() runs for a request that came the long
-    // way round, deliberately: a key served over a direct link and the same key
-    // served through the daemon must not be able to differ.  A free function
-    // because shard_link knows nothing about runtimes and should not.
+    // A publish delivered through the same entry point an in-process dispatch
+    // uses and dropped when there is no proxy yet -- and a request from
+    // another runtime, whose payload is handed over untouched and whose ticket
+    // goes back with the answer.
     static bool worker_serve_mesh(void* ctx, std::string_view /*target*/,
                                   std::string_view payload, std::string& reply)
     {
@@ -1776,11 +1043,9 @@ private:
         return true;
     }
 
-    // Crossings by route, summed over this shard's links.
-    //
-    // Reported because the relay fallback makes a mesh that never connects look
-    // exactly like one that made no difference: same throughput, same green
-    // tests.  Without these two numbers the benchmark cannot tell them apart.
+    // Crossings by route summed over this shard's links, reported because the
+    // relay fallback makes a mesh that never connects look exactly like one
+    // that made no difference.
     void mesh_counts(uint64_t& direct, uint64_t& relayed) const
     {
         direct = relayed = 0;
@@ -1797,9 +1062,9 @@ private:
         if (!worker_proto::decode_chan_request(payload, q))
             return;   // a frame this build cannot read is skipped, not fatal
 
-        // request_status::no_target if there is nothing to ask.  The daemon
-        // cannot know that from its side: the placeholder exists whether or not
-        // this worker ever built its runtime.
+        // request_status::no_target when there is nothing to ask, which the
+        // daemon cannot know because the placeholder exists whether or not
+        // this worker built its runtime.
         uint8_t     st = 1;   // no_target
         std::string reply;
         if (m_rt)
@@ -1815,11 +1080,9 @@ private:
                           worker_proto::encode_chan_reply(q.ticket, st, reply)))) {}
     }
 
-    // The answer to something this worker's runtime asked of a runtime it
-    // cannot see.  The ticket is one this process issued, so it can only ever
-    // match a request parked here — a chan_rep the other way carries the
-    // daemon's ticket and is read by the daemon, never by this.  The two
-    // namespaces never meet, which is why neither needs a tag.
+    // The answer to something this worker's runtime asked, whose ticket this
+    // process issued, so the two namespaces never meet and neither needs a
+    // tag.
     void on_chan_rep(const std::string& payload)
     {
         worker_proto::chan_reply_wire p;
@@ -1830,19 +1093,9 @@ private:
             p.ticket, static_cast<request_status>(p.status), p.payload);
     }
 
-    // ── socketley.create/.start/.stop/.remove, asked and waited for ─────────
-    //
-    // The only place in this process that blocks its own event loop, and the
-    // note at worker_protocol.h's encode_map_request is where the case for that
-    // is made and measured.  In short: these four are not on the data path —
-    // they run in on_start or on a rare control message, never per message —
-    // and `if socketley.create(...) then` cannot be answered with an
-    // acceptance.
-    //
-    // Everything this worker is serving stops for the duration.  That is the
-    // cost, it is bounded by map_wait_ms, and it is the same cost
-    // socketley.http() already imposes on the same loop for a network round
-    // trip three orders of magnitude longer.
+    // The only place in this process that blocks its own event loop, bounded
+    // by map_wait_ms, at the same cost socketley.http() already imposes for a
+    // round trip three orders of magnitude longer.
     bool map_request(std::string_view op, std::string_view name,
                      std::string_view config, std::string& err)
     {
@@ -1909,9 +1162,9 @@ private:
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline)
             {
-                // Said as what it is.  The daemon has not necessarily refused
-                // anything — it may still be doing the work — and a script told
-                // "it failed" would be told something this side cannot know.
+                // Said as what it is, because the daemon may still be doing
+                // the work and a script told "it failed" would be told
+                // something this side cannot know.
                 err = "the daemon did not answer within "
                     + std::to_string(map_wait_ms) + " ms";
                 return false;
@@ -1943,20 +1196,17 @@ private:
             if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
                 continue;
 
-            // Zero is the daemon letting go, and anything else is the socket.
-            // Either way this worker has no control plane left, and every
-            // later call says so at once rather than waiting five seconds for
-            // a descriptor that is not coming back.
+            // Zero is the daemon letting go and anything else is the socket,
+            // so every later call says so at once rather than waiting five
+            // seconds.
             close_map();
             err = "the daemon closed the control plane";
             return false;
         }
     }
 
-    // The request, out.  Bounded by the same deadline the wait is: a socketpair
-    // whose buffer is full has a daemon at the other end that has stopped
-    // reading, and blocking there without a limit would hold this worker's loop
-    // on a promise nobody made.
+    // The request out, bounded by the same deadline the wait is, because a
+    // full socketpair buffer means the daemon has stopped reading.
     bool map_write(const std::string& frame,
                    std::chrono::steady_clock::time_point deadline)
     {
@@ -1994,10 +1244,9 @@ private:
         return true;
     }
 
-    // The control plane is gone.  The sink stays installed and every later call
-    // is refused by the m_map_fd test at the top of map_request(), which is the
-    // truthful answer: a worker whose daemon has let go cannot alter the map,
-    // and it is about to be told to exit anyway.
+    // The control plane is gone, and the sink stays installed so every later
+    // call is refused truthfully by the m_map_fd test at the top of
+    // map_request().
     void close_map()
     {
         if (m_map_fd >= 0)
@@ -2008,26 +1257,17 @@ private:
         m_map_in.clear();
     }
 
-    // `socketley send` reaching the process that holds the connections.
-    //
-    // The same two calls cmd_send() makes on an in-process runtime, and the same
-    // mode test: a server in `in` mode and a client in `in` mode both read only,
-    // so a broadcast to one is a message with nowhere to go.
+    // `socketley send` reaching the process that holds the connections, with
+    // the same two calls and the same mode test cmd_send() makes on an
+    // in-process runtime.
     void on_deliver(const std::string& message)
     {
         deliver_local(message);
     }
 
-    // The two calls cmd_send() makes on an in-process runtime, against the one
-    // runtime this process holds.
-    //
-    // Reached from two directions now.  A `deliver` frame is the daemon routing
-    // somebody else's send here, and a `socketley.send(self, ...)` from this
-    // worker's own script is the same delivery with no wire between the ask and
-    // the answer — so it is short-circuited in the deliver sink rather than sent
-    // up for the daemon to send straight back down.  One body, because the two
-    // must not be able to disagree about what `send` does to a runtime in `in`
-    // mode.
+    // The two calls cmd_send() makes, reached from both a `deliver` frame and
+    // this worker's own script, in one body so the two cannot disagree about
+    // what `send` does to a runtime in `in` mode.
     void deliver_local(std::string_view message)
     {
         if (!m_rt || m_rt->get_state() != runtime_running)
@@ -2054,15 +1294,9 @@ private:
         }
     }
 
-    // A message for one of THIS shard's connections, sent by a sibling.
-    //
-    // write_to_ref() is the same function a routed-in message from another
-    // runtime lands in, and it already checks the three things that matter:
-    // that the name is ours to resolve, that it still resolves, and that what
-    // it resolves to is the connection it named when it was minted.  A ref for
-    // a client that has since gone answers false and the message is dropped —
-    // which is conn_identity.h's whole promise, and the reason nothing here has
-    // to guess.
+    // A message for one of this shard's connections sent by a sibling, through
+    // write_to_ref(), which already checks that the name is ours, still
+    // resolves, and names the connection it was minted for.
     void on_deliver_ref(const std::string& payload)
     {
         if (!m_rt || m_rt->get_state() != runtime_running)
@@ -2084,12 +1318,8 @@ private:
                       "this shard no longer has");
     }
 
-    // ── Routing: the four verbs that arrive, and the five that leave ────────
-    //
-    // A connection this worker's runtime does not own, being routed here by the
-    // runtime that does -- or a message for one it DID route away, coming back.
-    // Which of the five it is, is on the frame; see route_op, which says why
-    // the direction is carried rather than inferred from the ref.
+    // A connection being routed here, or a message for one this runtime routed
+    // away coming back, with which of the five it is carried on the frame.
     void on_route_down(const std::string& payload)
     {
         std::string            to, frm, msg;
@@ -2104,11 +1334,9 @@ private:
         if (!m_rt || m_rt->get_state() != runtime_running)
             return;
 
-        // Against m_rt's own name and not against the manager's map.  The map
-        // out here is a replica of the daemon's and holds a row for this
-        // runtime too, so looking `to` up in it would resolve -- to a replica,
-        // which is not the object holding the connections.  There is exactly
-        // one runtime in this process and this is it.
+        // Against m_rt's own name and not the manager's map, because the map
+        // out here holds a replica of this runtime, which is not the object
+        // holding the connections.
         if (to != m_rt->get_name())
         {
             LOG_WARN("proxy worker: a routing frame named another runtime; "
@@ -2123,11 +1351,9 @@ private:
         switch (op)
         {
             case worker_proto::route_op::open:
-                // Refused here is not refused at the origin: it was told yes
-                // from the map before this frame was ever written.  So the
-                // unwind travels back as a `drop`, which is the same message
-                // an origin gets when its target dies -- one path, already
-                // tested, rather than a second one for a rarer case.
+                // Refused here is not refused at the origin, which was told
+                // yes from the map, so the unwind travels back as a `drop` --
+                // one path, already tested.
                 if (srv->accept_routed(ref, frm) < 0)
                     post(frm, to, worker_proto::route_op::drop, ref, {});
                 break;
@@ -2146,28 +1372,23 @@ private:
                 srv->drop_route(ref);
                 break;
             case worker_proto::route_op::broadcast:
-                // Unconditional, and `--mode in` is deliberately not consulted:
-                // that flag says whether socketley.send reaches this runtime,
-                // not whether a sub-server it routed a connection to may answer
-                // its clients.  See route_op::broadcast.
+                // Unconditional, with `--mode in` deliberately not consulted,
+                // because that flag says whether socketley.send reaches this
+                // runtime and not whether a sub-server may answer its clients.
                 srv->lua_broadcast(msg);
                 break;
             case worker_proto::route_op::forget:
-                // `frm` is the runtime that went away, not one that asked for
-                // something -- the only op here where that field means the
-                // other thing.  Named rather than left to be read off the
-                // switch, because it is the kind of difference a reader
-                // supplies from the five lines above it.
+                // `frm` is the runtime that went away rather than one that
+                // asked for something, named because it is the kind of
+                // difference a reader supplies from the lines above it.
                 srv->forget_runtime(frm);
                 break;
         }
     }
 
-    // route_relay::sink.  Everything this runtime does TO another one leaves
-    // here: four verbs as frames, and `open` as the one question, which goes up
-    // the map socket because it is the only descriptor this process may block
-    // on.  See encode_map_request for that, and route_op for why the other four
-    // do not wait.
+    // Everything this runtime does to another leaves here: four verbs as
+    // frames, and `open` up the map socket, which is the only descriptor this
+    // process may block on.
     void post(std::string_view to, std::string_view frm,
               worker_proto::route_op op, const conn_ref& ref,
               std::string_view payload) override
@@ -2186,21 +1407,14 @@ private:
 
     void forget(std::string_view) override
     {
-        // Nothing, and the reason is structural rather than an omission.  This
-        // is called from runtime_manager::stop and ::remove, and both refuse
-        // outright in a replica -- so out here it is only ever reached for a
-        // runtime this process does not hold, which cannot happen.  The daemon
-        // is what tells everyone; see route_op::forget.
+        // Nothing, structurally: this is called from runtime_manager::stop and
+        // ::remove, both of which refuse in a replica, and the daemon is what
+        // tells everyone.
     }
 
-    // One cluster event, as the daemon resolved it.
-    //
-    // The snapshot frame above says what the cluster looks like; this says what
-    // changed, and a script that only reads the snapshot can never see a change
-    // it slept through -- which is what on_cluster_join and on_group_change are
-    // for.  All three fired nowhere at all before this frame existed: the
-    // daemon runs them off each runtime's lua_context, and a placeholder has
-    // none.
+    // One cluster event as the daemon resolved it, because a script that only
+    // reads the snapshot can never see a change it slept through -- and all
+    // three callbacks fired nowhere before this frame existed.
     void on_cluster_event(const std::string& payload)
     {
         if (!m_rt || m_rt->get_state() != runtime_running)
@@ -2235,24 +1449,15 @@ private:
     void on_start()
     {
         // A worker that has decided to exit must not bind anything on the way
-        // out.  start and config arrive together — the supervisor sends both
-        // before the first drain — so a refusal in on_config() is followed by
-        // this in the same batch, and without the guard the worker took the port,
-        // reported "proxy failed to start", and exited: a listener opened and
-        // closed for a configuration it had already refused.
+        // out, because start and config arrive together and without the guard
+        // it took the port and then exited.
         if (m_done || !m_rt || m_rt->get_state() == runtime_running)
             return;
 
-        // The second of the two checks the note above claim_current_daemon()
-        // describes, and the one it exists for: start() is what binds, and a
-        // bind is what joins the SO_REUSEPORT group.  Everything between the
-        // fork and this line — the config frame, the script's top level, the
-        // ring being built — is time in which the daemon can die, and a worker
-        // that binds afterwards is the stale shard that goes on serving 1/N of
-        // the traffic from a build nobody thinks is running.
-        //
-        // Refused rather than deferred: there is no daemon left to tell, and a
-        // worker that cannot name its owner has nothing to wait for.
+        // The second ownership check, at the bind, because a bind is what
+        // joins the SO_REUSEPORT group and everything since the fork is time
+        // the daemon can die in -- refused rather than deferred, since there
+        // is nothing left to wait for.
         if (!claim_current_daemon(m_fd))
         {
             LOG_ERROR("proxy worker: the daemon that forked this worker is gone; "
@@ -2265,13 +1470,9 @@ private:
         if (!m_rt->start(m_loop))
             LOG_ERROR("proxy worker: proxy failed to start");
 
-        // A raise in on_start does not stop this runtime serving and is not
-        // meant to — start() says why — but `create -s` is still holding the
-        // operator's terminal, and out here its script's set-up is the one
-        // thing that side cannot observe.  Written before send_state(), which
-        // is what ends the daemon's wait, for the reason the reload path gives
-        // at the same point: an answer that arrives after the wait has ended is
-        // an answer nobody reads.
+        // A raise in on_start does not stop this runtime serving, but `create
+        // -s` is holding the operator's terminal, so the reason is written
+        // before send_state(), which ends the daemon's wait.
         if (const std::string& why = m_rt->last_on_start_error(); !why.empty())
         {
             LOG_WARN(("proxy worker: " + why).c_str());
@@ -2290,39 +1491,17 @@ private:
         send_state();
     }
 
-    // `reload-lua` reached this runtime.  The script runs here and nowhere else,
-    // so the daemon cannot re-read it on this runtime's behalf; it can only ask,
-    // which is what this frame is.
-    //
-    // The answer goes back unconditionally, which is where this differs from
-    // on_config() above.  A fresh child has no predecessor and the daemon holds
-    // nothing to clear, so sending nothing there means "no declaration".  After a
-    // reload the daemon may be holding the *previous* version of this script's
-    // declaration, and a script that has deleted a route -- or its whole `routes`
-    // table -- has to be able to withdraw it.  An empty frame is what withdraws
-    // it: publish_endpoints() drops a declaration with nothing in it, so the
-    // gateway goes back to forwarding rather than being left enforcing a rule the
-    // handler has removed.  Silently, in that case, because nothing but `stats`
-    // reports what the gate holds.
+    // `reload-lua` reached this runtime, and the answer goes back
+    // unconditionally -- unlike on_config() -- because an empty frame is what
+    // withdraws a declaration the script has removed.
     void on_reload()
     {
         if (!m_rt || m_rt->get_lua_script_path().empty())
             return;
-        // A script that will not compile leaves the previous one in force --
-        // reload_lua_script()'s own contract -- so the declaration read below is
-        // still the one being enforced in that case, and still the right answer.
-        //
-        // But it is not the answer the operator asked for, and the WARN below
-        // is in a log they are not reading.  The reason goes up the control
-        // socket as well, so `reload-lua` can refuse rather than reporting
-        // success for an edit that did not take effect.  Written before the
-        // routes frame, which is what ends the daemon's wait.
-        //
-        // The WARN no longer claims the previous script survived, because that
-        // is only true of one of the two ways to reach it.  A script that will
-        // not compile leaves the previous one running; a script that compiled
-        // and then raised in on_start IS the one in force, with whatever set-up
-        // it managed before it failed.  The reason distinguishes them.
+        // A script that will not compile leaves the previous one in force, so
+        // the declaration below is still the right answer, but the reason goes
+        // up the control socket too, and the warning no longer claims
+        // survival, which is true of only one of the two ways here.
         lua_diag::clear();
         if (!m_rt->reload_lua_script())
         {
@@ -2354,52 +1533,33 @@ private:
     std::vector<std::unique_ptr<shard_link>> m_mesh_links;
     std::vector<std::unique_ptr<mesh_sink>>  m_mesh_sinks;
     remote_sink                            m_remote;
-    // A replica of the daemon's map, and a live channel.  See the wiring in
-    // on_config() and the runtime_map frame that fills the map in.
-    //
-    // The map was empty on purpose until that frame existed, and everything that
-    // looked a name up in it got the truth for a process holding one runtime:
-    // nothing.  What that cost was the twelve management calls a worker refuses,
-    // all of which reach for this object.
-    //
-    // Declared before the runtime so it outlives it: a runtime revokes its
-    // origin as it is destroyed, and that call needs a channel that is still
-    // there — the same ordering runtime_manager itself documents, and the same
-    // UBSan report if it is got wrong.
+    // A replica of the daemon's map and a live channel, declared before the
+    // runtime so it outlives it: a runtime revokes its origin as it is
+    // destroyed and that call needs a channel that is still there.
     runtime_manager                        m_manager;
     std::unique_ptr<runtime_instance>       m_owned;
-    // The runtime this worker owns, and the same pointer narrowed when it
-    // happens to be a proxy.  Everything generic goes through m_rt; m_proxy is
-    // for the two things only a proxy has — its own config applier and the
-    // endpoint table it routes with.
+    // The runtime this worker owns and the same pointer narrowed when it is a
+    // proxy, with m_proxy only for the two things only a proxy has.
     runtime_instance*                      m_rt{nullptr};
     proxy_instance*                        m_proxy{nullptr};
     std::shared_ptr<const endpoint_table>  m_pending_endpoints;
     std::string                            m_in;
     io_request                             m_ctl_req{};
     bool                                   m_ctl_armed{false};
-    // Where the ring's recv puts the frame.  Read only from on_cqe(), and only
-    // for the length the completion reports; the recv that owns it is the one
-    // named by m_ctl_req and there is never more than one.
-    //
-    // 4096 was what the ::read() loop used, and that loop went round again.  A
-    // recv does not, so a short buffer is a second completion and a second
-    // turn.  16 KiB holds the largest frame this socket carries under load —
-    // a chan_req or a chan_rep with a batch of cache commands in it — and
-    // costs one page more per worker.
+    // Where the ring's recv puts the frame, 16 KiB rather than the read loop's
+    // 4096 because a recv does not go round again and a short buffer is a
+    // second completion and a second turn.
     char                                   m_ctl_buf[16 * 1024];
-    // The daemon closed, or the recv failed for a reason that is not going to
-    // get better.  Set in on_cqe(), acted on by drain_frames().
+    // The daemon closed, or the recv failed for a reason that will not get
+    // better, set in on_cqe() and acted on by drain_frames().
     bool                                   m_ctl_eof{false};
     bool                                   m_done{false};
     int                                    m_exit_code{0};
 
     // ── The control plane ───────────────────────────────────────────────────
-    //
-    // -1 when this daemon does not serve map calls, which is how the four Lua
-    // bindings decide to refuse rather than to travel.  Never armed on the ring
-    // and never touched from on_cqe: the whole point of it is a descriptor the
-    // loop does not own, so that map_request() may block on it.
+    // -1 when this daemon does not serve map calls, never armed on the ring
+    // and never touched from on_cqe, because the whole point is a descriptor
+    // the loop does not own.
     int                                    m_map_fd{-1};
     std::string                            m_map_in;
     uint64_t                               m_map_ticket{0};
@@ -2412,36 +1572,26 @@ int proxy_worker_main(int control_fd)
     if (control_fd < 0)
         return 2;
 
-    // ─── Before anything else this process could go on to do ────────────────
-    //
-    // The order of these two is the whole of what makes them race-free, and it
-    // is the reverse of the intuitive one.  Ask the kernel to signal us on our
-    // parent's death FIRST, then ask whether that parent is still there: a
-    // daemon that died before the prctl will never produce the signal, and the
-    // getppid() check is what catches exactly that window.  Doing it the other
-    // way round leaves the window open instead of closing it.
-    //
-    // See the note above claim_current_daemon() for why a worker has to be able
-    // to prove this at all, and why the signal is SIGTERM.
+    // Ask the kernel to signal on the parent's death first and only then check
+    // the parent, because a daemon that died before the prctl produces no
+    // signal and the getppid() check is what catches that window.
     if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {}
 
     if (!claim_current_daemon(control_fd))
         return 2;
 
-    // Before the first line this process might want to log.  A worker reads no
-    // configuration file, so without this its level is the built-in default and
-    // every LOG_DEBUG out here — including the ones in the runtime it is about
-    // to build — is unreachable however the daemon was configured.
+    // Before the first line this process might log, because a worker reads no
+    // configuration file and every LOG_DEBUG out here would otherwise be
+    // unreachable.
     inherit_log_level();
 
-    // Before any interpreter exists, because it decides what one is built with.
-    // This process holds one runtime and no map of runtimes, so the cross-runtime
-    // half of the Lua management API has nothing here to answer from and says so
-    // instead of answering nothing.
+    // Before any interpreter exists, because it decides what one is built
+    // with: this process has no map of runtimes and says so rather than
+    // answering nothing.
     lua_context::set_worker_process(true);
-    // The same fact, in the bit that survives a SOCKETLEY_NO_LUA build.  Read by
-    // the --shards placement rule, which would otherwise refuse every shard of a
-    // runtime the daemon had just accepted -- see shards_config_refusal.
+    // The same fact in the bit that survives a SOCKETLEY_NO_LUA build, read by
+    // the --shards placement rule, which would otherwise refuse every shard
+    // the daemon had just accepted.
     set_worker_process(true);
 
     worker w(control_fd);
