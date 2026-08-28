@@ -567,8 +567,14 @@ par list "$OOP_list" "$IN_list"
 # Every field of the placeholder shape at once.  connections is the one that
 # cannot be answered from a name alone: a map carrying a stale or absent count
 # says .../0 here beside a CONN column that says 1.
-ctl "socketley.get()" "$IN_get" "server/running/$PEER_PORT/1/nil" \
-    "a build with no connection figure in the map would say .../0/nil"
+#
+# The control moved BELOW the convergence loop and this is why: it used to be
+# checked here, on a value sampled once, because the in-daemon arm read the
+# live count off the runtime and had nothing to converge to.  Both arms are
+# workers now, so both read a pushed figure and both need the same window --
+# checking one of them before the wait is checking it at the one moment it is
+# guaranteed to be allowed to be wrong.
+WANT_GET="server/running/$PEER_PORT/1/nil"
 
 # ── and the one field that is a CONVERGING figure, not an instantaneous one ──
 #
@@ -630,15 +636,37 @@ case "$STATS_MS" in
 esac
 CONVERGE_MS=$((STATS_MS * 4))
 
+# ─── BOTH arms are re-read, and that changed with --daemon-process ──────────
+#
+# This loop used to re-read only the worker arm, because the other one was
+# EXACT: par_in ran in the daemon, and socketley.get() there reads the live
+# connection count off the runtime itself.  There was a fixed number to
+# converge to.
+#
+# Both arms are workers now, so both read the daemon's pushed copy, and a
+# reference sampled once before the loop is a reference that can be stale.
+# Measured under Sanitize: IN_get was captured as 0 and the loop then waited
+# for the worker arm to become 0 again, which it never did -- reported as
+# "connections never converged" for two arms that agreed within one interval.
+#
+# Re-reading both is not a weaker assertion.  What is being asserted is that
+# the two arms AGREE, and a comparison where only one side is allowed to move
+# was asserting agreement with a snapshot instead.
 now_ms() { date +%s%3N; }
 GET_T0=$(now_ms)
 GET_WAITED=0
-while [ "$OOP_get" != "$IN_get" ]; do
+while [ "$OOP_get" != "$IN_get" ] || [ "$IN_get" != "$WANT_GET" ]; do
     GET_WAITED=$(( $(now_ms) - GET_T0 ))
     [ "$GET_WAITED" -ge "$CONVERGE_MS" ] && break
     sleep 0.05
     OOP_get=$(field "$(ask "$OOP_PORT" getpeer)" get)
+    IN_get=$(field "$(ask "$IN_PORT" getpeer)" get)
 done
+
+# The control, now that both arms have had the window the design promises them.
+ctl "socketley.get()" "$IN_get" "$WANT_GET" \
+    "a build with no connection figure in the map would say .../0/nil;" \
+    "waited ${GET_WAITED}ms of ${CONVERGE_MS}ms"
 GET_WAITED=$(( $(now_ms) - GET_T0 ))
 
 if [ "$OOP_get" = "$IN_get" ]; then

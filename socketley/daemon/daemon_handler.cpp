@@ -1679,6 +1679,31 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             std::cout << wmsg;
             return wrc;
         }
+
+        // ─── `instance` may not exist any more ──────────────────────────────
+        //
+        // The wait drains the worker's control plane and SERVES what comes off
+        // it, inline -- that is what makes a script's on_start able to call
+        // socketley.create at all.  One of the things a script may ask for is
+        // `socketley.remove(<its own name>)`, and the daemon does exactly that:
+        // takes the runtime out of the map and retires it.  retire() has a
+        // shortcut for an instance that never reached setup(), which a
+        // placeholder for an out-of-process runtime never does, so it is freed
+        // on the spot -- while this frame is still holding the pointer.
+        //
+        // Found by AddressSanitizer, at the line below this block: a
+        // heap-use-after-free in cmd_create, on a Release build that was green.
+        // It was reachable before this branch and unreachable by the suite,
+        // because the only test that removed a runtime from its own top level
+        // ran that top level in the daemon, where no wait was in progress.
+        //
+        // Re-resolved rather than cached, which is the rule this tree applies
+        // everywhere something may have run a script in between.  Gone means
+        // the create did what it was asked and there is nothing left to report
+        // about: the runtime the operator named removed itself.
+        instance = m_manager.get(name);
+        if (!instance)
+            return 0;
     }
 
     // ─── A script whose on_start raised is not a silent success ─────────────
