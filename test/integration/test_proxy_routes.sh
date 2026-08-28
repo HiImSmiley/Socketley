@@ -1,41 +1,17 @@
 #!/usr/bin/env bash
-# Integration test: a Lua script declares its routes, the daemon publishes them,
-# and the proxy refuses at the edge what the handler would have refused anyway.
-#
-# The declaration lives in the *handler's* script — a path and the methods
-# allowed on it — and is published to the proxy inside the same snapshot that
-# already carries name → host:port.  Nothing about methods is configured on the
-# proxy, which is the point: a method list written down in two runtimes is one
-# truth in two places, and two places drift.
-#
+# A Lua script declares its routes, the daemon publishes them, and the proxy
+# refuses at the edge what the handler would have refused anyway -- so the
+# method list lives in one place rather than two that drift.
 # ─── THE ORACLE ─────────────────────────────────────────────────────────────
-#
-# A 405 proves nothing.  It says the client was refused; it says nothing about
-# whether the proxy resolved an endpoint, spent a pooled socket, opened a
-# connection, forwarded the request and threw the answer away.  A gateway that
-# does all of that and then answers 405 is indistinguishable from this one by
-# status code alone, and it is exactly the gateway this feature is not.
-#
-# So the oracle is the backend's own bookkeeping, read off the backend runtime
-# itself with `stats`: total_connections and bytes_in.  A request refused at the
-# edge must move neither.
-#
-# bytes_in and not only total_connections, for the reason test_proxy_filters.sh
-# gives: this proxy pools backend sockets, so a request that reaches the backend
-# over a socket accepted earlier moves no accept counter at all.  Measured here
-# — forty forwarded requests through this proxy cost the backend *two* accepts
-# and seven hundred bytes.  An accept-only oracle would have called that "the
-# request never arrived".
-#
+# The oracle is the backend's own total_connections and bytes_in rather than
+# the status code, because a gateway that resolves, connects, forwards and then
+# answers 405 is indistinguishable by status alone -- and bytes_in because
+# pooling means a forwarded request may move no accept counter at all.
 # ─── THE VACUITY GUARDS ─────────────────────────────────────────────────────
-#
-# "Did not reach the backend" passes trivially against a proxy that reaches no
-# backend at all, and "was refused" passes against a proxy that refuses
-# everything.  So every refusal here is paired with a request that must be
-# served, every refusal names the Allow header it expects rather than only the
-# status, and the phases below deliberately include the four shapes that must
-# NOT be refused: a preflight, an undeclared path, an implied HEAD, and a method
-# only one member of a group declares.
+# Every refusal is paired with a request that must be served and names the
+# Allow header it expects, because "did not reach the backend" passes against a
+# proxy that reaches none and "was refused" against one that refuses
+# everything.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -82,17 +58,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet starts one of its own, detached from this shell; killing
-    # $DPID would leave that one running for good, holding this test's ports.
-    # The bracket keeps the pattern from matching the shell that carries it.
-    # Matched by exact process name, never by a command-line pattern.  The
-    # bracket this used to carry only kept the pattern from matching the pgrep
-    # itself; `-f` still matched any shell whose own command line carried the
-    # string — a test runner, or this file — and the environ check below cannot
-    # rule that out, because such a shell exports the very SOCKETLEY_SOCKET
-    # being matched on.  The two tests together are what make this reach
-    # daemons of this run and nothing else.
+    # Killed by socket and by exact process name, never by a command-line
+    # pattern, because a CLI command against a daemon that is not up starts a
+    # detached one and `-f` matches any shell whose own command line carries
+    # the string.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -109,19 +78,10 @@ trap cleanup EXIT
 
 echo "=== Integration: a handler declares its routes; the proxy enforces them ==="
 
-# The handler.  Three routes, each chosen to make a different claim falsifiable:
-#
-#   /endpoint/login  POST+GET — the case this feature exists for.  A browser
-#                    sends a preflight before the POST; a gateway that answers
-#                    that preflight 405 breaks the endpoint while looking like
-#                    a CORS misconfiguration.
-#   /static/*        GET — a prefix declaration, and a different Allow list, so
-#                    a gate that matched the wrong route would be visible.
-#   /cors            OPTIONS+POST — a handler that wants its own OPTIONS.  The
-#                    proxy must not answer it on the handler's behalf.
-#
-# on_http_request echoes method and path, so what the backend saw is readable
-# from the client side rather than inferred.
+# Three routes, each making a different claim falsifiable -- a preflight the
+# gateway must not answer, a prefix declaration with a different Allow list,
+# and a handler that wants its own OPTIONS -- with on_http_request echoing
+# method and path so what the backend saw is readable rather than inferred.
 cat > "$BE_LUA" <<'LUAEOF'
 routes = {
     { path = "/endpoint/login", methods = { "POST", "GET" } },
@@ -138,10 +98,9 @@ function on_http_request(req)
 end
 LUAEOF
 
-# The second group member.  It declares PUT on the same path and nothing else,
-# so the group's published declaration is the union of two disjoint method sets
-# — and a proxy that intersected them, or took the first member's answer, would
-# refuse a request the other member was going to serve.
+# The second group member declares PUT and nothing else, so the group's
+# declaration is a union of disjoint sets that an intersecting proxy would get
+# wrong.
 cat > "$GB_LUA" <<'LUAEOF'
 routes = {
     { path = "/endpoint/login", methods = { "PUT" } },
@@ -152,10 +111,9 @@ function on_http_request(req)
 end
 LUAEOF
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet, so
-# polling with one races the daemon this test has just launched and spawns a
-# second, orphaned one that survives cleanup.
+# Wait on the daemon's IPC socket directly, never by polling with a CLI
+# command, because every CLI command auto-starts a daemon and spawns a second
+# orphaned one.
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -183,14 +141,12 @@ SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart.
+# The daemon that answers is the one this test launched, because a zombie $DPID
+# has an empty /proc/<pid>/fd that `kill -0` cannot tell from a live one.
 TOTAL=$((TOTAL+1))
-# `|| true` because of `set -o pipefail`: when the pid really is gone — the
-# case this check exists for — `ls` fails, the pipeline fails, and the script
-# dies right here with no output at all.  The one check that can report a
-# dead daemon could never report one.
+# `|| true` because with pipefail a genuinely dead pid makes `ls` fail and
+# kills the script here, so the one check that can report a dead daemon could
+# never report one.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -201,10 +157,9 @@ case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     *) PASS=$((PASS+1)) ;;
 esac
 
-# Checked, not discarded.  A declaration the daemon will not load makes `create`
-# fail, and that is the single most likely way this file's setup goes wrong —
-# which used to be reported forty lines further down as "the gateway refused a
-# request it should have served", i.e. as the defect under test.
+# Checked rather than discarded, because a declaration the daemon will not load
+# fails `create` and used to be reported forty lines later as the defect under
+# test.
 create_ok "backend created"       "$BIN" create server "$BE_NAME" -p "$BE_PORT" --lua "$BE_LUA" -s
 create_ok "proxy created"         "$BIN" create proxy  "$PX_NAME" -p "$PX_PORT" --backend "$BE_NAME" --protocol http -s
 
@@ -212,11 +167,9 @@ create_ok "group member A created" "$BIN" create server "$GA_NAME" -p "$GA_PORT"
 create_ok "group member B created" "$BIN" create server "$GB_NAME" -p "$GB_PORT" --lua "$GB_LUA" -g "$GROUP" -s
 create_ok "group gateway created"  "$BIN" create proxy  "$GP_NAME" -p "$GP_PORT" --backend "@$GROUP" --protocol http -s
 
-# The same server twice: once by name, which has a declaration, and once as a
-# bare address, which cannot have one.  A proxy that enforced the declaration it
-# does have would be refusing methods on behalf of a backend that never said
-# anything about what it answers — and here the two happen to be the same
-# process, but nothing tells the proxy that.
+# The same server by name and as a bare address, because a proxy enforcing the
+# declaration it does have would be refusing methods for a backend that never
+# said anything.
 create_ok "mixed-backend proxy created" "$BIN" create proxy "$MX_NAME" -p "$MX_PORT" \
     --backend "$BE_NAME,127.0.0.1:$BE_PORT" --protocol http -s
 
@@ -235,12 +188,8 @@ for n in "$BE_NAME" "$PX_NAME" "$GA_NAME" "$GB_NAME" "$GP_NAME" "$MX_NAME"; do
     fi
 done
 
-# ── a declaration that is wrong refuses the script ─────────────────────────
-#
-# Named refusals, not merely "it failed".  "unknown flag" and "unknown runtime"
-# are refusals too, and an oracle that accepts any non-zero exit would pass
-# against a build in which `routes` does not exist at all — the script would be
-# rejected for a reason that has nothing to do with what is being tested.
+# Named refusals rather than merely "it failed", because "unknown flag" is a
+# refusal too and would pass against a build where `routes` does not exist.
 cat > "$BAD_LUA" <<'LUAEOF'
 routes = { { path = "endpoint/login", methods = { "GET" } } }
 LUAEOF
@@ -259,12 +208,9 @@ fi
 cat > "$BAD_LUA" <<'LUAEOF'
 routes = { ["/endpoint/login"] = { "GET" } }
 LUAEOF
-# Deliberately not create_ok.  This create is expected to be refused — that is
-# the assertion — and the oracle is the daemon's reason rather than the exit
-# status: "unknown flag" and "unknown runtime" are refusals too, and a check
-# that accepted any non-zero exit would pass against a build where `routes` does
-# not exist at all.  The status is still captured, so a create that *succeeded*
-# can be named in the failure rather than left to be inferred.
+# Deliberately not create_ok, because this create is expected to be refused and
+# the oracle is the daemon's reason rather than an exit status any build would
+# produce.
 BAD2_RC=0
 "$BIN" create server route_bad2 -p $((SL_PORT_BASE+649)) --lua "$BAD_LUA" -s >/dev/null 2>&1 || BAD2_RC=$?
 TOTAL=$((TOTAL+1))
@@ -737,9 +683,8 @@ print("P13 AFTER %s %s" % (st13, body13.strip()))
 print("DONE")
 PYEOF
 
-# The harness has to have reached its last line.  Without this an aborted run
-# would only show up as a pile of confusing per-phase failures, and any check
-# phrased as "compare what we read" would have nothing to compare and pass.
+# The harness has to have reached its last line, or an aborted run shows up as
+# per-phase failures and any comparison has nothing to compare and passes.
 TOTAL=$((TOTAL+1))
 if grep -qx 'DONE' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -795,8 +740,8 @@ grew() {
     fi
 }
 
-# The proxy serves a declared method at all.  Everything below is a difference
-# against this.
+# The proxy serves a declared method at all, which everything below is a
+# difference against.
 check "a declared method is served" \
     '^P0 HTTP/1\.1 200 .*GET /endpoint/login$' \
     "the proxy did not serve a declared method, so no assertion below discriminates:" \
@@ -814,10 +759,9 @@ check "the refusal is a 405" \
     '^P1 STATUS HTTP/1\.1 405 ' \
     "$(grep -m1 '^P1 STATUS' "$OUT" 2>/dev/null || echo 'no result')"
 
-# The reason, not just the refusal.  A 405 with no Allow tells a client no and
-# does not tell it what would have worked — and RFC 9110 Section 15.5.6 requires
-# the header.  It also discriminates against a gate that matched some other
-# route: /static/* answers a different list.
+# The reason rather than just the refusal, because RFC 9110 Section 15.5.6
+# requires Allow and it also discriminates against a gate that matched some
+# other route.
 check "the 405 carries Allow, listing the declared methods and the implied ones" \
     '^P1 ALLOW POST, GET, HEAD, OPTIONS$' \
     "the declaration is POST+GET; HEAD is implied by GET and OPTIONS by this proxy" \
@@ -956,14 +900,9 @@ else
     echo "  FAIL [runtime alive]: the proxy did not survive the run"
 fi
 
-# await_field <runtime> <field> <expected> — echoes the last reading seen.
-#
-# These proxies are themselves out of process, so declared_routes is a figure
-# their worker pushed rather than one read here (see LIMITATIONS), and a read
-# taken the instant the harness stops can be one publish behind.  Waits for the
-# expected reading rather than sleeping a fixed amount, and echoes whatever it
-# settled on if that never arrives — so a wrong value still fails the assertion
-# below, it simply is not failed for having been asked too early.
+# Waits for the expected reading rather than sleeping, because declared_routes
+# is a figure the worker pushes and a read taken as the harness stops can be
+# one publish behind.
 await_field() {
     local rt=$1 field=$2 want=$3 seen="" i
     for i in $(seq 1 50); do
@@ -975,8 +914,7 @@ await_field() {
 }
 
 # What the proxy says it is enforcing, which is the only way to tell the four
-# ways of enforcing nothing apart from outside.  One route now, not three: the
-# reload in phase 12 replaced the declaration with a single entry.
+# ways of enforcing nothing apart from outside.
 TOTAL=$((TOTAL+1))
 DR=$(await_field "$PX_NAME" declared_routes "declared_routes:1")
 if [ "$DR" = "declared_routes:1" ]; then

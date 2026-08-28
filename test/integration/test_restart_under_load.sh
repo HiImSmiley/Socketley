@@ -1,59 +1,18 @@
 #!/usr/bin/env bash
-# Integration test: a runtime restarted with traffic in flight comes back whole.
-#
-# stop() runs teardown(), start() runs setup(), and the two have to agree about
-# who owns what.  Every runtime in this tree carries a comment at the top of its
-# setup() saying that nothing is cleaned up there any more, because teardown()
-# deliberately keeps some of it alive — connection struct pools, pooled backend
-# descriptors, subscriptions.  A setup() that goes back to freeing those frees
-# storage the kernel still has a request against, and the restart is the only
-# moment that can be observed: created -> running is a fresh setup() over state
-# a teardown() just decided to keep.
-#
-# Restarting an idle runtime proves almost nothing — nothing is in flight, so
-# nothing is owed.  This test restarts a cache and a proxy alternately while
-# several connections per runtime are mid-request, and after each restart makes
-# a fresh connection and requires a correct answer on it.
-#
-# WHAT IT CATCHES
-#   - a restart that loses the runtime entirely (probe fails, port never
-#     answers again, or the daemon dies and every later assertion fails loudly)
-#   - a restart that leaves the runtime answering wrongly: '*_bad' counts a
-#     reply whose *content* was wrong, which is what stale state from the
-#     previous run looks like from a client
-#   - descriptors or memory that a restart never gives back (both runtimes are
-#     stopped again before the final sample, so teardown has to have released
-#     everything it took)
-#
-# WHAT IT DOES NOT CATCH
-#   - a use-after-free that happens not to touch a page that has been reused;
-#     that is a sanitizer's job, not a black-box test's
-#   - anything about restart while a *Lua* callback is mid-flight, or TLS, or
-#     UDP: only plain TCP cache and proxy traffic is driven here
-#   - single-restart races.  Six restarts is a standing chance of hitting a
-#     narrow window, not a proof.  When hunting this class deliberately, loop:
-#       for i in $(seq 20); do bash test/integration/test_restart_under_load.sh || break; done
-#
-# HONEST ABOUT TIMING — 'live_at_stop' is the guard against the failure window
-# never opening: before each stop the harness checks that the counter for that
-# runtime is still moving.  If a future change makes the traffic threads stall,
-# this test says so instead of quietly restarting an idle runtime and reporting
-# a pass.
-#
-# That guard is a claim about the HARNESS, not about the build, and the two are
-# reported differently now — see the floor argument at the assertion itself.  It
-# used to require all six cycles and print a shortfall in the same voice as a
-# use-after-free, which cost a full-suite run an hour of somebody's attention
-# for a scheduling artifact.
+# A runtime restarted with traffic in flight comes back whole, which is the
+# only moment a fresh setup() runs over state a teardown() decided to keep --
+# catching a lost runtime, one answering wrongly, and descriptors or memory
+# never given back, while proving nothing about Lua, TLS, UDP or a
+# single-restart race, and guarding against an empty measurement window with
+# live_at_stop.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 # shellcheck source=lib_create.sh
 . "$(dirname "$0")/lib_create.sh"
-# For daemon_sweep in cleanup.  This file keeps its own inline isolation; sourcing
-# defines functions without running anything, so nothing here changes hands.
-# shellcheck source=lib_daemon.sh
+# For daemon_sweep in cleanup, sourced because that defines functions without
+# running anything.
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ports.sh"
 
@@ -63,9 +22,9 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-# Own daemon, socket and state directory.  Against the shared daemon this test
-# does not discriminate at all: auto-restart puts a crashed runtime back and the
-# probe passes over the corpse.
+# Own daemon, socket and state directory, because against the shared daemon
+# auto-restart puts a crashed runtime back and the probe passes over the
+# corpse.
 TMPDIR_T=$(mktemp -d /tmp/socketley-restart-XXXXXX)
 export HOME="$TMPDIR_T/home"
 export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
@@ -83,82 +42,21 @@ CYCLES=6            # restarts; alternates cache, proxy, cache, ...
 MIN_OK=40           # per runtime: below this the load was too thin to mean much
 MIN_LIVE=$((CYCLES - 1))   # stops whose failure window must be provably open
 
-# Tolerance for the descriptor check.  Both samples are taken at the same point
-# in the lifecycle — both runtimes created but stopped, after a settle — so the
-# listener, the io_uring registrations and every lazily-opened one-time
-# descriptor are present in both.  What can still differ by a few is transient:
-# the IPC connection serving the command that triggered the sample, a state file
-# being rewritten.  A real leak in this family is one descriptor per connection
-# or per restart, i.e. hundreds, so 6 separates the two without being tight
-# enough to flake.
+# Tolerance for the descriptor check, where both samples are taken at the same
+# point in the lifecycle so only transients differ, and a real leak in this
+# family is hundreds rather than six.
 FD_TOLERANCE=6
 
-# RSS bound.  GUESSED, NOT MEASURED — this was written without a run, so treat
-# it as a ceiling that catches gross leakage (a few KiB per connection over a
-# few thousand connections, or a whole runtime's worth per restart), not as a
-# certified allocator profile.  The actual growth is printed on every run,
-# passing or failing: use the first real numbers to tighten this, and do not
-# assume a value that has never fired is correct.  A Release figure — see the
-# sanitizer note below for why it is not asserted in an instrumented build.
+# An RSS ceiling that is guessed rather than measured, so treat it as catching
+# gross leakage and tighten it from the numbers this run prints on every pass.
 RSS_BOUND_KB=24576
 
-# ─── ONE CHECK THAT MEASURES THE SANITIZER, NOT THE PRODUCT ─────────────────
-#
-# This file runs in the nightly under ASan+UBSan and under TSan as well as under
-# Release, and RSS_BOUND_KB has no defined meaning in an instrumented build.
-#
-# The bound above is a ceiling on how much a Release daemon may grow over six
-# restarts under load.  An ASan daemon keeps eight bytes of shadow for every
-# byte of application memory and a redzone around every allocation, so it starts
-# an order of magnitude higher and every page this test's traffic faults in
-# costs its shadow as well:
-#
-#     Release   base 14204 kB   growth  2192 kB   (2026-08-02, this machine)
-#     ASan      base 78972 kB   growth 38028 kB   (2026-08-02, this machine)
-#
-# The base alone is five and a half times the Release base, and the growth is
-# seventeen times the Release growth against a bound only eleven times it.  The
-# first ASan run of this file in five weeks, on the same commit, reported base
-# 78520 kB and growth 40220 kB: the two agree within 6%, which is what a
-# sanitizer's fixed overhead looks like and not what a leak looks like.  There
-# is no bound that both catches "a whole runtime's worth per restart" in Release
-# and clears ASan's floor — one that did would have stopped bounding anything.
-#
-# So it is printed and not asserted in a sanitized build, loudly, with the
-# numbers, so nobody reads a quiet log as a checked one.  EVERYTHING ELSE STAYS
-# ASSERTED IN EVERY BUILD — restarts_ok, recovered, cache_bad, proxy_bad, both
-# traffic floors, live_at_stop, both runtimes still in 'ps', that the daemon
-# still serves a runtime created after the load, and the descriptor count.
-# Those are what running this file under a sanitizer is FOR, and all of them
-# passed under ASan in the run above (descriptors: delta=2 of a tolerance of 6;
-# cache_bad=0 proxy_bad=0 over 33311 and 15594 healthy round trips, so the
-# traffic floors are nowhere near the sanitizer's clock here).
-#
-# THE DAEMON BEING GONE IS STILL A FAILURE, in every build.  'unreadable' is
-# rejected before the exemption below is ever reached: "this build cannot answer
-# the question" and "there was no daemon left to ask" are different statements
-# and only the first one is excused here.
-#
-# NOT ASSERTED IS NOT `NOT MEASURABLE`.  This file already carries herr() below,
-# from 2959e6b, for a claim this RUN could not put and might put next time.  This
-# is the other thing: this BUILD cannot answer this question and never will, so
-# retrying changes nothing.  They are counted in separate columns, and only
-# herr() ends the run non-zero — a job that is red every single night for a
-# reason nobody can act on gets ignored, which is the same end state as a check
-# that cannot fail.
-#
-# Detected from the binary rather than from an environment variable, using the
-# idiom the nightly's own "Verify the build" step uses: a build that lost its
-# sanitizer flags must not be able to claim this exemption.  A stripped Release
-# binary yields nothing and is treated as not sanitized, which is the safe way
-# round — unknown keeps the strict bound.
-#
-# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
-# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
-# then reports 141 and the `if` takes the branch for "no match" precisely when
-# there was one.  grep without -q reads its input to the end, so the pipeline's
-# status is grep's.  (The same idiom in the nightly's "Verify the build" step is
-# safe only because GitHub Actions does not set pipefail; it is not safe here.)
+# RSS is printed and not asserted in a sanitized build, because ASan's fixed
+# overhead is seventeen times the Release growth against a bound eleven times
+# it and no number bounds both -- detected from the binary rather than an
+# environment variable, counted in its own column because a nightly that is red
+# for an unactionable reason gets ignored, and with the daemon being gone still
+# a failure in every build.
 SANITIZED=""
 if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
     SANITIZED="TSan"
@@ -168,17 +66,9 @@ fi
 
 PASS=0; FAIL=0; HERR=0; SKIP=0; TOTAL=0
 
-# herr LABEL REASON [DETAIL...]
-#
-# A claim this run was unable to put the question to.  Kept apart from a failure
-# on purpose, and deliberately in the words test_proxy_group_keepalive_load.sh
-# already uses for it rather than a third vocabulary: an empty measurement
-# window and a broken build used to print the same sentence here, and the run
-# that printed it was read as a product defect.
-#
-# Both still end the run non-zero — an assertion that was never evaluated has
-# not passed — but only one of them is about the build, and the summary line
-# counts them separately so that is visible without reading the log.
+# A claim this run was unable to put the question to, in the words another test
+# already uses, counted separately from a failure although both end the run
+# non-zero.
 herr() {
     local label=$1 reason=$2; shift 2
     TOTAL=$((TOTAL+1)); HERR=$((HERR+1))
@@ -187,17 +77,8 @@ herr() {
     for line in "$@"; do echo "        $line"; done
 }
 
-# not_asserted LABEL REASON
-#
-# A claim this BUILD cannot answer, as opposed to one this RUN could not put.
-# See the long note at RSS_BOUND_KB: herr() above is for a window that did not
-# open and might next time, and it ends the run non-zero; this one is for a
-# number that belongs to the sanitizer and will belong to it every night for
-# ever, and it does not.  Two columns, deliberately, so the summary line says
-# which of the two happened without anyone reading the log.
-#
-# The vocabulary is test_abrupt_client_abort.sh's, from 3e153bf, and not a third
-# one invented here.
+# A claim this build cannot answer, as opposed to one this run could not put,
+# which does not end the run non-zero because retrying changes nothing.
 not_asserted() {  # label reason
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
     echo "  NOT ASSERTED [$1]: $2"
@@ -206,9 +87,9 @@ not_asserted() {  # label reason
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
-    # Wait for the daemon to actually go.  A plain kill returns immediately, and
-    # a daemon still holding connections stays bound long enough for the next
-    # test in the suite to collide with it.
+    # Wait for the daemon to actually go, because a plain kill returns
+    # immediately and a daemon holding connections stays bound long enough for
+    # the next test to collide.
     if [ -n "$DPID" ]; then
         kill "$DPID" 2>/dev/null || true
         for _ in $(seq 1 50); do
@@ -218,21 +99,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet — or not up any more — starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so this can only
-    # ever hit daemons belonging to this run.
-    #
-    # This was an inline `pgrep -f 'socketley daemon'` loop.  `-f` matches the
-    # whole command line, so the pattern also matches any shell whose own
-    # command line happens to carry that string — including the runner invoking
-    # this file — and an -f match one character too broad kills the run doing
-    # the killing, which has happened twice in this project.  The environ check
-    # underneath made it safe in practice, but the shape is the one lib_daemon.sh
-    # exists to delete, and a safe instance of a dangerous shape is still a copy
-    # of it for the next file to imitate.  daemon_sweep asks the socket who is
-    # serving it instead, and matches nothing by name.
+    # Killed through daemon_sweep, which asks the socket who is serving it,
+    # because a `pgrep -f` pattern one character too broad kills the run doing
+    # the killing -- which has happened twice in this project.
     daemon_sweep "$SOCKETLEY_SOCKET"
     rm -rf "$TMPDIR_T"
 }
@@ -241,11 +110,9 @@ trap cleanup EXIT
 echo "=== Integration: restart under load ==="
 
 # ── Resource sampling ───────────────────────────────────────────────────────
-# Both readers return the literal string 'unreadable' rather than an empty
-# string, and every assertion rejects it before comparing anything.  An empty
-# value compares equal to another empty value, and a "before == after" that
-# holds only because the daemon died and neither sample could be taken is a
-# pass for the wrong reason — this suite has produced exactly that before.
+# Both readers return the literal 'unreadable' rather than an empty string,
+# because two empty samples compare equal and a before==after that holds only
+# because the daemon died is a pass for the wrong reason.
 fd_count() {
     local n
     n=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l 2>/dev/null) || n=""
@@ -695,14 +562,9 @@ BEPID=$!
 SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
-# Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
-# command auto-starts a daemon when the socket does not answer yet — cli.cpp's
-# ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
-# 'ps' against the daemon this test has just launched races it and spawns a
-# second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run: /proc/$DPID/fd is then empty and every resource sample below reads
-# 'unreadable'.  Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the IPC socket itself, never by polling with a CLI command, because
+# polling auto-starts a second daemon and when the loser is $DPID every /proc
+# sample reads 'unreadable' -- measured at 2 orphans in 30 startups.
 python3 "$H" waitsock "$SOCKETLEY_SOCKET" 8 || true
 
 TOTAL=$((TOTAL+1))
@@ -713,10 +575,8 @@ else
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
 fi
 
-# ...and the daemon answering is the one this test launched.  A zombie $DPID
-# reads 'unreadable' in every /proc sample, so without this the run would report
-# its confusion at the very end, in the descriptor and memory checks, rather
-# than here where it happened.
+# And the daemon answering is the one this test launched, or the run reports
+# its confusion at the very end rather than here where it happened.
 TOTAL=$((TOTAL+1))
 if [ "$(fd_count)" != "unreadable" ]; then
     PASS=$((PASS+1))
@@ -743,9 +603,9 @@ wait_port "$PROXY_PORT" 5 || true
 WARM=$(python3 "$H" warmup "$BIN" "$CACHE_NAME" "$PROXY_NAME" \
         "$CACHE_PORT" "$PROXY_PORT" 2>&1 | grep '^WARMUP ' | head -1 || true)
 
-# Assert the success marker, not a comparison: 'WARMUP cache_ok=5 proxy_ok=5'
-# has to be present.  If the warm-up did not run there is no line at all, and
-# that must fail here rather than silently move the resource baseline.
+# Assert the success marker rather than a comparison, because a warm-up that
+# did not run leaves no line at all and must fail here rather than move the
+# baseline.
 TOTAL=$((TOTAL+1))
 if [ "$WARM" = "WARMUP cache_ok=5 proxy_ok=5" ]; then
     PASS=$((PASS+1))
@@ -773,16 +633,14 @@ python3 "$H" load "$BIN" "$CACHE_NAME" "$PROXY_NAME" \
     "$CACHE_PORT" "$PROXY_PORT" "$CYCLES" >"$OUT" 2>&1 || true
 TOTALS=$(grep '^TOTALS ' "$OUT" 2>/dev/null | head -1 || true)
 
-# Every number below is read out of that one line.  A missing field leaves the
-# value unset, and an unset value must fail loudly rather than compare equal to
-# an equally unset expectation.
+# Every number is read out of that one line, and a missing field must fail
+# loudly rather than compare equal to an equally unset expectation.
 field() {
     printf '%s\n' "$TOTALS" | grep -o "\b$1=[0-9]\+" | cut -d= -f2 | head -1 || true
 }
 
-# The same, for a field that is not a number.  'live_missed' is a list of
-# cycle:kind pairs, or '-' when every window opened; it is diagnostic only, so
-# an empty reading of it degrades the message and never the verdict.
+# The same for a field that is not a number, which is diagnostic only, so an
+# empty reading degrades the message and never the verdict.
 field_raw() {
     printf '%s\n' "$TOTALS" | grep -o "\b$1=[^ ]\+" | cut -d= -f2- | head -1 || true
 }
@@ -831,45 +689,11 @@ else
 fi
 
 # ── The failure window really opened ───────────────────────────────────────
-#
-# Traffic was demonstrably still moving against each runtime at the moment it
-# was stopped.  This is a claim about the HARNESS — whether it managed to ask
-# the question — and not about the build, and it is the only assertion in this
-# file of that kind.
-#
-# It used to be `assert_field_eq live_at_stop "$CYCLES"`, so a run that missed
-# one window printed
-#
-#     FAIL [traffic in flight at every stop]: live_at_stop=5, wanted 6
-#
-# in the same voice as a use-after-free.  That happened once, at 18/19, in a
-# full-suite run whose own numbers said nothing was wrong: cycles=6
-# restarts_ok=6 recovered=6 cache_bad=0 proxy_bad=0, over 52502 cache and 13669
-# proxy operations.  Re-run alone on a quiet box: 19/19, four times out of four.
-# What the harness could not do was GUARANTEE the window was open in one cycle
-# of six while the whole suite was competing for the machine.
-#
-# THE FLOOR IS FIVE OF SIX, and the missing one is named rather than waved
-# through.  The argument: three threads per runtime complete thousands of
-# operations a second, so a 0.5s window containing not one completion is a
-# scheduling artifact of a loaded box rather than a signal about anything.  Two
-# such windows in six cycles is no longer explicable that way — at that point
-# the traffic is genuinely intermittent, the restarts it is being paired with
-# are not reliably adversarial, and the run should say the question could not be
-# put.  That is NOT MEASURABLE, in the words test_proxy_group_keepalive_load.sh
-# already uses, and it still ends the run non-zero.
-#
-# Zero is different in kind and stays a failure.  No window open at any stop
-# means the traffic never ran at all, every restart was of an idle runtime, and
-# nothing this file reports means anything — which is precisely the case the
-# guard was written for, and the one it must never call merely unmeasurable.
-#
-# TOTAL is counted inside each branch rather than once above them, because the
-# last branch counts its own: herr() takes a TOTAL of its own the way bad() and
-# ok() do, so a pre-increment here would charge this one assertion twice.  It
-# did, in the first draft — a NOT MEASURABLE run printed `18/20 passed (0
-# failed, 1 not measurable)`, which adds up to nineteen of twenty and is the
-# same species of arithmetic this file is being repaired for.
+# Traffic was still moving at every stop, which is a claim about the harness
+# rather than the build, so five of six is not measurable and named rather than
+# failed -- while zero is a failure in kind, because it means every restart was
+# of an idle runtime; TOTAL is counted inside each branch, since herr() takes
+# one of its own.
 LIVE=$(field live_at_stop)
 LIVE_MISSED=$(field_raw live_missed)
 if [ -z "$LIVE" ]; then
@@ -900,17 +724,17 @@ else
         "question.  On a quiet machine it does; check what else was running."
 fi
 
-# The restart itself completed: both CLI commands succeeded and the port came
-# back.  A runtime lost to a bad setup() lands here.
+# The restart itself completed -- both commands succeeded and the port came
+# back -- which is where a runtime lost to a bad setup() lands.
 assert_field_eq restarts_ok "$CYCLES" "every restart completed"
 
-# The success marker that matters: a connection made *after* each restart got a
-# correct answer.  A dead daemon cannot satisfy this.
+# The marker that matters: a connection made after each restart got a correct
+# answer, which a dead daemon cannot satisfy.
 assert_field_eq recovered "$CYCLES" "the runtime served correctly after every restart"
 
-# Wrong content is the signature of state carried across a restart that should
-# not have been.  Dropped connections during the stop window are expected and
-# are counted as errors instead, deliberately not asserted on.
+# Wrong content is the signature of state carried across a restart, while
+# dropped connections during the stop window are expected and counted as errors
+# instead.
 assert_field_eq cache_bad 0 "cache answered with the wrong value"
 assert_field_eq proxy_bad 0 "proxy answered with the wrong payload"
 
@@ -931,22 +755,14 @@ for n in "$CACHE_NAME" "$PROXY_NAME"; do
     fi
 done
 
-# The daemon is not merely alive, it still does its job: create a runtime that
-# never existed during the load, serve a verified round trip on it, remove it.
-# Deliberately not create_ok.  Here the create is not setup, it is the
-# measurement — "the daemon still creates a runtime and serves it" is one claim
-# and the round trip below is the oracle for all of it, so counting the create
-# separately would report one defect as two.  What the create said is kept, so
-# the failure can say whether the runtime was ever made.
+# The daemon still does its job -- create, serve a verified round trip, remove
+# -- as one claim with the round trip its oracle, so counting the create
+# separately would report one defect as two.
 FINAL_CRC=0
 FINAL_CREATE=$("$BIN" create cache rl_final -p "$FINAL_PORT" -s 2>&1) || FINAL_CRC=$?
-# Wait for the success signal — a completed round trip — and not for a deadline.
-# 'wait_port' alone proves nothing here: it returns as soon as the kernel accepts
-# a connection out of the listen backlog, which is true from the instant listen()
-# ran, while an event loop still winding down six restarts' worth of connections
-# may not reach the new runtime's first read for a while.  Trying once after that
-# wait was a timing assumption; retrying until it answers is not, and a wedged or
-# dead daemon never answers and still fails, only later.
+# Wait for a completed round trip rather than a deadline, because wait_port
+# returns from the instant listen() ran while the event loop may not reach the
+# new runtime's first read for a while.
 FINAL_RT=""
 for _ in $(seq 1 60); do
     FINAL_RT=$(python3 "$H" serve "$FINAL_PORT" 2>/dev/null || true)
@@ -974,10 +790,8 @@ sleep 0.8
 assert_fds_returned "$BASE_FD" "$(fd_count)" "$FD_TOLERANCE"
 assert_rss_bounded  "$BASE_RSS" "$(rss_kb)"  "$RSS_BOUND_KB"
 
-# Every assertion is accounted for in exactly one column.  Cheap, and it caught
-# the draft of the branch above charging one assertion to TOTAL twice — a
-# summary that does not add up cannot be acted on, and the arithmetic that
-# produces it is not the sort of thing anyone re-checks by eye.
+# Every assertion is accounted for in exactly one column, which caught a draft
+# charging one assertion to TOTAL twice.
 if [ "$((PASS+FAIL+HERR+SKIP))" -ne "$TOTAL" ]; then
     echo "  FAIL [counters]: $PASS passed + $FAIL failed + $HERR not measurable"
     echo "        + $SKIP not asserted does not equal $TOTAL counted — this summary"
@@ -989,8 +803,8 @@ if [ "$FAIL" -gt 0 ] || [ "$HERR" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
     echo "  ${TOTALS:-<no TOTALS line>}"
 fi
 
-# SKIP is reported but never changes the verdict or the exit status: a claim
-# this build cannot answer is not a claim that failed.  HERR still does.
+# SKIP is reported but never changes the verdict, because a claim this build
+# cannot answer is not a claim that failed; HERR still does.
 if [ "$SKIP" -gt 0 ]; then
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable, $SKIP not asserted under $SANITIZED)"
 else
