@@ -1,64 +1,11 @@
 #!/usr/bin/env bash
-# Integration test: a client that vanishes with a reply still owed is torn down.
-#
-# The read path of every runtime here is written around "a completion is still
-# owed, so the teardown will run when it lands".  That reasoning fails the
-# moment the last operation has already finished: the connection is marked
-# closing, nothing is in flight to wake it, and it sits holding its descriptor
-# and its subscriptions until the runtime stops.  The cache's own read handler
-# carries a comment saying exactly that, and the proxy has been fixed twice for
-# the same shape — a peer that vanished while its counterpart still owed it
-# data.
-#
-# The provocation is a client that dies by RST with the answer still on its way:
-#   - against the proxy, the payload is marked so the backend sits on it for
-#     150ms; the client is already gone by the time the echo comes back
-#   - against the cache, a pipeline of several hundred reads of a 2 KB value is
-#     sent and the socket is reset immediately, so hundreds of KiB of reply are
-#     queued for a peer that no longer exists
-# SO_LINGER is set to (on, 0) so the close is an RST and not a FIN: the client's
-# descriptor is gone at once and its number is immediately available for reuse.
-# Verifying connections run against both runtimes throughout, so a healthy
-# connection is always present to be damaged.
-#
-# WHAT IT CATCHES
-#   - a connection that is never reaped: 'connections' from 'stats' has to fall
-#     back to 0 on both runtimes after the storm.  A connection with nothing
-#     left to wake it keeps that number above zero forever, and this is the
-#     sharpest assertion in the file
-#   - descriptors held past the connection: the count is compared against a
-#     baseline taken in the same lifecycle state
-#   - collateral damage: '*_bad' is a healthy connection given the wrong bytes,
-#     '*_reset' is a healthy connection closed by the runtime.  Both are zero in
-#     a correct build; both are what a recycled descriptor number looks like
-#     from the victim's side
-#   - a daemon left wedged rather than crashed: after the storm a runtime that
-#     never existed during it is created and has to serve a real round trip.
-#     This waits for that success signal rather than for a deadline, so it fails
-#     only when the answer never comes at all, or comes back wrong
-#
-# WHAT IT DOES NOT CATCH
-#   - anything that needs the peer to vanish during a *write* the kernel has
-#     already accepted; this drives the read and reply paths
-#   - WebSocket, TLS, UDP or Lua paths — plain TCP cache and proxy only
-#   - a leak of one connection in a thousand.  The 'connections' check is exact,
-#     but only a connection still held *after the drain deadline* counts, so a
-#     runtime that reaps late rather than never passes
-#   - a descriptor held by an unreaped connection.  The fd sample below is taken
-#     after both runtimes have been stopped, and teardown() closes every client
-#     socket it still has, so a connection that was never reaped gives its
-#     descriptor back at that point like any other.  'delta=0' alongside a
-#     failed drain is the expected reading, not a contradiction of it, and it
-#     was read as one for a while: the descriptor check answers "did the
-#     lifecycle give the fds back", never "was this connection reaped"
-#
-# HONEST ABOUT TIMING — whether an individual abort lands inside the narrow
-# window is luck; the 150ms backend delay and the size of the cache pipeline are
-# there to widen it, not to close it. What is not luck is the volume: the
-# assertion on 'aborted_*' below requires a real number of aborts to have
-# happened, so a run that finished before the window ever opened fails there
-# rather than reporting a pass. When hunting this class deliberately, loop:
-#   for i in $(seq 20); do bash test/integration/test_abrupt_client_abort.sh || break; done
+# A client that vanishes by RST with a reply still owed must be torn down,
+# provoked against a slow-echoing proxy and a cache pipelining hundreds of KiB
+# -- catching a connection never reaped, descriptors held past it, collateral
+# damage to healthy neighbours and a wedged daemon, while proving nothing about
+# writes, TLS, UDP, Lua or a leak of one connection in a thousand, and
+# requiring a real number of aborts so a run that never opened the window fails
+# rather than passing.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -91,84 +38,33 @@ FINAL_PORT=$((SL_PORT_BASE+523))
 CACHE_NAME=ab_cache
 PROXY_NAME=ab_proxy
 LOAD_SECS=1.5       # almost all of this test's runtime
-# Floors, not targets.  Against a stand-in server this window produced roughly
-# 1200 aborts and 1500 verified round trips per runtime; these are set an order
-# of magnitude below that so a busy machine does not fail the test, while a run
-# that never really got going still does.
+# Floors rather than targets, an order of magnitude below what a stand-in
+# server produced, so a busy machine does not fail while a run that never got
+# going still does.
 MIN_ABORTS=100      # per runtime: fewer than this and the storm never happened
 MIN_OK=60           # per runtime: fewer than this and the zeroes prove nothing
 DRAIN_SECS=8        # how long a runtime may take to reap its dead connections
-# Budget for the post-storm runtime to serve its first request.  This is a
-# ceiling on patience, not a wait: the check returns the instant a round trip
-# succeeds, so a healthy daemon spends milliseconds here and only a wedged or
-# dead one spends the whole budget — and then still fails.  It is generous
-# because the daemon may legitimately still be reaping the storm's connections
-# when the new runtime is created, and "the event loop is busy" must not read as
-# "the daemon is broken".
+# A ceiling on patience rather than a wait, generous because the daemon may
+# still be reaping the storm and "the event loop is busy" must not read as "the
+# daemon is broken".
 FINAL_SERVE_SECS=30
 
-# See the note in test_restart_under_load.sh.  Both samples are taken with both
-# runtimes created but stopped, so no listener and no pooled backend connection
-# is present in either — the proxy legitimately keeps up to 32 idle backend
-# descriptors per backend for a minute after load, which would swamp any
-# tolerance if the sample were taken while it was running.
+# Both samples are taken with both runtimes created but stopped, because the
+# proxy keeps up to 32 idle backend descriptors for a minute and would swamp
+# any tolerance.
 FD_TOLERANCE=6
 
-# GUESSED, NOT MEASURED.  Written without a run; a ceiling against gross
-# leakage, not a certified profile.  Aborted connections queue hundreds of KiB
-# of undeliverable reply each, so some transient growth is expected and only
-# growth that survives the settle is measured.  The real number is printed every
-# run — tighten this from data rather than trusting a bound that has never
-# fired.
+# Guessed rather than measured, a ceiling against gross leakage, with the real
+# number printed every run so it can be tightened from data.
 RSS_BOUND_KB=24576
 
 PASS=0; FAIL=0; TOTAL=0; SKIP=0
 
-# ─── THREE CHECKS THAT MEASURE THE SANITIZER, NOT THE PRODUCT ───────────────
-#
-# This file runs in the nightly under TSan as well as under Release, and under
-# ASan+UBSan once that job builds again.  Three of its assertions have no
-# defined meaning in a sanitized build:
-#
-#   * RSS_BOUND_KB.  24 MB of growth, against a Release daemon whose baseline
-#     is about 7 MB.  TSan's baseline is 88-100 MB before a byte of traffic and
-#     its shadow memory grows with every word the program touches.  Measured on
-#     the same commit, the same test, in nightly run 30719890629: the
-#     non-sanitized invariants job grew 5724 kB and passed; the TSan job grew
-#     1818092 kB.  Reproduced here on 2026-08-02 with a local tsan_x64 build:
-#     base 88316 kB, growth 1653100 kB.  A factor of roughly three hundred, in
-#     both places.  That number is TSan's, not the daemon's.
-#
-#   * MIN_OK, twice.  A floor on healthy round trips completed inside a fixed
-#     1.5 s window, set an order of magnitude below the ~1500 a Release build
-#     manages.  TSan is several times slower, so the same window yields tens:
-#     19 and 3 on the runner, 30 and 13 here.  That is the sanitizer's clock.
-#
-# They are printed and not asserted in a sanitized build, loudly, with the
-# numbers, so nobody reads a quiet log as a checked one.  Everything else stays
-# asserted in every build -- cache_bad, proxy_bad, the resets, the abort floors,
-# the drain, the descriptors, and that the daemon still serves a fresh runtime.
-# Those are what running this file under TSan is FOR, and all of them passed
-# under TSan in both runs above.
-#
-# ZERO IS STILL A FAILURE, in every build.  "Barely any traffic got through
-# because the sanitizer is slow" and "no traffic got through at all" are not the
-# same statement, and only the first one is excused here.
-#
-# Detected from the binary rather than from an environment variable, using the
-# idiom the nightly's own "Verify the build" step uses: a build that lost its
-# sanitizer flags must not be able to claim this exemption.  A stripped Release
-# binary yields nothing and is treated as not sanitized, which is the safe way
-# round -- unknown keeps the strict bounds.
-#
-# NOT `grep -q`.  This file runs under `set -euo pipefail`, and `grep -q` exits
-# the moment it matches, which hands `nm` a SIGPIPE; with pipefail the pipeline
-# then reports 141 and the `if` takes the branch for "no match" precisely when
-# there was one.  The first draft of this detection did exactly that and every
-# assertion below stayed armed under TSan.  grep without -q reads its input to
-# the end, so the pipeline's status is grep's.  (The same idiom in the nightly's
-# "Verify the build" step is safe only because GitHub Actions does not set
-# pipefail; it is not safe here.)
+# Three assertions have no defined meaning in a sanitized build -- TSan grew
+# 1.8 GB against Release's 5.7 MB and its clock turns the throughput floors
+# into tens -- so they are printed loudly rather than asserted, with zero still
+# a failure, detection taken from the binary and grep without -q, because -q
+# plus pipefail reports a match as no match.
 SANITIZED=""
 if nm -C "$BIN" 2>/dev/null | grep '__tsan_' >/dev/null 2>&1; then
     SANITIZED="TSan"
@@ -176,12 +72,9 @@ elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then
     SANITIZED="ASan"
 fi
 
-# Printed, counted in its own column, and deliberately NOT added to FAIL: unlike
-# NOT MEASURABLE in test_restart_under_load.sh, which means "this run could not
-# put the question and might next time", this means "this build cannot answer
-# this question and never will".  A job that is red every single night for a
-# reason nobody can act on gets ignored, which is the same end state as a check
-# that cannot fail.
+# Counted in its own column and not added to FAIL, because this build can never
+# answer the question and a nightly that is red for an unactionable reason gets
+# ignored.
 not_asserted() {  # label reason
     TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
     echo "  NOT ASSERTED [$1]: $2"
@@ -199,17 +92,9 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet — or not up any more — starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket and by exact process name, because a CLI command against
+    # an absent daemon starts a detached one and `-f` matches any shell whose
+    # command line carries the string.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -227,10 +112,9 @@ trap cleanup EXIT
 echo "=== Integration: abrupt client aborts ==="
 
 # ── Resource sampling ───────────────────────────────────────────────────────
-# Both readers return the literal string 'unreadable' rather than an empty
-# string, and every assertion rejects it before comparing anything.  Two empty
-# values compare equal, so a daemon that died would otherwise satisfy
-# "before == after" and be reported as a clean run.
+# Both readers return the literal 'unreadable' rather than an empty string,
+# because two empty values compare equal and a dead daemon would satisfy
+# before==after.
 fd_count() {
     local n
     n=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l 2>/dev/null) || n=""
@@ -294,9 +178,8 @@ assert_rss_bounded() {    # base final bound_kb
     fi
 }
 
-# Poll 'stats' until the runtime reports no live connections.  Prints '0' on
-# success, the last value seen otherwise, or 'unreadable' when the field could
-# not be read at all — which must fail rather than silently look like a match.
+# Poll `stats` until the runtime reports no live connections, printing the last
+# value seen or 'unreadable', which must fail rather than look like a match.
 wait_conns_zero() {   # name seconds
     local name="$1" secs="$2" end v="unreadable"
     end=$(( $(date +%s) + secs ))
@@ -704,11 +587,9 @@ wait_port() {   # port seconds
     python3 "$H" waitport "$1" "$2"
 }
 
-# ── Echo backend, with a deliberate delay for aborted requests ─────────────
-# Payloads beginning with 'SLOW' are held for 150ms before being echoed, which
-# is what guarantees the reply is still owed when the client's RST arrives.
-# Everything else is echoed at once, so the verifying connections are not slowed
-# down by the provocation aimed at their neighbours.
+# Payloads beginning with SLOW are held 150 ms before being echoed, which is
+# what guarantees the reply is still owed when the RST arrives, while
+# everything else is echoed at once.
 python3 - "$BE_PORT" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
 import socket, sys, threading, time
 
@@ -749,14 +630,9 @@ BEPID=$!
 "$BIN" daemon >"$TMPDIR_T/daemon.log" 2>&1 &
 DPID=$!
 SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
-# Wait on the IPC socket itself, never by polling with a CLI command.  Every CLI
-# command auto-starts a daemon when the socket does not answer yet — cli.cpp's
-# ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so polling
-# 'ps' against the daemon this test has just launched races it and spawns a
-# second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run: /proc/$DPID/fd is then empty and every resource sample below reads
-# 'unreadable'.  Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the IPC socket itself, never by polling with a CLI command, because
+# polling auto-starts a second daemon and when the loser is $DPID every /proc
+# sample reads 'unreadable' -- measured at 2 orphans in 30 startups.
 python3 "$H" waitsock "$SOCKETLEY_SOCKET" 8 || true
 
 TOTAL=$((TOTAL+1))
@@ -767,10 +643,8 @@ else
     echo "  FAIL [setup]: the daemon never became reachable — everything below is meaningless"
 fi
 
-# ...and the daemon answering is the one this test launched.  A zombie $DPID
-# reads 'unreadable' in every /proc sample, so without this the run would report
-# its confusion at the very end, in the descriptor and memory checks, rather
-# than here where it happened.
+# And the daemon answering is the one this test launched, or the run reports
+# its confusion at the very end rather than here where it happened.
 TOTAL=$((TOTAL+1))
 if [ "$(fd_count)" != "unreadable" ]; then
     PASS=$((PASS+1))
@@ -794,9 +668,8 @@ create_ok "proxy under test created" "$BIN" create proxy "$PROXY_NAME" -p "$PROX
 wait_port "$CACHE_PORT" 5 || true
 wait_port "$PROXY_PORT" 5 || true
 
-# Warm both runtimes before the baseline is taken, so that everything the daemon
-# allocates once is already inside it and does not read as growth later.  Not
-# asserted here: the priming that matters is the one after the restart below.
+# Warm both runtimes before the baseline, so what the daemon allocates once is
+# inside it rather than reading as growth later.
 python3 "$H" prime "$CACHE_PORT" >/dev/null 2>&1 || true
 python3 "$H" serve "$PROXY_PORT" >/dev/null 2>&1 || true
 
@@ -813,10 +686,9 @@ BASE_RSS=$(rss_kb)
 "$BIN" start "$PROXY_NAME" >/dev/null 2>&1 || true
 wait_port "$CACHE_PORT" 5 || true
 wait_port "$PROXY_PORT" 5 || true
-# 'start' ran a fresh setup(), so the big value has to be put back for this run.
-# This one is asserted: without it every aborted cache connection is owed four
-# bytes of 'nil' instead of hundreds of KiB, the provocation quietly stops being
-# a provocation, and the zeroes below would be measuring nothing.
+# The big value has to be put back after `start` ran a fresh setup(), asserted
+# because without it every aborted connection is owed four bytes and the zeroes
+# below measure nothing.
 TOTAL=$((TOTAL+1))
 if [ "$(python3 "$H" prime "$CACHE_PORT" 2>/dev/null || true)" = "PRIMED" ]; then
     PASS=$((PASS+1))
@@ -869,11 +741,9 @@ assert_field_min() {  # name minimum label
     fi
 }
 
-# A sufficiency floor whose number is a throughput figure: how much healthy
-# traffic the window produced.  Same as assert_field_min in a normal build; in a
-# sanitized one the floor is not asserted, because the window is measuring the
-# sanitizer's clock.  Zero still fails either way -- nothing got through at all
-# is a defect in any build, and it is the case the floor was written for.
+# A sufficiency floor on healthy traffic, not asserted in a sanitized build
+# because the window measures the sanitizer's clock, though zero still fails
+# either way.
 assert_field_min_throughput() {  # name minimum label
     local n
     n=$(field "$1")
@@ -900,15 +770,13 @@ else
     grep -v '^$' "$OUT" 2>/dev/null | head -8 | sed 's/^/        /' || true
 fi
 
-# The failure window actually opened: a real number of clients died owing a
-# reply.  A run that finished before the storm started fails here.
+# The failure window actually opened, so a run that finished before the storm
+# started fails here.
 assert_field_min aborted_cache "$MIN_ABORTS" "enough cache clients died mid-reply"
 assert_field_min aborted_proxy "$MIN_ABORTS" "enough proxy clients died mid-reply"
 
-# Collateral damage on the healthy connections running alongside.  Wrong bytes
-# and a peer-initiated close are both defects; timeouts are reported but not
-# asserted on, because on a loaded machine a timeout is usually scheduling and
-# would make this test flaky for a reason it is not about.
+# Collateral damage on healthy neighbours, with timeouts reported but not
+# asserted on, because on a loaded machine a timeout is usually scheduling.
 assert_field_eq cache_bad   0 "cache answered a healthy client with the wrong value"
 assert_field_eq proxy_bad   0 "proxy answered a healthy client with the wrong payload"
 assert_field_eq cache_reset 0 "cache closed a healthy connection"
@@ -919,22 +787,15 @@ assert_field_min_throughput cache_ok "$MIN_OK" "enough healthy cache traffic to 
 assert_field_min_throughput proxy_ok "$MIN_OK" "enough healthy proxy traffic to mean something"
 
 # ── The point of the test ──────────────────────────────────────────────────
-# Every client is gone. A connection that nothing will ever wake keeps this
-# number above zero for as long as the runtime lives.
+# Every client is gone, because a connection nothing will ever wake keeps this
+# number above zero for the life of the runtime.
 assert_drained "$CACHE_NAME"
 assert_drained "$PROXY_NAME"
 
-# The daemon is not merely alive: it still creates and serves a runtime that
-# never existed during the storm.
-#
-# The wait here is on the success signal — a completed set/get against the new
-# runtime — and not on a deadline.  'wait_port' is deliberately not used: it
-# returns as soon as the kernel accepts a connection out of the listen backlog,
-# which happens the moment listen() ran and says nothing about whether the event
-# loop has got round to serving.  Creating a runtime immediately after 1.5s of
-# RST churn and giving it one 3s attempt was a timing assumption, and it lost
-# roughly one run in five.  The assertion is not weakened by this: a daemon that
-# is wedged or dead never produces the signal and still fails, only later.
+# The daemon still creates and serves a runtime that never existed during the
+# storm, waiting on the round trip rather than a deadline, because wait_port
+# returns from the moment listen() ran and a one-attempt assumption lost one
+# run in five.
 CREATE_LOG="$TMPDIR_T/ab_final.create"
 "$BIN" create cache ab_final -p "$FINAL_PORT" -s >"$CREATE_LOG" 2>&1 \
     || echo "(create exited $?)" >>"$CREATE_LOG"
@@ -963,15 +824,13 @@ diagnose_final() {
 }
 
 FINAL_SERVE=$(python3 "$H" servewait "$FINAL_PORT" "$FINAL_SERVE_SECS" 2>&1 || true)
-# Sampled at the moment of judgement: 'create' is a CLI command, so if the storm
-# killed the daemon the create itself started a fresh one and the answer below
-# would come from a daemon that never saw the abuse.  A live $DPID is what makes
-# the round trip mean 'it survived' rather than 'something is listening'.
+# Sampled at the moment of judgement, because `create` would start a fresh
+# daemon that never saw the abuse and a live $DPID is what makes the round trip
+# mean it survived.
 FINAL_ALIVE=$(fd_count)
-# Dispatch on the marker line, not on the whole capture: stderr is merged in so
-# that a probe that died has something to show, and a stray warning ahead of the
-# marker must not turn a served round trip into 'never answered'.  No marker at
-# all falls through to the failure branch, which is the only safe direction.
+# Dispatch on the marker line rather than the whole capture, because stderr is
+# merged in and a stray warning must not turn a served round trip into never
+# answered.
 FINAL_MARK=$(printf '%s\n' "$FINAL_SERVE" | grep -m1 '^SERVES_' || true)
 TOTAL=$((TOTAL+1))
 case "$FINAL_MARK" in
@@ -1015,7 +874,7 @@ if [ "$FAIL" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
 fi
 
 # The summary has to add up, or it cannot be acted on and nobody re-checks the
-# arithmetic by eye.  Same guard as test_restart_under_load.sh.
+# arithmetic by eye.
 if [ "$((PASS+FAIL+SKIP))" -ne "$TOTAL" ]; then
     echo "  FAIL [counters]: $PASS passed + $FAIL failed + $SKIP not asserted"
     echo "        does not equal $TOTAL counted — this summary is wrong, not just the run"

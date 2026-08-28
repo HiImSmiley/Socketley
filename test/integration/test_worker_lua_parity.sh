@@ -3,123 +3,24 @@
 # it does in the daemon.
 #
 # ─── WHAT THIS IS FOR ───────────────────────────────────────────────────────
-#
-# Since 8399bee a runtime created without --daemon-process lives in a worker
-# process, and that is the DEFAULT.  A worker holds one runtime and no map of
-# runtimes, so twelve calls of the management API had nothing to answer from:
-#
-#     socketley.create  .start  .stop  .remove  .send  .list  .get  .pipe
-#     socketley.cluster.daemons  .runtimes  .group  .stats
-#
-# They were refused rather than answered, which was the right interim choice —
-# an empty list() from a worker is indistinguishable from a daemon with nothing
-# in it — and the wrong end state, because a third of the scripting API was
-# then missing from the default mode and a script only found out at runtime.
-#
-# Eleven of the twelve are closed.  Seven read the map and are answered from a
-# replica the daemon pushes; four CHANGE it and are asked of the daemon over a
-# socket of the worker's own, waiting for the answer.  What is left is
-# socketley.pipe across two runtimes, and self.route() beside it: those two
-# move a CONNECTION, which no map supplies, and they are still refused.
-#
-# This file is the definition of done for closing that.  One script, two
-# runtimes, one assertion per call asserted twice:
-#
-#   * a CONTROL, comparing the in-daemon arm against a hard-coded expected
-#     value, and
-#   * a PARITY assertion, comparing the worker arm against the in-daemon arm.
-#
-# Both, and not just the second.  `assert_eq "$OOP_list" "$IN_list"` passes
-# when both arms are equally broken — both refused, both empty, both nil — and
-# that is precisely the state this file exists to detect.  The control is what
-# makes the parity assertion mean something: it says the daemon arm really did
-# see four runtimes, one connection, one group member, so a worker arm that
-# matches it has really answered rather than really failed.
-#
+# Eleven of the twelve management calls a worker used to refuse are closed --
+# seven answered from a pushed replica and four asked of the daemon -- and each
+# is asserted twice, as a control against a hard-coded value and as parity
+# against the in-daemon arm, because parity alone passes when both arms are
+# equally broken.
 # ─── HOW EACH ARM IS MEASURED ───────────────────────────────────────────────
-#
-# The probe script is a server.  A client connects, sends one word, and the
-# script runs that word's group of calls under pcall and sends back one line
-# per call: either the canonical observation, or `REFUSED:<the raise>`.  pcall
-# rather than letting the error escape, because a raise in on_client_message
-# would end the callback and the arm would report nothing at all — which is a
-# failure this file could not tell from a worker that never came up.
-#
-# Three words, in this order, and the order matters:
-#
-#   probe   the read-only surface.  Run on BOTH arms before either mutates
-#           anything, so both see the same four runtimes.
-#   make    create + start a child of this arm's own.
-#   unmake  stop + remove it again.
-#
-# ─── THE ORACLES THAT ARE NOT THE SCRIPT'S OWN WORD ─────────────────────────
-#
-# Four of the twelve change the world, and a script grading its own return
-# value proves nothing about whether anything happened.  That is sharper now
-# than when it was written: these four USED to be refused in a worker, so the
-# oracle below was a negative one, and un-refusing them without also inverting
-# it would have left a green file asserting the opposite of what it says.  So:
-#
-#   * create/start   `ls` must show the child, running, on the port the script
-#                    asked for — from outside the daemon, over the CLI.
-#   * stop/remove    `ls` must no longer show it.
-#   * send           a real client holding a real connection to the target must
-#                    RECEIVE the bytes.  socketley.send() on a placeholder used
-#                    to return true and deliver to an empty table; a return
-#                    value cannot tell that apart from delivery, and a reader
-#                    on the far end can.
-#
+# The probe is a server whose client sends one of three words in order --
+# probe, make, unmake -- each running its group under pcall so a raise reports
+# rather than ending the callback, with the four world-changing calls graded by
+# external oracles rather than by their own return value.
 # ─── WHY THE HOLDER SENDS A BYTE FIRST ──────────────────────────────────────
-#
-# A connection that has sent nothing has no identified protocol yet and is
-# deliberately excluded from relay traffic, so a client that never speaks never
-# receives a broadcast, and the CONN column stays 0 until it does.  Verified on
-# this build.  The holder therefore sends "hi\n" before it starts reading, and
-# the test waits for CONN to reach 1 before probing — otherwise `get.connections`
-# would read 0 for a reason that has nothing to do with the process boundary.
-#
-# ─── ONE ASSERTION IS POLLED, AND IT IS NOT AN OVERSIGHT ────────────────────
-#
-# Forty-two of the forty-three compare a value that is either right or wrong the
-# moment it is read.  socketley.get()'s connection count is the exception, and
-# the asymmetry that makes it one is worth stating here because it is invisible
-# at the assertion:
-#
-#     the daemon arm's figure is EXACT.      par_peer is --daemon-process, so
-#                                            the daemon holds its connections
-#                                            and reads them off live tables.
-#     the worker arm's figure is REPLICATED. It arrives in a pushed runtime map
-#                                            on the stats cadence.
-#
-# Those two cannot agree in the same instant, and no transport would make them:
-# the design offers convergence, not simultaneity.  So that one assertion polls
-# to a deadline derived from the push interval, and every other one samples
-# once.  See the block at the `get` assertion for where the deadline comes from
-# and why a longer sleep is not the fix.
-#
-# DO NOT collapse it back into a single sample to match its neighbours.  It was
-# one, and it passed inside run_all.sh while failing 5 runs out of 5 standalone
-# — green in CI, red for anyone running the file alone, because the suite puts
-# ~180 ms of other work between the connection and the read.  A test that is
-# green because the machine is busy is telling you nothing on the machine where
-# it matters.
-#
-# ─── PIPE AND ROUTE WERE THE TWO THAT STAYED REFUSED, AND DO NOT ────────────
-#
-# This header said socketley.pipe() "hands a file descriptor from one runtime
-# to another", that across processes that is fd passing, and that its worker arm
-# was "expected to stay a refusal for good".  The first clause is true only of
-# the FOUR-argument form, which never crosses anything.  Across two runtimes
-# the three-argument form is route_client(): the socket stays where it is and
-# its bytes are relayed.  So the two of them were one problem, and it was not
-# the one named here.
-#
-# Both are parity assertions now, on the same footing as the other eleven.
-# What is kept from the old arrangement is its control discipline -- the
-# in-daemon arm still has to answer before the worker arm's agreement with it
-# means anything, and self.route still has PEER_CONN behind it, because "both
-# arms answered true" passes on a build where routing is broken on both sides.
-#
+# The holder speaks before it reads, because an unclassified connection
+# receives no relay traffic and CONN stays 0 -- and the one polled assertion is
+# get.connections, whose daemon arm is exact and worker arm replicated, so it
+# converges rather than agreeing in an instant; it was a single sample that
+# passed only because the suite put 180 ms between the connection and the read,
+# and pipe and route are parity assertions now rather than the permanent
+# refusals this header once called them.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -147,11 +48,8 @@ fail() {
     for line in "${@:3}"; do echo "        $line"; done
 }
 
-# ctl LABEL GOT WANT WHAT-A-BREAK-WOULD-LOOK-LIKE...
-#
-# The in-daemon arm against a value written here.  Every one of these is green
-# today; the day one goes red the parity assertion below it has stopped meaning
-# anything, and this says so before it is misread as progress.
+# The in-daemon arm against a value written here, so the day one goes red the
+# parity assertion below it has stopped meaning anything and says so.
 ctl() {
     local label=$1 got=$2 want=$3; shift 3
     if [ "$got" = "$want" ]; then pass; return; fi
@@ -162,29 +60,10 @@ ctl() {
          "$@"
 }
 
-# par CALL OOP IN
-#
-# The worker arm against the in-daemon arm.  These are the calls that MUST go
-# green when the worker is handed the runtime map — the definition of done.
-#
-# ─── TWO WAYS TO BE RED, AND ONLY ONE OF THEM IS PROGRESS ───────────────────
-#
-# Found by running the prepared un-refusal queue against a build with no map in
-# it, which is the state somebody will eventually land by mistake: the score
-# did not move.  Both of these are one failed assertion —
-#
-#     worker arm: REFUSED:...   the call is honestly refused.  Waiting.
-#     worker arm: 0/0           the refusal was removed and the call now
-#                               answers an empty table.
-#
-# — and the second is strictly worse than doing nothing, because an empty list
-# is what a SUCCESSFUL call returns on a daemon with nothing in it.  A script
-# cannot tell them apart, which is the entire reason the refusals were written.
-# A file that reports the same 35/43 for both is no use for catching it: the
-# number is what gets read, and a reviewer who sees the count unchanged
-# concludes nothing changed.
-#
-# So the two are named differently and the second says what it is.
+# The worker arm against the in-daemon arm, with an honest refusal and an
+# un-refused call that answers an empty table named differently -- because the
+# second is worse than doing nothing and a file reporting the same score for
+# both cannot catch it.
 par() {
     local call=$1 oop=$2 in=$3
     if [ "$oop" = "$in" ]; then pass; return; fi
@@ -206,32 +85,10 @@ par() {
     esac
 }
 
-# refused CALL OOP NEEDLE WHY...
-#
-# The other kind, for the calls that are refused FOR GOOD.  Not parity — parity
-# for these is unreachable by design, and an assertion that can never pass is
-# not a target, it is a permanent red that teaches everyone to ignore the file.
-# What is asserted instead is that the refusal names the right missing thing.
-#
-# ONE family is left here, and it used to be two.  The list is worth keeping
-# because the family that left did so within a release of this file calling it
-# refused "for good":
-#
-#   pipe, self.route           they move a CONNECTION.  Not a map problem at
-#                              all; what is missing is a channel between two
-#                              runtimes, and the mechanism for it already
-#                              exists unwired in shared/conn_transfer.h.
-#   create/start/stop/remove   GONE from here — see the par() assertions below.
-#                              They change the map, and the argument was that
-#                              being handed a copy of it is not permission to
-#                              alter it.  That is true and was never the
-#                              question: the calls do not alter the copy, they
-#                              ask the process holding the original, over a
-#                              socket the worker was given for it.
-#
-# A refusal that names the wrong missing thing is not a cosmetic fault: it
-# tells its reader to wait for a delivery that will not fix their call.  So is
-# a test file that calls a refusal permanent.
+# For the calls refused for good, asserting that the refusal names the right
+# missing thing rather than parity, which is unreachable by design -- with the
+# create family gone from this list within a release of being called permanent,
+# because they ask the process holding the map rather than altering a copy.
 refused() {
     local call=$1 oop=$2 needle=$3; shift 3
     case "$oop" in
@@ -260,15 +117,9 @@ echo "=== Integration: the cross-runtime Lua API, in a worker and in the daemon 
 
 mkdir -p "$CLUSTER_DIR"
 daemon_start "$BIN"
-# --cluster, because socketley.cluster.* returns an empty table when the daemon
-# has no discovery object at all — on either side of the boundary.  Four of the
-# twelve would then be green in a worker for the wrong reason.
-#
-# Sent to a daemon that is already up, not passed on its command line: `daemon
-# --name/--cluster` is CONFIGURATION mode in cli.cpp, which starts a detached
-# daemon and talks to it over IPC.  Given to daemon_start it produces a daemon
-# nothing holds the pid of and a "never came up" that is about the flag rather
-# than the build.
+# --cluster, because the four cluster calls answer an empty table on either
+# side without a discovery object, and sent to a daemon that is already up
+# rather than on its command line, which is configuration mode.
 if "$BIN" daemon --name parnode --cluster "$CLUSTER_DIR" >/dev/null 2>&1; then
     pass
 else
@@ -280,13 +131,8 @@ else
 fi
 
 # ─── The probe script ───────────────────────────────────────────────────────
-#
-# Identical for both arms, and everything in it is derived from self.* so that
-# nothing has to be substituted per arm: the child's name is self.name .. "_kid"
-# and its port is self.port + 10.  That makes self.name and self.port part of
-# what is measured — they are read inside the worker too — and a build that got
-# either wrong out there shows up in the external `ls` oracle rather than being
-# silently absorbed.
+# Identical for both arms and derived from self.*, which makes self.name and
+# self.port part of what is measured rather than silently absorbed.
 PROBE_LUA="$SOCKETLEY_TMPD/probe.lua"
 cat > "$PROBE_LUA" <<'LUAEOF'
 local PEER   = "par_peer"
@@ -431,14 +277,9 @@ function on_client_message(client_id, msg)
 end
 LUAEOF
 
-# par_peer's own script, and it exists for one assertion: that a route in the
-# daemon arm really moved a connection.  Without it "the worker refused" also
-# passes on a build where self.route() is broken everywhere, which would be a
-# feature that does not work rather than a boundary that cannot be crossed.
-#
-# The id is logged rather than a bare marker so the lines can be counted: the
-# holder's connection produces one before any routing happens, and each routed
-# connection produces one more.
+# par_peer's own script exists for one assertion -- that a route in the daemon
+# arm really moved a connection -- logging the id rather than a bare marker so
+# the lines can be counted.
 PEER_LUA="$SOCKETLEY_TMPD/peer.lua"
 cat > "$PEER_LUA" <<'LUAEOF'
 function on_connect(client_id)
@@ -465,8 +306,8 @@ s.close()
 sys.stdout.write(buf.decode('utf-8', 'replace'))
 PYEOF
 
-# The connection socketley.send() has to reach, and the one `get.connections`
-# counts.  Sends first, then reads for the rest of the test — see the header.
+# The connection socketley.send() has to reach and `get.connections` counts,
+# which sends first and then reads for the rest of the test.
 HOLD_PY="$SOCKETLEY_TMPD/hold.py"
 cat > "$HOLD_PY" <<'PYEOF'
 import socket, sys, time
@@ -500,12 +341,9 @@ row() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print tolower($4"/"$7) 
 conn() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print $5 }'; }
 
 # ─── The world both arms look at ────────────────────────────────────────────
-#
-# par_peer and par_idle are --daemon-process on purpose.  They are the SUBJECT
-# of the reads, not the thing being tested, and an in-daemon subject has a
-# connection count read from live tables rather than from a pushed frame — so
-# `get.connections` has one unambiguous right answer for both arms to be
-# compared against.
+# par_peer and par_idle are --daemon-process on purpose, because an in-daemon
+# subject's connection count comes from live tables and gives both arms one
+# unambiguous right answer.
 create_ok "target server created" "$BIN" create server par_peer \
     -p "$PEER_PORT" --group parity --lua "$PEER_LUA" -s
 create_ok "unstarted group member created" "$BIN" create server par_idle \
@@ -556,71 +394,23 @@ IN_cg=$(field "$IN_REPORT" cgroup);           OOP_cg=$(field "$OOP_REPORT" cgrou
 IN_cs=$(field "$IN_REPORT" cstats);           OOP_cs=$(field "$OOP_REPORT" cstats)
 
 # ── list ────────────────────────────────────────────────────────────────────
-# Four of four, and four in the map.  A worker map that omits the worker's OWN
-# runtime says 3/3 and is caught here; an empty one says 0/0, which is the lie
-# the refusal exists to prevent.
+# Four of four and four in the map, because a worker map omitting its own
+# runtime says 3/3 and an empty one says 0/0, which is the lie the refusal
+# existed to prevent.
 ctl "socketley.list()" "$IN_list" "4/4" \
     "a build that answered an empty table would say 0/0"
 par list "$OOP_list" "$IN_list"
 
 # ── get ─────────────────────────────────────────────────────────────────────
-# Every field of the placeholder shape at once.  connections is the one that
-# cannot be answered from a name alone: a map carrying a stale or absent count
-# says .../0 here beside a CONN column that says 1.
-#
-# The control moved BELOW the convergence loop and this is why: it used to be
-# checked here, on a value sampled once, because the in-daemon arm read the
-# live count off the runtime and had nothing to converge to.  Both arms are
-# workers now, so both read a pushed figure and both need the same window --
-# checking one of them before the wait is checking it at the one moment it is
-# guaranteed to be allowed to be wrong.
+# Every field of the placeholder shape at once, with the control moved below
+# the convergence loop because both arms are workers now and both read a pushed
+# figure.
 WANT_GET="server/running/$PEER_PORT/1/nil"
 
-# ── and the one field that is a CONVERGING figure, not an instantaneous one ──
-#
-# The forty-two assertions around this one compare a value that is either right
-# or wrong the moment it is read.  This one cannot be, and no amount of care in
-# the transport would make it so — see the header: par_peer lives in the daemon,
-# so the daemon's own answer for it is exact, while a worker's is a replica that
-# arrives on a push.  Demanding they agree in the same instant is demanding
-# something the design does not offer and should not be made to.
-#
-# What the map does promise is CONVERGENCE, so that is what is asserted: poll
-# until the two arms agree, and fail if they never do.
-#
-# ─── WHY THIS IS A POLL AND NOT A LONGER SLEEP ──────────────────────────────
-#
-# It was a single sample, and it passed inside run_all.sh and failed 5 runs out
-# of 5 standalone — 42/43 alone, green in the suite.  Not a flake in either
-# direction: under the suite there is ~180 ms of other test work between the
-# connection and the read, so more push intervals elapse and the figure arrives
-# in time.  The test was passing because the machine was busy, which is the
-# wrong way round — green in CI and red for whoever runs it alone to check
-# something, and the lone run is the honest one.  A fixed sleep would only move
-# the threshold; it would still be a race, just one that loses less often.
-#
-# ─── WHERE THE DEADLINE COMES FROM, AND WHY IT IS NOT A ROUND NUMBER ────────
-#
-# Read out of the source rather than written here, so that changing the cadence
-# moves this bound with it instead of silently leaving it behind.
-#
-# The mechanism bounds it from BOTH sides, which is what makes 4x the right
-# multiple rather than a number that happened to pass:
-#
-#   FLOOR   daemon_handler::on_worker_stats() coalesces one map round per
-#           interval, and a figure that changes just after a round waits out
-#           the remainder before the next one carries it.  The daemon side
-#           documents the result as: the daemon is <=1 interval stale, a worker
-#           <=2.  So anything at or under 2x is asserting something the design
-#           does not promise, and would be red on a correct build.
-#   CEILING The behaviour this replaced was the two-second health tick, which is
-#           8x.  A deadline at or above that passes on the very regression the
-#           assertion exists to catch, and 5fee09c is one revert away.
-#
-# 4x sits between them: twice the worst case the design promises, half the
-# interval of the bug it guards against.  Measured on this tree it converges far
-# inside that -- see the wait time the failure text prints, which is there so
-# the next reader can tell a real breakage from a margin that got tight.
+# The one converging figure is asserted by polling to a deadline read out of
+# the source at 4x the push interval, which sits between the 2x the design
+# promises and the 8x health tick the behaviour replaced -- a single sample
+# passed only inside the suite and failed five runs of five standalone.
 STATS_MS=$(grep -oE 'stats_interval_ms *= *[0-9]+' \
            "$(dirname "$0")/../../socketley/shared/worker_protocol.h" 2>/dev/null \
            | grep -oE '[0-9]+$' | head -1)
@@ -636,22 +426,9 @@ case "$STATS_MS" in
 esac
 CONVERGE_MS=$((STATS_MS * 4))
 
-# ─── BOTH arms are re-read, and that changed with --daemon-process ──────────
-#
-# This loop used to re-read only the worker arm, because the other one was
-# EXACT: par_in ran in the daemon, and socketley.get() there reads the live
-# connection count off the runtime itself.  There was a fixed number to
-# converge to.
-#
-# Both arms are workers now, so both read the daemon's pushed copy, and a
-# reference sampled once before the loop is a reference that can be stale.
-# Measured under Sanitize: IN_get was captured as 0 and the loop then waited
-# for the worker arm to become 0 again, which it never did -- reported as
-# "connections never converged" for two arms that agreed within one interval.
-#
-# Re-reading both is not a weaker assertion.  What is being asserted is that
-# the two arms AGREE, and a comparison where only one side is allowed to move
-# was asserting agreement with a snapshot instead.
+# Both arms are re-read, because both are workers now and a reference sampled
+# once can be stale -- measured under Sanitize as two arms that agreed within
+# one interval being reported as never converging.
 now_ms() { date +%s%3N; }
 GET_T0=$(now_ms)
 GET_WAITED=0
@@ -699,12 +476,9 @@ fi
 ctl "socketley.get() on a name that is not there" "$IN_gabs" "nil" \
     "a build that invented a row for any name would say nonnil"
 
-# Not one of the twelve — it is the same call — but it is what stops `get`
-# passing by answering every name.  Written as a mode check so that it is never
-# vacuously green: a worker either answers BOTH questions, in which case both
-# must match the daemon, or refuses both.  Answering the lookup that succeeds
-# while refusing the one that would say "no such name" is a third state, and it
-# is the shape a map that cannot express absence would produce.
+# Written as a mode check so it is never vacuously green: a worker either
+# answers both questions or refuses both, and answering only the lookup that
+# succeeds is the shape a map that cannot express absence would produce.
 oop_mode() { case "$1" in REFUSED:*) printf refused ;; *) printf answered ;; esac; }
 if [ "$(oop_mode "$OOP_get")" != "$(oop_mode "$OOP_gabs")" ]; then
     fail "socketley.get() answers both questions or neither" \
@@ -726,16 +500,10 @@ ctl "socketley.send()" "$IN_send" "true" \
 par send "$OOP_send" "$IN_send"
 
 # ── pipe: at parity now ─────────────────────────────────────────────────────
-#
-# This was "refused for good", and the file said so at length in its header:
-# fd passing across processes is a separate project.  It was wrong about the
-# mechanism, not about the refusal being real.  The three-argument form does
-# not pass a descriptor at all -- across two runtimes it is route_client(),
-# which keeps the socket where it is -- so what it needed was route_relay.h and
-# not SCM_RIGHTS.
-#
-# 4242 is deliberately not an open connection of either arm's runtime, so both
-# answer the same refusal about the same descriptor and nothing is moved.
+# This was called refused for good and the header was wrong about the mechanism
+# rather than the refusal, because the three-argument form is route_client()
+# and needed route_relay.h -- with 4242 deliberately not an open connection of
+# either arm.
 ctl "socketley.pipe()" "$IN_pipe" \
     "false:connection 4242 could not be routed to \"par_idle\": that is not an open connection of this server" \
     "in the daemon this resolves the source locally and answers about the" \
@@ -758,9 +526,8 @@ ctl "socketley.cluster.group()" "$IN_cg" "1" \
     "reached the caller at all"
 par cluster.group "$OOP_cg" "$IN_cg"
 
-# daemons/runtimes/running/groups.parity.  par_idle is counted in the group
-# histogram although it is not running, which is what stats() does and what a
-# reimplementation somewhere else would most easily get wrong.
+# par_idle is counted in the group histogram although it is not running, which
+# is what stats() does and what a reimplementation would most easily get wrong.
 ctl "socketley.cluster.stats()" "$IN_cs" "1/4/3/2" \
     "3 running of 4, and both group members counted"
 par cluster.stats "$OOP_cs" "$IN_cs"
@@ -786,30 +553,10 @@ ctl "the child the in-daemon arm made is really there" \
     "$IN_ROW" "$IN_KID_PORT/up" \
     "the script's own 'true' is not evidence that anything was built; this is"
 
-# ── The oracle, which was a NEGATIVE one and is now a positive one ─────────
-#
-# It used to assert that the worker arm had built nothing, and the interesting
-# half of it survives the inversion unchanged: `ls` on its own cannot make
-# either claim.
-#
-# The reason is the failure mode this whole feature is built against.  Answer
-# create inside a worker, against the worker's own manager — mgr->create(),
-# set_event_loop() with THIS WORKER'S ring, mgr->start() on it — and you get a
-# real runtime, bound and serving, inside the worker process, which the daemon
-# never hears about.  `ls` shows nothing.  A REFUSED create also shows nothing.
-# The two are identical in the CLI, and neither is what is wanted.
-#
-# So both halves are asked, and they are asked for opposite reasons:
-#
-#   ls lists it        the create reached the DAEMON's map.  A create answered
-#                      locally fails this, however loudly it returned true.
-#   the port answers   the runtime is really serving.  runtime_instance::start
-#                      stores `running` and returns true for an out-of-process
-#                      placeholder with no child forked, so `ls` saying Up is
-#                      not evidence that anything is bound.
-#
-# The in-daemon arm is the control for the probe itself: its own child must be
-# listening, or a probe that can see nothing anywhere would pass vacuously.
+# Both halves are asked for opposite reasons -- `ls` listing it proves the
+# create reached the daemon's map, and the port answering proves the runtime is
+# really serving -- because a create answered locally and a refused one look
+# identical in the CLI.
 listening() { ss -ltnH 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { f=1 } END { print f?"yes":"no" }'; }
 
 if [ "$(listening "$IN_KID_PORT")" = "yes" ]; then pass; else
@@ -851,11 +598,8 @@ par remove "$OOP_remove" "$IN_remove"
 
 for _ in $(seq 1 30); do [ -z "$(row par_in_kid)" ] && break; sleep 0.1; done
 
-# WAS there, and is now gone.  Not "is now gone" on its own: that is green when
-# the child was never created, which is exactly the state the worker arm is in
-# today — an assertion that passes because nothing happened is not coverage of
-# the thing that was supposed to happen.  BEFORE is the row captured after
-# `make`, above.
+# Was there and is now gone, because "is now gone" alone is green when the
+# child was never created.
 gone_after() {
     local label=$1 before=$2 after=$3
     if [ -z "$before" ]; then
@@ -875,11 +619,8 @@ gone_after() {
 gone_after "the child the in-daemon arm removed is really gone" \
            "$IN_ROW" "$(row par_in_kid)"
 
-# And the worker counterpart, which did not exist while the worker arm could
-# not make a child.  It is the same assertion for the same reason, and the
-# BEFORE guard in gone_after() is what stops it passing on a build where the
-# create never worked: an assertion that is green because nothing happened is
-# not coverage of the thing that was supposed to happen.
+# And the worker counterpart, with the BEFORE guard stopping it passing on a
+# build where the create never worked.
 for _ in $(seq 1 30); do [ -z "$(row par_oop_kid)" ] && break; sleep 0.1; done
 gone_after "the child the worker arm removed is really gone" \
            "$OOP_ROW" "$(row par_oop_kid)"
@@ -894,11 +635,9 @@ if [ "$(listening "$OOP_KID_PORT")" = "no" ]; then pass; else
          "more — a remove that leaves the listener up is a leak with no handle"
 fi
 
-# ─── the send oracle: bytes on a real connection ────────────────────────────
-#
-# Last, because the holder has had the whole test to receive them.  This is the
-# assertion socketley.send()'s return value cannot make: the placeholder path
-# returned true and broadcast into an object with no connections in it.
+# The send oracle, last because the holder has had the whole test to receive:
+# this is the assertion a return value cannot make, since the placeholder path
+# returned true into an object with no connections.
 sleep 0.5
 if grep -q "PARITY-par_in" "$PEER_OUT" 2>/dev/null; then pass; else
     fail "control: the in-daemon arm's send actually arrived" \
@@ -914,20 +653,10 @@ if grep -q "PARITY-par_oop" "$PEER_OUT" 2>/dev/null; then pass; else
 fi
 
 # ─── self.route(): the thirteenth refusal ───────────────────────────────────
-#
-# LAST, and that is not tidiness.  A route that works moves a connection onto
-# par_peer, which changes the CONN column and the `get.connections` figure the
-# probe asserted was exactly 1.  Run earlier it would make that assertion
-# depend on the order two unrelated things happened in.
-#
-# It is on the server table rather than the socketley one, which is the only
-# reason it was missed when the other twelve were refused — and a thirteenth
-# refusal that nothing measures is how this whole gap survived in the first
-# place.  It belongs with pipe, not with the eleven: route_client() does not
-# look a name up and stop there, it writes into the TARGET's private maps and
-# runs the target's on_connect on the caller's stack, after which this server
-# keeps the socket and relays the bytes through itself.  A map of names cannot
-# supply any of that.
+# Last, because a route that works changes the CONN column the probe asserted
+# was exactly 1 -- and it belongs with pipe rather than the eleven, since
+# route_client() writes into the target's private maps and runs its on_connect
+# on this stack.
 PEER_CONN_BEFORE=$(grep -ac "PEER_CONN " "$SOCKETLEY_DLOG" 2>/dev/null) || PEER_CONN_BEFORE=0
 
 # poke PORT — connect, ask to be routed, and hold the connection open long
@@ -948,12 +677,9 @@ PEER_CONN_AFTER=$(grep -ac "PEER_CONN " "$SOCKETLEY_DLOG" 2>/dev/null) || PEER_C
 ctl "self.route()" "$IN_ROUTE" "ROUTE-par_in true" \
     "an open connection and a server to give it to is a route that succeeds"
 
-# What makes the two lines around it mean anything.  par_peer logs every
-# connection it accepts, so a route that really happened is one more of them
-# than before -- and with both arms routing it must be TWO more.  Without this,
-# "both arms answered true" also passes on a build where route() returns true
-# and moves nothing, which is the accepted-but-not-applied shape this whole
-# suite is written against.
+# par_peer logs every connection it accepts, so a route that really happened is
+# one more line and both arms routing is two -- without which "both arms
+# answered true" passes on a build that moves nothing.
 if [ "$PEER_CONN_AFTER" -ge $((PEER_CONN_BEFORE + 2)) ]; then pass; else
     fail "control: both routes really moved a connection" \
          "par_peer logged $PEER_CONN_BEFORE connections before and $PEER_CONN_AFTER after" \
@@ -962,8 +688,8 @@ if [ "$PEER_CONN_AFTER" -ge $((PEER_CONN_BEFORE + 2)) ]; then pass; else
          "not evidence the target got anything"
 fi
 
-# The parity claim itself.  Same helper as the other twelve, so a worker arm
-# that still refuses is reported as still refused rather than as a mismatch.
+# The parity claim itself, through the same helper, so a worker arm that still
+# refuses is reported as refused rather than as a mismatch.
 par route "${OOP_ROUTE:-<no ROUTE line at all>}" "${IN_ROUTE/par_in/par_oop}"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
