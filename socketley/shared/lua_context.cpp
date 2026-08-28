@@ -2131,8 +2131,9 @@ std::string worker_refusal(const std::string& call,
            "() is refused in a worker process: this call reaches for the "
            "runtime map, which lives in the daemon, and answering from here "
            "would return nothing — indistinguishable from " + mistaken_for +
-           ". Create this runtime with --daemon-process, or move the call to "
-           "one that has it.";
+           ". The daemon pushes a cluster view to its workers; this one has "
+           "none, so either this daemon is in no cluster, or it joined one "
+           "after this script was loaded. Reload the runtime to pick it up.";
 }
 
 // ── The four that change the map rather than read it ────────────────────────
@@ -2188,8 +2189,8 @@ std::string worker_mutation_refusal(const std::string& call)
            "create the socket. Answering it here would act on this process's "
            "own copy of the map: a runtime built inside this worker that the "
            "daemon never hears about, or a start and a stop that flip a "
-           "placeholder and bind nothing. Restart the daemon, or move the call "
-           "to a runtime that runs in it.";
+           "placeholder and bind nothing. Restart the daemon: a current one "
+           "serves these four for every worker it forks.";
 }
 
 // ── The two whose missing piece is not the map at all ───────────────────────
@@ -2250,8 +2251,8 @@ std::string worker_transfer_refusal(const std::string& call, const char* moves,
 // pipe has two branches and only one of them crosses anything.  Naming one
 // runtime twice pairs two of THAT server's own connections — and self.pipe(a,
 // b) is the same operation on the same tables, bound in a worker and working
-// there.  So the way out names it, rather than sending somebody to
-// --daemon-process for a call that needs no boundary crossed.
+// there.  So the way out names it, rather than sending somebody after a
+// boundary this call never crosses.
 std::string worker_pipe_refusal()
 {
     return worker_transfer_refusal(
@@ -2259,11 +2260,12 @@ std::string worker_pipe_refusal()
         "a pipe hands an open file descriptor from one runtime to another",
         "To pair two connections of this same server, call self.pipe(fd_a, "
         "fd_b), which stays in this process and is not refused; to route a "
-        "connection to another runtime, create both with --daemon-process.");
+        "connection to another runtime, restart the daemon — a current one "
+        "gives every worker the channel this needs.");
 }
 
 // self.route() has no local branch: it always names another runtime, so there
-// is no self.* equivalent to point at and --daemon-process is the whole answer.
+// is no self.* equivalent to point at.
 //
 // It is the heavier of the two, and the message says which mechanism it wants
 // rather than leaving "a channel" to be guessed at.  server_instance::
@@ -2284,7 +2286,8 @@ std::string worker_route_refusal()
         "self.route",
         "routing hands a live client to another runtime, which answers it "
         "while this server keeps the socket and relays the bytes",
-        "Create both runtimes with --daemon-process. unroute(), get_route() "
+        "Restart the daemon; a current one gives every worker the channel "
+        "this needs. unroute(), get_route() "
         "and owner_send() are not refused here: they read this runtime's own "
         "tables, which in a worker are empty because nothing was ever routed "
         "in, and that is the truth rather than a substitute for it.");

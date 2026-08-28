@@ -82,12 +82,6 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         case fnv1a("--listen"):
             return parse_listen_flag(instance, pa, i);
 
-        // Taken here so it is not an unknown flag, and acted on nowhere but the
-        // pre-scan in daemon_handler, which is the only place that sees the
-        // whole command line before --lua is executed.
-        case fnv1a("--daemon-process"):
-            return 0;
-
         // ─── How many processes serve this one runtime ──────────────────────
         //
         // N workers sharing one listening socket through SO_REUSEPORT.  It
@@ -137,18 +131,18 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             //
             // Asked here with only the facts that cannot change further along
             // the command line: the type, and the number just parsed.  The rest
-            // of what it wants -- a --listen path, a --daemon-process -- may be
-            // typed AFTER this flag, so asking about them here would make the
-            // answer depend on the order the operator typed.  The whole question
-            // is asked again in cmd_create once every flag has been seen,
-            // exactly where the TLS set is checked and for the same reason.
+            // of what it wants -- a --listen path -- may be typed AFTER this
+            // flag, so asking about it here would make the answer depend on the
+            // order the operator typed.  The whole question is asked again in
+            // cmd_create once every flag has been seen, exactly where the TLS
+            // set is checked and for the same reason.
             //
             // --lua used to be one of those, and was the sharpest of them: a
             // scripted server was refused, so `--shards 4 --lua x` and
             // `--lua x --shards 4` had to reach the same answer.  It is no
             // longer part of the question at all.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n, {}, true); !msg.empty())
+                    instance->get_type(), n, {}); !msg.empty())
             {
                 std::cout << msg;
                 return 1;
@@ -218,13 +212,14 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         // field is for, silently did the wrong thing for one of the two
         // spellings and nothing anywhere said so.
         //
-        // The file itself already states the rule, at the --daemon-process
-        // pre-scan in cmd_create: "A create whose behaviour depends on argument
-        // order is a bug waiting for someone to reorder a command line."  That
-        // pre-scan fixed it for one flag, by finding the flag that had to be
-        // known early.  This is the other half — the flag that has to be acted
-        // on late — and there is only one of those, because loading the script
-        // is the only step in a create that reads the configuration back.
+        // The rule it breaks is stated in cmd_create, where a pre-scan for
+        // --daemon-process used to enforce it: "A create whose behaviour
+        // depends on argument order is a bug waiting for someone to reorder a
+        // command line."  That pre-scan is gone with its flag -- where a
+        // runtime runs has one answer now -- but this half remains, because
+        // loading the script is the only step in a create that reads the
+        // configuration back, and it is therefore the only flag that has to be
+        // acted on late.
         //
         // `edit` never had this: cmd_edit applies every field from its parsed
         // config and only then reloads.
@@ -1127,18 +1122,6 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
         // whatever is already pointing at it, and quietly dropping it would
         // leave the operator believing a runtime is isolated when it is not.
         //
-        // Here rather than in parse_proxy_edit_flags, where it lived while this
-        // was a proxy-only flag: `edit server x --out-of-process` answered
-        // "unknown flag" and `edit proxy x --out-of-process` answered the
-        // refusal, for the same request against the same field.
-        // Refused rather than ignored.  Honouring it would mean moving a
-        // configured runtime from one address space to another underneath
-        // whatever is already pointing at it, and quietly dropping it would
-        // leave the operator believing a runtime is isolated when it is not.
-        case fnv1a("--daemon-process"):
-            std::cout << "where a runtime runs can only be set when it is created\n";
-            return 1;
-
         // Same rule as `-p`, and for a sharper reason: a running runtime is
         // bound to the socket node it has, so moving it would mean binding a
         // second path underneath whatever is already connected and leaving the
@@ -1152,13 +1135,10 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             }
             return parse_listen_flag(instance, pa, i);
 
-        // Editable, unlike --daemon-process above, and refused while running
-        // like -p below.  The two are not the same request: --daemon-process
-        // would move a configured runtime between address spaces underneath
-        // whatever already points at it, whereas the shard count is read once,
-        // when the workers are forked, so changing it on a stopped runtime is
-        // exactly as safe as changing its port and takes effect the same way —
-        // at the next start.
+        // Editable, and refused while running like -p below.  The shard count
+        // is read once, when the workers are forked, so changing it on a
+        // stopped runtime is exactly as safe as changing its port and takes
+        // effect the same way — at the next start.
         //
         // Refused while running rather than applied, because applying it means
         // forking or retiring workers under live connections, and there is no
@@ -1183,14 +1163,12 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid shard count\n";
                 return 1;
             }
-            // Unlike the create case above, an edit CANNOT gain a
-            // --daemon-process further along its own command line: the flag is
-            // not editable.  --listen is, so it is left to the set check in
-            // cmd_edit rather than read here, and this asks the half of the
-            // question whose inputs are already final.
+            // --listen can be typed further along this same command line, so
+            // it is left to the set check in cmd_edit rather than read here,
+            // and this asks the half of the question whose inputs are already
+            // final.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n, {},
-                    instance->is_out_of_process()); !msg.empty())
+                    instance->get_type(), n, {}); !msg.empty())
             {
                 std::cout << msg;
                 return 1;

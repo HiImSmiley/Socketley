@@ -247,42 +247,33 @@ int cli_config(int argc, char** argv)
         if (test)
             command += " --test";
 
-        // Where this runtime runs.  The one flag a configuration could not
-        // reach, and the one it could least afford to miss.
+        // `daemon_process = true` is refused rather than ignored.
         //
-        // A runtime gets its own worker process unless it asks not to, and a
-        // worker holds one runtime and no runtime map.  The cross-runtime Lua
-        // API — socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe,
-        // everything under socketley.cluster, and self.route(), which names
-        // another runtime — is exactly the part that needs the map, so in a
-        // worker every one of those calls raises.
+        // The flag it emitted is gone: a runtime runs in its own process, and
+        // there is no longer an arrangement for this key to ask for.  Silently
+        // dropping it would leave an operator believing a runtime is in the
+        // daemon -- which is the exact failure this key's own previous comment
+        // warned about in the other direction -- so the file is refused and
+        // told which line to delete.
         //
-        // Inside a callback that raise is caught and logged and the runtime
-        // carries on, which is what made this worth adding rather than
-        // documenting: the runtime comes up green, `ls` lists it, the port
-        // accepts connections, and none of the work is done.  A configuration
-        // that wanted such a runtime had no way to say so, and no way to find
-        // out that it had not.
-        //
-        // Nor could it be repaired afterwards: `edit` refuses the flag, because
-        // honouring it would mean moving a configured runtime between address
-        // spaces underneath whatever already points at it.  A configuration
-        // that omitted it had to be deleted and recreated by hand.
-        //
-        // Emitted wherever it lands in the string: create pre-scans its
-        // arguments for this flag before parsing any of them, precisely so that
-        // its position cannot change what --lua does.
-        bool daemon_process = t["daemon_process"].get_or(false);
-        if (daemon_process)
-            command += " --daemon-process";
+        // Refused even for `daemon_process = false`, which asked for what it
+        // now gets: a key that means nothing is still a key whose presence
+        // implies this build has an opinion about it, and the next reader would
+        // set it to true.
+        if (t["daemon_process"].valid())
+        {
+            std::cerr << "daemon_process is no longer a setting: every runtime "
+                         "runs in its own process. Remove the line.\n";
+            return 1;
+        }
 
         // How many worker processes serve this runtime; see --shards.
         //
-        // Here for the same reason daemon_process above it is: a configuration
-        // file is a way of describing a runtime, and a property it cannot
-        // express is one that has to be set by hand afterwards — which for this
-        // one is not possible, because a configuration file starts what it
-        // creates and `--shards` may only be edited on a stopped runtime.
+        // A configuration file is a way of describing a runtime, and a
+        // property it cannot express is one that has to be set by hand
+        // afterwards — which for this one is not possible, because a
+        // configuration file starts what it creates and `--shards` may only be
+        // edited on a stopped runtime.
         //
         // Emitted only when it was asked for, so a table that says nothing
         // about shards produces exactly the command line it produced before.

@@ -63,14 +63,21 @@ struct runtime_config
     std::string owner;
     int child_policy = 0; // 0 = stop, 1 = remove
 
-    // Out-of-process: the runtime is served by a worker process the daemon
-    // supervises.  Persisted because was_running auto-restart has to bring a
-    // runtime back where it was running, not merely bring it back.
-    bool out_of_process = false;
+    // `out_of_process` used to live here, persisted because was_running
+    // auto-restart had to bring a runtime back WHERE it was running and not
+    // merely bring it back.  There is one where now, so there is nothing to
+    // carry: daemon.cpp marks every restored runtime out of process
+    // unconditionally, which also decides what to do with a file written by an
+    // older build.  See the note there; the short version is that
+    // `"out_of_process": false` described an arrangement this build cannot
+    // create, so honouring it would restore something untestable.
+    //
+    // The field is not read and the key is not written.  An old file still
+    // carrying it parses fine: json_get_* ignores keys nothing asks for.
 
     // How many worker processes serve this one runtime; see
-    // runtime_instance::set_shards().  Persisted for the same reason the flag
-    // above it is, and the cost of not doing so is sharper: a proxy restored
+    // runtime_instance::set_shards().  Persisted because the cost of not doing
+    // so is sharp: a proxy restored
     // with one shard where the operator asked for four is a quarter of the
     // throughput they configured, reported by `ls` as running and by nothing at
     // all as wrong.

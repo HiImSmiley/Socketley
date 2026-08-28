@@ -1570,8 +1570,8 @@ size_t server_instance::get_connection_count() const
 // is one branch there rather than a second copy of everything after it.
 //
 // SOCK_CLOEXEC: this listener belongs to one runtime in the daemon, and the
-// daemon forks a worker for every runtime that does not ask for
-// --daemon-process.  Without the flag every such worker inherits this port —
+// daemon forks a worker for every runtime there is.  Without the flag every
+// such worker inherits this port —
 // measured, as fd 6 of a worker whose own port was a different one — and holds
 // it after this runtime is stopped and after the daemon exits.  The shutdown()
 // in teardown() unhashes the socket for every dup at once and so hides it on

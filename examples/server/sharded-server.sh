@@ -126,12 +126,7 @@ socketley create server chat -p 9111 --shards 4 --lua /tmp/sharded-server-demo.l
 socketley remove chat >/dev/null 2>&1 || true
 
 echo ""
-echo "[4/4] Three combinations that are refused rather than ignored:"
-echo ""
-echo "  \$ socketley create server s -p 9112 --shards 4 --daemon-process"
-socketley create server s -p 9112 --shards 4 --daemon-process || true
-echo "     (a shard IS a worker process, so a runtime asked to stay in the"
-echo "      daemon has exactly one however many it declares)"
+echo "[4/4] Two combinations that are refused rather than ignored:"
 echo ""
 echo "  \$ socketley create server s --shards 4 --listen unix:/tmp/s.sock"
 socketley create server s --shards 4 --listen unix:/tmp/s.sock || true

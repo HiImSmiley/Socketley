@@ -307,9 +307,13 @@ daemon down with it, and a runtime that fails to start is visible to
 <code>ps</code> &mdash; which is the command an operator types when a runtime did
 not start.</p>
 
-<p><code>--daemon-process</code> opts back in to sharing the daemon's process.
-It is the only flag for where a runtime runs: a boolean needs one name, and it
-is the non-default state that is named.</p>
+<p>There is no opt-out and no flag. <code>--daemon-process</code>, which kept a
+runtime inside the daemon, has been removed along with the older
+<code>--out-of-process</code> / <code>--in-daemon</code> pair; a command line
+carrying one is refused as an unknown flag, and a configuration file with
+<code>daemon_process</code> in it is refused naming the line. What the flag
+bought back was thirteen Lua calls a worker could not make, and that count is
+now zero &mdash; see <a href="#concept-processes">the Lua notes below</a>.</p>
 
 <h4 id="concept-shards">--shards</h4>
 
@@ -330,13 +334,10 @@ process the client happened to reach. On a sharded server, a Lua script's
 <code>self.clients()</code>, <code>self.send</code> and connection counts span
 all shards, not just the process the script is running in.</div>
 
-<div class="warn-box"><strong>Three combinations are refused</strong>, each at
+<div class="warn-box"><strong>Two combinations are refused</strong>, each at
 start with the reason in the daemon log rather than one of the two winning
 quietly:
 <ul>
-<li><code>--shards</code> with <code>--daemon-process</code> &mdash; a shard
-    <em>is</em> a worker process, so a runtime asked to stay in the daemon would
-    have exactly one however many it declared.</li>
 <li><code>--shards</code> with <code>--listen unix:</code> &mdash;
     <code>SO_REUSEPORT</code> is not what a unix socket does. N processes would
     unlink each other's socket node and only the last to bind would be
@@ -581,7 +582,6 @@ socketley cluster watch</code></pre>
 <tr><td>--ca</td><td>On a listener, require and verify client certificates (mutual TLS). On a client, the trust store to verify the peer against instead of the system one</td></tr>
 <tr><td>-g / --group &lt;name&gt;</td><td>Assign to a <a href="#concept-groups">group</a> for dynamic proxy backend discovery via <code>@groupname</code></td></tr>
 <tr><td>--listen unix:&lt;path&gt;</td><td>Listen on an AF_UNIX socket instead of a TCP port. Taken by every runtime that listens &mdash; server, proxy, cache. A client dials out and listens on nothing, so there the flag is refused with a pointer at <code>-t unix:</code>. Absolute path, under 108 bytes</td></tr>
-<tr><td>--daemon-process</td><td>Run this runtime inside the daemon rather than in a process of its own. A runtime gets its own supervised worker process unless this is given &mdash; see <a href="#concept-processes">Processes and Sharding</a></td></tr>
 <tr><td>--cpus &lt;set&gt;</td><td>The CPUs this runtime's I/O may run on: <code>max</code>, a range (<code>0-3</code>), or a list whose elements may themselves be ranges (<code>0-1,3</code>). Default <code>max</code>, which pins nothing &mdash; a CPU that comes online later stays available. A CPU the machine does not have, a descending range, or an empty set is refused at creation</td></tr>
 <tr><td>--sqpoll / --no-sqpoll</td><td>Whether this runtime's ring carries a submission-queue polling kernel thread. <code>--no-sqpoll</code> is the default. With it, submitting work is a store to a queue tail and costs no system call; without it, each batch costs one <code>io_uring_enter(2)</code>. The price is a kernel thread per ring</td></tr>
 <tr><td>--idle-timeout &lt;seconds&gt;</td><td>Close connections idle (no data received) for longer than this. A sweep runs every 30&nbsp;seconds. 0 = disabled (default)</td></tr>
@@ -597,7 +597,7 @@ socketley cluster watch</code></pre>
 <tr><td>--http-cache</td><td>Pre-load all files into memory at startup (production mode)</td></tr>
 <tr><td>--master-pw &lt;password&gt;</td><td>Static password for master mode authentication</td></tr>
 <tr><td>--master-forward</td><td>Forward non-master messages to the master client</td></tr>
-<tr><td>--shards &lt;N&gt;</td><td>Serve this server from N worker processes instead of one, sharing the listening socket through <code>SO_REUSEPORT</code>; the kernel hands each incoming connection to one of them. 1&ndash;64, default 1. Refused with <code>--daemon-process</code> and with <code>--listen unix:</code> &mdash; see <a href="#concept-processes">Processes and Sharding</a></td></tr>
+<tr><td>--shards &lt;N&gt;</td><td>Serve this server from N worker processes instead of one, sharing the listening socket through <code>SO_REUSEPORT</code>; the kernel hands each incoming connection to one of them. 1&ndash;64, default 1. Refused with <code>--listen unix:</code> &mdash; see <a href="#concept-processes">Processes and Sharding</a></td></tr>
 <tr><td>--upstream &lt;host:port&gt;</td><td>Add an outbound upstream connection. The server dials it at startup and auto-reconnects with exponential backoff (1s&ndash;30s). May be repeated, or given several addresses separated by semicolons</td></tr>
 </tbody></table>
 <div class="info-box"><strong>WebSocket:</strong> Auto-detected on every server &mdash; no flag needed. TCP and WebSocket clients coexist on the same port.</div>

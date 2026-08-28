@@ -1855,9 +1855,7 @@ only while the runtime is stopped, for the same reason
 .B \-p
 may.
 .PP
-.B "\-\-shards is refused with \-\-daemon\-process and with \-\-listen."
-A shard is a worker process, so a server asked to stay in the daemon has exactly
-one however many it declares; and
+.B "\-\-shards is refused with \-\-listen."
 .B SO_REUSEPORT
 is not what a unix socket does, so
 .I N
@@ -2350,13 +2348,7 @@ under
 .B SERVER FLAGS
 for what that means for a script.
 .PP
-.B "Two combinations are refused on every type."
-.B \-\-shards
-with
-.B \-\-daemon\-process
-is refused because a shard is a worker process: a runtime asked to stay in the
-daemon has exactly one however many it declares, and being told four while one
-event loop serves the port is worse than being told no.
+.B "One combination is refused on every type."
 .B \-\-shards
 with
 .B "\-\-listen unix:"
@@ -2577,33 +2569,29 @@ client would read it as the middle of the response it is already receiving.
 Such a connection is closed, and the backend that produced an unfinished
 response is charged to its breaker so the next client is routed elsewhere.
 .SS Process Isolation
-.TP
+Every runtime runs in its own supervised worker process. There is no flag for
+this and nothing to configure: it is where a server, a client, a proxy and a
+cache each run.
+.PP
+There used to be one.
 .B \-\-daemon\-process
-Run this runtime inside the daemon rather than in a process of its own.
-.IP
-A runtime gets its own supervised worker process unless this is given. This is
-the only flag for where a runtime runs: a boolean needs one name, and it is the
-non\-default state that is named.
-.IP
-It is described here because a proxy is where the split was built first, but it
-is not a proxy flag: a server, a client and a cache each get their own process
-by default too, and each takes this flag to stay in the daemon.
-.IP
-There were two flags,
+kept a runtime inside the daemon, and before it
 .B \-\-out\-of\-process
 and
-.BR \-\-in\-daemon ,
-and this replaces both. They were one bit under two spellings that had to be
-kept level in four places; neither is kept as a synonym, because a flag that no
-longer changes anything is a flag whose meaning has to be looked up to discover
-that it has none.
-.IP
-What this buys back is now two calls, and it used to be thirteen. The list is
-kept as three groups because they were refused for three different reasons, and
-two of the three reasons have since been answered:
+.B \-\-in\-daemon
+spelled the same bit two ways. All three are gone, and none is kept as a
+synonym: a flag that no longer changes anything is a flag whose meaning has to
+be looked up to discover it has none. A command line that still carries one is
+refused as an unknown flag rather than accepted and ignored, and a
+configuration file with
+.B daemon_process
+in it says which line to delete.
+.PP
+What the flag bought back was the reason to keep it, and it is the reason it
+could go. Thirteen Lua calls were refused in a worker; the count is now zero.
 .RS
 .TP
-.B Reads of the map \(em answered
+.B Reads of the map
 .BR socketley.send ,
 .BR .list ,
 .B .get
@@ -2612,7 +2600,7 @@ and all four of
 The daemon pushes the worker a replica of the map and a snapshot of the cluster
 view, and these are answered out of them.
 .TP
-.B Changes to the map \(em answered
+.B Changes to the map
 .BR socketley.create ,
 .BR .start ,
 .BR .stop ,
@@ -2621,76 +2609,63 @@ Not out of the replica \(em being told what the map holds is not permission to
 alter it. They are asked of the daemon over a socket of the worker's own and
 they wait for the answer, so
 .B "if socketley.create(...) then"
-branches on what happened rather than on what was accepted. What that costs was
-measured: 9.95, 10.20 and 10.52 microseconds over three runs of 20000, on a path
-a script reaches deliberately and never per message.
-.IP
-The refusal still exists for one case: a worker forked by a daemon that has no
-such socket \(em an older build, or one that could not create it. It says so.
+branches on what happened rather than on what was accepted. Measured: 9.95,
+10.20 and 10.52 microseconds over three runs of 20000, on a path a script
+reaches deliberately and never per message.
 .TP
-.B Moving a connection \(em still refused
+.B Moving a connection
 .B socketley.pipe
 across two runtimes, and
 .BR self.route() .
-Not a map problem at all \(em see the note under the Lua API below. These are
-the two calls this flag still buys back.
+Despite the name, neither hands a descriptor over: the origin keeps the socket
+and relays the bytes, and the target answers as though the connection were its
+own. Names travel; the connection does not.
 .RE
-.IP
-At a script's top level either of those refusals leaves the runtime
-.BR failed .
-And a cross\-runtime request costs about 50 microseconds more, measured, which a
-server doing
+.PP
+One refusal survives, for one case: a worker forked by a daemon that could not
+give it the control plane these need \(em an older build, or one that could not
+create the socket. It says so, and says to restart the daemon.
+.PP
+A cross\-runtime request costs about 50 microseconds more than the same call in
+one address space, measured, which a server doing
 .B \-\-cache
 pays on every command.
-.IP
+.PP
 A script's
 .B routes
-declaration is
-.I not
-one of the things given up. It is produced by running the script, which happens
+declaration is not given up. It is produced by running the script, which happens
 in the worker, and travels back to the daemon on the control socket the worker
 already holds; the placeholder publishes it to the proxies in front of the
-runtime exactly as it would for an in\-process one. See
-.B "Declared Routes" .
-.IP
-The daemon forks and execs itself, hands the worker its configuration and
-its routing table over a control socket, and keeps a placeholder for it in
-the runtime map. What the CLI shows is unchanged:
+runtime. See
+.BR "Declared Routes" .
+.PP
+The daemon forks and execs itself, hands the worker its configuration and its
+routing table over a control socket, and keeps a placeholder for it in the
+runtime map. What the CLI shows is unchanged:
 .BR ps ,
 .BR ls ,
 .BR show ,
 .B stats
-and the Prometheus endpoint report the same figures they do for an
-in-process runtime, because the worker publishes them and the daemon stores
-them where an in-process runtime would have written them.
-.IP
-The port is bound in the worker; no descriptor is passed across the
-boundary. If the worker dies the daemon restarts it and the runtime stays
+and the Prometheus endpoint report the same figures they would for an
+in\-process runtime, because the worker publishes them and the daemon stores
+them where an in\-process runtime would have written them.
+.PP
+The port is bound in the worker; no descriptor is passed across the boundary. If
+the worker dies the daemon restarts it and the runtime stays
 .BR running ;
 if it dies more than five times in ten seconds the runtime is left
 .B failed
-rather than being forked in a loop.
-.IP
-Settable only at
-.BR create .
-.B edit
-rejects it, because honouring it would mean moving a configured runtime
-between address spaces underneath whatever already points at it.
-.IP
+rather than being forked in a loop. Either way every other runtime is told to
+let go of connections routed to or from it, because a killed worker runs no
+teardown of its own.
+.PP
 Lua callbacks run inside the worker, against the worker's own state, and a
 cache's
 .B PUBLISH
 reaches the worker's
 .B subscribe
-callbacks. A script that reaches for other runtimes through the management
-API is refused there by name rather than answering nothing \(em and if it does
-so at its top level the script does not load and the runtime is left
-.BR failed .
-The figures the daemon reports for it were pushed by the worker rather than
-read live, and
-.B stats
-says how old they are \(em measured from when the worker read them, so an age in
-the seconds means a child that has stopped publishing. See
+callbacks. The figures the daemon reports were read by the worker when they were
+printed. See
 .B "Out-of-process runtimes"
 under
 .BR LIMITATIONS .
@@ -3566,41 +3541,33 @@ http                       \-\-http
 http_cache (bool)          \-\-http\-cache
 udp (bool)                 \-\-udp
 test (bool)                \-\-test
-daemon_process (bool)      \-\-daemon\-process
 start (bool)               \-s
 .fi
 .PP
 .B daemon_process
-is the one to reach for when the handler named by
-.B config
-uses
-.B socketley.pipe
-across two runtimes or
-.BR self.route .
-Those two move a
-.I connection,
-and a connection does not travel in a snapshot of anything; they are the two
-calls still refused in a worker. Without the flag the runtime still comes up \(em
-it is listed, it accepts connections \(em and either call raises inside its
-callbacks, is caught and logged, and nothing gets done. It cannot be added later
-either \(em
-.B edit
-refuses the flag \(em so a configuration that omits it has to be recreated.
+was in this list and is gone with the flag it emitted. A configuration file
+still carrying it is refused, naming the line, rather than accepted with the key
+quietly dropped \(em which would leave an operator believing a runtime is in the
+daemon while it is not.
 .PP
-The rest of the cross\-runtime API no longer needs it.
+Nothing replaces it. The whole cross\-runtime API works in a worker:
 .BR socketley.send ,
 .BR .list ,
 .B .get
 and
 .B socketley.cluster
-are answered from the replica map the daemon pushes; \(em
+are answered from the replica map the daemon pushes;
 .BR socketley.create ,
 .BR .start ,
 .BR .stop
 and
 .B .remove
-are asked of the daemon and wait for its answer. See
-.B \-\-daemon\-process
+are asked of the daemon and wait for its answer; and
+.B socketley.pipe
+and
+.B self.route
+reach a runtime in another process. See
+.B "Process Isolation"
 above.
 .PP
 A key this list does not name is ignored in silence, and a flag this list does
@@ -4511,9 +4478,7 @@ declaration is produced by running the script, and only the worker runs it, so
 it travels back to the daemon in a
 .B routes
 frame on the control socket and the placeholder publishes the worker's copy.
-Where either runtime runs makes no difference to which methods are refused, and
-neither needs
-.BR \-\-daemon\-process .
+Where either runtime runs makes no difference to which methods are refused.
 .IP
 See
 .B examples/proxy/declared\-routes.lua
@@ -4598,18 +4563,18 @@ self.group_send(group, msg)        -- Send msg to all clients in a group.  Retur
 self.pipe(id_a, id_b)             -- Pair two clients: data forwarded directly between them
 self.unpipe(id)                    -- Remove pipe pairing for a client
 socketley.pipe(src, fd_a, src, fd_b)   -- Pair two connections of one server
-socketley.pipe(src, fd, dst)           -- Route a connection to another server
-                                   -- moves a connection, not a name: this form is
-                                   -- REFUSED in a worker, needs --daemon-process
+socketley.pipe(src, fd, dst)           -- Route a connection to another server.
+                                   -- Despite the name it hands no descriptor over:
+                                   -- src keeps the socket and relays the bytes
 
 -- Server: per-connection metadata
 self.set_data(id, key, val)        -- Set string metadata on a connection (nil val deletes key)
 self.get_data(id, key)             -- Get metadata string or nil
 
 -- Server: client routing
-self.route(client_id, target)      -- Forward client to sub-server. Names another
-                                   -- runtime, so it is REFUSED in a worker:
-                                   -- both runtimes need --daemon-process.
+self.route(client_id, target)      -- Forward client to sub-server, in this or
+                                   -- any other process. This server keeps the
+                                   -- socket and relays; the target answers.
 self.unroute(client_id)            -- Stop forwarding
 self.get_route(client_id)          -- Get current route (string or nil)
 
@@ -5035,14 +5000,12 @@ with the reason in the log and leaves no runtime behind. Lua-created runtimes
 have parent-child ownership; port=0 creates internal-only servers that receive
 forwarded messages only.
 .PP
-.B "Every call above requires \-\-daemon\-process, and raises without it."
+.B "Every call above works in a worker, which is where every runtime runs."
 .RS
 .PP
-These calls act on the runtime map, and the runtime map lives in the daemon. A
-runtime gets its own worker process unless it was created with
-.BR \-\-daemon\-process ,
-so a script written against these is, by default, a script running somewhere the
-map is not. All but two of them work there anyway, and how they work differs:
+These calls act on the runtime map, and the runtime map lives in the daemon \(em
+so a script written against them is running somewhere the map is not. All of
+them work there anyway, and how they work differs:
 .RS
 .PP
 .BR socketley.send ,
@@ -5083,29 +5046,17 @@ A script cannot tell from them which process it is running in, which is the
 point.
 .RE
 .PP
-.B Two calls are still refused there, and they raise rather than answer.
+.B "Two calls used to be refused there, and are not."
 .B socketley.pipe
 across two runtimes, and
 .BR self.route() .
-Returning
-.BR false ,
-.B nil
-or an empty table would be what a
-.I successful
-call returns when there is nothing to find, so neither the script nor the
-operator could tell the two apart. The raise names the call, the reason and the
-way out:
+Their refusal said a pipe hands a file descriptor between runtimes and that no
+channel existed to pass one over. Across two runtimes it hands no descriptor
+over at all: the origin keeps the socket and relays, which needed a way to name
+another runtime's connection rather than a way to move one. Both cross a process
+boundary now, with no change to how either is called.
 .PP
-.nf
-[lua lobby] on_start error: lobby.lua:13: socketley.pipe() is refused in a
-worker process: a pipe hands an open file descriptor from one runtime to
-another, and a connection cannot be handed to another process the way a name
-or a port can ... To pair two connections of this same server, call
-self.pipe(fd_a, fd_b) ... to route a connection to another runtime, create
-both with \-\-daemon\-process.
-.fi
-.PP
-There is a third message, and it is the one to read carefully if you meet it.
+One refusal is left, and it is the one to read carefully if you meet it.
 .BR socketley.create ,
 .BR .start ,
 .BR .stop
@@ -5118,51 +5069,48 @@ That message says so and tells you to restart the daemon. It is not the
 permanent refusal these four used to carry.
 .PP
 .B socketley.pipe
-is refused there too, and its message is a different one because its reason is
-different. A pipe hands an open file descriptor from one runtime to another,
-and a descriptor does not travel in a snapshot of the runtime map the way a
-name or a port does \(em it has to be passed with
-.B SCM_RIGHTS
-over a channel between the two processes, and there is no such channel between
-runtimes yet. The mechanism exists and is tested
-.RB ( shared/conn_transfer.h ,
-with
-.B shared/conn_identity.h
-for the reference that names a connection across a boundary); nothing is wired
-to it, and the daemon\(hyworker control socket carries no descriptors by
-design. So this is not waiting on the runtime map and will not come back with
-it. To pair two connections of the same server from inside a worker, use
-.B self.pipe(fd_a, fd_b)
-instead: that is the same operation on the same tables, it crosses nothing, and
-it is not refused there.
-.PP
+and
 .B self.route()
-is the other one, for the same reason and with a heavier version of it. It is
-easy to read as a lookup \(em it names another runtime \(em but that is not what
-it does.
-.B route_client()
-writes into the
-.I target's
-private connection maps and runs the target's
+were the last two refused in a worker, and are not any more. Their message said
+a pipe hands a file descriptor between runtimes, that a descriptor cannot travel
+in a snapshot of the map, and that it would need
+.B SCM_RIGHTS
+over a channel nothing had built. The mechanism it named
+.RB ( shared/conn_transfer.h )
+was real and the diagnosis was wrong: across two runtimes
+.B socketley.pipe
+does not hand a descriptor over at all. It is
+.BR route_client () ,
+which writes into the target's connection maps, runs the target's
 .B on_connect
-on the caller's stack, after which the routing server keeps the socket and
-relays the bytes through itself. So it wants
-.BR conn_transfer.h 's
-.I relay
-shape rather than its
-.IR handover :
-the middle stays in the data path. The reference that names the connection at
-both ends already exists and this call already uses it \(em only the channel is
-missing. It stays refused in a worker.
+and then keeps the socket where it is and relays the bytes through it. What both
+needed was a way to name another runtime's connection and reach it, which is
+.BR shared/route_relay.h .
+.PP
+So they cross a process boundary now, and what changes for a script is nothing:
+the same call, the same return value, the same target name. The origin stays in
+the data path either way \(em that is what routing is \(em and a message from a
+routed client reaches the target's
+.B on_client_message
+while the target's reply reaches the client through the origin.
+.PP
+The four\(hyargument form,
+.BR "socketley.pipe(src, fd_a, src, fd_b)" ,
+pairs two connections of one server and crosses nothing. It has to be called
+from that server's own script, because only that process holds its connections.
+.PP
+When a runtime holding routed connections goes away \(em stopped, removed,
+crashed or killed \(em every runtime on the other end of those routes is told to
+let go, and the target's
+.B on_disconnect
+runs. That is done by the daemon rather than by the departing runtime, because a
+killed worker runs no teardown at all.
+.PP
 .B unroute() ,
 .B get_route()
 and
 .B owner_send()
-are
-.I not
-refused: they read the runtime's own tables, which in a worker are empty
-because nothing was ever routed in, and that is the truth rather than a
-substitute for it.
+read the runtime's own tables and always did.
 .PP
 Where the raise lands is the thing to plan for. At a script's top level it fails
 the load, and a worker whose script did not load does not serve: the
@@ -5178,13 +5126,7 @@ was for having happened \(em
 .B ls
 green, connections accepted \(em so the command that started it exits 1 and
 names the callback and the reason. The runtime is left running either way; the
-exit code and the message are how the two are told apart. Add
-.B \-\-daemon\-process
-at
-.BR create ;
-it cannot be added later, since
-.B edit
-rejects it.
+exit code and the message are how the two are told apart.
 .PP
 Everything that does not reach for the map works in a worker exactly as it does
 in the daemon:
@@ -5195,9 +5137,7 @@ the timers,
 .BR .subscribe ,
 the whole
 .B self
-table apart from
-.BR self.route() ,
-and every connection and request callback. See
+table, and every connection and request callback. See
 .B "Out-of-process runtimes"
 under
 .B LIMITATIONS
@@ -7417,10 +7357,9 @@ A proxy in
 mode is unaffected by any of this: it was already a byte relay and never looked
 at a status line.
 .SS Out\-of\-process runtimes
-A runtime of any type gets its own supervised worker process unless
-.B \-\-daemon\-process
-is given, which keeps it inside the daemon. What a worker refuses, and what it
-costs, is worth stating plainly.
+A runtime of any type runs in its own supervised worker process. There is no
+longer an alternative and no flag to ask for one. What that costs is worth
+stating plainly.
 .PP
 .B "The script runs in the worker and nowhere else."
 An out\-of\-process runtime exists twice: the worker that owns the listening
@@ -7548,47 +7487,34 @@ the
 .B self
 table, and the connection and request callbacks.
 .IP
-.B "self.route() is the exception in that list, and it is refused like the rest."
-It names another runtime, so it reaches for the map exactly as the calls above
-do; it is only spelled
-.B self.
-rather than
-.B socketley.
-and so was bound while they were replaced. It raises the same refusal they do,
-naming itself and
-.BR \-\-daemon\-process ,
-and it is caught wherever theirs are \(em in a callback the request fails and
-the reason is logged against the callback's name, at the top level the script
-does not load.
+.B "self.route() crosses the boundary, and this section used to say it could not."
+It names another runtime, so it was grouped with the calls that reach for the
+map, and its refusal told a reader that "a connection cannot be routed out of a
+worker
+.I today"
+and that naming a runtime and handing it an open connection were separate
+mechanisms of which only the first existed.
 .IP
-It used to answer
-.BR false ,
-which is also what it answers for a target that does not exist, so a script
-could not tell a runtime that is absent from one that is merely in another
-process. Measured with two servers left at the out-of-process default it
-answered
+That was measured and correct at the time \(em with two servers at the
+out\-of\-process default it answered
 .BR false ,
 the target counted no connection and its
 .B on_connect
-never fired; with both created
-.B \-\-daemon\-process
-it routes, and still does.
-.IP
-The refusal says that a connection cannot be routed out of a worker
-.IR today ,
-and nothing more \(em it is not a statement about how moving a live connection
-between processes will eventually work. Naming a runtime and handing it an open
-connection are separate mechanisms, and only the first exists here. A script
-that routes should keep the runtimes it routes between in the daemon.
+never fired \(em and the conclusion drawn from it was wrong.
+.BR route_client ()
+never needed a descriptor to travel. It needed the target's connection tables,
+which it reaches by
+.B conn_ref
+now, through
+.BR shared/route_relay.h .
+The origin keeps the socket and relays the bytes, exactly as it does when both
+runtimes are in one process.
 .IP
 .BR unroute() ,
 .B get_route()
 and
 .B owner_send()
-are not refused. They answer from this runtime's own tables, which in a worker
-are empty because nothing was ever routed there \(em so their
-.B false
-is the truth rather than a stand-in for it.
+answer from this runtime's own tables, and always did.
 .PP
 .B "Cross\-runtime pub/sub reaches a worker."
 A cache's

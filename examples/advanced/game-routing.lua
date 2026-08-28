@@ -10,44 +10,28 @@
 --   # Send "modes"      to list the game modes and their player counts
 --   # Send "join rapid" to be routed to the rapid-mode sub-server
 --
--- WHY daemon_process = true IS THE POINT OF THIS EXAMPLE
+-- WHAT THIS EXAMPLE USED TO BE ABOUT, AND WHY IT NO LONGER IS
 --
--- The lobby's handler calls socketley.create, socketley.start, socketley.get,
--- socketley.list and self.route.  Four of those five work in a worker now --
--- the reads are answered from the replica map the daemon pushes, and the two
--- map changes are asked of the daemon and wait for its answer.
+-- The lobby entry carried `daemon_process = true` and this comment explained
+-- at length why it was REQUIRED.  The key is gone -- a configuration file
+-- carrying it is now refused, naming the line -- because every call the
+-- handler makes works in a worker.
 --
--- self.route is the one that does not, and it is the one this example turns
--- on.  A route moves a CONNECTION into another runtime's tables, and a
--- connection does not travel in a snapshot of anything.
+-- The reason is worth keeping, because the failure it described was invisible
+-- and the same shape can come back.  The handler calls socketley.create,
+-- .start, .get, .list and self.route.  self.route was refused in a worker; a
+-- raise inside a callback is caught and logged and the runtime carries on.  So
+-- without the key the lobby came up looking healthier than a broken thing has
+-- any right to: measured, `ls` showed lobby, chess-rapid and chess-blitz all
+-- Up, on_start reported "game modes ready", port 9000 accepted connections --
+-- and "join rapid" answered nothing at all.  The only sign was a line in the
+-- daemon log, and everything an operator would check first said fine.
 --
--- Inside a callback that raise is caught and logged, and the runtime carries
--- on.  Drop the key and the lobby comes up looking perfectly healthy -- and it
--- looks healthier than it used to, which makes this worse rather than better:
--- measured without the key, `ls` shows lobby, chess-rapid and chess-blitz all
--- Up, on_start reports "game modes ready", port 9000 accepts connections --
--- and "join rapid" answers nothing at all.  The only sign is a line in the
--- daemon's log, and everything an operator would check first says fine.
---
--- `edit` will not add the flag afterwards, because honouring it would mean
--- moving a configured runtime between address spaces underneath whatever
--- already points at it.  A lobby created without it has to be removed and
--- created again.
---
--- The sub-servers the lobby creates do not need it: a runtime created by
--- socketley.create is created inside the daemon that ran the call -- which is
--- true whichever process made the call, and is where self.route needs it to
--- be.
---
--- WHY THE CALLBACKS ARE IN game-routing-handler.lua
---
--- socketley reads `daemon` and `runtimes` out of this file, emits `create`
--- commands, and exits.  Callbacks written here would never be loaded and never
--- called.  The `config` key attaches the handler -- it becomes `--lua <path>`
--- on the create, and the DAEMON opens that path against its own working
--- directory, hence the repository-root spelling.
---
--- =============================================================================
+-- What changed is not that routing became cheaper.  The refusal named the
+-- wrong missing thing: a route hands no descriptor to another process, it
+-- keeps the socket where it is and relays.  What it needed was a way to name
+-- the far end's connection.
+
 
 runtimes = {
     -- The lobby.  chess-rapid and chess-blitz are not declared here: the
@@ -58,7 +42,6 @@ runtimes = {
         name = "lobby",
         port = 9000,
         config = "examples/advanced/game-routing-handler.lua",
-        daemon_process = true,   -- REQUIRED: see above
         start = true
     }
 }

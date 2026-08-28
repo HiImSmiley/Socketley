@@ -161,8 +161,8 @@ enum class frame_type : uint16_t
 //
 // So the worker sends its declaration up once, after the script has loaded, and
 // the daemon puts it where publish_endpoints() looks.  The alternative — having
-// the placeholder run the script too — is the one thing --daemon-process exists
-// to avoid: every top-level side effect would happen twice, in two processes.
+// the placeholder run the script too — is the thing the whole split exists to
+// avoid: every top-level side effect would happen twice, in two processes.
 
 // ── deliver: `socketley send <name> <message>` for a runtime in a worker ────
 //

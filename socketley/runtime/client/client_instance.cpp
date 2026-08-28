@@ -410,9 +410,14 @@ void client_instance::drop_connection()
     // for every other one, and the difference is measured rather than assumed.
     // Same probe build, timer submission forced to fail:
     //
-    //   --daemon-process   start refused, `ls` reads Failed, 2 log lines
+    //   in the daemon      start refused, `ls` reads Failed, 2 log lines
     //   worker-backed      start reports success, `ls` reads Up, 1 log line
     //   worker, healthy    start reports success, `ls` reads Up, 0 log lines
+    //
+    // The first row was reached with --daemon-process, which no longer exists.
+    // It is kept because it is the CONTRAST that gives the second row its
+    // meaning, and because it is what the daemon's own placeholder still does
+    // on the paths that run there.
     //
     // So in a worker the log IS the report, and it is the only one, because a
     // worker's state does not reach the daemon's placeholder.  That gap is

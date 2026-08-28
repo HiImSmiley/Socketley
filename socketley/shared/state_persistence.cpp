@@ -578,7 +578,6 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.group = instance->get_group();
     cfg.owner = instance->get_owner();
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
-    cfg.out_of_process = instance->is_out_of_process();
     cfg.shards = instance->get_shards();
     // Only a request that was actually made is written.  Storing the default
     // value of a flag nobody typed would turn every plain `create` into an
@@ -765,8 +764,6 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_str_field("owner", cfg.owner);
     if (cfg.child_policy != 0)
         append_int_field("child_policy", cfg.child_policy);
-    if (cfg.out_of_process)
-        append_bool_field("out_of_process", true);
     // Written only when it is not the default, on the rule this function states
     // above: a `create` nobody typed --shards on must not start producing a
     // state file that differs from the one the previous build wrote for it.
@@ -949,7 +946,6 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.group = json_get_string(json, "group");
     cfg.owner = json_get_string(json, "owner");
     cfg.child_policy = json_get_int(json, "child_policy");
-    cfg.out_of_process = json_get_bool(json, "out_of_process");
     // Absent means one, not zero: the field is omitted for every runtime that
     // did not ask for shards, which is every runtime written by a build older
     // than this one.  Reading a missing key as zero would restore them all with
@@ -1329,7 +1325,7 @@ void state_persistence::flip_was_running(std::string_view name, bool running)
         // enough to recover one: the comma the off-by-one ate is load-bearing,
         // because json_get_string reads a non-string value up to the next `,`,
         // `]` or `}` — so `"was_running": true` with no comma is read as
-        // `true\n    "out_of_process": true`, which is not "true", and the
+        // `true\n    "shards": 4`, which is not "true", and the
         // whole field silently reverts to its default of false.  Every
         // auto-restart stayed broken with the value looking right in the file.
         //

@@ -131,8 +131,7 @@ static std::string instance_shards_refusal(const runtime_instance* inst)
 
     return shards_config_refusal(inst->get_type(),
                                  inst->get_shards(),
-                                 inst->get_listen_path(),
-                                 inst->is_out_of_process());
+                                 inst->get_listen_path());
 }
 
 // ─── MAY THIS CALLER HAND THE DAEMON THIS PID ───────────────────────────────
@@ -497,8 +496,8 @@ bool daemon_handler::setup()
     unlink(socket_path.c_str());
 
     // SOCK_CLOEXEC: this is the socket every CLI command arrives on, and the
-    // daemon forks and execs a worker for every runtime that does not ask for
-    // --daemon-process.  Without the flag the worker inherits it — measured, as
+    // daemon forks and execs a worker for every runtime there is.  Without the
+    // flag the worker inherits it — measured, as
     // fd 5 of a live worker, an SO_ACCEPTCON row on the daemon's own path — and
     // then answers the question "is a daemon serving this socket" in the
     // affirmative for as long as it lives.  The test suite asks exactly that
@@ -1469,52 +1468,29 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // parsed, and the block below the TLS and ring refusals for where it is.
     std::string lua_script;
 
-    // ─── One flag has to be known before the others are read ────────────────
+    // ─── Where a runtime runs, and why there is no longer a flag for it ─────
     //
-    // What --lua does depends on whether this runtime will live in a worker: an
-    // out-of-process placeholder compiles the script and discards it, an
-    // in-process runtime loads and runs it (see
-    // runtime_instance::load_lua_script).  Flags arrive in whatever order the
-    // operator typed them, so when --lua was acted on where it was parsed,
-    // `--lua x --daemon-process` compiled-and-discarded the script before
-    // anyone knew it was staying in the daemon -- and `--daemon-process --lua x`
-    // did not.  A create whose behaviour depends on argument order is a bug
-    // waiting for someone to reorder a command line.
+    // In its own process.  Always, for every type, with nothing to type and
+    // nothing to read off the command line.
     //
-    // --lua is deferred to after the loop now, for the other half of the same
-    // sentence, and this pre-scan still has to happen: it settles the bit the
-    // deferred load reads.
+    // There was a flag, `--daemon-process`, and what it bought back was the
+    // reason to keep it: a script in a worker could not manage the runtime map
+    // and could not route a connection to another runtime.  Both are gone --
+    // the four map calls travel over the control plane at child_map_fd, and
+    // routing addresses a connection by conn_ref through shared/route_relay.h.
+    // A flag whose entire purpose is to restore capabilities that are no longer
+    // missing is a flag that only offers a worse arrangement: one runtime able
+    // to take the daemon down with it, stall another runtime's event loop, and
+    // share a core with whatever else that loop was doing.
     //
-    // Scanned rather than reordered: the flag takes no value, so finding it is
-    // exact, and marking early is idempotent with the case below that marks it
-    // again when the loop reaches it.  It stays a pre-scan now that --lua is
-    // deferred to after the loop, and for the same reason it was one: this bit
-    // decides what load_lua_script DOES, so it has to be settled before the
-    // load, and the load is still inside this command.
-    // Any type, not only a proxy.  mark_out_of_process() has always been on
-    // runtime_instance; what kept this to proxies was the cast, and the worker
-    // no longer needs one — it builds whatever the config frame's type says.
-    // Where this runtime runs.  A process of its own unless it says otherwise.
-    //
-    // One flag, naming the one state that is not the default.  A boolean needs
-    // one name, not two: `--out-of-process` and `--in-daemon` were one bit under
-    // two spellings, and the pair had to be kept level in four places.
-    //
-    // A runtime in a process of its own cannot take the daemon down with it,
-    // cannot stall another runtime's event loop, and is scheduled by the kernel
-    // rather than by whatever else that loop was doing. What --daemon-process
-    // buys back is what only shared memory can give: the cross-runtime Lua
-    // management API, a routes declaration the placeholder can publish, and
-    // about 50 µs per cross-runtime request.
-    //
-    // What this default costs where it is not yet free is written down in
-    // test/out_of_process_gaps.md, measured rather than guessed.
-    bool want_worker = true;
-    for (size_t i = 3; i < pa.count; ++i)
-        if (std::string_view(pa.args[i]) == "--daemon-process")
-            want_worker = false;
-    if (want_worker)
-        instance->mark_out_of_process();
+    // This used to be a PRE-SCAN, ahead of the flag loop, and that half is
+    // worth keeping in mind rather than only deleting: what --lua does depends
+    // on this bit -- a placeholder compiles the script and discards it, an
+    // in-process runtime loads and runs it -- so `--lua x --daemon-process` and
+    // `--daemon-process --lua x` did different things until the scan settled
+    // the bit before either was read.  With one answer there is no ordering
+    // left to get wrong.
+    instance->mark_out_of_process();
 
     for (size_t i = 3; i < pa.count; ++i)
     {
@@ -1579,9 +1555,9 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // And the shard count, for the third time the same reason: --listen and
-    // --daemon-process may be typed on either side of --shards, so the whole
-    // set is checked here once every flag has been seen.
+    // And the shard count, for the third time the same reason: --listen may be
+    // typed on either side of --shards, so the whole set is checked here once
+    // every flag has been seen.
     //
     // --lua used to be the sharpest member of that set — a scripted server was
     // refused, so the answer had to be the same whichever side of --shards the
@@ -1651,9 +1627,8 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         // success for a configuration that was about to be refused, with the
         // reason arriving in the log afterwards.
         //
-        // A declaration is where that finally bit, because `--daemon-process`
-        // made servers out-of-process by default and servers are the role that
-        // declares routes.  `path = "no-slash"` is faultless Lua, so the
+        // A declaration is where that finally bit, because servers run out of
+        // process and servers are the role that declares routes.  `path = "no-slash"` is faultless Lua, so the
         // placeholder's compile-only check passes it and only the worker ever
         // discovers it is not a path.
         //
@@ -3678,8 +3653,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                                           std::string(instance->get_listen_path()));
 
     if (const std::string msg = shards_config_refusal(type, eff_shards,
-                                                      eff_listen,
-                                                      instance->is_out_of_process());
+                                                      eff_listen);
         !msg.empty())
     {
         conn->write_buf = msg;

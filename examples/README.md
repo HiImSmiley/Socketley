@@ -144,5 +144,6 @@ own daemon, on its own socket, and removes what it made on the way out.
 - `logging-pipeline.lua` + `logging-pipeline-handler.lua` - Centralized logging
 - `development-env.lua` + `development-env-handler.lua` - Development stack
 - `game-routing.lua` + `game-routing-handler.lua` - A lobby that creates and
-  routes to sub-servers. The lobby needs `daemon_process = true`; see the file
+  routes to sub-servers. The lobby needed `daemon_process = true` and no longer
+  does; see the file
   for why

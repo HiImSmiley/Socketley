@@ -99,17 +99,13 @@ gateway and two clients, one handler branching on `self.name`.
 ### Runtimes table keys
 `type`, `name`, `port`, `target`, `mode`, `log`, `write`, `persistent`,
 `protocol`, `strategy`, `backends`, `config`/`lua`, `bash`, `cache`, `group`,
-`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`,
-`daemon_process`, `start`.
+`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`, `start`.
 
-`daemon_process = true` is what a runtime whose handler uses
-`socketley.pipe(src, fd, dst)` or `self.route()` has to say — see [The
-cross-runtime API in a
-worker](#the-cross-runtime-api-in-a-worker-two-calls-are-refused-the-rest-are-not)
-below, which also lists what no longer needs it. Omit it and the runtime is
-created, listed and connectable while those two calls raise inside its
-callbacks, are caught, logged, and do nothing; `edit` will not add the flag
-afterwards, so the runtime has to be recreated.
+`daemon_process` was in this list and is refused now, naming the line, rather
+than ignored — see [The cross-runtime API in a
+worker](#the-cross-runtime-api-in-a-worker-all-of-it-works) below. Refusing it
+rather than dropping it is deliberate: a silently ignored key would leave you
+believing a runtime is somewhere it is not.
 
 An unrecognised key is ignored in silence. Flags this list does not reach — the
 health-check, circuit-breaker, retry and TLS families — cannot be set from a
@@ -263,21 +259,20 @@ no binary module ships with socketley, and `package.cpath` is left at its
 default — the require fails the script load and the runtime is left `failed`.
 `socketley.json_encode` needs nothing installed.
 
-### The cross-runtime API in a worker: two calls are refused, the rest are not
+### The cross-runtime API in a worker: all of it works
 
 `socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe`, everything
 under `socketley.cluster`, and `self.route()` all act on the runtime map, which
-lives in the daemon — and a runtime gets its own worker process unless it was
-created with `--daemon-process`. So by default a script calling these is running
-somewhere the map is not.
+lives in the daemon — and every runtime runs in its own worker process. So a
+script calling these is always running somewhere the map is not.
 
-All but one of them work there anyway, and **how** differs by group:
+They all work there, and **how** differs by group:
 
 | group | calls | in a worker |
 |---|---|---|
 | read the map | `.send` `.list` `.get`, all of `socketley.cluster` | answered from a replica the daemon pushes |
 | change the map | `.create` `.start` `.stop` `.remove` | asked of the daemon, and they **wait** for the answer |
-| move a connection | `.pipe(src,fd,dst)`, `self.route()` | **refused** |
+| move a connection | `.pipe(src,fd,dst)`, `self.route()` | relayed to the runtime that answers |
 
 The four that **change** the map do not touch the replica — being told what the
 map holds is not permission to alter it. They travel: the request goes to the
@@ -293,26 +288,27 @@ request. Measured at about 10 µs for a call that forks nothing, and bounded at
 five seconds for one that does. `socketley.http()` on the same table blocks the
 same loop for a network round trip and is three orders of magnitude longer.
 
-The two that **move a connection** are not a map problem at all, and are the two
-that are still refused. `socketley.pipe`
-hands an **open file descriptor** from one runtime to another, and a descriptor
-does not travel in a snapshot the way a name or a port does — it has to be passed
-with `SCM_RIGHTS`, or its bytes relayed under a reference that means the same
-thing at both ends, over a channel between the two processes. There is no such
-channel between runtimes yet. The mechanism exists and is tested
-(`shared/conn_transfer.h`, with `shared/conn_identity.h` for the reference);
-nothing is wired to it, and the daemon-worker control socket carries no
-descriptors by design.
+The two that **move a connection** were the last to be refused, and their
+refusal named the wrong missing thing — worth knowing, because the message may
+still be in someone's notes. It said `socketley.pipe` hands an **open file
+descriptor** between runtimes and would need `SCM_RIGHTS` over a channel nothing
+had built. Across two runtimes it hands no descriptor over at all: it is
+`route_client()`, which writes into the *target's* maps, runs the target's
+`on_connect`, and then leaves the socket exactly where it was and relays the
+bytes through it. What was missing was a way to **name** the far end's
+connection, not a way to move one.
 
-`self.route()` is the same family, and easy to misread as a lookup because it
-names another runtime. It is not: `route_client()` writes into the *target's*
-private maps and runs the target's `on_connect` on the caller's stack, after
-which the routing server keeps the socket and relays the bytes through itself —
-the relay shape rather than the handover one. `unroute()`, `get_route()` and
-`owner_send()` are *not* refused: they read this runtime's own tables, which in
-a worker are empty because nothing was ever routed in, and that is the truth
-rather than a substitute for it.
+`self.route()` is the same call under another name and was refused for the same
+wrong reason. Both cross a process boundary now, called exactly as before.
+`unroute()`, `get_route()` and `owner_send()` read this runtime's own tables and
+always did.
 
-To pair two connections of the *same* server from inside a worker, use
-`self.pipe(fd_a, fd_b)`: it is the same operation on the same tables, it crosses
-nothing, and it is not refused there.
+When a runtime holding routed connections goes away — stopped, removed, crashed
+or killed — every runtime on the other end is told to let go and its
+`on_disconnect` runs. The daemon does that, not the departing runtime: a killed
+worker runs no teardown at all.
+
+The four-argument form, `socketley.pipe(src, fd_a, src, fd_b)`, pairs two
+connections of *one* server and crosses nothing. Call it from that server's own
+script — only that process holds its connections — or use the equivalent
+`self.pipe(fd_a, fd_b)`.

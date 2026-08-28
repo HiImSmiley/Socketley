@@ -184,31 +184,31 @@ inline bool in_worker_process()         { return g_worker_process; }
 // the path and the rest hold a listening socket nothing can reach: a server
 // that reports N shards, Up, and serves 1/N of nothing.
 //
-// --daemon-process is refused above one shard because a shard IS a worker
-// process.  reconcile_proxy_workers() only forks for a runtime that is out of
-// process, so `--shards 4 --daemon-process` was accepted, persisted, and
-// reported by `show` as four while exactly one event loop served the port.  The
-// operator asked for four and got one, reported by nothing as wrong.  That
-// predates servers being shardable — it is reachable on a proxy on this tree —
-// and it is refused here rather than at the proxy because the trap is the
-// flag's, not the type's.
+// --daemon-process was refused above one shard because a shard IS a worker
+// process, and that pair is gone with the flag.  The trap it named is worth
+// keeping written down, because it is the shape a future flag could recreate:
+// reconcile_proxy_workers() only forks for a runtime that is out of process, so
+// `--shards 4 --daemon-process` was accepted, persisted, and reported by `show`
+// as four while exactly one event loop served the port.  The operator asked for
+// four and got one, reported by nothing as wrong.
 //
-// `served_by_workers` is that last question, and it is NOT simply
-// is_out_of_process().  There are three objects a shard count can be attached
-// to and only two of them are the same: the daemon's placeholder, which is out
-// of process and is the thing that forks; the daemon's own in-daemon runtime,
-// which is the misconfiguration above; and a WORKER's runtime, which is
-// in-process by construction and is itself one of the shards.  Asking
-// is_out_of_process() in a worker answers false and refuses a configuration the
-// daemon just accepted — measured, before this parameter had its name: all four
-// shards of `create server ss -p P --shards 4 -s` exited config_refused and the
-// command reported "the worker did not accept its configuration".  So the
-// caller says whether this runtime is served by worker processes, and in a
-// worker the answer is yes.
+// The `served_by_workers` parameter went with it.  It was the sharper half of
+// that rule and is worth recording too: it was NOT simply is_out_of_process(),
+// because there are three objects a shard count can be attached to and only two
+// of them agree -- the daemon's placeholder, which is out of process and is the
+// thing that forks; the daemon's own in-daemon runtime, which was the
+// misconfiguration; and a WORKER's runtime, which is in-process by construction
+// and is itself one of the shards.  Asking is_out_of_process() in a worker
+// answered false and refused a configuration the daemon had just accepted --
+// measured, before the parameter had its name: all four shards of
+// `create server ss -p P --shards 4 -s` exited config_refused and the command
+// reported "the worker did not accept its configuration".
+//
+// With one answer to where a runtime runs, the middle of those three no longer
+// exists and the other two agree, so there is no question left to ask.
 inline std::string shards_config_refusal(runtime_type type,
                                          uint32_t    shards,
-                                         std::string_view listen_path,
-                                         bool        served_by_workers)
+                                         std::string_view listen_path)
 {
     // The unsharded case, which is every runtime that never typed the flag.
     // Nothing below may fire for it: a rule that refuses a default is a rule
@@ -230,12 +230,6 @@ inline std::string shards_config_refusal(runtime_type type,
                "through SO_REUSEPORT, and a unix socket is a path -- N "
                "processes would unlink each other's node and only the last to "
                "bind would be reachable.  Use -p for a sharded listener\n";
-
-    if (!served_by_workers)
-        return "--shards and --daemon-process are not compatible: a shard is a "
-               "worker process, so a runtime asked to stay in the daemon has "
-               "exactly one however many shards it declares.  Drop one of the "
-               "two rather than being told four and served by one\n";
 
     return {};
 }

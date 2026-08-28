@@ -109,7 +109,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime
-- **Process isolation**:Every runtime is a supervised worker process by default, so one runtime cannot take the daemon down with it; `--daemon-process` opts back in to sharing it
+- **Process isolation**:Every runtime is a supervised worker process, so one runtime cannot take the daemon down with it — there is no flag and no in-daemon mode; the whole cross-runtime Lua API works across the boundary
 - **Unix sockets**:`--listen unix:/path` on a listener and `--backend unix:/path` for a proxy's backends
 - **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run, and SQPOLL is a choice rather than always on
 - **Master mode**:One client claims master, broadcasts to all; optional forwarding
@@ -391,8 +391,8 @@ still want it to themselves.
 
 - Single-binary daemon + CLI communicating via Unix socket IPC
 - io_uring event loop (single-threaded, SQPOLL)
-- Each runtime gets its own supervised worker process by default;
-  `--daemon-process` keeps it inside the daemon instead
+- Each runtime gets its own supervised worker process — always, for every
+  type, with no flag and no in-daemon mode
 - FNV-1a hash switching for zero-allocation command dispatch
 - sol2/LuaJIT for Lua callbacks
 - LuaJIT is statically linked; liburing, OpenSSL and the C++ runtime are

@@ -331,10 +331,19 @@ static void restore_runtimes(state_persistence& persistence,
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
                                   : runtime_instance::child_policy::stop);
 
-        // A proxy that was created out-of-process comes back out-of-process.
+        // Every runtime comes back in a process of its own, whatever the state
+        // file says, because that is now the only place a runtime runs.
+        //
+        // Unconditional rather than `if (cfg.out_of_process)`, and the
+        // difference is what happens to a file written before the flag was
+        // removed: `"out_of_process": false` in it described a runtime that
+        // stayed in the daemon, and honouring that would restore an
+        // arrangement this build no longer has a way to create, test or
+        // support.  It comes back as a worker, which is what a fresh create of
+        // the same runtime would produce.
+        //
         // Before start(), which reads it to decide whether to arm anything.
-        if (cfg.out_of_process)
-            instance->mark_out_of_process();
+        instance->mark_out_of_process();
 
         // What this runtime asked its I/O to run as.  Restored before start(),
         // which is where the request meets the ring: this daemon's ring was

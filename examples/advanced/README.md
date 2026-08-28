@@ -58,11 +58,12 @@ routing proxy and a seeded mock database. Run
 ### Game Routing
 `game-routing.lua` + `game-routing-handler.lua`, which in turn creates
 sub-servers running `rapid-handler.lua` / `blitz-handler.lua`. A lobby that
-creates its game modes and routes players into them. The lobby entry carries
-**`daemon_process = true`** — every call its handler makes reaches for the
-runtime map, which lives in the daemon and not in a worker. Without that key
-the lobby comes up green and answers nothing, and `edit` will not add it
-afterwards.
+creates its game modes and routes players into them. The lobby entry used to
+carry **`daemon_process = true`**, and the file explains at length why — it is
+kept as the record of a failure that was invisible: without the key the lobby
+came up green, created both game modes, accepted connections, and answered
+nothing at all to "join rapid". Every call it makes works in a worker now, and
+the key is refused rather than ignored.
 
 ## Architecture Patterns
 

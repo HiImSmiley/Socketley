@@ -17,7 +17,7 @@ and it is the mistake this directory exists to keep you out of.
 
 | File | What it shows |
 |---|---|
-| `sharded-server.sh` | `--shards N`: N worker processes on one port through `SO_REUSEPORT`, still one runtime. Also what the flag refuses, and why — `--daemon-process` and `--listen unix:` are both incompatible with it |
+| `sharded-server.sh` | `--shards N`: N worker processes on one port through `SO_REUSEPORT`, still one runtime. Also what the flag refuses, and why — `--listen unix:` is incompatible with it |
 | `tls-server.sh` | TLS on a listener, and mutual TLS with `--ca`. Also what fails closed: an incomplete key pair, a certificate with no `--tls` |
 
 ## Handlers you attach

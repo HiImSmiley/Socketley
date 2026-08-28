@@ -4,33 +4,26 @@
 -- game-routing.lua names this path in its `config` key.  Every callback below
 -- runs there; nothing in here is read by the CLI.
 --
--- THE LOBBY MUST RUN IN THE DAEMON.  game-routing.lua says so with
--- `daemon_process = true`; a `create` command line says so with
--- `--daemon-process`.  Do not drop it.
+-- THE LOBBY RUNS IN ITS OWN PROCESS, LIKE EVERY RUNTIME.
 --
--- self.route is why, and it is the ONLY reason left.  A route moves a
--- CONNECTION into another runtime's tables, and a connection does not travel
--- in a snapshot of anything; it is one of the two calls still refused in a
--- worker.  The rest of what this file does no longer needs the flag:
--- socketley.get and .list are answered from the replica map the daemon pushes,
--- and socketley.create and .start are asked of the daemon and wait for its
--- answer.  Those four used to raise here too.
+-- This file used to open with the opposite instruction, in capitals: the lobby
+-- had to be created with `--daemon-process` or `daemon_process = true`, and
+-- self.route was the reason.  Both the flag and the reason are gone.
 --
--- The raise is caught and logged wherever a callback runs, which is what makes
--- this worth a paragraph rather than a footnote: without the flag the lobby
--- comes up looking perfectly healthy.  `ls` is green, the port accepts
--- connections, the game modes are created and running -- and "join rapid"
--- answers nothing at all, because the route is the step that fails, and the
--- only sign is a line in the daemon's log.  Measured both ways: without the
--- flag, no reply; with it, "join rapid" answered by the rapid handler.
+-- The reason is worth keeping because the failure it described was invisible,
+-- and the same shape can come back.  self.route was refused in a worker; the
+-- raise is caught and logged wherever a callback runs, so without the flag the
+-- lobby came up looking perfectly healthy -- `ls` green, the port accepting,
+-- the game modes created and running -- and "join rapid" answered nothing at
+-- all, because the route was the step that failed and the only sign was a line
+-- in the daemon log.  Measured both ways at the time: without the flag, no
+-- reply; with it, "join rapid" answered by the rapid handler.
 --
--- It cannot be added afterwards -- `edit` rejects it, because honouring it
--- would mean moving a configured runtime between address spaces underneath
--- whatever already points at it.  Create the lobby with it or recreate it.
---
--- The sub-servers do not need the flag: a runtime created by socketley.create
--- is created inside the daemon that ran the call, which is where self.route
--- needs it to be.
+-- What changed is not that route became cheaper.  It is that the refusal named
+-- the wrong missing thing: a route does not hand a descriptor to another
+-- process, it keeps the socket here and relays.  So it needed a way to name the
+-- far end's connection, which shared/route_relay.h is, and it now works between
+-- any two runtimes wherever they run.
 --
 -- The handler paths below are opened by the DAEMON, so they resolve against
 -- the daemon's working directory, not this file's.  Run from the repository

@@ -14,11 +14,24 @@ runtime is no longer confined to the daemon's process or to one core.
 
 #### Multi-process runtimes and sharding
 
-- **Every runtime now runs in its own supervised worker process by default.**
-  One runtime can no longer take the daemon down with it. `--daemon-process`
-  opts back in to sharing the daemon's process; it replaces the older
-  `--out-of-process` and `--in-daemon` pair, which were one bit under two
-  spellings.
+- **Every runtime now runs in its own supervised worker process.** One runtime
+  can no longer take the daemon down with it. There is no opt-out and no flag:
+  `--daemon-process`, and the older `--out-of-process` / `--in-daemon` pair it
+  replaced, are all gone. A command line carrying one is refused as an unknown
+  flag; a configuration file with `daemon_process` in it is refused naming the
+  line.
+- **The whole cross-runtime Lua API works in a worker.** Thirteen calls were
+  refused there; the count is zero. `socketley.send/.list/.get` and
+  `socketley.cluster.*` are answered from a replica map the daemon pushes;
+  `.create/.start/.stop/.remove` are asked of the daemon over a socket of the
+  worker's own and wait for the answer, so `if socketley.create(...) then`
+  branches on what happened; and `socketley.pipe` across two runtimes and
+  `self.route()` reach a runtime in another process. Despite the name neither
+  hands a descriptor over — the origin keeps the socket and relays.
+- When a runtime holding routed connections goes away — stopped, removed,
+  crashed or killed — every runtime on the other end is told to let go, and its
+  `on_disconnect` runs. The daemon does the telling, because a killed worker
+  runs no teardown of its own.
 - **`--shards N`** runs a single runtime across N worker processes behind one
   port via `SO_REUSEPORT`, on servers, proxies and caches.
 - A **sharded cache keeps one keyspace.** `mget`, `dbsize`, `publish` and

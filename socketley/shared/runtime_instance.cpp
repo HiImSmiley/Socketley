@@ -165,8 +165,7 @@ bool runtime_instance::start(event_loop& loop)
     // at boot and auto-started without passing a parser.  Without this line it
     // would come up sharded and answer a miss for 1/N of the data it holds.
     if (const std::string msg = shards_config_refusal(
-            get_type(), m_shards,
-            get_listen_path(), m_out_of_process || in_worker_process());
+            get_type(), m_shards, get_listen_path());
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());
