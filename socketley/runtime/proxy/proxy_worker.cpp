@@ -1135,6 +1135,7 @@ private:
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
             case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
+            case worker_proto::frame_type::cluster_ev: on_cluster_event(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
@@ -1493,10 +1494,28 @@ private:
         // fork a sixth copy of the same refusal.
         // Sent after the load below, not before: there is no declaration until
         // the script's top level has run.
+        lua_diag::clear();
         if (!cfg.lua_script.empty() && !m_rt->load_lua_script(cfg.lua_script))
         {
-            LOG_ERROR("proxy worker: lua script did not load; refusing to serve "
-                      "without it (the script's own error is above)");
+            std::string why = lua_diag::text();
+            if (why.empty())
+                why = "the script did not load";
+            LOG_ERROR(("proxy worker: lua script did not load; refusing to "
+                       "serve without it: " + why).c_str());
+
+            // Up the control socket as well as into the log, which is the
+            // whole of the difference to an operator: the daemon answers a
+            // `create` with "the worker did not accept its configuration (the
+            // reason is in the daemon log)", and the reason is this string.
+            // Same shape as reload_err and start_err; see config_err.
+            //
+            // Written BEFORE m_done, so the frame is queued while the writer
+            // still runs, and flushed by the shutdown drain below.  The bytes
+            // outlive this process in the socket until the supervisor reads
+            // them.
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::config_err, why))) {}
+
             m_exit_code = worker_proto::exit_config_refused;
             m_done      = true;
             return;
@@ -2090,6 +2109,13 @@ private:
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::broadcast:
+                // Unconditional, and `--mode in` is deliberately not consulted:
+                // that flag says whether socketley.send reaches this runtime,
+                // not whether a sub-server it routed a connection to may answer
+                // its clients.  See route_op::broadcast.
+                srv->lua_broadcast(msg);
+                break;
             case worker_proto::route_op::forget:
                 // `frm` is the runtime that went away, not one that asked for
                 // something -- the only op here where that field means the
@@ -2129,6 +2155,30 @@ private:
         // outright in a replica -- so out here it is only ever reached for a
         // runtime this process does not hold, which cannot happen.  The daemon
         // is what tells everyone; see route_op::forget.
+    }
+
+    // One cluster event, as the daemon resolved it.
+    //
+    // The snapshot frame above says what the cluster looks like; this says what
+    // changed, and a script that only reads the snapshot can never see a change
+    // it slept through -- which is what on_cluster_join and on_group_change are
+    // for.  All three fired nowhere at all before this frame existed: the
+    // daemon runs them off each runtime's lua_context, and a placeholder has
+    // none.
+    void on_cluster_event(const std::string& payload)
+    {
+        if (!m_rt || m_rt->get_state() != runtime_running)
+            return;
+
+        cluster_ev_wire w;
+        if (!worker_proto::decode_cluster_event(payload, w))
+        {
+            LOG_WARN("proxy worker: malformed cluster event, dropped");
+            return;
+        }
+
+        if (auto* lua = m_rt->lua())
+            lua->dispatch_cluster_event(w);
     }
 
     void on_publish(const std::string& payload)

@@ -2568,6 +2568,23 @@ written: it would land at an offset that is not a message boundary, and the
 client would read it as the middle of the response it is already receiving.
 Such a connection is closed, and the backend that produced an unfinished
 response is charged to its breaker so the next client is routed elsewhere.
+.PP
+.B "A script runs when its runtime starts, not when it is created."
+.B create
+compiles the file \(em so one that does not parse is refused on the spot, by
+the command that asked \(em and the worker runs it. Without
+.B \-s
+there is no worker yet and nothing has run: no top level, no
+.BR socketley.subscribe ,
+and no check of a global like
+.BR tick_ms .
+Those happen at the
+.B start
+that forks the worker, and a refusal there is reported by that command.
+.PP
+It used to be otherwise for a runtime kept in the daemon, where
+.B create \-\-lua
+loaded and ran the file at once. There is no such runtime now.
 .SS Process Isolation
 Every runtime runs in its own supervised worker process. There is no flag for
 this and nothing to configure: it is where a server, a client, a proxy and a
@@ -4217,8 +4234,8 @@ answering
 .BR ps .
 A runaway in the script's top level is still refused outright whatever
 .B callback_timeout_ms
-says, because the top level runs under the daemon's default before the script's
-own declaration has been read.
+says, because the top level runs under the default before the script's own
+declaration has been read.
 .PP
 .B What it does not bound.
 A callback stopped at its deadline has still held the loop for that long, so a
@@ -4675,14 +4692,13 @@ restored if it is started again. A stopped runtime executes no script, so a
 timer armed by one does not survive it \(em including a timer armed inside
 .BR on_stop ,
 which is severed with the rest. The registrations are made at the script's top
-level, which runs when the script is loaded rather than when the runtime starts,
-so there is nothing for a later
+level, which runs once, when the runtime's worker is forked \(em so a
 .B start
-to replay; use
-.B reload\-lua
-to arm them again \(em it re-runs
-.BR on_start ,
-so timers armed there do come back.
+after a
+.B stop
+forks a new worker, runs the top level again, and arms them again. What is not
+replayed is anything the previous worker held: a timer is not restored, it is
+re-armed by a script that is being run afresh.
 .IP
 Both return
 .B 0

@@ -259,6 +259,18 @@ no binary module ships with socketley, and `package.cpath` is left at its
 default — the require fails the script load and the runtime is left `failed`.
 `socketley.json_encode` needs nothing installed.
 
+### When a script runs
+
+When its runtime **starts**, not when it is created. `create` compiles the file
+— so one that does not parse is refused by the command that asked for it — and
+the worker runs it. Without `start = true` (or `-s` on the command line) there
+is no worker yet and nothing has run: no top level, no `socketley.subscribe`,
+and no check of a global like `tick_ms`. Those happen at the start that forks
+the worker, and a refusal there is reported by that command.
+
+A configuration file always starts what it creates, so this is only visible
+from the command line.
+
 ### The cross-runtime API in a worker: all of it works
 
 `socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe`, everything

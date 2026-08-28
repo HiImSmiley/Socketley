@@ -112,7 +112,7 @@ alive() { kill -0 "$SOCKETLEY_DPID" 2>/dev/null && daemon_alive "$SOCKETLEY_SOCK
 
 write_script "$LUA" V1
 create_ok "runtime with a repeating timer created in the daemon" "$BIN" create server tmr \
-    -p "$PORT" --mode in --lua "$LUA" --daemon-process -s
+    -p "$PORT" --mode in --lua "$LUA" -s
 ready_tcp 127.0.0.1 "$PORT" 10 || echo "  NOTE: the runtime never accepted"
 
 # ── 1. The timer is genuinely running ──────────────────────────────────────

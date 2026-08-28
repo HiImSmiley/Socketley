@@ -138,7 +138,7 @@ end
 LUAEOF
 
 create_ok "the vandal runtime created" "$BIN" create server loc_vandal \
-    -p "$VANDAL_PORT" --lua "$VANDAL" --daemon-process -s
+    -p "$VANDAL_PORT" --lua "$VANDAL" -s
 said "LOC reads=" 10 || true
 
 # ── os.setlocale is gone ────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ function on_start()
 end
 LUAEOF
     create_ok "the victim runtime created" "$BIN" create server loc_victim \
-        -p "$VICTIM_PORT" --lua "$VICTIM" --daemon-process -s
+        -p "$VICTIM_PORT" --lua "$VICTIM" -s
     said "NUM decoded=" 10 || true
 
     ENC=$(grep -a "NUM encoded=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)

@@ -2318,6 +2318,74 @@ bool lua_context::in_worker_process() { return s_worker_process; }
 
 bool lua_context::s_worker_process = false;
 
+void lua_context::dispatch_cluster_event(const cluster_ev_wire& ev)
+{
+    // Lifted out of runtime_manager::dispatch_cluster_events, unchanged in what
+    // it does and changed in what it reads from: it used to build the members
+    // table here, out of the daemon's cluster_discovery, which is the one
+    // object a worker must not have.  It is handed the resolved list now, so
+    // this function has no idea which process it is in -- which is what lets
+    // both run it.
+    switch (static_cast<cluster_event::type_t>(ev.kind))
+    {
+        case cluster_event::daemon_join:
+            if (has_on_cluster_join())
+            {
+                sol::table dt = m_lua.create_table();
+                dt["name"] = ev.daemon_name;
+                if (!ev.host.empty())
+                    dt["host"] = ev.host;
+                sol::protected_function_result r = on_cluster_join()(dt);
+                if (SOCKETLEY_UNLIKELY(!r.valid()))
+                {
+                    sol::error e = r;
+                    fprintf(stderr, "%s on_cluster_join error: %s\n",
+                            lua_diag::tag(m_owner_name).c_str(), e.what());
+                }
+            }
+            break;
+
+        case cluster_event::daemon_leave:
+            if (has_on_cluster_leave())
+            {
+                sol::table dt = m_lua.create_table();
+                dt["name"] = ev.daemon_name;
+                sol::protected_function_result r = on_cluster_leave()(dt);
+                if (SOCKETLEY_UNLIKELY(!r.valid()))
+                {
+                    sol::error e = r;
+                    fprintf(stderr, "%s on_cluster_leave error: %s\n",
+                            lua_diag::tag(m_owner_name).c_str(), e.what());
+                }
+            }
+            break;
+
+        case cluster_event::group_change:
+            if (has_on_group_change())
+            {
+                sol::table members = m_lua.create_table();
+                int mi = 1;
+                for (const auto& m : ev.members)
+                {
+                    sol::table t = m_lua.create_table();
+                    t["daemon"] = m.daemon;
+                    t["host"]   = m.host;
+                    t["port"]   = m.port;
+                    members[mi++] = t;
+                }
+                sol::protected_function_result r =
+                    on_group_change()(ev.group_name, members);
+                if (SOCKETLEY_UNLIKELY(!r.valid()))
+                {
+                    sol::error e = r;
+                    fprintf(stderr, "%s on_group_change error: %s\n",
+                            lua_diag::tag(m_owner_name).c_str(), e.what());
+                }
+            }
+            break;
+    }
+}
+
 void lua_context::set_cluster_view(cluster_view_ptr view)
 {
     s_cluster_view = std::move(view);
@@ -2808,6 +2876,20 @@ void lua_context::register_bindings(runtime_instance* owner)
                 return refuse(err.empty() ? std::string("the daemon refused the "
                                                         "create and said nothing")
                                           : err);
+
+            // The replica, corrected on the spot.  Without this the next line
+            // of the same script reads a map that does not have this runtime
+            // in it yet -- measured as `create=true port=nil` -- and a script
+            // could tell from that which process it is running in.  See
+            // runtime_manager::replica_note.
+            runtime_manager::replica_entry re;
+            re.name  = name;
+            re.type  = type;
+            re.state = cfg_start ? runtime_running : runtime_created;
+            re.port  = have_port ? static_cast<uint16_t>(cfg_port) : 0;
+            re.owner = std::string(owner->get_name());
+            re.group = cfg_group;
+            mgr->replica_note("create", name, re);
             return api_yes();
         }
 
@@ -2955,7 +3037,12 @@ void lua_context::register_bindings(runtime_instance* owner)
         {
             std::string err;
             if (mgr->map_mutate("start", name, {}, err))
+            {
+                runtime_manager::replica_entry re;
+                re.state = runtime_running;
+                mgr->replica_note("start", name, re);
                 return api_yes();
+            }
             return api_why(err.empty() ? q(name) + " could not be started" : err);
         }
 
@@ -3003,7 +3090,12 @@ void lua_context::register_bindings(runtime_instance* owner)
         {
             std::string err;
             if (mgr->map_mutate("stop", name, {}, err))
+            {
+                runtime_manager::replica_entry re;
+                re.state = runtime_stopped;
+                mgr->replica_note("stop", name, re);
                 return api_yes();
+            }
             return api_why(err.empty() ? q(name) + " could not be stopped" : err);
         }
 
@@ -3034,7 +3126,10 @@ void lua_context::register_bindings(runtime_instance* owner)
         {
             std::string err;
             if (mgr->map_mutate("remove", name, {}, err))
+            {
+                mgr->replica_note("remove", name, {});
                 return api_yes();
+            }
             return api_why(err.empty() ? q(name) + " could not be removed" : err);
         }
 

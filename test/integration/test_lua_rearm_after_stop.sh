@@ -123,7 +123,7 @@ LUAEOF
 
 create_ok "cache created"  "$BIN" create cache  rearm_cache -p "$CACHE_PORT" -s
 create_ok "server created" "$BIN" create server rearm_srv   -p "$SRV_PORT" \
-    --lua "$LUA" --daemon-process -s
+    --lua "$LUA" -s
 ready_tcp  127.0.0.1 "$SRV_PORT"   10 || echo "  NOTE: the server never accepted"
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || echo "  NOTE: the cache never answered PING"
 

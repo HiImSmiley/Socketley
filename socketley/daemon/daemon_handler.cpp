@@ -362,6 +362,28 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // whose contracts differ -- see route_relay::sink.  Cleared in teardown()
     // beside the others; the manager outlives this handler.
     m_manager.set_route_sink(this);
+
+    // And a cluster event, for the runtimes this process does not hold -- which
+    // is all of them.  dispatch_cluster_events walks the map and reaches for
+    // each runtime's lua_context; a placeholder has none, so on_cluster_join,
+    // on_cluster_leave and on_group_change fired nowhere at all.  See
+    // cluster_ev_wire for why the members list is resolved before it travels.
+    m_manager.set_cluster_event_sink(
+        [this](const cluster_ev_wire& w)
+        {
+            const std::string payload = worker_proto::encode_cluster_event(w);
+            for (auto& [name, shards] : m_proxy_workers)
+            {
+                (void)name;
+                // Every shard.  A cluster event is about the cluster, not about
+                // one connection, so every process running the script has to
+                // see it -- telling only shard 0 would run on_group_change in
+                // one of four identical interpreters.
+                for (auto& sup : shards)
+                    if (sup)
+                        sup->send_cluster_event(payload);
+            }
+        });
 }
 
 // Every shard of every sharded runtime, under `name#index`.
@@ -5000,6 +5022,9 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::broadcast:
+                srv->lua_broadcast(payload);
+                break;
             case worker_proto::route_op::forget:
                 // Not reachable through post(): forget() fans out directly,
                 // because it addresses every runtime rather than one.  Handled
@@ -6274,6 +6299,7 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             return 0;
 
         case proxy_supervisor::startup::refused:
+        {
             // Deliberately "did not accept" rather than "refused its script".
             // Two different things reach this verdict -- a worker that exits
             // rather than serve without its script, and one that started and
@@ -6291,7 +6317,35 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             out += "runtime ";
             out += name;
             out += " could not start: the worker did not accept its "
-                   "configuration (the reason is in the daemon log)\n";
+                   "configuration";
+
+            // The child's own reason, when it managed to send one.  It says
+            // things this side cannot know -- "'path' must start with '/'"
+            // names the entry and the rule -- and until config_err existed the
+            // only place it went was a log the operator has not opened.
+            //
+            // Read from the first shard that has one: a configuration refusal
+            // is the same for every shard of a runtime, so N copies of one
+            // sentence is noise, and a shard that died before it could write
+            // leaves the string empty rather than wrong.
+            std::string why;
+            if (auto wit = m_proxy_workers.find(std::string(name));
+                wit != m_proxy_workers.end())
+                for (auto& sup : wit->second)
+                    if (why = sup->take_config_error(); !why.empty())
+                        break;
+
+            if (!why.empty())
+            {
+                out += ": ";
+                out += why;
+                if (out.back() != '\n')
+                    out += "\n";
+            }
+            else
+            {
+                out += " (the reason is in the daemon log)\n";
+            }
 
             // ─── AND IT IS NOT `was_running` ────────────────────────────────
             //
@@ -6323,6 +6377,7 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
             if (m_persistence)
                 m_persistence->set_was_running(name, false);
             return 1;
+        }
 
         case proxy_supervisor::startup::pending:
             break;

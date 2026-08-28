@@ -135,7 +135,7 @@ LUAEOF
 
 create_ok "cache created"   "$BIN" create cache  selfrm_cache -p "$CACHE_PORT" -s
 create_ok "running created" "$BIN" create server selfrm_run   -p "$RUN_PORT" \
-    --lua "$RUN_LUA" --daemon-process -s
+    --lua "$RUN_LUA" -s
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || echo "  NOTE: the cache never answered PING"
 
 said() {
@@ -182,7 +182,23 @@ fi
 # building it, and whether that reports success is a separate question from the
 # one this file asks.  What matters is that the daemon is still the same daemon
 # afterwards.
-"$BIN" create server selfrm_new -p "$NEW_PORT" --lua "$NEW_LUA" --daemon-process \
+# `-s`, which this create did not have and now needs.  The top level runs where
+# the script runs, and that is the worker, which exists from `start`.
+#
+# The hazard is not the same one any more, and that is worth stating rather
+# than leaving to be discovered.  In the daemon this call asked retire() to
+# free the instance whose safe_script_file frame was two levels down -- the
+# segfault quoted above.  From a worker, socketley.remove travels to the
+# daemon, which removes a PLACEHOLDER with no Lua frame anywhere near it and
+# then retires the supervisor; the worker's own object is freed later, by a
+# shutdown frame, with nothing of the script on the stack.  So the free and the
+# frame are in different processes and the original crash is structurally out
+# of reach.
+#
+# The three assertions are kept because what they measure is unchanged: the
+# call is answered, the frame that made it runs on, and the runtime really is
+# gone.  A build that got any of those wrong would still be wrong.
+"$BIN" create server selfrm_new -p "$NEW_PORT" --lua "$NEW_LUA" -s \
     >/dev/null 2>&1 || true
 
 # Three assertions, and the first two exist so the third cannot pass on a build

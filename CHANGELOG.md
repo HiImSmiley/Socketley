@@ -28,6 +28,22 @@ runtime is no longer confined to the daemon's process or to one core.
   branches on what happened; and `socketley.pipe` across two runtimes and
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
+- **A script runs when its runtime starts, not when it is created.** `create`
+  compiles the file — one that does not parse is still refused by the command
+  that asked — and the worker runs it. Without `-s` there is no worker yet, so
+  the top level has not run, `socketley.subscribe` has not registered, and a
+  global like `tick_ms` has not been checked; all of that happens at `start`,
+  and a refusal there is reported by that command. Previously a runtime kept in
+  the daemon loaded and ran its script during `create`.
+- A worker that will not accept its configuration now sends the reason up, so
+  `create` says `'path' must start with '/'` rather than "the reason is in the
+  daemon log".
+- `on_cluster_join`, `on_cluster_leave` and `on_group_change` reach a worker.
+  They previously fired only for a runtime inside the daemon, which since the
+  split meant nowhere.
+- A map change made from a script is visible to that script immediately:
+  `socketley.stop("x")` followed by `socketley.get("x")` reports `stopped`,
+  where the worker's replica used to answer `running` until the next push.
 - When a runtime holding routed connections goes away — stopped, removed,
   crashed or killed — every runtime on the other end is told to let go, and its
   `on_disconnect` runs. The daemon does the telling, because a killed worker

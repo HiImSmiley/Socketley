@@ -242,7 +242,7 @@ function on_start()
     end)
 end
 LUAEOF
-"$BIN" create server subsrv -p "$PSRV" --lua "$WORK/sub.lua" --daemon-process -s >/dev/null 2>&1
+"$BIN" create server subsrv -p "$PSRV" --lua "$WORK/sub.lua" -s >/dev/null 2>&1
 sleep 1.5
 printf 'publish ch once\n' | timeout 5 nc -q1 127.0.0.1 "$P4" >/dev/null 2>&1
 sleep 1.5

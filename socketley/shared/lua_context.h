@@ -536,6 +536,16 @@ public:
     // worker.  That is deliberate and it is the whole point of routing them
     // through here: with no view they would answer an empty table, which is
     // what a successful call returns on a daemon alone in its cluster.
+    // ── The three cluster callbacks, run off a resolved event ──────────────
+    //
+    // One implementation for both processes.  The daemon observes the event and
+    // runs this for the runtimes it holds; a worker receives the same struct as
+    // a frame and runs the same function.  Before this the daemon walked its
+    // map and reached for each runtime's lua_context, which for a runtime in a
+    // worker is a placeholder with none -- so all three fired nowhere at all,
+    // and --daemon-process was the only way to reach them.
+    void dispatch_cluster_event(const cluster_ev_wire& ev);
+
     static void set_cluster_view(cluster_view_ptr view);
     static cluster_view_ptr cluster_view_snapshot();
 
@@ -844,6 +854,7 @@ public:
     // The worker calls this before it builds anything; without Lua there is no
     // management API to refuse, so it records nothing.
     static void set_worker_process(bool) {}
+    void dispatch_cluster_event(const cluster_ev_wire&) {}
     static void set_cluster_view(cluster_view_ptr) {}
     static cluster_view_ptr cluster_view_snapshot() { return {}; }
     static bool in_worker_process() { return false; }

@@ -253,7 +253,7 @@ ask() { python3 "$SOCKETLEY_TMPD/ask.py" "$1" "$2" "${3:-8.0}"; }
 # In the daemon: socketley.http blocks the loop it runs on, and the man page
 # says so.  Nothing here depends on that, but a worker would be the odd choice.
 create_ok "fetching server created in the daemon" "$BIN" create server httptls \
-    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" --daemon-process -s
+    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" -s
 ready_tcp 127.0.0.1 "$RPC_PORT" 10 || echo "  NOTE: the fetching server never accepted"
 
 # ── The control: the same client, the same body, no TLS ────────────────────

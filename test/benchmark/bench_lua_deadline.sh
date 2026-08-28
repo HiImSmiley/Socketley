@@ -74,7 +74,7 @@ one_run() {
     local dpid=$! i
     for i in $(seq 1 100); do grep -q "daemon started" "$TMPD/d.log" 2>/dev/null && break; sleep 0.1; done
 
-    "$BIN" create server dlb -p "$PORT" --mode inout --lua "$script" --daemon-process -s >/dev/null 2>&1
+    "$BIN" create server dlb -p "$PORT" --mode inout --lua "$script" -s >/dev/null 2>&1
     for i in $(seq 1 100); do nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; sleep 0.1; done
 
     "$BENCH" -r 7 server msg 127.0.0.1 "$PORT" 20000 64 2>/dev/null > "$TMPD/bench.out"

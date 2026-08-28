@@ -124,6 +124,22 @@ void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
     post_or_drop(mgr, to, from, worker_proto::route_op::drop, ref, {});
 }
 
+bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
+               std::string_view msg)
+{
+    if (auto* srv = local_server(mgr, to))
+    {
+        srv->lua_broadcast(msg);
+        return true;
+    }
+    if (auto* sink = mgr ? mgr->route_sink() : nullptr)
+    {
+        sink->post(to, from, worker_proto::route_op::broadcast, conn_ref{}, msg);
+        return true;
+    }
+    return false;
+}
+
 void forget(runtime_manager* mgr, std::string_view gone)
 {
     if (auto* sink = mgr ? mgr->route_sink() : nullptr)

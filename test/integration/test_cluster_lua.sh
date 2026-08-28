@@ -236,7 +236,7 @@ sleep 0.2
 # fired", which is the defect this file exists to catch.
 create_ok "server on nodeA created with the cluster script" \
     nodeA create server "$RT_A" -p "$PORT_A" -g api --lua "$LUA_SCRIPT" \
-        --daemon-process -s
+ -s
 sleep 1
 
 # ─── Test 1: on_start sees at least the local daemon ────────────────────────
@@ -273,9 +273,30 @@ function on_group_change(group, members)
     append("NEVER_GROUP=" .. group)
 end
 LUAEOF
-create_ok "never-started server on nodeA created" \
-    nodeA create server "$RT_N" -p "$PORT_N" -g api --lua "$NEVER_SCRIPT" \
-        --daemon-process
+# ─── Started, proved loaded, then stopped ───────────────────────────────────
+#
+# It used to be created and never started, and LOADED was written by the
+# script's top level during the `create`.  That worked because `create --lua x`
+# in the daemon loaded AND RAN the script.  Every runtime is in a worker now, a
+# worker exists from `start`, and a bare `create` only compiles -- so a
+# never-started runtime writes nothing, and the control that made this test
+# mean anything cannot be produced that way.
+#
+# Started, then stopped, and the claim is strictly stronger for it.  "Never
+# started" left open whether the callbacks had ever been registered; this one
+# has demonstrably registered them and then been stopped, so a line in the file
+# afterwards is delivery to a stopped runtime and nothing else.  Stopped before
+# nodeB exists, so the join it must not hear has not happened yet.
+create_ok "server on nodeA that will be stopped created" \
+    nodeA create server "$RT_N" -p "$PORT_N" -g api --lua "$NEVER_SCRIPT" -s
+
+for _ in $(seq 1 40); do
+    grep -q 'LOADED' "$NEVER_OUT" 2>/dev/null && break
+    sleep 0.1
+done
+nodeA stop "$RT_N" >/dev/null 2>&1 || true
+sleep 0.3
+
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 start_node "$SOCK_B" nodeB
@@ -292,24 +313,24 @@ echo "  Test 2: on_cluster_join fires for new daemon"
 OUT=$(cat "$LUA_OUT" 2>/dev/null || echo "")
 assert_contains "$OUT" "JOIN=nodeB"
 
-# ─── Test 2b: the never-started runtime heard none of it ────────────────────
+# ─── Test 2b: the stopped runtime heard none of it ──────────────────────────
 #
 # The assertion above is this one's control, and they are deliberately about the
 # same event: nodeB joined, the running runtime's on_cluster_join fired for it,
-# and a runtime on the same daemon that the operator has not started must not
-# have run a line.  A build that delivered to neither would fail Test 2 first.
+# and a runtime on the same daemon that is stopped must not have run a line.  A
+# build that delivered to neither would fail Test 2 first.
 #
-# LOADED proves the second half that an absence cannot: the script was read and
-# its callbacks were registered, so "nothing in the file" is a decision about
-# delivery rather than a script that never existed.
-echo "  Test 2b: a runtime that was never started hears no cluster event"
+# LOADED proves the second half that an absence cannot: the script was read, ran
+# and registered its callbacks, so "nothing in the file after the stop" is a
+# decision about delivery rather than a script that never ran.
+echo "  Test 2b: a stopped runtime hears no cluster event"
 NEVER=$(cat "$NEVER_OUT" 2>/dev/null || echo "")
 assert_contains "$NEVER" "LOADED"
 TOTAL=$((TOTAL+1))
 case "$NEVER" in
     *NEVER_JOIN=*|*NEVER_LEAVE=*|*NEVER_GROUP=*)
         FAIL=$((FAIL+1))
-        echo "  FAIL: a created-but-never-started runtime ran a cluster callback"
+        echo "  FAIL: a stopped runtime ran a cluster callback"
         echo "        got: $(printf '%s' "$NEVER" | grep -a NEVER_ | tr '\n' ' ')"
         echo "        dispatch_cluster_events collected every runtime with a Lua"
         echo "        VM and never asked what state it was in"

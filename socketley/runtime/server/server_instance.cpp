@@ -6026,15 +6026,19 @@ bool server_instance::owner_broadcast(std::string_view msg)
         return true;
     }
 
-    // Out of process.  Not one of routing's five verbs -- it broadcasts to a
-    // runtime rather than addressing one connection -- so it travels the sink
-    // that already exists for exactly that, the one socketley.send(name, msg)
-    // uses.  Fixed here because it is the same family as the eight above and
-    // was failing the same way: as_server() answered null for a parent that is
-    // merely elsewhere, and a sub-server's owner_broadcast returned false
-    // having reached nobody.  It predates this branch; every runtime has been
-    // out of process by default since 2313c26.
-    return mgr->deliver_out_of_process(owner_name, msg);
+    // Out of process.  It addresses a RUNTIME rather than one connection, so
+    // it is the one routing verb with no conn_ref -- but it is a routing verb,
+    // and the first draft of this sent it as a `deliver` instead.  Measured:
+    // an owner created `--mode in` received the frame and dropped it, because
+    // deliver honours that flag and must, while the in-process call had always
+    // gone straight to lua_broadcast().  `--mode in` says whether
+    // socketley.send reaches a runtime; it does not say a sub-server may not
+    // answer the clients that were routed from it.
+    //
+    // The gap it closes predates this branch either way: as_server() answered
+    // null for a parent that is merely elsewhere, and owner_broadcast returned
+    // false having reached nobody, for every runtime since 2313c26.
+    return route_relay::broadcast(mgr, owner_name, get_name(), msg);
 }
 
 int server_instance::find_or_add_peer(const struct sockaddr_in& addr)

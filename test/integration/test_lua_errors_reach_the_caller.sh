@@ -92,7 +92,7 @@ printf 'routes = { { path = "noslash", methods = { "GET" } } }\n' > "$BADROUTE"
 refuse() {
     local label=$1 port=$2 script=$3 needle=$4 rc=0 out
     out=$("$BIN" create server "sl_$label" -p "$port" --lua "$script" \
-              --daemon-process -s 2>&1) || rc=$?
+ -s 2>&1) || rc=$?
     "$BIN" remove "sl_$label" >/dev/null 2>&1 || true
 
     if [ "$rc" = "1" ]; then pass; else
@@ -134,7 +134,7 @@ GOOD="$SOCKETLEY_TMPD/good.lua"
 printf 'function on_message(m) end\n' > "$GOOD"
 
 OK_RC=0
-OK_OUT=$("$BIN" create server ok_srv -p $((LE+3)) --lua "$GOOD" --daemon-process -s 2>&1) || OK_RC=$?
+OK_OUT=$("$BIN" create server ok_srv -p $((LE+3)) --lua "$GOOD" -s 2>&1) || OK_RC=$?
 if [ "$OK_RC" = "0" ] && [ -z "$OK_OUT" ]; then pass; else
     fail "control: a script that loads says nothing and exits 0" \
          "create exited $OK_RC and said '${OK_OUT:-<nothing>}'" \
@@ -146,7 +146,7 @@ fi
 RL="$SOCKETLEY_TMPD/reload.lua"
 printf 'function on_message(m) end\n' > "$RL"
 create_ok "reload subject created" "$BIN" create server rl_srv -p $((LE+4)) \
-    --lua "$RL" --daemon-process -s
+    --lua "$RL" -s
 
 # Control 2: a reload that works is silent and succeeds.
 RLOK_RC=0

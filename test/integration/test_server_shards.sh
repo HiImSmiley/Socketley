@@ -55,15 +55,8 @@
 #                                                reachable — `ls` says Up, N
 #                                                shards, and 1/N of nothing is
 #                                                served.
-#   --shards + --daemon-process      refused.    Broken build: reconcile only
-#                                                forks for an out-of-process
-#                                                runtime, so `show` reports four
-#                                                and exactly one event loop
-#                                                serves the port.  This one is
-#                                                NOT new to servers; it is
-#                                                reachable on a proxy on the
-#                                                parent commit, and the control
-#                                                below pins it there too.
+#   (--shards + --daemon-process was the third row here.  The flag is gone; see
+#   the note where its five assertions were, further down.)
 #
 # A SHARD IS AN IMPLEMENTATION DETAIL OF A RUNTIME, NOT A RUNTIME
 #   ls           one line, not N.    Broken build: N lines.
@@ -117,11 +110,11 @@ LUA=$(mktemp /tmp/srvshards-XXXXXX.lua)
 SOCKNODE=/tmp/srvshards-$$-listen.sock
 
 cleanup() {
-    for n in ss_ok ss_lua ss_dp ss_ed ss_imp ss_state ss_unix ss_http px_dp; do
+    for n in ss_ok ss_lua ss_ed ss_imp ss_state ss_unix ss_http; do
         "$BIN" stop "$n"   >/dev/null 2>&1 || true
     done
     sleep 0.2
-    for n in ss_ok ss_lua ss_dp ss_ed ss_imp ss_state ss_unix ss_http px_dp; do
+    for n in ss_ok ss_lua ss_ed ss_imp ss_state ss_unix ss_http; do
         "$BIN" remove "$n" >/dev/null 2>&1 || true
     done
     [[ -n "${HOLD_PID:-}" ]] && kill -9 "$HOLD_PID" 2>/dev/null
@@ -194,8 +187,8 @@ check "the count was stored" "$n" "1"
 echo "== a server with a script may too, in either flag order =="
 # The count is read back, not just the exit code.  A build that accepted the
 # flag and dropped it would pass an rc check and serve one process for a
-# runtime `ls` reports as four — which is the --daemon-process trap this same
-# file pins, arriving through a different door.
+# runtime `ls` reports as four — which is the trap the --daemon-process pair
+# used to pin, arriving through a different door and now the only door left.
 out=$("$BIN" create server ss_lua -p $P_A --shards 4 --lua "$LUA" 2>&1); rc=$?
 check "--shards before --lua accepted" "$rc" "0"
 [[ -z "$out" ]] && ok "and said nothing (silence is success)" || bad "unexpected output: $out"
@@ -247,19 +240,21 @@ check "the refused edit rolled the listen path back" "$n" "0"
 n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"shards": 4')
 check "and left the shard count alone" "$n" "1"
 
-echo "== a shard IS a worker process, so --daemon-process is a contradiction =="
-out=$("$BIN" create server ss_dp -p $P_B --shards 4 --daemon-process 2>&1); rc=$?
-check "server --shards --daemon-process refused" "$rc" "1"
-[[ "$out" == *"--daemon-process"* ]] && ok "and names --daemon-process" || bad "reason: $out"
-# The same trap on a proxy.  It is reachable on the parent commit — `show`
-# reported four shards while one event loop served the port — so this is not a
-# server assertion, it is the flag's.
-out=$("$BIN" create proxy px_dp -p $P_C --backend 127.0.0.1:$P_D --shards 4 --daemon-process 2>&1); rc=$?
-check "proxy --shards --daemon-process refused too" "$rc" "1"
-# Control: either flag alone is still fine, so the refusal is about the pair.
-out=$("$BIN" create server ss_ed -p $P_E --daemon-process 2>&1); rc=$?
-check "--daemon-process alone still accepted" "$rc" "0"
-"$BIN" remove ss_ed >/dev/null 2>&1
+# ── Five assertions stood here and are gone with the flag ───────────────────
+#
+# They checked that `--shards N --daemon-process` was refused, on a server and
+# on a proxy, with a control that either flag alone was accepted.  A
+# contradiction between two flags cannot be tested when one of them does not
+# exist, and the two halves that could be kept would each pass on any build:
+# "--shards alone is accepted" is asserted a dozen times above, and "the
+# refusal names --daemon-process" has nothing left to name.
+#
+# The trap they were about is kept in shards_config_refusal's own comment,
+# because it is a shape a future flag could recreate:
+# reconcile_proxy_workers() only forks for a runtime that is out of process, so
+# `--shards 4 --daemon-process` was accepted, persisted, and reported by `show`
+# as four while exactly one event loop served the port -- the operator asked
+# for four and got one, reported by nothing as wrong.
 
 echo "== a cache may shard now; a client still may not =="
 # The cache's refusal is gone: ownership by key hash makes N shards one store,

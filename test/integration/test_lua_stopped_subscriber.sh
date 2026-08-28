@@ -34,11 +34,11 @@
 #
 # ─── THE OTHER HALF OF "NOT RUNNING" ────────────────────────────────────────
 #
-# Severing at `stop` covers a runtime that stopped.  It does not cover one that
-# never started, and that runtime is delivered to as well: a script's top level
-# runs when the script is LOADED, which is `create`, so a top-level
-# socketley.subscribe is a live registration on a runtime `ls` reports as
-# Created.  Measured on the parent commit:
+# Severing at `stop` covers a runtime that stopped.  The other half is one that
+# never started, and this file was written when that runtime WAS delivered to:
+# a script's top level ran when the script was loaded, which was `create`, so a
+# top-level socketley.subscribe was a live registration on a runtime `ls`
+# reported as Created.  Measured on the parent commit:
 #
 #     $ socketley create server nostart -p ... --lua top.lua --daemon-process
 #     $ socketley ls
@@ -46,12 +46,19 @@
 #     $ printf 'PUBLISH news m1\r\n' | nc ... <the cache>
 #     [lua] CREATED-STATE HIT msg=m1 state=created
 #
-# There is no event to sever at — nothing happened to that runtime between the
-# load and the publish — so this half is answered where the delivery is decided
-# rather than where the registration is made: runtime_manager::dispatch_publish
-# filtered on `lua() && !is_out_of_process()` and never on state.  The rule the
-# two halves share is one sentence, and it is the sentence 23e5181 was written
-# under: a runtime that is not running executes no script.
+# That command cannot be typed now and neither can that state be reached.  A
+# script runs where its runtime runs, which is a worker, and a worker exists
+# from `start` -- so a bare `create` compiles the script and runs nothing, and
+# the registration this half was about is never made in the first place.
+#
+# The claim is kept because it is still the claim, and it is now satisfied one
+# level lower down: a runtime that is not running executes no script.  What had
+# to change is the CONTROL.  It used to be "the never-started runtime logged
+# SUBSCRIBED", which is exactly the line that can no longer exist -- so a second
+# runtime is built from the same script and started, and it is that one which
+# proves the script, the subscription and the cache fan-out all work.  An
+# absence for the never-started one is then a decision about delivery rather
+# than a script nobody ran.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -78,9 +85,9 @@ fail() {
 }
 
 cleanup() {
-    "$BIN" stop   stopsub_srv stopsub_cache stopsub_new >/dev/null 2>&1 || true
+    "$BIN" stop   stopsub_srv stopsub_cache stopsub_new stopsub_live >/dev/null 2>&1 || true
     sleep 0.2
-    "$BIN" remove stopsub_srv stopsub_cache stopsub_new >/dev/null 2>&1 || true
+    "$BIN" remove stopsub_srv stopsub_cache stopsub_new stopsub_live >/dev/null 2>&1 || true
     daemon_stop
 }
 trap cleanup EXIT
@@ -118,10 +125,15 @@ LUAEOF
 
 create_ok "cache created"  "$BIN" create cache  stopsub_cache -p "$CACHE_PORT" -s
 create_ok "server created" "$BIN" create server stopsub_srv   -p "$SRV_PORT" \
-    --lua "$LUA" --daemon-process -s
+    --lua "$LUA" -s
 # No -s: created, never started, and never stopped either.
 create_ok "never-started created" "$BIN" create server stopsub_new -p "$NEW_PORT" \
-    --lua "$NEW_LUA" --daemon-process
+    --lua "$NEW_LUA"
+# The same script, started.  This is the control the never-started arm lost:
+# it is what says the subscription in NEW_LUA is a working one, so the silence
+# below is about the runtime's state and not about the script.
+create_ok "the same script, started" "$BIN" create server stopsub_live \
+    -p "$((NEW_PORT + 1))" --lua "$NEW_LUA" -s
 ready_tcp 127.0.0.1 "$SRV_PORT"   10 || echo "  NOTE: the server never accepted"
 ready_resp 127.0.0.1 "$CACHE_PORT" 10 || echo "  NOTE: the cache never answered PING"
 
@@ -158,25 +170,34 @@ fi
 # Its registration is proved live first, for the same reason — a build where the
 # top level never ran would satisfy "no delivery" without deciding anything.
 if grep -qa "NOSTART SUBSCRIBED" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
-    fail "control: the never-started runtime's top level ran and subscribed" \
-         "no 'NOSTART SUBSCRIBED' line" \
-         "a script's top level runs at load, which is 'create'; without it there" \
-         "is no registration here and the absence below means nothing"
+    fail "control: the same script, in a started runtime, subscribes" \
+         "no 'NOSTART SUBSCRIBED' line from stopsub_live" \
+         "the script is the same file the never-started runtime was given, so" \
+         "without this the absence below is a script that does not work"
+fi
+if grep -qa "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    fail "control: and it actually receives the publish" \
+         "stopsub_live logged no 'NOSTART msg=' line" \
+         "subscribing is not receiving; without this the absence below could be" \
+         "a fan-out that reaches nobody at all"
 fi
 STATUS=$("$BIN" ls 2>/dev/null | awk '$2 == "stopsub_new" { print $7 }' || true)
 if [ "$STATUS" = "Created" ]; then pass; else
     fail "control: ls reports the never-started runtime as created" \
          "ls says '${STATUS:-<nothing>}', wanted 'Created'"
 fi
-if grep -qa "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null; then
-    GOT=$(grep -a "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1 || true)
+# Counted, not merely present: stopsub_live is subscribed and receives it, so
+# "a line exists" is now the control above.  What must not happen is a SECOND
+# line, which is the never-started runtime having a live handler.
+NOSTART_HITS=$(grep -ac "NOSTART msg=" "$SOCKETLEY_DLOG" 2>/dev/null) || NOSTART_HITS=0
+if [ "$NOSTART_HITS" -eq 1 ]; then pass; else
     fail "a runtime that never started receives nothing" \
-         "got: $GOT" \
-         "dispatch_publish filtered on lua() && !is_out_of_process() and never" \
-         "on state, so a top-level subscribe on a runtime the operator has not" \
-         "started is a live handler — self.send from it reaches the clients of" \
-         "a listener that was never opened"
-else pass; fi
+         "$NOSTART_HITS deliveries of that publish, wanted exactly 1 (the" \
+         "started control's)" \
+         "a second one is stopsub_new having a live handler, which would mean a" \
+         "script running for a runtime the operator has not started:" \
+         "$(grep -a 'NOSTART msg=' "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"
+fi
 
 # ── The stop, proved rather than assumed ───────────────────────────────────
 #

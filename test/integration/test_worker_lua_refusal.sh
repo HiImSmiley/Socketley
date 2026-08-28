@@ -180,7 +180,7 @@ state() {
 create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "in-process callback proxy created" "$BIN" create proxy cb_in \
     -p "$CB_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$CB_LUA" \
-    --daemon-process -s
+ -s
 create_ok "out-of-process callback proxy created" "$BIN" create proxy cb_oop \
     -p "$CB_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$CB_LUA" \
     -s
@@ -372,9 +372,9 @@ function on_connect(client_id) socketley.log("RT_TARGET_GOT_ONE") end
 LUAEOF
 
 create_ok "route target created" "$BIN" create server rt_target -p "$RT_TARGET_PORT" \
-          --lua "$TARGET_LUA" --daemon-process -s
+          --lua "$TARGET_LUA" -s
 create_ok "routing server in the daemon created" "$BIN" create server rt_in -p "$RT_IN_PORT" \
-          --lua "$ROUTE_LUA" --daemon-process -s
+          --lua "$ROUTE_LUA" -s
 create_ok "routing server in a worker created" "$BIN" create server rt_oop -p "$RT_OOP_PORT" \
           --lua "$ROUTE_LUA" -s
 

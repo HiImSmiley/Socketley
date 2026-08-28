@@ -242,7 +242,7 @@ end
 LUAEOF
 
 create_ok "the script under test is created in the daemon" "$BIN" create server ret \
-    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" --daemon-process -s
+    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" -s
 ready_tcp 127.0.0.1 "$RPC_PORT" 10 || echo "  NOTE: the RPC server never accepted"
 
 # ── 1. socketley.start ─────────────────────────────────────────────────────

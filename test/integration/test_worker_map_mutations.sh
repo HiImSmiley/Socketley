@@ -296,7 +296,7 @@ function on_message() end
 LUAEOF
 
 create_ok "in-daemon parent created and started" \
-    "$BIN" create server parent_in -p "$IN_PORT" --lua "$LUA" --daemon-process -s
+    "$BIN" create server parent_in -p "$IN_PORT" --lua "$LUA" -s
 
 if [ "$(listed kid_in)" = "yes" ] && [ "$(accepts "$KID_IN_PORT")" = "yes" ]; then
     pass

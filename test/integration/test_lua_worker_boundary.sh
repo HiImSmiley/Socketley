@@ -247,11 +247,11 @@ mkdir -p "$SOCKETLEY_TMPD/cluster"
 "$BIN" daemon --name luaworker --cluster "$SOCKETLEY_TMPD/cluster" >/dev/null 2>&1 || true
 
 create_ok "controller created in the daemon" "$BIN" create server ctl \
-    -p "$CTL_PORT" --mode in --lua "$CTL_LUA" --daemon-process -s
+    -p "$CTL_PORT" --mode in --lua "$CTL_LUA" -s
 create_ok "worker-backed target created" "$BIN" create server peer \
     -p "$PEER_PORT" --mode out -g gr -s
 create_ok "in-daemon target created" "$BIN" create server inproc \
-    -p "$INPROC_PORT" --mode out --daemon-process -s
+    -p "$INPROC_PORT" --mode out -s
 create_ok "target to be stopped created" "$BIN" create server stoppedpeer \
     -p "$STOPPED_PORT" -s
 "$BIN" stop stoppedpeer >/dev/null 2>&1 || true

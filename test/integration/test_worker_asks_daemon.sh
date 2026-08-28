@@ -60,8 +60,8 @@ ask() {            # port, command -> the first line of the answer
 #
 # Both in the daemon.  If this stops working the rest of the file is measuring
 # something other than the process boundary.
-"$BIN" create cache  cdaemon -p $((WA+0)) --resp --daemon-process -s          >/dev/null 2>&1
-"$BIN" create server sin     -p $((WA+1)) --cache cdaemon --daemon-process -s >/dev/null 2>&1
+"$BIN" create cache  cdaemon -p $((WA+0)) --resp -s          >/dev/null 2>&1
+"$BIN" create server sin     -p $((WA+1)) --cache cdaemon -s >/dev/null 2>&1
 sleep 1.5
 
 if [ "$(ask $((WA+1)) 'cache set ctl 1')" = "ok" ] && [ "$(ask $((WA+1)) 'cache get ctl')" = "1" ]; then
@@ -135,7 +135,7 @@ fi
 # it — `nc -q1` quits a second after its stdin ends whether or not an answer
 # arrived, so a hung request and a refused one take the same wall time.  The
 # content is what tells them apart: silence was the old behaviour.
-"$BIN" create server sbadin  -p $((WA+5)) --cache nosuchcache --daemon-process      -s >/dev/null 2>&1
+"$BIN" create server sbadin  -p $((WA+5)) --cache nosuchcache      -s >/dev/null 2>&1
 "$BIN" create server sbadout -p $((WA+6)) --cache nosuchcache -s >/dev/null 2>&1
 sleep 2.5
 

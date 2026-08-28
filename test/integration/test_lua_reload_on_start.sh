@@ -115,7 +115,7 @@ publish() { printf 'PUBLISH news %s\r\n' "$1" | nc -q 1 127.0.0.1 "$CACHE_PORT" 
 write_script "$LUA" v1
 create_ok "cache created"  "$BIN" create cache  rlcache -p "$CACHE_PORT" -s
 create_ok "server created" "$BIN" create server rl_srv  -p "$SRV_PORT" \
-    --lua "$LUA" --daemon-process -s
+    --lua "$LUA" -s
 ready_tcp 127.0.0.1 "$SRV_PORT" 10 || echo "  NOTE: the server never accepted"
 
 # ── Control: v1's set-up is genuinely live ──────────────────────────────────

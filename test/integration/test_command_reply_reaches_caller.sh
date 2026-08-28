@@ -120,7 +120,7 @@ fi
 BROKEN="$SOCKETLEY_TMPD/broken.lua"
 printf 'function on_message(m)\n  print(m\nend\n' > "$BROKEN"
 says "create still reports a refusal" "could not load Lua script" 1 \
-     "$BIN" create server cr_never -p $((SL_PORT_BASE+1903)) --lua "$BROKEN" --daemon-process -s
+     "$BIN" create server cr_never -p $((SL_PORT_BASE+1903)) --lua "$BROKEN" -s
 "$BIN" remove cr_never >/dev/null 2>&1 || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

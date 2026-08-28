@@ -123,11 +123,11 @@ hit() { printf 'route-me\n' | timeout 4 nc -q1 127.0.0.1 "$1" >/dev/null 2>&1 ||
 
 # ─── CONTROL: on_route is consulted, and its answer is used ─────────────────
 
-create_ok "ok_be0 created"  "$BIN" create server ok_be0 -p "$OK_BE0" --daemon-process -s
-create_ok "ok_be1 created"  "$BIN" create server ok_be1 -p "$OK_BE1" --daemon-process -s
+create_ok "ok_be0 created"  "$BIN" create server ok_be0 -p "$OK_BE0" -s
+create_ok "ok_be1 created"  "$BIN" create server ok_be1 -p "$OK_BE1" -s
 create_ok "route_ok created" "$BIN" create proxy route_ok -p "$OK_PROXY" \
     --backend "127.0.0.1:$OK_BE0,127.0.0.1:$OK_BE1" --protocol tcp \
-    --strategy lua --lua "$SCRIPTS/good.lua" --daemon-process -s
+    --strategy lua --lua "$SCRIPTS/good.lua" -s
 ready_tcp 127.0.0.1 "$OK_PROXY" 10 || true
 
 for _ in 1 2 3; do hit "$OK_PROXY"; done
@@ -143,11 +143,11 @@ else bad "on_route answer used" "backend 0 saw '$C0' connections, expected 0" \
 
 # ─── THE INDEXED PATH ───────────────────────────────────────────────────────
 
-create_ok "idx_be0 created" "$BIN" create server idx_be0 -p "$IDX_BE0" --daemon-process -s
-create_ok "idx_be1 created" "$BIN" create server idx_be1 -p "$IDX_BE1" --daemon-process -s
+create_ok "idx_be0 created" "$BIN" create server idx_be0 -p "$IDX_BE0" -s
+create_ok "idx_be1 created" "$BIN" create server idx_be1 -p "$IDX_BE1" -s
 create_ok "route_idx created" "$BIN" create proxy route_idx -p "$IDX_PROXY" \
     --backend "127.0.0.1:$IDX_BE0,127.0.0.1:$IDX_BE1" --protocol tcp \
-    --strategy lua --lua "$SCRIPTS/bad.lua" --daemon-process -s
+    --strategy lua --lua "$SCRIPTS/bad.lua" -s
 ready_tcp 127.0.0.1 "$IDX_PROXY" 10 || true
 
 hit "$IDX_PROXY"
@@ -193,11 +193,11 @@ done
 # resolved pool has more than one entry.  A one-member group would take the
 # fast path and this section would pass against the unfixed build.
 
-create_ok "grp_be0 created" "$BIN" create server grp_be0 -p "$GRP_BE0" -g "$GROUP" --daemon-process -s
-create_ok "grp_be1 created" "$BIN" create server grp_be1 -p "$GRP_BE1" -g "$GROUP" --daemon-process -s
+create_ok "grp_be0 created" "$BIN" create server grp_be0 -p "$GRP_BE0" -g "$GROUP" -s
+create_ok "grp_be1 created" "$BIN" create server grp_be1 -p "$GRP_BE1" -g "$GROUP" -s
 create_ok "route_grp created" "$BIN" create proxy route_grp -p "$GRP_PROXY" \
     --backend "@$GROUP" --protocol tcp \
-    --strategy lua --lua "$SCRIPTS/bad.lua" --daemon-process -s
+    --strategy lua --lua "$SCRIPTS/bad.lua" -s
 ready_tcp 127.0.0.1 "$GRP_PROXY" 10 || true
 
 hit "$GRP_PROXY"

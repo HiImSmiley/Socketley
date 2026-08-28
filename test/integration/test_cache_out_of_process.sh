@@ -147,7 +147,7 @@ fi
 # untouched, and the reply comes back to the origin with the cookie it posted.
 # Neither the server nor the client can tell.
 if command -v nc >/dev/null 2>&1; then
-    "$BIN" create server srv -p $((PORT + 1)) --cache oopc --daemon-process -s >/dev/null 2>&1
+    "$BIN" create server srv -p $((PORT + 1)) --cache oopc -s >/dev/null 2>&1
     sleep 1.5
     SET=$(printf 'cache set foo bar\n' | timeout 5 nc -q1 127.0.0.1 $((PORT + 1)) 2>/dev/null | head -1)
     sleep 0.3

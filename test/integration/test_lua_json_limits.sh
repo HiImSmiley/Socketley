@@ -67,7 +67,7 @@ run_script() {
     # crash in one case cannot be reported again by the next.  Markers are per
     # case, so the log truncation inside daemon_recover costs nothing.
     daemon_recover
-    "$BIN" create server "$name" -p "$port" --daemon-process --lua "$file" -s \
+    "$BIN" create server "$name" -p "$port" --lua "$file" -s \
         >/dev/null 2>&1 || true
     sleep 0.4
 }

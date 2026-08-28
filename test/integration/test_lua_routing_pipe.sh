@@ -248,11 +248,11 @@ said() {
 # runtime map, which a worker does not have — test_worker_lua_refusal.sh covers
 # the refusal, and this file covers what the calls do where they are allowed.
 create_ok "parent server created in the daemon" "$BIN" create server rt_par \
-    -p "$PAR_PORT" --mode in --lua "$PAR_LUA" --daemon-process -s
+    -p "$PAR_PORT" --mode in --lua "$PAR_LUA" -s
 create_ok "pipe source created in the daemon" "$BIN" create server pipe_a \
-    -p "$A_PORT" --mode in --lua "$A_LUA" --daemon-process -s
+    -p "$A_PORT" --mode in --lua "$A_LUA" -s
 create_ok "pipe destination created in the daemon" "$BIN" create server pipe_b \
-    -p "$B_PORT" --mode in --lua "$B_LUA" --daemon-process -s
+    -p "$B_PORT" --mode in --lua "$B_LUA" -s
 for p in "$PAR_PORT" "$A_PORT" "$B_PORT"; do
     ready_tcp 127.0.0.1 "$p" 10 || echo "  NOTE: nothing accepted on $p"
 done

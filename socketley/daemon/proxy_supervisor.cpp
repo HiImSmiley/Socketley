@@ -1072,6 +1072,13 @@ std::string proxy_supervisor::take_reload_error()
     return out;
 }
 
+std::string proxy_supervisor::take_config_error()
+{
+    std::string out = std::move(m_config_error);
+    m_config_error.clear();
+    return out;
+}
+
 std::string proxy_supervisor::take_start_error()
 {
     // Cleared explicitly for the reason take_reload_error() gives: a moved-from
@@ -1118,6 +1125,14 @@ void proxy_supervisor::send_runtime_map(const std::string& encoded_payload)
     if (write_frame(worker_proto::frame(worker_proto::frame_type::runtime_map,
                                         encoded_payload)))
         m_runtime_map = encoded_payload;
+}
+
+void proxy_supervisor::send_cluster_event(const std::string& encoded_payload)
+{
+    if (encoded_payload.empty())
+        return;
+    if (!write_frame(worker_proto::frame(
+            worker_proto::frame_type::cluster_ev, encoded_payload))) {}
 }
 
 void proxy_supervisor::send_cluster_view(const std::string& encoded_payload)
@@ -1433,6 +1448,14 @@ void proxy_supervisor::ingest(const std::string&)
                 // read back there rather than logged: the worker has already
                 // logged it, and the point of the frame is the other terminal.
                 m_reload_error = payload;
+                break;
+
+            case worker_proto::frame_type::config_err:
+                // Written by a child that is about to exit rather than serve.
+                // Kept rather than logged for the reason the two above give:
+                // the worker has already logged it, and the point of the frame
+                // is the terminal that ran the command.
+                m_config_error = payload;
                 break;
 
             case worker_proto::frame_type::start_err:

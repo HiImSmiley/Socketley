@@ -121,7 +121,7 @@ worker_pid() {
 
 create_ok "backend created" "$BIN" create server backend -p "$BE_PORT" -s
 create_ok "in-process proxy created" "$BIN" create proxy px_in -p "$PX_IN_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol http --daemon-process -s
+    --backend "127.0.0.1:$BE_PORT" --protocol http -s
 create_ok "out-of-process proxy created" "$BIN" create proxy px_oop -p "$PX_OOP_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http -s
 

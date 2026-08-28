@@ -65,6 +65,59 @@ void runtime_manager::mark_replica()
     m_replica = true;
 }
 
+void runtime_manager::replica_note(std::string_view op, std::string_view name,
+                                   const replica_entry& e)
+{
+    // Only a replica has one of these to correct.  A daemon calling this would
+    // be writing over the authority with a copy of itself.
+    if (!m_replica)
+        return;
+
+    std::unique_ptr<runtime_instance> dropped;
+    {
+        std::unique_lock lock(mutex);
+        auto it = runtimes.find(name);
+
+        if (op == "remove")
+        {
+            if (it == runtimes.end())
+                return;
+            // Out of the map, NOT destroyed.  A script is mid-frame and is
+            // entitled to be holding the pointer get() handed it one statement
+            // ago -- the same reason install_replica refuses to run here at
+            // all, answered rather than avoided.
+            dropped = std::move(it->second);
+            runtimes.erase(it);
+        }
+        else if (op == "create")
+        {
+            if (it == runtimes.end())
+                it = runtimes.emplace(
+                    std::string(name),
+                    std::make_unique<replica_instance>(e.type, name)).first;
+            runtime_instance* inst = it->second.get();
+            inst->set_port(e.port);
+            inst->set_owner(e.owner);
+            inst->set_group(e.group);
+            inst->set_replicated_state(e.state);
+        }
+        else
+        {
+            // start / stop.  The row must already exist -- the daemon just
+            // acted on it -- and only its state moved.  Nothing is created
+            // here: a name this worker has never been told about is one the
+            // next push will bring, and inventing a row for it would be this
+            // process having an opinion rather than a copy.
+            if (it == runtimes.end())
+                return;
+            it->second->set_replicated_state(e.state);
+        }
+    }
+
+    if (dropped)
+        retire(std::move(dropped));
+}
+
 void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 {
     // Never under a script frame.  A replica the snapshot has dropped is freed
@@ -963,6 +1016,54 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
     }
 
 #ifndef SOCKETLEY_NO_LUA
+    // ─── Resolved once, for every consumer ──────────────────────────────────
+    //
+    // The members list for a group_change is built from this daemon's
+    // cluster_discovery and its own map, and neither is available in a worker.
+    // So it is resolved HERE, once per event rather than once per runtime, and
+    // what travels is the answer.  See cluster_ev_wire.
+    std::vector<cluster_ev_wire> resolved;
+    resolved.reserve(events.size());
+    for (const auto& ev : events)
+    {
+        cluster_ev_wire w;
+        w.kind        = static_cast<uint8_t>(ev.kind);
+        w.daemon_name = ev.daemon_name;
+        w.group_name  = ev.group_name;
+
+        if (ev.kind == cluster_event::daemon_join && m_cluster)
+        {
+            for (const auto& rd : m_cluster->get_all_daemons())
+                if (rd.name == ev.daemon_name) { w.host = rd.host; break; }
+        }
+        else if (ev.kind == cluster_event::group_change && m_cluster)
+        {
+            {
+                std::shared_lock lock(mutex);
+                for (const auto& [_, rinst] : runtimes)
+                    if (rinst->get_group() == ev.group_name &&
+                        rinst->get_state() == runtime_running &&
+                        rinst->get_port() > 0)
+                        w.members.push_back({std::string(m_cluster->get_daemon_name()),
+                                             std::string(m_cluster->get_cluster_addr()),
+                                             rinst->get_port()});
+            }
+            for (const auto& rd : m_cluster->get_all_daemons())
+                for (const auto& rt : rd.runtimes)
+                    if (rt.group == ev.group_name && rt.state == "running" &&
+                        rt.port > 0)
+                        w.members.push_back({rt.daemon_name, rt.host, rt.port});
+        }
+        resolved.push_back(std::move(w));
+    }
+
+    // Out of process first, and for the reason the publish sink gives one
+    // screen up: a callback here may create or remove a runtime, and a frame
+    // already written to a socket cannot be affected by what it does.
+    if (m_cluster_event_sink)
+        for (const auto& w : resolved)
+            m_cluster_event_sink(w);
+
     for (auto& n : names)
     {
         runtime_instance* inst;
@@ -977,7 +1078,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
         auto* lua = inst->lua();
         if (!lua) continue;
 
-        for (const auto& ev : events)
+        for (const auto& w : resolved)
         {
             // Re-validate: a previous event callback may have removed this
             // runtime, or stopped it.  Both end this runtime's batch.
@@ -988,104 +1089,7 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
                 if (it->second->get_state() != runtime_running) break;
             }
 
-            switch (ev.kind)
-            {
-                case cluster_event::daemon_join:
-                    if (lua->has_on_cluster_join())
-                    {
-                        sol::table dt = lua->state().create_table();
-                        dt["name"] = ev.daemon_name;
-                        // Look up host from remote daemons
-                        if (m_cluster)
-                        {
-                            auto daemons = m_cluster->get_all_daemons();
-                            for (const auto& rd : daemons)
-                            {
-                                if (rd.name == ev.daemon_name)
-                                {
-                                    dt["host"] = rd.host;
-                                    break;
-                                }
-                            }
-                        }
-                        sol::protected_function_result r = lua->on_cluster_join()(dt);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            fprintf(stderr, "%s on_cluster_join error: %s\n",
-                                    lua_diag::tag(n).c_str(), e.what());
-                        }
-                    }
-                    break;
-
-                case cluster_event::daemon_leave:
-                    if (lua->has_on_cluster_leave())
-                    {
-                        sol::table dt = lua->state().create_table();
-                        dt["name"] = ev.daemon_name;
-                        sol::protected_function_result r = lua->on_cluster_leave()(dt);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            fprintf(stderr, "%s on_cluster_leave error: %s\n",
-                                    lua_diag::tag(n).c_str(), e.what());
-                        }
-                    }
-                    break;
-
-                case cluster_event::group_change:
-                    if (lua->has_on_group_change())
-                    {
-                        // Build members table
-                        sol::table members = lua->state().create_table();
-                        int mi = 1;
-                        if (m_cluster)
-                        {
-                            // Local group members
-                            {
-                                std::shared_lock lock(mutex);
-                                for (const auto& [_, rinst] : runtimes)
-                                {
-                                    if (rinst->get_group() == ev.group_name &&
-                                        rinst->get_state() == runtime_running &&
-                                        rinst->get_port() > 0)
-                                    {
-                                        sol::table m = lua->state().create_table();
-                                        m["daemon"] = std::string(m_cluster->get_daemon_name());
-                                        m["host"] = std::string(m_cluster->get_cluster_addr());
-                                        m["port"] = rinst->get_port();
-                                        members[mi++] = m;
-                                    }
-                                }
-                            }
-                            // Remote group members
-                            auto daemons = m_cluster->get_all_daemons();
-                            for (const auto& rd : daemons)
-                            {
-                                for (const auto& rt : rd.runtimes)
-                                {
-                                    if (rt.group == ev.group_name &&
-                                        rt.state == "running" && rt.port > 0)
-                                    {
-                                        sol::table m = lua->state().create_table();
-                                        m["daemon"] = rt.daemon_name;
-                                        m["host"] = rt.host;
-                                        m["port"] = rt.port;
-                                        members[mi++] = m;
-                                    }
-                                }
-                            }
-                        }
-                        sol::protected_function_result r = lua->on_group_change()(ev.group_name, members);
-                        if (SOCKETLEY_UNLIKELY(!r.valid()))
-                        {
-                            sol::error e = r;
-                            fprintf(stderr, "%s on_group_change error: %s\n",
-                                    lua_diag::tag(n).c_str(), e.what());
-                        }
-                    }
-                    break;
-            }
+            lua->dispatch_cluster_event(w);
         }
     }
 #endif

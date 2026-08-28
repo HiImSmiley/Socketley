@@ -507,11 +507,11 @@ conn() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print $5 }'; }
 # `get.connections` has one unambiguous right answer for both arms to be
 # compared against.
 create_ok "target server created" "$BIN" create server par_peer \
-    -p "$PEER_PORT" --group parity --lua "$PEER_LUA" --daemon-process -s
+    -p "$PEER_PORT" --group parity --lua "$PEER_LUA" -s
 create_ok "unstarted group member created" "$BIN" create server par_idle \
-    -p "$IDLE_PORT" --group parity --daemon-process
+    -p "$IDLE_PORT" --group parity
 create_ok "in-daemon probe created" "$BIN" create server par_in \
-    -p "$IN_PORT" --lua "$PROBE_LUA" --daemon-process -s
+    -p "$IN_PORT" --lua "$PROBE_LUA" -s
 create_ok "worker probe created" "$BIN" create server par_oop \
     -p "$OOP_PORT" --lua "$PROBE_LUA" -s
 

@@ -15,6 +15,7 @@
 // whose lookups they exist for.
 #include "endpoint_table.h"
 #include "request_channel.h"
+#include "cluster_view.h"
 
 class event_loop;
 class cluster_discovery;
@@ -95,6 +96,32 @@ public:
     // here yet, and that is the same price `stats` already pays for a worker's
     // figures.
     void install_replica(const std::vector<replica_entry>& entries);
+
+    // ── One row of the replica, changed the instant this worker changed it ──
+    //
+    // install_replica() is a whole-map push on a coalescing timer, and it
+    // refuses outright while a script frame is live -- so the snapshot a script
+    // reads is up to one interval old.  That is the stated contract and it is
+    // fine for a map somebody ELSE is changing.
+    //
+    // It is not fine for a map THIS script just changed.  socketley.stop("x")
+    // travels to the daemon, is done, and returns true; the socketley.get("x")
+    // on the next line reads the replica and answers `running`.  Measured
+    // exactly that way in test_lua_globals.sh, for all three of stop, start and
+    // remove, and for the port of a runtime create had just built.  In the
+    // daemon those two lines agree, so a script CAN tell which process it is in
+    // -- which is the one property the whole map-call design was for.
+    //
+    // Applied by the worker after its own map_mutate returns true, so this is
+    // the daemon's answer being written down rather than a second opinion.
+    // Safe under a script frame, which install_replica is not, because it never
+    // frees: a dropped row goes to retire() and is released by the same
+    // graveyard every other instance destruction here goes through.
+    //
+    // Silently does nothing in a daemon: there is no replica to correct there,
+    // and the map is already right.
+    void replica_note(std::string_view op, std::string_view name,
+                      const replica_entry& e);
 
     // Declared below as a wrapper over try_create(), which p0-crashes added
     // so a refused create can say WHY.  The old bare declaration is gone.
@@ -295,6 +322,12 @@ public:
     // Non-owning. The daemon_handler and the worker outlive their manager, and
     // making this a unique_ptr would put a destruction order between them that
     // neither needs.
+    // Where a cluster event goes for the runtimes this process does not hold.
+    // Installed by the daemon; a worker installs none, because a worker never
+    // observes one -- it only receives them.  See cluster_ev_wire.
+    void set_cluster_event_sink(std::function<void(const cluster_ev_wire&)> s)
+    { m_cluster_event_sink = std::move(s); }
+
     void set_route_sink(route_relay::sink* sink) { m_route_sink = sink; }
     route_relay::sink* route_sink() const { return m_route_sink; }
 
@@ -366,6 +399,7 @@ private:
                        std::string_view, std::string&)> m_map_sink;
     std::function<void()> m_worker_release_sink;
     route_relay::sink*    m_route_sink{nullptr};
+    std::function<void(const cluster_ev_wire&)> m_cluster_event_sink;
 
     // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER
     // them.  A runtime revokes its origin as it goes — ~server_instance calls

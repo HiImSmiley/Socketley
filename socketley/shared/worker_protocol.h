@@ -102,11 +102,13 @@ enum class frame_type : uint16_t
     send_ref   = 9,  // payload: see encode_send_ref
     map_req    = 10, // payload: see encode_map_request
     route_up   = 11, // payload: see encode_route_frame
+    config_err = 12, // payload: why a `config` was refused; see below
 
     // daemon → worker, again
     deliver_ref = 27,  // payload: see encode_send_ref — the same frame coming
                        // back down, which is why it is one codec and two names
     map_rep     = 28,  // payload: see encode_map_reply
+    cluster_ev  = 31,  // payload: see encode_cluster_event
     route_down  = 29,  // payload: see encode_route_frame -- the same
                        // codec travelling the other leg, for the
                        // reason send_ref/deliver_ref are one codec
@@ -715,6 +717,27 @@ inline bool decode_send_ref(std::string_view payload, conn_ref& ref,
     return r.ok;
 }
 
+// ── config_err: the reason a worker would not serve its configuration ───────
+//
+// The third of the same shape, after reload_err and start_err, and the one that
+// was missing for the longest because a --daemon-process control arm hid it.
+//
+// A worker whose script will not load exits with exit_config_refused rather
+// than serving a proxy with none of the filters, routes or callbacks the
+// operator wrote.  The daemon then tells the CLI "the worker did not accept its
+// configuration (the reason is in the daemon log)" -- which is true, and is
+// what a `create` is answered with while the child has already written
+// `'path' must start with '/'` somewhere the operator is not looking.
+//
+// In the daemon the same failure came back on the terminal, so the gap was only
+// reachable with the flag off and every control arm had the flag on.  With the
+// flag gone it is the only path there is.
+//
+// Written BEFORE the exit, and that is the ordering that makes it work: the
+// bytes are in the socket once the write has been submitted, and a socket
+// outlives the process that wrote into it until the peer reads it.  The
+// supervisor is polling that descriptor and takes the frame on the same turn it
+// notices the child is gone.
 // ── route_up / route_down: a connection served by one runtime, answered by
 //    another ───────────────────────────────────────────────────────────────
 //
@@ -785,6 +808,22 @@ enum class route_op : uint8_t
     // everyone, from what it knows rather than from what the departing runtime
     // manages to say on its way out.
     forget = 6,
+
+    // ── The seventh, which addresses a RUNTIME and carries no ref ───────────
+    //
+    // self.owner_broadcast(): a sub-server reaching every client of the runtime
+    // that routed one to it.  `to` is that owner, `from` is the sub-server, the
+    // ref is unused and the payload is the message.
+    //
+    // It is here rather than on the deliver sink, and that distinction cost a
+    // measurement to find.  Sent as a `deliver` -- the socketley.send(name,msg)
+    // channel -- it arrives and is DROPPED for an owner created `--mode in`,
+    // because deliver honours that flag and must.  The in-process call never
+    // did: it went straight to lua_broadcast(), and `--mode in` is about
+    // whether socketley.send reaches a runtime, not about whether its own
+    // sub-server may answer its clients.  Routing it through deliver silently
+    // narrowed the verb.
+    broadcast = 7,
 };
 
 // `to` is the runtime the op is performed on, `from` the one that asked.  Both
@@ -824,7 +863,7 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     // length prefix.  Defaulting would turn a newer peer's sixth op into a
     // `data` delivery of the wrong bytes.
     if (raw < static_cast<uint8_t>(route_op::open) ||
-        raw > static_cast<uint8_t>(route_op::forget))
+        raw > static_cast<uint8_t>(route_op::broadcast))
         return false;
     op = static_cast<route_op>(raw);
 
@@ -863,6 +902,86 @@ inline bool decode_route_ask(std::string_view payload, conn_ref& ref,
         return false;
     reader r(p, static_cast<size_t>(end - p));
     origin = std::string(r.str());
+    return r.ok;
+}
+
+// ── cluster_ev: a daemon joined, left, or a group changed size ──────────────
+//
+// on_cluster_join, on_cluster_leave and on_group_change.  The daemon is the
+// only process that can observe any of them -- cluster_discovery scans the
+// shared directory, and a worker must not run one, because publishing there
+// claims the node name and a worker doing that would be a second daemon as far
+// as every other member is concerned (see cluster_view.h).
+//
+// So the OBSERVATION travels.  runtime_manager::dispatch_cluster_events walks
+// the daemon's map and reaches for each runtime's lua_context; for a runtime in
+// a worker that is a placeholder, which has none.  All three callbacks
+// therefore fired nowhere at all, and the only way to reach them was
+// --daemon-process -- which is to say, for as long as that flag existed this
+// was a capability it bought back and nobody had counted.
+//
+// ─── THE MEMBERS ARE RESOLVED HERE, NOT AT THE FAR END ──────────────────────
+//
+// on_group_change is handed (group_name, members), and members is built from
+// the local map plus every remote daemon's runtimes.  A worker could rebuild it
+// from its cluster view and its replica map, and that is the version not
+// written: two derivations of one list is two things to keep level, and the
+// worker's inputs are each a push interval old in a different way.
+//
+// The daemon resolves it once and sends the answer.  What a script in a worker
+// is handed is then the same table a script in the daemon is handed, by
+// construction rather than by agreement.
+// The struct itself lives in cluster_view.h, which lua_context.h already
+// includes: the daemon runs these callbacks against a resolved event too, for
+// the runtimes it holds, and one struct is what makes the two paths the same
+// code rather than the same intention.
+using cluster_ev_member = ::cluster_ev_member;
+using cluster_ev_wire   = ::cluster_ev_wire;
+
+inline std::string encode_cluster_event(const cluster_ev_wire& e)
+{
+    std::string out;
+    out.push_back(static_cast<char>(e.kind));
+    put_str(out, e.daemon_name);
+    put_str(out, e.host);
+    put_str(out, e.group_name);
+    put_u32(out, static_cast<uint32_t>(e.members.size()));
+    for (const auto& m : e.members)
+    {
+        put_str(out, m.daemon);
+        put_str(out, m.host);
+        put_u16(out, m.port);
+    }
+    return out;
+}
+
+inline bool decode_cluster_event(std::string_view payload, cluster_ev_wire& e)
+{
+    reader r(payload.data(), payload.size());
+    e.kind        = r.u8();
+    e.daemon_name = std::string(r.str());
+    e.host        = std::string(r.str());
+    e.group_name  = std::string(r.str());
+    const uint32_t n = r.u32();
+    if (!r.ok)
+        return false;
+    // Bounded before it is reserved.  A count is four bytes and a member is
+    // more than four, so a corrupt frame cannot ask for more members than the
+    // payload could hold -- the same rule every other decoder here follows.
+    if (n > payload.size() / 6)
+        return false;
+    e.members.clear();
+    e.members.reserve(n);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        cluster_ev_member m;
+        m.daemon = std::string(r.str());
+        m.host   = std::string(r.str());
+        m.port   = r.u16();
+        if (!r.ok)
+            return false;
+        e.members.push_back(std::move(m));
+    }
     return r.ok;
 }
 

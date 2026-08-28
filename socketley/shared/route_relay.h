@@ -142,6 +142,11 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
           const conn_ref& ref);
 
+// lua_broadcast on the origin.  The one verb here that names no connection:
+// see route_op::broadcast for why it is not a `deliver`.
+bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
+               std::string_view msg);
+
 // "This runtime is going away."  Called from runtime_manager::stop and
 // ::remove, which is the chokepoint every departure already goes through --
 // including the cascade, which reaches it once per runtime it takes down.

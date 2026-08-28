@@ -93,7 +93,7 @@ case_server() {
     local lua="$SOCKETLEY_TMPD/$name.lua"
     printf 'function on_master_auth(client_id, password)\n%s\nend\n' "$body" > "$lua"
     create_ok "$name created" "$BIN" create server "$name" -p "$port" \
-        --mode master --lua "$lua" --daemon-process -s
+        --mode master --lua "$lua" -s
 }
 
 case_server ma_string $((MA+0)) '    return "denied"'

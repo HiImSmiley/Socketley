@@ -116,8 +116,8 @@ say() {
 # ── Arm 1: a daemon whose own default is a bound ────────────────────────────
 daemon_start "$BIN"
 
-create_ok "silent script created" "$BIN" create server jb_silent -p "$SILENT_PORT" --mode in --lua "$LUADIR/silent.lua" --daemon-process -s
-create_ok "zero script created"   "$BIN" create server jb_zero   -p "$ZERO_PORT"   --mode in --lua "$LUADIR/zero.lua"   --daemon-process -s
+create_ok "silent script created" "$BIN" create server jb_silent -p "$SILENT_PORT" --mode in --lua "$LUADIR/silent.lua" -s
+create_ok "zero script created"   "$BIN" create server jb_zero   -p "$ZERO_PORT"   --mode in --lua "$LUADIR/zero.lua" -s
 
 ready_tcp 127.0.0.1 "$SILENT_PORT" 8 || echo "  NOTE: jb_silent never accepted a connection"
 ready_tcp 127.0.0.1 "$ZERO_PORT"   8 || echo "  NOTE: jb_zero never accepted a connection"
@@ -152,8 +152,8 @@ daemon_stop
 daemon_isolate luajitbound-env
 SOCKETLEY_LUA_TIMEOUT_MS=0 daemon_start "$BIN"
 
-create_ok "env-unbounded script created" "$BIN" create server jb_envz  -p "$ENVZ_PORT"  --mode in --lua "$LUADIR/silent.lua" --daemon-process -s
-create_ok "script raising it created"    "$BIN" create server jb_raise -p "$RAISE_PORT" --mode in --lua "$LUADIR/raise.lua"  --daemon-process -s
+create_ok "env-unbounded script created" "$BIN" create server jb_envz  -p "$ENVZ_PORT"  --mode in --lua "$LUADIR/silent.lua" -s
+create_ok "script raising it created"    "$BIN" create server jb_raise -p "$RAISE_PORT" --mode in --lua "$LUADIR/raise.lua" -s
 
 ready_tcp 127.0.0.1 "$ENVZ_PORT"  8 || echo "  NOTE: jb_envz never accepted a connection"
 ready_tcp 127.0.0.1 "$RAISE_PORT" 8 || echo "  NOTE: jb_raise never accepted a connection"

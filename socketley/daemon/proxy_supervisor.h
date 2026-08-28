@@ -410,6 +410,10 @@ public:
     // start's failure to a later one.
     std::string take_start_error();
 
+    // The same, for a worker that would not accept its configuration at all --
+    // a script that will not load.  See worker_proto::config_err.
+    std::string take_config_error();
+
     // A new membership snapshot.  Cheap enough to send unconditionally: the
     // daemon publishes only when a runtime is created, started, stopped,
     // removed or renamed, or when the cluster's view moves.
@@ -437,6 +441,11 @@ public:
     // differs on every scan and the dedupe rarely fires.  A daemon that is not
     // in a cluster sends this frame once, empty, and then never again.
     void send_cluster_view(const std::string& encoded_payload);
+
+    // One event, rather than the snapshot above.  The view says what the
+    // cluster looks like; this says what just changed about it, and a script
+    // that only reads the view can never see a change it slept through.
+    void send_cluster_event(const std::string& encoded_payload);
 
     // `socketley send <name> <message>`, on its way to the runtime that has the
     // connections.  Best-effort like every other frame going down: a false is a
@@ -637,6 +646,7 @@ private:
     // reload clears its own before sending — and one member for both would hand
     // a startup failure to the first reload that asked.
     std::string  m_start_error;
+    std::string  m_config_error;
 
     // The last state the child reported about itself, observed and not adopted.
     //

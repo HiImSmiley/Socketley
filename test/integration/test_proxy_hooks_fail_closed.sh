@@ -172,7 +172,7 @@ stand() {
         sleep 0.1
     done
     create_ok "$name created" "$BIN" create proxy "$name" -p "$pport" \
-        --backend "127.0.0.1:$beport" --protocol tcp --lua "$lua" --daemon-process -s
+        --backend "127.0.0.1:$beport" --protocol tcp --lua "$lua" -s
 }
 
 L="$SOCKETLEY_TMPD"

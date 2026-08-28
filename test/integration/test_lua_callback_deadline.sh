@@ -190,10 +190,10 @@ export SOCKETLEY_LUA_TIMEOUT_MS=1500
 
 daemon_start "$BIN"
 
-create_ok "spinner created"    "$BIN" create server dl_spin -p "$SPIN_PORT" --mode inout --lua "$SPIN" --daemon-process -s
-create_ok "bystander created"  "$BIN" create server dl_byst -p "$BYST_PORT" --mode inout --lua "$BYST" --daemon-process -s
-create_ok "own-budget created" "$BIN" create server dl_own  -p "$OWN_PORT"  --mode inout --lua "$OWN"  --daemon-process -s
-create_ok "slow one created"   "$BIN" create server dl_slow -p "$SLOW_PORT" --mode inout --lua "$SLOW" --daemon-process -s
+create_ok "spinner created"    "$BIN" create server dl_spin -p "$SPIN_PORT" --mode inout --lua "$SPIN" -s
+create_ok "bystander created"  "$BIN" create server dl_byst -p "$BYST_PORT" --mode inout --lua "$BYST" -s
+create_ok "own-budget created" "$BIN" create server dl_own  -p "$OWN_PORT"  --mode inout --lua "$OWN" -s
+create_ok "slow one created"   "$BIN" create server dl_slow -p "$SLOW_PORT" --mode inout --lua "$SLOW" -s
 # The sink: accepts, and from there on says and does nothing.  Not a socketley
 # runtime — see the block above $SLOW for why one cannot serve here.  The
 # accepted sockets are kept in a list on purpose: dropping the last reference
@@ -267,10 +267,7 @@ sleep 0.4
 
 # ── 1. The operator is not locked out ───────────────────────────────────────
 #
-# Issued while the callback is still inside its budget, so this command really
-# does have to wait behind the stall — and the elapsed time below is what proves
-# it waited rather than being answered by a daemon that was never blocked.  On
-# the parent commit this is the exit 2 the header records.
+# Issued while the callback is still inside its budget.
 T0=$(date +%s.%N)
 STATS_RC=0
 STATS_OUT=$("$BIN" stats dl_byst 2>&1) || STATS_RC=$?
@@ -284,13 +281,42 @@ if [ "$STATS_RC" = "0" ]; then pass; else
          "stats said: ${STATS_OUT:-<nothing>}"
 fi
 
-# The stall was real.  Without this, a build that never ran the callback at all
-# — a broken dispatch, a script that failed to load — passes the assertion above
-# instantly and is reported as the fix working.
-if [ "$(echo "$ELAPSED > 0.3" | bc)" = "1" ]; then pass; else
-    fail "that stats call really did wait behind the stalled callback" \
-         "it came back in ${ELAPSED}s, which is too fast for a callback to have" \
-         "been holding the event loop — so nothing was being bounded here"
+# ── The control for it, and the one assertion in this file that INVERTED ────
+#
+# It used to read `ELAPSED > 0.3` on the STATS call: that command had to have
+# waited behind the stall, and the elapsed time was the evidence that a callback
+# was really holding the event loop.  Correct while dl_spin ran in the daemon,
+# which is what --daemon-process was doing for it.
+#
+# With every runtime in its own process the stall is in dl_spin's worker and the
+# daemon is not blocked -- so the old assertion demanded the very lock-out this
+# arrangement exists to prevent, and would now go green only on a build that had
+# lost the split.  Measured after the flag was removed: .0083s against a 0.3s
+# floor.
+#
+# What it guarded against is still real: a build where the callback never ran --
+# a broken dispatch, a script that failed to load -- answers stats instantly too
+# and would read as the split working.  So the same instrument is pointed at the
+# runtime that IS blocked.  dl_spin's own loop is inside the callback, so a
+# client of dl_spin waits; dl_byst answers throughout.  Two runtimes, one clock,
+# opposite answers -- which is a sharper claim than the original, because it
+# names the loop that is stalled instead of inferring it from one number.
+#
+# The first attempt at this asserted that dl_spin gave NO answer, and that was
+# wrong for a reason worth recording: the deadline is 1500ms, so a client that
+# waits longer than that gets its reply once the callback is stopped.  It has to
+# be the elapsed time, not the presence of a reply.
+S0=$(date +%s.%N)
+SPIN_DURING=$(printf 'hello-during\n' | timeout 8 nc -q 2 127.0.0.1 "$SPIN_PORT" 2>/dev/null || true)
+S1=$(date +%s.%N)
+SPIN_ELAPSED=$(echo "$S1 - $S0" | bc)
+
+if [ "$(echo "$SPIN_ELAPSED > 0.3" | bc)" = "1" ]; then pass; else
+    fail "control: the spinner's own clients wait behind its runaway callback" \
+         "dl_spin answered in ${SPIN_ELAPSED}s, which is too fast for a callback" \
+         "to have been holding its loop — so nothing was stalled anywhere, and" \
+         "the stats call above returning fast says nothing about the split" \
+         "dl_spin said: ${SPIN_DURING:-<nothing>}"
 fi
 
 wait "$SPIN_CLIENT" 2>/dev/null || true
@@ -484,9 +510,9 @@ printf 'function on_proxy_request(id, data)\n  socketley.log("PXWATCH saw " .. #
     > "$SOCKETLEY_TMPD/pxwatch.lua"
 
 create_ok "spinning proxy hook created" "$BIN" create proxy dl_px -p "$PX_PORT" \
-    --backend "127.0.0.1:$BE_PORT" --protocol tcp --lua "$SOCKETLEY_TMPD/pxspin.lua" --daemon-process -s
+    --backend "127.0.0.1:$BE_PORT" --protocol tcp --lua "$SOCKETLEY_TMPD/pxspin.lua" -s
 create_ok "watching proxy hook created" "$BIN" create proxy dl_px2 -p "$PX2_PORT" \
-    --backend "127.0.0.1:$BE2_PORT" --protocol tcp --lua "$SOCKETLEY_TMPD/pxwatch.lua" --daemon-process -s
+    --backend "127.0.0.1:$BE2_PORT" --protocol tcp --lua "$SOCKETLEY_TMPD/pxwatch.lua" -s
 ready_tcp 127.0.0.1 "$PX_PORT"  8 || echo "  NOTE: dl_px never accepted a connection"
 ready_tcp 127.0.0.1 "$PX2_PORT" 8 || echo "  NOTE: dl_px2 never accepted a connection"
 
@@ -528,7 +554,7 @@ fi
 # also be what a daemon that had stopped answering produced.
 TOP_RC=0
 TOP_OUT=$(timeout 30 "$BIN" create server dl_top -p "$TOP_PORT" --mode inout \
-              --lua "$TOP" --daemon-process -s 2>&1) || TOP_RC=$?
+              --lua "$TOP" -s 2>&1) || TOP_RC=$?
 "$BIN" remove dl_top >/dev/null 2>&1 || true
 
 if [ "$TOP_RC" = "1" ]; then pass; else
@@ -557,7 +583,7 @@ BADCTO="$SOCKETLEY_TMPD/badcto.lua"
 printf 'callback_timeout_ms = "soon"\nfunction on_message(m) end\n' > "$BADCTO"
 BC_RC=0
 BC_OUT=$(timeout 30 "$BIN" create server dl_bad -p "$((PORT + 11))" --mode inout \
-             --lua "$BADCTO" --daemon-process -s 2>&1) || BC_RC=$?
+             --lua "$BADCTO" -s 2>&1) || BC_RC=$?
 "$BIN" remove dl_bad >/dev/null 2>&1 || true
 if [ "$BC_RC" = "1" ]; then pass; else
     fail "a callback_timeout_ms that is not a number refuses the create" \

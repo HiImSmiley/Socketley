@@ -98,7 +98,7 @@ state() { "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print $7 }'; }
 
 # ── create -s, in the daemon ────────────────────────────────────────────────
 set +e
-OUT=$("$BIN" create server os_boom -p $((PB + 0)) --lua "$BOOM" --daemon-process -s 2>&1)
+OUT=$("$BIN" create server os_boom -p $((PB + 0)) --lua "$BOOM" -s 2>&1)
 RC=$?
 set -e
 # Exit 1 specifically, not merely non-zero.  2 is the fatal code, and a build
@@ -138,7 +138,7 @@ fi
 # Silence is golden is a rule here, so "the reason now reaches the caller" must
 # not have become "every create prints something".
 set +e
-OUT=$("$BIN" create server os_ok -p $((PB + 1)) --lua "$GOOD" --daemon-process -s 2>&1)
+OUT=$("$BIN" create server os_ok -p $((PB + 1)) --lua "$GOOD" -s 2>&1)
 RC=$?
 set -e
 if [ "$RC" = "0" ] && [ -z "$OUT" ]; then pass; else
@@ -181,7 +181,7 @@ if [ "$RC" = "0" ] && [ -z "$OUT" ]; then pass; else
 fi
 
 # ── start, on a runtime whose script raises ─────────────────────────────────
-"$BIN" create server os_restart -p $((PB + 2)) --lua "$BOOM" --daemon-process \
+"$BIN" create server os_restart -p $((PB + 2)) --lua "$BOOM" \
     >/dev/null 2>&1 || true
 set +e
 OUT=$("$BIN" start os_restart 2>&1)
@@ -217,8 +217,8 @@ fi
 # refusal.  A build that returned at the raise would leave os_pair2 down while
 # reporting only os_pair1, which is the shape this tree has already been fixed
 # for once (`start myproxy -i` started the proxy and then exited 1).
-"$BIN" create server os_pair1 -p $((PB + 3)) --lua "$BOOM" --daemon-process >/dev/null 2>&1 || true
-"$BIN" create server os_pair2 -p $((PB + 4)) --lua "$GOOD" --daemon-process >/dev/null 2>&1 || true
+"$BIN" create server os_pair1 -p $((PB + 3)) --lua "$BOOM" >/dev/null 2>&1 || true
+"$BIN" create server os_pair2 -p $((PB + 4)) --lua "$GOOD" >/dev/null 2>&1 || true
 set +e
 OUT=$("$BIN" start os_pair1 os_pair2 2>&1)
 RC=$?

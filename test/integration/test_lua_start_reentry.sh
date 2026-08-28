@@ -114,7 +114,7 @@ end"
 
 # ── 1. create with start = true ────────────────────────────────────────────
 RC=$(rc_of "$BIN" create server par_a -p "$P_A" --mode in \
-           --lua "$SOCKETLEY_TMPD/a.lua" --daemon-process -s)
+           --lua "$SOCKETLEY_TMPD/a.lua" -s)
 assert_eq "create returns when on_start creates and starts a runtime" "0" "$RC" \
     "non-zero here means the command never came back — which is what a daemon" \
     "deadlocked against its own runtime map does to every command after it"
@@ -131,7 +131,7 @@ assert_eq "the sub-server on_start asked for is actually serving" \
 
 # ── 2. create, then socketley.start ────────────────────────────────────────
 RC=$(rc_of "$BIN" create server par_b -p "$P_B" --mode in \
-           --lua "$SOCKETLEY_TMPD/b.lua" --daemon-process -s)
+           --lua "$SOCKETLEY_TMPD/b.lua" -s)
 assert_eq "create returns when on_start creates then starts separately" "0" "$RC" \
     "the other spelling, which deadlocks one lock acquisition later"
 assert_eq "the daemon still answers after that create too" "0" "$(rc_of "$BIN" ls)"
@@ -145,9 +145,9 @@ assert_eq "that sub-server is serving as well" \
 # shared mode, so this one deadlocked only against a queued writer rather than
 # always — the kind of intermittency that gets called a flake.
 create_ok "a runtime for the third parent to stop" "$BIN" create server sub_c \
-    -p "$S_C" --daemon-process -s
+    -p "$S_C" -s
 RC=$(rc_of "$BIN" create server par_c -p "$P_C" --mode in \
-           --lua "$SOCKETLEY_TMPD/c.lua" --daemon-process -s)
+           --lua "$SOCKETLEY_TMPD/c.lua" -s)
 assert_eq "create returns when on_start stops another runtime" "0" "$RC"
 assert_eq "the daemon still answers after that one" "0" "$(rc_of "$BIN" ls)"
 

@@ -278,7 +278,7 @@ hits() { grep -ac "$1" "$2" 2>/dev/null || true; }
 # runtime map, and a worker holds none — those calls are refused there by
 # design, which test_worker_lua_refusal.sh already covers.
 create_ok "RPC server created in the daemon" "$BIN" create server glob \
-    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" --daemon-process -s
+    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" -s
 ready_tcp 127.0.0.1 "$RPC_PORT" 10 || echo "  NOTE: the RPC server never accepted"
 ready_http 127.0.0.1 "$HTTP_PORT" /probe.txt 15 || echo "  NOTE: the HTTP target never answered"
 

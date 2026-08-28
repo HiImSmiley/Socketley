@@ -87,7 +87,7 @@ create_ok "server for the in-daemon client"         "$BIN" create server s_dmn -
 create_ok "client, --reconnect with no value"  "$BIN" create client c_inf -t "127.0.0.1:$S_INF" --reconnect -s
 create_ok "client, --reconnect 5"              "$BIN" create client c_cnt -t "127.0.0.1:$S_CNT" --reconnect 5 -s
 create_ok "client, no --reconnect"             "$BIN" create client c_off -t "127.0.0.1:$S_OFF" -s
-create_ok "client, --reconnect --daemon-process" "$BIN" create client c_dmn -t "127.0.0.1:$S_DMN" --reconnect --daemon-process -s
+create_ok "client, --reconnect" "$BIN" create client c_dmn -t "127.0.0.1:$S_DMN" --reconnect -s
 
 # ── Control ─────────────────────────────────────────────────────────────────
 #

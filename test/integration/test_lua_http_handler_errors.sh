@@ -88,7 +88,7 @@ end
 LUAEOF
 
 create_ok "server with an HTTP handler created" "$BIN" create server http_err \
-    -p "$PORT" --lua "$LUA" --daemon-process -s
+    -p "$PORT" --lua "$LUA" -s
 ready_tcp 127.0.0.1 "$PORT" 10 || echo "  NOTE: the runtime never accepted"
 
 # status PATH -> the HTTP status code, or 000 when nothing answered

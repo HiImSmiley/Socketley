@@ -127,7 +127,7 @@ end
 LUAEOF
 
 create_ok "runtime with timers created" "$BIN" create server tmr_cancel \
-    -p "$PORT" --lua "$LUA" --daemon-process -s
+    -p "$PORT" --lua "$LUA" -s
 ready_tcp 127.0.0.1 "$PORT" 10 || echo "  NOTE: the runtime never accepted"
 
 said() {
@@ -247,7 +247,7 @@ function on_start()
 end
 LUAEOF
 create_ok "self-stopping runtime created" "$BIN" create server tmr_selfstop \
-    -p "$STOP_PORT" --lua "$SLUA" --daemon-process -s
+    -p "$STOP_PORT" --lua "$SLUA" -s
 said "SI stopping self" 10 || true
 sleep 1
 

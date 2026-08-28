@@ -236,11 +236,11 @@ end
 LUAEOF
 
 create_ok "the script under test is created in the daemon" "$BIN" create server args \
-    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" --daemon-process -s
+    -p "$RPC_PORT" --mode in --lua "$RPC_LUA" -s
 ready_tcp 127.0.0.1 "$RPC_PORT" 10 || echo "  NOTE: the RPC server never accepted"
 
 create_ok "the pipe destination is created in the daemon" "$BIN" create server pipe_b \
-    -p "$PIPE_B_PORT" --mode in --lua "$SOCKETLEY_TMPD/pipe_b.lua" --daemon-process -s
+    -p "$PIPE_B_PORT" --mode in --lua "$SOCKETLEY_TMPD/pipe_b.lua" -s
 ready_tcp 127.0.0.1 "$PIPE_B_PORT" 10 || echo "  NOTE: pipe_b never accepted"
 
 # ── 1. socketley.create reports what it actually built ─────────────────────
@@ -300,28 +300,47 @@ assert_eq "...and the destination runtime receives the source's traffic" \
     "asserted after a payload sent on the same connection that was piped"
 
 # ── 4. tick_ms has one floor ───────────────────────────────────────────────
+#
+# `-s`, and it is load-bearing rather than tidiness.  `tick_ms` is a GLOBAL in
+# the script, so reading it means evaluating the script's top level, and that
+# happens where the script runs -- in the worker, at start.  A bare `create`
+# only compiles it, which is the whole of what the placeholder does.
+#
+# This block used to have no `-s` and passed, because --daemon-process was not
+# needed to make `create` load a script in the daemon: `create --lua x` there
+# loaded AND ran it, floor check included.  With every runtime in a worker the
+# floor is checked one command later.  That is the contract now -- a script runs
+# when its runtime starts -- and asserting the refusal at `create -s` is
+# asserting the same rule at the first command that can enforce it.
 cat > "$SOCKETLEY_TMPD/tick5.lua" <<'EOF'
 tick_ms = 5
 function on_tick(dt) end
 EOF
-TICK_OUT=$("$BIN" create server tickrt -p "$TICK_PORT" --daemon-process \
-           --lua "$SOCKETLEY_TMPD/tick5.lua" 2>&1) && TICK_RC=0 || TICK_RC=$?
+TICK_OUT=$("$BIN" create server tickrt -p "$TICK_PORT" \
+           --lua "$SOCKETLEY_TMPD/tick5.lua" -s 2>&1) && TICK_RC=0 || TICK_RC=$?
 assert_eq "tick_ms below the floor is refused rather than silently multiplied" \
           "1" "$TICK_RC" \
     "lua_context mapped anything under 10 to 100 and runtime_instance clamped" \
     "it to 10, so the same script ticked at two different rates depending on" \
     "which of the two rules you read; got: $TICK_OUT"
 assert_has "...and the refusal names the floor" "10" "$TICK_OUT" "got: $TICK_OUT"
-assert_eq "...and nothing was left behind" "0" \
-          "$("$BIN" ls 2>/dev/null | grep -c ' tickrt ' || true)"
+# Left `failed` rather than absent, and that is the other half of the same
+# change.  A create that refuses in the daemon builds nothing; a create that is
+# refused BY ITS WORKER has already put a runtime in the map, and what says so
+# is the state.  Asserting it is gone would be asserting the old command's
+# shape, not this one's contract.
+assert_eq "...and it is left failed rather than serving" "1" \
+          "$("$BIN" ls 2>/dev/null | awk '$2 == "tickrt" && tolower($7) == "failed"' | grep -c . || true)" \
+    "a runtime whose script the worker would not load must not read as Up:" \
+    "$("$BIN" ls 2>/dev/null | grep ' tickrt ' || echo '<not listed at all>')"
 
 # ── 5. self.port does not depend on the order the flags were typed ─────────
 cat > "$SOCKETLEY_TMPD/order.lua" <<'EOF'
 function on_start() socketley.log("SELFPORT=" .. tostring(self.port)) end
 EOF
-create_ok "--lua before -p" "$BIN" create server ord_late --daemon-process \
+create_ok "--lua before -p" "$BIN" create server ord_late \
     --lua "$SOCKETLEY_TMPD/order.lua" -p "$ORDER_PORT" -s
-create_ok "-p before --lua" "$BIN" create server ord_early --daemon-process \
+create_ok "-p before --lua" "$BIN" create server ord_early \
     -p "$((ORDER_PORT + 10))" --lua "$SOCKETLEY_TMPD/order.lua" -s
 sleep 0.6
 assert_eq "self.port is the port that was asked for, --lua written first" \

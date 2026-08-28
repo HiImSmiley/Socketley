@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test: --drain flushes what was queued, in a worker and in the daemon
+# Integration test: --drain flushes what was queued
 #
 # --drain had no behavioural test.  The flag appears once under test/, as a
 # string inside a name-resolution unit test that never starts a runtime, so
@@ -17,9 +17,19 @@
 # decoration: it is the only assertion here that fails if --drain becomes a
 # no-op.
 #
+# It used to run that pair TWICE, once in a worker and once in the daemon, with
+# a third assertion that the worker drained at least as well.  --daemon-process
+# is gone and every runtime is a worker, so the second pair was the same
+# configuration under a different name and the third assertion compared a number
+# with itself.  Both are removed rather than left passing: an assertion that
+# cannot fail is not coverage.  What it was guarding against is still worth
+# knowing -- --reconnect worked only in the daemon for a while, which was
+# invisible because the daemon was where tests looked -- and the guard now is
+# that there is nowhere else to look.
+#
 # Thresholds are ratios and floors, not the observed constants.  Measured on
 # this tree the two arms are 4,930,596 and 2,636,801 bytes, identical across
-# three rounds and identical between worker and daemon — but a figure that
+# three rounds — but a figure that
 # reproduces to the byte today is still a figure a buffer size could move, and
 # a test that pins it would fail for a reason that is not a defect.
 set -euo pipefail
@@ -43,7 +53,7 @@ bad() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  FAIL [$1]: $2"; }
 
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/socketley-drain.XXXXXX")
 cleanup() {
-    for r in dw_on dw_off dd_on dd_off; do
+    for r in dw_on dw_off; do
         "$BIN" stop "$r"   >/dev/null 2>&1 || true
         "$BIN" remove "$r" >/dev/null 2>&1 || true
     done
@@ -100,18 +110,15 @@ daemon_start "$BIN"
 
 W_ON=$(measure  dw_on  $((SL_PORT_BASE+320)) "--drain")
 W_OFF=$(measure dw_off $((SL_PORT_BASE+321)) "")
-D_ON=$(measure  dd_on  $((SL_PORT_BASE+322)) "--drain --daemon-process")
-D_OFF=$(measure dd_off $((SL_PORT_BASE+323)) "--daemon-process")
 
-echo "  worker:    --drain $W_ON B   without $W_OFF B"
-echo "  in-daemon: --drain $D_ON B   without $D_OFF B"
+echo "  --drain $W_ON B   without $W_OFF B"
 
 # ── Controls ────────────────────────────────────────────────────────────────
 #
 # Without these, "drain sent more than no-drain" is satisfied by a fixture that
 # sent nothing at all in the second arm — including one where the runtime never
 # started, the script never loaded, or the probe never connected.
-for pair in "worker:$W_OFF" "in-daemon:$D_OFF"; do
+for pair in "worker:$W_OFF"; do
     if [ "${pair#*:}" -gt 500000 ]; then ok
     else bad "control: the ${pair%%:*} fixture floods at all" \
              "the no-drain arm received ${pair#*:} B; a stop drops the queue but the socket buffer alone is more than this, so the flood did not happen"; fi
@@ -121,19 +128,6 @@ done
 if [ "$W_ON" -gt $((W_OFF * 3 / 2)) ]; then ok
 else bad "worker: --drain delivers more than a bare stop" \
          "with $W_ON B against $W_OFF B, the flag changed nothing a stop would not have done anyway"; fi
-
-if [ "$D_ON" -gt $((D_OFF * 3 / 2)) ]; then ok
-else bad "in-daemon: --drain delivers more than a bare stop" \
-         "with $D_ON B against $D_OFF B"; fi
-
-# ── And that it is not a daemon-only feature ────────────────────────────────
-#
-# The worker is the default since 8399bee.  A drain that only worked in the
-# daemon would be invisible to almost every user, and --reconnect was exactly
-# that until this week, so it is asserted rather than assumed.
-if [ "$W_ON" -gt $((D_ON * 4 / 5)) ]; then ok
-else bad "the worker drains as well as the daemon does" \
-         "worker $W_ON B against in-daemon $D_ON B — the flag is weaker in the mode that is the default"; fi
 
 echo ""
 echo "  passed: $PASS / $TOTAL"

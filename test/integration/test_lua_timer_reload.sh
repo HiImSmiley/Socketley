@@ -112,7 +112,7 @@ grew_by() {
 # "did the process survive the completion" is a question about the pid this test
 # already has, with no worker restart in between to hide the answer.
 create_ok "timer_rt created" "$BIN" create server timer_rt -p "$RT_PORT" \
-    --lua "$SCRIPT" --daemon-process -s
+    --lua "$SCRIPT" -s
 ready_tcp 127.0.0.1 "$RT_PORT" 10 || true
 
 # ─── CONTROL: the interval is actually running ──────────────────────────────

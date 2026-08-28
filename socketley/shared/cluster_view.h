@@ -45,6 +45,7 @@
 // acceptable is publishing this only when local membership changes: a remote
 // daemon joining or leaving moves none of the local map, and a view frozen at
 // the worker's fork would report a cluster that no longer exists.
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,6 +56,39 @@
 // correct.  If the include weight ever matters, the two structs move here and
 // cluster_discovery.h includes this instead — they own no behaviour.
 #include "cluster_discovery.h"
+
+// ── One cluster event, with everything it needs already resolved ────────────
+//
+// on_cluster_join / on_cluster_leave / on_group_change.  The daemon observes
+// them, and every runtime that wants one is somewhere else -- so the event has
+// to travel, and what travels is the ANSWER rather than the question.
+//
+// on_group_change is handed a members list built from the local map plus every
+// remote daemon's runtimes.  A worker could rebuild that from its own view and
+// its replica map; that version is deliberately not written, because two
+// derivations of one list are two things to keep level and the worker's two
+// inputs are each stale in a different way.  The daemon resolves it once, and a
+// script in a worker is then handed the same table a script in the daemon is,
+// by construction rather than by agreement.
+//
+// Here rather than in worker_protocol.h because both sides need it and only one
+// of them is a wire: lua_context runs the callbacks off this struct whether it
+// arrived over a socket or was built one function away.
+struct cluster_ev_member
+{
+    std::string daemon;
+    std::string host;
+    uint16_t    port{0};
+};
+
+struct cluster_ev_wire
+{
+    uint8_t     kind{0};        // cluster_event::type_t
+    std::string daemon_name;    // join / leave
+    std::string host;           // join
+    std::string group_name;     // group_change
+    std::vector<cluster_ev_member> members;   // group_change
+};
 
 // One process's read-only answer to "what does the cluster look like".
 //

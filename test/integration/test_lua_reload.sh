@@ -128,7 +128,7 @@ write_script "$IN_LUA"  IN-V1
 write_script "$OOP_LUA" OOP-V1
 
 create_ok "in-daemon runtime created with a script" "$BIN" create server rl_in \
-    -p "$IN_PORT" --mode in --lua "$IN_LUA" --daemon-process -s
+    -p "$IN_PORT" --mode in --lua "$IN_LUA" -s
 create_ok "worker-backed runtime created with a script" "$BIN" create server rl_oop \
     -p "$OOP_PORT" --mode in --lua "$OOP_LUA" -s
 ready_tcp 127.0.0.1 "$IN_PORT" 8  || echo "  NOTE: rl_in never accepted"
