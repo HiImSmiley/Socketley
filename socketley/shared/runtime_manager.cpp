@@ -15,30 +15,9 @@
 namespace
 {
 
-// ─── What stands in for a runtime this process does not hold ────────────────
-//
-// The daemon's placeholder for an out-of-process runtime is a real instance of
-// the real type, and that is right there: it is persisted, inspected, cascaded
-// and started, so it has to answer everything a runtime answers.
-//
-// A replica in a worker is not that.  It answers six fields and is never
-// started, never persisted and never asked for a connection — and building it
-// out of the real type would cost what the real type costs.  proxy_instance
-// carries three fd-indexed tables of 65536 entries, about two megabytes before
-// it has taken a connection, and a worker would hold one per proxy in the
-// daemon, in every worker.  Ten workers and ten proxies is two hundred
-// megabytes of tables nothing will ever index into.
-//
-// So the replica is the base class and a type tag.  Deliberately file-local:
-// nothing outside this function can name the class, so nothing can be written
-// that reaches past runtime_instance's interface into it — which is the same
-// protection the daemon's placeholder gets from being a real instance, arrived
-// at from the other direction.
-//
-// The three pure virtuals are the whole of the implementation.  setup() answers
-// false because a replica cannot be started, and nothing calls it: start() on an
-// out-of-process instance returns before setup(), which is what
-// mark_out_of_process() is for.
+// A replica is the base class plus a type tag, file-local so nothing can reach
+// past runtime_instance's interface into it, because building one out of the
+// real type would cost megabytes of fd-indexed tables per proxy per worker.
 class replica_instance final : public runtime_instance
 {
 public:
@@ -46,10 +25,7 @@ public:
         : runtime_instance(type, name)
     {
         // Every read that distinguishes a runtime elsewhere from one here goes
-        // through this flag — socketley.send routes on it, cmd_send routes on
-        // it, and start()/stop() return before touching a ring because of it.
-        // A replica is out of process by definition: it is the record of a
-        // runtime in another one.
+        // through this flag, and a replica is out of process by definition.
         mark_out_of_process();
     }
 
@@ -68,8 +44,8 @@ void runtime_manager::mark_replica()
 void runtime_manager::replica_note(std::string_view op, std::string_view name,
                                    const replica_entry& e)
 {
-    // Only a replica has one of these to correct.  A daemon calling this would
-    // be writing over the authority with a copy of itself.
+    // Only a replica has one of these to correct, since a daemon calling this
+    // would write over the authority with a copy of itself.
     if (!m_replica)
         return;
 
@@ -82,10 +58,9 @@ void runtime_manager::replica_note(std::string_view op, std::string_view name,
         {
             if (it == runtimes.end())
                 return;
-            // Out of the map, NOT destroyed.  A script is mid-frame and is
-            // entitled to be holding the pointer get() handed it one statement
-            // ago -- the same reason install_replica refuses to run here at
-            // all, answered rather than avoided.
+            // Out of the map and not destroyed, because a script is mid-frame
+            // and entitled to hold the pointer get() handed it one statement
+            // ago.
             dropped = std::move(it->second);
             runtimes.erase(it);
         }
@@ -103,11 +78,9 @@ void runtime_manager::replica_note(std::string_view op, std::string_view name,
         }
         else
         {
-            // start / stop.  The row must already exist -- the daemon just
-            // acted on it -- and only its state moved.  Nothing is created
-            // here: a name this worker has never been told about is one the
-            // next push will bring, and inventing a row for it would be this
-            // process having an opinion rather than a copy.
+            // start / stop, where the row must already exist and only its
+            // state moved, because inventing a row would be this process
+            // having an opinion rather than a copy.
             if (it == runtimes.end())
                 return;
             it->second->set_replicated_state(e.state);
@@ -120,23 +93,14 @@ void runtime_manager::replica_note(std::string_view op, std::string_view name,
 
 void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
 {
-    // Never under a script frame.  A replica the snapshot has dropped is freed
-    // below, and a Lua callback is entitled to be holding the pointer get()
-    // handed it — socketley.get and socketley.send both take one and use it
-    // unlocked, on the rule that removal happens on this same thread.
-    //
-    // True today by construction: the only caller is the worker's control pump,
-    // which runs between turns of its event loop with nothing of the script's on
-    // the stack.  This is the belt for the day something calls it from inside a
-    // callback instead, and the cost of taking it is that the replica is one
-    // push interval older than it could be — which is the contract anyway.
+    // Never under a script frame, because a replica the snapshot has dropped
+    // is freed below and a callback may be holding the pointer get() handed
+    // it.
     if (script_frame_live())
         return;
 
-    // Freed with the lock released, like every other instance destruction in
-    // this file: the map's mutex does not nest, and a destructor is entitled to
-    // reach back in.  A replica holds no fds, no ring registration and no
-    // interpreter, so this is a deallocation and nothing more.
+    // Freed with the lock released, like every other instance destruction
+    // here, and for a replica that is a deallocation and nothing more.
     std::vector<std::unique_ptr<runtime_instance>> dropped;
     {
         std::unique_lock lock(mutex);
@@ -145,11 +109,9 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
         {
             auto it = runtimes.find(e.name);
 
-            // A type change under one name means the daemon removed a runtime
-            // and created another with the same name between two pushes.  The
-            // object is rebuilt rather than re-tagged: get_type() is fixed at
-            // construction, and a replica reporting the old type would be the
-            // confidently-wrong answer this whole file is written against.
+            // A type change under one name means the daemon replaced the
+            // runtime between two pushes, so the object is rebuilt rather than
+            // re-tagged, get_type() being fixed at construction.
             if (it != runtimes.end() && it->second->get_type() != e.type)
             {
                 dropped.push_back(std::move(it->second));
@@ -163,27 +125,24 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
                 it = runtimes.emplace(e.name, std::move(inst)).first;
             }
 
-            // Updated in place, so a pointer taken out of get() one statement
-            // ago still names this object.  The state is stored straight rather
-            // than through start()/stop(): those are transitions this process
-            // is not making, and this is a report of one somebody else made.
+            // Updated in place so a pointer from get() still names this
+            // object, with the state stored straight rather than through
+            // start()/stop(), which are transitions this process is not
+            // making.
             runtime_instance* inst = it->second.get();
             inst->set_port(e.port);
             inst->set_owner(e.owner);
             inst->set_group(e.group);
             inst->set_replicated_state(e.state);
 
-            // The same two fields the daemon writes into ITS placeholder from a
-            // stats frame, so reported_connection_count() answers the pushed
-            // figure here for the same reason it does there.  The detail text is
-            // empty because a replica has none: `stats` is a command the daemon
-            // serves, not something a script reads off the map.
+            // The same two fields the daemon writes into its placeholder from
+            // a stats frame, with the detail text empty because a replica has
+            // none.
             inst->set_worker_stats({}, e.connections);
         }
 
-        // Whatever the daemon no longer has.  Collected first because erasing
-        // from a map while walking it is the one thing this loop must not get
-        // wrong, and because the frees happen outside the lock.
+        // Whatever the daemon no longer has, collected first because erasing
+        // from a map while walking it is what this loop must not get wrong.
         for (auto it = runtimes.begin(); it != runtimes.end();)
         {
             const bool still_there =
@@ -202,25 +161,13 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
     dropped.clear();
 }
 
-// ─── ONE PLACE THAT DECIDES WHAT A RUNTIME MAY BE CALLED ────────────────────
-//
-// The rule was written out inside create() and nowhere else, so rename() -- the
-// other way a runtime acquires a name, and the one `import` uses -- enforced
-// nothing at all.  A name reaches the filesystem (state_persistence::config_path),
-// a JSON document (cmd_ls, cmd_ps), a command line (the IPC protocol is one
-// command per line) and a cluster file name.  This character set is what all
-// four can carry without escaping.
-//
-// Restored here during the merge of fix/p0-crashes: it lived between create()
-// and try_create(), and removing the duplicate create() took it with it.
+// One place that decides what a runtime may be called, because a name reaches
+// the filesystem, a JSON document, a command line and a cluster file, and this
+// character set is what all four carry without escaping.
 bool runtime_manager::valid_name(std::string_view name)
 {
-    // A leading '-' is refused for the same class of reason as a leading '.':
-    // not because the string is malformed, but because the CLI can never
-    // address it again.  `create client --help` made a runtime called
-    // "--help", and then `remove --help` parses as a flag and `remove <id>`
-    // does not exist -- so it could be created and never deleted, and it sat
-    // in `ls` until its state file was removed by hand.
+    // A leading '-' is refused because the CLI can never address it again:
+    // `create client --help` made a runtime that could not be removed.
     if (name.empty() || name.size() > 128 || name[0] == '.' || name[0] == '-')
         return false;
     for (char c : name)
@@ -234,22 +181,9 @@ bool runtime_manager::valid_name(std::string_view name)
 runtime_manager::create_result
 runtime_manager::try_create(runtime_type type, std::string_view name)
 {
-    // ─── A replica's map is read-only, and this is where that is enforced ───
-    //
-    // A runtime built here would exist in this worker and in no other process:
-    // not persisted, not listed by `ls`, not reachable by name from anywhere
-    // else, and gone at the next snapshot.  Worse, it would be built against
-    // this worker's ring by a manager whose map the daemon overwrites every
-    // couple of seconds.
-    //
-    // Unreachable today -- socketley.create is one of the calls a worker
-    // refuses, and it stays refused until there is a way to carry the request to
-    // the daemon and bring an answer back.  This is the guard for the day
-    // somebody removes the refusal without building that.
-    //
-    // It sits in try_create rather than in create(): create() is now a wrapper
-    // over this, so a guard in the wrapper would be a guard one caller could
-    // walk around.
+    // A replica's map is read-only, enforced in try_create rather than the
+    // create() wrapper, so no caller can walk around it -- a runtime built
+    // here would exist in this worker alone and vanish at the next snapshot.
     if (m_replica)
     {
         LOG_WARN("runtime_manager::create in a worker process: the map here is a "
@@ -279,7 +213,7 @@ runtime_manager::try_create(runtime_type type, std::string_view name)
 
 bool runtime_manager::start(std::string_view name, event_loop& loop)
 {
-    // See create().  Starting a replica would move a copy's state and bind
+    // See create(): starting a replica would move a copy's state and bind
     // nothing anywhere.
     if (m_replica)
     {
@@ -292,28 +226,10 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
     // has to be in its hands by the time start() below reaches that code.
     publish_endpoints();
 
-    // ─── The lock covers the lookup, and stops there ────────────────────────
-    //
-    // runtime_instance::start() runs the script's on_start, and a script is
-    // entitled to call socketley.create / .start / .stop / .remove from it —
-    // bringing a sub-server up as its parent starts is the obvious thing to
-    // write.  Every one of those reaches back into this manager and asks for
-    // this same mutex, create() and remove() in unique mode; `mutex` is a
-    // std::shared_mutex, which is not recursive.  Holding it across the
-    // callback therefore deadlocked the daemon's only event-loop thread against
-    // itself: measured, both threads parked in futex_do_wait, the IPC socket
-    // still accepting connections and answering none, which reads as a hang
-    // rather than a crash and takes every other runtime the daemon serves with
-    // it.  `create` never returned, and the operator's evidence was a daemon
-    // that had to be killed.
-    //
-    // Taking the pointer out and calling through it unlocked is not a weakening
-    // of the invariant: get() has always handed raw runtime_instance* to callers
-    // that use them outside any lock — socketley.get, socketley.send and the
-    // whole cross-runtime Lua surface are written that way — because removal
-    // happens on this same thread, so nothing can free the object between these
-    // two statements.  What changes is only that the callback is no longer
-    // executed underneath a lock it is allowed to reach for.
+    // The lock covers the lookup and stops there, because start() runs
+    // on_start, which may call back into this manager for the same
+    // non-recursive shared_mutex and deadlock the one event-loop thread
+    // against itself.
     runtime_instance* inst = nullptr;
     {
         std::shared_lock lock(mutex);
@@ -334,43 +250,10 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
     return started;
 }
 
-// ─── WHY EVERY CASCADE CARRIES A SET OF WHERE IT HAS BEEN ───────────────────
-//
-// `owner` is a plain string on the instance and nothing validates it:
-// set_owner() is a bare setter, `attach --owner` writes whatever it is given,
-// a script's socketley.create writes the creating runtime's name, and the
-// daemon's restore writes back whatever the state file says.  So the ownership
-// relation is a directed GRAPH, and it is free to contain a cycle — including
-// the shortest one, a runtime that names itself.
-//
-// The three functions below walk that graph, and they used to walk it with no
-// memory of where they had been.  A runtime that owns itself is its own child,
-// so the recursion had no bottom.  Measured on the parent commit, two commands
-// and no traffic at all:
-//
-//     socketley attach server selfown 18760 --owner selfown
-//     socketley stop selfown
-//     failed to connect to daemon          <- SIGSEGV, core dumped
-//
-// Every other runtime that daemon was holding went with it.  A two-runtime
-// cycle (a owns b, b owns a) did the same, and `remove` on either shape did not
-// crash but stopped answering — remove_children() recurses without exhausting
-// the stack, so the daemon kept its socket and had to be killed.
-//
-// The owner is persisted and restored, so a cycle survives a restart: a daemon
-// that met one was permanently one command away from dying again.  That is why
-// the fix is here and not only at the setters — validating set_owner() would
-// leave every cycle already written to disk arriving exactly as before.
-//
-// The set is threaded through rather than being a member because a cascade is
-// one call tree: two of them must not share state, and a script's on_stop is
-// entitled to start a second one from inside the first.
-//
-// It also makes the double walk below harmless.  The loop in stop_cascading()
-// descends into a child's subtree and then calls stop_cascading() on the child,
-// which descends into the same subtree again; without the set that was
-// redundant work on every stop, and with it the second pass finds everything
-// already marked and returns immediately.
+// Ownership is a directed graph that nothing validates, so every cascade
+// carries the set of names it has descended into -- threaded through rather
+// than a member, because a script's on_stop may start a second cascade inside
+// the first.
 bool runtime_manager::stop(std::string_view name, event_loop& loop)
 {
     // See create().
@@ -401,15 +284,9 @@ bool runtime_manager::stop_cascading(std::string_view name, event_loop& loop,
     if (!inst->stop(loop))
         return false;
 
-    // Every runtime that had a connection routed to or from this one has to let
-    // go of it, and this is the chokepoint every departure goes through -- the
-    // cascade below re-enters here once per runtime it takes down, so a subtree
-    // is covered without a second call site.
-    //
-    // Here rather than in the departing runtime's own teardown because in
-    // another process the teardown's frames never arrive: see route_op::forget
-    // for the measurement and for the kill case, which no amount of ordering
-    // fixes.  In one process this is the second notification and finds nothing.
+    // Every runtime that had a connection routed to or from this one has to
+    // let go, done here because in another process the departing runtime's own
+    // frames never arrive.
     route_relay::forget(this, name);
 
     // Marked before descending, and the answer is what decides whether to
@@ -455,75 +332,33 @@ bool runtime_manager::stop_cascading(std::string_view name, event_loop& loop,
     }
 
     // This runtime is no longer a routable group member, nor are any children
-    // that went down with it.  One publish covers the lot.
+    // that went down with it, and one publish covers the lot.
     publish_endpoints();
     return true;
 }
 
-// A runtime instance is the storage for its own io_requests: the accept
-// request, the timers, and — through the connection structs it owns — one set
-// per connection.  io_uring keeps whatever addresses we hand it, so destroying
-// an instance while any of its completions is still queued leaves the event
-// loop reading freed memory; that is the segfault in event_loop::run() on
-// `req->owner`.  Nulling req->owner in teardown() does not save us, because
-// that convention only carries while there is still an object there to read the
-// null out of.
-//
-// So removal never destroys.  The instance leaves the map — which is what ps,
-// stats, start, rename and the rest look at, so it is gone as far as anyone can
-// tell, and its name is free again — and lands here instead, to be freed once
-// the loop reports that nothing it submitted is still in the ring.
+// Removal never destroys, because an instance is the storage for its own
+// io_requests and io_uring keeps whatever addresses it was handed; the
+// instance leaves the map and is freed once the loop reports nothing of its is
+// still in the ring.
 void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
 {
     if (!inst)
         return;
 
-    // An instance that never reached setup() never put an io_request of its own
-    // into the ring, so nothing in the RING can point into it and it goes now.
-    // That covers create-then-reject-a-flag, and external runtimes, which do no
-    // I/O of their own — and which have to keep being dropped untouched, the way
-    // removal has always treated them, rather than being handed the SIGTERM
-    // that stopping one sends.
-    //
+    // An instance that never reached setup() put no io_request in the ring,
+    // which covers create-then-reject-a-flag and external runtimes, which must
+    // keep being dropped untouched.
     // ─── The ring is not the only holder ───────────────────────────────────
-    //
-    // The C++ stack is another, and it is reachable from a script.
-    // socketley.remove is bound in the interpreter every callback runs in, and a
-    // subscriber calling it on its OWN runtime is standing on frames inside the
-    // very lua_context this `return` would destroy — the unique_ptr is by value,
-    // so returning here IS the free.  dispatch_publish re-resolves each name
-    // before it delivers, which protects the other runtimes in its loop and
-    // cannot protect the one that is executing.
-    //
-    // The reachable case is a script's TOP LEVEL removing its own runtime.  It
-    // runs inside `create`, before the runtime has started and so before it has
-    // armed anything; register_bindings() runs before the chunk, so
-    // socketley.remove is already bound; and the top level runs inside a
-    // lua_deadline::scope, so a frame is live for all of it.  Measured with
-    // this line's guard deleted — the log's last word, then nothing:
-    //
-    //     [lua selfrm_top] TOP: about to remove myself
-    //     Segmentation fault (core dumped)
-    //
-    // It was first found through a never-started runtime reached by a PUBLISH.
-    // That way in is closed now — delivery requires a running runtime — and the
-    // test moved to the top level rather than being deleted with it.  A running
-    // runtime was never at risk and still is not: it has armed io, so it takes
-    // the graveyard below.
-    //
-    // The deferral costs one health tick.  The instance is out of the map here
-    // exactly as before — ps, stats, start and rename cannot see it and its name
-    // is free — and reap_retired() frees it on the next sweep, with the stack
-    // empty.
+    // The C++ stack is the other holder: a script's top level removing its own
+    // runtime stands on frames inside the lua_context this return would
+    // destroy, so the free is deferred one health tick.
     if (!inst->has_armed_io() && !script_frame_live())
         return;
 
-    // Every caller that can reach a running runtime stops it first, so this is
-    // a backstop rather than a path.  It has to be here all the same: retiring
-    // a runtime that is still armed would turn the old crash into something
-    // quieter and worse — a runtime nobody can see or name that keeps serving
-    // traffic for the rest of the daemon's life.  Done with the map lock
-    // released, because on_stop may run Lua that calls back into the manager.
+    // A backstop rather than a path, because retiring a still-armed runtime
+    // would leave one nobody can see or name still serving traffic; done with
+    // the map lock released, since on_stop may run Lua.
     if (inst->get_state() == runtime_running)
     {
         if (event_loop* loop = inst->get_event_loop())
@@ -548,21 +383,15 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
         }
     }
 
-    // Clear out whatever the ring has finished with.  This can never reach the
-    // instance being retired right now — it has only just stopped, and its last
-    // completions are still in the ring — which is why the daemon's periodic
-    // timer reaps as well.  Without that second caller the most recently
-    // removed runtime waits for the next removal, and the last one a daemon
-    // ever removes waits for shutdown.
+    // Clear out whatever the ring has finished with, which can never reach the
+    // instance being retired right now, so the daemon's periodic timer reaps
+    // as well.
     if (reap_loop)
         retired -= std::min(retired, reap_retired(*reap_loop));
 
     // The warning below says nothing until 32 instances are waiting, and a
-    // graveyard far below that already costs whole runtimes — a proxy is two
-    // megabytes of fd-indexed tables before it has taken a single connection,
-    // six once its connection pools are counted.  Nothing has ever read
-    // retired_count(), so the size was unobservable between "empty" and "32";
-    // this makes it readable for anyone who turns debug logging on.
+    // graveyard far below that already costs whole runtimes, so the size is
+    // readable here with debug logging on.
     if (logger::g_level <= log_debug)
     {
         std::string waiting = "retired runtime instances waiting: "
@@ -578,16 +407,9 @@ void runtime_manager::retire(std::unique_ptr<runtime_instance> inst)
     }
 }
 
-// See the declaration.  One question, asked in the two places that would
-// otherwise run a runtime_instance's destructor on the spot.
-//
-// Conservative on purpose: it says "a callback is running somewhere on this
-// thread", not "a callback belonging to THIS instance is running".  The narrow
-// question cannot be asked — a subscriber may publish, which runs another
-// runtime's subscriber, which may remove the first one, so the instance whose
-// frames are live is not always the instance being freed — and the cost of the
-// broad answer is one health tick of deferral for a free that was going to
-// happen anyway.
+// Conservative on purpose: it says a callback is running somewhere on this
+// thread, because the narrow question cannot be asked and the broad answer
+// costs one health tick of deferral.
 bool runtime_manager::script_frame_live()
 {
 #ifndef SOCKETLEY_NO_LUA
@@ -609,11 +431,9 @@ void runtime_manager::publish_offthread_stats()
     if (!m_offthread_stats.load(std::memory_order_relaxed))
         return;
 
-    // A shared lock, never an exclusive one.  Everything that mutates the map
-    // runs on this same thread, so a shared lock is enough to keep the map
-    // stable here, and taking it exclusively would make the event-loop thread
-    // wait on whatever a reader is in the middle of.  Each instance guards its
-    // own published text, and holds that guard for one move.
+    // A shared lock and never an exclusive one, because everything that
+    // mutates the map runs on this thread and an exclusive lock would make it
+    // wait on a reader.
     std::shared_lock lock(mutex);
     for (auto& [name, instance] : runtimes)
         instance->publish_offthread_stats();
@@ -621,43 +441,18 @@ void runtime_manager::publish_offthread_stats()
 
 size_t runtime_manager::reap_retired(const event_loop& loop)
 {
-    // The daemon's health timer is the only fixed-period call the manager gets
-    // on the event-loop thread, and the published figures have to be refreshed
-    // from that thread or not at all — see
-    // runtime_instance::publish_offthread_stats().  Hanging the sweep here
-    // rather than adding a second timer keeps it on the one caller that already
-    // ticks (every 2 s), and it costs nothing at all when nothing off-thread is
-    // reading.  Before the graveyard lock, because shared_mutex does not nest.
+    // Hung off the health timer, which is the only fixed-period call the
+    // manager gets on the event-loop thread, and before the graveyard lock
+    // because shared_mutex does not nest.
     publish_offthread_stats();
 
     if (loop.owner_table_full())
         return 0;
 
-    // Not from inside a callback.  retire() calls this on its way out, and
-    // retire() is reachable from socketley.remove — so on that path this sweep
-    // runs with Lua frames underneath it, and an instance those frames belong
-    // to could be sitting in the graveyard.  The health timer calls this with
-    // an empty stack and takes it then.
-    //
-    // ─── This half has no case anyone has managed to reach ──────────────────
-    //
-    // Said plainly so the next reader does not take it for proved.  The
-    // shortcut in retire() above IS reachable and has a test that dies without
-    // it; this one is the same rule applied two lines later, and the case it
-    // would catch needs an instance that is in the graveyard, owes the ring
-    // nothing, and has a live frame — all at once.  It could not be built:
-    // inflight only falls when event_loop::run() dispatches completions, and it
-    // is not dispatching while a Lua frame is on the stack, so an instance
-    // stopped inside a callback still owes the ring whatever its teardown
-    // submitted.  Two attempts are on record — a subscriber removing itself and
-    // then a second runtime to force the sweep, and the same with a client whose
-    // target refuses — and neither crashed with both guards deleted.
-    //
-    // It stays because it costs one predicated load on a path that runs every
-    // two seconds, and because the rule it enforces is the one the class is
-    // written around rather than the one instance that happens to reach it.
-    // Removing it would mean re-deriving that argument the next time the
-    // ordering changes.
+    // Not from inside a callback, because retire() reaches here from
+    // socketley.remove -- though no case has been built where this half fires,
+    // since inflight only falls when the loop dispatches and it does not
+    // dispatch under a Lua frame.
     if (script_frame_live())
         return 0;
 
@@ -708,9 +503,9 @@ size_t runtime_manager::reap_retired(const event_loop& loop)
 
 bool runtime_manager::remove(std::string_view name)
 {
-    // See create().  Removing a replica takes the copy out of this worker's map
-    // and leaves the runtime running in the daemon, until the next snapshot puts
-    // the copy back — an answer that is wrong twice.
+    // See create(): removing a replica takes the copy out of this worker's map
+    // and leaves the runtime running in the daemon until the next snapshot
+    // puts it back.
     if (m_replica)
     {
         LOG_WARN("runtime_manager::remove in a worker process: the map here is a "
@@ -732,10 +527,9 @@ bool runtime_manager::remove(std::string_view name)
 
     retire(std::move(inst));
 
-    // See stop_cascading().  Removal reaches here for a runtime that was never
-    // started as well as for one that was stopped a moment ago, and both are
-    // correct: forget_runtime finds nothing in the first case and nothing again
-    // in the second.
+    // See stop_cascading(): removal reaches here for a runtime that was never
+    // started as well as one just stopped, and forget_runtime finds nothing
+    // either way.
     route_relay::forget(this, name);
 
     // The name is free and the endpoint is gone; a proxy still routing to it
@@ -766,7 +560,7 @@ size_t runtime_manager::retired_count() const
 
 bool runtime_manager::rename(std::string_view old_name, std::string_view new_name)
 {
-    // See create().  Nothing in the Lua API renames, so this is the guard for a
+    // See create(): nothing in the Lua API renames, so this is the guard for a
     // call site that does not exist yet.
     if (m_replica)
     {
@@ -777,8 +571,7 @@ bool runtime_manager::rename(std::string_view old_name, std::string_view new_nam
 
     std::unique_lock lock(mutex);
 
-    // The same rule create() enforces, and it was missing here — see
-    // valid_name().  This is the door `import` comes through.
+    // The same rule create() enforces, on the door `import` comes through.
     if (!valid_name(new_name))
         return false;
 
@@ -811,8 +604,8 @@ std::vector<std::string> runtime_manager::get_children(std::string_view parent_n
     return children;
 }
 
-// The public spellings start a fresh walk.  See the note above stop() for why
-// every walk carries a set of the names it has already descended into.
+// The public spellings start a fresh walk, each carrying the set of names it
+// has already descended into.
 void runtime_manager::stop_children(std::string_view parent_name, event_loop& loop)
 {
     cascade_seen seen;
@@ -833,8 +626,8 @@ void runtime_manager::stop_children_cascading(std::string_view parent_name,
     auto children = get_children(parent_name);
     for (const auto& child : children)
     {
-        // Marked on the way in.  Without this a child that owns its own parent
-        // sends the next line straight back here with the same argument.
+        // Marked on the way in, or a child that owns its own parent sends the
+        // next line straight back here with the same argument.
         if (!seen.insert(child).second)
             continue;
 
@@ -864,19 +657,9 @@ void runtime_manager::remove_children_cascading(std::string_view parent_name,
 
 void runtime_manager::stop_all(event_loop& loop)
 {
-    // Names, not pointers, and the lock released before any of them is stopped
-    // — the same shape as dispatch_publish() below and for a superset of its
-    // reason.  stop() runs on_stop, a script is entitled to call
-    // socketley.create / .remove from there, and both take this mutex in unique
-    // mode; holding it across the callback deadlocked the daemon against itself
-    // in start(), and this is the same call one level up.  Here it would do it
-    // while the daemon was trying to exit, which is a shutdown that never
-    // completes and a process that needs SIGKILL.
-    //
-    // Names rather than pointers because this one is a loop: an on_stop that
-    // removes another runtime erases it from the map, and a pointer collected
-    // before that would be stopped afterwards.  get() re-checks, and answers
-    // null for anything that has since gone.
+    // Names rather than pointers, with the lock released before any of them is
+    // stopped, because on_stop may create or remove and a pointer collected
+    // beforehand could name an instance already gone.
     std::vector<std::string> names;
     {
         std::unique_lock lock(mutex);
@@ -896,60 +679,20 @@ void runtime_manager::stop_all(event_loop& loop)
 
 void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_view channel, std::string_view message)
 {
-    // Names, not pointers — the same shape as dispatch_cluster_events() below,
-    // for the same reason.  This used to snapshot a raw runtime_instance* for
-    // every runtime and then call on_publish_dispatch() on each with the lock
-    // released, on the strength of a comment asserting that subscribe callbacks
-    // do not modify the map.  Nothing enforced that, and socketley.remove is
-    // bound in the very VM those callbacks run in: one subscriber calling it
-    // left every pointer behind it in the snapshot naming an instance the
-    // manager had already taken out of the map, and a second removal — or the
-    // daemon's next reap — is all it takes for that storage to go.  Re-resolving
-    // the name means a runtime that left mid-dispatch is skipped rather than
-    // dereferenced.
-    //
-    // Only runtimes that have a Lua VM are collected.  on_publish_dispatch()'s
-    // whole body is "if (m_lua) m_lua->dispatch_publish(...)", so a runtime
-    // without one has nowhere to deliver to, and a PUBLISH on a daemon of plain
-    // C++ runtimes now costs one lock and a pointer test each instead of a
-    // string copy and a virtual call each.  If on_publish_dispatch() is ever
-    // overridden to do something that is not Lua, this filter has to go with it.
-    // Out of this address space first, and before any Lua runs.  A subscriber is
-    // allowed to call straight back into the manager — socketley.remove is bound
-    // in the very VM these run in — and a frame already written to a socket
-    // cannot be affected by what it does.
+    // Names rather than pointers, re-resolved per delivery because
+    // socketley.remove is bound in the very VM these callbacks run in, and
+    // only runtimes that have a Lua VM are collected at all.
     if (m_publish_sink)
         m_publish_sink(cache_name, channel, message);
 
-    // A runtime that lives in a worker process is skipped here on purpose; see
-    // set_publish_sink().  The frame goes to the process that is serving the
-    // traffic, and its subscribers run there.
-    //
-    // This used to say the placeholder "holds a fully loaded copy of the same
-    // script, so it answers lua()".  It does not: load_lua_script() only asks
-    // whether the file parses when the runtime is out of process, and builds no
-    // interpreter at all.  The skip is still right; the reason given for it was
-    // not.
+    // A runtime that lives in a worker process is skipped on purpose, because
+    // the frame goes to the process serving the traffic and its subscribers
+    // run there.
     // ─── And only a runtime that is running ─────────────────────────────────
-    //
-    // A runtime that is not running executes no script.  That is the sentence
-    // 23e5181 established for the timers and that severing subscriptions at
-    // `stop` extended to this API — but severing at `stop` can only answer for
-    // a runtime that stopped, and there is a second way to be not-running with
-    // live registrations: never having started.  A script's top level runs when
-    // the script is LOADED, which is `create`, so a top-level
+    // A runtime that is not running executes no script, decided here at the
+    // delivery rather than at the registration, because a top-level
     // socketley.subscribe is a live handler on a runtime `ls` reports as
-    // Created.  Measured on the parent commit, one PUBLISH on the linked cache:
-    //
-    //     [lua] CREATED-STATE HIT msg=m1 state=created
-    //
-    // There is no event to sever at — nothing happened to that runtime between
-    // the load and the publish — so this half is decided here, where the
-    // delivery is, rather than where the registration is made.  self.send from
-    // such a handler reaches the clients of a listener that was never opened.
-    //
-    // `failed` is covered by the same test and wants to be: a runtime whose
-    // setup() refused is not serving anything either.
+    // Created.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
@@ -965,16 +708,9 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
 
     for (const auto& n : names)
     {
-        // Re-resolve, then drop the lock again before the callback runs: a
-        // subscriber can call straight back into the manager, and remove() takes
-        // this same mutex exclusively — holding it across the callback would
-        // deadlock rather than dangle, which is not an improvement.
-        //
-        // The state is re-read here as well as filtered above, and for the same
-        // reason the name is re-resolved: socketley.stop is bound in the very VM
-        // these run in, so one subscriber can take another down in the middle of
-        // this fan-out.  Deciding once, before the loop, would deliver to it
-        // afterwards anyway.
+        // Re-resolve and re-read the state, then drop the lock before the
+        // callback runs, because one subscriber can stop or remove another in
+        // the middle of this fan-out.
         runtime_instance* inst;
         {
             std::shared_lock lock(mutex);
@@ -990,23 +726,13 @@ void runtime_manager::dispatch_publish(std::string_view cache_name, std::string_
 
 void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector<cluster_event>& events)
 {
-    // A remote daemon joined, left, or its groups changed — which is exactly
-    // when the remote half of the endpoint table is stale.  Republish before
-    // any Lua runs, so a callback that opens a connection routes on the new
-    // membership rather than the one that just expired.
+    // Republish before any Lua runs, so a callback that opens a connection
+    // routes on the new membership rather than the one that just expired.
     publish_endpoints();
 
-    // Snapshot names under read lock — same pattern as dispatch_publish().
-    // Re-lookup each name before invoking callbacks so that if a prior callback
-    // removed/stopped a runtime, we safely skip it instead of dereferencing
-    // a dangling pointer.
-    //
-    // "or stopped" is what the state test below makes true.  The comment above
-    // has always claimed it and only the map was ever checked, so a runtime a
-    // previous callback stopped went on receiving the rest of the batch — and,
-    // with no state test at all, so did one that had never been started: a
-    // cluster callback is a callback, and dispatch_publish's sentence is not
-    // about publishes.  A runtime that is not running executes no script.
+    // Snapshot names under the read lock and re-look-up each before invoking,
+    // skipping a runtime a previous callback removed or stopped -- because a
+    // runtime that is not running executes no script.
     std::vector<std::string> names;
     {
         std::shared_lock lock(mutex);
@@ -1017,11 +743,9 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 
 #ifndef SOCKETLEY_NO_LUA
     // ─── Resolved once, for every consumer ──────────────────────────────────
-    //
-    // The members list for a group_change is built from this daemon's
-    // cluster_discovery and its own map, and neither is available in a worker.
-    // So it is resolved HERE, once per event rather than once per runtime, and
-    // what travels is the answer.  See cluster_ev_wire.
+    // The members list is resolved here, once per event rather than once per
+    // runtime, because neither this daemon's cluster_discovery nor its map is
+    // available in a worker.
     std::vector<cluster_ev_wire> resolved;
     resolved.reserve(events.size());
     for (const auto& ev : events)
@@ -1080,8 +804,8 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 
         for (const auto& w : resolved)
         {
-            // Re-validate: a previous event callback may have removed this
-            // runtime, or stopped it.  Both end this runtime's batch.
+            // Re-validate, because a previous event callback may have removed
+            // or stopped this runtime, and both end its batch.
             {
                 std::shared_lock lock(mutex);
                 auto it = runtimes.find(n);
@@ -1097,29 +821,16 @@ void runtime_manager::dispatch_cluster_events([[maybe_unused]] const std::vector
 
 void runtime_manager::publish_endpoints()
 {
-    // Never from a replica.  This function's whole job is to build the
-    // authoritative answer to "where is every runtime" out of the local map and
-    // push it into everything that routes — and in a worker the local map is a
-    // copy, the authoritative answer arrives as a frame, and the copy is missing
-    // the half of it that comes from the cluster.  See mark_replica().
-    //
-    // Guarded here rather than only at the five callers, because it is the
-    // callers that make it hard: create/start/stop/remove/rename each call this
-    // on their way out, and every one of them is already refused above — so this
-    // line is unreachable through them, and is here for the sixth caller.
+    // Never from a replica, guarded here rather than only at the five callers,
+    // because those are all refused above and this line is here for the sixth.
     if (m_replica)
         return;
 
     auto tbl = std::make_shared<endpoint_table>();
 
-    // Every running member of every group, and what it declares — null when it
-    // declares nothing, which is a fact about that group and not a member to be
-    // skipped over.  Folded into one declaration per group below, once here
-    // rather than once inside every proxy that forwards to the group.
-    //
-    // Ordered by member name, and by std::map rather than by sorting later,
-    // because the fold decides the order of the Allow header a client is given
-    // and that must not change with the order a hash map is walked in.
+    // Every running member of every group and what it declares, ordered by
+    // member name through std::map because the fold decides the order of the
+    // Allow header a client is given.
     std::map<std::string, std::map<std::string, std::shared_ptr<const route_table>>> group_members;
 
     {
@@ -1127,11 +838,9 @@ void runtime_manager::publish_endpoints()
         for (const auto& [name, inst] : runtimes)
         {
             const uint16_t port = inst->get_port();
-            // A runtime listening on a unix socket has no port, and publishes
-            // its socket path in the host field with the port left at 0.  That
-            // is the same (path, 0) shape the proxy keys a unix backend by, and
-            // it cannot be mistaken for a network endpoint for the same reason:
-            // the path is absolute and no hostname is.
+            // A unix listener publishes its socket path in the host field with
+            // the port at 0, which cannot be mistaken for a network endpoint
+            // because the path is absolute and no hostname is.
             const std::string_view listen_path = inst->get_listen_path();
             if (port == 0 && listen_path.empty())
                 continue;
@@ -1143,41 +852,19 @@ void runtime_manager::publish_endpoints()
                                     ? runtime_endpoint{"127.0.0.1", port}
                                     : runtime_endpoint{std::string(listen_path), 0});
 
-            // By group: running only, which is what get_by_group() filtered on.
-            // A member that is merely configured has nothing listening.
-            //
-            // And `running` is not the whole of that question.  For a runtime
-            // that binds in a worker, this side sets `running` when the child is
-            // forked, not when it binds — so `running` alone put an address into
-            // every gateway's group while nothing was accepting on it.  See
-            // runtime_instance::endpoint_live(), which is the rest of the
-            // question and is answered by whoever owns the child.  Always true
-            // for a runtime that binds here, so nothing about the in-process
-            // case changes.
-            //
-            // A unix listener is deliberately NOT offered as a group member.
-            // The group path resolves a member to an AF_INET address per
-            // request and has no route for anything else, so an entry it cannot
-            // dial would take a turn of the round-robin and answer 503 with it.
-            // This is what a unix runtime already got before it could be
-            // published at all — a group has never carried one — and it is said
-            // here so the exclusion is a decision rather than a leftover.  By
-            // name and by explicit `unix:` path, both of which name exactly one
-            // peer, it works.
+            // By group: running and endpoint_live(), because a worker-backed
+            // runtime is `running` from the fork rather than from the bind,
+            // and never a unix listener, which the group path has no route to
+            // dial.
             const std::string_view group = inst->get_group();
             const bool running = (inst->get_state() == runtime_running) &&
                                  inst->endpoint_live();
             if (!group.empty() && running && listen_path.empty())
                 tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
 
-            // And what this runtime says it will answer, if its script says so
-            // at all.  The declaration belongs to the handler and is published
-            // to whoever routes to it — see shared/route_table.h.  A runtime
-            // that declares nothing gets no entry, and a proxy in front of it
-            // forwards exactly as it did before this existed.
-            // The worker's copy first: a runtime in another process has no
-            // interpreter here, so lua() is null and the declaration can only
-            // have come up the control socket.
+            // And what this runtime says it will answer, taking the worker's
+            // copy first because a runtime in another process has no
+            // interpreter here.
             std::shared_ptr<const route_table> decl = inst->worker_routes();
             if (!decl)
             {
@@ -1192,12 +879,9 @@ void runtime_manager::publish_endpoints()
         }
     }
 
-    // One declaration per group, describing every member at once: a path only
-    // some of them declare is dropped and a path all of them declare keeps the
-    // union of their methods.  A single member that declares nothing therefore
-    // leaves the group with nothing — which is the point, because a request to
-    // the group may land on that member and it has told us nothing about what
-    // it answers.  See route_table::merge_alternative.
+    // One declaration per group describing every member at once, so a single
+    // member that declares nothing leaves the group with nothing, which is the
+    // point.
     for (const auto& [group, members] : group_members)
     {
         route_table merged;
@@ -1223,10 +907,8 @@ void runtime_manager::publish_endpoints()
             tbl->set_group_routes(group, std::make_shared<const route_table>(std::move(merged)));
     }
 
-    // Remote members, from the cluster's last scan.  Same filter as
-    // cluster_discovery::get_remote_group(), which this replaces on the
-    // connection path: running, with a port, and reached at the host the remote
-    // daemon advertised.
+    // Remote members from the cluster's last scan, filtered exactly as
+    // cluster_discovery::get_remote_group() does.
     if (m_cluster)
     {
         for (const auto& daemon : m_cluster->get_all_daemons())
@@ -1239,28 +921,17 @@ void runtime_manager::publish_endpoints()
         }
     }
 
-    // Hand the finished table out.  Immutable from here on, so every runtime
-    // holds the same one and none of them copies it.
+    // Hand the finished table out, immutable from here on, so every runtime
+    // holds the same one.
     {
         std::shared_lock lock(mutex);
         for (const auto& [_, inst] : runtimes)
             inst->set_endpoints(tbl);
     }
 
-    // The other half of the same snapshot: not where a runtime is, but who
-    // answers a request addressed to its name.  Rebuilt wholesale for the same
-    // reason and at the same moments — a name that has just been taken, freed
-    // or renamed must not still resolve to the object it used to mean.
-    //
-    // Running only.  A cache that is merely configured has no store loaded, and
-    // a request that arrives for it is better answered "no such target" than
-    // served out of an empty one.
-    //
-    // A worker's placeholder answers with its supervisor, which is a sink that
-    // cannot serve inline: the request is parked and put on the control socket
-    // instead of being computed on this thread.  Before that existed the
-    // placeholder answered null and a runtime in another process was simply
-    // unreachable by name.
+    // The other half of the same snapshot -- who answers a request addressed
+    // to a name -- rebuilt wholesale at the same moments, running only, with a
+    // worker's placeholder answering through its supervisor.
     {
         std::shared_lock lock(mutex);
         m_requests.clear_sinks();
@@ -1273,21 +944,13 @@ void runtime_manager::publish_endpoints()
         }
     }
 
-    // The per-shard entries, from the one side that knows how many processes a
-    // name has.  Outside the lock above for the reason the endpoint sink is:
-    // this walks the daemon's supervisor map, and holding the runtime map
-    // across that is how one runtime ends up waiting on another's child.
-    //
-    // After the by-name pass and never instead of it: a request that names the
-    // runtime still goes to shard 0, which is what a caller asking for the
-    // RUNTIME means.  See shared/shard_target.h.
+    // The per-shard entries, after the by-name pass and never instead of it,
+    // outside the lock because this walks the daemon's supervisor map.
     if (m_shard_sink_publisher)
         m_shard_sink_publisher(m_requests);
 
-    // And to whatever lives outside this address space.  Last, and outside the
-    // lock: the sink writes to sockets, and holding the runtime map across a
-    // write to a process that may not be reading is how an unrelated runtime
-    // ends up waiting on a proxy's child.
+    // And to whatever lives outside this address space, last and outside the
+    // lock, because the sink writes to sockets.
     if (m_endpoint_sink)
         m_endpoint_sink(*tbl);
 }
