@@ -318,13 +318,25 @@ python3 "$SOCKETLEY_TMPD/hold.py" "$PEER_PORT" 3 "$HOLD_OUT" "$STOPFILE" &
 HOLD_PID=$!
 for _ in $(seq 1 100); do grep -q READY "$HOLD_OUT" 2>/dev/null && break; sleep 0.05; done
 
-# Wait for the worker's pushed figure to catch up before reading any of them, so
-# that a slow push is not reported as a wrong answer.
+# Two pushes have to land, not one, and waiting only for the first is what made
+# this red under Sanitize while Release passed.  `stats` reads the DAEMON's copy
+# of peer's figure; socketley.get() in the controller reads the CONTROLLER's
+# replica of the map, which the daemon pushes on its own schedule.  The
+# controller ran in the daemon until --daemon-process was removed, where the two
+# were one read.
+#
+# So the controller is asked again until its answer agrees, bounded -- and the
+# bound failing is a real answer, not a longer wait: it says the replica never
+# caught up.
 for _ in $(seq 1 100); do [ "$(stat_conns peer)" = "3" ] && break; sleep 0.1; done
 BUSY_STAT=$(stat_conns peer)
 
-poke busy
-said 'CTL busy group=' 8 || true
+for _ in $(seq 1 100); do
+    poke busy
+    said 'CTL busy group=' 8 || true
+    [ "$(field busy get)" = "$BUSY_STAT" ] && break
+    sleep 0.1
+done
 
 assert_eq "control: stats sees the three connections" "3" "$BUSY_STAT" \
     "the oracle every assertion below compares against; if this is not 3 the" \
