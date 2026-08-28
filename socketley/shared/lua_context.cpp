@@ -5,9 +5,9 @@
 // and the callers that read a load failure back are not conditional on Lua.
 namespace lua_diag
 {
-    // Thread-local, which is what makes this safe where a cerr swap is not.
-    // A CLI command runs on the daemon's own thread and each worker has its
-    // own; nothing here is shared and nothing needs a lock.
+    // Thread-local, which is what makes this safe where a cerr swap is not,
+    // because a CLI command runs on the daemon's own thread and each worker
+    // has its own.
     static thread_local std::string s_text;
 
     void clear() { s_text.clear(); }
@@ -19,9 +19,8 @@ namespace lua_diag
         s_text += line;
     }
 
-    // See the declaration.  The empty name is not an error case — the daemon's
-    // own configuration file and the SOCKETLEY_LUA_TIMEOUT_MS parse are Lua
-    // diagnostics belonging to no runtime, and "[lua]" is what they mean.
+    // The empty name is not an error case, because the daemon's configuration
+    // file and the SOCKETLEY_LUA_TIMEOUT_MS parse belong to no runtime.
     std::string tag(std::string_view runtime_name)
     {
         std::string out("[lua");
@@ -70,99 +69,45 @@ namespace lua_diag
 #endif
 
 // ─── The callback deadline ──────────────────────────────────────────────────
-//
-// See lua_context.h for what this is and why it has this shape.  What lives
+// See lua_context.h for what this is and why it has this shape; what lives
 // here is the state it is enforced through.
 namespace lua_deadline
 {
-// How many VM instructions between hook calls.
-//
-// The hook's whole body on the ordinary path is one clock read and one
-// comparison — steady_clock::now() is a vDSO read on this platform, about 20ns
-// — so at this count it costs on the order of 20ns per 10,000 instructions,
-// which is noise beside the interpreter itself.  It is also 100,000 times finer
-// than the smallest deadline anyone would set, so the granularity of the check
-// is never what decides when a runaway is caught.
-//
-// The real cost of having a hook at all is elsewhere and is not tunable by this
-// number — but it is NOT what this comment said until it was measured, and the
-// difference matters, so both halves are written down here.
-//
-// What was claimed: LuaJIT drops the state to the interpreter while a count or
-// line hook is installed, because a compiled trace does not call back out.
-//
-// What is true on this build (LuaJIT 2.1.1767980792, measured 2026-08-25, three
-// runs of the same 12.8M-iteration Lua loop in one process):
-//
-//     lua_context's library set, no hook            497 / 454 / 480 ms
-//     + luaopen_jit, no hook                        120 / 120 / 120 ms
-//     + luaopen_jit AND this hook                   120 / 134 / 120 ms
-//     lua_context's set AND this hook  <- default   644 / 660 / 624 ms
-//
-// A count hook does not stop trace compilation: the third row is the second
-// row.  What it does cost is the hooked dispatch path, which checks on every
-// VM instruction rather than every hook_count of them — lj_vm_inshook is
-// 10.75% of the worker's CPU in a profile of a compute-shaped callback, and
-// costs 15.1% of throughput end to end (bench_lua_share.sh --lua
-// echo_compute.lua: 11772/12107 msg/s with the hook against 13361/14124
-// without, non-overlapping).  Against a callback-shaped script it is not
-// resolvable at all: echo.lua measured 42581/43130 against 42571/42644.
-//
-// The fourth row is 5.2-5.5x the second, and the reason is the *library*, not
-// the hook — see the note at open_libraries in the constructor below.  The
-// deadline is not what makes Lua slow here; not opening LuaJIT's own jit
-// library is.
-//
-// The claim above is still the reason the mechanism cannot simply be kept
-// alongside a compiled trace, and that half survives measurement: with
-// luaopen_jit called, a 300 ms deadline stopped `while true do end` never,
-// against 300.2 ms without it, and `for i = 1, 1e18 do h = h + 1 end` never,
-// against 300.1 ms — a hard ceiling inside the hook did not help either,
-// because the hook is not reached from inside a trace.  So installing nothing
-// when the deadline is off is still worth the branch, and turning the compiler
-// on is a decision about the deadline rather than about performance.
+// How many VM instructions between hook calls, which is noise beside the
+// interpreter itself -- the real cost of having a hook at all is the hooked
+// dispatch path and the jit library it forbids, not this number.
 static constexpr int hook_count = 10000;
 
 // ── The armed invocation ────────────────────────────────────────────────────
-//
-// Thread-local, not per-interpreter.  The daemon serves every runtime from one
-// thread and each worker has one of its own, so this is per event loop, which
-// is the resource the deadline exists to protect.  Nesting across interpreters
-// then works out to the right thing on its own: a publish that runs another
-// runtime's subscriber spends the budget of the callback that published.
+// Thread-local and not per-interpreter, because the deadline protects one
+// event loop, which makes nesting across interpreters work out on its own.
 static thread_local unsigned                              t_depth{0};
 static thread_local std::chrono::steady_clock::time_point t_deadline{};
 static thread_local const char*                           t_what{nullptr};
-// Which runtime's script the armed invocation belongs to; null for the two
-// that belong to none.  Set and cleared beside t_what, which makes the pairing
-// impossible to get half right.
+// Which runtime's script the armed invocation belongs to, set and cleared
+// beside t_what so the pairing cannot be got half right.
 static thread_local const char*                           t_runtime{nullptr};
 static thread_local uint32_t                              t_limit_ms{0};
-// Whether this invocation has already been reported.  The hook raises every
-// time it fires past the deadline, but says so once: a script that wraps its
-// own runaway in pcall() swallows the first error and is raised in again a few
-// thousand instructions later, and that must stop the script without also
-// filling the log with one line per raise.
+// Whether this invocation has already been reported, because the hook raises
+// every time it fires past the deadline and a script that pcalls its own
+// runaway would otherwise fill the log.
 static thread_local bool                                  t_reported{false};
 // How many callback invocations are on this thread's stack, counted whether or
-// not the deadline is armed.  t_depth cannot answer that question: it stays 0
-// when the mechanism is off, deliberately, because remaining_ms() has to keep
-// answering -1 so socketley.http keeps the timeout the script asked for.  See
-// in_callback() in the header for who asks and why the difference matters.
+// not the deadline is armed, which t_depth deliberately does not answer.
 static thread_local unsigned                              t_frames{0};
 
 uint32_t default_ms()
 {
-    // Read once.  A getenv per lua_context would be a syscall-free but still
-    // pointless string parse on a path that runs at every create.
+    // Read once, because a parse per lua_context would run at every create for
+    // nothing.
     static const uint32_t value = [] () -> uint32_t {
         const char* e = std::getenv("SOCKETLEY_LUA_TIMEOUT_MS");
         if (!e || !*e)
             return builtin_default_ms;
 
-        // Anything that is not a number is a typo in an operator's unit file,
-        // and silently falling back to the default would hide it.  Anything
-        // negative is the same.  0 is meaningful: it turns the deadline off.
+        // Anything that is not a non-negative number is a typo in an
+        // operator's unit file, and 0 is meaningful because it turns the
+        // deadline off.
         char*     end = nullptr;
         long long v   = std::strtoll(e, &end, 10);
         if (end == e || *end != '\0' || v < 0 || v > 3600000)
@@ -181,12 +126,8 @@ scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
     : m_outermost(t_depth == 0 && limit_ms != 0)
     , m_first_frame(t_frames == 0)
 {
-    // Unconditional, and reset at the boundary rather than decremented, for the
-    // reason the destructor gives about t_depth: a path that skips an inner
-    // destructor must not leave this stuck above zero.  Stuck here is quieter
-    // than a stuck deadline and worse — nothing would ever be freed on the spot
-    // again, and a create/remove churn would grow the graveyard until the health
-    // timer's two-second sweep became the only thing draining it.
+    // Unconditional and reset at the boundary rather than decremented, because
+    // stuck above zero here means nothing is ever freed on the spot again.
     ++t_frames;
 
     if (m_outermost)
@@ -198,24 +139,18 @@ scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
         t_limit_ms = limit_ms;
         t_reported = false;
     }
-    // Counted even when this scope did not arm, so that the matching destructor
-    // does not have to decide anything and an inner scope can never disarm the
-    // outer one's deadline.  A scope constructed while the deadline is off does
-    // not arm and does not count: t_depth stays 0, remaining_ms() stays -1, and
-    // socketley.http keeps the timeout the script asked for.
+    // Counted even when this scope did not arm, so an inner scope can never
+    // disarm the outer one's deadline, while a scope constructed with the
+    // deadline off neither arms nor counts.
     if (t_depth != 0 || m_outermost)
         ++t_depth;
 }
 
 scope::~scope() noexcept
 {
-    // The outermost scope resets rather than decrements, and that is the one
-    // thing in here that has to be true no matter what happened inside it.  A
-    // leaked depth would leave the deadline armed and already expired after the
-    // callback that armed it had returned — so the NEXT callback, an innocent
-    // one, would be stopped on its first hook fire, and so would every callback
-    // after that.  Decrementing makes that outcome reachable from any path that
-    // skips an inner destructor; resetting at the boundary does not.
+    // The outermost scope resets rather than decrements, because a leaked
+    // depth would leave the deadline armed and already expired for every
+    // innocent callback after it.
     if (m_outermost)
     {
         t_depth    = 0;
@@ -228,9 +163,8 @@ scope::~scope() noexcept
         --t_depth;
     }
 
-    // Same rule, same reason, on the frame count.  The outermost frame is the
-    // one that knows the stack is about to be empty of callbacks, so it says so
-    // outright instead of trusting that every inner scope was unwound.
+    // Same rule and reason on the frame count: the outermost frame knows the
+    // stack is about to be empty and says so outright.
     if (m_first_frame)      t_frames = 0;
     else if (t_frames != 0) --t_frames;
 }
@@ -251,50 +185,10 @@ long remaining_ms() noexcept
     return static_cast<long>(left);
 }
 
-// The hook.  Runs on the hot path of every script, so the ordinary return is
-// two loads and a compare.
-//
-// ─── It reports before it raises, and that is still worth a line ────────────
-//
-// This used to be the only report there was.  Every callback was invoked inside
-// a `catch (const sol::error&)`, and that catch only ever fired because sol2's
-// panic handler happens to throw and the throw happens to unwind out of the
-// interpreter — which it does not in the Sanitize build, so the diagnostic was
-// dead in exactly the configuration the nightly job uses.
-//
-// 2a1e135..df02e6f removed every one of those catches and made the calls
-// protected, so a deadline now arrives at the call site as an invalid result
-// and IS reported there, in both builds, with the script and line attached —
-// which this line cannot know.  That is the primary report now, and it is the
-// one to read.
-//
-// This line stays because one path still has nothing else.  A script that
-// wraps its own slow work in pcall() — `local ok = pcall(fetch_all)` is an
-// ordinary thing to write — catches the deadline error itself, and the call
-// site never sees a failure to report; without this the runtime would simply
-// stop making progress with nothing in the log to say why.
-//
-// It used to be two.  on_http_request was the one callback the sweep did not
-// reach — still a sol::function, its call site checking nothing at all — so a
-// deadline there was invisible unless it was written here.  It is a protected
-// call now and its call site reports like the rest.
-//
-// So it is deliberately short, and deliberately not a copy of the error text:
-// this line is the event, the call site's line is the diagnosis.
-//
-// No C++ object with a destructor is alive at the raise: lua_error unwinds by
-// whatever means LuaJIT was built for, and a std::string here would be the one
-// allocation that leaks when that turns out to be longjmp.
-//
-// The deadline is NOT pushed forward after it fires, and that is deliberate.
-// Leaving it expired means the hook raises again on the next few thousand
-// instructions, which is what closes the obvious way around this: a script that
-// writes `while true do pcall(spin) end` swallows the raise inside pcall, and
-// the only thing that ends it is the next raise landing on the outer loop
-// instead.  The hook count is a global countdown rather than a per-frame one,
-// so it lands there within a few thousand fires — a fraction of a second — and
-// the invocation ends.  A grace period after each fire would give the protected
-// frame all of it and the outer loop none, and never end.
+// The hook reports before it raises, and this line stays only for the path
+// with nothing else -- a script that pcalls its own slow work -- with no C++
+// object alive at the raise and the deadline deliberately left expired so a
+// `while true do pcall(spin) end` still ends.
 static void hook(lua_State* L, lua_Debug*)
 {
     if (t_depth == 0)
@@ -308,10 +202,9 @@ static void hook(lua_State* L, lua_Debug*)
     if (!t_reported)
     {
         t_reported = true;
-        // Two formats rather than one built with lua_diag::tag(): that returns
-        // a std::string, and the paragraph above is about what may be alive
-        // when luaL_error unwinds by whatever means LuaJIT was built for.
-        // Nothing here allocates.
+        // Two formats rather than one built with lua_diag::tag(), because that
+        // returns a std::string and nothing here may allocate when luaL_error
+        // unwinds.
         if (t_runtime && *t_runtime)
             std::fprintf(stderr,
                          "[lua %s] %s hit its %ums deadline and was stopped\n",
@@ -332,8 +225,7 @@ void install(lua_State* L, uint32_t limit_ms)
     if (limit_ms == 0)
     {
         // Off means off, down to not paying for it: with no count hook LuaJIT
-        // compiles again.  An operator who has measured the hook and decided
-        // against it gets the interpreter they had before this existed.
+        // compiles again.
         lua_sethook(L, nullptr, 0, 0);
         return;
     }
@@ -347,39 +239,17 @@ void lua_context::install_deadline_hook()
     lua_deadline::install(m_lua.lua_state(), m_deadline_ms);
 }
 
-// ─── The trace compiler, tied to the deadline, because it is one decision ───
-//
-// LuaJIT's compiler is initialised by luaopen_jit and by nothing else — see the
-// note at open_libraries for what else was tried and measured not to work.
-// Opening it is worth 3.8-4.1x on a hot loop, and 5.2-5.5x against what this
-// daemon runs today.
-//
-// It is opened exactly when no hook is installed, because those are the same
-// decision rather than two.  A compiled trace does not call a hook back, so
-// with the compiler on a runaway callback cannot be interrupted: measured,
-// `while true do end` against a 300 ms deadline stops in 300.2 ms as this tree
-// stands and never once luaopen_jit has been called.  Coupling it to a limit of
-// 0 therefore adds NO new failure mode — at 0 there is no hook to defeat, so an
-// operator who has already decided against the deadline gets the compiler with
-// it, and nobody on the default is affected at all.
-//
-// One direction, once.  There is no supported way back: luajit.h is not
-// vendored, so LUAJIT_MODE_ENGINE|LUAJIT_MODE_OFF would mean hand-written
-// constants against a header this tree does not carry.  So this is called from
-// the one point where m_deadline_ms is final — after the script's top level has
-// run and its `callback_timeout_ms`, if it declared one, has been read.  A
-// script cannot raise the deadline after the compiler is on, because there is
-// nowhere left to raise it from; `reload-lua` builds a fresh lua_context
-// (runtime_instance::reload_lua_script) rather than reusing this state, so a
-// reloaded script cannot inherit a compiler its own deadline forbids either.
+// The trace compiler is opened exactly when no hook is installed, because a
+// compiled trace calls no hook back and the two are one decision -- and once
+// only, from the point where m_deadline_ms is final, since there is no
+// supported way back.
 void lua_context::enable_jit_if_unbounded()
 {
     if (m_deadline_ms != 0)
         return;
 
-    // luaopen_jit is a module opener and leaves its table on the stack.
-    // Restoring the top is right where popping a count is merely correct today:
-    // the count is LuaJIT's to change, and this file would have to notice.
+    // luaopen_jit is a module opener and leaves its table on the stack, so the
+    // top is restored rather than a count popped, which is LuaJIT's to change.
     lua_State* L  = m_lua.lua_state();
     const int  top = lua_gettop(L);
     luaopen_jit(L);
@@ -388,114 +258,23 @@ void lua_context::enable_jit_if_unbounded()
 
 lua_context::lua_context()
 {
-    // ─── THE MISSING LIBRARY, AND WHY IT IS STILL MISSING ───────────────────
-    //
-    // `jit` is not in this list, and LuaJIT's trace compiler is therefore never
-    // initialised in this process: luaopen_jit is not even linked into the
-    // binary (nm finds no such symbol), because nothing references it and the
-    // linker leaves lib_jit.o in the archive.  Every Lua callback this daemon
-    // has ever run has run in the interpreter.
-    //
-    // That is not free.  Measured 2026-08-25 on one hot loop, three runs:
-    // adding luaopen_jit takes 497/454/480 ms down to 120/120/120 — 3.8-4.1x —
-    // and against what the daemon actually runs today (this set plus the
-    // deadline hook, 644/660/624 ms) it is 5.2-5.5x.  A profile of a
-    // compute-shaped callback confirms it from the other side: not one sample
-    // in an anonymous executable mapping, and the hot symbols are lj_BC_* and
-    // lj_ffh_* — bytecode dispatch, no compiled code anywhere.
-    //
-    // sol::lib::jit does NOT do this.  Passed to open_libraries it leaves the
-    // global `jit` nil and the compiler off; so does calling
-    // luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE|LUAJIT_MODE_ON) by hand, which
-    // returns 1 to say it accepted the mode and then changes nothing measurable
-    // (453/455/468 ms).  The compiler needs luaopen_jit's own initialiser, and
-    // there is no narrower way in.
-    //
-    // It stays out because of what it costs, not because nobody noticed: with
-    // the compiler on, a runaway callback can no longer be stopped.  See the
-    // measured 2x2 at hook_count above — `while true do end` and a counted
-    // for-loop both ran forever against a 300 ms deadline that stops both in
-    // 300.1 ms today.  lua_deadline exists because that failure takes the whole
-    // daemon with it, not one runtime.
-    //
-    // So this is a live trade-off with both sides priced, and not an oversight:
-    // 5.2-5.5x on compute-shaped scripts against the only mechanism that can
-    // interrupt one.  Anyone changing this line should read lua_deadline first.
+    // `jit` is left out deliberately, at a measured 5.2-5.5x on compute-shaped
+    // scripts, because with the compiler on a runaway callback can no longer
+    // be interrupted -- and neither sol::lib::jit nor luaJIT_setmode is a
+    // narrower way in.
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
                          sol::lib::math, sol::lib::os, sol::lib::io,
                          sol::lib::package);
 
-    // ─── THIS IS NOT A SANDBOX, AND SAYING SO IS THE POINT ──────────────────
-    //
-    // What used to be here removed five names — os.execute, os.remove,
-    // os.rename, os.tmpname, os.exit — under the heading "dangerous os
-    // functions".  Four of those five bought nothing.  `io` is open, so
-    // io.popen("...") is a shell and io.open(path, "w") truncates any file this
-    // uid can write; `package` is open, so package.loadlib maps arbitrary
-    // native code; `base` is open, so load/loadstring/dofile/loadfile compile
-    // anything a handler can produce.  Removing os.execute while io.popen sits
-    // beside it does not deny a capability, it hides where the capability is.
-    //
-    // That is worse than leaving it alone.  A script author who sees os.remove
-    // come back nil concludes the daemon protects its files, and it does not.
-    // Anyone deciding whether to accept a handler from a colleague was reading
-    // a boundary that was never enforced anywhere.
-    //
-    // And the capability is not one to take away.  Handlers legitimately read
-    // and write files — a logging pipeline appends, a config-driven handler
-    // reads its table off disk — so closing `io` would break supported use for
-    // the sake of a fence with a gate next to it.
-    //
-    // THE HONEST STATEMENT, which the man page now carries in these words: a
-    // Lua handler runs with the daemon's full privileges.  Treat a handler the
-    // way you would treat a program you are about to run as that user, because
-    // that is what it is.  What keeps an untrusted local user from supplying
-    // one is the permission on the IPC socket — see daemon_handler::setup() —
-    // not anything in this interpreter.
-    //
-    // ─── WHAT IS STILL REMOVED, AND ON WHAT GROUNDS ─────────────────────────
-    //
-    // Two names, and the test is not "could a script misuse this" — every name
-    // here fails that test.  It is: does ONE call damage the process that every
-    // other runtime shares, in a way no other single call does?  That is a
-    // guard against an accident in a handler that is trusted, which is a real
-    // thing to want and is not a security claim.
-    //
-    // os.exit() ends the daemon.  A handler is very often a standalone script
-    // that grew into one, and standalone scripts end with os.exit; copied in as
-    // written it takes down every runtime in the process, from inside a
-    // callback, with no error anywhere.  Yes, a determined script can reach the
-    // same end through io.popen and a signal — that is the point of the
-    // paragraphs above — but it cannot reach it by accident.
+    // This is not a sandbox and says so: `io`, `package` and `base` are open,
+    // so a Lua handler runs with the daemon's full privileges, and what stays
+    // removed is only what one call can do to the whole process by accident --
+    // os.exit ends the daemon.
     m_lua["os"]["exit"] = sol::nil;
 
-    // ─── os.setlocale, which reaches further than any name yet named ─────────
-    //
-    // It is the one that damages every other runtime in the daemon without the
-    // script doing anything else at all.
-    //
-    // setlocale(LC_ALL, ...) is process-wide, and this daemon serves every
-    // runtime from one process.  Two of its own primitives read the C locale:
-    // socketley.json_encode formats numbers with "%.14g" and json_decode parses
-    // them with std::stod, both of which take the decimal separator from
-    // LC_NUMERIC.  Measured, with a de_DE.UTF-8 locale available:
-    //
-    //     before                snprintf("%.14g", 1.5) -> "1.5"
-    //     os.setlocale("de_DE.UTF-8")
-    //     after                 snprintf("%.14g", 1.5) -> "1,5"
-    //                           strtod("1.5")          -> 1.0
-    //
-    // So one line in one script turns every other script's JSON into something
-    // no JSON parser accepts, and makes every number it decodes truncate at the
-    // decimal point — silently, with no error anywhere, and for as long as the
-    // daemon lives.  A cache holding "1,5" does not become "1.5" again when the
-    // script that did it is removed.
-    //
-    // Removed rather than wrapped, for the same reason as os.exit above and
-    // because there is nothing to wrap it down to: the legitimate uses of a
-    // locale are reads, and os.date, os.time and os.clock — which stay — are
-    // the reads.  Nothing a script in this tree does needs to CHANGE the
-    // process's idea of how a number is spelled.
+    // os.setlocale is process-wide, so one script turns every other script's
+    // JSON into something no parser accepts, and it is removed rather than
+    // wrapped because nothing here needs to change how a number is spelled.
     m_lua["os"]["setlocale"] = sol::nil;
 
     install_deadline_hook();
@@ -512,9 +291,8 @@ struct lua_timer : io_handler
     io_request            req{};
     bool                  repeat{false};
     bool                  cancelled{false};
-    // True for exactly as long as `fn` is on the stack below.  Read by
-    // sever_timer(), which must not replace a callable that is executing; see
-    // the note there.
+    // True for exactly as long as `fn` is on the stack below, read by
+    // sever_timer(), which must not replace a callable that is executing.
     bool                  dispatching{false};
     int                   timer_id{0};
 
@@ -530,24 +308,16 @@ struct lua_timer : io_handler
             else delete this;
             return;
         }
-        // A timer body is a callback invocation like any other — it runs on the
-        // event-loop thread, from a completion, and holds it for as long as it
-        // runs.  The budget comes from the context that registered it, so a
-        // script that set callback_timeout_ms gets the same answer here as in
-        // on_message.  A timer whose context has already been severed (ctx null:
-        // see the destructor) has nothing left to run, and fn is nil by then.
-        //
-        // The scope brackets the call and nothing else: a deadline that expires
-        // in here comes back as an invalid result, and a0ffcd5's branch below
-        // is already the right place for it to be reported.
+        // A timer body is a callback invocation like any other, spending the
+        // budget of the context that registered it, with the scope bracketing
+        // the call and nothing else.
         {
             lua_deadline::scope guard("a socketley.set_timeout/set_interval callback",
                                       ctx ? ctx->callback_timeout_ms() : 0u,
                                       ctx ? ctx->owner_name().c_str() : nullptr);
-            // The flag brackets the call and nothing else.  A callback may
-            // cancel its own timer — clear_interval(id) from inside the
-            // interval is the one-shot shape — and sever_timer() has to be able
-            // to tell that this is the timer it is being asked to sever.
+            // The flag brackets the call and nothing else, so sever_timer()
+            // can tell that the timer it is asked to sever is the one
+            // executing.
             dispatching = true;
             sol::protected_function_result tr = fn();
             dispatching = false;
@@ -574,54 +344,16 @@ struct lua_timer : io_handler
 };
 
 // ─── Severing one timer from its context ───────────────────────────────────
-//
-// b74487c built this in ~lua_context and 23e5181 generalised it to
-// cancel_timers(); it is one function now because clear_timeout and
-// clear_interval need exactly it and used to perform a weaker thing instead.
-//
-// The order is the reasoning, and it is written out at cancel_timers():
-//
-//   * the sol::function goes first, so a completion already in flight cannot
-//     call into Lua.  It is also what releases the closure's registry
-//     reference — until it does, the callback and everything it captured are
-//     reachable from C++ and no collectgarbage() can free them.  The one
-//     exception is a timer severed from inside its own callback; see below.
-//   * `ctx` goes second, so lua_timer::on_cqe takes its terminal `delete this`
-//     path rather than calling two methods on a context that has either
-//     already given this timer away or is about to be destroyed.
-//   * deregister_owner is deliberately NOT called here.  event_loop.h: a
-//     handler that frees itself from inside its own on_cqe must deregister
-//     THERE, because deregistering while its last completion is in flight has
-//     that completion dropped and the callback that would have freed it never
-//     runs.  on_cqe already does it in the right place.
-//
-// The withdrawal at the end is the part clear_timeout/clear_interval were
-// missing.  They set `cancelled` and `repeat` and stopped, which is enough to
-// keep the callback from running — the existing tests pin that — but the
-// timeout stayed armed, so the lua_timer, its closure and its owner
-// registration all stayed alive until it expired on its own.  Cancelling a
-// one-hour interval kept every one of them for the hour.
-//
-// Guarded on ring_open() rather than merely on a non-null loop: ~lua_context
-// reaches this at process teardown, by which time shutdown_ring() has been
-// called, and a submission then is a submission into a ring that is gone.
+// The order is the reasoning -- function, then ctx, and never
+// deregister_owner, which on_cqe does in the right place -- and the withdrawal
+// at the end is what clear_timeout and clear_interval were missing, guarded on
+// ring_open() because ~lua_context reaches this after shutdown_ring().
 static void sever_timer(lua_timer* t)
 {
-    // ─── Unless it is the callback doing the severing ───────────────────────
-    //
-    // `clear_interval(id)` from inside that interval's own callback is how a
-    // one-shot subscriber to time is written, and `socketley.stop(self.name)`
-    // from a timer reaches cancel_timers() the same way.  In both, `fn` is the
-    // function currently executing, and sol's call reads members of the object
-    // it was invoked through after lua_pcall returns — so replacing it here
-    // took the daemon down with a SIGSEGV on that very tick.  Measured on this
-    // branch before the flag existed: three ticks, "IV cleared", then nothing.
-    //
-    // Skipping the assignment costs nothing.  `ctx` and the two flags below are
-    // still cleared, so lua_timer::on_cqe takes its terminal branch the moment
-    // the callback returns and deletes the timer there — and ~lua_timer
-    // releases the reference at that point, a few instructions later than this
-    // line would have.
+    // Unless it is the callback doing the severing, in which case replacing
+    // `fn` frees the object sol is still reading members of; skipping the
+    // assignment costs nothing because on_cqe deletes the timer the moment it
+    // returns.
     if (!t->dispatching)
         t->fn = sol::nil;
 
@@ -635,39 +367,14 @@ static void sever_timer(lua_timer* t)
 
 lua_context::~lua_context()
 {
-    // An active timer outlives this context, and has to.  Its io_request lives
-    // inside the lua_timer, which is its own heap allocation and its own
-    // io_handler — so the storage the ring is still reading is NOT the storage
-    // being freed here, and there is nothing to defer or quarantine the way
-    // daemon_handler defers a retired proxy_supervisor.  What this destructor
-    // owes the timer is severance, and it used to perform only half of it.
-    //
-    // It nilled the sol::function, which is why a completion could not call into
-    // a closed Lua state.  It left `ctx` pointing here — and lua_timer::on_cqe
-    // reaches through that pointer on every path it has, to unregister_timer()
-    // and timer_pool_release(), both of them methods on this object.  So a
-    // `reload-lua`, or a second load_lua_script(), on any script that called
-    // set_interval left a live registration naming a timer that would call two
-    // methods on freed memory the next time it fired.  Under ASan that is an
-    // abort one tick after the reload; without it, the replacement context is
-    // allocated at exactly this size immediately afterwards, so the stale
-    // completion edits the new context's timer tables about as often as it
-    // touches an unmapped page.
-    //
-    // deregister_owner() is deliberately NOT called here, and that is not an
-    // omission.  event_loop.h: a handler that frees itself from inside its own
-    // on_cqe must deregister THERE and not earlier, because deregistering while
-    // its last completion is in flight has that completion dropped, and the
-    // callback that would have freed the handler never runs.  on_cqe already
-    // does it in the right place, and the `else delete this` beside it is the
-    // terminal path a null ctx selects — which is what this severance is handing
-    // the timer to.  runtime_instance does the identical thing to its tick timer
-    // (`m_tick->rt = nullptr` in reload_lua_script), for the identical reason.
+    // An active timer outlives this context and is severed rather than freed,
+    // `ctx` included -- leaving it pointing here made a reload's next tick
+    // call two methods on freed memory -- while deregister_owner() is
+    // deliberately left to on_cqe.
     cancel_timers();
 
-    // Free all pooled timers.  These are safe to delete outright: a timer only
-    // reaches the pool from inside its own on_cqe, after that completion has
-    // reported, so the ring owes them nothing.
+    // Free all pooled timers, which are safe to delete outright because a
+    // timer only reaches the pool from inside its own reported completion.
     for (auto* t : m_timer_pool)
         delete static_cast<lua_timer*>(t);
     m_timer_pool.clear();
@@ -700,32 +407,18 @@ void* lua_context::timer_pool_acquire()
     return new lua_timer{};
 }
 
-// How many spent lua_timers this context keeps to hand back out.
-//
-// The pool exists so that a script arming a timer per message does not allocate
-// one per message, and a handful of slots buys all of that.  It had no bound,
-// and a pool without one is not a pool: a script that arms two thousand
-// timeouts at once — a fan-out, a retry sweep, a batch of deadlines — leaves
-// two thousand lua_timers in this vector after they fire, and they stay for the
-// life of the context because nothing ever shrinks it.  Retention at the
-// high-water mark is a strange thing to pay for a cache of empty objects.
-//
-// 64 because the concurrency this is worth optimising for is a script's steady
-// state, not its worst burst, and past that the allocator is the right thing to
-// be using.  A lua_timer is small, so the cap is about the shape rather than
-// the bytes: a bound that exists is what makes the memory a script can hold
-// this way a function of its steady state instead of its peak.
+// How many spent lua_timers this context keeps to hand back out, bounded at 64
+// so the memory a script can hold this way is a function of its steady state
+// rather than its peak.
 static constexpr size_t timer_pool_max = 64;
 
 void lua_context::timer_pool_release(void* t)
 {
     auto* timer = static_cast<lua_timer*>(t);
 
-    // Freed rather than pooled once the pool is full.  Safe in exactly the way
-    // the pooling is: this is only ever reached from inside the timer's own
-    // on_cqe, after that completion has been reported and after
-    // deregister_owner, so the ring owes this object nothing — which is why the
-    // branch beside this call site can already write `delete this`.
+    // Freed rather than pooled once the pool is full, safe in exactly the way
+    // the pooling is, because this is only reached from inside the timer's own
+    // reported completion.
     if (m_timer_pool.size() >= timer_pool_max)
     {
         delete timer;
@@ -751,27 +444,18 @@ static const char* state_to_string(runtime_state s)
     return "unknown";
 }
 
-// One load-time refusal: into the daemon's log, and into the buffer the command
-// that asked for this load reads back.  Every `return false` in load_script and
-// in the two declaration validators goes through here, because every one of
-// them is a sentence written for the person editing the script — and until now
-// not one of them could reach them.
-//
-// See the declaration for why only one of the two halves carries the name.
+// One load-time refusal, into the daemon's log and into the buffer the asking
+// command reads back, which every `return false` in load_script and the two
+// validators goes through.
 void lua_context::load_diag(const std::string& msg) const
 {
     std::cerr << lua_diag::tag(m_owner_name) << ' ' << msg << std::endl;
     lua_diag::record(msg);
 }
 
-// The same line, from the management API rather than from a load.
-//
-// It records as well as prints for a reason that is easy to miss: a script's
-// TOP LEVEL runs synchronously inside `create`, and a top-level
-// socketley.create() is the ordinary way an orchestration script builds its
-// children — so there genuinely is a command in flight to carry the reason to,
-// and cmd_create already reads the buffer back.  When there is no such command
-// the buffer costs a string nobody reads and is cleared by the next load.
+// The same line from the management API, recorded as well as printed because a
+// script's top level runs synchronously inside `create` and cmd_create reads
+// the buffer back.
 static void api_diag(runtime_instance* owner, const std::string& msg)
 {
     std::cerr << lua_diag::tag(owner ? owner->get_name() : std::string_view{})
@@ -779,69 +463,11 @@ static void api_diag(runtime_instance* owner, const std::string& msg)
     lua_diag::record(msg);
 }
 
-// ─── ONE RETURN CONTRACT FOR EVERYTHING A SCRIPT ASKS FOR ───────────────────
-//
-// `true` when it happened; `false, "<reason>"` when it did not.
-//
-// 721a97f fixed the calls that took a value, altered it and reported success.
-// This is the same defect one step along: the call answers, and the answer
-// carries nothing.  `socketley.start("web")` returned a bare `false` for a
-// runtime that does not exist, for one that is already running, for one whose
-// port another process holds, and for one whose --cpus cannot be met by this
-// daemon's ring.  Four situations, four different things to do about them, one
-// answer — so a script that wants to be idempotent has to guess, and a script
-// that wants to report has nothing to report.
-//
-// ─── WHY TWO RETURNS, AND EXACTLY WHAT IT BREAKS ────────────────────────────
-//
-// `false, "reason"` is what Lua itself does — io.open, os.remove, and pcall —
-// so it is the shape a script author already knows, and `assert(socketley.start(n))`
-// starts printing the reason with no change to anything.
-//
-// It is also nearly free to adopt, because Lua truncates a multiple-return call
-// to one value in every context but two.  UNCHANGED: assignment
-// (`local ok = f()`), `if not f() then`, `and`/`or`, concatenation, tostring,
-// comparison, and any argument position that is not the last.  CHANGED, and
-// this is the whole list:
-//
-//     print(socketley.stop(n))     -- "false   <reason>", was "false"
-//     { socketley.start(n) }       -- a two-element table, was one
-//     g(socketley.start(n))        -- g receives two arguments, was one
-//
-// Only the third can alter behaviour rather than output, and it needs the call
-// to be the LAST argument of a function that also reads its second parameter.
-// Nothing in examples/ or test/ is written that way — checked, every call site
-// of the six — and where it does occur the fix is a pair of parentheses.
-//
-// Success returns ONE value, not `true, nil`: `print(socketley.start(n))` on the
-// ordinary path still prints "true", and a script collecting answers in a table
-// does not get a hole punched in it.
-//
-// ─── WHY A VARIANT OF TUPLES AND NOT sol::variadic_results ──────────────────
-//
-// That arity is what this used to be sol::variadic_results for -- a plain
-// std::tuple cannot be one value here and two there, because a C++ function has
-// one return type.  A variant CAN: sol2 pushes the active alternative, and the
-// alternatives have different arities.  Verified from Lua with select('#'),
-// all five shapes: tuple<bool> pushes 1, tuple<bool,string> pushes 2,
-// tuple<size_t> 1, tuple<string> 1, tuple<object> 1.  The contract is unchanged
-// in every case.
-//
-// It matters because sol::variadic_results is a std::vector<sol::object>, and
-// that container is the single most expensive thing in a binding call.  Measured
-// 2026-08-25 at 3M calls per cell, a send-shaped binding taking a 64-byte
-// string:
-//
-//     lua_CFunction, pushes true, reads nothing      20.6 ns   the Lua/C boundary
-//     the same, reading the string argument         +43.2 ns   the actual work
-//     the same through sol2, returning this variant +15.0 ns   sol2's marshalling
-//     the same returning sol::variadic_results     +113.7 ns   the container
-//
-// So the container cost 7.6x what sol2's whole marshalling layer costs, to
-// return the single value `true`.  On the failure path it was worse still:
-// 431.8 ns against 119.5.  Dropping sol2 for hand-written lua_CFunctions --
-// argument checking, upvalues and all -- would have bought the 15 ns; this
-// bought the 114 and kept the type checking.
+// One return contract for everything a script asks for -- `true`, or `false,
+// "<reason>"` -- which is Lua's own shape, changes behaviour only for a call
+// in a function's last argument position, and is a variant of tuples rather
+// than sol::variadic_results, whose vector cost 114 ns against sol2's whole
+// marshalling layer's 15.
 using api_yes_t   = std::tuple<bool>;
 using api_why_t   = std::tuple<bool, std::string>;
 using api_count_t = std::tuple<size_t>;
@@ -855,23 +481,16 @@ static api_result api_yes()
     return api_yes_t{ true };
 }
 
-// The refusal.  NOT logged, and that is the deliberate difference from
-// api_diag above.
-//
-// api_diag belongs to `create`, which is construction: its failures are
-// configuration mistakes, they can happen at a script's top level with a CLI
-// command in flight, and the operator is the one who has to see them.  These
-// are control flow.  `socketley.stop(name)` on something already stopped is how
-// an idempotent teardown is written, and a daemon that printed a line every
-// time would be punishing a script for being careful.  The caller is handed the
-// reason; what to do with it is the caller's business.
+// The refusal, deliberately not logged, because these are control flow --
+// stopping something already stopped is how an idempotent teardown is written
+// -- while api_diag belongs to construction, which an operator has to see.
 static api_result api_why(std::string why)
 {
     return api_why_t{ false, std::move(why) };
 }
 
-// A count, for the two calls whose interesting answer is "how many" rather than
-// "did it".  See self.group_send and self.multicast.
+// A count, for the two calls whose interesting answer is how many rather than
+// whether.
 static api_result api_count(size_t n)
 {
     return api_count_t{ n };
@@ -893,9 +512,9 @@ bool lua_context::script_compiles(std::string_view path, std::string& err)
 {
     lua_diag::clear();
 
-    // Its own state, with nothing registered on it.  load_file compiles the
-    // chunk and leaves it on the stack unexecuted, so no top-level line runs
-    // and there is nothing for a top-level line to reach even if one did.
+    // Its own state with nothing registered on it, and load_file leaves the
+    // chunk unexecuted, so no top-level line runs and none could reach
+    // anything if it did.
     sol::state probe;
     sol::load_result chunk = probe.load_file(std::string(path));
     if (chunk.valid())
@@ -931,17 +550,10 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         m_lua["package"]["path"] = new_path;
     }
 
-    // The top-level chunk is bounded too, and it is the one place the bound
-    // changes what a *command* does rather than what a connection sees.  This
-    // runs synchronously inside `create`: a script whose top level does not
-    // return used to freeze the daemon before the runtime existed, with the
-    // operator's terminal blocked on a create that would never answer.  It is
-    // safe_script_file, so an expiry comes back as an invalid result and lands
-    // in load_diag — the create is refused, with a reason, and nothing is
-    // half-built.
-    //
-    // The process default and not the script's own `callback_timeout_ms`: the
-    // global is set BY this chunk, so at this point there is nothing to read.
+    // The top-level chunk is bounded too, because it runs synchronously inside
+    // `create` and used to freeze the daemon before the runtime existed --
+    // against the process default, since the script's own global is set by
+    // this very chunk.
     auto result = [&] {
         lua_deadline::scope guard("the script's top level", lua_deadline::default_ms(),
                                   m_owner_name.c_str());
@@ -954,40 +566,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         return false;
     }
 
-    // What this script asked for, now that its top level has run.  Same shape
-    // as tick_ms directly below: a global, read once, clamped.
-    //
-    // 0 is meaningful and means "no deadline on my callbacks" — a script that
-    // genuinely blocks for minutes has to be able to say so, and saying so in
-    // the file is the visible way to do it.  A negative or non-integer value is
-    // a mistake in a file somebody is editing right now, so it is named rather
-    // than rounded into something plausible.
-    //
-    // TWO READS, AND BOTH FORMS ARE DELIBERATE.
-    //
-    // `.get<sol::optional<int>>()` is the checked read f956524 replaced every
-    // bare `sol::optional<T> x = tbl[k]` in this tree with.  The bare form runs
-    // an unconditional conversion, and sol2's safety checks follow NDEBUG — on
-    // in every Debug and Sanitize build, off in Release — so what it does with
-    // a value it cannot convert is a property of the build rather than of the
-    // code.  f956524 has the case that cost a daemon: an ABSENT key read as
-    // sol::optional<std::string> inside socketley.create's binding, throwing
-    // across the Lua C boundary into std::terminate.
-    //
-    // Honestly: the bare form was tried here and did NOT misbehave.  Measured,
-    // Sanitize, `callback_timeout_ms = "soon"` through `create --lua`: it
-    // answered nullopt and the diagnostic below fired, the same as the checked
-    // form.  The guard above is why — sol::object first, so the key is known to
-    // be present, which is the case f956524 was about.  So this is not a crash
-    // being fixed; it is the one read in this file that would otherwise be
-    // spelled differently from every other read in the file, resting on a
-    // measurement of which type pairs sol2 happens to throw on.  That is not a
-    // thing to rest on, and the checked form costs nothing.
-    //
-    // The sol::object probe stays because the checked read cannot tell the two
-    // failures apart — absent and present-but-wrong both answer nullopt, and
-    // they need different answers.  Absent means "no opinion, use the daemon's
-    // default"; present and unreadable is a typo somebody wants told about.
+    // What this script asked for now that its top level has run, probed as a
+    // sol::object first because the checked read cannot tell an absent key
+    // from a present unreadable one, which need different answers.
     {
         sol::object cto = m_lua["callback_timeout_ms"];
         if (cto.valid() && cto != sol::nil)
@@ -1006,11 +587,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
         }
     }
 
-    // m_deadline_ms is final here, in both branches above: the script either
-    // declared `callback_timeout_ms` or left the daemon's default standing.
-    // That is what makes this the place to decide about the compiler, and it is
-    // deliberately outside the block above so that a script which declares
-    // nothing is decided too.  See enable_jit_if_unbounded.
+    // m_deadline_ms is final here in both branches, which is what makes this
+    // the place to decide about the compiler, and it is outside the block so a
+    // script that declares nothing is decided too.
     enable_jit_if_unbounded();
 
     m_on_start = m_lua["on_start"];
@@ -1023,27 +602,10 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
     m_on_tick = m_lua["on_tick"];
-    // ─── tick_ms, against one floor rather than two ─────────────────────────
-    //
-    // See lua_tick in the header for which of the two rules this file used to
-    // hold survived and why.  What changed here is that a value below the floor
-    // is now REFUSED instead of being turned into a different number: this line
-    // read `(tms && *tms >= 10) ? *tms : 100`, so `tick_ms = 5` was not a
-    // clamp, it was a substitution — the script asked for 5 and got 100, twenty
-    // times slower, with the same silence a script that asked for nothing gets.
-    //
-    // Absent still means 100.  A script that declares on_tick and no interval
-    // has expressed no opinion, and a default is the right answer to that;
-    // there is nothing for anybody to be surprised by later.  The refusal is
-    // only for a value that was written down and could not be honoured.
-    //
-    // The read is a double with an integrality test rather than
-    // `get<sol::optional<int>>()`, and that is not decoration.  Every Lua
-    // number is a double, so `tick_ms = 12.5` is an ordinary thing to type;
-    // asking sol for an int leaves what happens to the half up to a conversion
-    // this file does not own, and the two builds do not agree about conversions
-    // — that is the whole subject of the note at callback_timeout_ms above.
-    // Asking for the number and judging it here has one answer in every build.
+    // A tick_ms below the floor is refused rather than substituted, absent
+    // still means 100, and the read is a double with an integrality test
+    // because every Lua number is a double and the two builds do not agree
+    // about conversions.
     if (m_on_tick.valid()) {
         sol::object t = m_lua["tick_ms"];
         if (!t.valid() || t == sol::nil)
@@ -1109,14 +671,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_upstream_disconnect.valid()) m_callback_mask |= CB_ON_UPSTREAM_DISCONNECT;
     if (m_on_http_request.valid())       m_callback_mask |= CB_ON_HTTP_REQUEST;
 
-    // The filter chain.  `filters` is an array of functions run in order before
-    // a proxy chooses a backend; see proxy_instance::run_request_filters.
-    //
-    // A malformed entry refuses the script rather than being skipped.  The chain
-    // is where authentication lives, so "the third filter was a typo and was
-    // quietly dropped" is a runtime that admits everyone while looking exactly
-    // like one that does not.  A script that cannot be loaded is visible at the
-    // moment the operator writes it; a hole in the chain is not.
+    // The filter chain, where a malformed entry refuses the script rather than
+    // being skipped, because a quietly dropped filter is a runtime that admits
+    // everyone while looking like one that does not.
     m_filters.clear();
     {
         sol::object fobj = m_lua["filters"];
@@ -1146,9 +703,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
             if (m_filters.empty())
             {
                 // `filters = { auth = f }` reads like a registration and is
-                // silently nothing: the array part is empty, so the chain never
-                // runs.  An empty table is a legitimate way to say "no filters"
-                // and is left alone.
+                // silently nothing, while an empty table is a legitimate way
+                // to say no filters.
                 bool any = false;
                 ft.for_each([&](sol::object, sol::object) { any = true; });
                 if (any)
@@ -1162,21 +718,9 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     }
     if (!m_filters.empty()) m_callback_mask |= CB_FILTERS;
 
-    // The route declaration.  `routes` is an array of { path, methods }, and it
-    // states what this runtime will answer — see shared/route_table.h for why
-    // it lives here rather than in the proxy that enforces it.
-    //
-    //   routes = {
-    //       { path = "/endpoint/login", methods = { "POST", "GET" } },
-    //       { path = "/static/*",       methods = { "GET" } },
-    //   }
-    //
-    // A malformed entry refuses the script, as a malformed filter does.  The
-    // failure mode is the opposite one — a dropped declaration fails open, and
-    // the gateway simply forwards what it would have refused — but it is still
-    // a runtime whose published routes are not the ones written in the file,
-    // and the operator has no way to see that from either side.  A script that
-    // will not load is visible at the moment it is written.
+    // The route declaration, an array of { path, methods }, where a malformed
+    // entry refuses the script because a dropped declaration fails open and
+    // neither side can see that the published routes are not the written ones.
     m_routes.clear();
     {
         sol::object robj = m_lua["routes"];
@@ -1207,10 +751,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
                     return false;
                 }
 
-                // A single string is accepted where a table of one is meant.
-                // `methods = "POST"` is what everyone writes first, and the
-                // alternative to reading it is a script that loads with the
-                // route silently dropped.
+                // A single string is accepted where a table of one is meant,
+                // because `methods = "POST"` is what everyone writes first.
                 std::vector<std::string> methods;
                 sol::object mobj = e["methods"];
                 if (mobj.valid() && mobj.is<std::string>())
@@ -1269,9 +811,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
             if (m_routes.empty())
             {
                 // Same trap as `filters`: a keyed table reads like a
-                // declaration and is silently nothing, because the array part
-                // is what is walked.  An empty table means "declare nothing"
-                // and is left alone.
+                // declaration and is silently nothing, while an empty table
+                // means declare nothing.
                 bool any = false;
                 rt.for_each([&](sol::object, sol::object) { any = true; });
                 if (any)
@@ -1300,36 +841,16 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
     if (it == m_subscriptions.end()) return;
 
     // ─── Nothing may move under this loop ───────────────────────────────────
-    //
-    // A subscriber is a script, and a script may call straight back into this
-    // API: socketley.subscribe and socketley.unsubscribe are both bound in the
-    // very VM these run in.  This was a range-for over the vector, which holds
-    // an iterator into it — so one subscribe on this same channel from inside a
-    // handler reallocated the buffer and the loop went on walking the freed
-    // one.  Latent only because there was no unsubscribe to make the other half
-    // of it reachable.
-    //
-    // Both directions are therefore deferred rather than guarded against.
-    // subscribe() parks a new registration in m_pending_subscriptions and
-    // unsubscribe() marks its entry dead; settle_subscriptions() applies both
-    // when the last frame here unwinds.  The vector is then immutable for the
-    // whole dispatch, which is what makes the plain index below correct — and
-    // it costs nothing on the ordinary path, where no subscriber touches
-    // either call.
-    //
-    // Deferring the insertion also settles a question that would otherwise be
-    // decided by std::vector's growth policy: a subscription registered while a
-    // message is being delivered does not receive that message.
+    // Both directions are deferred rather than guarded against, because a
+    // subscriber may subscribe or unsubscribe from inside a handler, which
+    // makes the vector immutable for the whole dispatch and settles what a new
+    // registration receives.
     auto&        subs = it->second;
     const size_t n    = subs.size();
 
-    // One scope for the whole fan-out, not one per subscriber.  A publish is
-    // usually made from inside another callback, and lua_deadline::scope nests
-    // outermost-wins, so in that case this arms nothing and the subscribers
-    // spend the publisher's budget — which is right, because the publisher's
-    // callback does not return until the last subscriber has run.  When the
-    // publish comes from somewhere with no callback armed, this is the outermost
-    // scope and the whole fan-out shares one budget.
+    // One scope for the whole fan-out, because a publish made from inside
+    // another callback spends the publisher's budget, which does not return
+    // until the last subscriber has run.
     ++m_dispatch_depth;
     {
         lua_deadline::scope guard("a socketley.subscribe callback", m_deadline_ms,
@@ -1350,9 +871,8 @@ void lua_context::dispatch_publish(std::string_view cache_name, std::string_view
         settle_subscriptions();
 }
 
-// See the declaration.  Called at the moment it is safe to move the vectors
-// dispatch_publish walks — which is when the last of its frames has unwound, or
-// immediately when there were none.
+// Called at the moment it is safe to move the vectors dispatch_publish walks,
+// which is when the last of its frames has unwound.
 void lua_context::settle_subscriptions()
 {
     for (auto& [key, sub] : m_pending_subscriptions)
@@ -1369,58 +889,25 @@ void lua_context::settle_subscriptions()
                                [](const subscription& s) { return s.dead; }),
                 v.end());
         // A channel nobody listens to comes out of the map rather than staying
-        // as an empty vector: dispatch_publish finds by key, and a key that is
-        // present answers the lookup and then does nothing, on every publish,
-        // for the life of the context.
+        // an empty vector a lookup answers on every publish.
         if (v.empty()) it = m_subscriptions.erase(it);
         else           ++it;
     }
     m_subscriptions_dirty = false;
 }
 
-// End every subscription this context holds, leaving the context itself alive.
-//
-// The other half of cancel_timers(), and it exists for the sentence that one is
-// written under: a stopped runtime must execute no script.  23e5181 severed the
-// timers at `stop` and left this standing, so a registration went on living as
-// long as the interpreter did — and only `remove` destroys that — which meant a
-// PUBLISH on the linked cache was delivered to a runtime `ls` reported as
-// Stopped.  Measured on the parent commit, the handler even read self.state as
-// "stopped" and ran anyway.  The bill is the same one: socketley.subscribe
-// callbacks call self.send, and self.send from a stopped runtime delivers to
-// clients of a runtime the operator has taken down.
-//
-// ─── Deferred while a dispatch is walking, exactly as unsubscribe() is ──────
-//
-// This is not a theoretical ordering.  `socketley.stop(self.name)` from inside a
-// subscriber reaches here through runtime_instance::stop(), and the frame it
-// reaches here from is holding `auto& subs = it->second` — a reference into the
-// very map below.  Clearing it there would free the vector being walked, which
-// is the same shape sever_timer() has to dodge one call along when a timer
-// cancels itself.  So the marking path is the one unsubscribe() already built:
-// entries are marked dead, m_subscriptions_dirty is set, and the outermost
-// dispatch frame calls settle_subscriptions() on its way out.  Marking dead is
-// enough for the delivery in progress too — dispatch_publish skips a dead entry
-// on every iteration, so the handlers after this one in the same fan-out do not
-// run either.
-//
-// The ids go in both paths.  They name registrations this context no longer
-// has, so a later socketley.unsubscribe(id) answering true for one of them
-// would be answering for something that is already gone; false is the truth,
-// and it is what the id's contract says.
+// End every subscription this context holds while leaving it alive, because a
+// stopped runtime must execute no script, deferred exactly as unsubscribe() is
+// since `socketley.stop(self.name)` from a subscriber holds a reference into
+// the map below.
 void lua_context::cancel_subscriptions()
 {
-    // Up before anything is torn down, and it stays up until start() lowers it.
-    // See registrations_severed(): severing what is armed does not stop the
-    // script that called socketley.stop from arming more the moment stop()
-    // returns to it.
+    // Up before anything is torn down and until start() lowers it, because
+    // severing what is armed does not stop the calling script arming more.
     m_severed = true;
 
-    // Nothing is walking the pending queue — dispatch_publish reads the map —
-    // so these go outright whether or not a dispatch is in flight.  They are
-    // registrations made during this dispatch, which is to say made by a script
-    // that is being stopped, and settling them afterwards would install
-    // subscribers on a runtime that has gone.
+    // Nothing is walking the pending queue, so these go outright: settling
+    // them would install subscribers on a runtime that has gone.
     m_pending_subscriptions.clear();
     m_subscription_keys.clear();
 
@@ -1437,36 +924,22 @@ void lua_context::cancel_subscriptions()
     m_subscriptions_dirty = false;
 }
 
-// Sever every armed timer from this context, leaving the context itself alive.
-//
-// Split out of ~lua_context so that stopping a runtime can reach it.  A stopped
-// runtime must execute no script, and its intervals used to go on firing at
-// full rate for as long as the daemon lived — the context is only destroyed by
-// `remove`, so `stop` left every set_interval running.  That is not untidy, it
-// is wrong in a way a script can act on: self.send from such a timer reaches
-// clients of a runtime the operator has taken down.
-//
-// The severance is exactly what the destructor performed, and the reasoning is
-// written out at sever_timer() above.  The only difference is that this object
-// survives, which is why both containers are cleared: what is left in them
-// would name timers this context has already given away.
+// Sever every armed timer while leaving the context alive, split out of the
+// destructor so `stop` can reach it, clearing both containers because what is
+// left would name timers this context has given away.
 void lua_context::cancel_timers()
 {
-    // The same latch, raised by both severances rather than by one of them:
-    // they are called together from stop() and they answer the same sentence,
-    // and a script that re-arms afterwards re-arms whichever it likes.  The
-    // destructor reaches this too, where it costs nothing — the context is
-    // going, so nothing will read it again.
+    // The same latch, raised by both severances because they are called
+    // together and answer the same sentence.
     m_severed = true;
 
     for (auto* p : m_active_timers)
         sever_timer(static_cast<lua_timer*>(p));
     m_active_timers.clear();
 
-    // The timer ids too.  They name timers this context no longer owns — every
-    // one of them has just been handed to its own completion — so a lookup that
-    // survived into the destructor's remaining work would find a pointer with
-    // nothing left to say.
+    // The timer ids too, because every one has just been handed to its own
+    // completion and a surviving lookup would find a pointer with nothing left
+    // to say.
     m_timer_map.clear();
 }
 
@@ -1478,48 +951,10 @@ void lua_context::update_self_state(const char* state_str)
 }
 
 // ---------------------------------------------------------------------------
-// socketley.http(opts) — synchronous HTTP/HTTPS client for Lua scripts
-// opts = { url, method="GET", body="", headers={}, timeout_ms=5000 }
-// Returns { ok=bool, status=int, body=string, error=string }
-//
-// HTTPS now verifies the chain against the system trust store *and* that the
-// certificate was issued for the host in the URL. It used to do neither
-// (SSL_VERIFY_NONE): that bought encryption against somebody recording the
-// wire and nothing whatsoever against somebody sitting on it. Any self-signed
-// certificate was accepted, so a script fetching config, polling a health
-// endpoint or posting a webhook could be answered by whoever got in the middle
-// — with no error, no log line, and a `result.ok` of true.
-//
-// STILL BLOCKS THE EVENT-LOOP THREAD. This runs on the single thread that
-// serves every runtime in the daemon, so a slow host still stalls all of them.
-// Making it asynchronous means driving the socket from event_loop and
-// suspending the Lua callback across the round trip, which is a different
-// change in a different file. What is fixed here is that the block is now
-// *bounded*: DNS aside, connect, handshake, send and receive share one deadline
-// of timeout_ms enforced with poll(). Before, connect() ignored timeout_ms
-// entirely and sat in the kernel's SYN retry schedule for over two minutes,
-// and the socket timeouts restarted on every byte, so a server trickling one
-// byte at a time held the whole daemon for as long as it cared to.
-//
-// Residual: getaddrinfo() is still unbounded and is not counted against the
-// deadline until it returns — the resolver has no per-call timeout, and giving
-// it one means resolving off-thread, which is the same asynchronous rework.
-// It is also the one part of this call the callback deadline cannot reach: a
-// count hook counts VM instructions and the resolver executes none.
-//
-// AND IT LIVES INSIDE THE CALLBACK'S BUDGET. There are now two bounds on how
-// long the event loop may be held, and two bounds that merely happen to be
-// compatible is a bug waiting for the day somebody changes one of them. So
-// timeout_ms is clamped to what is left of the invocation deadline (see
-// lua_deadline in lua_context.h) and there is one budget: whatever a callback
-// spends here, it spends out of the ten seconds it has in total, and a script
-// that wants a thirty-second fetch says `callback_timeout_ms = 31000` and gets
-// it. Nothing here can be interrupted mid-socket by the hook — no bytecode runs
-// between these poll() calls — so the clamp is the only way the two interact,
-// and it interacts by returning an ordinary `ok = false, error = "..."` result
-// that a script can see and handle.
-//
-// Keep to on_start/on_stop or low-frequency on_tick callbacks regardless.
+// socketley.http is a synchronous client that verifies the chain and the host
+// name, still blocks the event-loop thread, and is bounded by one deadline
+// clamped to what is left of the callback's budget -- with getaddrinfo() the
+// residual neither bound reaches.
 // ---------------------------------------------------------------------------
 
 using http_clock = std::chrono::steady_clock;
@@ -1534,8 +969,8 @@ static int http_ms_left(http_clock::time_point deadline)
     return static_cast<int>(left);
 }
 
-// Wait for `fd` to become ready for `events`, or for the deadline to pass.
-// Returns 1 = ready, 0 = out of time, -1 = poll failed.
+// Wait for `fd` to become ready for `events` or for the deadline, answering 1
+// ready, 0 out of time, -1 failed.
 static int http_wait(int fd, short events, http_clock::time_point deadline)
 {
     for (;;)
@@ -1557,20 +992,15 @@ static int http_wait(int fd, short events, http_clock::time_point deadline)
     }
 }
 
-// Ceiling on what one response may accumulate in daemon memory. The old loop
-// appended until the peer stopped sending, so a hostile or broken endpoint
-// could grow this string until the allocator gave up — on a box with no swap
-// that takes the daemon down, not just the script.
+// Ceiling on what one response may accumulate, because a hostile endpoint
+// could otherwise grow this string until the allocator gave up and took the
+// daemon with it.
 static constexpr size_t http_max_response = 8u * 1024u * 1024u;
 
 #ifndef SOCKETLEY_NO_HTTPS
-// Drain OpenSSL's thread-local error queue into readable text.
-//
-// Every TLS failure here reported the bare string "TLS handshake failed". The
-// reason — expired certificate, unknown CA, name mismatch, a plain-HTTP server
-// on port 443 — was on that queue and nobody popped it. Leaving it there is a
-// second bug: the queue persists, so a stale entry gets drained later and
-// reported as the cause of an unrelated request's failure.
+// Drain OpenSSL's thread-local error queue into readable text, or the reason
+// is lost and a stale entry is later reported as the cause of an unrelated
+// failure.
 static std::string ssl_error_text()
 {
     std::string out;
@@ -1598,25 +1028,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     if (!url_opt || url_opt->empty()) { result["error"] = "url required"; return result; }
 
     // ─── The three optional keys, checked ───────────────────────────────────
-    //
-    // These were the last `sol::optional<T> x = tbl[k]` reads in this file, the
-    // form f956524 replaced everywhere else after one of them took the daemon
-    // down: the converting constructor runs an unconditional conversion, sol2's
-    // safety checks follow NDEBUG, and a key that is absent or of another type
-    // throws across the Lua C boundary into std::terminate.  Honestly: this
-    // pair does not throw today, measured — `socketley.http{url=...}` with no
-    // `method` is what every test in the tree calls and it answers "GET" in
-    // both builds.  It is replaced anyway for the reason written at
-    // callback_timeout_ms: whether a conversion throws is a property of the
-    // build, and that is not a thing to rest on when the checked form costs
-    // nothing.
-    //
-    // And the second half is this file's own subject.  `timeout_ms = "soon"`
-    // read as nullopt and became 5000 — a value written down, discarded, and
-    // the request made anyway on a number nobody chose.  A wrong value is
-    // reported through `result.error`, which is the channel this call already
-    // has and the one a script can act on; a *missing* value keeps its default,
-    // because saying nothing is not a mistake.
+    // Checked reads rather than a converting optional, because whether a
+    // conversion throws is a property of the build, and a `timeout_ms` that
+    // was written down and unreadable is reported through result.error rather
+    // than silently defaulted.
     std::string url = *url_opt;
 
     std::string method = "GET";
@@ -1655,10 +1070,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         timeout_ms = static_cast<int>(d);
     }
 
-    // Inside the callback's budget, not beside it.  remaining_ms() is -1 when
-    // no deadline is armed — a call from somewhere that is not a callback, or a
-    // script that set callback_timeout_ms = 0 — and then timeout_ms stands as
-    // the script wrote it, which is exactly the behaviour that existed before.
+    // Inside the callback's budget and not beside it, with remaining_ms() of
+    // -1 leaving timeout_ms as the script wrote it.
     {
         const long budget = lua_deadline::remaining_ms();
         if (budget == 0)
@@ -1674,10 +1087,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             timeout_ms = static_cast<int>(budget);
     }
 
-    // One deadline for the whole exchange, taken before anything can block.
-    // Every wait below measures against this, so the total time this call can
-    // hold the event-loop thread is timeout_ms plus the resolver, rather than
-    // timeout_ms per operation with no ceiling on the number of operations.
+    // One deadline for the whole exchange, taken before anything can block, so
+    // the total hold is timeout_ms plus the resolver rather than timeout_ms
+    // per operation.
     const auto deadline = http_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     // Parse scheme
@@ -1688,13 +1100,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
 
 #ifdef SOCKETLEY_NO_HTTPS
     if (is_https) {
-        // The wording here used to be `use io.popen("curl -s https://...")`.
-        // A diagnostic that hands the caller a shell is the wrong answer twice
-        // over: it turns one runtime's missing TLS into an arbitrary command
-        // executed with the daemon's privileges, and it teaches that as the
-        // normal way to fetch a URL, in the one message a script author is
-        // guaranteed to read at the moment they are looking for a workaround.
-        // What is actually missing is a build, so that is what it says.
+        // What is missing is a build, so that is what this says -- the wording
+        // it replaced handed the caller a shell running with the daemon's
+        // privileges.
         result["error"] = "HTTPS not supported in this build (compiled with "
                           "SOCKETLEY_NO_HTTPS); use http://, or rebuild with "
                           "TLS support";
@@ -1702,19 +1110,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     }
 #endif
 
-    // Parse host:port/path.
-    //
-    // The last colon is not the port separator: an IPv6 literal is full of
-    // colons. rfind(':') turned "[::1]:8443" into host "[::1]" — brackets and
-    // all, which no resolver and no certificate ever matches — and bare "::1"
-    // into host "::" with port 1. Either way the address never resolved, so
-    // the IP-literal branch of the certificate check below was unreachable
-    // from here.
-    //
-    // Two forms of the host come out of this: `host`, without brackets, which
-    // is what getaddrinfo(), SNI and the certificate verifier all expect, and
-    // `host_header`, which keeps them, because an unbracketed IPv6 address in
-    // a Host header cannot be told from host:port.
+    // The last colon is not the port separator, because an IPv6 literal is
+    // full of them, so two forms come out of this: `host` without brackets for
+    // the resolver and the verifier, and `host_header` with them.
     int port = is_https ? 443 : 80;
     std::string host, host_header, path;
     {
@@ -1743,9 +1141,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         else
         {
             auto colon = authority.rfind(':');
-            // Exactly one colon is a port. More than one and no brackets is an
-            // unbracketed IPv6 literal — not strictly a legal URL, but it must
-            // not be silently cut in half either.
+            // Exactly one colon is a port, and more than one without brackets
+            // is an IPv6 literal that must not be silently cut in half.
             if (colon != std::string::npos && authority.find(':') == colon)
             {
                 host     = authority.substr(0, colon);
@@ -1788,15 +1185,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         return result;
     }
 
-    // Connect.
-    //
-    // Non-blocking socket plus poll(), not a blocking connect() with
-    // SO_SNDTIMEO: that option does not bound connect() on Linux at all. A host
-    // that drops the SYN — a firewall blackholing the port is the usual way —
-    // left this parked in the kernel's retry schedule for well over two
-    // minutes, on the thread every other runtime needs, no matter what
-    // timeout_ms said. The socket stays non-blocking for the rest of the call
-    // so every later wait goes through the same deadline.
+    // Non-blocking socket plus poll() and not SO_SNDTIMEO, which does not
+    // bound connect() on Linux at all, and the socket stays non-blocking so
+    // every later wait goes through the same deadline.
     int sock = ::socket(addrs->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) { freeaddrinfo(addrs); result["error"] = "socket() failed"; return result; }
 
@@ -1813,10 +1204,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         int so_err = 0;
         if (ready == 1)
         {
-            // Writable only means the attempt finished, not that it succeeded:
-            // a refused connection reports readiness and hides ECONNREFUSED in
-            // SO_ERROR, which is how a failed connect turns into a mysterious
-            // empty response if nobody looks.
+            // Writable only means the attempt finished, and a refused
+            // connection reports readiness while hiding ECONNREFUSED in
+            // SO_ERROR.
             socklen_t so_len = sizeof(so_err);
             if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0)
                 so_err = errno;
@@ -1865,10 +1255,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     req.append("Connection: close\r\n\r\n");
     req.append(body);
 
-    // Send + receive. Both directions are poll-driven against the shared
-    // deadline: the socket timeouts this used to rely on restart on every byte
-    // that arrives, so a peer sending one byte per second never "times out"
-    // while holding the thread forever.
+    // Both directions are poll-driven against the shared deadline, because
+    // socket timeouts restart on every byte and a peer sending one a second
+    // never times out.
     std::string response;
     std::string xfer_err;
 
@@ -1877,12 +1266,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx) { ::close(sock); result["error"] = "SSL_CTX_new failed"; return result; }
 
-        // ── Verification ──
-        // SSL_VERIFY_PEER fails the handshake on a chain no trusted CA signed;
-        // the host pin below fails it when the chain is trusted but was issued
-        // to somebody else. Both are needed: a certificate for a domain the
-        // attacker owns is entirely valid, and without the name check it
-        // impersonates any host this script fetches.
+        // SSL_VERIFY_PEER and the host pin are both needed, because a
+        // certificate for a domain the attacker owns is entirely valid.
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
         if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
@@ -1892,14 +1277,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             return result;
         }
 #if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
-        // HTTP/1.0 with "Connection: close": a great many servers just drop the
-        // TCP connection instead of sending close_notify. OpenSSL 3.0 calls
-        // that a protocol error by default, which would turn a complete
-        // response into "SSL_read failed" for a large slice of the internet.
-        // The cost is that a truncated response is indistinguishable from a
-        // complete one — the same exposure the plaintext path has always had,
-        // and the reason a caller should check status and body rather than
-        // trust length.
+        // HTTP/1.0 with Connection: close, tolerating the missing close_notify
+        // a great many servers omit, at the cost that a truncated response is
+        // indistinguishable from a complete one.
         SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
 
@@ -1930,10 +1310,9 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             return result;
         }
 
-        // Handshake, bounded by the shared deadline. The socket is
-        // non-blocking, so OpenSSL hands back WANT_READ/WANT_WRITE instead of
-        // sleeping inside read(), and poll() decides how long we are willing to
-        // wait for the peer's next record.
+        // Handshake bounded by the shared deadline, with the non-blocking
+        // socket giving WANT_READ/WANT_WRITE back to poll() instead of
+        // sleeping inside read().
         std::string tls_err;
         for (;;) {
             ERR_clear_error();
@@ -2012,10 +1391,8 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             }
         }
 
-        // One attempt only: on a non-blocking socket SSL_shutdown normally
-        // wants another round trip, and we are closing the connection either
-        // way — waiting for the peer's close_notify would spend the deadline we
-        // just spent enforcing on nothing.
+        // One attempt only, because waiting for the peer's close_notify would
+        // spend the deadline on a connection being closed either way.
         if (SSL_shutdown(ssl) < 0) {}
         ERR_clear_error();
         SSL_free(ssl); SSL_CTX_free(ctx);
@@ -2092,37 +1469,10 @@ using socketley::lua_json::json_max_depth;
 namespace
 {
 
-// ── What a worker cannot answer, said in the way this tree says it ──────────
-//
-// Named, with the reason and the way out, like tls_config_refusal — and for the
-// same reason.  Every one of these calls used to return a false, a nil or an
-// empty table from inside a worker, which is exactly what a *successful* call
-// on an empty daemon returns.  A script could not tell "there are no other
-// runtimes" from "this call cannot see any runtimes from here", so it carried
-// on routing, sending and creating against nothing, and the operator was told
-// nothing at all.
-//
-// Raised rather than returned, because the return value is the thing that
-// cannot carry it: `if socketley.create(...) then` is how these are written and
-// a false is what it already handles.
-//
-// `call` is the fully-qualified name as a script writes it, so the message
-// names what was typed.  `mistaken_for` completes the sentence, because the lie
-// differs by call: an empty list reads as a daemon with nothing in it, while a
-// false from self.route() reads as a target that is not there.
-//
-// THIS ONE IS FOR THE CALLS THAT READ.  It says "answering from here would
-// return nothing", which is true of a lookup and false of a mutation, and it
-// ends by promising the map — which is a promise only a read can keep.  The
-// three families are split below because a refusal that names the wrong
-// missing thing sends its reader to wait for the wrong delivery:
-//
-//   read       list, get, send, and the four cluster calls — this function.
-//              They come back when the worker is handed the runtime map.
-//   mutate     create, start, stop, remove — worker_mutation_refusal().
-//              They do not come back with it; see there.
-//   carry a    pipe, self.route — worker_transfer_refusal().  What is missing
-//   connection is a channel between two runtimes, not a map at all.
+// What a worker cannot answer, raised rather than returned and split into
+// three families -- read, mutate, carry a connection -- because a refusal that
+// names the wrong missing thing sends its reader to wait for the wrong
+// delivery.
 std::string worker_refusal(const std::string& call,
                            const char* mistaken_for =
                                "a successful call on a daemon with nothing in it")
@@ -2136,50 +1486,10 @@ std::string worker_refusal(const std::string& call,
            "after this script was loaded. Reload the runtime to pick it up.";
 }
 
-// ── The four that change the map rather than read it ────────────────────────
-//
-// create, start, stop and remove shared the sentence above, and it is wrong
-// about them twice over.
-//
-// It says answering here "would return nothing".  It would not: it would
-// return TRUE, having done something, and the something is the problem.  Read
-// against the worker's own manager — which is not null; the runtime's manager
-// is set in the worker's on_config — each of these acts on this process's
-// private copy of a map with one runtime in it:
-//
-//   create   mgr->create(), then set_event_loop() with THIS WORKER'S ring and
-//            mgr->start() on it.  A second live runtime, bound and serving,
-//            inside a process that is supposed to hold one — invisible to the
-//            daemon, absent from the state file, gone at the next restart.
-//   start    runtime_instance::start() returns early for an out-of-process
-//            placeholder: it stores `running` and returns true without binding
-//            anything.  In the daemon that is harmless because the health tick
-//            reconciles and forks the child; a worker has neither.
-//   stop     the mirror of it — stores `stopped`, returns true, does nothing.
-//   remove   drops the local copy.  The daemon still has the runtime.
-//
-// ─── AND WHY THIS IS NOW THE RARE PATH RATHER THAN THE ONLY ONE ─────────────
-//
-// What stood here said these four could never work, and gave a reason: doing
-// them from a worker needs a synchronous round trip inside a Lua callback, and
-// this project had settled that question the other way — a runtime does not
-// make a synchronous request of another process, because the only way to
-// implement one is to block the loop serving every connection this worker
-// holds.
-//
-// That decision was right about the DATA path, which is what it was written
-// about: socketley.get() runs per message, and a worker answering ~131k
-// requests a second cannot spend ~7.6 us of loop time on each.  These four are
-// not on it.  They run in on_start, or on a rare control message, never per
-// message, and the round trip was measured rather than assumed: 9.95 / 10.20 /
-// 10.52 us over three runs of 20000, against socketley.http() — shipping, on
-// this same table — which blocks the identical loop for a network round trip
-// three orders of magnitude longer.
-//
-// So they travel now, and this message is reached only by a worker that has
-// nowhere to send them: a daemon that predates the control plane, or one whose
-// socketpair could not be created.  It says that, rather than the old text's
-// "this will never work", because the two send an operator to different places.
+// The four that change the map would each act on this process's private copy,
+// and they travel now, so this message is reached only by a worker with
+// nowhere to send them -- an older daemon, or one whose socketpair could not
+// be created.
 std::string worker_mutation_refusal(const std::string& call)
 {
     return call +
@@ -2193,48 +1503,9 @@ std::string worker_mutation_refusal(const std::string& call)
            "serves these four for every worker it forks.";
 }
 
-// ── The two whose missing piece is not the map at all ───────────────────────
-//
-// socketley.pipe() and self.route() shared the generic sentence, and it sends
-// their reader after the wrong thing.  The read calls are refused because the
-// runtime map lives in the daemon, so the day the worker is handed that map
-// they stop being refused.  These two do not: what they move is a CONNECTION,
-// and a connection does not travel in a snapshot of anything.
-//
-// Told the generic message, an operator reads "the runtime map is elsewhere"
-// and waits for the map.  It will arrive and both will still be refused.
-//
-// ─── WHAT IS ACTUALLY MISSING, STATED AS WHAT IT IS ─────────────────────────
-//
-// NOT "SCM_RIGHTS is not built", which was the first draft of this and is
-// false.  Checked, and the mechanism is in the tree with a test on it:
-//
-//   shared/conn_transfer.h   send_handover/recv_handover over SCM_RIGHTS for
-//                            the case where the far runtime becomes the
-//                            endpoint; withdraw/relinquish, which is what
-//                            stops the sender and the receiver both holding a
-//                            working descriptor for one socket; and a tagged
-//                            relay framing for the case where the middle has
-//                            to keep seeing the bytes.
-//   shared/conn_identity.h   the naming half — a conn_ref that means the same
-//                            thing in both processes, written precisely
-//                            because a descriptor number does not.
-//   test/unit/test_conn_transfer.cpp   exercises all of it.
-//
-// What does not exist is a CHANNEL between two runtimes to carry either.
-// worker_protocol.h says in as many words that no descriptor crosses the
-// daemon-worker control socket, and points at conn_transfer.h as "a different
-// channel with a different rule" — a channel nothing has opened.  Grepped: no
-// conn_transfer:: call site anywhere outside that unit test.
-//
-// The message says so, and says the mechanism exists, because the distinction
-// is the whole cost estimate.  Whoever picks these up next should find a
-// component to wire, not conclude they have to write SCM_RIGHTS from scratch.
-//
-// `moves` completes the first sentence, because the two move a connection in
-// different directions and a reader has to recognise their own call in it.
-// `way_out` is separate for the same reason and is exact per call — see the
-// two callers.
+// pipe and route move a connection rather than read a map, so what was missing
+// was never SCM_RIGHTS -- conn_transfer.h and conn_identity.h are in the tree
+// with a test -- but a channel between two runtimes to carry it.
 std::string worker_transfer_refusal(const std::string& call, const char* moves,
                                     const std::string& way_out)
 {
@@ -2248,11 +1519,8 @@ std::string worker_transfer_refusal(const std::string& call, const char* moves,
            "on the runtime map and will not come back with it. " + way_out;
 }
 
-// pipe has two branches and only one of them crosses anything.  Naming one
-// runtime twice pairs two of THAT server's own connections — and self.pipe(a,
-// b) is the same operation on the same tables, bound in a worker and working
-// there.  So the way out names it, rather than sending somebody after a
-// boundary this call never crosses.
+// pipe has two branches and only one crosses anything, so the way out names
+// self.pipe(a, b), which is the same operation on the same tables.
 std::string worker_pipe_refusal()
 {
     return worker_transfer_refusal(
@@ -2264,22 +1532,9 @@ std::string worker_pipe_refusal()
         "gives every worker the channel this needs.");
 }
 
-// self.route() has no local branch: it always names another runtime, so there
-// is no self.* equivalent to point at.
-//
-// It is the heavier of the two, and the message says which mechanism it wants
-// rather than leaving "a channel" to be guessed at.  server_instance::
-// route_client() does not hand the descriptor over at all — it writes into the
-// TARGET's private maps and calls the target's on_connect on the caller's
-// stack, while this server keeps the connection and relays the bytes.  That is
-// conn_transfer.h's RELAY shape, not its HANDOVER shape, and the two want
-// opposite things: a handover leaves the middle out of the data path, a relay
-// keeps it in.  Naming the relay here is not decoration — it is the difference
-// between one wiring job and the other.
-//
-// The conn_ref half is already done and this call already uses it:
-// route_client() takes ref_for_fd(client_id) and passes it to
-// accept_routed(ref, get_name()).  Only the channel is missing.
+// self.route() always names another runtime, and route_client() writes into
+// the target's maps while keeping the socket here, which is conn_transfer.h's
+// RELAY shape rather than its HANDOVER shape.
 std::string worker_route_refusal()
 {
     return worker_transfer_refusal(
@@ -2293,14 +1548,9 @@ std::string worker_route_refusal()
         "in, and that is the truth rather than a substitute for it.");
 }
 
-// The raise itself.  Built by a Lua factory so that what a script sees is Lua's
-// own error() at the call site rather than a C++ exception thrown through
-// LuaJIT's frames — which is what lets every callback in this tree catch it and
-// print it with the callback's name attached.
-//
-// Shared by the two tables that have something to refuse, so both fail the same
-// way.  Comes back invalid if the interpreter could not build it; callers say so
-// rather than quietly leaving a working binding in place.
+// Built by a Lua factory so a script sees Lua's own error() at the call site,
+// shared by the two tables that have something to refuse, and invalid when the
+// interpreter could not build it.
 sol::function refusal_factory(sol::state& lua)
 {
     auto factory = lua.safe_script(
@@ -2320,12 +1570,9 @@ bool lua_context::s_worker_process = false;
 
 void lua_context::dispatch_cluster_event(const cluster_ev_wire& ev)
 {
-    // Lifted out of runtime_manager::dispatch_cluster_events, unchanged in what
-    // it does and changed in what it reads from: it used to build the members
-    // table here, out of the daemon's cluster_discovery, which is the one
-    // object a worker must not have.  It is handed the resolved list now, so
-    // this function has no idea which process it is in -- which is what lets
-    // both run it.
+    // Lifted out of runtime_manager::dispatch_cluster_events and handed the
+    // resolved list, so this function has no idea which process it is in --
+    // which is what lets both run it.
     switch (static_cast<cluster_event::type_t>(ev.kind))
     {
         case cluster_event::daemon_join:
@@ -2394,20 +1641,9 @@ cluster_view_ptr lua_context::cluster_view_snapshot() { return s_cluster_view; }
 
 cluster_view_ptr lua_context::s_cluster_view;
 
-// Replace the cross-runtime half of the management API with something that says
-// why it is not there.
-//
-// The raise is built by a Lua factory and is therefore Lua's own error(): no C++
-// exception is thrown through LuaJIT's frames to produce it.  What a script sees
-// is an ordinary runtime error at the call site, which every callback in this
-// tree already catches and prints with the callback's name attached — so a
-// refusal in on_proxy_request reads as
-//
-//   [lua] on_proxy_request error: lua: error: px.lua:7: socketley.list() is
-//   refused in an out-of-process proxy worker: ...
-//
-// and a refusal at the top level fails the script load, which the worker treats
-// as a configuration it cannot serve.
+// Replace the cross-runtime half of the management API with a Lua error()
+// saying why it is not there, which every callback already catches and prints
+// with the callback's name attached.
 void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_tbl,
                                            runtime_instance* owner)
 {
@@ -2424,50 +1660,17 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
         return;
     }
 
-    // ── Grouped by what is missing, not by which table they sit on ──────────
-    //
-    // These were one loop over eight names sharing one sentence, and three of
-    // the four groups below were being told the wrong reason.  Grouped rather
-    // than written out per call so the list of what is refused is still
-    // readable in one place — which was the point of doing this here at all —
-    // but a group is now a claim about WHY, and each group's claim is checked
-    // in the function that writes its message.
-    //
-    // socketley.log, .http, .json_*, the timers and .subscribe/.unsubscribe are
-    // in none of them: they work in a worker exactly as they do in the daemon,
-    // and .subscribe in particular is delivered to — see
-    // runtime_manager::set_publish_sink.
+    // Grouped by what is missing rather than by which table they sit on,
+    // because one sentence for eight names was telling three of the four
+    // groups the wrong reason.
 
-    // READ.  Empty now: list, get and send all answer in a worker, because the
-    // worker is handed the runtime map.  Kept as a group rather than deleted,
-    // because the three families below are the shape of this function and a
-    // reader who finds only two of them has to work out whether the third was
-    // never there or was emptied on purpose.
-    //
-    // What each of the three needed, for whoever adds a fourth read:
-    //   list   the map keys, and the worker's OWN row among them.
-    //   get    six fields per row, and a refreshed connections figure.
-    //   send   the map for the pre-checks, plus a deliver sink out of this
-    //          process — see below.
+    // READ, empty now that the worker is handed the runtime map, kept as a
+    // group so a reader finding two families knows the third was emptied on
+    // purpose.
 
-    // MUTATE.  Refused only while this process has no way to ASK for them.
-    //
-    // Being told what the map holds is still not permission to alter it, and
-    // that has not changed — what changed is that these four no longer try.
-    // They travel: the request goes to the daemon over the control plane at
-    // worker_map_fd, the daemon acts on the map it holds, and the answer comes
-    // back before the call returns.  See runtime_manager::set_map_sink and the
-    // note at encode_map_request in worker_protocol.h.
-    //
-    // So the question here is not "is this a worker" but "is there a sink", and
-    // the two differ in exactly one case: a worker forked by a daemon that does
-    // not serve map calls — an older build, or one whose socketpair could not
-    // be created. That worker keeps the refusal, and the refusal says so.
-    //
-    // Asked once, while the bindings are being built, which is safe for the
-    // reason the cluster view's identical test is safe: proxy_worker installs
-    // the sink in its CONSTRUCTOR, before a single frame is read, precisely so
-    // that it is in place before the config frame loads this script.
+    // MUTATE, refused only while this process has no sink to ask through,
+    // tested once while the bindings are built because proxy_worker installs
+    // the sink in its constructor.
     const runtime_manager* mgr = owner ? owner->get_runtime_manager() : nullptr;
     if (!mgr || !mgr->has_map_sink())
     {
@@ -2478,56 +1681,15 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
         }
     }
 
-    // CARRY A CONNECTION.  Not a map problem at all, and no longer a permanent
-    // one either: the same test as the mutators, against a different sink.
-    //
-    // What was missing was never SCM_RIGHTS -- worker_transfer_refusal() says
-    // so at length and was right about that -- but a channel, and there is one
-    // now.  It is not the one the old message predicted, and the difference is
-    // worth a line because the prediction was reasonable and wrong: the
-    // three-argument socketley.pipe does not hand a descriptor over at all.
-    // Read its own binding below.  Across two runtimes it is route_client(),
-    // which keeps the socket here and relays the bytes -- conn_transfer.h's
-    // RELAY shape -- so what it needed was a way to name another runtime's
-    // connection and reach it, which is shared/route_relay.h.
-    //
-    // The four-argument form comes back with it, and that is the part a script
-    // author notices first: it joins two connections of THIS server, needed no
-    // boundary crossed, and was refused only because the refusal was installed
-    // on the name rather than on the operation.  The message it printed even
-    // pointed at self.pipe as the way out.
+    // CARRY A CONNECTION, no longer permanent: the same test as the mutators
+    // against a different sink, since route_client() needed a way to name
+    // another runtime's connection rather than SCM_RIGHTS.
     if (!mgr || !mgr->route_sink())
         sk["pipe"] = make(worker_pipe_refusal());
 
-    // ASK THE CLUSTER.  Refused only while this process has no view of one.
-    //
-    // The four need three things no runtime map carries — this daemon's cluster
-    // name, the address it advertises, and every remote daemon — and until the
-    // daemon began pushing a snapshot of those there was nothing out here they
-    // could be answered from.  Now there may be, so the refusal is a question
-    // rather than a fact about being in a worker.
-    //
-    // Two states, and the second is the reason this is not simply unrefused:
-    //
-    //   a view is installed   the bindings answer from it, exactly as the
-    //                         daemon's answer from cluster_discovery.
-    //   no view               this daemon is in no cluster, or has left one.
-    //                         Refused rather than answered, because the answer
-    //                         would be an empty table — which is what a
-    //                         SUCCESSFUL call returns on a daemon alone in its
-    //                         cluster, and no script can tell the two apart.
-    //
-    // Asked here, once, while the bindings are being built.  What makes that
-    // safe is the order the daemon writes its frames in: the cluster view goes
-    // out BEFORE the config frame, and the config frame is what loads the
-    // script this table is being built for.  See proxy_supervisor::spawn().
-    //
-    // The case that order does not cover is a daemon that joins a cluster after
-    // a worker's script has already loaded: that script keeps the refusal until
-    // it is reloaded.  Wrong in the safe direction — a refusal that names itself
-    // rather than an empty table — and the fix if it ever matters is to move
-    // this question inside the four bindings, where `!src.ok` is already the
-    // branch that would carry it.
+    // ASK THE CLUSTER, refused only while this process has no view, because
+    // with none the answer would be an empty table -- which is what a
+    // successful call returns on a daemon alone in its cluster.
     if (!lua_context::cluster_view_snapshot())
     {
         for (const char* call : {"daemons", "runtimes", "group", "stats"})
@@ -2540,28 +1702,16 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
 
 void lua_context::register_bindings(runtime_instance* owner)
 {
-    // Which runtime every diagnostic from this interpreter belongs to.  First,
-    // because load_diag is called from the validators below this point and from
-    // load_script, which calls this function before it does anything else.
+    // Which runtime every diagnostic from this interpreter belongs to, first,
+    // because load_diag is called from everything below.
     m_owner_name = std::string(owner->get_name());
 
     // Register socketley.log() and management API
     sol::table sk = m_lua.create_table();
 
-    // ─── socketley.log, through the daemon's own logger ─────────────────────
-    //
-    // It wrote straight to std::cerr, which made it the one stream in this
-    // process with no timestamp, no level and no way to turn it down.  A script
-    // logging per message is a script whose operator cannot ask for less
-    // without editing the script — and `log_level` in the daemon's
-    // configuration file exists precisely so that asking for less is a setting.
-    //
-    // At `info`, which is the default, nothing that used to appear stops
-    // appearing; it gains a clock and a level. At `warn`, script chatter goes
-    // quiet, which is what an operator who set `warn` asked for and could not
-    // previously get. That is the judgement: this is output, not diagnosis —
-    // the failures a script must never lose are the callback errors below,
-    // and those are ERROR and survive every level but silence.
+    // socketley.log goes through the daemon's logger, so script output gains a
+    // clock and a level and an operator who set `warn` can finally ask for
+    // less.
     sk["log"] = [owner](std::string_view msg) {
         std::string line = lua_diag::tag(owner->get_name());
         line += ' ';
@@ -2569,51 +1719,10 @@ void lua_context::register_bindings(runtime_instance* owner)
         LOG_INFO(line.c_str());
     };
 
-    // socketley.create(type, name, config_table) → bool
-    //
-    // ─── THE TABLE IS JUDGED BEFORE ANYTHING IS BUILT ───────────────────────
-    //
-    // Every read below used to be "if it is there and I can convert it, apply
-    // it", with no branch for a value that was there and wrong.  That is one
-    // decision repeated eight times, and it is the wrong one every time:
-    //
-    //     port = 70000        cast to uint16_t -> a server on 4464
-    //     mode = "mater"      the switch's default: -> an inout server
-    //     on_parent_stop="keeep"  compared only against "remove" -> keep
-    //     prot = 8080         read by nothing -> a server on port 0
-    //
-    // and in all four the call answered `true`.  A script cannot see any of it:
-    // socketley.get(name).port answers 4464 as confidently as it would answer
-    // 8080, and the operator finds out from a client that cannot connect.
-    //
-    // The refusal policy is not invented here.  `filters` and `routes`, two
-    // hundred lines up this file, refuse the WHOLE script for exactly this
-    // class of mistake, and their validators say why: a hole in a chain is not
-    // visible, so the load fails rather than half-working.  A child runtime on
-    // a port nobody chose is the same shape — invisible from the script, from
-    // `ls`, and from the runtime itself, which is running perfectly well.
-    //
-    // UNKNOWN KEYS ARE REFUSED TOO, and that is the one line here worth
-    // arguing.  The case against is forward compatibility: a script written for
-    // a later socketley, naming a key this one has never heard of, stops
-    // loading instead of degrading.  The case for is that this table is not a
-    // wire format — it is read by the daemon the script is running inside, of
-    // the same build, on the same machine — so there is no version skew to
-    // absorb, and the failure it prevents is the commonest one there is.
-    // `prot = 8080` is a typo somebody will make; a server on port 0 is what
-    // they get for it, and nothing anywhere says the word `prot`. Refused, with
-    // the key named.
-    //
-    // The order matters as much as the checks: everything is judged BEFORE
-    // mgr->create, so a refusal leaves no runtime behind at all.  The two that
-    // cannot be — the script, which needs an instance to load into, and the
-    // start, which needs one to bind — remove what they built, which is what
-    // cmd_create does for the identical two failures on the CLI side.
-    // sol::object and not sol::optional<sol::table> for the third parameter:
-    // the optional answers nullopt for a value that is present and not a table,
-    // which is indistinguishable from no third argument at all — so
-    // socketley.create("server", "s", 8080) built a portless server and
-    // reported success.  An object says which of the two it was.
+    // The config table is judged before anything is built -- unknown keys
+    // included, since it is read by the same build on the same machine --
+    // because a child on a port nobody chose is invisible from the script,
+    // from `ls` and from the runtime itself.
     sk["create"] = [owner](std::string type_str, std::string name,
                            sol::object config) -> api_result {
         auto* mgr = owner->get_runtime_manager();
@@ -2622,12 +1731,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             return api_why("this runtime has no runtime manager");
 
         const std::string where = "socketley.create(\"" + type_str + "\", \"" + name + "\")";
-        // Logged AND returned, which makes this the one call in the family that
-        // does both — and both callers are real.  api_why alone would serve the
-        // script; api_diag alone is what a TOP-LEVEL create needs, because that
-        // one runs inside the `create` command and the operator who typed
-        // `create --lua x.lua` is the person who wrote the mistake.  cmd_create
-        // reads the buffer back to their terminal.
+        // Logged and returned, because a top-level create runs inside the
+        // `create` command and cmd_create reads the buffer back to the
+        // operator's terminal.
         auto refuse = [&](const std::string& why) {
             api_diag(owner, where + ": " + why);
             return api_why(why);
@@ -2686,28 +1792,9 @@ void lua_context::register_bindings(runtime_instance* owner)
                               "port, config/lua, target, mode, http, http_cache, "
                               "group, on_parent_stop, start");
 
-            // ─── A key that is not there must read as absent, not throw ─────
-            //
-            // `sol::optional<T> x = tbl[k]` looks like it says "if present",
-            // and it does not.  The optional's converting constructor runs an
-            // unconditional conversion, and with sol2's safety checks on — they
-            // follow NDEBUG, so they are ON in every Debug and Sanitize build
-            // and off in Release — a key that is absent or of another type
-            // throws.  The throw is raised inside a lambda that sol2 called
-            // across the Lua C boundary, so it unwinds into std::terminate:
-            //
-            //     socketley.create("server","made",{port=P,start=true})
-            //     Release   -> the runtime is created and started
-            //     Sanitize  -> terminate called without an active exception
-            //                  (the whole daemon, and every runtime in it)
-            //
-            // gdb put it at this line: the config above has no `lua` key, and
-            // reading the one that is not there is what ended the process.
-            //
-            // Every read below is therefore taken as a sol::object first, which
-            // asks the Lua stack what is there without converting anything, and
-            // is then type-checked by this code rather than by a conversion
-            // whose behaviour is a property of the build.
+            // A key that is not there must read as absent rather than throw,
+            // so every read is taken as a sol::object first and type-checked
+            // here instead of by a conversion whose behaviour follows NDEBUG.
             sol::object o_port = t["port"];
             if (o_port.valid() && o_port != sol::nil)
             {
@@ -2806,11 +1893,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             {
                 if (o_ops.get_type() != sol::type::string)
                     return refuse("`on_parent_stop` must be \"remove\" or \"stop\"");
-                // "stop" and not "keep": child_policy::stop is what the enum
-                // calls it, what the `owner` command prints, and what the man
-                // page documents.  A second name for one bit is the thing the
-                // --out-of-process/--in-daemon note in flag_handlers warns
-                // about, and it costs the same here.
+                // "stop" and not "keep", because that is what the enum, the
+                // `owner` command and the man page call it, and a second name
+                // for one bit costs the same here as anywhere.
                 const std::string p = o_ops.as<std::string>();
                 if (fnv1a(p) == fnv1a("remove"))
                     cfg_remove_with_parent = true;
@@ -2829,24 +1914,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             }
         }
 
-        // ── In a worker, the same call goes to the process holding the map ──
-        //
-        // Everything above this line is the TABLE, read by the interpreter that
-        // has it and refused here where the mistake was made — a script gets
-        // `port must be a number` at its own call site whichever process it is
-        // running in.  Everything below is the MAP, and a worker holds a copy.
-        //
-        // So the seam is exactly here, and what crosses is a runtime_config:
-        // the same struct a config frame carries in the other direction and the
-        // same one a state file holds, so there is one JSON codec and no second
-        // description of a runtime anywhere.  The daemon applies it with
-        // apply_common_config/apply_typed_config, which is the list both sides
-        // of the boundary already share.
-        //
-        // Only the fields this table can set are filled.  A default-constructed
-        // runtime_config is what `create` starts from in the daemon too, so an
-        // unset field carries the same meaning on both sides by construction
-        // rather than by agreement.
+        // The seam is exactly here: everything above is the table, refused
+        // where the mistake was made, and what crosses is a runtime_config,
+        // which is the same struct a config frame and a state file carry.
         if (mgr->has_map_sink())
         {
             runtime_config c;
@@ -2877,11 +1947,8 @@ void lua_context::register_bindings(runtime_instance* owner)
                                                         "create and said nothing")
                                           : err);
 
-            // The replica, corrected on the spot.  Without this the next line
-            // of the same script reads a map that does not have this runtime
-            // in it yet -- measured as `create=true port=nil` -- and a script
-            // could tell from that which process it is running in.  See
-            // runtime_manager::replica_note.
+            // The replica, corrected on the spot, or the next line of the same
+            // script reads a map without this runtime in it.
             runtime_manager::replica_entry re;
             re.name  = name;
             re.type  = type;
@@ -2911,30 +1978,17 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!cfg_group.empty()) inst->set_group(cfg_group);
         if (cfg_remove_with_parent)
             inst->set_child_policy(runtime_instance::child_policy::remove);
-        // as_server(), not static_cast.  `inst` came out of the manager, and
-        // since a worker got a runtime map "out of the manager" no longer
-        // implies "a real server_instance": a replica answers runtime_server
-        // truthfully from get_type() and is a bare runtime_instance underneath,
-        // deliberately so — building replicas out of the real type would cost a
-        // proxy's three 65536-entry tables per runtime per worker.  A
-        // static_cast onto one writes past the end of the object, and the type
-        // check above cannot catch it; it is the thing that looks like it
-        // already has.
-        //
-        // Nothing reaches here with a replica today, and the reason is worth
-        // stating rather than leaving to be rediscovered: socketley.create() is
-        // refused in a worker PERMANENTLY, so this runs only in the daemon,
-        // where mgr->create() has just built the real thing.  That refusal is
-        // what made the old raw cast survivable — this call and socketley.pipe
-        // are the two most likely to be revisited, and a reader who changes the
-        // refusal needs to find this coupling written down.
+        // as_server() and not static_cast, because a replica answers
+        // runtime_server truthfully and is a bare runtime_instance underneath
+        // -- unreachable today only because socketley.create is refused in a
+        // worker, which is the coupling a reader who changes that refusal has
+        // to find.
         if (type == runtime_server)
         {
             auto* srv = inst->as_server();
             // Null means the manager handed back something that calls itself a
-            // server and is not one.  Refused rather than written into, and the
-            // half-built runtime goes with it — the same unwind the two
-            // failures below take, for the same reason.
+            // server and is not one, so the half-built runtime goes with the
+            // refusal.
             if (!srv)
             {
                 mgr->remove(name);
@@ -2945,30 +1999,9 @@ void lua_context::register_bindings(runtime_instance* owner)
             if (cfg_http_cache) srv->set_http_cache(true);
         }
 
-        // ─── The two that can only fail after the runtime exists ────────────
-        //
-        // Both returns were discarded.  A child whose script would not compile
-        // was created, registered and answered `true` with not one callback on
-        // it — a server that accepts connections and does nothing with them,
-        // which is indistinguishable from a working one until traffic arrives.
-        // A `start = true` that could not bind answered `true` for a runtime
-        // that never listened.
-        //
-        // Removed rather than left `failed`, because that is what cmd_create
-        // does for the same two failures: a script that will not load and a
-        // start that will not bind both take `m_manager.remove(name)` on the
-        // way out.  The one place this tree leaves a refusal standing is the
-        // out-of-process create, where the reason lives in another process and
-        // a `failed` row is the only record — not this path, where the reason
-        // is on the line above.  A Lua-created child is always in-daemon, so
-        // there is no supervisor holding a pointer to it and no release_workers
-        // to do first, which is why this is a plain remove.
-        //
-        // The reason is not repeated here on purpose: the child's own load has
-        // already written it, named for the CHILD, to both the log and the
-        // buffer a top-level create reads back.  Saying it again under the
-        // parent's name would put one failure on the operator's terminal twice
-        // under two different runtime names.
+        // The two that can only fail after the runtime exists remove what they
+        // built, exactly as cmd_create does, without repeating a reason the
+        // child's own load has already written under the child's name.
         if (!cfg_script.empty() && !inst->load_lua_script(cfg_script))
         {
             mgr->remove(name);
@@ -2986,53 +2019,18 @@ void lua_context::register_bindings(runtime_instance* owner)
         return api_yes();
     };
 
-    // socketley.start(name) → bool
-    // ─── THE DIAGNOSIS IS MADE HERE, FROM WHAT THIS SIDE CAN KNOW ───────────
-    //
-    // runtime_manager::start answers a bool, and the reasons behind it are
-    // spread through runtime_instance::start: a state that cannot be started, a
-    // ring policy this loop cannot meet, a TLS pair that is not a pair, a bind
-    // that failed.  Two of those four can be asked about from here, exactly and
-    // in O(1), BEFORE anything is attempted — so they are, and they are named.
-    //
-    // The other two cannot, and this deliberately does not pretend otherwise.
-    // setup() is where a held port is discovered and it reports to the daemon's
-    // log; a second diagnosis invented here would be a guess wearing the
-    // clothes of a fact.  What is said instead is true and is the part a script
-    // can act on: the attempt was made, it failed, and this is the state the
-    // runtime is in now.
-    //
-    // The ring check runs before the attempt rather than after it for a reason
-    // beyond tidiness: runtime_instance::start stores `failed` on that path, so
-    // a call that could have been refused would otherwise leave the runtime
-    // unstartable for the rest of the daemon's life.
+    // Two of the four reasons a start fails can be asked about from here in
+    // O(1) before anything is attempted, so they are named, and the ring check
+    // runs first because runtime_instance::start stores `failed` on that path.
     sk["start"] = [owner](std::string name) -> api_result {
         auto* mgr = owner->get_runtime_manager();
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
 
-        // ── In a worker, asked of the daemon — and asked FIRST ──────────────
-        //
-        // Above every check below it, and that placement is the whole lesson of
-        // the first draft, which put it after them.
-        //
-        // A worker's map is a REPLICA and the daemon pushes it on a coalescing
-        // timer, so a runtime created a millisecond ago is not in it yet.  The
-        // lookup below then answered `there is no runtime called "kid2"` for a
-        // runtime the same script had just created and the daemon had already
-        // built — measured, three calls in a row, immediately after a create
-        // that returned true.  Every one of those checks reads the replica, so
-        // every one of them can be a snapshot behind.
-        //
-        // The daemon makes them all against the map it holds, and its wording
-        // is the wording here; see daemon_handler::serve_map_request.  One
-        // source of truth, and the answers a script sees do not depend on how
-        // recently a push happened to land.
-        //
-        // `loop` is a second reason: it is this WORKER'S ring, and the runtime
-        // being started is in the daemon, so ring_policy_refusal() below would
-        // be asking the wrong process's ring about somebody else's runtime.
+        // In a worker, asked of the daemon and asked first, because every
+        // check below reads a replica that can be a snapshot behind and `loop`
+        // is this worker's ring rather than the runtime's.
         if (mgr->has_map_sink())
         {
             std::string err;
@@ -3079,13 +2077,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
 
-        // In a worker, asked of the daemon, and asked before the replica is
-        // consulted; see socketley.start above for why that order is the point.
-        //
-        // stop is also the one of the four where waiting is load-bearing beyond
-        // the return value: the daemon takes the runtime's workers down before
-        // it answers, so a script that stops a runtime and then binds its port
-        // finds it free — the same guarantee `stop` gives at the CLI.
+        // In a worker, asked of the daemon before the replica, and the one of
+        // the four where waiting is load-bearing: the daemon takes the workers
+        // down before it answers, so a script can rebind the port.
         if (mgr->has_map_sink())
         {
             std::string err;
@@ -3118,10 +2112,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         auto* loop = owner->get_event_loop();
         if (!mgr || !loop)
             return api_why("this runtime has no runtime manager");
-        // In a worker, asked of the daemon, before the replica is consulted;
-        // see socketley.start above.  The stop below would be a write to that
-        // replica, which is the one thing a worker must not do — the daemon
-        // stops the runtime itself, on its own loop, as part of serving this.
+        // In a worker, asked of the daemon before the replica, because the
+        // stop below would be a write to that replica.
         if (mgr->has_map_sink())
         {
             std::string err;
@@ -3139,10 +2131,9 @@ void lua_context::register_bindings(runtime_instance* owner)
 
         if (inst->get_state() == runtime_running)
             mgr->stop(name, *loop);
-        // Before the instance leaves the map, and for the reason cmd_remove()
-        // gives at the same point in the same order: a worker's supervisor
-        // holds a pointer to the placeholder, and that pointer has to be
-        // dropped while the object it names is still there.
+        // Before the instance leaves the map, because a worker's supervisor
+        // holds a pointer to the placeholder that has to be dropped while the
+        // object is still there.
         mgr->release_workers();
         if (mgr->remove(name))
             return api_yes();
@@ -3152,15 +2143,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         return api_why(q(name) + " could not be removed");
     };
 
-    // socketley.send(name, msg) → bool
-    //
-    // The connections are wherever the runtime is — the same sentence cmd_send()
-    // is written under, and for the same reason.  Calling lua_broadcast() on a
-    // placeholder reaches an object that has the name, the port and the state
-    // and not one connection: it succeeds, it returns true, and the message
-    // goes nowhere.  That was fixed for the CLI when the deliver frame was
-    // added and left standing here, so since 8399bee made the worker the
-    // default it was the ordinary case for a script.
+    // The connections are wherever the runtime is, so calling lua_broadcast()
+    // on a placeholder succeeds, returns true and delivers nothing.
     sk["send"] = [owner](std::string_view name,
                          std::string_view msg) -> api_result {
         auto* mgr = owner->get_runtime_manager();
@@ -3176,25 +2160,10 @@ void lua_context::register_bindings(runtime_instance* owner)
         {
             if (mgr->deliver_out_of_process(name, msg))
                 return api_yes();
-            // Named as the transport it is.  A script told only `false` would
-            // look at its own runtime for a fault that is in the pipe to
-            // somebody else's process.
-            //
-            // This is the branch that runs for EVERY peer when the caller is
-            // itself in a worker, including peers that live in the daemon:
-            // from out here every other runtime is in another process, and the
-            // map marks them so.  Without that mark this falls through to
-            // lua_broadcast() on a row with no connections in it, which
-            // succeeds, returns true and delivers nothing — the defect this
-            // branch was added for, reintroduced from the other side.
-            //
-            // What `true` means is one hop weaker here than in the daemon.
-            // There it means the message reached the process holding the
-            // connections; here it means it reached the daemon, which then
-            // routes it in-process or on to another worker.  That is the
-            // honest reading of the sink's return and it is not worth a
-            // synchronous round trip to narrow — the thing a script actually
-            // wants to know is checked by the receiver, not by this bool.
+            // Named as the transport it is, taken for every peer when the
+            // caller is itself in a worker, where `true` means the message
+            // reached the daemon rather than the process holding the
+            // connections.
             return api_why(q(name) + " runs in another process, and the "
                                      "message could not be handed to it");
         }
@@ -3218,14 +2187,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         return result;
     };
 
-    // socketley.get(name) → table {name, type, state, port, connections, owner} or nil
-    //
-    // reported_connection_count(), not get_connection_count(): `name` is some
-    // OTHER runtime, and since 8399bee another runtime is normally one in a
-    // worker process, whose connections this object does not hold.  The three
-    // calls in this file that ask about another runtime are the three that had
-    // to change; every self.connections() below asks its own object in its own
-    // process and is right to walk the tables.
+    // reported_connection_count() and not get_connection_count(), because
+    // `name` is some other runtime, whose connections this object does not
+    // hold.
     sk["get"] = [owner, this](std::string name) -> sol::object {
         auto* mgr = owner->get_runtime_manager();
         if (!mgr) return sol::nil;
@@ -3249,27 +2213,12 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.set_timeout(ms, fn) → timer_id
     //
     // ─── What 0 means, and why it stays 0 ───────────────────────────────────
-    //
-    // A refusal, and only a refusal.  The ids come from `++m_next_timer_id` on
-    // a counter that starts at 0, so a timer that was armed always has an id of
-    // 1 or more and there is no value a script has to disambiguate — `if
-    // socketley.set_timeout(ms, f) == 0 then` is a complete test.
-    //
-    // What it does not say is WHICH refusal, and both are worth a line in the
-    // log rather than a silent nothing: a runtime with no event loop is not a
-    // runtime that can schedule anything, and `ms <= 0` is a script asking for
-    // a timer that would never be armed.  Neither can happen in a working
-    // script, so the cost of saying so is nothing and the cost of not saying so
-    // is a callback that never runs with no record of why.
-    //
-    // Not changed to a nil return, which was the alternative.  0 is already
-    // unambiguous, and a nil would break `local id = set_timeout(...)` followed
-    // by `clear_timeout(id)` — clear_timeout takes an int, so the failure would
-    // move from a callback that never fires to a type error at a line that has
-    // nothing wrong with it.
+    // 0 is a refusal and never an id, said in the log because a callback that
+    // never runs otherwise leaves no record, and not a nil, which would break
+    // `clear_timeout(id)`.
     sk["set_timeout"] = [this, owner](int ms, sol::protected_function fn) -> int {
-        // A third refusal, and the same 0.  See registrations_severed(): the
-        // runtime is down and this call would schedule work for it.
+        // A third refusal and the same 0: the runtime is down and this call
+        // would schedule work for it.
         if (m_severed)
         {
             std::cerr << lua_diag::tag(owner->get_name())
@@ -3308,8 +2257,8 @@ void lua_context::register_bindings(runtime_instance* owner)
     //
     // 0 on refusal, said out loud; see set_timeout above for the whole of it.
     sk["set_interval"] = [this, owner](int ms, sol::protected_function fn) -> int {
-        // See set_timeout above.  This is the one the measurement came from: 41
-        // ticks in two seconds on a runtime that had been stopped.
+        // See set_timeout above; this is the one the measurement came from, at
+        // 41 ticks in two seconds on a stopped runtime.
         if (m_severed)
         {
             std::cerr << lua_diag::tag(owner->get_name())
@@ -3345,26 +2294,10 @@ void lua_context::register_bindings(runtime_instance* owner)
     };
 
     // ─── Cancelling a timer withdraws it ────────────────────────────────────
-    //
-    // Both of these were two assignments — `cancelled = true; repeat = false;`
-    // — and nothing else.  That stops the callback, which is all the existing
-    // tests ask for, and it leaves everything else exactly where it was: the
-    // timeout stays armed in the ring, the lua_timer keeps its storage and its
-    // owner registration, and the sol::protected_function keeps a registry
-    // reference to the closure and to every upvalue it captured.  Cancelling a
-    // one-hour interval held all of that for the hour.  Measured on the parent,
-    // 100 cleared timeouts each capturing a 32 KB string, collectgarbage()
-    // called after the clear: the Lua heap did not move.
-    //
-    // sever_timer() is what cancel_timers() already does to every timer at stop
-    // and at teardown, so this is that mechanism reused rather than a second
-    // one — which matters, because the order it performs those four steps in is
-    // load-bearing and there should be exactly one place that knows it.
-    //
-    // unregister_timer() first, and not after: it finds the map entry by
-    // t->timer_id, and it is what takes this timer out of m_timer_map and
-    // m_active_timers so that neither goes on naming a timer this context has
-    // handed to its own completion.
+    // sever_timer() rather than two assignments, which stopped the callback
+    // and left the timeout armed and the closure referenced, reusing the one
+    // place that knows the load-bearing order -- unregister_timer() first,
+    // because it finds the entry by timer_id.
     auto cancel_timer_by_id = [this](int id) {
         auto it = m_timer_map.find(id);
         if (it == m_timer_map.end()) return;   // already fired, or never issued
@@ -3379,13 +2312,9 @@ void lua_context::register_bindings(runtime_instance* owner)
     // socketley.clear_interval(id) — cancel a repeating interval
     sk["clear_interval"] = cancel_timer_by_id;
 
-    // socketley.json_encode(value) → JSON string, or false + why
-    //
-    // The refusal follows this file's return contract rather than raising: a
-    // string is truthy and false is not, so `local s = socketley.json_encode(t)`
-    // reads the same, and `if not s then` is how the two callers that care
-    // already test everything else here.  Both refusals used to be a crash of
-    // the whole daemon — see json_max_depth.
+    // json_encode refuses with false and a reason rather than raising,
+    // following this file's return contract, where both refusals used to crash
+    // the whole daemon.
     sk["json_encode"] = [](sol::object val)
                         -> api_result {
         std::string out;
@@ -3398,13 +2327,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         return api_str_t{ std::move(out) };
     };
 
-    // socketley.json_decode(str) → Lua value, or false + why
-    //
-    // The depth refusal is the one that matters here: this call is written to be
-    // pointed at a request body, so the nesting is chosen by whoever sent it.
-    // Answering nil would be indistinguishable from a document that really did
-    // decode to nil, which is the ambiguity this file's whole return contract
-    // exists to remove.
+    // json_decode's depth refusal matters most because this call is pointed at
+    // request bodies, and nil would be indistinguishable from a document that
+    // really decoded to nil.
     sk["json_decode"] = [this](std::string_view str)
                         -> api_result {
         const char* p = str.data();
@@ -3420,12 +2345,9 @@ void lua_context::register_bindings(runtime_instance* owner)
                            "byte " + std::to_string(
                                static_cast<size_t>(p - str.data())));
 
-        // Trailing bytes are a failure too, and this is where they are caught:
+        // Trailing bytes are a failure too, caught here because
         // json_decode_value stops at the end of the first complete value and
-        // says nothing about what follows.  Without this, `{"a":1} DROP TABLE`
-        // decoded to {a=1} and the rest went unmentioned — the caller cannot
-        // notice what it is never told, and a body with something appended to it
-        // is exactly the case worth noticing.
+        // says nothing about what follows.
         socketley::lua_json::json_skip_ws(p, end);
         if (p != end)
             return api_why("socketley.json_decode(): " +
@@ -3435,18 +2357,13 @@ void lua_context::register_bindings(runtime_instance* owner)
         return api_obj_t{ std::move(v) };
     };
 
-    // socketley.subscribe(cache_name, channel, fn) → subscription_id
-    //
-    // The id is new, and it is what socketley.unsubscribe takes.  Returning one
-    // rather than answering unsubscribe(cache_name, channel) follows the timers
-    // — set_timeout hands back an integer that clear_timeout takes — and is the
-    // only identity that can express the case the counterpart exists for: two
-    // handlers on one channel, of which the script wants to drop one.
+    // The id is what socketley.unsubscribe takes, following the timers, and is
+    // the only identity that can express dropping one of two handlers on one
+    // channel.
     sk["subscribe"] = [this](std::string cache_name, std::string channel,
                              sol::protected_function fn) -> int {
-        // 0, which is never an id — see the note above on where ids start.  The
-        // runtime is down and a registration made now would outlive the stop
-        // that was supposed to end them all; see registrations_severed().
+        // 0, which is never an id: the runtime is down and a registration made
+        // now would outlive the stop that was supposed to end them all.
         if (m_severed)
         {
             std::cerr << lua_diag::tag(owner_name())
@@ -3463,9 +2380,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         sub.id = id;
         sub.fn = std::move(fn);
 
-        // Parked rather than appended when a dispatch is walking a vector; see
-        // dispatch_publish.  A handler that subscribes does not thereby receive
-        // the message it is handling.
+        // Parked rather than appended while a dispatch is walking, so a
+        // handler that subscribes does not receive the message it is handling.
         if (m_dispatch_depth > 0)
             m_pending_subscriptions.emplace_back(std::move(key), std::move(sub));
         else
@@ -3473,15 +2389,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         return id;
     };
 
-    // socketley.unsubscribe(subscription_id) → bool
-    //
-    // True when it removed a live registration, false when the id names none —
-    // an id that was never issued, or one already unsubscribed.  The timers
-    // return nothing from clear_timeout because cancelling a timeout that has
-    // already fired is an ordinary thing to do and says nothing about the
-    // script; a subscription has no such state.  It is live until this call, so
-    // false means the script asked about something that does not exist, and
-    // that is worth being able to see.
+    // True when it removed a live registration and false when the id names
+    // none, which unlike a cleared timeout is always the script asking about
+    // something that does not exist.
     sk["unsubscribe"] = [this](int id) -> bool {
         auto ki = m_subscription_keys.find(id);
         if (ki == m_subscription_keys.end())
@@ -3506,44 +2416,18 @@ void lua_context::register_bindings(runtime_instance* owner)
         m_subscription_keys.erase(ki);
         m_subscriptions_dirty = true;
 
-        // Marked now, taken out now — unless a dispatch is walking the vector
-        // this entry is in, in which case the walk finishes first.  A handler
-        // unsubscribing itself is the ordinary way to write a one-shot
-        // subscriber, so this is not an exotic path.
+        // Marked and taken out now, unless a dispatch is walking this entry's
+        // vector, since a handler unsubscribing itself is the ordinary
+        // one-shot subscriber.
         if (m_dispatch_depth == 0)
             settle_subscriptions();
         return true;
     };
 
-    // socketley.pipe(src_name, src_fd, dst_name[, dst_fd])
-    //
-    // ─── TWO OPERATIONS, AND THE ARGUMENT COUNT IS WHICH ────────────────────
-    //
-    // This was one four-argument call that did two unrelated things, and told
-    // you it had done the one you asked for either way.
-    //
-    // Inside one runtime it is a pipe: lua_pipe writes each connection's
-    // descriptor into the other's `pipe_peer_fd`, and bytes arriving on one go
-    // straight out of the other.  Both descriptors are needed and both are
-    // used.
-    //
-    // Across two runtimes it is not a pipe and cannot be.  `pipe_peer_fd` is an
-    // index into ONE server's connection table, so there is no pairing to make;
-    // what the branch actually does is route_client(src_fd, dst_name), which
-    // hands the connection to the destination RUNTIME and lets that runtime
-    // decide what to do with it.  There is no destination descriptor in that at
-    // all — and the fourth argument was read by nothing:
-    //
-    //     socketley.pipe("a", 3, "b", 7)  ->  true, and 7 was never looked at
-    //
-    // A script that went to the trouble of obtaining descriptor 7 from `b` was
-    // told it had joined 3 to 7.  It had not; it had given the connection to
-    // `b`, which delivered it wherever its own script says.
-    //
-    // So the fourth argument is optional now and the count states the request.
-    // Four is the pipe and requires one runtime; three is the route and
-    // requires two.  Asking for the combination that does not exist is refused
-    // by name rather than served as the other one.
+    // Two operations and the argument count is which: four is a pipe within
+    // one runtime, three is route_client() across two, because the
+    // cross-runtime branch has no destination descriptor and used to read the
+    // fourth argument not at all.
     sk["pipe"] = [owner](std::string src_name, int src_fd,
                          std::string dst_name,
                          sol::optional<int> dst_fd) -> api_result {
@@ -3562,10 +2446,9 @@ void lua_context::register_bindings(runtime_instance* owner)
 
         if (src_name == dst_name)
         {
-            // A pipe pairs two connections of one server, and only that
-            // server's own object holds them.  Naming a third runtime twice
-            // used to fall through to the cross-runtime branch and route a
-            // runtime to itself.
+            // A pipe pairs two connections of one server, so naming a third
+            // runtime twice must not fall through to the cross-runtime branch
+            // and route a runtime to itself.
             if (src_name != owner->get_name())
                 return refuse("a pipe joins two connections of one server, and "
                               "only that server holds them — call it from \""
@@ -3592,13 +2475,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (src_rt->get_type() != runtime_server)
             return refuse("\"" + src_name + "\" is not a server");
 
-        // The DESTINATION is not checked here when there is a route sink, and
-        // that is the Part 1 lesson applied a second time.  Both checks read
-        // this process's map, which in a worker is the daemon's copied on a
-        // coalescing timer -- so a script that creates a runtime and routes to
-        // it in the next statement was told "there is no runtime called x" for
-        // a runtime that demonstrably existed.  Whoever holds the map answers,
-        // in the map's own words, and route_client carries them back.
+        // The destination is not checked here when there is a route sink,
+        // because this process's map is a replica pushed on a timer and
+        // whoever holds the map answers in the map's own words.
         if (!mgr->route_sink())
         {
             auto* dst_rt = mgr->get(dst_name);
@@ -3607,30 +2486,10 @@ void lua_context::register_bindings(runtime_instance* owner)
                 return refuse("both ends must be servers");
         }
 
-        // as_server(), not static_cast — and this is the sharper of the two
-        // sites, because `src_rt` is an ARBITRARY name out of the map rather
-        // than something this call just built.  In a worker every row in that
-        // map is a replica: it answers runtime_server from get_type() and is a
-        // bare runtime_instance underneath, so the check on the line above is
-        // satisfied by an object that a static_cast then writes past the end
-        // of.  route_client() is not a read, either — it writes m_routes and
-        // m_conn_idx.
-        //
-        // Nothing reaches here with a replica today because socketley.pipe() is
-        // refused in a worker PERMANENTLY: it moves a connection, and no map
-        // supplies a descriptor.  That refusal is what made the old raw cast
-        // survivable, and it is the coupling to know about before relaxing it.
-        // ─── RESOLVING THE SOURCE, AND WHY THE MANAGER IS ASKED SECOND ──────
-        //
-        // A worker does not register its own runtime in its manager -- `m_rt`
-        // is held by the worker and the map holds a REPLICA of it, pushed down
-        // with everyone else's.  So `mgr->get(own_name)->as_server()` is null
-        // out here for the one runtime this process definitely has, and
-        // socketley.pipe("myself", fd, "other") answered "it lives somewhere
-        // else" while self.route on the same connection worked.
-        //
-        // `owner` is that object.  Asked first, because it is the only
-        // resolution that cannot be a replica.
+        // as_server() and not static_cast, sharper here because `src_rt` is an
+        // arbitrary name out of a map whose rows are replicas in a worker --
+        // and `owner` is asked first, because it is the only resolution that
+        // cannot be one.
         server_instance* src_srv = nullptr;
         if (src_name == owner->get_name())
             src_srv = owner->as_server();
@@ -3640,11 +2499,8 @@ void lua_context::register_bindings(runtime_instance* owner)
             return refuse("\"" + src_name + "\" says it is a server but this "
                           "process holds no server object for it — it lives "
                           "somewhere else");
-        // route_client refuses several different things, and the bare false
-        // told them apart no better than it told any of them from success.  It
-        // says which now, and for a target in another process the words are the
-        // daemon's -- so a script cannot tell from the message which side of
-        // the boundary answered, which is the property the map calls hold too.
+        // route_client refuses several different things and now says which, in
+        // the daemon's own words for a target in another process.
         std::string why;
         if (src_srv->route_client(src_fd, dst_name, &why))
             return api_yes();
@@ -3654,28 +2510,10 @@ void lua_context::register_bindings(runtime_instance* owner)
                                                    "reason was given") : why));
     };
 
-    // ─── socketley.cluster.* — cluster introspection API ───
-    //
-    // ── WHERE THE CLUSTER HALF OF THE ANSWER COMES FROM ─────────────────────
-    //
-    // Each of the four below needs three things the runtime map does not carry:
-    // this daemon's cluster NAME, the address it advertises, and every remote
-    // daemon with its runtimes.  In the daemon those come off
-    // cluster_discovery.  In a worker there is no cluster_discovery and there
-    // must not be one — it would claim this node's name in the shared cluster
-    // directory and read as a second daemon to every other member — so the
-    // daemon pushes a snapshot instead.  See shared/cluster_view.h.
-    //
-    // Resolved once, here, rather than four times: the four differ in what they
-    // do with the answer, not in where it comes from, and a fifth cluster call
-    // added later should not have to rediscover this.
-    //
-    // `ok` false means this process has neither source, which is what a daemon
-    // started without --cluster looks like.  Every caller returns an empty
-    // table for that, unchanged: it is the honest answer for a runtime that is
-    // not in a cluster at all.  It is NOT the honest answer for a worker whose
-    // view has not arrived, and that case never reaches here — the refusal is
-    // still installed over these bindings until a view exists.
+    // The cluster half of the answer is resolved once here rather than four
+    // times, from cluster_discovery in the daemon and from a pushed view in a
+    // worker, where `ok` false means neither source and an empty table is the
+    // honest answer.
     struct cluster_source
     {
         std::string                daemon_name;
@@ -3715,12 +2553,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!src.ok) return result;
 
         int i = 1;
-        // Local daemon entry.
-        //
-        // `runtimes` is the size of the LOCAL map, so in a worker this is the
-        // pushed runtime map and it has to be the whole of it — a snapshot
-        // filtered to peers, or one missing the worker's own row, reports a
-        // daemon smaller than it is.
+        // The local daemon entry, whose `runtimes` is the whole local map,
+        // because a snapshot missing the worker's own row reports a daemon
+        // smaller than it is.
         {
             sol::table d = m_lua.create_table();
             d["name"] = src.daemon_name;
@@ -3754,13 +2589,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         if (!src.ok) return result;
 
         int i = 1;
-        // Local runtimes.
-        //
-        // This is the row that needs the most out of a pushed map, and it is
-        // the one that decides whether a name-and-port snapshot is enough: it
-        // reads get_group() as well as the six fields socketley.get() wants.
-        // A map carrying only what get() needs answers here with every group
-        // empty, which reads as a cluster where nobody is grouped.
+        // Local runtimes, the row that decides whether a name-and-port
+        // snapshot is enough, because it reads get_group() as well as the six
+        // fields socketley.get() wants.
         {
             std::shared_lock lock(mgr->mutex);
             for (const auto& [name, inst] : mgr->list())
@@ -3815,16 +2646,13 @@ void lua_context::register_bindings(runtime_instance* owner)
                 {
                     sol::table m = m_lua.create_table();
                     m["daemon"] = src.daemon_name;
-                    // The ADVERTISED address, not 127.0.0.1.  A worker has no
-                    // way to derive this and guessing loopback would hand a
-                    // script an address no other node can reach — which is why
-                    // the view carries it rather than being rebuilt locally.
+                    // The advertised address and not 127.0.0.1, which a worker
+                    // cannot derive and which no other node could reach.
                     m["host"] = src.host;
                     m["port"] = inst->get_port();
-                    // The figure a least-connections choice is made on.  A local
-                    // member in a worker reported 0 here beside a remote
-                    // member's true count, so every such choice picked the
-                    // local one, however busy it was.
+                    // The figure a least-connections choice is made on, which
+                    // read 0 for a local member in a worker and so was always
+                    // picked.
                     m["connections"] = static_cast<int>(inst->reported_connection_count());
                     result[i++] = m;
                 }
@@ -3898,10 +2726,8 @@ void lua_context::register_bindings(runtime_instance* owner)
         return result;
     };
 
-    // Last, and over the top of the bindings above: a worker gets the same table
-    // with the calls it cannot honour replaced by a refusal that names them.
-    // Done here rather than by not binding them at all, so the two builds differ
-    // in one place and the list of what is refused is readable in one place.
+    // Last and over the top of the bindings above, so the two builds differ in
+    // one place and the list of what is refused is readable in one place.
     if (in_worker_process())
         refuse_cross_runtime_api(sk, cluster_tbl, owner);
 
@@ -3941,26 +2767,14 @@ void lua_context::register_bindings(runtime_instance* owner)
 
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
 {
-    // broadcast_all(), not lua_broadcast(): the second is this PROCESS's
-    // connection table, and under --shards that is a quarter of the clients on
-    // four shards -- delivered, reported as done, and wrong by nothing.
-    // Unsharded the two are the same call.  See runtime_instance::broadcast_all.
+    // broadcast_all() and not lua_broadcast(), which is this process's
+    // connection table and under --shards reaches a quarter of the clients
+    // while reporting success.
     self["broadcast"] = [owner](std::string_view msg) {
         owner->broadcast_all(msg);
     };
-    // ─── THE SAME CONTRACT AT THE OTHER DOOR ────────────────────────────────
-    //
-    // socketley.create refuses a port it cannot honour.  Every mutator below
-    // used to take whatever it was given and, when it could not honour it, do
-    // nothing and say nothing.  Checking at one door and not the other is worse
-    // than checking at neither, because it teaches a script author that the
-    // check exists.
-    //
-    // So these answer the way the management family answers: `true`, or
-    // `false, "<reason>"`.  Nothing that exists can be reading a value that
-    // changed, because every one of them returned NOTHING before — the only
-    // scripts affected are the ones that now have an answer where they had
-    // silence.
+    // The same contract at the other door, because checking at one and not the
+    // other teaches a script author that the check exists.
     self["send"] = [owner, this](int client_id,
                                  std::string_view msg) -> api_result {
         if (owner->is_udp())
@@ -3975,21 +2789,9 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                        + " on " + q(m_owner_name)
                        + " — it may have closed, or it may never have been one");
     };
-    // ─── ONE RUNTIME'S CONNECTIONS, NOT ONE PROCESS'S ───────────────────────
-    //
-    // shard_connection_count() rather than get_connection_count(), and the
-    // difference is only visible with --shards: N processes share one listening
-    // socket, so a script asking how many clients its runtime has was answered
-    // with how many THIS process had -- 10 for a four-shard runtime holding 40,
-    // with nothing anywhere saying so.
-    //
-    // Unsharded it is get_connection_count() and costs exactly what it did, so
-    // all four of these bindings are written the same way rather than only the
-    // ones --shards can reach today.  A client cannot be sharded and is refused
-    // outright; writing its binding differently would leave the next reader to
-    // work out which of four identical-looking calls was the deliberate one.
-    //
-    // See runtime_instance::shard_connection_count and shard_stats.h.
+    // shard_connection_count() and not get_connection_count(), because under
+    // --shards a script asking how many clients its runtime has was answered
+    // with how many this process had.
     self["connections"] = [owner]() -> size_t {
         return static_cast<size_t>(owner->shard_connection_count());
     };
@@ -4046,20 +2848,9 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         return t;
     };
 
-    // Targeted multicast to a subset of clients
-    // ─── A LIST WITH A HOLE IN IT IS NOT A SHORTER LIST ─────────────────────
-    //
-    // `if (v.is<int>()) fds.push_back(...)` dropped every entry that was not an
-    // integer and sent to whatever was left.  `self.multicast({1, "2", 3}, m)`
-    // therefore reached two of the three clients the script named and reported
-    // nothing — and the entry it skipped is exactly the one whose id came back
-    // from json_decode as a string, which is how this happens in practice.
-    //
-    // Refused, for the reason the `filters` validator gives in this same file: a
-    // hole in a list is not visible from the outside, so the call fails rather
-    // than half-works.  The array part only, stopping at the first gap, exactly
-    // as `filters` and `routes` are read — and a keyed table, which reaches
-    // nobody at all, is named rather than treated as an empty list.
+    // A list with a hole in it is not a shorter list, so a non-integer entry
+    // refuses the call rather than being dropped -- which is exactly what an
+    // id that came back from json_decode as a string would be.
     self["multicast"] = [owner](sol::table ids,
                                 std::string_view msg) -> api_result {
         std::vector<int> fds;
@@ -4092,10 +2883,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // Per-connection metadata: nil value deletes the key
     self["set_data"] = [owner, this](int id, std::string key,
                                      sol::optional<std::string> val) -> api_result {
-        // An empty key is a key nothing can read back — get_data("") answers nil
-        // whether it was ever set or not — so storing under it is a write that
-        // cannot be observed.  It is also what a missing table field looks like
-        // after `..`.
+        // An empty key is a key nothing can read back, so storing under it is
+        // a write that cannot be observed.
         if (key.empty())
             return api_why("the metadata key is empty");
         auto* srv = static_cast<server_instance*>(owner);
@@ -4130,10 +2919,8 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         return t;
     };
 
-    // Multicast groups
-    // An empty group name is refused at all three doors rather than at none:
-    // it is a name no client can be reached by, and it is what a missing table
-    // field looks like after `..`.
+    // An empty group name is refused at all three doors rather than at none,
+    // because no client can be reached by it.
     self["join_group"] = [owner, this](int fd,
                                        std::string group) -> api_result {
         if (group.empty()) return api_why("the group name is empty");
@@ -4176,61 +2963,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         return api_why("connection " + std::to_string(fd) + " is not piped");
     };
 
-    // ── Last, and over the top of the binding above ─────────────────────────
-    //
-    // self.route() names another runtime, so it looks that name up in the
-    // runtime map exactly as the socketley.* calls do — and a worker holds no
-    // such map, only its own runtime.  It escaped their refusal for one reason:
-    // it is spelled self. rather than socketley., and the refusal was installed
-    // per table rather than per what a call reaches for.
-    //
-    // Left alone it answered a bare false, which is also what it answers for a
-    // target that does not exist.  A script could not tell a runtime that is
-    // absent from one that is merely in another process, and the accepted-but-
-    // not-applied call is the shape this tree refuses everywhere else.
-    //
-    // ─── IT IS NOT WAITING ON THE MAP, AND THE MESSAGE USED TO SAY IT WAS ───
-    //
-    // The paragraph that stood here said the mechanism was undecided and that
-    // this binding "stops being refused" when a connection can be handed to
-    // another process.  The first half is no longer true and the second half
-    // was pointing at the wrong delivery: the message it installed was the map
-    // one, so a script author read "the runtime map is elsewhere" and waited
-    // for a map that will not help.
-    //
-    // Read route_client() for why.  It does not hand the descriptor over: it
-    // takes ref_for_fd(client_id), writes m_routes and m_conn_idx, and calls
-    // sub->accept_routed(ref, get_name()) — the TARGET's on_connect, on this
-    // thread's stack — after which this server keeps the socket and relays the
-    // bytes through itself.  Two of those three steps are reaching into another
-    // runtime's object, and a map of names cannot supply either.  What it wants
-    // is conn_transfer.h's RELAY shape over a channel between the two
-    // processes, and worker_route_refusal() says exactly that.
-    //
-    // So it is grouped with socketley.pipe() rather than with the reads, and
-    // the day the map lands it stays refused.
-    //
-    // Only route().  unroute(), get_route() and owner_send() answer from this
-    // runtime's own tables, and in a worker those are empty because nothing was
-    // ever routed — so their false is the truth rather than a substitute for
-    // it, and refusing them would replace a correct answer with an error.  The
-    // refusal says that too, because a script author who has just been refused
-    // route() is the person most likely to try the other three next.
+    // self.route() escaped the socketley.* refusals only because it is spelled
+    // self., and it is grouped with socketley.pipe rather than the reads --
+    // while unroute(), get_route() and owner_send() answer from this runtime's
+    // own empty tables, where false is the truth.
     // ─── AND WHAT IT IS NOW ────────────────────────────────────────────────
-    //
-    // The channel exists.  route_client() is unchanged above the seam and asks
-    // shared/route_relay.h for the target instead of reaching into it, so the
-    // same five calls it always made now reach a runtime in another process --
-    // and the test is the sink rather than the process, for the reason the
-    // mutators give: a worker forked by a daemon that does not serve routing is
-    // the one case where the two differ, and it keeps the refusal.
-    //
-    // The paragraphs above are left standing rather than deleted.  They are the
-    // record of a call being refused for three different stated reasons in turn,
-    // two of which were wrong -- first "waiting on the runtime map", then
-    // "waiting on SCM_RIGHTS" -- and the mechanism it actually wanted was named
-    // correctly in the third.  A reader who finds only the answer cannot tell
-    // which of those to trust the next time something here is refused.
+    // The channel exists now and the test is the sink rather than the process,
+    // with the paragraphs above left standing as the record of one call
+    // refused for three stated reasons, two of them wrong.
     const runtime_manager* rmgr = owner ? owner->get_runtime_manager() : nullptr;
     if (in_worker_process() && (!rmgr || !rmgr->route_sink()))
     {
@@ -4396,9 +3136,9 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
     };
     self["stats"] = [proxy, this]() -> sol::table {
         sol::table t = m_lua.create_table(0, 6);
-        // The same figure self.connections() answers, and for the same reason:
-        // two members of one API disagreeing about one number is worse than
-        // either answer on its own.  See register_server_table above.
+        // The same figure self.connections() answers, because two members of
+        // one API disagreeing about one number is worse than either answer
+        // alone.
         t["connections"] = static_cast<size_t>(proxy->shard_connection_count());
         // worker_figures(), not the four atomics: for a runtime in a worker
         // these are summed out of the shared table at this instant, which is
