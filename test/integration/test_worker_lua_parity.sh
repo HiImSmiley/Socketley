@@ -104,16 +104,22 @@
 # green because the machine is busy is telling you nothing on the machine where
 # it matters.
 #
-# ─── PIPE IS THE ONE THAT STAYS REFUSED ─────────────────────────────────────
+# ─── PIPE AND ROUTE WERE THE TWO THAT STAYED REFUSED, AND DO NOT ────────────
 #
-# socketley.pipe() hands a file descriptor from one runtime to another.  Across
-# processes that is fd passing, which is a separate project, so its worker arm
-# is expected to stay a refusal for good.  Its assertion is therefore not
-# parity but specificity: the refusal must say THAT, rather than share the
-# generic "reaches for the runtime map" text.  An operator told the generic
-# message would go looking for a map that, for this one call, is not what is
-# missing — and every other call on this table now answers from one, so that
-# reading is more inviting than ever.
+# This header said socketley.pipe() "hands a file descriptor from one runtime
+# to another", that across processes that is fd passing, and that its worker arm
+# was "expected to stay a refusal for good".  The first clause is true only of
+# the FOUR-argument form, which never crosses anything.  Across two runtimes
+# the three-argument form is route_client(): the socket stays where it is and
+# its bytes are relayed.  So the two of them were one problem, and it was not
+# the one named here.
+#
+# Both are parity assertions now, on the same footing as the other eleven.
+# What is kept from the old arrangement is its control discipline -- the
+# in-daemon arm still has to answer before the worker arm's agreement with it
+# means anything, and self.route still has PEER_CONN behind it, because "both
+# arms answered true" passes on a build where routing is broken on both sides.
+#
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -329,13 +335,20 @@ local function report(what)
       local ok, why = socketley.send(PEER, "PARITY-" .. self.name .. "\n")
       return ok and "true" or ("false:" .. tostring(why))
     end))
-    -- The CROSS-RUNTIME branch, which is the one that would have to hand a
-    -- descriptor to another process.  Not the same-runtime branch — that one
-    -- pairs two of this server's own connections, needs neither a map nor a
-    -- descriptor crossing anything, and would make the refusal asserted below
-    -- read as being about something it is not.
+    -- The CROSS-RUNTIME branch, three arguments, which is the one that has to
+    -- cross a process boundary.  Not the four-argument same-runtime branch:
+    -- that pairs two of this server's own connections and crosses nothing.
+    --
+    -- The SOURCE is this runtime and not par_peer, and that changed with the
+    -- assertion below.  While this was expected to be refused outright it did
+    -- not matter which names it used; now that it answers, naming a THIRD
+    -- runtime as the source is a question only that runtime's own process can
+    -- answer -- socketley.pipe needs the source's connection table, which lives
+    -- where the source lives.  So the two arms would legitimately differ, and
+    -- the difference would be about where par_peer is rather than about
+    -- anything this file is measuring.
     add("pipe", one(function()
-      local ok, why = socketley.pipe("par_peer", 4242, "par_idle")
+      local ok, why = socketley.pipe(self.name, 4242, "par_idle")
       return ok and "true" or ("false:" .. tostring(why))
     end))
     add("cdaemons", one(function()
@@ -684,25 +697,22 @@ ctl "socketley.send()" "$IN_send" "true" \
     "a target that is running and holds a connection is a send that succeeds"
 par send "$OOP_send" "$IN_send"
 
-# ── pipe: refused for good, and it must say why ─────────────────────────────
+# ── pipe: at parity now ─────────────────────────────────────────────────────
+#
+# This was "refused for good", and the file said so at length in its header:
+# fd passing across processes is a separate project.  It was wrong about the
+# mechanism, not about the refusal being real.  The three-argument form does
+# not pass a descriptor at all -- across two runtimes it is route_client(),
+# which keeps the socket where it is -- so what it needed was route_relay.h and
+# not SCM_RIGHTS.
+#
+# 4242 is deliberately not an open connection of either arm's runtime, so both
+# answer the same refusal about the same descriptor and nothing is moved.
 ctl "socketley.pipe()" "$IN_pipe" \
-    "false:connection 4242 could not be routed to \"par_idle\" — it is not an open connection of \"par_peer\", or it was itself routed in from another runtime, or \"par_idle\" refused it" \
-    "in the daemon this reaches both runtimes and answers about the descriptor;" \
-    "4242 is deliberately not an open connection of either"
-# The one asymmetry that is not a defect.  fd passing across processes is a
-# separate project, so this stays a refusal — but wearing the generic "reaches
-# for the runtime map" text sends the reader after a runtime map, and a runtime
-# map is not what is missing here.  Sharper now that the other eleven answer:
-# every other call on this table works in a worker, so the reason this one does
-# not is the only thing its message has left to carry.
-case "$OOP_pipe" in
-    REFUSED:*descriptor*|REFUSED:*file\ descriptor*) pass ;;
-    *) fail "socketley.pipe() in a worker is refused as fd passing, by name" \
-            "worker arm: $OOP_pipe" \
-            "wanted a refusal whose reason is passing a descriptor between" \
-            "processes — not the generic 'reaches for the runtime map' text," \
-            "which for this one call names the wrong missing thing" ;;
-esac
+    "false:connection 4242 could not be routed to \"par_idle\": that is not an open connection of this server" \
+    "in the daemon this resolves the source locally and answers about the" \
+    "descriptor; 4242 is deliberately not an open connection of it"
+par pipe "$OOP_pipe" "$IN_pipe"
 
 # ── cluster.* ───────────────────────────────────────────────────────────────
 # One daemon, so one entry, and its runtimes count is the size of the map.
@@ -904,37 +914,29 @@ poke "$OOP_PORT"
 sleep 1.0
 
 IN_ROUTE=$(grep -ao "ROUTE-par_in [^ ]*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
-OOP_ROUTE=$(grep -ao "ROUTE-par_oop REFUSED:.*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
-[ -n "$OOP_ROUTE" ] || OOP_ROUTE=$(grep -ao "ROUTE-par_oop [^ ]*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
+OOP_ROUTE=$(grep -ao "ROUTE-par_oop [^ ]*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
 PEER_CONN_AFTER=$(grep -ac "PEER_CONN " "$SOCKETLEY_DLOG" 2>/dev/null) || PEER_CONN_AFTER=0
 
 ctl "self.route()" "$IN_ROUTE" "ROUTE-par_in true" \
     "an open connection and a server to give it to is a route that succeeds"
 
-# What makes the line above mean something.  par_peer logs every connection it
-# accepts, so a route that really happened is one more of them than before.
-if [ "$PEER_CONN_AFTER" -gt "$PEER_CONN_BEFORE" ]; then pass; else
-    fail "control: the in-daemon route really moved a connection" \
+# What makes the two lines around it mean anything.  par_peer logs every
+# connection it accepts, so a route that really happened is one more of them
+# than before -- and with both arms routing it must be TWO more.  Without this,
+# "both arms answered true" also passes on a build where route() returns true
+# and moves nothing, which is the accepted-but-not-applied shape this whole
+# suite is written against.
+if [ "$PEER_CONN_AFTER" -ge $((PEER_CONN_BEFORE + 2)) ]; then pass; else
+    fail "control: both routes really moved a connection" \
          "par_peer logged $PEER_CONN_BEFORE connections before and $PEER_CONN_AFTER after" \
-         "self.route() answering true is not evidence the target got anything;" \
-         "without this, 'the worker refused' also passes on a build where" \
-         "routing is broken on both sides of the boundary"
+         "wanted at least two more — one per arm; one more means only the" \
+         "in-daemon arm arrived, and self.route() answering true out there is" \
+         "not evidence the target got anything"
 fi
 
-# The refusal itself, and it must name the right missing thing.  Refused for
-# good — but a message that says "the runtime map lives in the daemon" sends
-# its reader to wait for the map, and the map will not help this call.
-case "$OOP_ROUTE" in
-    *REFUSED:*relay*|*REFUSED:*SCM_RIGHTS*)
-        pass ;;
-    *)
-        fail "self.route() in a worker is refused as a connection handoff, by name" \
-             "worker arm: ${OOP_ROUTE:-<no ROUTE line at all>}" \
-             "wanted a refusal naming the channel a connection would need —" \
-             "not the generic 'reaches for the runtime map' text, which for" \
-             "this call names the wrong missing thing and promises a delivery" \
-             "that will not fix it" ;;
-esac
+# The parity claim itself.  Same helper as the other twelve, so a worker arm
+# that still refuses is reported as still refused rather than as a mismatch.
+par route "${OOP_ROUTE:-<no ROUTE line at all>}" "${IN_ROUTE/par_in/par_oop}"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

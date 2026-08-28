@@ -2090,6 +2090,14 @@ private:
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::forget:
+                // `frm` is the runtime that went away, not one that asked for
+                // something -- the only op here where that field means the
+                // other thing.  Named rather than left to be read off the
+                // switch, because it is the kind of difference a reader
+                // supplies from the five lines above it.
+                srv->forget_runtime(frm);
+                break;
         }
     }
 
@@ -2112,6 +2120,15 @@ private:
     {
         return map_request("route", target,
                            worker_proto::encode_route_ask(ref, origin), err);
+    }
+
+    void forget(std::string_view) override
+    {
+        // Nothing, and the reason is structural rather than an omission.  This
+        // is called from runtime_manager::stop and ::remove, and both refuse
+        // outright in a replica -- so out here it is only ever reached for a
+        // runtime this process does not hold, which cannot happen.  The daemon
+        // is what tells everyone; see route_op::forget.
     }
 
     void on_publish(const std::string& payload)

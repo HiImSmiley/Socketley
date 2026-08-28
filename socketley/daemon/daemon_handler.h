@@ -578,6 +578,7 @@ public:
               std::string_view payload) override;
     bool open(std::string_view target, const conn_ref& ref,
               std::string_view origin, std::string& err) override;
+    void forget(std::string_view gone) override;
 
 private:
     // One resolution for both directions.  post() arrives from an in-daemon

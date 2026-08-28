@@ -763,6 +763,28 @@ enum class route_op : uint8_t
     close = 3,
     write = 4,
     drop  = 5,
+
+    // ── The sixth, which is not about one connection ────────────────────────
+    //
+    // `from` has stopped or been removed; `to` must let go of every routing
+    // relationship it has with it, in both directions.  `ref` is unused and the
+    // payload is empty.
+    //
+    // It exists because the origin cannot be the one to tell.  Measured: a
+    // stopped worker's teardown posts its `close` frames through the writer,
+    // which submits at the end of a loop turn -- and the daemon does not wait,
+    // so reconcile_proxy_workers() has already retired the supervisor and
+    // closed the socket by the time they are written.  The frames go into a
+    // descriptor nobody reads.
+    //
+    // Fixing the race would not have been enough, and that is the part worth
+    // keeping: a worker that is KILLED never runs teardown at all.  Any design
+    // where the departing runtime does the telling is wrong for that case, and
+    // the in-process version never had to face it because one process losing
+    // its memory takes both ends of the route with it.  So the daemon tells
+    // everyone, from what it knows rather than from what the departing runtime
+    // manages to say on its way out.
+    forget = 6,
 };
 
 // `to` is the runtime the op is performed on, `from` the one that asked.  Both
@@ -802,7 +824,7 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     // length prefix.  Defaulting would turn a newer peer's sixth op into a
     // `data` delivery of the wrong bytes.
     if (raw < static_cast<uint8_t>(route_op::open) ||
-        raw > static_cast<uint8_t>(route_op::drop))
+        raw > static_cast<uint8_t>(route_op::forget))
         return false;
     op = static_cast<route_op>(raw);
 

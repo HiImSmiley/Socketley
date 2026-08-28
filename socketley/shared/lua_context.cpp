@@ -3522,7 +3522,22 @@ void lua_context::register_bindings(runtime_instance* owner)
         // refused in a worker PERMANENTLY: it moves a connection, and no map
         // supplies a descriptor.  That refusal is what made the old raw cast
         // survivable, and it is the coupling to know about before relaxing it.
-        auto* src_srv = src_rt->as_server();
+        // ─── RESOLVING THE SOURCE, AND WHY THE MANAGER IS ASKED SECOND ──────
+        //
+        // A worker does not register its own runtime in its manager -- `m_rt`
+        // is held by the worker and the map holds a REPLICA of it, pushed down
+        // with everyone else's.  So `mgr->get(own_name)->as_server()` is null
+        // out here for the one runtime this process definitely has, and
+        // socketley.pipe("myself", fd, "other") answered "it lives somewhere
+        // else" while self.route on the same connection worked.
+        //
+        // `owner` is that object.  Asked first, because it is the only
+        // resolution that cannot be a replica.
+        server_instance* src_srv = nullptr;
+        if (src_name == owner->get_name())
+            src_srv = owner->as_server();
+        else
+            src_srv = src_rt->as_server();
         if (!src_srv)
             return refuse("\"" + src_name + "\" says it is a server but this "
                           "process holds no server object for it — it lives "

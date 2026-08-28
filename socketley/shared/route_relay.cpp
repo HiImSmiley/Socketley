@@ -124,4 +124,10 @@ void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
     post_or_drop(mgr, to, from, worker_proto::route_op::drop, ref, {});
 }
 
+void forget(runtime_manager* mgr, std::string_view gone)
+{
+    if (auto* sink = mgr ? mgr->route_sink() : nullptr)
+        sink->forget(gone);
+}
+
 }   // namespace route_relay

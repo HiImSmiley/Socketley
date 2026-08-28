@@ -1,59 +1,53 @@
 #!/usr/bin/env bash
-# Integration test: a worker refuses, by name, the calls it cannot serve.
+# Integration test: how a worker's refusal reaches the operator.
 #
-# ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
+# ─── THIS FILE HAS NOW EXPIRED THREE TIMES, AND THE THIRD ONE ENDED IT ──────
 #
-# A runtime created without --daemon-process runs in its own process, and that
-# process cannot serve every call the API offers.  Each refusal used to
-# be a false, a nil or an empty table — which is precisely what a *successful*
-# call returns on a daemon with nothing in it.  A script could not tell "there
-# is nothing there" from "I cannot see anything from here", so it carried on
-# against nothing, and neither the script nor the operator was told.
+# It was written on the premise that a runtime in its own process cannot serve
+# every call the API offers, and that each such call must be refused BY NAME
+# rather than answered with the false, nil or empty table a successful call
+# also returns.  The premise about refusals was right.  The premise about which
+# calls need one has been wrong three times:
 #
-# They are refused instead, by name, with the reason and the way out, and the
-# refusal is a Lua error rather than a return value: `if socketley.create(...)`
-# is how these are written and a false is what that already handles.
-#
-# ─── WHY THIS FILE PROBES socketley.pipe, AND WHAT IT PROBED BEFORE ─────────
-#
-# It has now been re-pointed twice, and the reason is the same both times: it
-# was written on a call that later stopped being refused.
-#
-#   .list   the worker was handed the runtime map, so list() answers out
-#           there.  Five assertions went red that were never about listing.
+#   .list   the worker was handed the runtime map, so list() answers out there.
+#           Five assertions went red that were never about listing.
 #   .stop   the four map calls travel to the daemon now.  Six went red, and
-#           this file's own header had called them "permanently refused".
-#           Watched, not assumed — 12/18 before the re-point.
+#           this header had called them "permanently refused".
+#   .pipe   the last one, and the one this header called "about the mechanism
+#           rather than about the transport" -- correctly, and then predicted
+#           the wrong mechanism.  It said the call was waiting on SCM_RIGHTS.
+#           It was not: across two runtimes socketley.pipe is route_client(),
+#           which keeps the socket where it is and relays.  What it wanted was
+#           a way to name another runtime's connection, which is
+#           shared/route_relay.h.  Watched, not assumed -- 11/18 before this
+#           rewrite, and self.route went red with it.
 #
-# That header was wrong on its own terms, and the correction is worth keeping
-# rather than quietly replacing: it argued that being handed a COPY of the map
-# is not permission to alter it, which is true and is not the question.  The
-# calls do not alter the copy; they ask the process that holds the original.
+# There is no fourth call to re-point at.  Every refusal this file was written
+# about is now installed only when the worker was forked WITHOUT the control
+# plane at fd 6 -- an older daemon, or one that could not make the socketpair --
+# which no test in this tree can produce.
 #
-# So the split is not "reads come back, writes never do".  It is:
+# ─── SO WHAT IS LEFT, AND WHY IT IS THE HALF WORTH KEEPING ──────────────────
 #
-#   needs the map        .list, .get, .send, .create, .start, .stop, .remove
-#                        and socketley.cluster.*.  All of these are answered
-#                        in a worker now — the first three from the replica,
-#                        the four map calls over the control plane at
-#                        child_map_fd.  A file written on one of these has an
-#                        expiry date, and this one has expired twice.
-#   needs a CONNECTION   .pipe and self.route().  A connection does not travel
-#                        in a snapshot of anything: the descriptor has to be
-#                        passed with SCM_RIGHTS or its bytes relayed under a
-#                        reference.  shared/conn_transfer.h has both and
-#                        nothing is wired to it.
+# The durable half was never the list of calls.  It is the DELIVERY: where a
+# refusal lands, who is told, and what the command that asked for it exits
+# with.  That machinery is unchanged and is still the only cover for it:
 #
-# The probe is from the second group, which is the only one whose refusal is
-# about the mechanism rather than about the transport.  It will expire too, on
-# the day conn_transfer is wired up, and that is the honest position for a file
-# like this to be in — what it must not do is claim a refusal is permanent.
+#   * a script that raises at its top level is refused by `create`, which
+#     waits for the worker's verdict rather than reporting success and
+#     correcting itself in the log a moment later;
+#   * the runtime is left `failed` and does not serve;
+#   * and it is not restarted in a loop, because a refused configuration is
+#     not a crash.
 #
-# socketley.pipe on two names nothing in this file ever creates, specifically:
-# the CONTROL arm of every assertion here really executes the call in the
-# daemon, so the probe has to be one that changes nothing when it succeeds.
-# pipe() on absent names answers `false` plus "there is no runtime called ..."
-# in the daemon, raises in a worker, and touches nothing on either side.
+# Those four assertions kept their shape and changed their trigger, from a
+# refused API call to a plain error() -- which raises for a reason that cannot
+# expire.
+#
+# What replaced the rest is the inverse claim, kept here rather than moved
+# because this is the file that would notice: the calls listed above are
+# answered in a worker now, and no refusal for any of them appears in the log
+# at all.  A build that reinstalls one goes red here.
 #
 # ─── THE TWO PLACES A REFUSAL LANDS ─────────────────────────────────────────
 #
@@ -117,7 +111,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Integration: a worker refuses what it cannot serve, by name ==="
+echo "=== Integration: how a worker's refusal reaches the operator ==="
 
 daemon_start "$BIN"
 
@@ -130,11 +124,11 @@ cat > "$CB_LUA" <<'LUAEOF'
 filters = {
     function(req)
         if string.find(req.path, "/mgmt", 1, true) then
-            -- Two names nothing in this file ever creates.  In the daemon this
-            -- answers false plus a reason and changes nothing; in a worker it
-            -- raises.  The reason is carried into the body because the control
-            -- below checks for it: a bare `false` is also what a build with a
-            -- broken pipe() returns, and the sentence is what tells them apart.
+            -- Two names nothing in this file ever creates.  It answers false
+            -- plus a reason on BOTH sides now and changes nothing on either.
+            -- The reason is carried into the body because the assertions below
+            -- check it: a bare `false` is also what a build with a broken
+            -- pipe() returns, and the sentence is what tells them apart.
             local ok, why = socketley.pipe("mgmt_no_such_src", 1, "mgmt_no_such_dst")
             return { status = 200,
                      body = "pipe=" .. tostring(ok) .. " why=" .. tostring(why) .. "\n" }
@@ -149,8 +143,13 @@ LUAEOF
 # ── The top-level script ────────────────────────────────────────────────────
 TOP_LUA="$SOCKETLEY_TMPD/top.lua"
 cat > "$TOP_LUA" <<'LUAEOF'
-local ok, why = socketley.pipe("top_no_such_src", 1, "top_no_such_dst")
-socketley.log("TOPLEVEL-SAW " .. tostring(ok) .. " " .. tostring(why))
+-- A plain raise, and deliberately not an API call.  Every call this file used
+-- to raise with has since been served, taking these assertions red with it
+-- three times; error() cannot stop being an error.  It also raises on the
+-- FIRST line, so nothing is half-built when it does -- which is what makes
+-- "the runtime does not serve" a statement about the refusal rather than about
+-- whatever the script managed to set up before it died.
+error("toplevel: a deliberate raise, so only the worker can know")
 filters = {
     function(req)
         if string.find(req.path, "/ok", 1, true) then
@@ -216,40 +215,61 @@ case "$MGMT_IN" in
              "the call does not work on either side of it" ;;
 esac
 
-# ── Assertion 1: the call is refused in the worker ──────────────────────────
+# ── Assertion 1: the call is ANSWERED in the worker ────────────────────────
+#
+# The inverse of what stood here.  A 500 is what a refusal produces -- the
+# filter chain reports the error and refuses the request -- so a 500 now means
+# a build that has put the refusal back.
 MGMT_OOP_CODE=$(code cb_oop "$CB_OOP_PORT" /mgmt)
 MGMT_OOP_BODY=$(body cb_oop "$CB_OOP_PORT" /mgmt)
-if [ "$MGMT_OOP_CODE" = "500" ]; then pass; else
-    fail "a management call in a worker is refused, not answered" \
+if [ "$MGMT_OOP_CODE" = "200" ]; then pass; else
+    fail "a management call in a worker is answered, not refused" \
          "/mgmt on the out-of-process proxy answered $MGMT_OOP_CODE '$MGMT_OOP_BODY'," \
-         "wanted 500 — a 200 means socketley.pipe() answered in a worker, and" \
-         "there is no channel out there for it to have moved a connection over:" \
-         "the answer would be about descriptors this process alone can see"
+         "wanted 200 — a 500 is the refusal being reinstalled, and the call" \
+         "has a channel now: see shared/route_relay.h"
 fi
 
-# ── Assertion 2: and the refusal says what and why ──────────────────────────
-if grep -q 'socketley\.pipe() is refused in a worker process' \
-        "$SOCKETLEY_DLOG" 2>/dev/null; then
-    pass
-else
-    fail "the refusal names the call and the reason" \
-         "no such line in the daemon log" \
-         "wanted: socketley.pipe() is refused in a worker process: ..." \
-         "last lines: $(tail -3 "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"
-fi
-if grep -q 'refused in a worker process.*--daemon-process' \
-        "$SOCKETLEY_DLOG" 2>/dev/null; then
-    pass
-else
-    fail "the refusal names the way out" \
-         "the message does not mention --daemon-process, so an operator" \
-         "reading it is not told how to get the call back"
+# ── Assertion 2: and it answers the SAME THING on both sides ───────────────
+#
+# Not merely "answered".  A script must not be able to tell which side of the
+# boundary it is running on from the text it gets back, and the refusal wording
+# is served by two different code paths -- the in-daemon one from route_client
+# and the worker one from the daemon, over the map socket -- so this is the one
+# assertion that would catch them drifting apart.
+if [ "$MGMT_OOP_BODY" = "$MGMT_IN" ]; then pass; else
+    fail "the worker and the daemon answer the same call the same way" \
+         "worker: '$MGMT_OOP_BODY'" \
+         "daemon: '$MGMT_IN'" \
+         "the two paths that produce this sentence are different code, and this" \
+         "is what stops them saying different things"
 fi
 
-# ── Assertion 3: a top-level refusal fails the runtime ──────────────────────
-create_ok "in-process top-level proxy created" "$BIN" create proxy top_in \
-    -p "$TOP_IN_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
-    --daemon-process -s
+# ── Assertion 2b: no refusal for these calls in the log at all ─────────────
+#
+# The negative oracle, and it is not redundant with the two above: a build
+# could answer /mgmt correctly while still refusing self.route, or refuse in a
+# path this file never exercises.  Nothing in this suite should now produce
+# this sentence.
+if ! grep -q 'refused in a worker process' "$SOCKETLEY_DLOG" 2>/dev/null; then
+    pass
+else
+    fail "no call is refused in a worker for being out of process" \
+         "the daemon log carries a refusal that should no longer exist:" \
+         "$(grep -a -m1 -o 'refused in a worker process[^"]*' "$SOCKETLEY_DLOG" | cut -c1-160)"
+fi
+
+# ── Assertion 3: a script that raises at load fails the runtime ────────────
+#
+# The in-daemon arm that used to stand here is gone, and its removal is the
+# point rather than a tidy-up.  It was a CONTROL: the same script loaded in the
+# daemon and was refused in a worker, so the failure could be attributed to the
+# boundary.  With the trigger changed from a refused API call to error(), there
+# is no boundary left in it -- the script raises on both sides, so an in-daemon
+# arm would assert that a raise is a raise.
+#
+# What still needs a control is "the worker loads scripts at all", and cb_oop
+# above is it: same process kind, same load path, a script that works.
+#
 # Deliberately not create_ok.  This create is expected to be refused, and that
 # is now an assertion in its own right: `create` waits for the worker's verdict
 # before answering, so a script the worker will not load is refused by the
@@ -267,9 +287,9 @@ TOP_OOP_OUT=$("$BIN" create proxy top_oop \
 if [ "$TOP_OOP_RC" = "1" ]; then pass; else
     fail "create refuses a script the worker will not load" \
          "create exited $TOP_OOP_RC, wanted 1" \
-         "the script's top-level socketley.pipe() cannot work in a worker, so the" \
-         "worker refuses the configuration — and create is what has to say so," \
-         "because by the time the log says it the operator has been told 0" \
+         "the script raises on its first line, so the worker refuses the" \
+         "configuration — and create is what has to say so, because by the" \
+         "time the log says it the operator has been told 0" \
          "create said: ${TOP_OOP_OUT:-<nothing>}"
 fi
 
@@ -282,22 +302,25 @@ for _ in $(seq 1 100); do
 done
 
 TOP_OOP_STATE=$(state top_oop)
-TOP_IN_STATE=$(state top_in)
 
 if [ "$TOP_OOP_STATE" = "failed" ]; then pass; else
     fail "a worker whose script will not load does not serve" \
          "top_oop is '$TOP_OOP_STATE', wanted 'failed'" \
-         "the script's top-level socketley.pipe() cannot work in a worker, so the" \
-         "script did not load — and a proxy relaying with none of the filters," \
-         "routes or callbacks the operator wrote is not the proxy they configured"
+         "the script raises before it defines anything, so it did not load — and" \
+         "a proxy relaying with none of the filters, routes or callbacks the" \
+         "operator wrote is not the proxy they configured"
 fi
 
-# ── Control 3: the same script is fine in the daemon ────────────────────────
-if [ "$TOP_IN_STATE" = "up" ] || [ "$TOP_IN_STATE" = "running" ]; then pass; else
-    fail "control: the same script runs in process" \
-         "top_in is '$TOP_IN_STATE', wanted to still be up" \
-         "if this is failed too, the assertion above is about scripts, not about" \
-         "the boundary, and proves nothing"
+# ── Control 3: a worker DOES load a script that works ──────────────────────
+#
+# Replaces the in-daemon arm described above.  Without it, "top_oop is failed"
+# also passes on a build where no worker ever loads a script, which would make
+# every assertion in this section true for the wrong reason.
+if [ "$(body cb_oop "$CB_OOP_PORT" /ok)" = "alive" ]; then pass; else
+    fail "control: a worker loads a script that does not raise" \
+         "cb_oop's /ok did not answer 'alive'" \
+         "if no worker can load any script, top_oop being failed says nothing" \
+         "about this one"
 fi
 
 # ── Assertion 4: it is not restarted in a loop ──────────────────────────────
@@ -306,7 +329,13 @@ fi
 # refusal.  The supervisor is told so by the exit status, and one refusal in the
 # log is the evidence that it listened -- five would be the evidence that it did
 # not.
-REFUSALS=$(grep -c 'refusing to serve without it' "$SOCKETLEY_DLOG" 2>/dev/null) || REFUSALS=0
+# Counted on the raise text, which the worker prints once per attempt to load.
+# The previous oracle grepped 'refusing to serve without it', which belonged to
+# the configuration-refusal path the old trigger took; error() takes the
+# script-load path and prints its own message.  Changing the oracle with the
+# trigger is not weakening it -- what is being counted is still "how many times
+# did the supervisor fork this child", and one is still the only right answer.
+REFUSALS=$(grep -c 'toplevel: a deliberate raise' "$SOCKETLEY_DLOG" 2>/dev/null) || REFUSALS=0
 if [ "$REFUSALS" -eq 1 ]; then pass; else
     fail "a refused configuration is not retried" \
          "the worker refused $REFUSALS times, wanted exactly 1" \
@@ -363,23 +392,38 @@ poke "$RT_IN_PORT"      # the control: in the daemon, this must actually route
 poke "$RT_OOP_PORT"      # the worker: this must be refused by name
 sleep 0.8
 
-if grep -q 'self\.route() is refused in a worker process' "$SOCKETLEY_DLOG" 2>/dev/null
-then pass; else
-    fail "self.route() is refused in a worker, by name" \
-         "the log carries no such refusal" \
-         "a bare false here is indistinguishable from 'no such target', which is" \
-         "the accepted-but-not-applied shape this whole file is about:" \
-         "$(grep -a -o 'ROUTE ok=[a-z]* res=[^ ]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)"
+ROUTED=$(grep -c 'RT_TARGET_GOT_ONE' "$SOCKETLEY_DLOG" 2>/dev/null) || ROUTED=0
+if [ "$ROUTED" -ge 2 ]; then pass; else
+    fail "self.route() in a worker reaches the target" \
+         "the target reported $ROUTED routed connection(s), wanted 2" \
+         "one for the in-daemon arm and one for the worker arm; 1 means the" \
+         "boundary is still not crossed and only the control routed:" \
+         "$(grep -a -o 'ROUTE ok=[a-z]* res=[^ ]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -2 | tr '\n' '|')"
 fi
 
-# ── Control 4: the same call, in the daemon, still routes ───────────────────
+# ── Assertion 5b: and it answers true, not merely "did not raise" ──────────
 #
-# Without this, "the worker refused" also passes on a build where self.route()
-# refuses everywhere — which would be a broken feature, not a boundary.
-if grep -q 'RT_TARGET_GOT_ONE' "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
-    fail "control: the same self.route() works in the daemon" \
-         "the target never reported a routed connection" \
-         "if this fails the assertion above is about routing being broken," \
+# pcall's first value is true for a call that merely RETURNED false, so ok=true
+# alone says only that nothing was thrown -- which is what the refusal this
+# file used to assert would not produce, and is not what a working route looks
+# like either.  res is self.route's own return value.
+if [ "$(grep -a -c 'ROUTE ok=true res=true' "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 2 ]; then
+    pass
+else
+    fail "self.route() answers true on both sides" \
+         "wanted two 'ROUTE ok=true res=true' lines, got:" \
+         "$(grep -a -o 'ROUTE ok=[a-z]* res=[^ ]*' "$SOCKETLEY_DLOG" 2>/dev/null | tr '\n' '|')"
+fi
+
+# ── Control 4: the in-daemon arm routed at all ─────────────────────────────
+#
+# Kept, and it is now the floor under a count rather than a separate claim: if
+# neither arm routed, "wanted 2" is unreachable for a reason that has nothing
+# to do with the boundary, and this is what says which.
+if [ "$ROUTED" -ge 1 ]; then pass; else
+    fail "control: self.route() works in the daemon at all" \
+         "neither arm reported a routed connection" \
+         "the assertion above is then about routing being broken outright," \
          "not about the process boundary, and proves nothing"
 fi
 

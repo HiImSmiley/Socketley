@@ -94,6 +94,12 @@ struct sink
     // wording the in-process path uses for the same refusal.
     virtual bool open(std::string_view target, const conn_ref& ref,
                       std::string_view origin, std::string& err) = 0;
+
+    // `gone` has stopped or been removed.  Told to every OTHER runtime, by
+    // whoever knows -- see route_op::forget for why that cannot be the runtime
+    // that is leaving.  A process that holds only its own runtime implements
+    // this as nothing: it never stops another one.
+    virtual void forget(std::string_view gone) = 0;
 };
 
 // The runtime behind `name`, if this process holds it and it is a server.
@@ -135,5 +141,12 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
 // drop_route on the origin.
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
           const conn_ref& ref);
+
+// "This runtime is going away."  Called from runtime_manager::stop and
+// ::remove, which is the chokepoint every departure already goes through --
+// including the cascade, which reaches it once per runtime it takes down.
+// Both refuse outright in a replica, so this is the daemon by construction and
+// does not need to ask which process it is in.
+void forget(runtime_manager* mgr, std::string_view gone);
 
 }   // namespace route_relay

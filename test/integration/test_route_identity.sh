@@ -135,25 +135,29 @@ if ! "$BIN" ls >/dev/null 2>&1; then
     exit 1
 fi
 
-# --daemon-process is load-bearing, not decoration.
+# --daemon-process WAS load-bearing here, and is not any more.
 #
-# This parent's script calls socketley.create() and socketley.start() to bring
-# the sub-server up, and that is the cross-runtime management API: it reaches
-# for the runtime map, which exists only in the daemon.  A runtime in a worker
-# is refused it by name — deliberately, and with an error that prescribes this
-# exact flag — so a parent left out of process never creates rid_sub, nothing
-# ever listens on SUB_PORT, and the harness dies on its first connect there
-# with every assertion below unrun.
+# The paragraph this replaces was correct when it was written and is worth
+# recording rather than deleting.  It said: this parent's script calls
+# socketley.create() and socketley.start(), which reach for the runtime map;
+# a worker was refused them by name; so a parent left out of process never
+# created rid_sub, nothing listened on SUB_PORT, and the harness died on its
+# first connect there with every assertion below unrun.
 #
-# It was not always needed.  This file was written when a server ran inside the
-# daemon, and it says so by not asking; `--daemon-process` became the thing you
-# have to ask for when out-of-process became the default.  So the flag restores
-# the arrangement these fourteen assertions were written against rather than
-# changing what any of them claims — the parent and its sub-server in one
-# address space, which is what makes "the id is not a descriptor" a statement
-# about naming rather than about which process happened to be asked.
+# Two changes since have removed both halves.  The four map calls travel to the
+# daemon now, and self.route reaches a runtime in another process through
+# shared/route_relay.h.  Measured on this file rather than assumed: with the
+# flag removed it went 9/14, then 13/14, then 14/14 as the two landed, and the
+# fourteenth was a real leak the second one closed.
+#
+# The flag is gone rather than kept, and that is the stronger arrangement: with
+# it, "the id is not a descriptor" was a statement about naming inside one
+# address space, which is the easy case. Without it the parent and its
+# sub-server are in different processes and the id has to survive the crossing
+# -- which is what conn_identity.h is for and what these fourteen assertions
+# are now actually testing.
 "$BIN" create server rid_par -p "$PARENT_PORT" --lua "$WORK/parent.lua" \
-       --daemon-process -s >/dev/null 2>&1
+       -s >/dev/null 2>&1
 sleep 0.5
 
 OUT=$(python3 - "$PARENT_PORT" "$SUB_PORT" <<'PY'
@@ -354,26 +358,29 @@ function on_client_message(client_id, msg)
 end
 EOLUA
 
-# Both in the daemon, for the same reason the parent above is, and one more.
+# Both out of process, like everything else here, and the paragraph that used
+# to justify keeping them in the daemon is the one worth recording.
 #
-# self.route() looks its target up in the runtime map — a worker holds no such
-# map, only its own runtime — so routing from a worker to a runtime in another
-# process does not happen.  Measured on this build: with both of these left at
-# today's out-of-process default, self.route() answers `false`, rid_lone counts
-# 0 connections and its on_connect never fires; with both in the daemon it
-# answers true, counts 1, and fires once.
+# It said: self.route() looks its target up in the runtime map, a worker holds
+# no such map, so routing from a worker to a runtime in another process does
+# not happen -- measured, with `false` returned, rid_lone counting 0 and its
+# on_connect never firing.  Right about the symptom and wrong about the cause.
+# route_client() never needed the map; it needed the target's OBJECT, and what
+# it has now is shared/route_relay.h, which addresses the connection by
+# conn_ref instead of reaching for the object.
 #
-# That `false` is indistinguishable from "no such target", so a script cannot
-# tell a target that is absent from one that is merely elsewhere.  It is a real
-# gap and it is recorded here rather than asserted, because these two checks
-# are about a stopped origin leaving stale entries in its target's books — a
-# question about bookkeeping between two runtimes that share one, which is what
-# the flag restores.  Routing a connection between processes is a separate
-# feature and is not what this file measures.
+# These two checks are about a stopped origin leaving stale entries in its
+# target's books, and running them across processes is what makes them worth
+# having: in one address space the origin's own teardown does the cleanup
+# synchronously, which is the case that always worked.  Across processes it
+# cannot -- the teardown's frames are written after the daemon has already
+# retired the supervisor, and a KILLED worker never runs teardown at all -- so
+# the daemon tells every other runtime instead.  That is route_op::forget, and
+# the second of these two assertions is its only cover.
 "$BIN" create server rid_lone -p "$LONE_PORT" --lua "$WORK/lone.lua" \
-       --daemon-process -s >/dev/null 2>&1
+       -s >/dev/null 2>&1
 "$BIN" create server rid_par2 -p "$PAR2_PORT" --lua "$WORK/parent2.lua" \
-       --daemon-process -s >/dev/null 2>&1
+       -s >/dev/null 2>&1
 sleep 0.6
 
 lone_conns() { "$BIN" stats rid_lone 2>/dev/null | grep -E "^connections:" | head -1 | cut -d: -f2; }

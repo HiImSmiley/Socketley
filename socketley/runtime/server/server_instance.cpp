@@ -5890,6 +5890,37 @@ void server_instance::release_routed(const conn_ref& ref)
     m_forwarded.erase(handle);
 }
 
+void server_instance::forget_runtime(std::string_view gone)
+{
+    // Collected before anything is released.  release_routed runs the script's
+    // on_disconnect, and a script is entitled to answer that by unrouting, by
+    // closing a connection, or by removing a runtime -- any of which mutates
+    // the two containers being walked.  This is the same rule unroute_client
+    // states one screen down and the same one the teardown loops follow.
+    std::vector<conn_ref> incoming;
+    for (const auto& [handle, fc] : m_forwarded)
+    {
+        (void)handle;
+        if (fc.origin == gone)
+            incoming.push_back(fc.ref);
+    }
+    for (const auto& ref : incoming)
+        release_routed(ref);
+
+    // The other direction: routes this runtime made TO the departed one.  Not
+    // sent anywhere -- there is nobody left to tell -- so the entry and the
+    // cached flag on the connection go together.  Leaving the flag set is the
+    // defect drop_route's own comment describes: the read path keeps taking the
+    // routed branch, finding nothing, and falling through, once per message for
+    // the rest of the connection's life.
+    std::vector<uint64_t> outgoing;
+    for (const auto& [serial, target] : m_routes)
+        if (target == gone)
+            outgoing.push_back(serial);
+    for (uint64_t serial : outgoing)
+        drop_route(conn_ref{owner_key(), serial});
+}
+
 void server_instance::deliver_routed(const conn_ref& ref, std::string_view msg)
 {
     auto it = m_forwarded_by_ref.find(ref);

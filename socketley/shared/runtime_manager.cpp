@@ -1,4 +1,5 @@
 #include "runtime_manager.h"
+#include "route_relay.h"
 #include <algorithm>
 #include "runtime_factory.h"
 #include "event_loop.h"
@@ -347,6 +348,17 @@ bool runtime_manager::stop_cascading(std::string_view name, event_loop& loop,
     if (!inst->stop(loop))
         return false;
 
+    // Every runtime that had a connection routed to or from this one has to let
+    // go of it, and this is the chokepoint every departure goes through -- the
+    // cascade below re-enters here once per runtime it takes down, so a subtree
+    // is covered without a second call site.
+    //
+    // Here rather than in the departing runtime's own teardown because in
+    // another process the teardown's frames never arrive: see route_op::forget
+    // for the measurement and for the kill case, which no amount of ordering
+    // fixes.  In one process this is the second notification and finds nothing.
+    route_relay::forget(this, name);
+
     // Marked before descending, and the answer is what decides whether to
     // descend at all: a name already on this path has had its children walked
     // by the frame that put it there.
@@ -666,6 +678,12 @@ bool runtime_manager::remove(std::string_view name)
     }
 
     retire(std::move(inst));
+
+    // See stop_cascading().  Removal reaches here for a runtime that was never
+    // started as well as for one that was stopped a moment ago, and both are
+    // correct: forget_runtime finds nothing in the first case and nothing again
+    // in the second.
+    route_relay::forget(this, name);
 
     // The name is free and the endpoint is gone; a proxy still routing to it
     // would otherwise keep the old port until the next membership change.

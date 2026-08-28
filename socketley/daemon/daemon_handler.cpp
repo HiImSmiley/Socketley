@@ -5026,6 +5026,14 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
             case worker_proto::route_op::drop:
                 srv->drop_route(ref);
                 break;
+            case worker_proto::route_op::forget:
+                // Not reachable through post(): forget() fans out directly,
+                // because it addresses every runtime rather than one.  Handled
+                // anyway so that a worker sending it up -- which nothing does,
+                // and which a future build might -- is served rather than
+                // silently dropped by a switch that looks complete.
+                srv->forget_runtime(frm);
+                break;
         }
         return;
     }
@@ -5083,6 +5091,51 @@ bool daemon_handler::open(std::string_view target, const conn_ref& ref,
 
     route_dispatch(target, origin, worker_proto::route_op::open, ref, {});
     return true;
+}
+
+void daemon_handler::forget(std::string_view gone)
+{
+    // Everyone but the runtime that is leaving, and everyone means both kinds:
+    // the ones this process holds and the ones in children.  A fan-out rather
+    // than a lookup because the daemon keeps no table of who routed to whom --
+    // and deliberately does not.  Such a table would be a third place a route
+    // is recorded, after the origin's m_routes and the target's m_forwarded,
+    // and the two that exist are already the authority.  forget_runtime is
+    // idempotent, so telling a runtime that held no route costs a map walk over
+    // what it does hold and nothing else.
+    //
+    // Collected first.  release_routed runs a script's on_disconnect, which may
+    // create or remove a runtime, and this must not be walking the map when it
+    // does.
+    std::vector<std::string> local;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [name, inst] : m_manager.list())
+        {
+            (void)inst;
+            if (name != gone)
+                local.push_back(name);
+        }
+    }
+    for (const auto& name : local)
+        if (auto* srv = route_relay::local_server(&m_manager, name))
+            srv->forget_runtime(gone);
+
+    for (auto& [name, shards] : m_proxy_workers)
+    {
+        if (name == gone)
+            continue;
+        // Every shard, not the first.  Routing INTO a runtime lands on shard 0
+        // today, but routing OUT of one is done by whichever shard holds the
+        // connection -- so a sibling of shard 0 can be holding a route to the
+        // departed runtime, and telling only shard 0 would leave it set.
+        for (auto& sup : shards)
+            if (sup && !sup->send_route(name, gone,
+                                        worker_proto::route_op::forget,
+                                        conn_ref{}, {}))
+                LOG_DEBUG("could not tell a worker that a routed runtime went "
+                          "away; it is stopping too");
+    }
 }
 
 void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to,

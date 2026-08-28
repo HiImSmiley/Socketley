@@ -531,6 +531,17 @@ public:
     // Called on the receiving runtime: the connection is gone.
     void release_routed(const conn_ref& ref);
 
+    // Both directions at once, for a runtime that has stopped.  Releases every
+    // connection `gone` routed here and drops every route this runtime holds
+    // that pointed at it.
+    //
+    // Idempotent, and it has to be: the in-process path already does this per
+    // connection from the departing runtime's own teardown, so in one process
+    // this arrives second and finds nothing.  Across processes it arrives
+    // FIRST, because the teardown's frames never make it out -- see
+    // route_op::forget.
+    void forget_runtime(std::string_view gone);
+
     // Called on the *owning* runtime by a receiver that is shutting down: stop
     // routing this connection, it has nowhere to go.  The connection itself is
     // untouched and goes back to being served here.
