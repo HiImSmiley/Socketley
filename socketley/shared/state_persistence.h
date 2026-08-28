@@ -14,13 +14,8 @@
 
 namespace sp_detail
 {
-// Quote-and-backslash escaping for a JSON string body, without the quotes.
-//
-// Declared here because this file is no longer the only place that writes JSON:
-// `ls --json` and `ps --json` build their documents by hand, and a runtime's
-// group or owner is an arbitrary operator string that nothing validates.  A
-// quote in one of those produced a document no parser would accept — measured,
-// json.load() failing at column 27 of `ls --json`.
+// Quote-and-backslash escaping for a JSON string body, without the quotes;
+// shared because `ls --json` and `ps --json` also build documents by hand.
 std::string json_escape(std::string_view s);
 }
 
@@ -63,58 +58,21 @@ struct runtime_config
     std::string owner;
     int child_policy = 0; // 0 = stop, 1 = remove
 
-    // `out_of_process` used to live here, persisted because was_running
-    // auto-restart had to bring a runtime back WHERE it was running and not
-    // merely bring it back.  There is one where now, so there is nothing to
-    // carry: daemon.cpp marks every restored runtime out of process
-    // unconditionally, which also decides what to do with a file written by an
-    // older build.  See the note there; the short version is that
-    // `"out_of_process": false` described an arrangement this build cannot
-    // create, so honouring it would restore something untestable.
-    //
-    // The field is not read and the key is not written.  An old file still
-    // carrying it parses fine: json_get_* ignores keys nothing asks for.
+    // `out_of_process` used to live here; there is one where now, so the key is
+    // neither read nor written and an old file carrying it still parses.
 
-    // How many worker processes serve this one runtime; see
-    // runtime_instance::set_shards().  Persisted because the cost of not doing
-    // so is sharp: a proxy restored
-    // with one shard where the operator asked for four is a quarter of the
-    // throughput they configured, reported by `ls` as running and by nothing at
-    // all as wrong.
+    // Persisted because a proxy restored with one shard of four is a quarter of
+    // the configured throughput, reported by nothing as wrong.
     uint32_t shards = 1;
 
-    // WHICH of those processes this config frame is addressed to: 0..shards-1.
-    //
-    // Not a property of the runtime, unlike `shards` above — it is a property
-    // of one child, and it is the only field in this struct that differs
-    // between the N frames the daemon writes for one runtime.  A worker has no
-    // other way to learn it: the whole point of SO_REUSEPORT is that the shards
-    // are indistinguishable from the outside, and a process that cannot say
-    // which one it is has neither an aggregation slot nor an ownership claim.
-    //
-    // The daemon's own placeholder always reads 0 here, so a state file never
-    // carries it — see format_json_pretty, which writes it only above zero.  If
-    // it ever did, a restore would give every shard the same index and the
-    // region below would have N writers on one line.
+    // Which child this config frame is for, 0..shards-1 -- the only field that
+    // differs between the N frames, and a worker has no other way to learn it.
+    // Never written to a state file: a restore would give every shard index 0.
     uint32_t shard_index = 0;
 
-    // Ring policy: what this runtime's --cpus / --sqpoll asked its I/O to run
-    // as.  See runtime_instance.h — these are a request, not a result, and the
-    // daemon refuses one its ring cannot meet.
-    //
-    // Persisted because the refusal is the whole value of the request.  A ring
-    // belongs to a process, so dropping these across a restart never changed
-    // where a restored runtime's I/O ran; what it dropped was the operator's
-    // stated requirement, and with it the refusal that would have said the new
-    // ring does not meet it.  A daemon restarted without SOCKETLEY_CPUS brought
-    // a runtime created with --cpus 0-1 back up on an unpinned ring, reported
-    // cpus:max, and said nothing.
-    //
-    // `cpus` is stored as it would be typed — max | 0-3 | 0,1,2,3 — because
-    // cpu_set_spec::to_string() round-trips through parse_cpu_set and a state
-    // file a human can read is worth more here than a bitmask.  Empty means no
-    // request was made, which is not the same as a request for the default:
-    // see the note on has_cpus_request() in runtime_instance.h.
+    // A request, not a result: persisted because the refusal is the whole value
+    // of it, and a restore that drops it silently meets no requirement.
+    // Stored as typed (max | 0-3 | 0,1,2,3); empty means no request was made.
     std::string cpus;
     bool sqpoll = false;
     bool sqpoll_set = false;
@@ -152,10 +110,7 @@ struct runtime_config
     int health_threshold = 3;
     int circuit_threshold = 5;
     int circuit_timeout = 30;
-    // Mirrors mesh_config::backend_timeout, default and all: 0 is a meaningful
-    // value here ("no deadline"), so absence has to be told apart from it —
-    // which is why the reader asks for this default rather than treating 0 as
-    // "not set" the way the fields above do.
+    // 0 means "no deadline" here, so absence cannot be read off the value.
     int backend_timeout = 2;
     int retry_count = 0;
     bool retry_all = false;
@@ -172,21 +127,8 @@ struct runtime_config
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
 
-    // ─── WHICH KEYS THE DOCUMENT ACTUALLY NAMED ─────────────────────────────
-    //
-    // Every field above has a default, and until this set existed there was no
-    // way to tell a document that SET a field to its default from one that did
-    // not mention it at all.  `import` applied all of them either way, so a
-    // partial document cleared everything it left out.  Measured, against a
-    // runtime with a port, a log path, two limits and a full TLS set:
-    //
-    //     socketley import c '{"name":"c"}'   ->  exit 0, no output
-    //     ... and seven fields were gone, TLS among them.
-    //
-    // Filled by parse_json_string.  Empty after any other way of building a
-    // runtime_config — read_from_instance() describes a live runtime, where
-    // every field is present by construction and nothing is deciding whether
-    // to apply it.
+    // Which keys the document actually named, so `import` can tell a field set
+    // to its default from one left out.  Filled only by parse_json_string.
     std::set<std::string, std::less<>> present;
 
     bool has(std::string_view key) const { return present.find(key) != present.end(); }
@@ -210,52 +152,17 @@ public:
     std::string format_json_pretty(const runtime_config& cfg) const;
     bool parse_json_string(const std::string& json, runtime_config& cfg) const;
 
-    // One field's value, exactly as the document wrote it.
-    //
-    // parse_json_string has no error channel for a single field -- it returns
-    // false only for a document with no name -- so a field whose value is
-    // syntactically fine and semantically wrong is silently normalised away.
-    // `listen` is one of those: the `unix:` prefix is stripped on the way in,
-    // and a value that never had one is indistinguishable afterwards from a
-    // document that cleared the field.  `import` re-reads it through this and
-    // judges it with the same function the flag parser uses.
+    // One field exactly as written, for a value that parsing normalises away --
+    // `listen` loses its `unix:` prefix and cannot be judged afterwards.
     std::string raw_field(const std::string& json, std::string_view key) const;
 
-    // Block until everything queued has reached disk.  For a caller that is
-    // about to read the files back — a test, a shutdown that will be followed
-    // by a restart — and for nothing else: taking this on the event loop
-    // thread reintroduces exactly the stall the queue exists to remove.
+    // Blocks until everything queued is on disk; never call it on the loop
+    // thread, which reintroduces the stall the queue exists to remove.
     void drain();
 
 private:
-    // ─── WHY THE WRITES LEFT THE CALLING THREAD ─────────────────────────────
-    //
-    // write_json() ends in an fsync, and every one of these three methods was
-    // called from the daemon's event loop thread — the one thread that serves
-    // every runtime in the process.  Measured with a cache PING on the same
-    // daemon while six `create` commands ran:
-    //
-    //     quiet            p50 0.012 ms   p99 0.018 ms   max 0.044 ms
-    //     during creates   p50 0.015 ms   p99 0.244 ms   max 9.598 ms
-    //
-    // and fsync on that filesystem: p50 3.79 ms, p99 24.26 ms — the same
-    // distribution.  A factor of 800 on the answer time of every runtime the
-    // daemon holds, every time an operator typed create, start, stop or
-    // remove.
-    //
-    // WHAT DOES NOT CHANGE IS THE GUARANTEE.  The fsync is there, in its own
-    // words, to prevent "partial/empty state files on power loss or kernel
-    // crash" — it is about never publishing a file whose contents are not on
-    // disk, not about the CLI's reply meaning anything.  Moving the whole
-    // write-fsync-rename sequence to another thread keeps that exactly: the
-    // rename still happens after the fsync, so a published file is still an
-    // intact one.  What the reply no longer means is "already on disk", and it
-    // never legitimately meant that: if the machine dies between the two, the
-    // runtime is not persisted either way.
-    //
-    // ORDER IS PRESERVED because there is one writer and one FIFO.  A create
-    // followed by a remove reaches the disk in that order, which is the only
-    // property the callers depend on.
+    // Queued off the loop thread because write_json ends in an fsync; rename
+    // still follows fsync, and one writer on one FIFO preserves order.
     struct job
     {
         enum kind { write_cfg, remove_file, flip_running } k;
