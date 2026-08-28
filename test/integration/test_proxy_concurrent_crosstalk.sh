@@ -1,50 +1,15 @@
 #!/usr/bin/env bash
-# Integration test: under concurrency, nobody receives another connection's data.
-#
-# Tearing a backend down clears the client's backend_fd, but a client that died
-# first left a deferred backend still holding client_fd.  That descriptor number
-# is reused by the next accept within microseconds, and the stale backend then
-# spliced its data into a stranger's socket and took that healthy connection
-# down with it on EOF — no error recorded anywhere.  The fix clears the
-# back-reference and makes both forwarding paths verify that the pairing is
-# mutual, because a descriptor number does not prove identity once numbers are
-# reused.
-#
-# For a second and a half two kinds of connection run against each other: ones
-# that connect, exchange tagged messages and verify them, and ones that connect,
-# push data and then die by RST with the reply still owed to them.  The second
-# kind is what frees a descriptor number, the first kind is what keeps taking
-# fresh ones, and the collision between the two is the defect.  Every message is
-# tagged '<connection>-<sequence>' with an id unique for the whole run, so a
-# line from a connection that closed a second ago is still recognisable as
-# foreign rather than merely unexpected, and the report separates missing, out
-# of order, foreign and scrambled — "foreign" is the signature that matters, the
-# others are ordinary breakage.
-#
-# HONEST LIMIT — the crossed-delivery half of this is probabilistic, not a
-# deterministic check.  The other failure kinds it asserts are not: the same fix
-# also stopped the splice pipeline from starting while the ordinary write queue
-# still held data for that backend, and stopped teardown from discarding queued
-# and in-pipe bytes.  Those showed up in 87% of measured rounds before the fix,
-# so a regression of either lands on the 'missing' or 'scrambled' assertion
-# almost every run.  It is specifically the stale-descriptor race that needs
-# luck.
-#
-# The bug needs a descriptor to be recycled into a live connection inside the
-# window in which the dead peer's backend still owes it data.  One run is at
-# most 1500 verifying connections and 18000 messages against several thousand
-# RST'd ones, in a little over two seconds; the original diagnosis ran 240000
-# messages per path over repeated passes on a quiet machine.  A green run here
-# therefore means "not observed", not "cannot happen", and a reintroduced
-# regression can survive a fair number of runs before this catches it — treat a
-# single pass as weak evidence.  What it buys the suite is a cheap standing
-# chance of noticing, and, when it does fire, a message that names the failure
-# kind instead of an unexplained hang.  When deliberately hunting this class of
-# defect, loop it:
-#   for i in $(seq 30); do bash test/integration/test_proxy_concurrent_crosstalk.sh || break; done
-# The classifier itself is not probabilistic and was checked against relays that
-# deliberately mis-deliver and truncate; it is only the *provocation* that is a
-# matter of luck.
+# A client that died first left a deferred backend holding a client_fd whose
+# number the next accept reuses within microseconds, so the stale backend
+# spliced into a stranger's socket -- and the fix clears the back-reference and
+# makes both forwarding paths verify the pairing is mutual, because a
+# descriptor number does not prove identity once numbers are reused; verifying
+# connections run against ones that die by RST with a reply still owed, every
+# message tagged with a run-unique id so a foreign line is recognisable rather
+# than merely unexpected, and the crossed-delivery half is probabilistic -- a
+# green run means not observed rather than cannot happen, so loop it when
+# hunting this class of defect, while the missing and scrambled assertions
+# catch the rest of the same fix almost every run.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -66,9 +31,8 @@ BEPID=""
 BE_PORT=$((SL_PORT_BASE+430))
 PX_PORT=$((SL_PORT_BASE+431))
 PX_NAME=xtalk_px
-# Load knobs.  These are the dials to turn if this test ever becomes slow or
-# flaky on a loaded machine: LOAD_SECS is almost all of the runtime, and
-# CHURNERS is almost all of the pressure on the proxy's accept path.
+# The dials to turn if this ever becomes slow or flaky: LOAD_SECS is almost all
+# of the runtime and CHURNERS almost all of the pressure on the accept path.
 LOAD_SECS=1.5      # how long the two kinds of connection run against each other
 VERIFIERS=8        # threads opening verifying connections back to back
 CHURNERS=8         # threads opening connections that die with data still owed
@@ -79,11 +43,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
-    # Wait for the daemon to actually go, and insist if it does not.  A plain
-    # kill returns immediately, and this test leaves a daemon holding thousands
-    # of connections, which takes long enough to shut down that the next test in
-    # the suite starts while it is still bound — the leftovers accumulate and one
-    # of them ends up answering somebody else's requests.
+    # Wait for the daemon to actually go and insist if it does not, because
+    # this test leaves one holding thousands of connections and the next test
+    # starts while it is still bound.
     if [ -n "$DPID" ]; then
         kill "$DPID" 2>/dev/null || true
         for _ in $(seq 1 50); do
@@ -93,17 +55,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet — or not up any more — starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket as well as by pid and matched on exact process name,
+    # because a CLI command against an absent daemon starts a detached one that
+    # would hold this test's ports, and a `pgrep -f` pattern also matches the
+    # shell doing the matching.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -120,9 +75,9 @@ trap cleanup EXIT
 
 echo "=== Integration: no crossed delivery through the proxy under load ==="
 
-# Threaded TCP echo backend.  Whatever a connection sends must come back on that
-# same connection and nowhere else — that is the invariant under test, so the
-# backend has to be trivially correct about it.
+# A threaded TCP echo backend that has to be trivially correct about returning
+# bytes on the connection they arrived on, since that is the invariant under
+# test.
 python3 - "$BE_PORT" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
 import socket, sys, threading
 
@@ -159,14 +114,9 @@ while True:
 PYEOF
 BEPID=$!
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet —
-# cli.cpp's ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so
-# polling 'ps' against the daemon this test has just launched races it and spawns
-# a second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run — and the orphan survives cleanup, because cleanup only knows $DPID.
-# Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the daemon's IPC socket directly and never by polling with a CLI
+# command, because every CLI command auto-starts a daemon when the socket does
+# not answer and the orphan survives cleanup, which only knows $DPID.
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -194,16 +144,11 @@ SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart — so this looks at the descriptor table, which only a
-# live process has.  Without it the run measures somebody else's daemon and says
-# nothing about it.
+# The daemon that answers is the one this test launched, asked of the
+# descriptor table because `kill -0` cannot tell a zombie from a live process.
 TOTAL=$((TOTAL+1))
-# `|| true` because of `set -o pipefail`: when the pid really is gone — the
-# case this check exists for — `ls` fails, the pipeline fails, and the script
-# dies right here with no output at all.  The one check that can report a
-# dead daemon could never report one.
+# `|| true` because under pipefail the failing `ls` in exactly the case this
+# check exists for would kill the script with no output at all.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -407,10 +352,8 @@ PYEOF
 
 TOTALS=$(grep '^TOTALS ' "$OUT" 2>/dev/null | head -1 || true)
 
-# Every check below reads its number out of that one line.  If the line is not
-# there the number is unset, and an unset number must fail loudly instead of
-# comparing equal to an equally unset expectation — that mistake has produced a
-# green run against a broken build in this project before.
+# Every check below reads its number out of that one line, and an unset number
+# must fail loudly rather than compare equal to an equally unset expectation.
 assert_zero() {
     local field="$1" what="$2" n
     TOTAL=$((TOTAL+1))
@@ -439,18 +382,17 @@ else
     grep -v '^$' "$OUT" 2>/dev/null | head -5 | sed 's/^/        /' || true
 fi
 
-# This is the one that matters.  Missing and misordered data can come from any
-# number of ordinary problems; a message carrying somebody else's connection id
-# can only mean the proxy wrote it into the wrong socket.
+# The one that matters: missing and misordered data come from any number of
+# ordinary problems, while a message carrying somebody else's connection id can
+# only mean the proxy wrote it into the wrong socket.
 assert_zero foreign     "messages delivered on the wrong connection"
 assert_zero corrupt     "scrambled or truncated stream"
 assert_zero outoforder  "messages delivered out of order"
 assert_zero missing     "messages never delivered"
 assert_zero reset       "healthy connections torn down by the proxy"
 
-# A run that only managed a handful of connections has not exercised anything,
-# and its zeroes above are worthless.  Assert the load actually happened rather
-# than let an empty run report success.
+# A run that only managed a handful of connections has not exercised anything
+# and its zeroes above are worthless.
 CONNS=$(printf '%s\n' "$TOTALS" | grep -o "\bconns=[0-9]\+" | cut -d= -f2 | head -1 || true)
 TOTAL=$((TOTAL+1))
 if [ -n "$CONNS" ] && [ "$CONNS" -ge "$MIN_CONNS" ]; then

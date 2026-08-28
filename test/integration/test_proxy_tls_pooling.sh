@@ -3,54 +3,25 @@
 # request it belongs to.
 #
 # ─── WHAT CHANGED ───────────────────────────────────────────────────────────
-#
-# Until now a backend socket carrying a TLS session was never pooled, so every
-# single request to an https:// backend paid for a full handshake: a TCP
-# handshake, a certificate chain to verify, a key exchange, and then one
-# request.  The stated reason was that the pool is keyed on a host and a port
-# while a TLS connection carries a negotiated session, a peer verified against
-# a name, a client certificate and a record layer part way through a stream.
-#
-# Three of those four are functions of that key -- start_backend_tls builds the
-# session with create_ssl_client(host), where host is the same
-# backend_endpoint_of() answer the pool files the socket under -- and the
-# fourth belongs to the proxy's one backend tls_context.  The record layer is
-# answered by pooling the session with the descriptor instead of the descriptor
-# alone.
-#
+# Every request to an https backend used to pay for a full handshake, on the
+# grounds that the pool is keyed on host and port while a TLS connection
+# carries more -- but three of those four are functions of that same key and
+# the fourth belongs to the proxy's one backend context, so the record layer is
+# answered by pooling the session with the descriptor rather than the
+# descriptor alone.
 # ─── THE ORACLE ─────────────────────────────────────────────────────────────
-#
-# Counted at the backend, which is the end that does the work and the only one
-# with no reason to flatter the proxy.  The Python backends below count two
-# things per listener: a completed TLS handshake, and an HTTP request served.
-# The saving is the ratio, and it is meaningless without both numbers -- a
-# proxy that dropped requests would show a wonderful handshake count.
-#
-# The SNI name of every handshake is recorded with it.  That is what makes
-# phase 2 an identity test rather than a load-balancing test: the two backends
-# are configured under names that are different strings for the same machine,
-# "localhost" and "127.0.0.1", so a pooled socket that crossed between them
-# would be a socket whose peer was verified against one name serving a request
-# routed to the other.  The names are visible at the backend because the proxy
-# sends one as SNI and, for the address literal, deliberately sends none at all
-# (RFC 6066 allows host names there only).
-#
+# Counted at the backend, which is the end with no reason to flatter the proxy,
+# as handshakes and requests together since the saving is the ratio -- and the
+# SNI name is recorded with each handshake, which makes phase 2 an identity
+# test, because the two backends are configured under different spellings of
+# the same machine and the address literal deliberately sends no SNI at all.
 # ─── THE VACUITY GUARDS ─────────────────────────────────────────────────────
-#
-# "Few handshakes" passes trivially against a proxy that forwards nothing, and
-# "no crossing" passes trivially against a proxy that only ever uses one
-# backend.  So:
-#
-#   * every phase asserts the request count as well as the handshake count,
-#     and every response body is checked to be the one that request asked for;
-#   * phase 2 asserts that BOTH backends served requests, and that neither
-#     served more than the round robin could have sent it;
-#   * phase 3 asserts that a restart DOES handshake again -- the pool must not
-#     survive the context that verified it -- which is the one place in this
-#     file where a fresh handshake is the pass;
-#   * phase 4 asserts a specific body, not merely a 200: the failure it is
-#     written for produces a perfectly well-formed answer belonging to
-#     somebody else.
+# "Few handshakes" passes trivially against a proxy that forwards nothing, so
+# every phase asserts the request count and the body, phase 2 asserts both
+# backends served and neither more than round robin could send, phase 3 asserts
+# a restart does handshake again, and phase 4 asserts a specific body --
+# because the failure it is written for produces a well-formed answer belonging
+# to somebody else.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -90,10 +61,8 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 
 fi
 
 # ── certificates ─────────────────────────────────────────────────────────────
-#
-# Two leaves under two different names for the same machine.  That is the whole
-# point of the pair: the addresses differ only in how they are spelled, so
-# nothing but the pool's own key can keep the two apart.
+# Two leaves under two different names for the same machine, so nothing but the
+# pool's own key can keep them apart.
 openssl req -x509 -newkey rsa:2048 -keyout "$TMPD/ip.key" -out "$TMPD/ip.pem" \
     -days 2 -nodes -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" \
     >/dev/null 2>&1 || { echo "  SKIP: could not generate a certificate"; exit 0; }
@@ -259,20 +228,15 @@ echo "  phase 1: $REQS requests to one https:// backend -> $H1 TLS handshake(s),
 if [ "$BODIES_OK" = "1" ] && [ "$R1" = "$REQS" ]; then ok
 else bad "phase1-delivery" "expected $REQS correct bodies, served=$R1 bodies_ok=$BODIES_OK"; fi
 
-# The headline.  A handshake per request is the old behaviour and is what this
-# has to beat; the bound is generous on purpose -- curl opens a fresh client
-# connection each time, and the proxy is free to keep more than one backend
-# socket -- because the claim being made is "not one per request", not an exact
-# count that would turn a scheduling wobble into a red build.
-#
-# The lower bound is not decoration: "$H1 -lt $REQS" is satisfied by zero, and
-# zero is what a proxy that never reached the backend reports.  It has to have
-# handshaked at least once and far fewer than once per request.
+# The claim is "not one per request" rather than an exact count, so the upper
+# bound is generous -- and the lower bound is not decoration, because "fewer
+# than the request count" is satisfied by the zero a proxy that never reached
+# the backend reports.
 if [ "$H1" -ge 1 ] && [ "$H1" -lt "$REQS" ] && [ "$H1" -le 4 ]; then ok
 else bad "phase1-handshakes" "expected between 1 and 4 handshakes for $REQS requests, got $H1"; fi
 
-# And the name that was pinned to those handshakes.  An address literal must be
-# checked against the certificate's iPAddress SAN with no SNI sent at all.
+# And the name pinned to those handshakes: an address literal is checked
+# against the certificate's iPAddress SAN with no SNI sent at all.
 S1=$(field "$TMPD/a.state" sni)
 if [ "$S1" = "-no-name-" ]; then ok
 else bad "phase1-sni" "an https://127.0.0.1 backend must be asked for by no name at all, saw '$S1'"; fi
@@ -320,10 +284,9 @@ else bad "phase2-delivery" "every response must be this request's own; crossed=$
 if [ "$A_SHARE" -gt 0 ] && [ "$RB" -gt 0 ]; then ok
 else bad "phase2-vacuity" "both backends must serve; 127.0.0.1=$A_SHARE localhost=$RB"; fi
 
-# THE IDENTITY ASSERTION.  The proxy pins the endpoint's name to the session
-# before the ClientHello, so a socket that ever crossed between these two would
-# put the wrong name on the wire -- or, for the literal, put a name on the wire
-# at all.  Each backend must have seen exactly one name, and its own.
+# The identity assertion: the endpoint's name is pinned to the session before
+# the ClientHello, so a socket that ever crossed between these two would put
+# the wrong name on the wire -- or, for the literal, a name at all.
 if [ "$SA" = "-no-name-" ]; then ok
 else bad "phase2-sni-ip" "the https://127.0.0.1 endpoint must send no SNI, and never localhost's name, saw '$SA'"; fi
 if [ "$SB" = "localhost" ]; then ok
@@ -335,27 +298,19 @@ if [ "$HA" -ge 1 ] && [ "$HB" -ge 1 ] && [ "$((HA + HB))" -lt "$REQS" ]; then ok
 else bad "phase2-handshakes" "expected reuse across both endpoints, got $HA + $HB for $REQS requests"; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. A pooled session must not outlive the context that verified it.
-#
-# The one phase where a fresh handshake is the pass.  The proxy's backend
-# tls_context -- the trust store it checks chains against and the client
-# certificate it presents -- is built at start and thrown away at stop, so a
-# pooled socket that survived a restart would be a connection verified by a
-# configuration that is no longer in force.
+# The one phase where a fresh handshake is the pass, because the proxy's
+# backend context is built at start and thrown away at stop, so a pooled socket
+# surviving a restart would be verified by a configuration no longer in force.
 # ─────────────────────────────────────────────────────────────────────────────
 H_BEFORE=$((HA + HB))
 "$BIN" stop tpool2 >/dev/null 2>&1
 sleep 0.4
 "$BIN" start tpool2 >/dev/null 2>&1
-# Recorded rather than swallowed.  This file failed once inside a sweep under
-# load and has not been reproduced since: 64 further runs, 58 of them under six
-# or nine busy cores, all green.  Ruled out along the way -- test order (four
-# orderings, no per-test disagreement), port exhaustion (peak 4,875 TIME_WAIT
-# against ~28,000 ephemeral ports), and the stop-wait above, which was removed
-# entirely and still passed 5 of 5.  The cause is unknown, so the useful change
-# is not a guess at a fix but making the next occurrence explain itself:
-# `served=0` on its own cannot tell "the port never came back" from "it came
-# back and answered wrongly", and those two want different investigations.
+# Recorded rather than swallowed, because this failed once under load and has
+# not reproduced in 64 further runs with test order, port exhaustion and the
+# stop-wait each ruled out -- so the useful change is making the next
+# occurrence explain itself, since `served=0` cannot tell "the port never came
+# back" from "it came back and answered wrongly".
 PORT_BACK=1; wait_port "$PX_TWO" || PORT_BACK=0
 got=$(timeout 8 curl -s -m 6 "http://127.0.0.1:$PX_TWO/tpool2/after-restart" 2>/dev/null)
 HA2=$(field "$TMPD/a.state" handshakes); HB2=$(field "$TMPD/b.state" handshakes)
@@ -374,15 +329,11 @@ else bad "phase3-restart" "the first request after a restart must handshake agai
 "$BIN" stop tpool2 >/dev/null 2>&1; "$BIN" remove tpool2 >/dev/null 2>&1
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. A backend that speaks on an idle pooled socket.
-#
-# This is bbf4e9f's defect over an encrypted leg.  The backend answers, and then
-# writes a second answer nobody asked for onto the same socket.  The proxy pools
-# that socket; the next request borrows it.  What is waiting on it is a TLS
-# record, and a record carrying application data looks exactly like a session
-# ticket from outside -- so a probe that asks the kernel "are there bytes?" is
-# answering the wrong question in both directions.  Nothing here may ever come
-# back marked VOLUNTEERED.
+# A backend that writes a second answer nobody asked for onto a socket the
+# proxy then pools, over an encrypted leg -- where a record carrying
+# application data looks exactly like a session ticket from outside, so asking
+# the kernel whether there are bytes answers the wrong question in both
+# directions.
 # ─────────────────────────────────────────────────────────────────────────────
 start_be "$BE_C" "$TMPD/ip.pem" "$TMPD/ip.key" "$TMPD/c.state" "$TMPD/c.log" \
     unbidden || { echo "  SKIP: unbidden backend would not start"; exit 0; }
@@ -412,8 +363,8 @@ echo "  phase 4: $N4 requests to a backend that volunteers answers -> $MISS wron
 if [ "$VOL" = "0" ]; then ok
 else bad "phase4-crosstalk" "a client received an answer the backend volunteered on a pooled socket"; fi
 
-# The vacuity guard for it.  A proxy that answered nothing would also never
-# hand over a volunteered answer, so the requests have to have been served.
+# The vacuity guard, because a proxy that answered nothing would also never
+# hand over a volunteered answer.
 if [ "$MISS" = "0" ] && [ "$RC" -ge "$N4" ]; then ok
 else bad "phase4-delivery" "every request must still get its own answer; wrong=$MISS served=$RC"; fi
 

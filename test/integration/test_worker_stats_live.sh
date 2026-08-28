@@ -1,57 +1,25 @@
 #!/usr/bin/env bash
 # suite: quiet -- one assertion times a `stats` round trip against a SIGSTOPped
-# worker, which is a bound on wall-clock delay and not on the code under test.
-# Integration test: an out-of-process runtime's figures are read when they are
-# printed.
-#
+# worker, which is a bound on wall-clock delay rather than on the code under
+# test.
 # ─── WHAT THIS REPLACED ─────────────────────────────────────────────────────
-#
-# This file used to assert the opposite property and was right to.  A worker's
-# figures were PUSHED: the child published them every 250 ms and the daemon
-# drained the control socket before any command that printed them, so what
-# `stats` showed was recent but was not read at the moment of the question the
-# way an in-process runtime's counters are.  `stats` said so, in figures:pushed
-# and figures_age_ms, and this file made that label honest by stopping the
-# worker and watching the age grow.
-#
-# The counters moved into a shared-memory region — shard_stats.h.  Each worker
-# stores its line once per turn of its event loop; the daemon sums the slots as
-# it prints.  There is no interval left between the reading and the printing, so
-# the two labels have nothing to say and are gone, and what has to be pinned
-# instead is the property that took their place.
-#
+# This file used to assert the opposite property and was right to, but the
+# counters moved into a shared-memory region each worker stores into once per
+# loop turn and the daemon sums as it prints -- so there is no interval left
+# between the reading and the printing, the figures:pushed and figures_age_ms
+# labels are gone, and what has to be pinned is the property that took their
+# place.
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
-#
-# 1  the labels are gone, on BOTH paths.  A build that reintroduces a pushed
-#    figure has to print an age again; one that pushes without printing an age
-#    is worse than the build this change replaced, because the staleness is then
-#    unlabelled.  Asserted of the in-process proxy too, which is the control:
-#    the two paths now print the same shape, which is the whole claim.
-#
-# 2  how long after a connection the runtime says so.  The discriminating
-#    assertion, and the one a slower publish cannot pass.  Measured on this box:
-#    246-553 ms while the figures were pushed, median 253, which is the publish
-#    period exactly; 7-17 ms after they moved into shared memory, and most of
-#    that is the CLI round trip.  The median of ten, because a single attempt
-#    against a 250 ms publish whose phase this script does not control is a coin
-#    toss in both directions.
-#
-# 3  a stopped worker does not stop `stats`.  The obvious way to make figures
-#    live is to ask the child and wait for the answer, which is the synchronous
-#    cross-runtime call this design refuses everywhere else — and the failure it
-#    produces is not a wrong number, it is a CLI that hangs.  So the worker is
-#    SIGSTOPped and `stats` has to answer anyway, out of the line that worker
-#    last wrote.  A reader that cannot be delayed by a writer is the property
-#    shard_stats.h is built on and this is where it is exercised.
-#
-# 4  and the figure it answers with is the one that was true.  A wait-free read
-#    that returned zero when the writer was descheduled would pass 3 and be
-#    useless; the count taken before the stop has to survive it.
-#
-# The worker is found by walking /proc for a process whose /proc/PID/exe is this
-# binary and whose parent is this test's daemon.  Never by a command-line
-# pattern: an -f match one character too broad reaches the shell doing the
-# matching.
+# Four claims: the labels are gone on both paths, with the in-process proxy as
+# the control since the two now print the same shape; how long after a
+# connection the runtime says so, taken as the median of ten because a single
+# attempt against a publish whose phase this script does not control is a coin
+# toss; a SIGSTOPped worker does not stop `stats`, because the obvious way to
+# make figures live is to ask the child and wait, whose failure is a CLI that
+# hangs; and the figure it answers with is the one that was true, since a
+# wait-free read returning zero would pass the third and be useless -- with the
+# worker found by walking /proc for an exe and a parent, never by a
+# command-line pattern.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -91,24 +59,16 @@ echo "=== Integration: a worker's figures are read when they are printed ==="
 
 daemon_start "$BIN"
 
-# field NAME KEY -> the value, or the empty string.  Never a substituted zero:
-# 0 is a legitimate reading and "the field is not there" must not compare equal
-# to it.
+# Never a substituted zero, because 0 is a legitimate reading and "the field is
+# not there" must not compare equal to it.
 field() {
     "$BIN" stats "$1" 2>/dev/null | sed -n "s/^$2:\(.*\)$/\1/p" | head -1
 }
 
-# worker_pid -> the pid of the named runtime's worker, or the empty string.
-#
-# Identified by exe and by parent, never by a command-line pattern.  The exe test
-# is a device+inode comparison through the symlink, which a shell can never
-# satisfy; the parent test pins it to this test's own daemon, so a worker
-# belonging to another run on this machine cannot be picked up — or signalled.
-#
-# By NAME and not "the first worker of this daemon": `backend` is created first
-# and is a worker too, so a walk of the daemon's children finds it, and a test
-# that stopped the wrong process measured a figure that never moved and read it
-# as a property of the build.
+# Identified by exe and by parent so a worker belonging to another run cannot
+# be picked up or signalled, and by name rather than "the first worker of this
+# daemon" -- since stopping the wrong process measures a figure that never
+# moved and reads it as a property of the build.
 worker_pid() {
     local dpids p ppid
     p=$(field "$1" pid)
@@ -125,17 +85,10 @@ create_ok "in-process proxy created" "$BIN" create proxy px_in -p "$PX_IN_PORT" 
 create_ok "out-of-process proxy created" "$BIN" create proxy px_oop -p "$PX_OOP_PORT" \
     --backend "127.0.0.1:$BE_PORT" --protocol http -s
 
-# Wait for the worker to be answering for itself.  Before its first frame the
-# placeholder is not worker-backed and prints its own empty containers, which is
-# a different state from the one under test.
-#
-# NOT on `pid:`, which is written by the supervisor at the fork and is there
-# before the child has said anything: this file was watched passing its first
-# assertion against a build that DOES print figures:pushed, because it read the
-# labels in the window between the fork and the first frame.  `mesh_links:` is
-# appended by push_stats() in the worker and by nothing else, so its presence is
-# the child having reported at least once — on this build and on the one this
-# assertion has to be able to fail against.
+# Wait for the worker to be answering for itself, on `mesh_links:` rather than
+# on `pid:` -- which the supervisor writes at the fork, so reading the labels
+# in the window before the first frame passed against a build that does print
+# figures:pushed.
 for _ in $(seq 1 100); do
     "$BIN" stats px_oop 2>/dev/null | grep -q '^mesh_links:' && break
     sleep 0.1
@@ -152,32 +105,12 @@ if [ "$OOP_LABEL" -eq 0 ] && [ "$IN_LABEL" -eq 0 ]; then pass; else
          "is stale without saying so, which is worse than what this replaced"
 fi
 
-# ── 2: how long after a connection the runtime says so ─────────────────────
-#
-# The discriminating measurement, and the one a slower publish cannot pass.  A
-# connection is opened and `stats` is asked until the count moves; what is timed
-# is the interval between the two.  While the figures were pushed on a 250 ms
-# timer this read 246-553 ms with a median of 253 — the publish period, exactly.
-# Summed at print time it reads 7-17 ms, and most of that is the CLI round trip
-# rather than anything the worker does.
-#
-# The MEDIAN of ten and not one reading: a single attempt against a 250 ms
-# publish whose phase this script does not control is a coin toss, and one
-# unlucky attempt against a correct build is a scheduler artefact.  The first
-# attempt is a warm-up and is discarded for a named reason: it is the one that
-# makes this proxy dial its backend, measured here at 240 ms against 7 ms for
-# every attempt after it, and that cost is the backend handshake and not the
-# figure being stale.
-#
-# bash's own /dev/tcp, so the connection is held by this shell and closes with
-# the descriptor rather than with somebody else's process.
-#
-# 9999 is the sentinel for "it never moved inside the loop", and against a
-# pushed figure it is a real reading rather than a broken one: the reap of the
-# previous attempt's connection and the accept of this one can land inside the
-# same publish, so the published number goes 1 -> 1 and no sample ever differs
-# from the baseline.  A build that reads at print time cannot alias like that,
-# because it sees every value the count passes through that it is asked during.
+# The discriminating measurement, timing the interval between a connection and
+# the count moving, as the median of ten with the first attempt discarded
+# because it is the one that makes this proxy dial its backend -- with 9999 the
+# sentinel for a count that never moved, which against a pushed figure is a
+# real reading, since a reap and an accept landing in the same publish alias to
+# no change at all.
 lag_once() {                       # -> milliseconds, or 9999 if it never moved
     local base t0 v i
     base=$(field px_oop connections)
@@ -192,9 +125,9 @@ lag_once() {                       # -> milliseconds, or 9999 if it never moved
     if [ "$v" = "$base" ]; then printf '9999'
     else printf '%s' "$(( $(date +%s%3N) - t0 ))"; fi
     exec 8>&-
-    # Back to the baseline before the next attempt, so each one starts from the
-    # same place.  Bounded: a reap this loop never sees would otherwise leave
-    # the count high and make the next attempt time the wrong transition.
+    # Back to the baseline before the next attempt and bounded, because a reap
+    # this loop never sees would leave the count high and make the next attempt
+    # time the wrong transition.
     for i in $(seq 1 60); do
         [ "$(field px_oop connections)" = "$base" ] && break
         sleep 0.05
@@ -207,10 +140,8 @@ for _ in $(seq 1 10); do LAGS="$LAGS $(lag_once)"; done
 MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
 echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS )"
 
-# 100 ms: two and a half times the worst correct reading seen here and under
-# half the 253 ms median a 250 ms publish produces.  It is separating two
-# mechanisms, not timing a fast path, so the margin is what matters and not the
-# tightness.
+# 100 ms separates two mechanisms rather than timing a fast path, so the margin
+# is what matters and not the tightness.
 if [ "$MEDIAN" -le 100 ] 2>/dev/null; then pass; else
     fail "a connection is visible as soon as it is asked about" \
          "the median lag over ten attempts was ${MEDIAN} ms, bound 100" \
@@ -228,10 +159,8 @@ if [ -n "$WORKER_PID" ]; then pass; else
 fi
 
 if [ -n "$WORKER_PID" ]; then
-    # One connection, seen, and only then is the worker stopped: the figure the
-    # stopped worker has to keep answering with must be one it was ever asked
-    # about.  An identity assertion over 0 passes on a build that answers 0 to
-    # everything.
+    # One connection, seen, and only then is the worker stopped, because an
+    # identity assertion over 0 passes on a build that answers 0 to everything.
     HELD_BASE=$(field px_oop connections)
     exec 8<>"/dev/tcp/127.0.0.1/$PX_OOP_PORT" 2>/dev/null || true
     WANT=$((HELD_BASE + 1))
@@ -250,11 +179,9 @@ if [ -n "$WORKER_PID" ]; then
     kill -CONT "$WORKER_PID" 2>/dev/null || true
     exec 8>&-
 
-    # 1000 ms.  A `stats` that is answered out of shared memory takes the same
-    # few milliseconds it always does; one that asks the child and waits does
-    # not come back at all while the child is stopped, and whatever timeout it
-    # eventually hits is longer than this.  The bound is loose on purpose — it
-    # is separating "answered" from "did not answer", not timing a fast path.
+    # A loose 1000 ms, separating "answered" from "did not answer": a read out
+    # of shared memory takes its usual few milliseconds while one that asks a
+    # stopped child does not come back at all.
     if [ "$MS" -le 1000 ]; then pass; else
         fail "stats answers while the worker is stopped" \
              "it took ${MS} ms against a SIGSTOPped worker" \

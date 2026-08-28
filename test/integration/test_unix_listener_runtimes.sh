@@ -3,23 +3,16 @@
 # and the connect side on the one that dials.
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
-#
-# test_server_unix_listen.sh proves the mechanism on the server, where it was
-# born.  This file proves the mechanism is shared rather than copied: the
-# proxy and the cache listen through the same shared/unix_listener.h bind, the
-# client dials through the same address construction, and each runtime's OWN
-# incompatibilities (--tls everywhere, --cluster on a cache, --shards on a
-# proxy) are refused with their stated reasons.
-#
+# test_server_unix_listen.sh proves the mechanism where it was born; this file
+# proves it is shared rather than copied -- the proxy and cache bind through
+# the same shared/unix_listener.h, the client dials through the same address
+# construction, and each runtime's own incompatibilities are refused with their
+# stated reasons.
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
-#
-# The payload checks would catch a runtime whose accept path assumed AF_INET —
-# a peer-address read, a TCP socket option treated as load-bearing.  The 0600
-# checks would catch a runtime that reached the shared bind without the shared
-# chmod.  The node-removal checks would catch a teardown that closed the fd
-# and left the node — which is exactly the half that existed only in the
-# server before this was shared.  The refusals each name the broken build they
-# catch beside the assertion.
+# The payload checks catch an accept path that assumed AF_INET, the mode checks
+# a runtime that reached the shared bind without the shared chmod, and the
+# node-removal checks a teardown that closed the fd and left the node -- the
+# half that existed only in the server before this was shared.
 
 set -euo pipefail
 
@@ -27,8 +20,8 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib_daemon.sh"
 . "$HERE/lib_ports.sh"
-# lib_ports.sh opens its lock with `exec 9>`; an exec with no command applies
-# its redirections to this shell for good.  Put stderr back.
+# lib_ports.sh opens its lock with `exec 9>`, and an exec with no command
+# applies its redirections to this shell for good, so stderr is put back.
 exec 2>&1
 daemon_isolate unixrts
 PASS=0; FAIL=0; TOTAL=0
@@ -98,10 +91,8 @@ s.close()
 }
 
 # ─── 1. A proxy listens on a unix socket ────────────────────────────────────
-#
-# Backend over TCP, front door over unix — the mirror of what --backend unix:
-# already covered.  Catches an accept path that assumed the accepted peer has
-# an AF_INET address.
+# Backend over TCP and front door over unix, which catches an accept path that
+# assumed the accepted peer has an AF_INET address.
 "$BIN" create server ur_be -p $((P + 1)) --http "$WWW" -s >/dev/null 2>&1 || true
 PXSOCK="$D/px.sock"
 "$BIN" create proxy ur_px --listen "unix:$PXSOCK" --backend "127.0.0.1:$((P + 1))" -s >/dev/null 2>&1 || true
@@ -139,10 +130,8 @@ CMODE=$(stat -c '%a' "$CSOCK" 2>/dev/null || echo "?")
 if [ "$CMODE" = "600" ]; then pass
 else fail "the cache's node is owner-only" "mode is $CMODE, not 600"; fi
 
-# Framed as a RESP array, because that is what selects RESP: the cache reads
-# a first byte of '*' as RESP and anything else as its plaintext protocol
-# (cache_instance.cpp, resp_parser.h), and plaintext has no PING.  An inline
-# "PING" here answered 'failed: unknown command' -- correctly.
+# Framed as a RESP array because a first byte of '*' is what selects RESP, and
+# the plaintext protocol has no PING.
 PONG=$(resp_unix "$CSOCK" '*1\r\n$4\r\nPING')
 if [ "$PONG" = "+PONG" ]; then pass
 else fail "the cache answers RESP over unix" "PING answered '$PONG'"; fi
@@ -159,9 +148,8 @@ if [ ! -e "$CSOCK" ]; then pass
 else fail "stopping the cache removes its node" "$CSOCK is still there"; fi
 
 # ─── 3. A client dials a unix socket ────────────────────────────────────────
-#
-# The connect side: -t unix:/path.  Asserted through the server's connection
-# count, which is the one observable a connected-and-idle client has.
+# The connect side, asserted through the server's connection count, which is
+# the one observable a connected-and-idle client has.
 USOCK="$D/usrv.sock"
 "$BIN" create server ur_usrv --listen "unix:$USOCK" -s >/dev/null 2>&1 || true
 sleep 0.8
@@ -218,15 +206,15 @@ setup_refusal() {   # setup_refusal <label> <needle> <create-args...>
     else fail "$label" "exit $rc; the log said: ${after:0:200}"; fi
 }
 
-# A sharded proxy on a unix path: N workers would unlink each other's node.
-# Would catch a build that let the pair through to serve on whichever shard
-# bound last.
+# A sharded proxy on a unix path would have N workers unlink each other's node,
+# so a build that let the pair through would serve on whichever shard bound
+# last.
 refuse_cli "a sharded proxy is refused a unix listener" \
     "--shards and --listen are not compatible" \
     proxy ur_shpx --shards 2 --listen "unix:$D/shpx.sock" --backend "127.0.0.1:9"
 
-# A client listens on nothing; the flag is refused with the pointer to the
-# side it does have.  Would catch a build that took the flag and ignored it.
+# A client listens on nothing, so the flag is refused with a pointer to the
+# side it does have.
 refuse_cli "a client is refused --listen, and told about -t" \
     "-t unix:" \
     client ur_clil --listen "unix:$D/cl.sock"
@@ -237,8 +225,8 @@ refuse_cli "a client's relative unix target is refused" \
     "must be absolute" \
     client ur_clir -t "unix:relative.sock"
 
-# TLS on a unix listener, per runtime that grew the listener.  Would catch a
-# runtime that reached the shared bind without asking the shared refusal.
+# TLS on a unix listener, per runtime that grew the listener, which catches one
+# that reached the shared bind without asking the shared refusal.
 setup_refusal "a proxy is refused --tls with --listen" \
     "--tls encrypts a listener" \
     proxy ur_pxtls --listen "unix:$D/pxtls.sock" --backend "127.0.0.1:9" \
@@ -258,16 +246,14 @@ setup_refusal "a cache is refused --listen with -p" \
     "--listen and -p" \
     cache ur_cboth -p $((P + 31)) --listen "unix:$D/cboth.sock"
 
-# --cluster advertises base+1+i ports out of a formula; a path has no
-# successor.  Would catch a build that advertised addresses nothing answers.
+# --cluster advertises base+1+i ports out of a formula and a path has no
+# successor, so a build that took it would advertise addresses nothing answers.
 setup_refusal "a cache is refused --cluster with --listen" \
     "--cluster" \
     cache ur_cclu --listen "unix:$D/cclu.sock" --cluster --shards 1
 
 # The dial side's own incompatibilities, decided in the client's setup() like
-# the listeners' are.  Would catch a build that dialled a SOCK_STREAM path
-# with --udp set and silently served streams, or spent a TLS handshake on a
-# peer the socket node's permissions already bound.
+# the listeners' are.
 setup_refusal "a client is refused --udp with a unix target" \
     "--udp asks" \
     client ur_cudp -t "unix:$D/cudp.sock" --udp
