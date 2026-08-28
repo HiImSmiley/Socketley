@@ -15,26 +15,12 @@
 
 class event_loop;
 
-// ── CPU set ─────────────────────────────────────────────────────────────────
-// Which CPUs a loop's I/O may run on: the thread that drives the ring, and —
-// when SQPOLL is on — the kernel thread that polls its submission queue.
-//
-// One value covers both because they are one question.  A ring is a queue
-// between one thread and the kernel; asking "how many rings" only ever reduces
-// to "how many I/O threads", and two rings on one thread are strictly worse
-// than one, so there is no count to configure here.  What is left to say is
-// where that thread's work is allowed to land, and that is a set of CPUs.
-//
-// `all` is the `max` spelling: no restriction, and no sched_setaffinity call at
-// all, which is not the same as a mask with every bit set — a mask would pin
-// the thread to the CPUs online *now* and keep it off any that come online
-// later.
+// Which CPUs a loop's I/O may run on, covering the ring's thread and its SQPOLL
+// poller.  `all` makes no sched_setaffinity call at all, which differs from a
+// full mask: that would pin to the CPUs online now and exclude later ones.
 struct cpu_set_spec
 {
-    // A mask is the shape the kernel wants and 64 covers every machine this
-    // daemon has ever been run on.  A wider one would be a bitset in a struct
-    // that is copied into every runtime; when a 65-CPU box turns up, parsing
-    // says so rather than silently dropping the high half — see parse_cpu_set.
+    // A 65-CPU box is refused by parsing rather than losing its high half.
     static constexpr uint32_t max_cpus = 64;
 
     bool     all{true};
@@ -42,12 +28,8 @@ struct cpu_set_spec
 
     bool empty() const { return !all && mask == 0; }
 
-    // Lowest CPU in the set, or -1 when there is no single one to name.  This is
-    // what an SQPOLL ring is pinned to: io_uring takes a CPU *number* for the
-    // poller, not a mask, so the set bounds the loop thread and its lowest
-    // member carries the poller.  Documented rather than hidden, because a user
-    // who writes --cpus 0-3 and finds one kernel thread on CPU 0 deserves to
-    // have been told.
+    // io_uring pins its poller to a CPU NUMBER, not a mask, so the set bounds
+    // the loop thread and its lowest member carries the poller.
     int first() const
     {
         if (all || mask == 0) return -1;
@@ -59,10 +41,7 @@ struct cpu_set_spec
         return all ? 0u : static_cast<uint32_t>(__builtin_popcountll(mask));
     }
 
-    // `max`, or the shortest of the two spellings that round-trips through
-    // parse_cpu_set: a single unbroken run prints as a range, anything else as
-    // a list.  This is what `stats` shows, so it has to be a string the user
-    // could have typed.
+    // What `stats` shows, so it must be a string the user could have typed.
     std::string to_string() const
     {
         if (all) return "max";
@@ -99,20 +78,9 @@ inline uint32_t online_cpu_count()
     return n > 0 ? static_cast<uint32_t>(n) : 1u;
 }
 
-// Parse `max`, a range `A-B`, or a comma-separated list whose elements are
-// single CPUs or ranges: `0`, `0-3`, `0,1,2,3`, `0-1,3`.
-//
-// False — with a reason in `err` — for anything else, and deliberately for the
-// two answers that are tempting to paper over:
-//
-//   * a CPU number this machine does not have.  Falling back to "all" here is
-//     the failure that made this function exist: an operator pins a runtime to
-//     CPU 7 on a four-core box, reads no complaint, and believes it is pinned.
-//   * a set that comes out empty (`--cpus ""`, `--cpus 3-1`).  Empty is not a
-//     synonym for unrestricted; it is a set on which nothing can be scheduled,
-//     and the only honest answer to it is a refusal.
-//
-// `ncpus` is the machine's CPU count.
+// `max`, `0`, `0-3`, `0,1,2,3`, `0-1,3`.  A CPU this machine lacks and an empty
+// set are both refused rather than falling back to "all" -- an operator who
+// pins to CPU 7 on a four-core box must not read silence as success.
 inline bool parse_cpu_set(std::string_view spec, uint32_t ncpus,
                           cpu_set_spec& out, std::string& err)
 {
@@ -232,24 +200,14 @@ public:
 private:
     friend class event_loop;
 
-    // Who this handler is as far as the loop is concerned: the index of its
-    // slot in the loop's owner table in the low bits, the epoch of the
-    // registration holding that slot in the high 16.  Written only by
-    // event_loop::register_owner() and cleared only by deregister_owner().
-    //
-    // Every submission copies it into its io_request, so a completion carries
-    // the identity its owner had at submit time.  The loop can then decide
-    // whether that owner is still there without dereferencing it — which it
-    // must not do, because "still there" is exactly the question.
+    // Slot index in the low bits, registration epoch in the high 16, copied
+    // into every submission -- so the loop can ask whether an owner is still
+    // there without dereferencing it, which is the question.
     uint32_t m_loop_token{0};
 };
 
-// Stamp source for io_request::generation below.  One counter for the whole
-// process: the comparison it feeds is only meaningful if no two structs that
-// are alive at the same time can hold the same value, and per-struct counters
-// cannot promise that.  Only the loop thread calls this, so a plain increment
-// is enough.  Zero stays reserved for "never stamped" and is skipped on wrap,
-// so a request that was never given a generation never looks current.
+// One counter for the whole process, because two live structs must never hold
+// the same value.  Zero is reserved for "never stamped" and skipped on wrap.
 inline uint32_t next_io_generation()
 {
     static uint32_t seq = 0;
@@ -262,28 +220,9 @@ inline uint32_t next_io_generation()
 // Outside every valid group id, so returning it is a no-op.
 inline constexpr uint8_t NO_BUF_GROUP = 0xFF;
 
-// ── Descriptor targets ──────────────────────────────────────────────────────
-// An SQE does not carry a file.  It carries a *number* — a raw descriptor, or
-// an index into the ring's fixed-file table — and the kernel resolves that
-// number to a file when it consumes the SQE.  With SQPOLL that happens on
-// another thread at a moment nothing here controls, and even without it this
-// loop batches a whole completion round before it submits.
-//
-// So a number that is given away between the submission and the consumption is
-// not a cancelled operation, it is a *redirected* one: the read, write or
-// splice lands on whatever now answers to that number.  This was measured on
-// the proxy — about 6% of healthy connections received an aborting client's
-// 8192 bytes spliced into the middle of their own stream, because the aborting
-// client's descriptor had been closed and reissued by the next accept while its
-// splice was still queued.  Giving the number away covers three moves, not one:
-// close() and let the next accept take it, hand it to a connection pool, or
-// free a fixed-file slot and let the next allocation have the index.
-//
-// event_loop counts, per number, the submissions that named it, and refuses all
-// three moves until that count is zero.  These are how a submission records
-// which number it named, so the count can be undone when the completion lands.
-// IO_TARGET_FIXED separates the two namespaces: fixed index 7 and raw
-// descriptor 7 are different things and must not share a counter.
+// Giving a descriptor number away before the kernel consumes the SQE REDIRECTS
+// the operation rather than cancelling it, so event_loop counts submissions per
+// number and refuses close, pooling and slot reuse until zero.
 inline constexpr uint32_t IO_TARGET_NONE  = 0xFFFFFFFFu;
 inline constexpr uint32_t IO_TARGET_FIXED = 0x80000000u;
 
@@ -310,17 +249,11 @@ enum op_type : uint8_t
     op_health_check          = 18,    // async health check (connect/write/read phases)
     op_poll                  = 19,    // wait for readiness (used to finish a non-blocking connect)
     op_poll_abort            = 20,    // wait for a peer to die (POLLERR/POLLHUP), reading nothing
-    // Readiness for the socket end of a splice pipeline, armed in place of the
-    // splice itself while the socket is quiet.  It is a separate kind because it
-    // reports to the splice handler rather than to the connect one, and because
-    // "waiting to splice" and "splicing" have to be told apart in a breakdown:
-    // one of them costs a kernel thread and the other does not.
+    // Its own kind because it reports to the splice handler, and because only
+    // one of "waiting to splice" and "splicing" costs a kernel thread.
     op_splice_poll           = 21,
-    // Multishot recv with IORING_RECVSEND_BUNDLE: one completion may carry the
-    // contents of SEVERAL provided buffers, packed contiguously in the buffer
-    // ring's consumption order.  A separate kind because the completion is
-    // consumed differently — the CQE names only the FIRST buffer, and the rest
-    // are known to the loop's per-group cursor, not to the completion.
+    // One completion may carry SEVERAL buffers; the CQE names only the first,
+    // and the rest are known to the loop's cursor.
     op_recv_multishot_bundle = 22
 };
 
@@ -360,17 +293,8 @@ inline const char* io_op_name(uint8_t t)
     }
 }
 
-// ─── Is this completion a multishot receive? ────────────────────────────────
-//
-// A predicate rather than a comparison at each site, because "which op types
-// are a multishot recv" is exactly the kind of fact a new op type makes stale
-// everywhere at once.  Adding op_recv_multishot_bundle without this cost a
-// hang: the server checked `type == op_recv_multishot` in three places, the
-// bundle completion matched none of them, and every read it carried was
-// dropped -- an echo server that accepted connections and answered nothing.
-//
-// A site that genuinely means "the plain variant only" should say so and name
-// why; there is no such site today.
+// A predicate, not a comparison per site: adding the bundle op without this
+// cost a hang, because three sites compared against the plain variant alone.
 constexpr bool is_multishot_recv_op(op_type t)
 {
     return t == op_recv_multishot || t == op_recv_multishot_bundle;
@@ -390,21 +314,10 @@ struct io_request
     uint32_t length;
     op_type type;
 
-    // Connection structs are pooled and their io_requests live inside them, so
-    // a completion that arrives after the struct was handed to a new connection
-    // is indistinguishable from that connection's own — same address, same fd
-    // number, and the same owner, so owner_token below cannot separate them:
-    // the owner really is unchanged.  This is the finer-grained stamp for that
-    // case.  A struct writes the value it was reset with into every request it
-    // submits, and the handler compares before acting on the completion.
-    //
-    // The value must come from next_io_generation() and from nowhere else.  A
-    // counter kept per struct does not work, because both check sites reach the
-    // struct through the fd index first: once a descriptor is handed to a
-    // different struct, the stamp is compared against a *different* object's
-    // counter, and with a pool of a few dozen structs those counters sit in a
-    // narrow band, so two unrelated connections agreeing is common rather than
-    // rare.  One monotonic source makes agreement mean identity again.
+    // Tells a pooled struct's completion from its successor's, which
+    // owner_token cannot: same address, same fd, same owner.  From
+    // next_io_generation() only -- a per-struct counter is compared against a
+    // DIFFERENT object's after reuse and agrees by accident.
     uint32_t generation{0};
 
     // Submit-to-complete timing, -DSOCKETLEY_TIMING only; the field is absent
@@ -412,38 +325,19 @@ struct io_request
     SKL_TIMING_FIELD
 
 
-    // Which handler this submission belonged to, copied from the owner's
-    // io_handler::m_loop_token by the submit_* helpers.  run() compares it
-    // against the loop's owner table before dispatching: a handler that has
-    // deregistered since — or a request left over from an earlier registration
-    // that happened to land on the same slot — fails the compare and its
-    // completion is dropped instead of delivered.  Zero means the request had
-    // no owner at submit time, which never matches a live registration.
+    // Compared against the owner table before dispatch, so a deregistered
+    // handler -- or an old registration on the same slot -- is dropped.
+    // Zero never matches a live registration.
     uint32_t owner_token{0};
 
-    // The provided-buffer group this submission selected from, so the loop can
-    // put the buffer back when it drops the completion — by then the owner that
-    // knew the group may be gone.  Set only by the helpers that ask for a
-    // provided buffer; a value left behind by an earlier such submission on the
-    // same request is never read, because it is only consulted when the
-    // completion carries IORING_CQE_F_BUFFER and only those helpers can produce
-    // that.
+    // So the loop can return the buffer when it drops a completion, by which
+    // time the owner that knew the group may be gone.  Read only when the CQE
+    // carries IORING_CQE_F_BUFFER, which only those helpers produce.
     uint8_t buf_group{NO_BUF_GROUP};
 
-    // The number(s) this submission wrote into its SQE, in the encoding
-    // described above.  Written by event_loop::arm() from the argument the
-    // submit_* helper was called with — not from ::fd, which several helpers
-    // deliberately set to something else (submit_file_read names the file but
-    // records the socket, so the completion routes to the right connection).
-    //
-    // Two of them because splice names two: the pipe it reads from and the
-    // socket it writes into, and both have to be held.  The measured bug was on
-    // the second one.
-    //
-    // These are read by run() *before* the handler is dispatched, for the same
-    // reason ::type is: on_cqe may free the storage this request lives in, and
-    // may re-arm the request onto a different descriptor.  The value that has
-    // to be undone is the one that was armed.
+    // The numbers the SQE named -- not ::fd, which several helpers set to
+    // something else.  Two, because splice names a pipe and a socket.
+    // Read BEFORE dispatch: on_cqe may free this storage or re-arm it.
     uint32_t armed_target{IO_TARGET_NONE};
     uint32_t armed_target2{IO_TARGET_NONE};
 };
