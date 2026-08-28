@@ -128,12 +128,8 @@ std::vector<cluster_daemon> load_cluster_dir(const std::string& dir)
     while ((entry = readdir(d)) != nullptr)
     {
         std::string_view fname(entry->d_name);
-        // The ".json" test is also what keeps a half-written file out:
-        // cluster_discovery::publish() writes "<name>.json.tmp" and renames it
-        // into place, and that name does not end in ".json".  A second guard
-        // for ".tmp.json" stood here — the suffix written backwards, matching
-        // nothing any writer in this tree produces.  See the longer note in
-        // cluster_discovery.cpp::scan().
+        // The ".json" test is also what keeps a half-written "<name>.json.tmp"
+        // out; see the longer note in cluster_discovery.cpp::scan().
         if (fname.size() < 6 || fname.substr(fname.size() - 5) != ".json")
             continue;
 
@@ -307,12 +303,8 @@ static int cluster_group(const std::string& dir, std::string_view group_name)
 
 static int cluster_show(const std::string& dir, std::string_view daemon_name)
 {
-    // The name is pasted into a path, so it has to be a name.  Nothing checked
-    // it, and `cluster show ../../etc/passwd` read <dir>/../../etc/passwd.json —
-    // harmless in itself, since it opens with the caller's own rights and only
-    // prints, but it is the same string cmd_daemon_name validates for exactly
-    // this reason one process over.  A cluster file is named after a daemon,
-    // and a daemon name has no path in it.
+    // The name is pasted into a path, so it has to be a name, validated as
+    // cmd_daemon_name validates it one process over.
     if (daemon_name.empty() ||
         daemon_name.find('/')  != std::string_view::npos ||
         daemon_name.find('\\') != std::string_view::npos ||
@@ -364,10 +356,9 @@ static int cluster_stats(const std::string& dir, const std::string& local_name,
         }
     }
 
-    // This node's own line first.  Everything under it is read off the shared
-    // directory and therefore describes the cluster as seen from outside; a
-    // daemon that is not in the cluster is missing from all of it, and a
-    // summary that starts at "Daemons:" gives an operator no way to notice.
+    // This node's own line first, because everything under it describes the
+    // cluster as seen from outside and a daemon not in it is missing from all
+    // of it.
     std::cout << "Node: " << local_name
               << " (" << local_host << ") — cluster on, dir " << dir << "\n";
 
@@ -438,11 +429,9 @@ std::string status_field(std::string_view body, std::string_view key)
 
 int cli_cluster(int argc, char** argv)
 {
-    // Ask the daemon about itself, not the directory about the daemon.  This
-    // command used to open with `cluster-dir`, which answers "not in cluster
-    // mode" for a daemon that was never given --cluster and for one that was
-    // given it and refused — and those are not the same thing to anybody
-    // holding a node that is up, serving and in no group.
+    // Ask the daemon about itself rather than the directory about the daemon,
+    // because "not in cluster mode" covers both never asked and asked and
+    // refused.
     std::string status;
     int rc = ipc_send("cluster-status", status);
     if (rc < 0)

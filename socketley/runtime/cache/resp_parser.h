@@ -15,9 +15,8 @@ namespace resp {
 constexpr int RESP_MAX_ARRAY_SIZE = 1024;
 constexpr int RESP_MAX_BULK_LEN = 512 * 1024; // 512 KB
 
-// ─── Fast \r\n scanner — avoids std::string_view::find overhead ───
-// Uses memchr for the first byte, then checks second byte. Faster than
-// two-byte search on short buffers because memchr is SIMD-optimized.
+// Fast \r\n scanner using memchr for the first byte, which beats a two-byte
+// search on short buffers because memchr is SIMD-optimised.
 inline const char* find_crlf(const char* data, size_t len) noexcept
 {
     const char* end = data + len;
@@ -61,19 +60,9 @@ inline void encode_error_into(std::string& buf, std::string_view msg)
     buf.append("\r\n", 2);
 }
 
-// ─── AN ERROR WHOSE CODE THE CALLER CHOOSES ─────────────────────────────────
-//
-// encode_error_into() writes `-ERR <msg>`, which is correct for every error
-// this cache invents: ERR is the generic code and the text after it is for a
-// human.
-//
-// It is wrong for the errors a PROTOCOL defines.  A client matches the first
-// word of an error reply, so `-ERR MOVED 12182 127.0.0.1:23803` is an unknown
-// error to every client in existence rather than a redirect.  Measured, not
-// reasoned: redis-cli -c printed that line and did not follow it, and every
-// key written through it stayed on the shard that was asked.
-//
-// So MOVED and CROSSSLOT are built here, where the code is the caller's.
+// MOVED and CROSSSLOT are built here, where the code is the caller's, because
+// a client matches the first word of an error reply and `-ERR MOVED ...` is an
+// unknown error rather than a redirect.
 inline void encode_error_code_into(std::string& buf, std::string_view msg)
 {
     buf += '-';
@@ -110,8 +99,8 @@ inline void encode_integer_into(std::string& buf, int64_t n)
 
 inline void encode_bulk_into(std::string& buf, std::string_view str)
 {
-    // Fast-path for tiny values (most cache values in benchmarks are small).
-    // Avoid to_chars for single-digit lengths (0-9), which covers values up to 9 bytes.
+    // Fast path for single-digit lengths, which covers values up to 9 bytes
+    // and avoids to_chars.
     size_t sz = str.size();
     if (__builtin_expect(sz <= 9, 1))
     {
@@ -206,9 +195,8 @@ inline std::string encode_simple(std::string_view msg)
 
 enum class parse_result { ok, incomplete, error };
 
-// Parse a single RESP message from partial buffer.
-// Returns parse_result::ok and fills `args` with extracted strings.
-// `consumed` is set to how many bytes were consumed from `buf`.
+// Parse a single RESP message from a partial buffer, filling `args` and
+// setting `consumed` to how many bytes were taken.
 inline parse_result parse_message(std::string_view buf, std::vector<std::string>& args, size_t& consumed)
 {
     args.clear();
@@ -306,10 +294,8 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
     return parse_result::ok;
 }
 
-// Zero-allocation RESP parser: fills string_view array pointing into buf.
-// args[] must have room for at least max_args entries.
-// Safe to call in a tight loop — no heap allocations.
-// Uses find_crlf() for SIMD-accelerated \r\n scanning.
+// Zero-allocation RESP parser filling string_views into buf, safe in a tight
+// loop, with args[] needing room for max_args entries.
 inline parse_result parse_message_views(std::string_view buf,
     std::string_view* args, int max_args, int& argc, size_t& consumed)
 {
@@ -396,8 +382,8 @@ inline parse_result parse_message_views(std::string_view buf,
         if (__builtin_expect(data[offset] != '$', 0))
             return parse_result::error;
 
-        // Fast-path for single-digit bulk lengths (0-9): "$N\r\n" is 4 bytes.
-        // This covers SET/GET/DEL key/value args up to 9 bytes — the common case.
+        // Fast path for single-digit bulk lengths, which covers SET/GET/DEL
+        // arguments up to 9 bytes.
         char d = data[offset + 1];
         if (__builtin_expect(d >= '0' && d <= '9' && data[offset + 2] == '\r' && data[offset + 3] == '\n', 1))
         {

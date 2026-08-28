@@ -28,14 +28,9 @@ int cli_config(int argc, char** argv)
         return 1;
     }
 
-    // Deliberately NOT bounded by lua_deadline, unlike every other chunk this
-    // tree runs.  That bound exists because the daemon's event loop is one
-    // thread serving every runtime, and a script that does not return takes all
-    // of them down with it.  This chunk runs in the CLI process: it holds
-    // nothing anybody else is waiting on, the operator started it in the
-    // foreground and can end it with a keystroke, and a configuration file that
-    // spends thirty seconds working out what to create is doing something
-    // legitimate that a ten second bound would break for no gain.
+    // Deliberately not bounded by lua_deadline, because this chunk runs in the
+    // CLI process, holds nothing anybody is waiting on, and can be ended with
+    // a keystroke.
     sol::protected_function_result result = script();
 
     if (!result.valid())
@@ -73,40 +68,19 @@ int cli_config(int argc, char** argv)
     if (!runtimes.valid())
         return 0;
 
-    // ─── WHAT THE DAEMON SAID, AND WHETHER ANYBODY LISTENED ─────────────────
-    //
-    // Every create below used to be sent with `if (ipc_send(...) < 0)`, which
-    // asks only whether the socket answered.  The exit code and the sentence
-    // the daemon wrote were both dropped, the loop went on, and the function
-    // ended with `return 0`.  A configuration file whose every runtime failed
-    // reported success and printed nothing.  Measured, against a config naming
-    // a script that does not exist:
-    //
-    //     $ socketley --lua badconf.lua ; echo $?
-    //     0                                     <- silence
-    //
-    //     $ socketley create server conf_a -p 18703 --lua /nonexistent/x.lua -s
-    //     could not load Lua script: /nonexistent/x.lua
-    //     script error: cannot open /nonexistent/x.lua: No such file or directory
-    //     1
-    //
-    // The daemon wrote the diagnosis both times.  Only one of the two callers
-    // read it.
-    //
-    // Collected rather than returned at the first failure: a config file is a
-    // set of runtimes, and the eleven that came up are worth having.  What is
-    // not on offer is finishing quietly.
+    // The daemon's exit code and sentence are read rather than only whether
+    // the socket answered, because a config file whose every runtime failed
+    // reported success and printed nothing -- collected rather than returned
+    // at the first failure.
     int failed = 0;
 
     for (auto& pair : runtimes)
     {
         sol::table t = pair.second;
 
-        // sol::optional, like every other field below.  Read as a plain
-        // std::string these two throw on a table that has no such key — and
-        // sol2's safety checks follow NDEBUG, so in Release they do not throw,
-        // they convert whatever is there.  A config with a misspelled key got
-        // undefined behaviour in the build everybody runs.
+        // sol::optional like every other field below, because a plain
+        // std::string read converts whatever is there in Release rather than
+        // throwing on a misspelled key.
         sol::optional<std::string> type_opt = t["type"].get<sol::optional<std::string>>();
         sol::optional<std::string> name_opt = t["name"].get<sol::optional<std::string>>();
 
@@ -247,19 +221,9 @@ int cli_config(int argc, char** argv)
         if (test)
             command += " --test";
 
-        // `daemon_process = true` is refused rather than ignored.
-        //
-        // The flag it emitted is gone: a runtime runs in its own process, and
-        // there is no longer an arrangement for this key to ask for.  Silently
-        // dropping it would leave an operator believing a runtime is in the
-        // daemon -- which is the exact failure this key's own previous comment
-        // warned about in the other direction -- so the file is refused and
-        // told which line to delete.
-        //
-        // Refused even for `daemon_process = false`, which asked for what it
-        // now gets: a key that means nothing is still a key whose presence
-        // implies this build has an opinion about it, and the next reader would
-        // set it to true.
+        // `daemon_process` is refused rather than ignored, for either value,
+        // because a key that means nothing still implies this build has an
+        // opinion about it.
         if (t["daemon_process"].valid())
         {
             std::cerr << "daemon_process is no longer a setting: every runtime "
@@ -267,18 +231,9 @@ int cli_config(int argc, char** argv)
             return 1;
         }
 
-        // How many worker processes serve this runtime; see --shards.
-        //
-        // A configuration file is a way of describing a runtime, and a
-        // property it cannot express is one that has to be set by hand
-        // afterwards — which for this one is not possible, because a
-        // configuration file starts what it creates and `--shards` may only be
-        // edited on a stopped runtime.
-        //
-        // Emitted only when it was asked for, so a table that says nothing
-        // about shards produces exactly the command line it produced before.
-        // Not validated here: the daemon refuses a bad count, and one refused
-        // in two places with two wordings is how the two come to disagree.
+        // How many worker processes serve this runtime, emitted only when
+        // asked for and not validated here, because a property a config file
+        // cannot express is one that cannot be set afterwards.
         const int shards = t["shards"].get_or(0);
         if (shards > 0)
             command += " --shards " + std::to_string(shards);
@@ -319,10 +274,9 @@ int cli_config(int argc, char** argv)
             continue;
         }
 
-        // Success is silent, per this project's convention — but a create that
-        // printed something while succeeding has something to say (an on_start
-        // that raised, for one), and dropping it here is what this whole change
-        // is about.
+        // Success is silent, but a create that printed something while
+        // succeeding has something to say and dropping it here is what this
+        // change is about.
         if (!response.empty())
             std::cout << response;
     }

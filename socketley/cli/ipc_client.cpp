@@ -28,10 +28,9 @@ int ipc_send(std::string_view command, std::string& data)
     struct timeval tv{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // A line unless it cannot be one.  See ipc_framing.h: framing only when the
-    // command carries a newline keeps every ordinary command byte-identical to
-    // what it has always been, which is what lets a new CLI talk to a daemon
-    // that has not been restarted since the last build.
+    // A line unless it cannot be one, so every ordinary command stays
+    // byte-identical and a new CLI can talk to a daemon that has not been
+    // restarted.
     std::string msg;
     const bool framed = ipc_frame::needs_frame(command);
     if (framed)
@@ -62,14 +61,9 @@ int ipc_send(std::string_view command, std::string& data)
     {
         close(fd);
 
-        // The one case where "failed to connect" would be the wrong sentence.
-        // A daemon that predates length framing is still serving and still
-        // answering everything else; it simply does not recognise this frame,
-        // and waits for a newline that is never coming.  The caller's generic
-        // message would send the operator looking for a daemon that is right
-        // there.
-        //
-        // Said here because this is the only place that knows a frame went out.
+        // The one case where "failed to connect" would be the wrong sentence,
+        // said here because this is the only place that knows a frame went out
+        // to a daemon that predates framing.
         if (framed)
             std::cerr << "the daemon did not answer a length-framed command.\n"
                          "  Commands carrying a newline — a message, a value, an "

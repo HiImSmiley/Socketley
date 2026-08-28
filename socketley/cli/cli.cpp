@@ -22,26 +22,13 @@
 #include "../shared/daemon_client.h"
 #include "../shared/paths.h"
 
-// Is the daemon executing a file that has since been replaced at the path it
-// was started from — that is, has this tree been rebuilt under a running
-// daemon.
-//
-// Decided on the inode, because the version cannot decide it.  Nothing in
-// SOCKETLEY_VERSION is a single literal in shared/version.h
-// and every build of a release carries it; two builds a minute apart compare
-// equal, and the whole case worth reporting is a same-version rebuild.
-//
-// Reported only when both sides name the same path.  Comparing inodes across
-// different paths would say "your daemon is stale" to anyone running the CLI
-// from a copy while a daemon runs the original — which is how every agent in
-// this tree works, and it is the misidentification 81dcf4a was written to
-// undo.  A message printed when nothing is wrong is how a message printed when
-// something is wrong gets ignored.
+// Has this tree been rebuilt under a running daemon, decided on the inode
+// because two builds a minute apart carry the same version, and reported only
+// when both sides name the same path.
 static bool daemon_exe_was_replaced(const socketley::daemon_ident& id)
 {
     // A daemon that did not report an executable has not reported a different
-    // one.  Builds exist that answer `ping` with a version and a pid and stop
-    // there, and terse is not the same as mismatched.
+    // one, and terse is not the same as mismatched.
     if (!id.has_exe)
         return false;
 
@@ -54,29 +41,20 @@ static bool daemon_exe_was_replaced(const socketley::daemon_ident& id)
     if (self != id.exe_path)
         return false;
 
-    // Either signal is conclusive once the paths agree.  They are not the same
-    // signal: a filesystem is free to hand the replacement the inode number the
-    // unlinked file just gave up, and then only the marker shows it.
+    // Either signal is conclusive once the paths agree, and they are not the
+    // same signal, because a filesystem may reuse the unlinked file's inode
+    // number.
     return id.exe_deleted || dev != id.exe_dev || ino != id.exe_ino;
 }
 
-// Is *anything* listening on the socket path.
-//
-// Deliberately still the weak question, and used in exactly one place: the poll
-// that waits for the daemon this process has just forked.  By the time it runs,
-// the strong question below has already established that the path was free, so
-// whatever is answering now appeared in the last few milliseconds and is the
-// child.  Asking the strong question here instead would be a regression, not an
-// improvement: a daemon binds and listens before it restores its runtimes and
-// only enters its event loop afterwards, so a daemon coming back with a dozen
-// persisted runtimes accepts connections for as long as the restore takes and
-// answers none of them.  The poll's budget is one second.
+// Deliberately still the weak question, used only in the poll that waits for
+// the daemon this process just forked, because a daemon accepts connections
+// while it restores its runtimes and answers none of them.
 static bool socket_answers()
 {
-    // SOCK_CLOEXEC on all of the CLI's sockets, for the same reason as the
-    // daemon's: ensure_daemon() below forks and execs a daemon, and the only
-    // descriptors that exec is meant to receive are the three it opens
-    // /dev/null onto.  Nothing here is ever handed to a child on purpose.
+    // SOCK_CLOEXEC on all of the CLI's sockets, because ensure_daemon() forks
+    // and execs a daemon that is meant to receive only the three /dev/null
+    // descriptors.
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return false;
@@ -90,32 +68,18 @@ static bool socket_answers()
     return ok;
 }
 
-// Make sure a daemon is serving the socket, and — before anything is written to
-// it — that the thing serving it is a daemon.
-//
-// The two failures are not symmetric, which is what decides where the strict
-// check goes.  A false negative forks a spare daemon; that daemon finds the
-// socket taken and exits 0, so it costs one process.  A false positive means
-// the whole session is delivered to a stranger: `create server db -p 9000` is
-// written out in full to whatever accepted the connection, and a peer that
-// writes back two zero bytes — a well-formed reply frame of exit 0 with no text
-// — makes the CLI report success in a shell whose convention is that silence
-// means it worked.  Nothing was created; the operator is told it was.
-//
-// So this refuses rather than forking when the path is occupied by something it
-// cannot identify.  Forking there would be worse than either: the new daemon
-// unlinks the path and binds over it, which is how you take a socket away from
-// whatever legitimately owns it.
+// Make sure a daemon is serving the socket and that the thing serving it is a
+// daemon, refusing rather than forking over an unidentified peer -- a false
+// negative costs one spare process and a false positive writes the whole
+// session to a stranger.
 static bool ensure_daemon(char* /*argv0*/)
 {
     switch (socketley::daemon_probe(daemon_handler::socket_path.c_str()))
     {
         case socketley::daemon_identity::daemon:
         // A daemon too old to answer `ping` is still a daemon, and locking an
-        // operator out of runtimes they are already running — with a message
-        // accusing their own daemon of being an impostor — would be a worse
-        // outcome than the defect this probe exists to close.  `socketley
-        // version` is where the mismatch is reported.
+        // operator out of runtimes they are running would be worse than the
+        // defect this probe closes.
         case socketley::daemon_identity::predates_ping:
             return true;
 
@@ -133,9 +97,9 @@ static bool ensure_daemon(char* /*argv0*/)
                          "wedged, or the path belongs to something else.\n";
             return false;
 
-        // Not forked over.  The socket belongs to another user, and starting a
-        // daemon here would at best fail on the bind and at worst unlink a
-        // running daemon's socket out from under it.
+        // Not forked over, because the socket belongs to another user and
+        // starting a daemon here would at worst unlink a running daemon's
+        // socket.
         case socketley::daemon_identity::forbidden:
             std::cerr << "not permitted to open the daemon socket at "
                       << daemon_handler::socket_path << "\n"
@@ -221,17 +185,9 @@ int cli_dispatch(int argc, char** argv)
         {
             std::cout << SOCKETLEY_VERSION << "\n";
 
-            // And, on stderr, what is actually serving the socket — because a
-            // second build of this tree is the one case where the version the
-            // operator just printed is not the version answering their
-            // commands.  A daemon holds its runtimes across an upgrade, so
-            // "I rebuilt and my new flag is rejected" has exactly this cause
-            // and nothing anywhere else reported it.
-            //
-            // stderr, not stdout, so `$(socketley version)` is byte-identical
-            // in every case.  A short deadline because there is nothing to wait
-            // for: this command has never needed a daemon and must not start
-            // hanging on one that is busy or on a path someone else owns.
+            // What is actually serving the socket, on stderr so `$(socketley
+            // version)` is byte-identical, with a short deadline because this
+            // command has never needed a daemon.
             socketley::daemon_ident id;
             switch (socketley::daemon_probe(daemon_handler::socket_path.c_str(),
                                             &id, 300))
@@ -269,9 +225,9 @@ int cli_dispatch(int argc, char** argv)
                                  "open it\n";
                     break;
 
-                // Nothing there, or there and busy.  Neither is worth a word:
-                // the first is the ordinary case, and the second is what a
-                // daemon restoring its runtimes looks like from outside.
+                // Nothing there, or there and busy, neither of which is worth
+                // a word: the second is what a daemon restoring its runtimes
+                // looks like from outside.
                 case socketley::daemon_identity::absent:
                 case socketley::daemon_identity::mute:
                     break;
@@ -279,9 +235,9 @@ int cli_dispatch(int argc, char** argv)
             return 0;
         }
 
-        // Not a user-facing command, and deliberately absent from the help: the
-        // daemon execs itself with this after putting the control socket on
-        // descriptor 3.  Run by hand it finds nothing there and exits.
+        // Not a user-facing command and deliberately absent from the help,
+        // because the daemon execs itself with it after putting the control
+        // socket on descriptor 3.
         case fnv1a("proxy-worker"):
             return proxy_worker_main(3);
 
@@ -302,12 +258,9 @@ int cli_dispatch(int argc, char** argv)
             if (!has_config)
                 return cli_daemon(argc, argv);
 
-            // Configuration mode talks to a daemon that is already up, and the
-            // ring flags configure one that is being started.  They cannot both
-            // be on the same command line: a ring's flags are fixed when the
-            // ring is created, so --sqpoll here would be read, sent nowhere and
-            // do nothing — which is exactly the silence this pair of flags was
-            // given a parser to stop.
+            // Configuration mode talks to a daemon that is already up and the
+            // ring flags configure one being started, so --sqpoll here would
+            // be read, sent nowhere and do nothing.
             for (int i = 2; i < argc; ++i)
             {
                 std::string_view arg = argv[i];
@@ -321,12 +274,9 @@ int cli_dispatch(int argc, char** argv)
                 }
             }
 
-            // Configuration mode — ensure daemon is running, then send IPC
-            // The message belongs to ensure_daemon: "failed to start daemon" is
-            // one of three reasons it can say no, and the other two are about a
-            // path it refused to write to rather than a daemon it could not
-            // start.  Reprinting it here would put the wrong sentence under the
-            // right one.
+            // The message belongs to ensure_daemon, which has three reasons to
+            // say no, so reprinting one here would put the wrong sentence
+            // under the right one.
             if (!ensure_daemon(argv[0]))
                 return 2;
 
@@ -361,25 +311,10 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("--help"):
         case fnv1a("-h"):
         {
-            // The binary's own copy first, then the installed one.
-            //
-            // This was the other way round, and on any machine with socketley
-            // installed that made `./bin/Release/socketley --help` print
-            // /usr/share's help — a different version's, describing flags this
-            // binary may not have and omitting the ones it just grew.  Measured
-            // here: the installed copy was eight months older than the tree.
-            //
-            // The order below cannot misfire in the other direction.  An
-            // installed binary lives at /usr/bin/socketley, so three
-            // parent_path() calls land on "/" and the candidate is
-            // "/man/socketley-help.sh", which does not exist — it falls through
-            // to /usr/share exactly as before.  Only a binary that really does
-            // sit under a tree carrying man/ takes the first branch, and that
-            // binary's help is the one that matches it.
-            //
-            // Everything else in this project decides dev-versus-system in
-            // paths.cpp; this lookup predates that and answered a different
-            // question. Nearest-wins is the same answer paths.cpp gives.
+            // The binary's own copy first and then the installed one, because
+            // the other order made a development build print an installed
+            // version's help -- and an installed binary falls through to
+            // /usr/share exactly as before.
             std::string help_script;
             {
                 char self_exe[4096];
@@ -426,28 +361,9 @@ int cli_dispatch(int argc, char** argv)
                     return cli_interactive(argc, argv);
             return cli_forward(argc, argv);
         }
-        // ─── restart = stop, then start.  Nothing else. ─────────────────────
-        //
-        // The comment here used to say "preserving all flags" and the loop below
-        // forwarded every argument to `start`.  `start` reads one flag, `-i`, and
-        // hands the rest to resolve_names(), which skips anything beginning with
-        // '-' and treats what follows as a RUNTIME NAME.  So a flag's value was
-        // looked up as a runtime — and when it happened to name one, that runtime
-        // was started:
-        //
-        //     $ socketley ls --name --status
-        //     r1      Up 15 seconds
-        //     victim  Stopped
-        //     $ socketley restart r1 --some-flag victim
-        //     $ socketley ls --name --status
-        //     r1      Up 0 seconds
-        //     victim  Up 0 seconds        <- nothing asked for this
-        //
-        // Exit 0 throughout, and the unknown flag accepted in silence.
-        //
-        // Configuration is `edit`'s job, and `import`'s.  A restart that pretended
-        // to take flags could only ever be the half of that which `start` happens
-        // to understand, so it takes the name and -i and refuses the rest by name.
+        // restart is stop then start and takes only the name and -i, because
+        // forwarding every argument had `start` read a flag's value as a
+        // runtime name and start whatever it happened to name.
         case fnv1a("restart"):
         {
             if (argc < 3)
@@ -469,9 +385,8 @@ int cli_dispatch(int argc, char** argv)
                 return 1;
             }
 
-            // The stop's answer is read now.  It was discarded, so `restart
-            // nosuchruntime` ran a start against a name the stop had already
-            // reported as missing — two refusals, one of them printed.
+            // The stop's answer is read now, because discarding it ran a start
+            // against a name the stop had already reported as missing.
             std::string stop_cmd = std::string("stop ") + argv[2];
             std::string stop_data;
             int rc = ipc_send(stop_cmd, stop_data);
@@ -516,11 +431,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("show"):
         case fnv1a("owner"):
         case fnv1a("dashboard"):
-        // Typed by hand it answers "which daemon is on this socket", which is
-        // the question the probe above asks on every command and the one an
-        // operator asks when a socket is behaving oddly.  Without this case it
-        // fell through to the runtime-action and piped-stdin arms and was
-        // answered "empty message", which is a reply to a different question.
+        // Typed by hand it answers which daemon is on this socket, which
+        // without this case fell through to the piped-stdin arm and was
+        // answered "empty message".
         case fnv1a("ping"):
             return cli_forward(argc, argv);
 
@@ -533,12 +446,9 @@ int cli_dispatch(int argc, char** argv)
         case fnv1a("edit"):
             return cli_edit(argc, argv);
 
-        // Not a plain forward.  The document `show` prints is pretty-printed,
-        // and the IPC framing is one command per line, so forwarding the
-        // argument verbatim would send the daemon everything up to the first
-        // newline and nothing after it.  cli_import compacts first, the same
-        // way the interactive editor does before it calls the same daemon
-        // command.
+        // Not a plain forward, because `show` pretty-prints and IPC frames one
+        // command per line, so cli_import compacts first exactly as the
+        // interactive editor does.
         case fnv1a("import"):
             return cli_import(argc, argv);
 
@@ -606,13 +516,9 @@ int cli_send(int argc, char** argv)
         ss << std::cin.rdbuf();
         message = ss.str();
 
-        // Only the trailing newline goes, and only the trailing one.
-        //
-        // `echo hi | socketley send x` should not deliver "hi\n", which is what
-        // this strip is for.  Newlines INSIDE the message are the message: they
-        // used to end the command and turn everything after them into commands
-        // of their own (see ipc_framing.h), and ipc_send frames the command now
-        // rather than the CLI mangling it.
+        // Only the trailing newline goes, because newlines inside the message
+        // are the message and ipc_send frames the command rather than the CLI
+        // mangling it.
         while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
             message.pop_back();
     }
@@ -658,17 +564,9 @@ int cli_stdin_send(int /*argc*/, char** argv)
     while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
         message.pop_back();
 
-    // Nothing arrived on stdin, and this is the arm an unrecognised word falls
-    // into whenever stdin is not a terminal — which is every script, pipeline
-    // and CI step there is.  `socketley gibtsnicht` on a keyboard says "unknown
-    // command"; the same typo in a script used to say "empty message", naming
-    // neither the word it did not understand nor the reading it had chosen.
-    //
-    // From here the two cases are genuinely indistinguishable: this process
-    // cannot tell a misspelled command from a real runtime that was piped
-    // nothing, because both are one word with no data behind it.  So it names
-    // both instead of guessing, and leads with the likelier one — a runtime
-    // being sent zero bytes on purpose is rare, and a typo is not.
+    // Nothing arrived on stdin, which is also where an unrecognised word falls
+    // whenever stdin is not a terminal, so both readings are named rather than
+    // guessed at, likelier one first.
     if (message.empty())
     {
         std::cerr << "unknown command: " << name << "\n"
@@ -694,28 +592,9 @@ int cli_stdin_send(int /*argc*/, char** argv)
     return exit_code;
 }
 
-// Strip the whitespace `show` pretty-prints with, leaving string literals alone.
-//
-// ─── LOOKING BACK ONE CHARACTER IS NOT ENOUGH ───────────────────────────────
-//
-// The test was `c == '"' && pretty[i-1] != '\\'` — a quote is a delimiter
-// unless the character before it is a backslash.  That is right for `\"` and
-// wrong for `\\"`, where the backslash is itself escaped and the quote really
-// does close the string.  A value ending in a backslash is all it takes:
-//
-//     "log_file": "C:\\",
-//
-// From that quote onwards in_string stayed true for the rest of the document,
-// so every newline was preserved — and IPC frames one command per line, so the
-// daemon received the first fragment as the whole `import` and the remaining
-// lines as commands of their own.  The fragment is truncated JSON, which
-// parse_json_string accepted, so the round trip `show | import` silently
-// dropped every field after the backslash and reported success.  Measured: two
-// fields lost, exit 0 on both sides.
-//
-// The state is carried forward now instead of being reconstructed by looking
-// back: inside a string, a backslash makes the next character literal whatever
-// it is, and that is the whole rule.
+// The escape state is carried forward rather than reconstructed by looking
+// back, because `"C:\\"` left in_string true for the rest of the document and
+// `show | import` silently dropped every field after it.
 static std::string compact_json(const std::string& pretty)
 {
     std::string result;
@@ -747,32 +626,9 @@ static std::string compact_json(const std::string& pretty)
     return result;
 }
 
-// import <name> <json>
-//
-// The other half of `show`.  The man page has documented the pair as a round
-// trip since the daemon grew cmd_import, but the CLI never had a case for the
-// word, so `import` fell through to cli_runtime_action and was sent as the name
-// of a runtime to act on — "runtime not found: import", exit 1.  The daemon
-// side was never the problem and is exercised daily: interactive `edit` dumps,
-// opens $EDITOR and sends the result through this same IPC command.
-//
-// Two things have to happen here that cli_forward would not do.
-//
-// The document has to be compacted.  `show` pretty-prints, IPC frames one
-// command per line, and cli_forward would hand ipc_send a string whose first
-// newline ends the command — the daemon would parse `import name {` and answer
-// "invalid JSON".  compact_json strips whitespace outside string literals,
-// which is exactly what the editor path already does before sending.
-//
-// And stdin has to be accepted.  The documented spelling puts the whole
-// document in one argv entry, which is fine for the configs socketley writes
-// but is the same shape as every command-substitution size limit: `show`
-// output grows with backends, upstreams and mesh paths, and a document that
-// outgrows ARG_MAX fails with E2BIG from the shell, before this binary runs at
-// all.  `socketley show name | socketley import name` has no such ceiling, and
-// it is the form that composes.  cli_send already reads a message from stdin
-// when the argument is absent, so this is the house pattern rather than a new
-// one.
+// The other half of `show`, which needs the document compacted -- IPC frames
+// one command per line -- and accepted on stdin, because a `show` document can
+// outgrow ARG_MAX before this binary runs at all.
 int cli_import(int argc, char** argv)
 {
     if (argc < 3)
@@ -787,10 +643,9 @@ int cli_import(int argc, char** argv)
 
     if (argc >= 4)
     {
-        // Quoted, the document is argv[3] entire, newlines and all.  Unquoted,
-        // the shell has already split it on whitespace; joining with a single
-        // space puts it back together well enough for the compaction below,
-        // which is about to drop that whitespace anyway.
+        // Quoted, the document is argv[3] entire; unquoted, joining with a
+        // space puts it back together well enough for the compaction about to
+        // drop that whitespace.
         for (int i = 3; i < argc; ++i)
         {
             if (i > 3) json += ' ';
@@ -898,14 +753,8 @@ int cli_edit(int argc, char** argv)
         return rc;
     }
 
-    // 2. Write to tmpfile
-    //
-    // TMPDIR, then /tmp.  The file holds the runtime's whole configuration —
-    // which for a cache with a master password holds that too — so where it
-    // lands is the operator's decision to make, and an operator who points
-    // TMPDIR at a private directory is making exactly this one.  Hard-coding
-    // /tmp ignored them.  mkstemp opens it 0600 either way; a private TMPDIR
-    // additionally keeps the NAME out of a world-readable directory listing.
+    // TMPDIR then /tmp, because the file holds the runtime's whole
+    // configuration and where it lands is the operator's decision to make.
     const char* tmpdir = std::getenv("TMPDIR");
     if (!tmpdir || !tmpdir[0])
         tmpdir = "/tmp";
@@ -938,10 +787,9 @@ int cli_edit(int argc, char** argv)
         std::ofstream f(tmp_file, std::ios::trunc);
         if (!f.is_open())
         {
-            // tmp_file, not tmpl.  The rename above succeeded, so the name in
-            // tmpl no longer exists and this unlinked nothing — leaving the
-            // real file behind with the runtime's whole configuration in it,
-            // master_pw included.
+            // tmp_file and not tmpl, because the rename succeeded and
+            // unlinking the old name left the real file behind with master_pw
+            // in it.
             std::cerr << "failed to write temporary file\n";
             unlink(tmp_file.c_str());
             return 2;
