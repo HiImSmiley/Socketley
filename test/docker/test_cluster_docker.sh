@@ -1,49 +1,16 @@
 #!/usr/bin/env bash
-# Cluster discovery in the shape the man page documents.
-#
-# Three containers, one daemon each, every one of them on the DEFAULT socket
-# path, sharing nothing but a Docker volume and a network.  Two backends carry
-# group `api`; the gateway runs a proxy with `--backend @api` and is the only
-# container with a published port.
-#
-# ─── WHAT THIS PROVES THAT test/integration/test_cluster.sh CANNOT ──────────
-#
-# The integration suite runs several daemons inside one filesystem namespace,
-# told apart by SOCKETLEY_SOCKET.  That is the development simulation of a
-# cluster and it is the only thing the suite has ever covered.  In the shape
-# this file runs, every daemon is /run/socketley/socketley.sock and the only
-# things that distinguish nodes are the network address each one advertises out
-# of gethostname(3) and the file it writes to the shared volume.  Nothing else
-# in the tree exercises that.
-#
+# Three containers, one daemon each, every one on the default socket path and
+# sharing nothing but a Docker volume and a network -- which is what the
+# integration suite cannot produce, since it tells its daemons apart by
+# SOCKETLEY_SOCKET while here the only distinguishing facts are the address
+# each node advertises out of gethostname and the file it writes to the volume.
 # ─── WHAT THE ASSERTIONS ARE ────────────────────────────────────────────────
-#
-# The claim is the product's, not the script's: a runtime on one daemon is
-# reachable through a proxy on another, discovered only through the volume.  So
-# the replies carry the name of the backend runtime that produced them
-# (test/docker/identity.lua), and the test reads which container answered
-# rather than inferring it from a connection that did not fail.  The previous
-# version of this file asserted `nc` exit status 0 against a gateway proxy,
-# which is true of a proxy with no backends at all.
-#
-# The negative half matters as much: a member whose container is killed stops
-# receiving traffic within the 10s staleness window the man page documents, and
-# starts again when it comes back.  Both halves are checked twice over, once
-# against the volume (which involves no proxy at all) and once against traffic
-# through the gateway — because traffic alone would not distinguish cluster
-# staleness from the proxy's own circuit breaker ejecting a backend that had
-# stopped answering, and the volume view is what makes it a cluster claim.
-#
-# And the restart that a deployment actually performs: killed and brought back
-# INSIDE the staleness window, so the node meets its own entry still fresh under
-# its own name.  Only this shape produces it — the container comes back with a
-# new pid namespace and a new pid, the same hostname, and the same default
-# socket path — and it is the normal recovery path of every restart policy this
-# project documents.  Test 5.
-#
-# Prerequisites: docker, docker compose.  bash for /dev/tcp; no netcat.
-# Usage: bash test/docker/test_cluster_docker.sh
-#        DOCKER="sudo -n docker" bash test/docker/test_cluster_docker.sh
+# The replies name the backend runtime that produced them, so the test reads
+# which container answered rather than inferring it from a connection that did
+# not fail -- and the negative half is checked both against the volume and
+# against traffic, because traffic alone cannot tell cluster staleness from the
+# proxy's own circuit breaker; requires docker and docker compose, with bash
+# for /dev/tcp and no netcat.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -54,16 +21,13 @@ PROJECT="${COMPOSE_PROJECT:-socketley-cluster-test}"
 # is not in the docker group); CI runners need no prefix at all.
 DOCKER="${DOCKER:-docker}"
 
-# The host-side port the gateway is published on, and the one every request in
-# this file goes to.  Nothing in group `api` is published, so a reply naming a
-# backend can only have arrived through the proxy.
+# Nothing in group `api` is published, so a reply naming a backend can only
+# have arrived through the proxy.
 export GW_PORT="${GW_PORT:-18080}"
 export BUILD_JOBS="${BUILD_JOBS:-1}"
 
-# The documented threshold is 10s and the publish interval is 2s, so a killed
-# member is expected out within about 12s.  The ceiling is generous because a
-# loaded machine is allowed to be slow; it is not generous enough to pass if
-# staleness never happens.
+# A generous ceiling over the documented 10s threshold and 2s publish interval,
+# but not generous enough to pass if staleness never happens.
 STALE_DEADLINE="${STALE_DEADLINE:-25}"
 REJOIN_DEADLINE="${REJOIN_DEADLINE:-25}"
 REQ_TIMEOUT=5
@@ -91,12 +55,9 @@ assert_contains() {   # assert_contains HAYSTACK NEEDLE LABEL
 }
 
 # ─── One request through the gateway ─────────────────────────────────────────
-#
-# bash's /dev/tcp rather than netcat: the reply is the assertion here, and a
-# netcat that has to be told how long to wait for it with -q is one more thing
-# to be wrong about on a machine with a different netcat.  Prints the reply
-# line, or nothing if the connection failed or nothing came back — which is a
-# distinction the caller makes, not this function.
+# bash's /dev/tcp rather than netcat, because the reply is the assertion and a
+# netcat that has to be told how long to wait is one more thing to be wrong
+# about on another machine.
 req() {
     local reply=""
     exec 3<>"/dev/tcp/127.0.0.1/$GW_PORT" 2>/dev/null || { printf '\n'; return 0; }
@@ -115,21 +76,9 @@ sample() {  # sample N -> N lines, one reply each (possibly empty)
 }
 
 # ─── Sampling against a deadline ─────────────────────────────────────────────
-#
-# Every traffic claim in this file is about what routing settles to, not about
-# what it is at some instant, because none of the moments involved are ones a
-# test gets to pick.  A member's file is written every 2s, read on the peer's
-# own 2s timer, and only then does the endpoint table reach the proxy — a
-# cold-started cluster takes about two seconds after its last node reports
-# ready before both backends are in rotation, and a killed one takes the 10s
-# threshold plus a cycle.
-#
-# So: sample until the predicate holds, and fail when the deadline passes.  The
-# deadline is the assertion — not the sleep length, which is what a one-shot
-# sample after a fixed sleep is really asserting, and which passes or fails
-# with the machine's load rather than with the product.
-#
-# converge SECONDS PREDICATE_FN  ->  sets CONVERGED_REPLIES and CONVERGED_AT
+# Sample until the predicate holds and fail when the deadline passes, because
+# every traffic claim here is about what routing settles to and a one-shot
+# sample after a fixed sleep asserts the sleep length rather than the product.
 converge() {
     local timeout=$1 pred=$2
     local started=$SECONDS
@@ -164,15 +113,9 @@ has_web2() {
 }
 
 # ─── Readiness ───────────────────────────────────────────────────────────────
-#
-# On the node's own "ready" line, printed after its daemon is serving, after it
-# has been named and joined to the cluster, and after its runtime is started.
-#
-# By count, not by presence: `docker compose start` on a container that was
-# killed restarts the same container and its log is appended to, so the ready
-# line from the first boot is still there.  Waiting for "a ready line" would
-# return instantly for a node that has not come back yet, and every assertion
-# after that would be measuring the gap rather than the rejoin.
+# On the node's own ready line and by count rather than presence, because a
+# restarted container appends to the same log and waiting for "a ready line"
+# returns instantly for a node that has not come back.
 ready_count() {  # ready_count SERVICE NAME
     dc logs --no-log-prefix "$1" 2>/dev/null | grep -c "node $2 ready"
 }
@@ -207,9 +150,9 @@ wait_ready api1    api1    1 || exit 2
 wait_ready api2    api2    1 || exit 2
 wait_ready gateway gateway 1 || exit 2
 
-# One publish interval, so that every node has written its file and read the
-# others'.  This is the only unconditional sleep in the file and it is the
-# product's own 2s cycle, not a guess about startup.
+# One publish interval, so every node has written its file and read the others'
+# -- the only unconditional sleep in the file, and it is the product's own
+# cycle rather than a guess about startup.
 sleep 3
 
 # ─── Test 1: the volume is the discovery channel ───────────────────────────────
@@ -230,12 +173,9 @@ assert_contains "$OUT" "web1" "group api contains api1's runtime"
 assert_contains "$OUT" "web2" "group api contains api2's runtime"
 
 # ─── Test 2: cross-node routing ───────────────────────────────────────────────
-#
-# The headline claim.  Eight requests into the published gateway port; the
-# replies name the container that produced them.  Both backends have to appear,
-# because the gateway container has no member of group `api` of its own —
-# every answer necessarily crossed a container boundary, over an address that
-# came out of the volume.
+# The headline claim: both backends have to appear, and since the gateway
+# container holds no member of group `api` every answer necessarily crossed a
+# container boundary over an address that came out of the volume.
 
 echo "  Test 2: a request to the gateway is answered by a backend on another node"
 if converge 30 both_backends; then
@@ -248,20 +188,16 @@ else
     echo "         no live group member to hand to)"
 fi
 
-# ─── Test 3: a killed member goes stale and stops receiving traffic ───────────
-#
-# SIGKILL, not `compose stop`: a graceful shutdown deletes the node's file and
-# the peers drop it immediately, which is the OTHER row of the stale-detection
-# table.  Killed, the file stays behind with a frozen heartbeat and the only
-# thing that can remove the member is the 10s threshold — which is the
-# mechanism under test.
+# SIGKILL rather than `compose stop`, because a graceful shutdown deletes the
+# node's file and peers drop it immediately, while a killed node leaves a
+# frozen heartbeat that only the 10s threshold can remove.
 
 echo "  Test 3: a killed node goes stale within the documented window"
 dc kill -s SIGKILL api2 >/dev/null 2>&1
 
-# Proof that this is the stale path and not the unpublish path: the file the
-# dead daemon wrote is still on the volume.  If it were gone, everything below
-# would pass for a reason that has nothing to do with heartbeats.
+# Proof that this is the stale path and not the unpublish path, without which
+# everything below would pass for a reason that has nothing to do with
+# heartbeats.
 FILES=$(dc exec -T gateway ls /cluster 2>&1)
 assert_contains "$FILES" "api2.json" "the killed node left its file behind"
 
@@ -283,16 +219,11 @@ else
     printf '%s\n' "$STALE_OUT" | sed 's/^/          /'
 fi
 
-# And the traffic half.  Against a deadline, because the CLI's staleness view
-# above is read straight off the volume by the CLI process and says nothing
-# about when the gateway daemon's own scan runs, drops the member and pushes a
-# new endpoint table to the proxy.  Those are two independent clocks and only
-# one of them is the one that stops traffic.
-#
-# What is asserted is that it settles at all, and inside a bound: every one of
-# eight consecutive requests answered, and answered by the survivor.  While the
-# dead member is still in rotation some of them come back empty, which is the
-# documented cost of the window and not a failure.
+# The traffic half runs against a deadline because the CLI's view of the volume
+# and the gateway daemon's own scan are two independent clocks, and what is
+# asserted is that it settles at all inside a bound -- replies that come back
+# empty while the dead member is still in rotation are the documented cost of
+# the window.
 if converge "$STALE_DEADLINE" only_web1; then
     ok "traffic settled on the survivor ${CONVERGED_AT}s after the kill"
     echo "        replies: $(printf '%s' "$CONVERGED_REPLIES" | tr '\n' ' ')"
@@ -314,23 +245,11 @@ else
     printf '%s\n' "$CONVERGED_REPLIES" | sed 's/^/          /'
 fi
 
-# ─── Test 5: killed and restarted INSIDE the staleness window ─────────────────
-#
-# Test 4 restarts a node whose entry has long since aged out, which is the easy
-# half and not the one a deployment meets.  A container restart, a systemd
-# `Restart=on-failure`, a redeploy and a crash loop all come back in a second or
-# two — well inside the 10s threshold — and the node then finds its OWN file
-# still fresh in the volume under its own name.
-#
-# That used to be refused with "name may already be in use", and the refusal was
-# quiet in the worst way: the daemon went on serving, in no group, invisible to
-# every peer, with nothing but an exit code to say so.  Under this node.sh's
-# `set -e` the container dies instead, which is why the assertion below is
-# mostly "did it come back at all".
-#
-# Only reachable in this shape: the restarted container gets a NEW pid namespace
-# and a new pid, keeps its hostname, and comes back on the same default socket
-# path.  test/integration/test_cluster.sh cannot produce that arrangement.
+# A container restart, a systemd Restart=on-failure and a crash loop all come
+# back well inside the 10s threshold, where the node meets its own file still
+# fresh under its own name -- a shape only this arrangement produces, since the
+# container returns with a new pid namespace, the same hostname and the same
+# default socket path.
 
 echo "  Test 5: a node restarted inside the staleness window rejoins"
 
@@ -347,16 +266,9 @@ else
     bad "down under set -e, which is what this assertion is for"
 fi
 
-# Proof that the window was actually reached.  Without it a slow machine turns
-# this test into test 4 again: the entry ages out during the restart, the rejoin
-# succeeds for a reason that has nothing to do with the rule under test, and the
-# run reports a pass it did not earn.
-#
-# Polled, not read once.  The node's "ready" line is echoed by node.sh straight
-# to the container's stdout, while the daemon's log reaches it by way of a file
-# and the `tail -f` following it — so the reclaim line lands a moment AFTER the
-# line this test waited on, and reading immediately catches the log one entry
-# short.  Measured at well under a second; the deadline is generous.
+# Proof that the window was actually reached, polled rather than read once
+# because the reclaim line reaches the container's log a moment after the ready
+# line this test waited on.
 RECLAIM_DEADLINE=$((SECONDS + 15))
 RECLAIMED=0
 while [ "$SECONDS" -lt "$RECLAIM_DEADLINE" ]; do
@@ -392,12 +304,9 @@ if [ "$RESTARTED" -eq 1 ]; then
     fi
 fi
 
-# ─── Test 6: a graceful shutdown is not the same mechanism ────────────────────
-#
-# The man page distinguishes "graceful shutdown → file deleted → immediate"
-# from "container killed → stale heartbeat → ~10 seconds".  Asserting the
-# removal happens well inside the 10s threshold is what tells the two apart:
-# aged out would take longer than this bound allows.
+# Asserting the removal happens well inside the 10s threshold is what tells a
+# graceful shutdown apart from a killed node, whose entry could only age out
+# later than this bound allows.
 
 echo "  Test 6: a graceful stop unpublishes rather than going stale"
 dc stop -t 10 api2 >/dev/null 2>&1

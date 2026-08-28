@@ -1,65 +1,13 @@
 #!/usr/bin/env bash
-# Integration test: three backends under load, one of them breaks mid-traffic.
-#
-# It breaks in three different ways, because the proxy notices them by three
-# different routes and only two of those work:
-#
-#   down   the listener goes away          -> connect is refused
-#   rst    it accepts, then aborts         -> the connection dies mid-request
-#   stall  it accepts and never answers    -> nothing fails, ever
-#
-# "stall" is the one that is not handled, and this test runs the configuration
-# in which it is not handled: --health-check tcp.  A TCP health check connects
-# successfully to a process that has stopped answering, so the backend stays
-# healthy; a request that never completes is never recorded as an error, so the
-# circuit breaker never opens; and no timeout bounds how long a backend may take
-# to reply.  The backend therefore stays in rotation indefinitely and every
-# request routed to it is held until the *client* gives up.  With a fixed client
-# connection pool -- which is what every real client has -- those connections are
-# consumed one by one and throughput collapses rather than degrading by the
-# share of the pool that is broken.
-#
-# Two things make that configuration the one worth testing.  --sidecar, the
-# documented shorthand for a service-mesh proxy, expands to exactly it
-# (health_tcp + circuit + retry + drain).  And with no health check configured
-# at all the same stall is unbounded: a single request against a stalled backend
-# was measured still open, unanswered and unclosed after 100 s, with the daemon
-# reporting the backend healthy and no circuit open.  Only --idle-timeout ever
-# ends it, by closing the *client* as idle -- and the sweep that enforces it
-# runs every 30 s, so a 5 s idle timeout first acted at 29 s.
-#
-# --health-check http is the configuration that copes: it needs a 2xx from
-# --health-path, which a stalled backend cannot produce, so it is marked
-# unhealthy and traffic fails over cleanly.  Measured on the same load, one of
-# three backends stalled: 37415 requests in the settled window, zero failures,
-# nothing routed to the stalled backend.  That contrast is the shape of the fix
-# -- the tcp probe and the breaker both need a notion of "answered in time".
-#
-# Every request carries a marker "<connection>-<sequence>" that the backend
-# echoes, and each backend stamps its own id beside it.  That second stamp is
-# what makes this a failover test instead of an availability test: it shows
-# where traffic actually went, so "the proxy took the broken backend out of
-# rotation" is checked directly rather than inferred from requests happening to
-# succeed.
-#
-# This test wants a quiet machine: it is a closed-loop load test, so anything
-# else competing for the four cores shows up as connect failures that belong to
-# the machine and not to the proxy.
-#
-# Window boundaries are measured, never assumed -- and "measured" now means an
-# event was observed, not that a stopwatch reached a number.  Each window opens
-# on something that happened:
-#
-#   healthy   the first response the proxy serves
-#   settled   the moment the daemon's own stats show it has noticed the fault
-#   restored  the first response the repaired backend serves again
-#
-# and each closes only once it has carried traffic.  The old boundaries were
-# "the fault instant plus three seconds" and "the restore instant plus three",
-# against a driver that stopped at a fixed 3 x WIN -- so a control command that
-# took a second longer than usual, which is what happens inside
-# `bash test/run_all.sh`, moved the restored window past the end of the run and
-# left it empty.  An empty window has to be reported as one; see lib_window.sh.
+# Three backends under load with one breaking three different ways, run in the
+# --health-check tcp configuration where a stall is not handled: the probe
+# connects to a process that has stopped answering, no request is ever recorded
+# as an error, and with a fixed client pool throughput collapses rather than
+# degrading -- which is worth testing because --sidecar expands to exactly it,
+# while --health-check http needs a 2xx and fails over cleanly; every request
+# carries a marker the backend echoes beside its own id, so where traffic went
+# is checked rather than inferred, and each window opens on an observed event
+# rather than on a stopwatch.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -105,17 +53,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet -- or not up any more -- starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket as well as by pid and matched on exact process name,
+    # because a CLI command against an absent daemon starts a detached one
+    # $DPID would never reach, and a `pgrep -f` pattern also matches the shell
+    # doing the matching.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -132,10 +73,8 @@ trap cleanup EXIT
 
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
-# A claim this run could not put a question to -- an empty or too-thin window.
-# Distinct from bad() because the two used to print the same sentence, and a run
-# that measured nothing was read as a proxy that routed wrongly.  Both end the
-# run non-zero; only one of them is about the product.
+# A claim this run could not put a question to, kept apart from bad() because
+# an empty window and a mis-routed one used to print the same sentence.
 herr() { TOTAL=$((TOTAL+1)); HERR=$((HERR+1)); echo "  NOT MEASURABLE [$1]: $2"; }
 
 echo "=== Integration: proxy failover under load ==="
@@ -258,16 +197,10 @@ async def main():
 asyncio.run(main())
 PYEOF
 
-# ---- load driver: marker-verified, reconnecting, timestamped ---------------
-#
-# It writes each request down as it finishes -- when it was sent, when it was
-# answered, what came back and which backend stamped it -- and keeps going until
-# a stop file appears.  Both changes exist for the same reason: the windows are
-# decided from these events while the run is still going, so the events have to
-# be readable while the run is still going, and the run has to still be going
-# when the last window opens.  The old driver buffered everything to the end and
-# stopped at a fixed 3 x WIN, which is how the restored window came to be
-# measured after the traffic had stopped.
+# Each request is written down as it finishes and the driver runs until a stop
+# file appears, because the windows are decided from these events while the run
+# is still going and the old driver buffered to the end and stopped at a fixed
+# deadline.
 cat > "$TMPD/drv.py" <<'PYEOF'
 import asyncio, os, re, sys, time
 
@@ -393,13 +326,10 @@ python3 "$TMPD/be.py" $CTRL be1:$BE1 be2:$BE2 be3:$BE3 >"$TMPD/be.log" 2>&1 &
 BEPID=$!
 for _ in $(seq 1 60); do grep -q ready "$TMPD/be.log" 2>/dev/null && break; sleep 0.1; done
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet --
-# cli.cpp's ensure_daemon() forks, setsids and re-execs 'socketley daemon' -- so
-# polling 'ps' against the daemon this test has just launched races it and spawns
-# a second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run.  Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the daemon's IPC socket directly and never by polling with a CLI
+# command, because every CLI command auto-starts a daemon when the socket does
+# not answer and when the loser of the bind is $DPID this test watches a
+# zombie.
 cat > "$TMPD/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -427,17 +357,10 @@ SOCKETLEY_DLOG="$TMPD/daemon.log"
 DPID=$!
 python3 "$TMPD/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart -- so without this the run would go on measuring a
-# corpse and only notice, if at all, at the very end.
-#
-# `|| true` because of `set -o pipefail`: when the pid really is gone -- the
-# case this check exists for -- `ls` fails and the pipeline fails with it.
-# This file runs without `set -e`, so that leaves nothing worse than a status
-# behind; in the sibling tests that do set it, the one check able to report a
-# dead daemon exited the run before it could report one.  The `|| true` is what
-# makes this line safe to copy into a file that has the -e.
+# The daemon that answers is the one this test launched, asked of the
+# descriptor table because `kill -0` cannot tell a zombie from a live process
+# -- with `|| true` so pipefail cannot make the one check able to report a dead
+# daemon exit before it does.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -452,12 +375,9 @@ create_ok "proxy created" "$BIN" create proxy $NAME -p $PX \
     --backend "127.0.0.1:$BE1,127.0.0.1:$BE2,127.0.0.1:$BE3" --protocol http \
     --health-check tcp --health-interval 1 --health-threshold 2 \
     --circuit-threshold 3 --circuit-timeout 5 --retry 2 -s
-# Not "the port accepts, now wait half a second and hope".  A request that
-# comes back 200 has gone through the proxy, been routed to a backend that
-# passed its health checks, and been answered -- which is what the windows
-# below measure.  With --health-interval 1 --health-threshold 2 a backend is
-# not in rotation for up to two seconds after the listener is armed, and the
-# fixed sleep was shorter than that whenever the machine was busy.
+# A request that comes back 200 has been routed to a backend that passed its
+# health checks, which a fixed sleep shorter than the health interval was
+# standing in for.
 if ! ready_http 127.0.0.1 $PX "/$NAME/ready" 20; then
     bad "setup" "the proxy never answered a request on $PX"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $HERR not measurable)"; exit $((FAIL+HERR))
@@ -472,9 +392,8 @@ for F in $FAULTS; do
     echo "  -- fault: $F --"
 
     # Longer than circuit-timeout, so a breaker left open by the previous fault
-    # has closed again.  Without this the "healthy" window of the next fault
-    # starts with a backend still out of rotation, and the run reports an
-    # imbalance that belongs to the test rather than to the proxy.
+    # has closed and the next healthy window does not open on a backend still
+    # out of rotation.
     sleep 7
 
     EVF="$TMPD/ev_$F.txt"; STOPF="$TMPD/stop_$F"
@@ -486,9 +405,8 @@ for F in $FAULTS; do
         >"$EVF" 2>"$TMPD/drv_$F.err" &
     LPID=$!
 
-    # The healthy window opens on the first response, which is the earliest
-    # instant at which "the proxy is serving" is an observation rather than an
-    # assumption.  The old +1 s after the driver's start was standing in for it.
+    # The healthy window opens on the first response, the earliest instant at
+    # which "the proxy is serving" is an observation rather than an assumption.
     START=$(win_wait_backend "$EVF" any 0 "$ANCHOR_WAIT")
     if [ -z "$START" ]; then
         bad "$F: the proxy serves the load" \
@@ -506,12 +424,10 @@ for F in $FAULTS; do
         : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
     fi
 
-    # The settled window opens when the daemon's own stats say it has noticed --
-    # the health check having marked the backend unhealthy, or the breaker
-    # having opened.  That is the event the old "+3 s" was guessing at, and it is
-    # also the assertion: a proxy that never notices never opens the window, and
-    # the bound expiring is reported as the failure it is rather than as a
-    # window full of errors.
+    # The settled window opens when the daemon's own stats say it has noticed,
+    # which is also the assertion: a proxy that never notices never opens the
+    # window, and the bound expiring is reported as the failure rather than as
+    # a window full of errors.
     NOTICE_T=$(win_wait_output "$ANCHOR_WAIT" \
         '^healthy_backends:[012]$|^open_circuits:[1-9]' "$BIN" stats $NAME)
     if [ -n "$NOTICE_T" ]; then ok; else
@@ -530,10 +446,9 @@ for F in $FAULTS; do
         : >"$STOPF"; wait $LPID 2>/dev/null; LPID=""; continue
     fi
 
-    # And the restored window opens on the repaired backend's first response.
-    # Reaching it is the claim -- a breaker that never half-opens never gets
-    # there, and that is what the bound catches.  The window after it is where
-    # "it is carrying its share again" is measured.
+    # The restored window opens on the repaired backend's first response, and
+    # reaching it is the claim, because a breaker that never half-opens never
+    # gets there.
     RETURN_T=$(win_wait_backend "$EVF" be2 "$RESTORE_T" "$ANCHOR_WAIT")
     if [ -n "$RETURN_T" ]; then ok; else
         bad "$F: the backend returns to rotation after it recovers" \
@@ -569,9 +484,8 @@ for F in $FAULTS; do
         win_detail "$EVF" "$START" "$FAULT_T"
     fi
 
-    # The broken backend must be out of rotation once the window has settled.
-    # The daemon's own view opened this window, so this is the other half of the
-    # same claim: no successful response may carry its stamp either.
+    # The daemon's own view opened this window, so no successful response may
+    # carry the broken backend's stamp either.
     if [ -n "$S_TOT" ] && [ "$S_TOT" -gt 0 ]; then
         if [ "${S_BE2:-0}" -eq 0 ] 2>/dev/null; then ok; else
             bad "$F: the broken backend serves no more responses" "it still served ${S_BE2} requests"
@@ -580,22 +494,19 @@ for F in $FAULTS; do
         herr "$F: the broken backend serves no more responses" "the settled window is empty"
     fi
 
-    # And the clients must stop noticing.  Not "zero": a breaker that half-opens
-    # every circuit-timeout spends a request finding out whether the backend is
-    # back, and that cost is by design.  A backend still taking its full share
-    # of a three-way rotation would show ~33% here.
+    # Not zero, because a breaker that half-opens every circuit-timeout spends
+    # a request finding out whether the backend is back, while a backend still
+    # taking its full share would show about a third.
     if [ -n "$S_TOT" ] && [ -n "$S_OK" ] && [ "$S_TOT" -gt 0 ] && \
        [ "$(( (S_TOT - S_OK) * 1000 / S_TOT ))" -le 5 ]; then ok; else
         bad "$F: clients see no failures once failover has settled" \
             "${S_OK:-<none>} of ${S_TOT:-<none>} correct -- $(printf '%s\n' "$OUT" | grep '^WINDOW settled' | sed 's/.*kinds://')"
     fi
 
-    # Throughput, not just success rate.  A backend that holds requests open
-    # instead of refusing them consumes the client's connections one by one, so
-    # the surviving two backends can look perfect while almost nothing gets
-    # through.  Compared as rates, not as totals: the windows are as long as they
-    # needed to be to carry traffic, so their totals are not comparable and a
-    # settled window that simply ran longer would otherwise pass this.
+    # Throughput as a rate rather than a total, because a backend that holds
+    # requests open consumes the client's connections one by one while the
+    # survivors look perfect, and the windows are only as long as they needed
+    # to be.
     if [ -n "$H_RATE" ] && [ -n "$S_RATE" ] && [ "$H_RATE" -gt 0 ] && \
        [ "$((S_RATE * 100 / H_RATE))" -ge 50 ]; then ok; else
         bad "$F: throughput survives the loss of one backend" \

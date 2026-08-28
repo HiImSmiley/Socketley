@@ -1,80 +1,21 @@
 #!/usr/bin/env bash
-# Integration test: how a worker's refusal reaches the operator.
-#
-# ─── THIS FILE HAS NOW EXPIRED THREE TIMES, AND THE THIRD ONE ENDED IT ──────
-#
-# It was written on the premise that a runtime in its own process cannot serve
-# every call the API offers, and that each such call must be refused BY NAME
-# rather than answered with the false, nil or empty table a successful call
-# also returns.  The premise about refusals was right.  The premise about which
-# calls need one has been wrong three times:
-#
-#   .list   the worker was handed the runtime map, so list() answers out there.
-#           Five assertions went red that were never about listing.
-#   .stop   the four map calls travel to the daemon now.  Six went red, and
-#           this header had called them "permanently refused".
-#   .pipe   the last one, and the one this header called "about the mechanism
-#           rather than about the transport" -- correctly, and then predicted
-#           the wrong mechanism.  It said the call was waiting on SCM_RIGHTS.
-#           It was not: across two runtimes socketley.pipe is route_client(),
-#           which keeps the socket where it is and relays.  What it wanted was
-#           a way to name another runtime's connection, which is
-#           shared/route_relay.h.  Watched, not assumed -- 11/18 before this
-#           rewrite, and self.route went red with it.
-#
-# There is no fourth call to re-point at.  Every refusal this file was written
-# about is now installed only when the worker was forked WITHOUT the control
-# plane at fd 6 -- an older daemon, or one that could not make the socketpair --
-# which no test in this tree can produce.
-#
-# ─── SO WHAT IS LEFT, AND WHY IT IS THE HALF WORTH KEEPING ──────────────────
-#
-# The durable half was never the list of calls.  It is the DELIVERY: where a
-# refusal lands, who is told, and what the command that asked for it exits
-# with.  That machinery is unchanged and is still the only cover for it:
-#
-#   * a script that raises at its top level is refused by `create`, which
-#     waits for the worker's verdict rather than reporting success and
-#     correcting itself in the log a moment later;
-#   * the runtime is left `failed` and does not serve;
-#   * and it is not restarted in a loop, because a refused configuration is
-#     not a crash.
-#
-# Those four assertions kept their shape and changed their trigger, from a
-# refused API call to a plain error() -- which raises for a reason that cannot
-# expire.
-#
-# What replaced the rest is the inverse claim, kept here rather than moved
-# because this is the file that would notice: the calls listed above are
-# answered in a worker now, and no refusal for any of them appears in the log
-# at all.  A build that reinstalls one goes red here.
-#
+# What is left of this file is the delivery of a refusal rather than the list
+# of calls that need one, because that list has been wrong three times and
+# every refusal it was written about is now installed only for a worker forked
+# without the control plane at fd 6 -- so the four surviving assertions changed
+# their trigger to a plain error(), which raises for a reason that cannot
+# expire, and the inverse claim is kept here because this is the file that
+# would notice a build reinstalling one.
 # ─── THE TWO PLACES A REFUSAL LANDS ─────────────────────────────────────────
-#
-#   * In a callback.  The chain that ran it reports the error and refuses the
-#     request — a filter that raised has not said "carry on" — so the client
-#     gets a 500 and the log gets the message.
-#   * At the script's top level.  The script does not load, and a worker whose
-#     script did not load does not serve: it exits, saying it is a configuration
-#     it will never accept, and the supervisor leaves the runtime `failed`
-#     instead of forking five more copies of the same refusal.  Before, the
-#     proxy came up and relayed with none of the filters, routes or callbacks
-#     the operator wrote, behind one WARN.
-#
+# A raise in a callback refuses the request and logs, while a raise at the
+# script's top level stops the worker serving at all -- so the supervisor
+# leaves the runtime failed instead of forking five more copies of the same
+# refusal.
 # ─── THE CONTROLS ───────────────────────────────────────────────────────────
-#
-# Three, and they are what stop this from being a file that passes against a
-# build where Lua does not work at all:
-#
-#   * The same script on an in-process proxy must ANSWER the management call.
-#     The refusal has to be about the boundary, not about the call.
-#   * The same script on an in-process proxy must stay `running`.  Without it,
-#     "the out-of-process one is failed" also passes on a build that fails
-#     every proxy with a script.
-#   * The worker's own script must be alive and serving: a route that touches
-#     nothing cross-runtime must answer normally from inside the worker.  A
-#     build that refused the entire Lua API, or that never loaded the script,
-#     would satisfy every other assertion here.
+# Three controls stop this file passing against a build where Lua does not work
+# at all: the same script on an in-process proxy answers the management call
+# and stays running, and the worker's own script serves a route that touches
+# nothing cross-runtime.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -168,11 +109,8 @@ code() {
     curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
          "http://127.0.0.1:$2/$1$3" 2>/dev/null || printf '000'
 }
-# state NAME -> the daemon's word for it, lowercased, or the empty string.
-#
-# `ls` and not `ps`: ps lists only what is running, which is the one state this
-# file is asserting a runtime is NOT in.  Asked of ps, a failed runtime and a
-# runtime that never existed are the same empty output.
+# `ls` and not `ps`, because ps lists only what is running and would make a
+# failed runtime indistinguishable from one that never existed.
 state() {
     "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { print tolower($7) }' | head -1
 }
@@ -201,10 +139,9 @@ fi
 
 # ── Control 2: the same call answers in process ─────────────────────────────
 MGMT_IN=$(body cb_in "$CB_IN_PORT" /mgmt)
-# Both halves, and the second is what makes this a control rather than a
-# formality.  `pipe=false` alone is also what a build whose pipe() is broken
-# returns; the reason naming the runtime is the evidence that the call ran, went
-# looking and answered about what it found.
+# Both halves, because `pipe=false` alone is also what a broken pipe() returns
+# and the reason naming the runtime is the evidence that the call ran and
+# answered about what it found.
 case "$MGMT_IN" in
     *"pipe=false"*"there is no runtime called"*) pass ;;
     *)
@@ -215,11 +152,8 @@ case "$MGMT_IN" in
              "the call does not work on either side of it" ;;
 esac
 
-# ── Assertion 1: the call is ANSWERED in the worker ────────────────────────
-#
-# The inverse of what stood here.  A 500 is what a refusal produces -- the
-# filter chain reports the error and refuses the request -- so a 500 now means
-# a build that has put the refusal back.
+# The inverse of what stood here: a 500 is what a refusal produces, so a 500
+# now means a build that has put the refusal back.
 MGMT_OOP_CODE=$(code cb_oop "$CB_OOP_PORT" /mgmt)
 MGMT_OOP_BODY=$(body cb_oop "$CB_OOP_PORT" /mgmt)
 if [ "$MGMT_OOP_CODE" = "200" ]; then pass; else
@@ -229,13 +163,9 @@ if [ "$MGMT_OOP_CODE" = "200" ]; then pass; else
          "has a channel now: see shared/route_relay.h"
 fi
 
-# ── Assertion 2: and it answers the SAME THING on both sides ───────────────
-#
-# Not merely "answered".  A script must not be able to tell which side of the
-# boundary it is running on from the text it gets back, and the refusal wording
-# is served by two different code paths -- the in-daemon one from route_client
-# and the worker one from the daemon, over the map socket -- so this is the one
-# assertion that would catch them drifting apart.
+# A script must not be able to tell which side of the boundary it is on from
+# the text it gets back, and the wording is served by two different code paths,
+# so this is the one assertion that would catch them drifting apart.
 if [ "$MGMT_OOP_BODY" = "$MGMT_IN" ]; then pass; else
     fail "the worker and the daemon answer the same call the same way" \
          "worker: '$MGMT_OOP_BODY'" \
@@ -244,12 +174,9 @@ if [ "$MGMT_OOP_BODY" = "$MGMT_IN" ]; then pass; else
          "is what stops them saying different things"
 fi
 
-# ── Assertion 2b: no refusal for these calls in the log at all ─────────────
-#
-# The negative oracle, and it is not redundant with the two above: a build
-# could answer /mgmt correctly while still refusing self.route, or refuse in a
-# path this file never exercises.  Nothing in this suite should now produce
-# this sentence.
+# The negative oracle, not redundant with the two above, because a build could
+# answer /mgmt correctly while still refusing self.route or refusing in a path
+# this file never exercises.
 if ! grep -q 'refused in a worker process' "$SOCKETLEY_DLOG" 2>/dev/null; then
     pass
 else
@@ -258,28 +185,11 @@ else
          "$(grep -a -m1 -o 'refused in a worker process[^"]*' "$SOCKETLEY_DLOG" | cut -c1-160)"
 fi
 
-# ── Assertion 3: a script that raises at load fails the runtime ────────────
-#
-# The in-daemon arm that used to stand here is gone, and its removal is the
-# point rather than a tidy-up.  It was a CONTROL: the same script loaded in the
-# daemon and was refused in a worker, so the failure could be attributed to the
-# boundary.  With the trigger changed from a refused API call to error(), there
-# is no boundary left in it -- the script raises on both sides, so an in-daemon
-# arm would assert that a raise is a raise.
-#
-# What still needs a control is "the worker loads scripts at all", and cb_oop
-# above is it: same process kind, same load path, a script that works.
-#
-# Deliberately not create_ok.  This create is expected to be refused, and that
-# is now an assertion in its own right: `create` waits for the worker's verdict
-# before answering, so a script the worker will not load is refused by the
-# command that asked for it instead of being reported as success and corrected
-# in the log a moment later.  It used to exit 0 here, which is the defect that
-# wait exists to close.
-#
-# Exit 1 specifically, not merely non-zero: "unknown flag" and "unknown runtime"
-# are refusals too, and 2 is the timeout — an oracle that accepted any failure
-# would pass against a build that simply never answered.
+# Deliberately not create_ok, because the refusal is itself the assertion --
+# `create` waits for the worker's verdict rather than reporting success and
+# correcting itself in the log -- and exit 1 specifically, since 2 is the
+# timeout and an oracle accepting any failure would pass against a build that
+# never answered.
 TOP_OOP_RC=0
 TOP_OOP_OUT=$("$BIN" create proxy top_oop \
     -p "$TOP_OOP_PORT" --backend "127.0.0.1:$BE_PORT" --protocol http --lua "$TOP_LUA" \
@@ -293,9 +203,8 @@ if [ "$TOP_OOP_RC" = "1" ]; then pass; else
          "create said: ${TOP_OOP_OUT:-<nothing>}"
 fi
 
-# Already true by the time create returned, since create waited for it.  The
-# poll is kept because it costs nothing when the answer is already there and
-# still covers the runtime being failed by the health tick instead.
+# Already true by the time create returned, with the poll kept because it costs
+# nothing and still covers the runtime being failed by the health tick instead.
 for _ in $(seq 1 100); do
     [ "$(state top_oop)" = "failed" ] && break
     sleep 0.2
@@ -311,11 +220,8 @@ if [ "$TOP_OOP_STATE" = "failed" ]; then pass; else
          "operator wrote is not the proxy they configured"
 fi
 
-# ── Control 3: a worker DOES load a script that works ──────────────────────
-#
-# Replaces the in-daemon arm described above.  Without it, "top_oop is failed"
-# also passes on a build where no worker ever loads a script, which would make
-# every assertion in this section true for the wrong reason.
+# Without a worker that does load a working script, "top_oop is failed" also
+# passes on a build where no worker ever loads one.
 if [ "$(body cb_oop "$CB_OOP_PORT" /ok)" = "alive" ]; then pass; else
     fail "control: a worker loads a script that does not raise" \
          "cb_oop's /ok did not answer 'alive'" \
@@ -323,18 +229,10 @@ if [ "$(body cb_oop "$CB_OOP_PORT" /ok)" = "alive" ]; then pass; else
          "about this one"
 fi
 
-# ── Assertion 4: it is not restarted in a loop ──────────────────────────────
-#
-# A refused configuration is not a crash: forking it again produces the same
-# refusal.  The supervisor is told so by the exit status, and one refusal in the
-# log is the evidence that it listened -- five would be the evidence that it did
-# not.
-# Counted on the raise text, which the worker prints once per attempt to load.
-# The previous oracle grepped 'refusing to serve without it', which belonged to
-# the configuration-refusal path the old trigger took; error() takes the
-# script-load path and prints its own message.  Changing the oracle with the
-# trigger is not weakening it -- what is being counted is still "how many times
-# did the supervisor fork this child", and one is still the only right answer.
+# A refused configuration is not a crash, so one refusal in the log is the
+# evidence that the supervisor listened and five would be the evidence that it
+# did not -- counted on the raise text, which the worker prints once per
+# attempt to load.
 REFUSALS=$(grep -c 'toplevel: a deliberate raise' "$SOCKETLEY_DLOG" 2>/dev/null) || REFUSALS=0
 if [ "$REFUSALS" -eq 1 ]; then pass; else
     fail "a refused configuration is not retried" \
@@ -343,15 +241,10 @@ if [ "$REFUSALS" -eq 1 ]; then pass; else
          "more copy of the same refusal per attempt, up to the burst limit"
 fi
 
-# ── Assertion 5: self.route() is refused too, and says so ───────────────────
-#
-# It reaches for the same runtime map as the calls above and is refused for the
-# same reason; it is only spelled self. rather than socketley., which is the
-# whole reason it was missed.  It answered a bare false — which is also what it
-# answers for a target that does not exist — so a script could not tell a
-# runtime that is absent from one that is merely in another process.
-#
-# A server rather than a proxy, because self.route() is a server's call.
+# self.route() reaches the same runtime map and is only spelled differently,
+# which is why it was missed, and it answered a bare false -- indistinguishable
+# from a target that does not exist -- so it is asserted here on a server,
+# whose call it is.
 ROUTE_LUA="$SOCKETLEY_TMPD/route.lua"
 # "route" and not something shorter: a client message under three bytes is not
 # delivered to on_client_message at all on this build — protocol detection wants
@@ -401,12 +294,8 @@ if [ "$ROUTED" -ge 2 ]; then pass; else
          "$(grep -a -o 'ROUTE ok=[a-z]* res=[^ ]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -2 | tr '\n' '|')"
 fi
 
-# ── Assertion 5b: and it answers true, not merely "did not raise" ──────────
-#
-# pcall's first value is true for a call that merely RETURNED false, so ok=true
-# alone says only that nothing was thrown -- which is what the refusal this
-# file used to assert would not produce, and is not what a working route looks
-# like either.  res is self.route's own return value.
+# pcall's first value is true for a call that merely returned false, so the
+# route's own return value is what has to be checked.
 if [ "$(grep -a -c 'ROUTE ok=true res=true' "$SOCKETLEY_DLOG" 2>/dev/null)" -ge 2 ]; then
     pass
 else
