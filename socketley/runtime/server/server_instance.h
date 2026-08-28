@@ -492,7 +492,14 @@ public:
     // handle out of conn_identity.h's reserved range for one that was routed
     // here from elsewhere.  Nothing above this line ever sees a conn_ref, and
     // nothing below it ever sees a descriptor belonging to another process.
-    bool route_client(int client_id, std::string_view target_name);
+    // `err`, when given, is filled with the reason a false was returned.  It
+    // exists because the reason is no longer in this process: a target in a
+    // worker is refused by the daemon, in the daemon's words, and a caller that
+    // renders its own guess at why would print something that contradicts it.
+    // socketley.pipe passes one; self.route does not, because Lua's route()
+    // answers a bare boolean and always has.
+    bool route_client(int client_id, std::string_view target_name,
+                      std::string* err = nullptr);
     bool unroute_client(int client_id);
     std::string_view get_client_route(int client_id) const;
     bool send_to_client(int client_id, std::string_view msg);

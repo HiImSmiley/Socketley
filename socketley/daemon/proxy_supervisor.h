@@ -49,6 +49,7 @@
 // without adopting it, so the enum is part of this class's own storage now
 // rather than something only the .cpp had to know about.
 #include "../shared/runtime_definitions.h"
+#include "../shared/worker_protocol.h"
 
 class proxy_instance;
 class runtime_instance;
@@ -193,6 +194,39 @@ public:
     // The message on its way down to the shard that owns the connection.
     bool send_deliver_ref(const conn_ref& ref, std::string_view message);
     void set_deliver_handler(deliver_handler h) { m_on_deliver = std::move(h); }
+
+    // ── A connection served by this child, answered by another runtime ──────
+    //
+    // `self.route` and the three-argument `socketley.pipe`.  Same shape as
+    // send_ref above and a DIFFERENT question, which is the thing to keep
+    // straight: send_ref addresses one shard of the runtime that already owns
+    // the connection, and this addresses a different runtime entirely.  So the
+    // ref's shard bits resolve the first and are no help at all with the
+    // second, which is why the frame carries two names.
+    //
+    // The handler is the daemon because the daemon holds the map: it is the
+    // only side that can turn "to" into either an in-process server or another
+    // child's socket, and a worker filling that in would be a second authority
+    // to disagree with the first.
+    using route_handler = std::function<void(proxy_supervisor* from,
+                                             std::string_view to,
+                                             std::string_view frm,
+                                             worker_proto::route_op op,
+                                             const conn_ref& ref,
+                                             std::string_view payload)>;
+    void set_route_handler(route_handler h) { m_on_route = std::move(h); }
+
+    // Which runtime this supervisor stands for, for a caller that has to check
+    // a name a CHILD supplied against one the daemon holds.  Const, and const
+    // for a reason: the placeholder is the daemon's record and a reader of a
+    // worker's frame has no business writing to it.  Null after retire().
+    const runtime_instance* placeholder() const { return m_placeholder; }
+
+    // The same frame going the other way.  One codec, two names, for the reason
+    // send_ref/deliver_ref are one codec.
+    bool send_route(std::string_view to, std::string_view frm,
+                    worker_proto::route_op op, const conn_ref& ref,
+                    std::string_view payload);
 
     // ── The figures this child last published ───────────────────────────────
     //
@@ -582,6 +616,7 @@ private:
     publish_handler  m_on_publish;
     deliver_handler  m_on_deliver;
     send_ref_handler m_on_send_ref;
+    route_handler    m_on_route;
     stats_handler   m_on_stats;
     map_handler      m_on_map;
 

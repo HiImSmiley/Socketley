@@ -357,6 +357,12 @@ daemon_handler::daemon_handler(runtime_manager& manager, event_loop& loop)
     // See shared/shard_target.h.
     m_manager.set_shard_sink_publisher([this](request_channel& ch)
                                        { publish_shard_sinks(ch); });
+
+    // And a routing verb aimed at a runtime this process does not hold.  The
+    // pointer, not a lambda, because the sink is an interface with two methods
+    // whose contracts differ -- see route_relay::sink.  Cleared in teardown()
+    // beside the others; the manager outlives this handler.
+    m_manager.set_route_sink(this);
 }
 
 // Every shard of every sharded runtime, under `name#index`.
@@ -752,6 +758,7 @@ void daemon_handler::teardown()
     m_manager.set_publish_sink(nullptr);
     m_manager.set_deliver_sink(nullptr);
     m_manager.set_worker_release_sink(nullptr);
+    m_manager.set_route_sink(nullptr);
 
     // Reap managed children
     {
@@ -4959,6 +4966,151 @@ void daemon_handler::on_worker_send_ref(proxy_supervisor* from,
     }
 }
 
+// ─── self.route and the three-argument socketley.pipe ───────────────────────
+//
+// A connection stays where it is and another RUNTIME answers it.  The daemon is
+// in this path because it holds the only authoritative answer to "where is
+// `to`", and for no other reason: once a route is open the two ends still talk
+// through here, which is a relay and is the floor rather than the destination
+// -- shard_mesh.h makes the same argument for sibling shards and then measures
+// the direct link that replaces it.  Nothing here has been measured yet, and
+// this comment will be wrong the day it is.
+//
+// ─── WHICH SHARD A ROUTED CONNECTION LANDS ON ───────────────────────────────
+//
+// The first, always, and this is a limitation stated rather than a decision
+// defended.  A routed connection produces exactly one on_connect and one handle
+// at the far end, so it goes to exactly one process; there is no key to hash
+// and no field on the ref that means anything about the TARGET -- the ref's
+// shard bits name the shard that MINTED it, which is the origin's.  Sending it
+// to shard 0 is what the request-sink override already does for cross-runtime
+// requests, for the same "one question, one answer" reason.
+//
+// What it costs: routing into a sharded server concentrates every routed
+// connection on one of its shards while its accepted connections spread across
+// all of them.  That is visible in the per-shard connection counts and is worth
+// fixing with a real placement rule; it is not worth guessing at one here.
+void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
+                                    worker_proto::route_op op,
+                                    const conn_ref& ref,
+                                    std::string_view payload)
+{
+    // In this process, and a real server rather than a placeholder standing in
+    // for one.  local_server() is the single test; see route_relay.h for what
+    // goes wrong when a caller writes the two halves of it by hand.
+    if (auto* srv = route_relay::local_server(&m_manager, to))
+    {
+        switch (op)
+        {
+            case worker_proto::route_op::open:
+                // The one op that can be refused after it has been accepted at
+                // this level.  The origin was already told yes -- open()
+                // answers from the map, deliberately -- so the unwind is a
+                // `drop` back the way the ask came, which is the same message
+                // the origin gets when the target dies a moment later.  It has
+                // one path for both.
+                if (srv->accept_routed(ref, frm) < 0)
+                    route_dispatch(frm, to, worker_proto::route_op::drop, ref, {});
+                break;
+            case worker_proto::route_op::data:
+                srv->deliver_routed(ref, payload);
+                break;
+            case worker_proto::route_op::close:
+                srv->release_routed(ref);
+                break;
+            case worker_proto::route_op::write:
+                if (!srv->write_to_ref(ref, payload))
+                    LOG_DEBUG("a routed message named a connection its owner no "
+                              "longer has");
+                break;
+            case worker_proto::route_op::drop:
+                srv->drop_route(ref);
+                break;
+        }
+        return;
+    }
+
+    auto it = m_proxy_workers.find(std::string(to));
+    if (it == m_proxy_workers.end() || it->second.empty())
+    {
+        // The runtime went away between the ask and this frame, which for
+        // teardown ops is the ORDINARY case: a stopping runtime tells every
+        // origin to drop its routes, and some of those origins are stopping
+        // too.  Debug rather than warn, for that reason.
+        LOG_DEBUG("a routing frame named a runtime the daemon no longer holds");
+        return;
+    }
+
+    if (!it->second[0]->send_route(to, frm, op, ref, payload))
+        LOG_WARN("could not reach the worker holding a routed runtime");
+}
+
+void daemon_handler::post(std::string_view to, std::string_view frm,
+                          worker_proto::route_op op, const conn_ref& ref,
+                          std::string_view payload)
+{
+    route_dispatch(to, frm, op, ref, payload);
+}
+
+bool daemon_handler::open(std::string_view target, const conn_ref& ref,
+                          std::string_view origin, std::string& err)
+{
+    // Reached only when the target is NOT in this process -- route_relay tried
+    // that first -- so this is the daemon answering on behalf of a child, or
+    // for a runtime that does not exist at all.  Both are decided here from the
+    // map, which is the whole reason the ask travels to the daemon rather than
+    // being answered against a worker's stale replica.
+    //
+    // The three refusals are worded exactly as the in-process path words them,
+    // because a script cannot tell which path it took and must not be able to
+    // tell from the message.
+    auto* rt = m_manager.get(target);
+    if (!rt)
+    {
+        err = "there is no runtime called \"" + std::string(target) + "\"";
+        return false;
+    }
+    if (rt->get_type() != runtime_server)
+    {
+        err = "\"" + std::string(target) + "\" is not a server";
+        return false;
+    }
+    if (rt->get_state() != runtime_running)
+    {
+        err = "\"" + std::string(target) + "\" is not running";
+        return false;
+    }
+
+    route_dispatch(target, origin, worker_proto::route_op::open, ref, {});
+    return true;
+}
+
+void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to,
+                                     std::string_view frm,
+                                     worker_proto::route_op op,
+                                     const conn_ref& ref,
+                                     std::string_view payload)
+{
+    if (!from)
+        return;
+
+    // `frm` is checked against what this supervisor actually stands for rather
+    // than trusted.  A worker filling in somebody else's name would make the
+    // target's on_connect report the wrong origin, and owner_send would then
+    // write into a runtime the connection never came from -- which is the exact
+    // class of defect conn_identity.h was written to close, arriving through a
+    // different door.
+    const auto* ph = from->placeholder();
+    if (!ph || ph->get_name() != frm)
+    {
+        LOG_WARN("a worker sent a routing frame naming a runtime that is not "
+                 "its own; dropped");
+        return;
+    }
+
+    route_dispatch(to, frm, op, ref, payload);
+}
+
 // ─── socketley.create/.start/.stop/.remove, asked by a script in a worker ───
 //
 // See the note on m_map_queue in the header for why these are recorded here and
@@ -5153,6 +5305,29 @@ bool daemon_handler::serve_map_request(const std::string& op,
         }
 
         return true;
+    }
+
+    // ── route ──────────────────────────────────────────────────────────────
+    //
+    // The fifth op, and the one that is not a map mutation.  It is on this
+    // socket because this socket is what a worker can BLOCK on -- see the note
+    // at encode_map_request, which now says so in as many words.
+    //
+    // `name` is the target runtime, as it is for every op here; the connection
+    // and the runtime asking ride in `config`.  It is answered by open() rather
+    // than inline, so that an in-daemon script routing to a worker and a worker
+    // script routing anywhere get one implementation and cannot drift apart in
+    // what they refuse.
+    if (h == fnv1a("route"))
+    {
+        conn_ref    ref{};
+        std::string origin;
+        if (!worker_proto::decode_route_ask(config, ref, origin))
+        {
+            err = "the routing request could not be read by the daemon";
+            return false;
+        }
+        return open(name, ref, origin, err);
     }
 
     // ── The other three, and where their wording comes from ────────────────
@@ -5779,6 +5954,11 @@ void daemon_handler::reconcile_proxy_workers()
         sup->set_send_ref_handler([this](proxy_supervisor* f, const conn_ref& r,
                                          std::string_view m)
                                   { on_worker_send_ref(f, r, m); });
+        sup->set_route_handler([this](proxy_supervisor* f, std::string_view to,
+                                      std::string_view frm,
+                                      worker_proto::route_op op,
+                                      const conn_ref& r, std::string_view pl)
+                               { on_worker_route(f, to, frm, op, r, pl); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
 
         // The four map calls, recorded here and served a turn later; see

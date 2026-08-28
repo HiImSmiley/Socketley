@@ -2407,10 +2407,26 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
         }
     }
 
-    // CARRY A CONNECTION.  Not a map problem at all.  See
-    // worker_transfer_refusal(); self.route() is the other one and is installed
-    // on the server table, at the bottom of this file.
-    sk["pipe"] = make(worker_pipe_refusal());
+    // CARRY A CONNECTION.  Not a map problem at all, and no longer a permanent
+    // one either: the same test as the mutators, against a different sink.
+    //
+    // What was missing was never SCM_RIGHTS -- worker_transfer_refusal() says
+    // so at length and was right about that -- but a channel, and there is one
+    // now.  It is not the one the old message predicted, and the difference is
+    // worth a line because the prediction was reasonable and wrong: the
+    // three-argument socketley.pipe does not hand a descriptor over at all.
+    // Read its own binding below.  Across two runtimes it is route_client(),
+    // which keeps the socket here and relays the bytes -- conn_transfer.h's
+    // RELAY shape -- so what it needed was a way to name another runtime's
+    // connection and reach it, which is shared/route_relay.h.
+    //
+    // The four-argument form comes back with it, and that is the part a script
+    // author notices first: it joins two connections of THIS server, needed no
+    // boundary crossed, and was refused only because the refusal was installed
+    // on the name rather than on the operation.  The message it printed even
+    // pointed at self.pipe as the way out.
+    if (!mgr || !mgr->route_sink())
+        sk["pipe"] = make(worker_pipe_refusal());
 
     // ASK THE CLUSTER.  Refused only while this process has no view of one.
     //
@@ -3474,11 +3490,24 @@ void lua_context::register_bindings(runtime_instance* owner)
                           "descriptor to honour, so drop the fourth argument");
 
         auto* src_rt = mgr->get(src_name);
-        auto* dst_rt = mgr->get(dst_name);
         if (!src_rt) return refuse("there is no runtime called \"" + src_name + "\"");
-        if (!dst_rt) return refuse("there is no runtime called \"" + dst_name + "\"");
-        if (src_rt->get_type() != runtime_server || dst_rt->get_type() != runtime_server)
-            return refuse("both ends must be servers");
+        if (src_rt->get_type() != runtime_server)
+            return refuse("\"" + src_name + "\" is not a server");
+
+        // The DESTINATION is not checked here when there is a route sink, and
+        // that is the Part 1 lesson applied a second time.  Both checks read
+        // this process's map, which in a worker is the daemon's copied on a
+        // coalescing timer -- so a script that creates a runtime and routes to
+        // it in the next statement was told "there is no runtime called x" for
+        // a runtime that demonstrably existed.  Whoever holds the map answers,
+        // in the map's own words, and route_client carries them back.
+        if (!mgr->route_sink())
+        {
+            auto* dst_rt = mgr->get(dst_name);
+            if (!dst_rt) return refuse("there is no runtime called \"" + dst_name + "\"");
+            if (dst_rt->get_type() != runtime_server)
+                return refuse("both ends must be servers");
+        }
 
         // as_server(), not static_cast — and this is the sharper of the two
         // sites, because `src_rt` is an ARBITRARY name out of the map rather
@@ -3498,15 +3527,18 @@ void lua_context::register_bindings(runtime_instance* owner)
             return refuse("\"" + src_name + "\" says it is a server but this "
                           "process holds no server object for it — it lives "
                           "somewhere else");
-        if (src_srv->route_client(src_fd, dst_name))
+        // route_client refuses several different things, and the bare false
+        // told them apart no better than it told any of them from success.  It
+        // says which now, and for a target in another process the words are the
+        // daemon's -- so a script cannot tell from the message which side of
+        // the boundary answered, which is the property the map calls hold too.
+        std::string why;
+        if (src_srv->route_client(src_fd, dst_name, &why))
             return api_yes();
-        // route_client refuses three different things, and the bare false told
-        // them apart no better than it told any of them from success.
         return refuse("connection " + std::to_string(src_fd) + " could not be "
-                      "routed to " + q(dst_name) + " — it is not an open "
-                      "connection of " + q(src_name) + ", or it was itself "
-                      "routed in from another runtime, or " + q(dst_name)
-                      + " refused it");
+                      "routed to " + q(dst_name) + ": "
+                      + (why.empty() ? std::string("it was refused and no "
+                                                   "reason was given") : why));
     };
 
     // ─── socketley.cluster.* — cluster introspection API ───
@@ -4071,7 +4103,23 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // it, and refusing them would replace a correct answer with an error.  The
     // refusal says that too, because a script author who has just been refused
     // route() is the person most likely to try the other three next.
-    if (in_worker_process())
+    // ─── AND WHAT IT IS NOW ────────────────────────────────────────────────
+    //
+    // The channel exists.  route_client() is unchanged above the seam and asks
+    // shared/route_relay.h for the target instead of reaching into it, so the
+    // same five calls it always made now reach a runtime in another process --
+    // and the test is the sink rather than the process, for the reason the
+    // mutators give: a worker forked by a daemon that does not serve routing is
+    // the one case where the two differ, and it keeps the refusal.
+    //
+    // The paragraphs above are left standing rather than deleted.  They are the
+    // record of a call being refused for three different stated reasons in turn,
+    // two of which were wrong -- first "waiting on the runtime map", then
+    // "waiting on SCM_RIGHTS" -- and the mechanism it actually wanted was named
+    // correctly in the third.  A reader who finds only the answer cannot tell
+    // which of those to trust the next time something here is refused.
+    const runtime_manager* rmgr = owner ? owner->get_runtime_manager() : nullptr;
+    if (in_worker_process() && (!rmgr || !rmgr->route_sink()))
     {
         sol::function make = refusal_factory(m_lua);
         if (make.valid())

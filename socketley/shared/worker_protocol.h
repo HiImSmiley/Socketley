@@ -101,11 +101,15 @@ enum class frame_type : uint16_t
     deliver_to = 8,  // payload: see encode_deliver_to
     send_ref   = 9,  // payload: see encode_send_ref
     map_req    = 10, // payload: see encode_map_request
+    route_up   = 11, // payload: see encode_route_frame
 
     // daemon → worker, again
     deliver_ref = 27,  // payload: see encode_send_ref — the same frame coming
                        // back down, which is why it is one codec and two names
     map_rep     = 28,  // payload: see encode_map_reply
+    route_down  = 29,  // payload: see encode_route_frame -- the same
+                       // codec travelling the other leg, for the
+                       // reason send_ref/deliver_ref are one codec
 };
 
 // ── reload_err: the answer `reload-lua` had no way to hear ──────────────────
@@ -597,6 +601,26 @@ inline bool decode_deliver_to(std::string_view payload, std::string& name,
 // So the wait is bounded and it is the script's own callback deadline that
 // bounds it: a map request cannot outlive the callback that made it.
 //
+// ─── THE FIFTH OP, AND WHY IT IS ON THIS SOCKET ─────────────────────────────
+//
+// `route` joined the four in 2026-08.  It is not a map mutation, and the names
+// here (`map_req`, map_mutate, m_map_sink) were chosen when it was only the
+// four -- so what this socket actually is, is the worker's SYNCHRONOUS
+// ask-the-daemon channel, and the map calls were its first four users.
+//
+// It belongs here rather than on a channel of its own for the same reason the
+// four do not travel the control socket: a worker cannot block on that
+// descriptor at all, its writes being queued for the ring and its reads being a
+// standing recv that a direct read would race. That reasoning is about the
+// descriptor, not about what is asked over it, so a second socket with the
+// identical property would be a second thing to create, place at fork, drain in
+// both startup waits, and tear down -- four places to forget, for no
+// difference. `route` gets an op, and `config` carries its argument blob.
+//
+// What it must NOT be used for is the per-message path. `data`, `write`,
+// `close` and `drop` are route_up/route_down frames on the control socket
+// precisely because they are frequent and answer nothing; see route_op.
+//
 // `ticket` correlates, because frames interleave.  A worker waiting on a reply
 // still receives publishes, deliveries and stats requests, and a reply left
 // over from a call that already timed out must not be read as the answer to
@@ -607,9 +631,11 @@ inline std::string encode_map_request(uint64_t ticket, std::string_view op,
     std::string out;
     out.reserve(20 + op.size() + name.size() + config.size());
     put_u64(out, ticket);
-    put_str(out, op);       // "create" | "start" | "stop" | "remove"
+    put_str(out, op);       // "create"|"start"|"stop"|"remove"|"route"
     put_str(out, name);
-    put_str(out, config);   // create only; empty for the other three
+    put_str(out, config);   // create: the runtime_config JSON
+                            // route:  see encode_route_ask
+                            // empty for the other three
     return out;
 }
 
@@ -686,6 +712,135 @@ inline bool decode_send_ref(std::string_view payload, conn_ref& ref,
         return false;
     reader r(p, static_cast<size_t>(end - p));
     message = std::string(r.str());
+    return r.ok;
+}
+
+// ── route_up / route_down: a connection served by one runtime, answered by
+//    another ───────────────────────────────────────────────────────────────
+//
+// `self.route(client_id, "other")`.  The origin keeps the socket and stays in
+// the data path; the target gets a handle, its on_connect, and every message
+// that arrives.  That is conn_transfer.h's RELAY shape, and the choice between
+// relay and handover is made there rather than here -- read it before adding a
+// sixth op to this list.
+//
+// ─── FIVE OPS BECAUSE THERE ARE FIVE METHODS ────────────────────────────────
+//
+// server_instance declares exactly five cross-runtime methods, every one of
+// them already taking a conn_ref rather than a descriptor, and this enum is one
+// op per method with nothing left over:
+//
+//     open  -> accept_routed(ref, from)      on the TARGET
+//     data  -> deliver_routed(ref, payload)  on the TARGET
+//     close -> release_routed(ref)           on the TARGET
+//     write -> write_to_ref(ref, payload)    on the ORIGIN
+//     drop  -> drop_route(ref)               on the ORIGIN
+//
+// The direction is carried, not inferred.  Inferring it from `ref.owner ==
+// my_owner_key()` reads correctly and is wrong for one case that already
+// exists in process: a runtime routing a connection to ITSELF, where both
+// halves of that test are true at once.  A byte costs less than the paragraph
+// explaining why the inference is safe, and the inference would not have been.
+//
+// ─── WHY `open` IS NOT HERE ─────────────────────────────────────────────────
+//
+// It is, as an op -- but the ASK that produces it travels the map socket as a
+// synchronous request, not as one of these frames.  These five are all
+// fire-and-forget, and `route()` is the one call in the set that owes its
+// script a true answer: it is written `if self.route(fd, "other") then`.
+//
+// The other four owe nothing.  `unroute()` decides from this runtime's own
+// table whether there was a route to remove, and is right about that without
+// asking anyone; `drop` and `close` are teardown, where there is no caller left
+// to answer; and `data` is the per-message path, where a round trip would cost
+// what this whole design has spent three steps avoiding -- see the note on
+// send_ref, which declines to answer for the same reason and says so at more
+// length.
+enum class route_op : uint8_t
+{
+    open  = 1,
+    data  = 2,
+    close = 3,
+    write = 4,
+    drop  = 5,
+};
+
+// `to` is the runtime the op is performed on, `from` the one that asked.  Both
+// are names rather than shard indices, because the two ends are different
+// RUNTIMES here and not two shards of one -- send_ref's trick of reading the
+// owning shard out of the ref's top six bits answers a question this frame is
+// not asking.  The daemon resolves `to` through the map it is the authority
+// for, which is also what stops a worker addressing a runtime that has gone.
+inline std::string encode_route_frame(std::string_view to, std::string_view from,
+                                      route_op op, const conn_ref& ref,
+                                      std::string_view payload)
+{
+    std::string out;
+    out.reserve(conn_ref_wire_size + 13 + to.size() + from.size() + payload.size());
+    put_str(out, to);
+    put_str(out, from);
+    out.push_back(static_cast<char>(op));
+    put_conn_ref(out, ref);
+    put_str(out, payload);
+    return out;
+}
+
+inline bool decode_route_frame(std::string_view payload_in, std::string& to,
+                               std::string& from, route_op& op, conn_ref& ref,
+                               std::string& payload)
+{
+    reader r(payload_in.data(), payload_in.size());
+    to   = std::string(r.str());
+    from = std::string(r.str());
+    const uint8_t raw = r.u8();
+    if (!r.ok)
+        return false;
+    // Refuse an op this build does not know rather than defaulting to one it
+    // does.  The two ends are separate processes with independent lifetimes and
+    // an upgrade can replace the binary under one of them -- the same rule
+    // conn_transfer.h states for its own framing, and the reason both carry a
+    // length prefix.  Defaulting would turn a newer peer's sixth op into a
+    // `data` delivery of the wrong bytes.
+    if (raw < static_cast<uint8_t>(route_op::open) ||
+        raw > static_cast<uint8_t>(route_op::drop))
+        return false;
+    op = static_cast<route_op>(raw);
+
+    const char* p   = r.p;   // reader leaves its cursor public; conn_ref is
+    const char* end = r.end; // taken by the pointer pair, as decode_send_ref does
+    if (!take_conn_ref(p, end, ref))
+        return false;
+    reader r2(p, static_cast<size_t>(end - p));
+    payload = std::string(r2.str());
+    return r2.ok;
+}
+
+// The argument to the `route` op above: which connection, and who owns it.
+// Rides in the map request's `config` field, which is a string and is therefore
+// allowed to be bytes -- the four map ops put JSON there and this one does not,
+// so the field is opaque to the transport and read by whoever handles the op.
+//
+// The target runtime is NOT in here: it is the request's `name`, which is where
+// every other op puts the runtime it is about, and duplicating it would create
+// two answers to one question.
+inline std::string encode_route_ask(const conn_ref& ref, std::string_view origin)
+{
+    std::string out;
+    out.reserve(conn_ref_wire_size + 4 + origin.size());
+    put_conn_ref(out, ref);
+    put_str(out, origin);
+    return out;
+}
+
+inline bool decode_route_ask(std::string_view payload, conn_ref& ref,
+                             std::string& origin)
+{
+    const char* p   = payload.data();
+    const char* end = payload.data() + payload.size();
+    if (!take_conn_ref(p, end, ref))
+        return false;
+    reader r(p, static_cast<size_t>(end - p));
+    origin = std::string(r.str());
     return r.ok;
 }
 

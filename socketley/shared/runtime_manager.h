@@ -18,6 +18,12 @@
 
 class event_loop;
 class cluster_discovery;
+
+// Forward-declared rather than included: route_relay.h includes THIS file's
+// neighbours (conn_identity, worker_protocol) and its implementation reaches
+// for server_instance, so including it here would drag the server into every
+// translation unit that only wants the map.
+namespace route_relay { struct sink; }
 struct cluster_event;
 
 class runtime_manager
@@ -272,6 +278,26 @@ public:
     bool map_mutate(std::string_view op, std::string_view name,
                     std::string_view config, std::string& err) const;
 
+    // ── A connection served here and answered somewhere else ───────────────
+    //
+    // The sixth sink, and the only one that is an interface rather than a
+    // std::function: it has two methods with different contracts -- four verbs
+    // that are posted and one that waits -- and a pair of functions would have
+    // let a process install half of it.
+    //
+    // Installed by whoever can reach another process: the daemon, which
+    // resolves a name to a supervisor, and a worker, which sends everything up
+    // for the daemon to resolve. Its presence is again what decides, so a
+    // runtime with nothing around it keeps the old behaviour of doing nothing
+    // for a target it cannot see -- correct there, because there really is no
+    // other process.
+    //
+    // Non-owning. The daemon_handler and the worker outlive their manager, and
+    // making this a unique_ptr would put a destruction order between them that
+    // neither needs.
+    void set_route_sink(route_relay::sink* sink) { m_route_sink = sink; }
+    route_relay::sink* route_sink() const { return m_route_sink; }
+
     // "The map has changed; let go of anything that names a runtime leaving
     // it."  The fourth of the same shape, and the one with no payload: what
     // crosses here is a moment, not an answer.
@@ -339,6 +365,7 @@ private:
     std::function<bool(std::string_view, std::string_view,
                        std::string_view, std::string&)> m_map_sink;
     std::function<void()> m_worker_release_sink;
+    route_relay::sink*    m_route_sink{nullptr};
 
     // Declared BEFORE the map and the graveyard, so that it is destroyed AFTER
     // them.  A runtime revokes its origin as it goes — ~server_instance calls

@@ -10,6 +10,7 @@
 #include "../shared/event_loop_definitions.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/shard_clients.h"
+#include "../shared/route_relay.h"
 #include "../cli/arg_parser.h"
 
 class event_loop;
@@ -51,7 +52,12 @@ struct ipc_connection
     std::string interactive_name;
 };
 
-class daemon_handler : public io_handler
+// route_relay::sink is the second base and it is an interface, not a mixin:
+// the daemon is the only process that can turn a runtime NAME into either an
+// object it may call or a child's socket, so it is the natural implementor.
+// See shared/route_relay.h for what the five verbs are and why one of them
+// waits.
+class daemon_handler : public io_handler, public route_relay::sink
 {
 public:
     daemon_handler(runtime_manager& manager, event_loop& loop);
@@ -561,6 +567,30 @@ private:
     // worker waiting on the answer would otherwise sit until its own deadline.
     void queue_map_request(uint64_t ticket, int reply_fd, std::string op,
                            std::string name, std::string config);
+
+    // ── route_relay::sink ──────────────────────────────────────────────────
+    //
+    // Public through the base, private as a name: nothing calls these except
+    // the manager, which was handed the base pointer.
+public:
+    void post(std::string_view to, std::string_view frm,
+              worker_proto::route_op op, const conn_ref& ref,
+              std::string_view payload) override;
+    bool open(std::string_view target, const conn_ref& ref,
+              std::string_view origin, std::string& err) override;
+
+private:
+    // One resolution for both directions.  post() arrives from an in-daemon
+    // runtime and on_worker_route() from a child, and the question they ask is
+    // identical: whose is `to`, and does this process hold it.  Two copies of
+    // that answer is how the two ends would come to disagree about which shard
+    // a routed connection lands on.
+    void route_dispatch(std::string_view to, std::string_view frm,
+                        worker_proto::route_op op, const conn_ref& ref,
+                        std::string_view payload);
+    void on_worker_route(proxy_supervisor* from, std::string_view to,
+                         std::string_view frm, worker_proto::route_op op,
+                         const conn_ref& ref, std::string_view payload);
 
     // Serve everything queued, answer each one, close each descriptor.  Called
     // from the nop's completion, so nothing on the stack belongs to a

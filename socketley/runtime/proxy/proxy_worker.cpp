@@ -24,6 +24,7 @@
 #include "../../shared/logging.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/runtime_config_apply.h"
+#include "../../shared/route_relay.h"
 #include "../../shared/runtime_factory.h"
 #include "../../shared/runtime_instance.h"
 #include "../../shared/runtime_manager.h"
@@ -309,7 +310,7 @@ private:
 // Arming the fd on this worker's own ring makes the wait end when the frame
 // arrives.  Everything else about the loop is unchanged: pump_control() still
 // runs every turn, so a missed arm costs latency, never a frame.
-class worker : public io_handler
+class worker : public io_handler, public route_relay::sink
 {
 public:
     explicit worker(int control_fd)
@@ -346,6 +347,23 @@ public:
                 [this](std::string_view op, std::string_view name,
                        std::string_view config, std::string& err) -> bool
                 { return map_request(op, name, config, err); });
+
+            // ── And routing, which needs BOTH descriptors ───────────────────
+            //
+            // Installed under the same condition as the map sink, and that is
+            // the whole reason it is inside this branch: four of its five verbs
+            // are frames on the control socket and would work without fd 6, but
+            // `open` is a question and has nowhere to ask it.  A route sink
+            // that could carry the traffic and not open the route would let a
+            // script start relaying into a connection the far end never
+            // accepted -- which is worse than the refusal, because it looks
+            // like it worked.
+            //
+            // Same binding-time reason for being here rather than in
+            // on_config(): lua_context asks route_sink() while it builds the
+            // table, and a script routes from on_connect, which can fire before
+            // anything else this worker does.
+            m_manager.set_route_sink(this);
         }
     }
 
@@ -1113,6 +1131,7 @@ private:
         {
             case worker_proto::frame_type::config:    on_config(payload);    break;
             case worker_proto::frame_type::deliver_ref: on_deliver_ref(payload); break;
+            case worker_proto::frame_type::route_down: on_route_down(payload); break;
             case worker_proto::frame_type::endpoints: on_endpoints(payload); break;
             case worker_proto::frame_type::runtime_map: on_runtime_map(payload); break;
             case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
@@ -2008,6 +2027,91 @@ private:
         if (!srv->write_to_ref(ref, message))
             LOG_DEBUG("proxy worker: a sibling's message named a connection "
                       "this shard no longer has");
+    }
+
+    // ── Routing: the four verbs that arrive, and the five that leave ────────
+    //
+    // A connection this worker's runtime does not own, being routed here by the
+    // runtime that does -- or a message for one it DID route away, coming back.
+    // Which of the five it is, is on the frame; see route_op, which says why
+    // the direction is carried rather than inferred from the ref.
+    void on_route_down(const std::string& payload)
+    {
+        std::string            to, frm, msg;
+        worker_proto::route_op op{};
+        conn_ref               ref{};
+        if (!worker_proto::decode_route_frame(payload, to, frm, op, ref, msg))
+        {
+            LOG_WARN("proxy worker: malformed route frame, dropped");
+            return;
+        }
+
+        if (!m_rt || m_rt->get_state() != runtime_running)
+            return;
+
+        // Against m_rt's own name and not against the manager's map.  The map
+        // out here is a replica of the daemon's and holds a row for this
+        // runtime too, so looking `to` up in it would resolve -- to a replica,
+        // which is not the object holding the connections.  There is exactly
+        // one runtime in this process and this is it.
+        if (to != m_rt->get_name())
+        {
+            LOG_WARN("proxy worker: a routing frame named another runtime; "
+                     "dropped");
+            return;
+        }
+
+        auto* srv = m_rt->as_server();
+        if (!srv)
+            return;   // only a server routes or is routed to
+
+        switch (op)
+        {
+            case worker_proto::route_op::open:
+                // Refused here is not refused at the origin: it was told yes
+                // from the map before this frame was ever written.  So the
+                // unwind travels back as a `drop`, which is the same message
+                // an origin gets when its target dies -- one path, already
+                // tested, rather than a second one for a rarer case.
+                if (srv->accept_routed(ref, frm) < 0)
+                    post(frm, to, worker_proto::route_op::drop, ref, {});
+                break;
+            case worker_proto::route_op::data:
+                srv->deliver_routed(ref, msg);
+                break;
+            case worker_proto::route_op::close:
+                srv->release_routed(ref);
+                break;
+            case worker_proto::route_op::write:
+                if (!srv->write_to_ref(ref, msg))
+                    LOG_DEBUG("proxy worker: a routed message named a "
+                              "connection this runtime no longer has");
+                break;
+            case worker_proto::route_op::drop:
+                srv->drop_route(ref);
+                break;
+        }
+    }
+
+    // route_relay::sink.  Everything this runtime does TO another one leaves
+    // here: four verbs as frames, and `open` as the one question, which goes up
+    // the map socket because it is the only descriptor this process may block
+    // on.  See encode_map_request for that, and route_op for why the other four
+    // do not wait.
+    void post(std::string_view to, std::string_view frm,
+              worker_proto::route_op op, const conn_ref& ref,
+              std::string_view payload) override
+    {
+        if (!m_writer.write(worker_proto::frame(
+                worker_proto::frame_type::route_up,
+                worker_proto::encode_route_frame(to, frm, op, ref, payload)))) {}
+    }
+
+    bool open(std::string_view target, const conn_ref& ref,
+              std::string_view origin, std::string& err) override
+    {
+        return map_request("route", target,
+                           worker_proto::encode_route_ask(ref, origin), err);
     }
 
     void on_publish(const std::string& payload)

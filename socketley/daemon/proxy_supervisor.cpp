@@ -184,6 +184,7 @@ uint32_t proxy_supervisor::retire()
     m_on_publish = nullptr;
     m_on_deliver = nullptr;
     m_on_send_ref = nullptr;
+    m_on_route   = nullptr;
     m_on_stats   = nullptr;
 
     if (!m_loop)
@@ -1505,6 +1506,20 @@ void proxy_supervisor::ingest(const std::string&)
                 break;
             }
 
+            case worker_proto::frame_type::route_up:
+            {
+                // A routing verb this child performed on a runtime it does not
+                // hold.  Decoded here and resolved by the handler, for the
+                // reason send_ref gives one line up: the daemon holds the map.
+                std::string        to, frm, rp;
+                worker_proto::route_op op{};
+                conn_ref           ref{};
+                if (m_on_route &&
+                    worker_proto::decode_route_frame(payload, to, frm, op, ref, rp))
+                    m_on_route(this, to, frm, op, ref, rp);
+                break;
+            }
+
             case worker_proto::frame_type::state:
                 // created / running / stopped are still not acted on, and for
                 // the reason that was always given: the daemon's own record is
@@ -1732,6 +1747,15 @@ bool proxy_supervisor::send_deliver_ref(const conn_ref& ref,
     return write_frame(worker_proto::frame(
         worker_proto::frame_type::deliver_ref,
         worker_proto::encode_send_ref(ref, message)));
+}
+
+bool proxy_supervisor::send_route(std::string_view to, std::string_view frm,
+                                 worker_proto::route_op op, const conn_ref& ref,
+                                 std::string_view payload)
+{
+    return write_frame(worker_proto::frame(
+        worker_proto::frame_type::route_down,
+        worker_proto::encode_route_frame(to, frm, op, ref, payload)));
 }
 
 void proxy_supervisor::on_chan_req(std::string_view payload)

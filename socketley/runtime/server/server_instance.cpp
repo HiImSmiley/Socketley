@@ -14,6 +14,7 @@
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/runtime_manager.h"
+#include "../../shared/route_relay.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/ws_protocol.h"
 #include "../../shared/invariants.h"
@@ -2410,13 +2411,7 @@ void server_instance::teardown(event_loop& loop)
     for (auto& [handle, fc] : m_forwarded)
     {
         (void)handle;
-        auto* mgr = get_runtime_manager();
-        if (mgr)
-        {
-            auto* origin = mgr->get(fc.origin);
-            if (auto* srv = origin ? origin->as_server() : nullptr)
-                srv->drop_route(fc.ref);
-        }
+        route_relay::drop(get_runtime_manager(), fc.origin, get_name(), fc.ref);
     }
     m_forwarded.clear();
     m_forwarded_by_ref.clear();
@@ -2434,12 +2429,8 @@ void server_instance::teardown(event_loop& loop)
     {
         auto* mgr = get_runtime_manager();
         for (const auto& [serial, target_name] : m_routes)
-        {
-            if (!mgr) break;
-            auto* target = mgr->get(target_name);
-            if (auto* srv = target ? target->as_server() : nullptr)
-                srv->release_routed(conn_ref{owner_key(), serial});
-        }
+            route_relay::close(mgr, target_name, get_name(),
+                               conn_ref{owner_key(), serial});
     }
 
     // Our own side: whatever we had routed away, and the serial index that
@@ -4161,20 +4152,20 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         auto rit = m_routes.find(sender->ref_serial);
         if (rit != m_routes.end())
         {
-            auto* mgr = get_runtime_manager();
-            if (mgr)
-            {
-                auto* target = mgr->get(rit->second);
-                if (target && target->get_state() == runtime_running)
-                {
-                    // The name, not the descriptor.  In one process this is the
-                    // same call it always was; the argument is what changed,
-                    // and it is the argument that decides whether the same call
-                    // still means anything once the target is elsewhere.
-                    if (auto* sub = target->as_server())
-                        sub->deliver_routed(conn_ref{owner_key(), sender->ref_serial}, msg);
-                }
-            }
+            // The name, not the descriptor.  In one process this is the same
+            // call it always was; the argument is what changed, and it is the
+            // argument that decides whether the same call still means anything
+            // once the target is elsewhere.
+            //
+            // The running check went with the lookup.  It read the target's
+            // state out of THIS process's map, which for a worker is a replica
+            // one push interval old — so it could withhold a message from a
+            // runtime that is running and pass one to a runtime that has
+            // stopped.  Whoever holds the target decides now: deliver_routed
+            // resolves the ref against what was actually accepted there, and a
+            // ref that names nothing is dropped rather than delivered.
+            route_relay::data(get_runtime_manager(), rit->second, get_name(),
+                              conn_ref{owner_key(), sender->ref_serial}, msg);
             return;
         }
     }
@@ -4451,16 +4442,10 @@ void server_instance::lua_broadcast(std::string_view msg)
     for (auto& [handle, fc] : m_forwarded)
     {
         (void)handle;
-        auto* mgr = get_runtime_manager();
-        if (mgr)
-        {
-            auto* origin = mgr->get(fc.origin);
-            if (origin && origin->get_state() == runtime_running)
-            {
-                if (auto* srv = origin->as_server())
-                    srv->write_to_ref(fc.ref, msg);
-            }
-        }
+        // Same removal as in the read path above, for the same reason: the
+        // state this used to test was this process's copy of somebody else's.
+        route_relay::write(get_runtime_manager(), fc.origin, get_name(),
+                           fc.ref, msg);
     }
 }
 
@@ -5680,37 +5665,51 @@ std::string server_instance::stats_extra() const
 
 // ── The Lua-facing half ─────────────────────────────────────────────────────
 
-bool server_instance::route_client(int client_id, std::string_view target_name)
+bool server_instance::route_client(int client_id, std::string_view target_name,
+                                   std::string* err)
 {
+    const auto fail = [&](const char* why) { if (err) *err = why; return false; };
+
     // A connection that was routed *here* is not ours to route on.  It used to
     // be indistinguishable from one of our own — both were "an int" — so this
     // was reachable and did something incoherent: it wrote a route for a
     // descriptor number belonging to a third runtime.
     if (is_conn_handle(client_id))
-        return false;
+        return fail("that connection was routed here from another runtime, so "
+                    "it is not this one's to route on");
 
     const conn_ref ref = ref_for_fd(client_id);
     if (!ref.valid())
-        return false;
+        return fail("that is not an open connection of this server");
 
     auto* mgr = get_runtime_manager();
-    if (!mgr) return false;
-
-    auto* target = mgr->get(target_name);
-    if (!target) return false;
+    if (!mgr) return fail("this runtime has no runtime manager");
 
     // Our own bookkeeping first, the notification second.  accept_routed runs
     // the target's on_connect, and a script is allowed to answer that by
     // closing the connection — which frees the struct m_conn_idx[client_id]
     // points at.  Touching that pointer afterwards would be a read of a pooled
     // connection at best.
-    auto* sub = target->as_server();
-    if (!sub) return false;
+    //
+    // The two pre-checks that used to stand here — get(target_name), then
+    // as_server() — have moved INTO route_relay::open, and with them the case
+    // they could not decide.  In a worker every other runtime is a replica, so
+    // as_server() answered null for a target that exists and is perfectly
+    // reachable, and this returned false having touched nothing.  In the daemon
+    // it answered the target's PLACEHOLDER, and the route was written into an
+    // object with no connections and reported as made.
+    //
+    // What that costs here is that a bad target is now discovered after the two
+    // lines below rather than before them, so it takes the rollback path.  That
+    // path was written to be taken and is safe to take: it resolves by serial
+    // precisely because it must not trust a descriptor number.
     m_routes[ref.serial] = std::string(target_name);
     m_conn_idx[client_id]->routed = true;
 
-    if (sub->accept_routed(ref, get_name()) >= 0)
+    std::string route_err;
+    if (route_relay::open(mgr, target_name, get_name(), ref, route_err))
         return true;
+    if (err) *err = std::move(route_err);
 
     // Refused.  Undo, and find the connection by name rather than by the
     // descriptor we were given: nothing ran in between here, but the rule that
@@ -5745,13 +5744,8 @@ bool server_instance::unroute_client(int client_id)
     m_routes.erase(it);
     m_conn_idx[client_id]->routed = false;
 
-    auto* mgr = get_runtime_manager();
-    if (mgr)
-    {
-        auto* target = mgr->get(target_name);
-        if (auto* srv = target ? target->as_server() : nullptr)
-            srv->release_routed(conn_ref{owner_key(), serial});
-    }
+    route_relay::close(get_runtime_manager(), target_name, get_name(),
+                       conn_ref{owner_key(), serial});
     return true;
 }
 
@@ -5804,14 +5798,16 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
             return true;
         }
 
-        auto* mgr = get_runtime_manager();
-        if (!mgr) return false;
-        auto* origin = mgr->get(it->second.origin);
-        if (!origin || origin->get_state() != runtime_running) return false;
-        auto* srv = origin->as_server();
-        if (!srv) return false;
-
-        return srv->write_to_ref(ref, msg);
+        // ─── ANOTHER RUNTIME'S CONNECTION, ROUTED HERE ──────────────────────
+        //
+        // The eighth site of the same shape, and the one that made the feature
+        // look half-built: with the other seven moved to route_relay a routed
+        // client's on_connect fired, its messages arrived and owner_send got
+        // back to it, but `self.send(handle, msg)` -- the ordinary way a script
+        // answers -- still resolved the origin through as_server() and found a
+        // replica.  So the sub-server was reachable and could not reply.
+        return route_relay::write(get_runtime_manager(), it->second.origin,
+                                  get_name(), ref, msg);
     }
 
     if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return false;
@@ -5843,15 +5839,8 @@ bool server_instance::owner_send(int client_id, std::string_view msg)
     if (it == m_forwarded.end())
         return false;
 
-    auto* mgr = get_runtime_manager();
-    if (!mgr) return false;
-
-    auto* origin = mgr->get(it->second.origin);
-    if (!origin || origin->get_state() != runtime_running) return false;
-    auto* srv = origin->as_server();
-    if (!srv) return false;
-
-    return srv->write_to_ref(it->second.ref, msg);
+    return route_relay::write(get_runtime_manager(), it->second.origin,
+                              get_name(), it->second.ref, msg);
 }
 
 // ── The cross-runtime half ──────────────────────────────────────────────────
@@ -5994,12 +5983,27 @@ bool server_instance::owner_broadcast(std::string_view msg)
     // found nothing at all out there and answered false; with the replica map
     // and the old cast it would have run server_instance's code over a replica.
     auto* parent = mgr->get(owner_name);
-    if (!parent || parent->get_state() != runtime_running) return false;
-    auto* srv = parent->as_server();
-    if (!srv) return false;
+    if (!parent) return false;
 
-    srv->lua_broadcast(msg);
-    return true;
+    // In this process, and running: both still required, and the second is
+    // still read locally because for an IN-PROCESS parent this map is the
+    // authority rather than a copy of one.
+    if (auto* srv = route_relay::local_server(mgr, owner_name))
+    {
+        if (parent->get_state() != runtime_running) return false;
+        srv->lua_broadcast(msg);
+        return true;
+    }
+
+    // Out of process.  Not one of routing's five verbs -- it broadcasts to a
+    // runtime rather than addressing one connection -- so it travels the sink
+    // that already exists for exactly that, the one socketley.send(name, msg)
+    // uses.  Fixed here because it is the same family as the eight above and
+    // was failing the same way: as_server() answered null for a parent that is
+    // merely elsewhere, and a sub-server's owner_broadcast returned false
+    // having reached nobody.  It predates this branch; every runtime has been
+    // out of process by default since 2313c26.
+    return mgr->deliver_out_of_process(owner_name, msg);
 }
 
 int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
