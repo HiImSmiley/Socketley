@@ -46,19 +46,9 @@ void client_instance::set_mode(client_mode mode)
     const client_mode was = m_mode;
     m_mode = mode;
 
-    // Switching a running client out of send-only mode has to start it reading.
-    //
-    // arm_read() declines while the mode is client_mode_out, so a client started
-    // that way has never had a read armed and nothing else ever arms one: every
-    // read this runtime submits comes from a completion, and with none in flight
-    // there are no completions.  `socketley edit <name> --mode in` is allowed on
-    // a running client — it is one of the few edit flags with no "cannot change
-    // while running" guard — so before this it changed the field, reported
-    // success, and left the client connected and receiving nothing until it lost
-    // the connection and dialled again.
-    //
-    // The other direction needs nothing: a read already in the ring completes as
-    // it always would, and arm_read() simply declines to replace it.
+    // Switching a running client out of send-only mode has to start it
+    // reading, because arm_read() declines in client_mode_out and every read
+    // comes from a completion, so with none in flight there are none.
     if (was == client_mode_out && mode != client_mode_out)
         arm_read();
 }
@@ -83,31 +73,9 @@ size_t client_instance::get_connection_count() const
     return m_connected ? 1 : 0;
 }
 
-// ─── EVERYTHING A CLIENT'S SOCKET NEEDS, IN ONE PLACE ───────────────────────
-//
-// try_connect() creates the socket twice -- once, and again after a cached DNS
-// answer turns out to be stale -- and each copy set TCP_NODELAY for itself.
-// Two is how three starts, and the option below is exactly the kind that gets
-// added to one of them: the second socket is on the *reconnect* path, which is
-// the path that needs it most.
-//
-// SO_KEEPALIVE, because a peer can go away without saying so.  A FIN or an RST
-// is a message, and a client acts on either the moment it arrives; a machine
-// that loses power, a link that partitions, a firewall that forgets an idle
-// flow -- none of those send anything.  The socket then stays ESTABLISHED
-// against nothing, and an idle client never writes, so it never finds out.
-// With --reconnect that is the worse half: the runtime believes it is connected
-// and therefore never reconnects, which is the documented promise not kept.
-//
-// The kernel's own default idle is two hours.  60s idle, 10s between probes,
-// 3 probes puts detection at about 90 seconds -- one packet every 60s per idle
-// connection, which is nothing, against a promise that otherwise waits until
-// after lunch.  No flag: a knob here would be a number nobody has a reason to
-// pick, and the failure it guards is not one an operator can see coming.
-//
-// This is the client's own outbound socket.  A server's accepted connections
-// are covered by --idle-timeout, which is a different question -- "this peer
-// has nothing to say" rather than "this peer is gone".
+// Everything a client's socket needs in one place, TCP_NODELAY and
+// SO_KEEPALIVE at 60/10/3 -- because a peer that loses power sends nothing, an
+// idle client never writes, and --reconnect's promise is then never kept.
 static void tune_client_socket(int fd, bool udp)
 {
     if (udp)
@@ -132,14 +100,9 @@ bool client_instance::try_connect()
 
     auto target = get_target();
 
-    // ─── -t unix:/path — the connect side of --listen unix: ─────────────────
-    //
-    // The address rules are shared/unix_listener.h's, the same ones the
-    // listener binds with; setup() has already refused a path that fails them
-    // and the --udp/--tls pairs.  No resolver, no cached-address dance: the
-    // path IS the address.  No tune_client_socket either — everything it sets
-    // is a TCP-level option or a TCP keepalive timer, and a unix peer that
-    // goes away is reported by the socket itself, not probed for.
+    // `-t unix:/path` needs no resolver and no tune_client_socket, because the
+    // path is the address and a unix peer that goes away is reported by the
+    // socket rather than probed for.
     if (target.starts_with("unix:"))
     {
         const std::string_view upath = target.substr(5);
@@ -149,10 +112,9 @@ bool client_instance::try_connect()
 
         struct sockaddr_un uaddr{};
         const socklen_t ulen = socketley::unix_sock::fill_addr(upath, uaddr);
-        // A non-blocking AF_UNIX connect is not TCP's: it either completes
-        // now or fails now — EAGAIN (a full backlog) included, since unlike
-        // EINPROGRESS nothing will finish it later.  A failure here is what
-        // the reconnect machinery exists for.
+        // A non-blocking AF_UNIX connect either completes now or fails now,
+        // EAGAIN included, because unlike EINPROGRESS nothing will finish it
+        // later.
         if (connect(m_conn->fd, reinterpret_cast<struct sockaddr*>(&uaddr), ulen) < 0)
         {
             close_tracked(m_conn->fd);
@@ -176,10 +138,8 @@ bool client_instance::try_connect()
         }
     }
 
-    // The name a TLS peer's certificate has to be valid for, taken here because
-    // this is the only place the host is known and taken *before* the resolver
-    // runs.  It is what the operator typed, never what DNS answered and never
-    // what the certificate says about itself: a name read back out of either
+    // The name a TLS peer's certificate has to be valid for, taken before the
+    // resolver runs, because a name read back from DNS or the certificate
     // would verify the peer against its own claim.
     m_tls_peer_name = host;
 
@@ -212,9 +172,9 @@ bool client_instance::try_connect()
     }
 
     {
-    // A literal address needs no resolver.  getaddrinfo runs on the event loop
-    // thread and stalls every other connection this runtime serves for as long
-    // as it takes, so the common case — a configured IP — must not enter it.
+    // A literal address needs no resolver, because getaddrinfo runs on the
+    // event loop thread and stalls every other connection for as long as it
+    // takes.
     {
         struct sockaddr_in lit{};
         lit.sin_family = AF_INET;
@@ -286,51 +246,35 @@ connected:
     m_conn->partial.reserve(65536);
     m_conn->closing = false;
 
-    // The session goes on the socket before anything is read from it, and the
-    // ClientHello is the first thing this connection sends.  A failure here is
-    // local — no session could be built, or the first flight did not reach the
-    // ring — and it costs the socket: there is deliberately no path from a
-    // refused session to a cleartext dial, which is the whole point of --tls.
-    //
-    // The connect may still be in flight at this point; that is as true of the
-    // read and the queued write below, and the ring holds a submission on a
-    // connecting socket until it is writable exactly as it always has.
+    // The session goes on the socket before anything is read from it, and a
+    // failure costs the socket -- there is deliberately no path from a refused
+    // session to a cleartext dial.
     if (m_tls && !start_tls())
     {
         drop_connection();
         return false;
     }
 
-    // read_pending and write_pending are deliberately left alone.  There is one
-    // read request and one write request in this struct, and a previous socket's
-    // operation can still be holding one of them, since a request is occupied
-    // until its completion arrives and no earlier.  Clearing the flags here and
-    // arming again would point a second kernel read at m_conn->read_buf while
-    // the first is still writing into it.  Across a stop it is setup() that
-    // settles this, by asking the loop rather than guessing — see there.
+    // read_pending and write_pending are deliberately left alone, because a
+    // previous socket's operation can still hold one of the two requests and
+    // arming again would point a second kernel read at the same buffer.
     arm_read();
     flush_queued_write();
 
     return m_connected;
 }
 
-// The one place a read is armed.  Never while one is already armed: both would
-// be writing into m_conn->read_buf, and the second's bytes would land in the
-// middle of the first's.
+// The one place a read is armed, never while one already is, because both
+// would write into m_conn->read_buf.
 void client_instance::arm_read()
 {
     if (!m_loop || !m_connected || m_conn->closing || m_conn->fd < 0)
         return;
     if (m_conn->read_pending)
         return;
-    // `--mode out` says this runtime delivers no application data, and on a
-    // cleartext socket that means it never reads at all.  A TLS session cannot
-    // be run that way: the handshake, the peer's alerts and its session tickets
-    // all arrive on this socket, and a client that never reads would send its
-    // ClientHello and wait forever for a ServerHello nothing was going to
-    // collect.  So a TLS connection always reads, and handle_read drops the
-    // plaintext instead — the mode is honoured where the data would be
-    // delivered, not by refusing to run the transport.
+    // A TLS connection always reads even in `--mode out`, because the
+    // handshake, alerts and session tickets arrive on this socket, and
+    // handle_read drops the plaintext instead.
     if (m_mode == client_mode_out && !m_conn->ssl)
         return;
 
@@ -349,9 +293,9 @@ void client_instance::arm_read()
         drop_connection();
 }
 
-// The one place a write is armed.  Stamped like the read with the socket it
-// belongs to, so a completion left over from a socket this client has already
-// lost cannot push the remains of that conversation into the current one.
+// The one place a write is armed, stamped with the socket it belongs to so a
+// completion from a lost socket cannot push that conversation into the current
+// one.
 void client_instance::arm_write(const char* data, uint32_t len)
 {
     m_conn->write_req = { this, const_cast<char*>(data), m_conn->fd, len, op_write,
@@ -369,11 +313,9 @@ void client_instance::flush_queued_write()
     if (!m_loop || !m_connected || m_conn->write_pending)
         return;
 
-    // A TLS connection's bytes go through the record layer, which is the only
-    // thing allowed to put one on the wire.  Checked ahead of `closing` and not
-    // after it: a session that is on its way down still owes the peer the alert
-    // that says why, and that alert is sitting in the write BIO with an empty
-    // queue in front of it.
+    // A TLS connection's bytes go through the record layer, checked ahead of
+    // `closing` because a session on its way down still owes the peer the
+    // alert that says why.
     if (m_conn->ssl)
     {
         tls_flush();
@@ -403,37 +345,16 @@ void client_instance::drop_connection()
     }
     tls_release();
     m_connected = false;
-    // A refusal here has nowhere to recover to: the socket is already gone and
-    // nothing else re-drives the clock.
-    //
-    // mark_failed() is authoritative for an in-daemon client and WORKER-LOCAL
-    // for every other one, and the difference is measured rather than assumed.
-    // Same probe build, timer submission forced to fail:
-    //
-    //   in the daemon      start refused, `ls` reads Failed, 2 log lines
-    //   worker-backed      start reports success, `ls` reads Up, 1 log line
-    //   worker, healthy    start reports success, `ls` reads Up, 0 log lines
-    //
-    // The first row was reached with --daemon-process, which no longer exists.
-    // It is kept because it is the CONTRAST that gives the second row its
-    // meaning, and because it is what the daemon's own placeholder still does
-    // on the paths that run there.
-    //
-    // So in a worker the log IS the report, and it is the only one, because a
-    // worker's state does not reach the daemon's placeholder.  That gap is
-    // bigger than this fix and is not closed here — it is named so the next
-    // reader does not mistake the call for something it does in every case.
+    // A refused timer has nowhere to recover to, and mark_failed() is
+    // authoritative in the daemon and worker-local everywhere else -- so out
+    // here the log is the report, which is a gap named rather than closed.
     if (!schedule_reconnect())
         mark_failed();
 }
 
-// A session belongs to one socket and dies with it.  Carrying one across a
-// reconnect would leave the record layer half a handshake ahead of a peer that
-// has never heard from us, and every byte after that undecryptable.
-//
-// Safe to do with a write still in flight: the ciphertext the kernel is reading
-// lives in m_conn->write_buf, which this struct owns, and nothing inside the
-// SSL is ever named by an SQE.  That is what the memory BIO pair buys.
+// A session belongs to one socket and dies with it, safe to release with a
+// write in flight because the ciphertext lives in write_buf and nothing inside
+// the SSL is ever named by an SQE.
 void client_instance::tls_release()
 {
     if (m_conn->ssl)
@@ -453,10 +374,8 @@ void client_instance::return_provided_buf(struct io_uring_cqe* cqe)
         static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
 }
 
-// A completion that belongs to a socket we no longer have, or that arrived
-// while the runtime is stopped.  It is not acted on, but it is not nothing
-// either: the buffer it carries belongs to the shared group, and the request it
-// names is free to be armed again only once this has arrived.
+// A completion for a socket we no longer have, not acted on but settled, so
+// the buffer goes back and the request becomes free to arm again.
 void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
 {
     return_provided_buf(cqe);
@@ -476,21 +395,9 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     }
 }
 
-// ─── WHAT true MEANS HERE, BECAUSE THREE OF THE RETURNS ARE NOT SUBMISSIONS ──
-//
-// The question a caller asks is not "did you submit a timer?" but "is there
-// anything left that will bring this client back, or should I stop claiming
-// there is?".  Three of the four exits answer yes without submitting anything,
-// and answering them `false` would mark a healthy runtime failed:
-//
-//   reconnect disabled   -- nothing is owed; drop_connection() calls this on
-//                           every client, including the ones that never retry
-//   attempts exhausted   -- the operator's own limit, reached as configured
-//   already pending      -- the clock is armed; this call is the no-op that
-//                           keeps two reconnect chains from racing
-//
-// Only a refused submission is false, and that is the one case where nothing
-// will ever run again.
+// True means something will bring this client back rather than that a timer
+// was submitted, because three of the four exits owe nothing and only a
+// refused submission means nothing will ever run again.
 bool client_instance::schedule_reconnect()
 {
     int max = get_reconnect();
@@ -500,9 +407,8 @@ bool client_instance::schedule_reconnect()
     if (max > 0 && m_reconnect_attempt >= max)
         return true; // The configured limit, reached as asked
 
-    // One timer, one request slot.  Arming it again while the kernel still
-    // holds it gives the client two reconnect chains racing to open a socket,
-    // and the loser's fd is leaked when the winner overwrites m_conn->fd.
+    // One timer and one request slot, because arming it again while the kernel
+    // holds it races two reconnect chains and leaks the loser's fd.
     if (m_reconnect_pending)
         return true; // Already armed — that IS the clock running
 
@@ -519,17 +425,9 @@ bool client_instance::schedule_reconnect()
     m_conn->timeout_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
     m_reconnect_pending = m_loop->submit_timeout(&m_conn->timeout_ts, &m_conn->timeout_req);
 
-    // ─── A refused timer here is the end of this client, not a hiccup ────────
-    //
-    // Nothing else re-drives the reconnect clock: the three callers are
-    // drop_connection(), setup() and handle_timeout(), and every one of them
-    // is fire-and-forget.  So a refusal leaves a runtime that reports
-    // `running`, holds no connection, and will never dial again — silently.
-    //
-    // Said in words rather than as a code, the way the proxy states its own
-    // timer refusals and the way teardown() below already states the
-    // withdrawal: the operator can see a log line, and cannot see a bool that
-    // was dropped on the floor.
+    // A refused timer here is the end of this client, because all three
+    // callers are fire-and-forget, and it is said in words rather than as a
+    // code the operator cannot see.
     if (!m_reconnect_pending)
         LOG_ERROR("client: the reconnect timer could not be submitted — this "
                   "client is disconnected and will not dial again on its own; "
@@ -543,43 +441,10 @@ bool client_instance::setup(event_loop& loop)
     m_loop = &loop;
     m_ring_loop = &loop;
 
-    // ── what an earlier run armed and never saw the end of ──────────────────
-    //
-    // This runtime has one read request, one write request and one reconnect
-    // timer, all living in m_conn and all reused for as long as that struct
-    // does.  The three flags below say "this one is occupied, do not arm it
-    // again"; they are raised when it is armed and lowered by its completion.
-    //
-    // Only by a completion the loop *delivers*, though.  stop() deregisters this
-    // owner, and from that moment the loop drops this instance's completions
-    // instead of dispatching them — so neither on_cqe nor settle_stale runs, and
-    // the flag is never lowered.  It then survives into the next run, where
-    // arm_read() declines to arm a read it believes is already in flight: the
-    // client connects and is deaf for the rest of the process.  Same for the
-    // write request, whose queue is then never flushed, and for the reconnect
-    // timer, which can never be scheduled again.  A stop followed by a start was
-    // all it took.
-    //
-    // Clearing the flags is not on its own an answer — the kernel really may
-    // still be writing into read_buf and reading out of write_buf, which is why
-    // teardown leaves them standing.  So this asks the loop, which is the only
-    // thing that knows: owner_inflight() counts what is still in the ring for
-    // this handler over every registration it has ever held, whatever became of
-    // the completions.
-    //
-    //   zero      — every request in m_conn is free.  Lower the flags, and
-    //               release the structs earlier runs left behind.
-    //   non-zero  — something really is still in the ring.  The old struct keeps
-    //               it and this run takes a fresh one; the old one is not freed,
-    //               because the loop reads the request inside it to drop its
-    //               completion.  This is the `restart` path: stop() and start()
-    //               in one loop iteration, with nothing reaping the ring in
-    //               between.
-    //
-    // owner_table_full() is the case owner_inflight() cannot answer: a handler
-    // that never got a slot reads zero whatever it has outstanding, so a full
-    // table takes the conservative branch rather than acting on a zero that
-    // means "unknown".
+    // The three occupied flags survive a stop, because a deregistered owner's
+    // completions are dropped and never lower them, so this asks the loop --
+    // zero frees the old struct, non-zero takes a fresh one, and a full owner
+    // table takes the conservative branch.
     if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
     {
         m_conn->read_pending  = false;
@@ -595,27 +460,10 @@ bool client_instance::setup(event_loop& loop)
     }
 
     // ── TLS ─────────────────────────────────────────────────────────────────
-    //
-    // The CA file and the client certificate are read and parsed here, at
-    // setup, before a single completion is armed.  That is file I/O and it
-    // blocks, which is exactly why it happens here and nowhere near the event
-    // loop: the handshake itself never touches a file and never touches a
-    // socket — see tls_feed/tls_flush.
-    //
-    // Rebuilt on every start, which is what makes `reload` — a stop followed by
-    // a start — the way a renewed certificate is installed, exactly as it is on
-    // a server.
-    //
-    // Every refusal below returns false, which puts the runtime in the failed
-    // state.  None of them may fall through to a cleartext dial: a client that
-    // asked for encryption and connected in the clear is the one outcome the
-    // operator cannot see, because `inspect` would go on reporting TLS.
-    // ─── -t unix:/path — the connect side of --listen unix: ─────────────────
-    //
-    // Judged here rather than only in the flag parser, for the listener's
-    // reason: setup() is on the restore and import paths the parser never
-    // sees.  Before the TLS block, so a doomed configuration is refused
-    // without loading certificates it may not use.
+    // The CA file and client certificate are read here, at setup, because that
+    // is blocking file I/O and the handshake itself touches neither file nor
+    // socket -- and every refusal returns false rather than falling through to
+    // a cleartext dial, which `inspect` would still report as TLS.
     if (const std::string_view target = get_target(); target.starts_with("unix:"))
     {
         if (const std::string why =
@@ -647,15 +495,13 @@ bool client_instance::setup(event_loop& loop)
     if (get_tls())
     {
         auto ctx = std::make_unique<tls_context>();
-        // --ca is this client's trust store; without one the system store is
-        // used.  Either way the chain is verified and the peer's name is
-        // checked per connection (see start_tls) -- there is deliberately no
-        // way to turn either off.  --cert/--key are the certificate this client
-        // presents when the peer asks for one.
+        // --ca is this client's trust store and the system store is used
+        // without one, with the chain and the peer's name always checked;
+        // --cert/--key are what this client presents.
         if (!ctx->init_client(get_ca_path(), get_cert_path(), get_key_path()))
         {
             // init_client has already said which file and what OpenSSL made of
-            // it.  This says what it cost.
+            // it, so this says what it cost.
             LOG_ERROR("client: TLS not started -- the CA file or the client "
                       "certificate could not be loaded");
             return false;
@@ -667,12 +513,8 @@ bool client_instance::setup(event_loop& loop)
 
     if (!try_connect())
     {
-        // If reconnect enabled, schedule first attempt.
-        //
-        // Checked, because "we'll connect later" is only true if the clock that
-        // makes it later was actually armed.  Returning true on a refused
-        // submission is the shape of the defect this tree has already had once:
-        // a start that failed, recorded as running, answering nothing.
+        // Checked, because "we'll connect later" is only true if the clock
+        // that makes it later was actually armed.
         if (get_reconnect() >= 0)
             return schedule_reconnect();
         return false;
@@ -689,38 +531,23 @@ void client_instance::teardown(event_loop& loop)
 
     if (m_conn->fd >= 0)
     {
-        // A read and a write can both be in flight on this socket, and closing
-        // alone leaves them armed on m_conn->read_buf and m_conn->write_buf,
-        // which the next start() would hand straight to a new socket.
-        //
-        // Cancelling first was the old defence and it was half of one: flush()
-        // hands the SQE to the ring and returns, so nothing here waited for the
-        // kernel to look at either the cancel or the read.  This runtime is the
-        // clearest case of why that matters — one read request and one write
-        // request reused across reconnects, and a socket number the kernel
-        // hands straight back on the next connect(), so an unconsumed read
-        // resolved after the reconnect reads the *new* connection's bytes into
-        // a buffer the old completion still owns.  close_fd submits the cancel
-        // and holds the number until both have reported.
+        // close_fd submits the cancel and holds the number until both
+        // operations report, because this runtime reuses one read and one
+        // write request and the kernel hands the socket number straight back
+        // on the next connect.
         shutdown(m_conn->fd, SHUT_RDWR);
         close_tracked(m_conn->fd);
         m_conn->fd = -1;
     }
 
-    // The socket is gone, so the session is finished whatever it was doing.
-    // Released here rather than left for the destructor because this struct can
-    // outlive the stop — see the comment on m_conn_spent in setup() — and a
-    // session held across a start would be a handshake this client believes it
-    // is halfway through and the next peer has never heard of.
+    // The socket is gone so the session is finished, released here because
+    // this struct can outlive the stop and a session held across a start is a
+    // handshake the next peer never heard of.
     tls_release();
 
-    // The reconnect timer is attached to no fd: the cancel above could not reach
-    // it, and it can be up to thirty seconds from firing.  Thirty seconds during
-    // which the ring still owes this owner a completion, which is what the
-    // manager waits on before it frees a removed runtime — so a client removed
-    // while backing off was never freed at all on any reap that ran in between,
-    // and the whole instance stayed in the graveyard.  Withdraw it instead: the
-    // timeout still reports, with -ECANCELED, only now rather than later.
+    // The reconnect timer is attached to no fd, so the cancel could not reach
+    // it and the ring would owe this owner a completion for up to thirty
+    // seconds -- during which a removed runtime is never freed.
     if (m_reconnect_pending)
     {
         if (!loop.submit_timeout_remove(&m_conn->timeout_req))
@@ -729,16 +556,9 @@ void client_instance::teardown(event_loop& loop)
         loop.flush();
     }
 
-    // Its request keeps its owner all the same.  The loop reads the request
-    // when that completion lands — to decide whether to deliver it, and to count
-    // it off this owner's tally — so it has to go on pointing at memory that is
-    // there, which retirement guarantees and a null does not.
-    //
-    // The pending flags are left standing for the same reason they are in
-    // try_connect: the request stays occupied until its completion arrives, and
-    // a withdrawn timeout is still owed exactly one.  Clearing m_reconnect_pending
-    // here would let a start() in this same loop iteration arm a second timeout
-    // on a request the kernel is still carrying one for.
+    // Its request keeps its owner, because the loop reads the request when the
+    // completion lands, and the pending flags are left standing since a
+    // withdrawn timeout is still owed exactly one.
     m_connected = false;
     m_conn->closing = false;
     m_conn->partial.clear();
@@ -755,12 +575,8 @@ void client_instance::on_cqe(struct io_uring_cqe* cqe)
     if (!req)
         return;
 
-    // Stopped, or the completion belongs to a socket we have already lost: not
-    // acted on, but settled, so the buffer goes back and the request it names
-    // becomes free to arm again.  Acting on it instead would put the tail of a
-    // finished conversation into the current one — the descriptor number alone
-    // cannot tell the two apart, because the kernel hands the closed one
-    // straight back to the next connect.
+    // Stopped, or belonging to a socket already lost: not acted on but
+    // settled, because the descriptor number alone cannot tell the two apart.
     if (!m_loop || req->generation != m_conn_generation)
     {
         settle_stale(cqe, req);
@@ -807,13 +623,9 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         if (is_provided && cqe->res == -ENOBUFS)
         {
             m_conn->read_pending = true;
-            // Reset the request type: the fallback is a plain read into the
-            // connection's own buffer, not a provided-buffer one.  Leaving it
-            // as a recv/provided type makes the completion handler treat the
-            // result as a buffer-ring delivery — it then appends whatever sits
-            // in ring buffer 0 instead of the bytes just read, discards those
-            // bytes, and returns a buffer it never took, corrupting the ring's
-            // free list.
+            // Reset the request type, because leaving it as a provided-buffer
+            // type makes the handler append ring buffer 0's contents and
+            // return a buffer it never took.
             m_conn->read_req.type = op_read;
             m_conn->read_pending = m_loop->submit_read(m_conn->fd, m_conn->read_buf,
                                                       sizeof(m_conn->read_buf), &m_conn->read_req);
@@ -900,11 +712,9 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         m_conn->partial.append(m_conn->read_buf, cqe->res);
     }
 
-    // A send-only TLS client reads because the record layer has to (see
-    // arm_read), and what comes out the far side is application data this mode
-    // says the runtime does not deliver.  Dropped here rather than parsed:
-    // otherwise turning on --tls would quietly start printing and dispatching
-    // messages that `--mode out` exists to say no to.
+    // A send-only TLS client reads because the record layer has to, so the
+    // application data is dropped here rather than parsed -- otherwise --tls
+    // would quietly start delivering what `--mode out` says no to.
     if (m_conn->ssl && m_mode == client_mode_out)
         m_conn->partial.clear();
 
@@ -940,17 +750,9 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
     }
 
 resubmit:
-    // ── the TLS half of the same idea ──
-    // The peer's close_notify is applied here rather than where it was read:
-    // the read that carried it can carry a last line ahead of it, and marking
-    // the connection closing any earlier would have thrown that line away.
-    //
-    // Then one flush for everything the record layer owes the wire — the next
-    // handshake flight, an alert explaining a handshake that just failed, a
-    // session ticket, and whatever lua_send queued while the handshake was
-    // still running.  Every path through this function reaches this label, so
-    // nothing is left sitting in a BIO waiting for a completion that has no
-    // reason to come.
+    // close_notify is applied here rather than where it was read, because the
+    // same read can carry a last line ahead of it, and one flush then covers
+    // everything the record layer owes the wire.
     if (m_conn->ssl)
     {
         if (m_conn->tls_peer_closed)
@@ -958,14 +760,9 @@ resubmit:
         tls_flush();
     }
 
-    // A connection marked closing with nothing left in flight has nobody to
-    // notice it.  arm_read() declines while closing, so no completion is
-    // coming; the client sat connected and deaf, on an open socket, until the
-    // runtime was stopped — and with reconnect configured it never dialled
-    // again either, because nothing had told it the connection was gone.  Two
-    // paths reach that state: a line longer than MAX_PARTIAL_SIZE, and now a
-    // handshake or a record the session refused.  Every other way of losing the
-    // socket goes through drop_connection; this one used to just stop.
+    // A connection marked closing with nothing in flight has nobody to notice
+    // it, because arm_read() declines while closing, so the client sat
+    // connected and deaf and never dialled again.
     if (m_conn->closing && !m_conn->write_pending && m_connected)
     {
         drop_connection();
@@ -975,39 +772,11 @@ resubmit:
     arm_read();
 }
 
-// ─── THE TWO read_pending GUARDS BELOW, AND WHY THEY STAY ───────────────────
-//
-// Both of them defer a teardown to an armed read, which is the shape
-// shared/conn_reachability.h exists to refuse: an armed read is ended by the
-// peer sending something or by the socket ending, and a connection that is
-// `closing` is one whose peer has already gone.  It cost the cache a stranded
-// connection (87d2c9d) and the server one too, and here the stakes are higher
-// per occurrence rather than lower — a client has exactly one connection, so a
-// stranded one means the whole runtime sits connected and deaf and, with
-// --reconnect configured, never dials again, because drop_connection() is the
-// only thing that would tell it the connection was gone.
-//
-// It is nevertheless left alone, for the same reason as the proxy and with the
-// same two properties named:
-//
-//   * the read is SINGLE-SHOT (op_read / op_read_provided), never multishot, so
-//     it is re-armed per completion rather than parked in the kernel across
-//     them, and arm_read() is the one place that does it;
-//   * it is armed on the DESCRIPTOR, never on a fixed-file index — this file
-//     mentions neither multishot nor fixed files anywhere — so close_fd() can
-//     withdraw it, which free_fixed_file_slot() explains is exactly what a
-//     fixed-index submission does not allow.
-//
-// MEASURED, and it is a weaker measurement than the other two.  A client in
-// --mode inout with a 60 KB write in flight, reset by its peer with
-// SO_LINGER (on, 0): 109 consecutive resets, 109 reconnects, no stranding.  109 is
-// not 15,000, and "not reproduced in 109 trials" is not "it is not there" — what
-// makes this a decision rather than a gap is the two properties above, not the
-// run length.  A reproducer would move it, and it would move it here.
-//
-// One shape is immune by construction and worth knowing: in --mode out on a
-// cleartext socket arm_read() declines outright, so read_pending is false for
-// the life of the connection and both guards always fire.
+// The two read_pending guards defer a teardown to an armed read, which
+// conn_reachability.h refuses, and are left alone because the read is
+// single-shot and armed on the descriptor -- 109 resets reproduced no
+// stranding, which is a weaker measurement than the other two and is named as
+// one.
 void client_instance::handle_write(struct io_uring_cqe* cqe)
 {
     m_conn->write_pending = false;
@@ -1032,10 +801,9 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     }
     m_conn->write_off = 0;
 
-    // Flush queued writes before checking closing state.  flush_queued_write
-    // routes a TLS connection through the record layer, which is what turns
-    // this completion into the next handshake flight or the next batch of
-    // encrypted messages — the session makes no progress on its own.
+    // Flush queued writes before checking closing state, because
+    // flush_queued_write is what turns this completion into the next handshake
+    // flight.
     flush_queued_write();
     if (m_conn->write_pending)
         return;
@@ -1052,9 +820,8 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe)
     if (cqe->res != -ETIME && cqe->res != 0)
         return;
 
-    // A timer that outlived what it was waiting for.  The socket is already up,
-    // and dialling again here would overwrite m_conn->fd and leak the one it
-    // replaced.
+    // A timer that outlived what it was waiting for, since dialling again here
+    // would overwrite m_conn->fd and leak the one it replaced.
     if (m_connected)
         return;
 
@@ -1063,8 +830,8 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe)
     if (try_connect())
         return; // Reconnected successfully
 
-    // Failed — schedule another attempt.  Same reasoning as drop_connection():
-    // if the clock cannot be re-armed there is no later attempt to wait for.
+    // Failed, so schedule another attempt, because if the clock cannot be
+    // re-armed there is no later attempt to wait for.
     if (!schedule_reconnect())
         mark_failed();
 }
@@ -1090,11 +857,8 @@ void client_instance::process_message(std::string_view msg)
     }
 }
 
-// Whether the message was written or queued.
-//
-// It was void, and the three conditions below are the ordinary ones: a client
-// that has not connected yet, one whose server dropped it, and one created
-// --mode in, which does not send at all.  self.send() reported none of them.
+// Whether the message was written or queued, which was void, so self.send()
+// reported none of the three ordinary refusals.
 bool client_instance::lua_send(std::string_view msg)
 {
     if (!m_loop || !m_connected || m_mode == client_mode_in)
@@ -1109,21 +873,16 @@ bool client_instance::lua_send(std::string_view msg)
         return true;
     }
 
-    // Queue message if a write is already in flight — or always, on a TLS
-    // connection.  There every byte has to be turned into a record first, and
-    // tls_flush is the only thing allowed to do that and put the result on the
-    // wire; there is no "connected with nothing in flight" case that can write
-    // straight out, because the handshake may not have finished and an SSL
-    // asked to write before it has would answer WANT_READ and leave this
-    // function unsure what it had consumed.
+    // Queued when a write is in flight, or always on a TLS connection, because
+    // tls_flush is the only thing allowed to put a record on the wire and an
+    // SSL asked to write mid-handshake answers WANT_READ.
     if (m_conn->ssl || m_conn->write_pending || m_conn->closing)
     {
         if (!m_conn->closing)
         {
-            // The bound is memory, not entries: a client sending 20-byte lines
-            // hit a 4096-entry cap after 80 KB and every message past it was
-            // dropped without a word, while one sending megabyte payloads could
-            // queue gigabytes before the same cap noticed.
+            // The bound is memory and not entries, because an entry cap
+            // dropped 20-byte lines after 80 KB and let megabyte payloads
+            // queue gigabytes.
             if (m_write_queue.bytes() >= socketley::write_queue_max_bytes)
             {
                 if (!m_write_queue_full)
@@ -1140,10 +899,8 @@ bool client_instance::lua_send(std::string_view msg)
                 out.push_back('\n');
             m_write_queue.push(std::move(out));
         }
-        // Nothing else will come back for this message on its own: with no
-        // write in flight there is no completion due, so the record layer has
-        // to be driven from here or the line sits in the queue until something
-        // unrelated happens to arrive.
+        // Nothing else will come back for this message on its own, so the
+        // record layer is driven from here or the line sits in the queue.
         if (m_conn->ssl)
             tls_flush();
         // Queued, or dropped because the connection is already closing.
@@ -1159,9 +916,8 @@ bool client_instance::lua_send(std::string_view msg)
     return true;
 }
 
-// The datagram path.  Reached only from lua_send's UDP branch, and a UDP client
-// never has a session — setup() refuses --tls on one rather than dial in the
-// clear — so this deliberately knows nothing about the record layer.
+// The datagram path, which knows nothing about the record layer because
+// setup() refuses --tls on a UDP client rather than dialling in the clear.
 void client_instance::send_to_server(std::string_view msg)
 {
     if (!m_loop || !m_connected || m_mode == client_mode_in || m_conn->write_pending || m_conn->closing)
@@ -1173,15 +929,9 @@ void client_instance::send_to_server(std::string_view msg)
 }
 
 // ─── TLS record layer ───────────────────────────────────────────────────────
-//
-// Give this connection its session and put the ClientHello on the wire.
-//
-// The name pinned to the session is the host from `-t` — what the operator
-// meant to reach — and never one read back out of the certificate that turns
-// up.  create_ssl_client refuses to build a session without one and there is no
-// way to ask it not to check, which is what makes this able to fail only
-// closed: a false return costs the socket and the reconnect clock starts, and
-// nothing is ever retried in cleartext.
+// Give this connection its session and put the ClientHello on the wire, pinned
+// to the host from `-t` and never to a name read back from the certificate, so
+// this can only fail closed.
 bool client_instance::start_tls()
 {
     if (SOCKETLEY_UNLIKELY(!m_tls))
@@ -1200,10 +950,9 @@ bool client_instance::start_tls()
     m_conn->tls_state = tls_conn_handshake;
     m_conn->tls_peer_closed = false;
 
-    // One turn of the handshake, which produces the ClientHello; the peer
-    // speaks next and the read armed on this socket carries the answer.  A
-    // negative here is a local failure — no memory, no usable cipher — rather
-    // than a rejection: there is nothing on the wire yet to be rejected.
+    // One turn of the handshake, which produces the ClientHello, where a
+    // negative is a local failure rather than a rejection because nothing is
+    // on the wire yet.
     if (SOCKETLEY_UNLIKELY(tls_context::do_handshake(m_conn->ssl) < 0))
         return false;
 
@@ -1211,18 +960,13 @@ bool client_instance::start_tls()
     return true;
 }
 
-// Ciphertext in, plaintext into m_conn->partial.  One call per read completion,
-// which is what makes the handshake asynchronous: OpenSSL is handed the bytes
-// that have arrived and asked what it makes of them, and whatever it wants to
-// say back is drained by the tls_flush at the end of handle_read.  Several
-// rounds of that is a handshake; there is no loop here waiting for one, and
-// nothing blocks the event loop.
+// Ciphertext in and plaintext into m_conn->partial, one call per read
+// completion, which is what makes the handshake asynchronous with nothing
+// blocking the event loop.
 void client_instance::tls_feed(const char* data, size_t len)
 {
-    // Inbound ciphertext into the read BIO.  A refusal is fatal by contract —
-    // the peer is over the per-connection buffer cap, or the BIO failed — and
-    // it has to be: there is nowhere to hold what was not taken, and handing a
-    // record layer a stream with a hole in it is worse than closing.
+    // Inbound ciphertext into the read BIO, whose refusal is fatal by contract
+    // because there is nowhere to hold what was not taken.
     size_t off = 0;
     while (off < len)
     {
@@ -1241,12 +985,9 @@ void client_instance::tls_feed(const char* data, size_t len)
         const int r = tls_context::do_handshake(m_conn->ssl);
         if (SOCKETLEY_UNLIKELY(r < 0))
         {
-            // This is where a server's certificate is rejected: an unknown CA,
-            // an expired chain, a name that does not match the host in `-t`.
-            // do_handshake has already logged which.  Closing, but not
-            // silently — what OpenSSL produced on its way to failing is the
-            // alert that tells the peer why, and the tls_flush at the end of
-            // handle_read puts it on the wire before the connection goes.
+            // Where a server's certificate is rejected, closing but not
+            // silently, because the alert OpenSSL produced tells the peer why
+            // and the tls_flush at the end of handle_read puts it on the wire.
             m_conn->closing = true;
             return;
         }
@@ -1254,11 +995,9 @@ void client_instance::tls_feed(const char* data, size_t len)
             return;   // another round; its records go out with that flush
 
         m_conn->tls_state = tls_conn_ready;
-        // Deliberately falling through rather than returning: the same read can
-        // already carry application data behind the handshake's last flight —
-        // under TLS 1.3 a peer's Finished and its first message routinely
-        // arrive in one packet, and returning here would leave that message
-        // sitting in the BIO until something else was sent.
+        // Deliberately falling through rather than returning, because under
+        // TLS 1.3 a peer's Finished and its first message routinely arrive in
+        // one packet.
     }
 
     char plain[16384];
@@ -1269,9 +1008,8 @@ void client_instance::tls_feed(const char* data, size_t len)
         {
             m_conn->partial.append(plain, static_cast<size_t>(n));
             // The same ceiling the cleartext path applies, checked inside the
-            // loop rather than after it: one read completion can decrypt
-            // everything the inbound BIO had buffered, so "one read cannot
-            // produce more than one buffer's worth" is not true here.
+            // loop, because one read completion can decrypt everything the
+            // inbound BIO had buffered.
             if (SOCKETLEY_UNLIKELY(m_conn->partial.size() >
                                    client_tcp_connection::MAX_PARTIAL_SIZE))
             {
@@ -1282,10 +1020,9 @@ void client_instance::tls_feed(const char* data, size_t len)
         }
         if (n < 0)
         {
-            // Either the peer's close_notify or a record we cannot use.  Both
-            // end the connection, and neither ends it here: the bytes decrypted
-            // above may be a complete line that deserves to be delivered, so
-            // this is recorded and applied by the caller once it has been.
+            // Either the peer's close_notify or an unusable record, both
+            // recorded and applied by the caller because the bytes decrypted
+            // above may be a complete line.
             m_conn->tls_peer_closed = true;
         }
         break;
@@ -1293,26 +1030,21 @@ void client_instance::tls_feed(const char* data, size_t len)
 }
 
 // Every byte this connection sends is a TLS record, including the ones nobody
-// queued: a handshake flight, an alert, a session ticket.  There is no other
-// way onto the wire for a connection that has a session.
+// queued, and there is no other way onto the wire for a connection with a
+// session.
 void client_instance::tls_flush()
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || !m_conn->ssl))
         return;
 
-    // One write in flight at a time, exactly as the cleartext path does — the
-    // ciphertext buffer built below is what the kernel reads out of, and a
-    // second submission would need a second buffer and would interleave two
-    // record streams on one socket.  Whatever does not go now stays in the
-    // queue or in the write BIO; the write completion comes back through
-    // handle_write and lands here again.
+    // One write in flight at a time, because a second submission would need a
+    // second buffer and would interleave two record streams on one socket.
     if (m_conn->write_pending)
         return;
 
-    // Application data only once the handshake is done.  A message queued by
-    // on_connect — which fires when the socket is dialled, before a single
-    // record has crossed — waits here rather than being handed to an SSL that
-    // would answer WANT_READ and leave the caller unsure what was consumed.
+    // Application data only once the handshake is done, so a message queued by
+    // on_connect waits rather than being handed to an SSL that would answer
+    // WANT_READ.
     if (m_conn->tls_state == tls_conn_ready)
     {
         while (!m_write_queue.empty())
@@ -1322,18 +1054,16 @@ void client_instance::tls_flush()
                                                  static_cast<int>(msg.size()));
             if (n <= 0)
             {
-                // 0 is backpressure: the write BIO is at its cap, and OpenSSL's
-                // contract is that the same buffer is offered again once it has
-                // drained — which is what leaving this message at the front of
-                // the queue arranges.  -1 is fatal for the session.
+                // 0 is backpressure and the same buffer is offered again once
+                // the write BIO drains, which leaving the message at the front
+                // of the queue arranges; -1 is fatal.
                 if (n < 0)
                     m_conn->closing = true;
                 break;
             }
-            // Partial writes are not enabled on this context, so SSL_write is
-            // all-or-nothing.  A short count would mean the record layer and
-            // this queue disagree about what has been sent, and a stream with a
-            // hole in it has no framing left to recover: close instead.
+            // Partial writes are not enabled on this context, so a short count
+            // would mean the record layer and this queue disagree about what
+            // has been sent.
             if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg.size()))
             {
                 m_conn->closing = true;
@@ -1350,15 +1080,10 @@ void client_instance::tls_flush()
     if (!tls_context::has_pending_out(m_conn->ssl))
         return;
 
-    // Ciphertext out of the write BIO and into a buffer this connection owns.
-    // It has to be copied rather than pointed at: an SQE names an address the
-    // kernel reads at its leisure, and the BIO's storage moves under it as
-    // OpenSSL writes the next record.  Copying is also what keeps the SSL free
-    // of anything the ring can name, which is what makes the session safe to
-    // release the moment the connection is lost — see tls_release.
-    //
-    // The buffer is write_buf, the same one a cleartext message rides in, so
-    // the short-write resume in handle_write needs no TLS-specific case at all.
+    // Ciphertext copied out of the write BIO into write_buf rather than
+    // pointed at, because the BIO's storage moves as OpenSSL writes the next
+    // record -- and the copy is what keeps the SSL free of anything the ring
+    // can name.
     std::string cipher;
     char buf[16384];
     for (;;)

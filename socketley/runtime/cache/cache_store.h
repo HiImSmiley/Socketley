@@ -57,8 +57,8 @@ class cache_store
 public:
     cache_store()
     {
-        // Pre-allocate hash buckets to avoid rehashing during initial load.
-        // 1024 is a reasonable starting point for most workloads.
+        // Pre-allocate hash buckets to avoid rehashing during the initial
+        // load.
         m_data.reserve(1024);
     }
 
@@ -67,8 +67,8 @@ public:
     bool get(std::string_view key, std::string& out) const;
     const std::string* get_ptr(std::string_view key) const;
 
-    // Combined check_expiry + get_ptr in a single hash probe sequence.
-    // Avoids the cost of two separate lookups on the hot GET path.
+    // Combined check_expiry and get_ptr in a single probe sequence, which
+    // avoids two lookups on the hot GET path.
     const std::string* check_expiry_and_get_ptr(std::string_view key);
 
     // --- Lists ---
@@ -110,14 +110,9 @@ public:
     // --- Set if not exists ---
     bool setnx(std::string_view key, std::string_view value);
 
-    // --- Cursor scan (stateless offset cursor; returns next cursor, 0=done) ---
-    //
     // The cursor packs [map index : 8][bucket count : 24][bucket index : 32],
-    // and the map index only ever holds 0..scan_last_map.  That is stated here
-    // rather than left inside scan() because something else now depends on it:
-    // a sharded cache carries the shard in the top six bits of this cursor, and
-    // those are free only while the map index fits in the two below them.
-    // cache_instance.cpp static_asserts the two against each other.
+    // and the top six bits are free for a shard tag only while the map index
+    // fits in the two below them.
     static constexpr uint8_t scan_last_map = 3;   // m_data, m_lists, m_sets, m_hashes
     uint64_t scan(uint64_t cursor, std::string_view pattern,
                   size_t count, std::vector<std::string_view>& out) const;
@@ -125,11 +120,9 @@ public:
     // --- Atomic increment ---
     bool incr(std::string_view key, int64_t delta, int64_t& result);
 
-    // --- String extras ---
-    // append() sentinels.  npos has always meant "wrong type"; a refusal by the
-    // memory limit used to come back as the *unchanged* length, which a caller
-    // cannot tell apart from a successful append of nothing — so a discarded
-    // write was reported to the client as a successful one.
+    // append() sentinels, where npos means the wrong type, because a memory
+    // refusal reported as the unchanged length was indistinguishable from a
+    // successful append of nothing.
     static constexpr size_t append_wrong_type = std::string::npos;
     static constexpr size_t append_denied     = std::string::npos - 1;
 
@@ -147,21 +140,10 @@ public:
     uint32_t size() const;
     bool exists(std::string_view key) const;
 
-    // `prefix` is written ahead of the dump's own magic and is opaque here: a
-    // sharded cache puts the header that says which slice this file is in it.
-    // `offset` is how many bytes to skip back off on the way in.  Both default
-    // to nothing, so an unsharded save/load is byte-for-byte what it was.
-    // Take from `other` every key this shard owns, and leave the rest.
-    //
-    // The filter half of loading a dump set whose split is not this one: each
-    // shard reads every dump and keeps what hashes to it now.  Moves rather
-    // than copies — `other` is a dump just read and is discarded after — so a
-    // redistribution costs one pass and no duplication of the values.
-    //
-    // Expiry travels with the key.  A dump records the REMAINING time and load()
-    // has already turned it into a deadline, so what is moved here is that
-    // deadline and not a fresh one; a key that was five seconds from expiring
-    // before the restart is five seconds from expiring after it.
+    // `prefix` is written ahead of the dump's magic and `offset` skipped on
+    // the way in, both defaulting to nothing -- and take_owned() moves every
+    // key this shard owns out of a dump just read, deadline included, so a key
+    // five seconds from expiring stays five seconds from expiring.
     void adopt_owned(cache_store& other, uint32_t shard_index, uint32_t shard_count);
 
     bool save(std::string_view path, std::string_view prefix = {}) const;
@@ -170,11 +152,8 @@ public:
     // --- Eviction / Memory ---
     void set_max_memory(size_t bytes);
     size_t get_max_memory() const { return m_max_memory; }
-    // Payload plus the cost of the containers holding it.  Counting payload
-    // alone made this read 10 MB where the process had actually grown by
-    // 111 MB, so --maxmemory 256M would happily occupy ~2.8 GB.  "Payload" here
-    // means what the strings really allocate, not the sum of their lengths;
-    // see stored_string().
+    // Payload plus the cost of the containers holding it, because counting
+    // payload alone read 10 MB where the process had grown by 111 MB.
     size_t get_memory_used() const { return m_current_memory + structural_overhead(); }
     void set_eviction(eviction_policy policy);
     eviction_policy get_eviction() const { return m_eviction; }
@@ -188,28 +167,10 @@ public:
         return try_evict(needed, nullptr);
     }
 
-    // The same admission check, asked on behalf of a named key: try_evict() may
-    // not choose that key as a victim.  Every write path uses this form and
-    // names the key it is about to write.
-    //
-    // Eviction was free to delete the very key the caller was writing, and that
-    // went wrong in three separate ways:
-    //
-    //   * lpush/rpush/sadd/hset hold an iterator into their container across
-    //     this call, and the write that follows then went through a freed node
-    //     — a use-after-free an unauthenticated client could reach with two
-    //     commands under --maxmemory;
-    //   * a write that was refused *anyway* had already destroyed the value it
-    //     refused to replace: the caller got an error and its data was gone,
-    //     evicted to make room for a write that never landed;
-    //   * APPEND, having lost the key that way, fell through to its create
-    //     branch, stored the suffix alone and reported that as a length — a
-    //     silent truncation, with the key's TTL gone with it.
-    //
-    // Excluding the target costs nothing.  What evicting it frees is exactly
-    // what re-creating it costs — the same key, the same overheads — so it can
-    // never turn a refusal into an acceptance; it could only ever make room the
-    // write immediately spends again, after throwing the old value away.
+    // The same admission check on behalf of a named key try_evict() may not
+    // take, because eviction of the key being written invalidated held
+    // iterators, destroyed values for writes that were then refused, and
+    // turned APPEND into a silent truncation.
     bool check_memory(size_t needed, std::string_view key)
     {
         if (__builtin_expect(m_max_memory == 0, 1))
@@ -219,9 +180,8 @@ public:
         return try_evict(needed, &key);
     }
 
-    // --- Replication dump ---
-    // Serialize all data as text commands (SET/LPUSH/SADD/HSET) into buf.
-    // Used for initial full sync when a follower connects.
+    // Serialize all data as text commands into buf, for the initial full sync
+    // when a follower connects.
     void dump_commands(std::string& buf) const;
 
     // --- Pub/Sub ---
@@ -242,86 +202,37 @@ private:
     bool load_v2_stream(std::ifstream& file);  // legacy fallback
     bool load_v1(std::ifstream& file, uint32_t first_key_len);
 
-    // Take ownership of one entry restored by load(), with the same bookkeeping
-    // a live write would have done.  load() used to insert straight into the
-    // containers, so a reloaded store reported zero bytes in use and — worse —
-    // had an empty LRU, which leaves try_evict nothing to walk and makes the
-    // configured maxmemory unenforceable for everything that came off disk.
+    // Take ownership of one entry restored by load() with the bookkeeping a
+    // live write would have done, because inserting straight into the
+    // containers left an empty LRU and an unenforceable maxmemory.
     void adopt_loaded_string(std::string&& key, std::string&& value);
     void adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq);
     void adopt_loaded_set(std::string&& key, set_inner&& members);
     void adopt_loaded_hash(std::string&& key, hash_inner&& fields);
 
-    // Populate the eviction order from the data already resident.  Needed when a
-    // limit is switched on after the fact: touch_lru does nothing while
-    // m_max_memory is zero, so those keys never entered the LRU.
+    // Populate the eviction order from data already resident, needed when a
+    // limit is switched on after the fact.
     void rebuild_lru();
 
     void touch_lru(std::string_view key);
 
-    // Remove a key from the LRU bookkeeping.  Both structures have to go
-    // together: erasing only from m_lru_map orphans the m_lru_order node, and
-    // touch_lru then appends a *second* node when the key comes back, so
-    // eviction later drops a live key while walking the stale one.
+    // Remove a key from both LRU structures together, because erasing only
+    // from m_lru_map orphans the node and touch_lru then appends a second one.
     void drop_lru(std::string_view key);
 
-    // `protect`, when it is not null, names a key try_evict() may not take —
-    // the key the write that called it is about to touch.  See check_memory().
+    // `protect`, when not null, names the key try_evict() may not take -- the
+    // one the calling write is about to touch.
     bool try_evict(size_t needed, const std::string_view* protect);
 
-    // Drop the key's expiry.  A plain SET discards any expiry the key already
-    // carried, as Redis specifies for SET without KEEPTTL.  Leaving it in place
-    // made a freshly written value inherit its predecessor's deadline and
-    // disappear at a time the writer had no reason to expect:
-    //
-    //   SET k v1 / EXPIRE k 2 / SET k v2   ->  v2 gone two seconds later
-    //
-    // SETEX, PSETEX and SET ... EX all assign the expiry after the write, so
-    // they are unaffected.
-    //
-    // Called at the point a write is known to be going ahead, never on the way
-    // in.  set() used to erase here as its very first act — before the
-    // type-conflict check and before check_memory — so a SET that was then
-    // *refused* had still stripped the TTL off a key it did not otherwise
-    // touch, and a key that was going to expire never did.
+    // Drop the key's expiry, as Redis specifies for SET without KEEPTTL,
+    // called at the point a write is known to be going ahead -- doing it on
+    // the way in stripped the TTL off keys whose write was then refused.
     void drop_expiry(std::string_view key);
 
-    // Structural cost of the containers, in bytes per entry.  Measured on this
-    // toolchain (libstdc++ / glibc malloc, x86-64) with 500k short keys: an
-    // unordered_map node holding two std::strings plus its bucket slot costs
-    // ~74 bytes before any payload, and while a memory limit is configured each
-    // key additionally carries an m_lru_order node and an m_lru_map entry for
-    // ~139 bytes more.
-    //
-    // They cover the *fixed* part of an entry only.  What a fixed term cannot
-    // cover is the heap block a std::string takes once it outgrows the buffer
-    // inside the string object: that depends on the length, and only the payload
-    // sites know it.  Counting the length alone read low — the dangerous
-    // direction, because --maxmemory then lets the process grow past the ceiling
-    // it was given.  Measured against RSS at 500k keys, with the figure this
-    // file now produces alongside:
-    //
-    //   11-byte keys, 10-byte values  ->  was 234, now 234 B/key   actual 234
-    //   26-byte keys, 100-byte values ->  was 340, now 469 B/key   actual 489
-    //
-    // (the "now" column is what stored_string() below computes for those two
-    // shapes; the parent measurement is the check on it.)
-    //
-    // Short keys are untouched — nothing leaves the SSO buffer there.  The long
-    // key reads ~4% low instead of 1.4x low, and what is left no longer grows
-    // with the key or the value: it is these fixed terms being ~23 bytes light
-    // per key, which the short-key calibration hid because the SSO payload is
-    // counted on top of them.  Left alone on purpose — bending the constants
-    // until a second workload matched is how they came to be wrong for the
-    // first one.
-    //
-    // One gap is knowingly still open: a key that carries a TTL is copied into
-    // m_expiry as well, and that copy's heap block is not counted (the node is,
-    // through expiry_entry_overhead).  Unlike the LRU, whose entries are created
-    // and destroyed by exactly two functions, m_expiry is written in a dozen
-    // places, so counting it there would be precisely the scattered bookkeeping
-    // structural_overhead() exists to avoid.  It costs one block per expiring
-    // key with a name over the SSO limit.
+    // Structural cost of the containers in bytes per entry, measured on this
+    // toolchain and covering the fixed part only, because the heap block a
+    // string takes past its SSO buffer depends on the length and is charged at
+    // the payload sites.
     static constexpr size_t key_entry_overhead    = 74;
     static constexpr size_t lru_entry_overhead    = 139;
     static constexpr size_t expiry_entry_overhead = 64;
@@ -329,21 +240,16 @@ private:
     static constexpr size_t set_elem_overhead     = 64;
     static constexpr size_t hash_field_overhead   = 74;
 
-    // Longest string libstdc++ keeps inside the string object itself.  Derived,
-    // not written as 15, for the same reason structural_overhead() is derived
-    // from live container sizes: a std::string with a different layout has to
-    // move this number rather than silently invalidate it.  The object is a
-    // pointer, a length and a union of {capacity, inline buffer}, so the buffer
-    // is what is left over, minus the terminator.
+    // Longest string libstdc++ keeps inside the string object, derived rather
+    // than written as 15, so a different layout moves this number instead of
+    // silently invalidating it.
     static constexpr size_t sso_capacity =
         sizeof(std::string) - sizeof(char*) - sizeof(size_t) - 1;
     static_assert(sso_capacity >= 7 && sso_capacity < sizeof(std::string),
                   "std::string is not laid out the way this accounting assumes");
 
-    // Bytes glibc malloc actually spends on a request: rounded up to a 16-byte
-    // chunk that carries an 8-byte header, never smaller than 32 bytes.  The
-    // header and the rounding are resident memory like any other, so they are
-    // charged.
+    // Bytes glibc malloc actually spends on a request, header and rounding
+    // included, because those are resident memory like any other.
     static constexpr size_t malloc_chunk(size_t request)
     {
         constexpr size_t header = 8, align = 16, min_chunk = 32;
@@ -351,56 +257,27 @@ private:
         return chunk < min_chunk ? min_chunk : chunk;
     }
 
-    // What one stored string costs, given its length.  Inside the SSO limit the
-    // bytes live in the node that key_entry_overhead already measures, so the
-    // length is all there is to add; past it the string owns a separate block of
-    // length+1 bytes and the payload has moved into that block, so the block is
-    // the whole cost.  The jump at the boundary is real: crossing it buys a
-    // fresh 32-byte chunk while the inline buffer stays behind, unused.
-    //
-    // Assumes capacity == size.  That is true of every string this class
-    // creates, and it is what admission has to assume anyway, since the string
-    // it is deciding about does not exist yet.
+    // What one stored string costs given its length, where inside the SSO
+    // limit only the length is added and past it the separate block is the
+    // whole cost -- assuming capacity equals size, which is true of every
+    // string this class creates.
     static constexpr size_t stored_string(size_t len)
     {
         return len <= sso_capacity ? len : malloc_chunk(len + 1);
     }
 
-    // The same cost, read off a string that does exist — capacity, not length.
-    // Used by everything that adds to or subtracts from the running total, for
-    // two reasons the length alone gets wrong in the low direction:
-    //
-    //   * assign() never hands a buffer back, so after SET k <1 KB> followed by
-    //     SET k <10 B> the key still owns the kilobyte;
-    //   * APPEND doubles the buffer rather than growing it to fit.
-    //
-    // It also keeps the two sides honest: every site subtracts what the live
-    // string costs before it changes and adds what it costs after, so the pair
-    // can only disagree if something mutates a stored string behind this class's
-    // back — and nothing outside it gets a non-const reference to one.
+    // The same cost read off a string that exists, using capacity rather than
+    // length, because assign() never hands a buffer back and APPEND doubles
+    // rather than fitting.
     static size_t stored_string(const std::string& s)
     {
         return s.capacity() <= sso_capacity ? s.size() : malloc_chunk(s.capacity() + 1);
     }
 
-    // What an existing string will cost once it holds `new_len` bytes — the
-    // figure every write over an existing value has to be admitted against,
-    // because it is the buffer that write will actually leave behind.
-    //
-    // stored_string(len) is the wrong question here: it costs a string built to
-    // fit, and libstdc++ neither grows one to fit nor gives a buffer back.
-    // append(), assign() and operator= all reallocate to max(new length, twice
-    // the old capacity) when the value outgrows its buffer, and all of them
-    // keep the buffer when it does not.  Admitting on the length that comes out
-    // of the write let it land over the ceiling by whole size classes:
-    //
-    //   SET k <15 B> / SET k <16 B>   under maxmemory 400: asked for 17 bytes,
-    //                                 bought 33, and settled at 405
-    //   APPEND of 32 B onto 1300      asked for 32, bought a 2600-byte buffer
-    //
-    // Both directions matter.  Asking for the doubling refuses a write that
-    // would have exceeded the limit; charging the kept buffer stops a shrinking
-    // rewrite from looking like it freed memory it still holds.
+    // What an existing string will cost once it holds `new_len` bytes, which
+    // is the figure a write over an existing value is admitted against,
+    // because libstdc++ reallocates to twice the old capacity and keeps the
+    // buffer when it does not.
     static size_t rewritten_string(const std::string& s, size_t new_len)
     {
         const size_t cap = s.capacity();
@@ -409,46 +286,34 @@ private:
         return malloc_chunk((new_len < 2 * cap ? 2 * cap : new_len) + 1);
     }
 
-    // The LRU keeps two further copies of the key — one in the m_lru_order node,
-    // one as the key of m_lru_map — and nothing else counts their bytes.  Only
-    // the heap block is charged here; the two string objects themselves are part
-    // of lru_entry_overhead.  Tracked by touch_lru/drop_lru rather than by the
-    // payload sites, because those two are what actually decide whether a key is
-    // in the LRU at all.
+    // The LRU keeps two further copies of the key and nothing else counts
+    // their bytes, tracked by touch_lru/drop_lru because those two decide
+    // whether a key is in the LRU at all.
     static constexpr size_t lru_key_copies(size_t key_len)
     {
         return key_len <= sso_capacity ? 0 : 2 * malloc_chunk(key_len + 1);
     }
 
-    // What a brand new key costs: the key string itself plus everything holding
-    // it.  Callers add this to the amount they pass to check_memory, so
-    // admission and the limit are measured the same way — otherwise every
-    // accepted write overshoots by its own structural cost and the cache settles
-    // above the configured maximum.  That is why the LRU's copies of the key are
-    // in here too: they are charged the moment the key is admitted.
-    //
-    // This was new_key_overhead() and blind to the key's length while a key cost
-    // its own byte count; it takes the length now because both the key's own
-    // block and the LRU's copies of it turn on where that length falls.
+    // What a brand new key costs, added by callers to what they pass
+    // check_memory so admission and the limit are measured the same way, and
+    // taking the length because both the key's block and the LRU's copies turn
+    // on it.
     size_t new_key_cost(size_t key_len) const
     {
         return stored_string(key_len) + key_entry_overhead
              + (m_max_memory != 0 ? lru_entry_overhead + lru_key_copies(key_len) : 0);
     }
 
-    // Accounted payload of one whole key, for the removal paths.  Five copies of
-    // the same loop (del, check_expiry, the expiring GET and both halves of
-    // try_evict) used to compute this by hand; now that a string no longer costs
-    // its own length, one of them getting it wrong is a permanent error in the
-    // reported figure, so they all come through here.
+    // Accounted payload of one whole key for the removal paths, in one place,
+    // because five hand-written copies of this loop is a permanent error in
+    // the reported figure waiting to happen.
     static size_t entry_cost(const std::string& key, const std::string& val);
     static size_t entry_cost(const std::string& key, const std::deque<std::string>& deq);
     static size_t entry_cost(const std::string& key, const set_inner& members);
     static size_t entry_cost(const std::string& key, const hash_inner& fields);
 
-    // Derived from live container sizes rather than tracked incrementally: a
-    // missed increment somewhere would corrupt the figure permanently, and this
-    // cannot drift.  Every term is O(1).
+    // Derived from live container sizes rather than tracked incrementally, so
+    // it cannot drift, with every term O(1).
     size_t structural_overhead() const
     {
         return (m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size()) * key_entry_overhead
@@ -477,13 +342,12 @@ private:
 
     // Eviction / Memory
     size_t m_max_memory = 0;
-    // Payload: every stored string charged through stored_string(), plus the LRU's
-    // own copies of the keys.  The containers holding them are the other half of
-    // get_memory_used() — see structural_overhead().
+    // Payload: every stored string charged through stored_string(), plus the
+    // LRU's own copies of the keys.
     size_t m_current_memory = 0;
 
-    // Element counts for the collection types.  The number of keys is O(1) from
-    // the maps themselves, but the number of members inside them is not.
+    // Element counts for the collection types, where the number of keys is
+    // O(1) from the maps and the number of members inside them is not.
     size_t m_list_elems = 0;
     size_t m_set_elems = 0;
     size_t m_hash_fields = 0;

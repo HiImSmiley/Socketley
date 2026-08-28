@@ -44,8 +44,8 @@ size_t cache_store::entry_cost(const std::string& key, const hash_inner& fields)
 
 bool cache_store::has_type_conflict_for_string(std::string_view key) const
 {
-    // In typical workloads, lists/sets/hashes are empty or the key
-    // doesn't conflict. The empty() checks are O(1) fast-paths.
+    // Lists, sets and hashes are usually empty or unconflicting, and the
+    // empty() checks are O(1) fast paths.
     if (__builtin_expect(!m_lists.empty() && m_lists.count(key), 0)) return true;
     if (__builtin_expect(!m_sets.empty() && m_sets.count(key), 0)) return true;
     if (__builtin_expect(!m_hashes.empty() && m_hashes.count(key), 0)) return true;
@@ -80,10 +80,9 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
 
 void cache_store::drop_expiry(std::string_view key)
 {
-    // Guarded on empty() to keep the common case — a cache with no TTLs at all
-    // — free of the lookup.  find() accepts a string_view through the
-    // transparent hash; erase() does not, so go through the iterator rather
-    // than allocating a std::string.
+    // Guarded on empty() to keep a cache with no TTLs free of the lookup, and
+    // taken through the iterator because erase() does not accept a
+    // string_view.
     if (m_expiry.empty())
         return;
     auto eit = m_expiry.find(key);
@@ -93,38 +92,33 @@ void cache_store::drop_expiry(std::string_view key)
 
 bool cache_store::set(std::string_view key, std::string_view value)
 {
-    // Fast-path: key already exists as string (most common in benchmarks).
-    // Check m_data first — this avoids the type-conflict cross-map lookups.
+    // Fast path for a key that already exists as a string, which avoids the
+    // type-conflict cross-map lookups.
     auto it = m_data.find(key);
     if (__builtin_expect(it != m_data.end(), 1))
     {
-        // Growing an existing value has to clear the same bar as creating one.
-        // This path used to skip check_memory entirely, so a 10-byte value could
-        // be replaced by a 100 MB one without maxmemory ever being consulted.
-        // Only the growing case needs the check, and only when a limit is set —
-        // shrinking or rewriting in place can never push us over.
+        // Growing an existing value has to clear the same bar as creating one,
+        // which this path skipped, so a 10-byte value could be replaced by a
+        // 100 MB one without maxmemory being consulted.
         if (__builtin_expect(m_max_memory != 0 && value.size() > it->second.size(), 0))
         {
-            // The delta is between what the two values *cost*, not between their
-            // lengths: 15 bytes to 16 is one byte of payload and a whole new
-            // 48-byte heap block, because assign() reallocates to twice the old
-            // capacity rather than to fit.  Nothing is asked for when the buffer
-            // already charged for is big enough to take the new value in place.
+            // The delta is between what the two values cost and not their
+            // lengths, because assign() reallocates to twice the old capacity
+            // rather than to fit.
             const size_t held = stored_string(it->second);
             const size_t want = rewritten_string(it->second, value.size());
             if (want > held && !check_memory(want - held, key))
                 return false;
             // check_memory() will not take the key it was named, so `it` is
-            // still live.  Re-acquired all the same: that guarantee belongs to
-            // another function, and a stale iterator here writes through a
-            // freed node.
+            // still live, and re-acquired anyway because that guarantee
+            // belongs to another function.
             it = m_data.find(key);
         }
 
         if (__builtin_expect(it != m_data.end(), 1))
         {
-            // Past the last refusal: the write is going ahead, so the key's old
-            // deadline goes.  See drop_expiry().
+            // Past the last refusal, so the write is going ahead and the key's
+            // old deadline goes.
             drop_expiry(key);
             track_sub(stored_string(it->second));
             // Use assign() instead of operator= to potentially reuse existing allocation
@@ -177,11 +171,8 @@ const std::string* cache_store::get_ptr(std::string_view key) const
 
 const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
 {
-    // Combined expiry check + get in minimal hash probes.
-    // For the common case (no expiry set, key exists), this does:
-    //   1. m_expiry.empty() check (O(1))
-    //   2. single m_data.find() probe
-    // Instead of check_expiry() + get_ptr() which does two m_data.find() probes.
+    // Combined expiry check and get in minimal probes, which for the common
+    // case is one empty() test and one find() rather than two find() probes.
 
     if (__builtin_expect(!m_expiry.empty(), 0))
     {
@@ -242,10 +233,9 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
-        // The key is named to check_memory() so that eviction cannot take it:
-        // `it` has to survive this call, and it did not — try_evict was free to
-        // pick this very list, and the emplace below then went through a freed
-        // node.  See check_memory().
+        // The key is named to check_memory() so eviction cannot take it,
+        // because `it` has to survive the call and the emplace below went
+        // through a freed node.
         if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
             return false;
         // Measured after it has been constructed in place, like every other add
@@ -476,12 +466,9 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         auto fit = it->second.find(field);
         if (fit != it->second.end())
         {
-            // Overwriting a field has to clear the same bar as adding one.
-            // This path called check_memory nowhere at all, so a 5-byte field
-            // value could be replaced by a 100 KB one with maxmemory never
-            // consulted: 294 bytes in use before, 100305 after, against a
-            // configured 1200.  The same hole was closed for SET; the delta is
-            // between what the two values *cost*, not between their lengths.
+            // Overwriting a field has to clear the same bar as adding one,
+            // which this path did not, so a 5-byte value could become 100 KB
+            // against a configured 1200.
             if (__builtin_expect(m_max_memory != 0 && val.size() > fit->second.size(), 0))
             {
                 const size_t held = stored_string(fit->second);
@@ -495,9 +482,8 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         }
         else
         {
-            // Named so that eviction cannot take this hash: `it` is held across
-            // the call and the emplace below writes through it.  See
-            // check_memory().
+            // Named so that eviction cannot take this hash, because `it` is
+            // held across the call and the emplace below writes through it.
             if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead, key))
                 return false;
             auto nfit = it->second.emplace(std::string(field), std::string(val)).first;
@@ -715,47 +701,11 @@ bool cache_store::setnx(std::string_view key, std::string_view value)
     return set(key, value);
 }
 
-// ─── A CURSOR OVER BUCKETS, NOT OVER AN OFFSET ──────────────────────────────
-//
-// This was an offset: every call walked all four maps from the beginning and
-// skipped `cursor` keys before it started collecting.  Two things were wrong
-// with that, and the second is the one nobody had written down.
-//
-// IT SKIPPED AND DUPLICATED.  An offset only means something if the traversal
-// order is stable, and an unordered_map's is not: inserting a key can move
-// every later key to a different position, so a key already returned comes back
-// and a key never returned is stepped over.  For a cache, whose whole purpose is
-// concurrent reads and writes, that is not a corner case — it is the ordinary
-// one.
-//
-// AND IT WAS QUADRATIC.  Resuming at offset N costs N steps, so a full scan of a
-// keyspace of N keys in pages of `count` costs O(N^2/count) — a million keys at
-// the default page size is on the order of 10^10 iterations, on the event loop
-// thread that serves every other runtime in the daemon.  Nothing in the review
-// caught this; it showed up on reading the resume path.
-//
-// A bucket index fixes both.  Resuming is O(1), and a key stays in its bucket
-// for as long as the table is not rehashed, so an insert that does not trigger
-// a rehash cannot disturb what has already been visited.
-//
-// ─── WHAT IS STILL NOT GUARANTEED, PRECISELY ────────────────────────────────
-//
-// A rehash — which unordered_map does when the load factor is exceeded — moves
-// keys between buckets, and a key that moves to a bucket this scan has already
-// passed will not be returned by it.  Redis avoids that with reverse-binary
-// iteration, which needs a power-of-two bucket count and control over the
-// table; libstdc++ uses prime counts and does not offer one.
-//
-// So the guarantee this makes, and the man page states, is:
-//
-//   * a key present for the whole iteration is returned at least once, PROVIDED
-//     the table was not rehashed during it;
-//   * a key may be returned more than once;
-//   * a key added or removed during the iteration may or may not appear.
-//
-// The bucket count is carried in the cursor so a rehash is at least VISIBLE
-// rather than silent: it restarts the map being walked, which trades duplicates
-// — allowed above — for the skip, which is not.
+// A cursor over buckets rather than an offset, because an offset into an
+// unordered_map both skips and duplicates and made a full scan quadratic --
+// and what is still not guaranteed is a rehash mid-iteration, which restarts
+// the map being walked and trades duplicates, which the contract allows, for a
+// skip, which it does not.
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out) const
 {
@@ -765,13 +715,9 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         return fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
     };
 
-    // cursor layout: [ map index : 8 ][ bucket count : 24 ][ bucket index : 32 ]
-    //
-    // The bucket count rides along so the next call can tell whether the table
-    // it is resuming into is the one it left.  Truncated to 24 bits, which is
-    // sixteen million buckets — far past anything this store holds, and a
-    // truncation that collides only makes the check miss a rehash, which is the
-    // behaviour without the field at all.
+    // The bucket count rides in the cursor so the next call can tell whether
+    // the table it is resuming into is the one it left, truncated to 24 bits,
+    // where a collision only misses a rehash.
     const uint8_t  in_map     = static_cast<uint8_t>(cursor >> 56);
     const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFF);
     uint64_t       in_bucket  = cursor & 0xFFFFFFFFu;
@@ -782,7 +728,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
              | (static_cast<uint64_t>(bucket) & 0xFFFFFFFFu);
     };
 
-    // One map, from `first_bucket` on.  Returns the cursor to resume with, or 0
+    // One map from `first_bucket` on, returning the cursor to resume with or 0
     // when this map is exhausted.
     auto walk = [&](const auto& map, uint8_t idx, size_t first_bucket) -> uint64_t {
         const size_t nbuckets = map.bucket_count();
@@ -792,9 +738,8 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                 if (match(it->first))
                     out.push_back(it->first);
 
-            // Whole buckets, never half of one: a page boundary inside a bucket
-            // would need an element index, and an element index is the offset
-            // this is replacing.  `count` is a hint, exactly as Redis's COUNT is.
+            // Whole buckets and never half of one, because a page boundary
+            // inside a bucket would need the element index this is replacing.
             if (out.size() >= count && b + 1 < nbuckets)
                 return pack(idx, nbuckets, b + 1);
         }
@@ -808,9 +753,9 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         size_t start = 0;
         if (idx == in_map && cursor != 0)
         {
-            // A rehash between calls invalidates the bucket index.  Restarting
-            // this map is the answer that cannot skip; it may repeat, which the
-            // contract allows.
+            // A rehash between calls invalidates the bucket index, so this map
+            // restarts -- the answer that cannot skip, and may repeat, which
+            // the contract allows.
             const size_t now = (idx == 0 ? m_data.bucket_count()
                               : idx == 1 ? m_lists.bucket_count()
                               : idx == 2 ? m_sets.bucket_count()
@@ -829,8 +774,8 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         if (next != 0)
             return next;
 
-        // This map is done.  If the page is already full, resume at the next
-        // map rather than walking into it now.
+        // This map is done, and a full page resumes at the next map rather
+        // than walking into it now.
         if (out.size() >= count && idx < last_map)
             return pack(static_cast<uint8_t>(idx + 1), 0, 0);
     }
@@ -862,10 +807,9 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
 
     if (it != m_data.end() && __builtin_expect(m_max_memory != 0 && sv.size() > it->second.size(), 0))
     {
-        // The same bar SET has to clear, for the same reason: a counter that
-        // crosses the small-string limit — 15 digits to 16 — does not grow by a
-        // digit, it takes a 48-byte buffer.  This path consulted the limit only
-        // when it was creating the key.
+        // The same bar SET has to clear, because a counter crossing the
+        // small-string limit takes a 48-byte buffer rather than growing by a
+        // digit.
         const size_t held = stored_string(it->second);
         const size_t want = rewritten_string(it->second, sv.size());
         if (want > held && !check_memory(want - held, key))
@@ -901,41 +845,32 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
     {
         if (__builtin_expect(m_max_memory != 0, 0))
         {
-            // Refusing has to be visible.  Returning the unchanged length here
-            // told the caller the append had happened and produced nothing.
-            //
-            // What is asked for is the growth of the *allocation*, not the
-            // length of the suffix: appending one byte to a full 4 KB buffer
-            // buys another 4 KB, and appending into spare capacity buys nothing.
-            // rewritten_string() is what the buffer will be after the append,
-            // doubling included — asking for the length the result needs let an
-            // accepted APPEND land over the ceiling.
+            // Refusing has to be visible, and what is asked for is the growth
+            // of the allocation rather than the length of the suffix, because
+            // libstdc++ doubles the buffer.
             const size_t held = stored_string(it->second);
             const size_t want = rewritten_string(it->second, it->second.size() + suffix.size());
             if (want > held && !check_memory(want - held, key))
                 return append_denied;
             // check_memory() will not take the key it was named, so `it` is
-            // still live.  Re-acquired all the same — see set().
+            // still live, and re-acquired anyway.
             it = m_data.find(key);
         }
 
         if (it != m_data.end())
         {
             // Measured on both sides of the append rather than added as the
-            // suffix length: libstdc++ doubles the buffer instead of growing it
-            // to fit, so a string appended to in a loop holds up to twice what
-            // its length says.
+            // suffix length, because a string appended to in a loop holds up
+            // to twice what its length says.
             track_sub(stored_string(it->second));
             it->second.append(suffix.data(), suffix.size());
             track_add(stored_string(it->second));
             touch_lru(key);
             return it->second.size();
         }
-        // Unreachable while check_memory() honours the key it is named.  It did
-        // not, and this was the path taken: the append evicted the key it was
-        // appending to, recreated it here holding only the suffix, and returned
-        // that as a length.  The value that was there and its TTL were gone and
-        // the caller was told a number that looked like success.
+        // Unreachable while check_memory() honours the key it is named, which
+        // it did not: the append evicted the key it was appending to and
+        // returned the suffix's length as success.
     }
 
     if (!check_memory(stored_string(suffix.size()) + new_key_cost(key.size()), key))
@@ -1055,18 +990,9 @@ bool cache_store::exists(std::string_view key) const
 void cache_store::dump_commands(std::string& buf) const
 {
     // ─── A VALUE MAY CONTAIN THE SEPARATOR ──────────────────────────────────
-    //
-    // This stream is one command per line and a cache value is arbitrary bytes,
-    // so a value with a newline in it ended the command here just as it did on
-    // the live replication path — the follower stored the part before the break
-    // and ran the rest as a command of its own.  The initial full sync is the
-    // same defect on the same link, and fixing only the live half would have
-    // left every value that was already stored broken while every value written
-    // afterwards was fine.
-    //
-    // Framed by the same rule and the same code: a frame only when the line
-    // cannot carry the command, so a dataset without newlines produces a stream
-    // that is byte-for-byte what it always was.
+    // Framed by the same rule as the live replication path, so a value with a
+    // newline in it does not end the command -- and a dataset without newlines
+    // produces a byte-for-byte identical stream.
     std::string cmd;
     const auto emit = [&buf, &cmd]() {
         if (ipc_frame::needs_frame(cmd))
@@ -1131,17 +1057,9 @@ void cache_store::dump_commands(std::string& buf) const
     }
 
     // ─── TTLs, in milliseconds ──────────────────────────────────────────────
-    //
-    // These were emitted as `expire key <seconds>`, truncated by the cast: a
-    // key with 500 ms left became `expire key 0`, which the `> 0` test then
-    // dropped entirely — so it came back from the dump with NO expiry at all
-    // and lived forever.  Every key under a second was immortalised by being
-    // written down.
-    //
-    // pexpire is the same command one unit finer, and the receiving side has
-    // had it as long as expire has.  The `> 0` test stays: a key whose deadline
-    // has already passed is expiring, not being given a new lease, and the
-    // sweep will take it.
+    // pexpire rather than expire, because the cast truncated a key with 500 ms
+    // left to `expire key 0`, which the `> 0` test then dropped and the key
+    // came back immortal.
     auto now = std::chrono::steady_clock::now();
     for (const auto& [key, tp] : m_expiry)
     {
@@ -1252,31 +1170,11 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     // Phase 2: mmap temp file and serialize directly into mapped region
     //
     // ─── 0600, AND CREATED THAT WAY ─────────────────────────────────────────
-    //
-    // This was a literal 0644, so a --persistent dump was readable by every
-    // account on the machine.  A cache holds whatever the application put in
-    // it; measured, one SET and a second uid:
-    //
-    //     SET session_token abc-super-secret
-    //     uid nobody: cat c1.rdb | strings  ->  session_token
-    //                                           abc-super-secret
-    //
-    // The same treatment as the runtime state files (state_persistence.cpp),
-    // and for a sharper reason than disclosure alone: cache_instance::start()
-    // calls load() on this path, so the dump is not a report of what the cache
-    // held, it is what the cache will hold.  0644 does not let another user
-    // rewrite the file — but replacing it needs write permission on the
-    // DIRECTORY, not on the file, and the directory is whatever path the
-    // operator passed to --persistent.  Narrowing the file is what this code
-    // can do; where the file lives is the operator's to choose.
-    //
-    // O_EXCL after an unlink, rather than O_TRUNC, for the reason spelled out
-    // in state_persistence.cpp: O_CREAT does not touch the mode of a file that
-    // already exists, and this .tmp name is deterministic, so a leftover from a
-    // killed daemon would hand its old mode to every save after it.  No chmod
-    // afterwards — the content is written before one could run — and no umask,
-    // which is process-wide and would apply to whatever else the daemon
-    // happened to create in the window.
+    // 0600 rather than the literal 0644 a dump was written at, created O_EXCL
+    // after an unlink because O_CREAT does not touch an existing file's mode
+    // and this .tmp name is deterministic -- and cache_instance::start() loads
+    // this path, so it is what the cache will hold rather than a report of
+    // what it held.
     unlink(tmp_path.c_str());
     int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd_raw < 0) return false;
@@ -1392,18 +1290,9 @@ bool cache_store::load(std::string_view path, size_t offset)
     }
 
     // ─── THE DUMPS THAT ARE ALREADY ON DISK ─────────────────────────────────
-    //
-    // Saving at 0600 does nothing for a cache that already has a 0644 dump
-    // beside it, and that dump does not get replaced until the next save —
-    // which for a cache that is running and never stopped is never.  This is
-    // the same repair state_persistence::tighten_existing() makes to the
-    // runtime records, at the same moment: the point where the daemon opens
-    // the file and takes it as its own.
-    //
-    // fchmod on the descriptor already opened, not chmod on the path, so this
-    // cannot be pointed at a different file between the fstat above and the
-    // change.  It only ever narrows, and a dump that is already owner-only is
-    // not touched.
+    // The same repair state_persistence makes to the runtime records, through
+    // fchmod on the descriptor already opened so it cannot be pointed at a
+    // different file, narrowing only.
     if ((st.st_mode & 0077) != 0)
     {
         if (fchmod(fd_raw, 0600) == 0)
@@ -1499,13 +1388,9 @@ bool cache_store::load_v2(const char* data, size_t size)
         uint32_t len = 0;
         if (!read_u32(len)) return false;
         if (remaining() < len) return false;
-        // Constructed, not assign()ed into.  assign() onto a fresh std::string
-        // goes through libstdc++'s growth policy, which rounds a request under
-        // twice the old capacity up to twice it: 16..29 bytes came back holding
-        // 30, one whole malloc size class more than the live write paths spend
-        // on the same string.  A cache that reloaded its own dump therefore
-        // occupied more than the one that wrote it — reported correctly, and
-        // real, one 16-byte class per string of that length.
+        // Constructed and not assign()ed into, because assign() rounds up to
+        // twice the old capacity and a cache reloading its own dump occupied
+        // more than the one that wrote it.
         out = std::string(p, len);
         p += len;
         return true;
@@ -1789,10 +1674,8 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
 
 void cache_store::set_max_memory(size_t bytes)
 {
-    // touch_lru is a no-op while there is no limit, so anything written before
-    // now is absent from the eviction order.  Without this, switching a limit on
-    // over existing data leaves try_evict with an empty list and no way to get
-    // back under the ceiling.
+    // touch_lru is a no-op while there is no limit, so switching one on over
+    // existing data would otherwise leave try_evict an empty list.
     const bool enabling = (m_max_memory == 0 && bytes != 0);
     m_max_memory = bytes;
     if (enabling)
@@ -1854,9 +1737,8 @@ void cache_store::drop_lru(std::string_view key)
         return;
     m_lru_order.erase(it->second);
     m_lru_map.erase(it);
-    // The two copies of the key go with them; see lru_key_copies().  Entering
-    // and leaving the LRU is the only thing that creates or destroys them, which
-    // is why they are counted here and not at the payload sites.
+    // The two copies of the key go with them, counted here because entering
+    // and leaving the LRU is the only thing that creates or destroys them.
     track_sub(lru_key_copies(key.size()));
 }
 
@@ -1869,11 +1751,9 @@ void cache_store::touch_lru(std::string_view key)
     auto it = m_lru_map.find(key);
     if (it != m_lru_map.end())
     {
-        // Relink the existing node instead of destroying and rebuilding it.
-        // erase + push_back frees a list node, allocates a new one and copies
-        // the key string again — on every cache hit, purely to move an element
-        // to the end of a list.  splice does it by pointer swap, and iterators
-        // to the moved element stay valid, so the map entry needs no update.
+        // Relink the existing node rather than destroying and rebuilding it,
+        // because erase plus push_back copies the key string again on every
+        // cache hit.
         m_lru_order.splice(m_lru_order.end(), m_lru_order, it->second);
     }
     else
@@ -1881,8 +1761,8 @@ void cache_store::touch_lru(std::string_view key)
         std::string k(key);
         m_lru_order.push_back(k);
         m_lru_map[std::move(k)] = std::prev(m_lru_order.end());
-        // Two more copies of the key now exist; nothing else counts them.  The
-        // splice branch above allocates nothing, so it adds nothing.
+        // Two more copies of the key now exist and nothing else counts them,
+        // while the splice branch allocates nothing.
         track_add(lru_key_copies(key.size()));
     }
 }
@@ -1896,20 +1776,17 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
     // stop far short of the limit the caller actually set.
     while (get_memory_used() + needed > m_max_memory && !m_lru_order.empty())
     {
-        // The key the caller is writing is not a candidate — see check_memory()
-        // for the three defects that came of it being one.  When it is the only
-        // thing left in the order there is nothing to take, and the write is
-        // refused rather than paid for with its own data.
+        // The key the caller is writing is not a candidate, so when it is the
+        // only thing left the write is refused rather than paid for with its
+        // own data.
         const bool protect_resident = (protect != nullptr && m_lru_map.count(*protect) != 0);
         const size_t candidates = m_lru_order.size() - (protect_resident ? 1 : 0);
         if (candidates == 0)
             break;
 
-        // Both branches go through drop_lru() rather than unlinking the node and
-        // erasing the map entry by hand.  That is the one place that knows what
-        // leaving the LRU costs — it gives back the two copies of the key — and
-        // an eviction path that skipped it would leak those bytes into the
-        // reported figure for as long as the process ran.
+        // Both branches go through drop_lru(), which is the one place that
+        // knows what leaving the LRU costs, so an eviction path that skipped
+        // it would leak those bytes into the reported figure.
         size_t skip = 0;
         if (m_eviction != evict_allkeys_lru)   // evict_allkeys_random
         {
@@ -1918,10 +1795,8 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
         }
 
         // The LRU policy takes the front of the order and the random one the
-        // skip'th candidate; both walk from the front and step over the
-        // protected key if it is in their path.  The walk costs the random
-        // branch what std::advance cost it before, and the LRU branch stops on
-        // the first or second node.
+        // skip'th candidate, both stepping over the protected key if it is in
+        // their path.
         auto node = m_lru_order.end();
         for (auto n = m_lru_order.begin(); n != m_lru_order.end(); ++n)
         {
@@ -1942,11 +1817,9 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
         drop_lru(victim);
         if (m_lru_order.size() == order_before)
         {
-            // The map held no entry for this node, so drop_lru() found nothing
-            // to remove.  It cannot happen while the two stay in step, but the
-            // loop above only ends when the list shrinks: leaving the node in
-            // place would spin here forever.  Whatever removed the map entry
-            // accounted for the copies, so this only unlinks.
+            // The map held no entry for this node, which cannot happen while
+            // the two stay in step, and leaving it in place would spin here
+            // forever.
             m_lru_order.erase(node);
         }
         m_expiry.erase(victim);
