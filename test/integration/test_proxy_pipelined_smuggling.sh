@@ -1,30 +1,11 @@
 #!/usr/bin/env bash
-# Integration test: a request pipelined behind another still has to pass the
-# proxy's framing checks.
-#
-# rewrite_http_request took everything past the first "\r\n\r\n" in the buffer
-# and appended it to the forwarded request verbatim, then cleared the buffer.
-# parse_http_request_line only ever validates the FIRST message in that buffer —
-# that is where the CL+TE rejection, the duplicate-Content-Length rejection, the
-# bare-LF framing scan, the obs-fold rejection and the whitespace-before-colon
-# rejection all live.  So a client that sent one clean request and, in the same
-# write, a second request carrying Content-Length together with
-# Transfer-Encoding, had that second request handed to the backend untouched.
-# No malformed byte anywhere in the first request was needed; putting the
-# payload second was the whole of the bypass.
-#
-# This drives a real proxy in front of a real backend.  The backend records the
-# raw bytes of every connection it accepts, and the smuggled request carries a
-# header no legitimate request in this test carries — so "did it reach the
-# backend" is a grep over what the backend actually read, not an inference from
-# a status code.  A proxy that forwards it fails here whatever it answers the
-# client.
-#
-# The other half matters just as much: the fix holds the second request back so
-# it can be *checked*, not so it can be dropped.  Phase 2 pipelines two clean
-# requests in one write and requires both to be answered, in order, on the same
-# socket.  A fix that closed the hole by discarding pipelined bytes passes
-# phase 1 and fails phase 2.
+# Only the first message in the buffer is validated while everything past the
+# first blank line was appended verbatim, so a second request carrying both
+# Content-Length and Transfer-Encoding reached the backend untouched --
+# asserted by grepping what the backend actually read for a header no
+# legitimate request here carries, with phase 2 pipelining two clean requests
+# because a fix that closed the hole by discarding pipelined bytes passes phase
+# 1.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -62,15 +43,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet starts one of its own, detached from this shell; killing
-    # $DPID would leave that one running for good, holding this test's ports.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket as well as by pid and matched on exact process name,
+    # because a CLI command against an absent daemon starts a detached one that
+    # would hold this test's ports, and a `pgrep -f` pattern also matches the
+    # shell doing the matching.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -87,12 +63,9 @@ trap cleanup EXIT
 
 echo "=== Integration: a pipelined request is checked, not smuggled ==="
 
-# Backend.  Answers every framed request with Content-Length and keep-alive —
-# both are needed for the proxy to reach its pooling path at all — and echoes
-# the request path back as the body so each answer can be told from the others.
-# Every byte it reads is also appended to $RAW, which is what the smuggling
-# assertions look at: a header that arrives here arrived here, whatever the
-# proxy told the client.
+# A backend that answers with Content-Length and keep-alive so the proxy
+# reaches its pooling path, echoes the path as the body, and appends every byte
+# it reads to the capture the smuggling assertions look at.
 python3 - "$BE_PORT" "$RAW" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
 import socket, sys, threading
 
@@ -167,10 +140,8 @@ while True:
 PYEOF
 BEPID=$!
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet, so
-# polling with one races the daemon this test has just launched and spawns a
-# second, orphaned one that survives cleanup.
+# Wait on the daemon's IPC socket directly and never by polling with a CLI
+# command, which auto-starts a second orphaned daemon that survives cleanup.
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -198,14 +169,11 @@ SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart.
+# The daemon that answers is the one this test launched, since a zombie $DPID
+# has an empty /proc/<pid>/fd that `kill -0` cannot tell from a live process.
 TOTAL=$((TOTAL+1))
-# `|| true` because of `set -o pipefail`: when the pid really is gone — the
-# case this check exists for — `ls` fails, the pipeline fails, and the script
-# dies right here with no output at all.  The one check that can report a
-# dead daemon could never report one.
+# `|| true` because under pipefail the failing `ls` in exactly the case this
+# check exists for would kill the script with no output at all.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -237,8 +205,8 @@ else
     echo "  FAIL [setup]: the proxy runtime is not up — everything below is meaningless"
 fi
 
-# Everything the backend read before the smuggling attempt.  The readiness probe
-# above has already been through it, so this is not assumed to be empty.
+# Everything the backend read before the smuggling attempt, which is not
+# assumed empty because the readiness probe has already been through it.
 BEFORE_BYTES=$(wc -c <"$RAW" 2>/dev/null || echo 0)
 
 python3 - "$PX_PORT" "$PX_NAME" >"$OUT" 2>&1 <<'PYEOF' || true
@@ -399,9 +367,8 @@ except OSError:
 print("DONE")
 PYEOF
 
-# The harness has to have reached its last line.  Without this an aborted run
-# would only show up as a pile of confusing per-phase failures, and any check
-# phrased as "compare what we read" would have nothing to compare and pass.
+# The harness has to have reached its last line, or a check phrased as "compare
+# what we read" would have nothing to compare and pass.
 TOTAL=$((TOTAL+1))
 if grep -qx 'DONE' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -431,7 +398,7 @@ else
     echo "        so the smuggling assertions below would pass without proving anything"
 fi
 
-# THE assertion.  The marker is carried by the smuggled request and by nothing
+# The assertion: the marker is carried by the smuggled request and by nothing
 # else, so its presence in what the backend read means the request reached it.
 TOTAL=$((TOTAL+1))
 if grep -qa 'X-Smuggled-Marker' "$RAW" 2>/dev/null; then
@@ -485,8 +452,8 @@ else
     echo "        assertion above passed for the wrong reason"
 fi
 
-# Pipelining is held back to be checked, not to be dropped.  Both clean requests
-# must be answered on the one socket, in order.
+# Pipelining is held back to be checked rather than dropped, so both clean
+# requests must be answered on the one socket, in order.
 TOTAL=$((TOTAL+1))
 if grep -qx 'PHASE2 RESP1 OK pipe-a' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))

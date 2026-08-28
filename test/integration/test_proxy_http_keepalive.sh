@@ -1,26 +1,11 @@
 #!/usr/bin/env bash
-# Integration test: an HTTP keep-alive connection survives every response.
-#
-# detach_and_pool_backend has a fallback for a backend that still has a
-# completion owed to it, and that fallback closed the whole pair.  A backend
-# read is armed essentially all of the time, so that fallback is the branch that
-# runs — the client was torn down after every single response although both
-# sides had negotiated keep-alive, pooling never happened, and every request
-# paid for a fresh TCP handshake.
-#
-# The test sends several requests down one socket and requires every one of them
-# to be answered on that same socket.  Each request carries its own marker in
-# the path, the backend echoes that marker back as the response body, and the
-# body is compared against what was asked for: "some bytes came back" is not a
-# result.  Against the broken build the first request is answered and the second
-# one gets EOF, so the second assertion is the one that discriminates.
-#
-# Two green runs against a broken build in this project came from comparing a
-# value that could not be read against an equally empty expectation, so nothing
-# here is checked by string equality with a captured variable.  Every assertion
-# below demands the *presence* of a positive result line, absence is a failure,
-# and the harness prints a final DONE line that is asserted separately so that
-# a harness which died halfway cannot look like a clean run.
+# detach_and_pool_backend's fallback for a backend with a completion owed
+# closed the whole pair, and a backend read is armed essentially all of the
+# time, so the client was torn down after every response despite keep-alive --
+# so several requests go down one socket with a marker echoed back as the body,
+# and every assertion demands the presence of a positive result line rather
+# than comparing possibly-empty captures, with a final DONE line asserted
+# separately.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -49,11 +34,9 @@ PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
     [ -n "$BEPID" ] && kill "$BEPID" 2>/dev/null || true
-    # Wait for the daemon to actually go, and insist if it does not.  A plain
-    # kill returns immediately, and this test leaves a daemon holding thousands
-    # of connections, which takes long enough to shut down that the next test in
-    # the suite starts while it is still bound — the leftovers accumulate and one
-    # of them ends up answering somebody else's requests.
+    # Wait for the daemon to actually go and insist if it does not, because
+    # this test leaves one holding thousands of connections and the next test
+    # starts while it is still bound.
     if [ -n "$DPID" ]; then
         kill "$DPID" 2>/dev/null || true
         for _ in $(seq 1 50); do
@@ -63,17 +46,10 @@ cleanup() {
         kill -9 "$DPID" 2>/dev/null || true
         wait "$DPID" 2>/dev/null || true
     fi
-    # Kill by socket, not only by pid.  A CLI command run against a daemon that
-    # is not up yet — or not up any more — starts one of its own, detached from
-    # this shell; killing $DPID would leave that one running for good, holding
-    # this test's ports.  The socket path comes from mktemp, so matching on it
-    # can only ever hit daemons belonging to this run.
-    # Matched by exact process name, never by a command-line pattern.  `pgrep -f
-    # 'socketley daemon'` also matches a shell whose own command line merely
-    # carries that string — a test runner, or this file — and the environ check
-    # below cannot rule it out, because such a shell exports the very
-    # SOCKETLEY_SOCKET being matched on.  The two tests together are what make
-    # this reach daemons of this run and nothing else.
+    # Killed by socket as well as by pid and matched on exact process name,
+    # because a CLI command against an absent daemon starts a detached one that
+    # would hold this test's ports, and a `pgrep -f` pattern also matches the
+    # shell doing the matching.
     for p in $(pgrep -x socketley 2>/dev/null || true); do
         case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
             *" daemon "*|*" daemon") ;;
@@ -90,11 +66,9 @@ trap cleanup EXIT
 
 echo "=== Integration: HTTP keep-alive through the proxy ==="
 
-# Backend.  There is no HTTP echo mode in the server runtime, so this is a
-# minimal HTTP/1.1 origin that answers with Content-Length and keep-alive —
-# both are required for the proxy to reach the pooling path at all, and a
-# backend that answered "Connection: close" would skip the defect entirely.
-# It echoes the request path back as the body, which is the marker.
+# A minimal HTTP/1.1 origin answering with Content-Length and keep-alive, both
+# required for the proxy to reach the pooling path, echoing the request path
+# back as the marker.
 python3 - "$BE_PORT" >"$TMPDIR_T/backend.log" 2>&1 <<'PYEOF' &
 import socket, sys, threading
 
@@ -142,14 +116,9 @@ while True:
 PYEOF
 BEPID=$!
 
-# Wait on the daemon's IPC socket directly, never by polling with a CLI command.
-# Every CLI command auto-starts a daemon when the socket does not answer yet —
-# cli.cpp's ensure_daemon() forks, setsids and re-execs 'socketley daemon' — so
-# polling 'ps' against the daemon this test has just launched races it and spawns
-# a second, orphaned one.  Whichever loses the bind exits, and when the loser is
-# $DPID the pid this test watches becomes a zombie while an orphan serves the
-# run — and the orphan survives cleanup, because cleanup only knows $DPID.
-# Measured at 2 spawned orphans in 30 startups of this sequence.
+# Wait on the daemon's IPC socket directly and never by polling with a CLI
+# command, because every CLI command auto-starts a daemon when the socket does
+# not answer and the orphan survives cleanup, which only knows $DPID.
 cat > "$TMPDIR_T/waitsock.py" <<'PYEOF'
 import socket, sys, time
 
@@ -177,16 +146,11 @@ SOCKETLEY_DLOG="$TMPDIR_T/daemon.log"
 DPID=$!
 python3 "$TMPDIR_T/waitsock.py" "$SOCKETLEY_SOCKET" 8 >/dev/null 2>&1 || true
 
-# The daemon that answers is the one this test launched.  A zombie $DPID has an
-# empty /proc/<pid>/fd while an orphaned daemon serves the run, and 'kill -0'
-# cannot tell the two apart — so this looks at the descriptor table, which only a
-# live process has.  Without it the run measures somebody else's daemon and says
-# nothing about it.
+# The daemon that answers is the one this test launched, asked of the
+# descriptor table because `kill -0` cannot tell a zombie from a live process.
 TOTAL=$((TOTAL+1))
-# `|| true` because of `set -o pipefail`: when the pid really is gone — the
-# case this check exists for — `ls` fails, the pipeline fails, and the script
-# dies right here with no output at all.  The one check that can report a
-# dead daemon could never report one.
+# `|| true` because under pipefail the failing `ls` in exactly the case this
+# check exists for would kill the script with no output at all.
 NFD=$(ls -1 "/proc/$DPID/fd" 2>/dev/null | wc -l || true)
 case "$(printf '%s' "$NFD" | tr -d '[:space:]')" in
     ''|0|*[!0-9]*)
@@ -222,8 +186,8 @@ else
     echo "  FAIL [setup]: the proxy runtime is not up — everything below is meaningless"
 fi
 
-# One socket, several requests.  The socket object is never reopened: if the
-# proxy closes it, request 2 has nowhere to go and says so.
+# One socket, several requests, never reopened -- so if the proxy closes it,
+# request 2 has nowhere to go and says so.
 python3 - "$PX_PORT" "$PX_NAME" "$NREQ" >"$OUT" 2>&1 <<'PYEOF' || true
 import socket, sys
 
@@ -310,9 +274,8 @@ except OSError:
     pass
 PYEOF
 
-# The harness has to have reached its last line.  Without this an aborted run
-# would only show up as a pile of confusing per-request failures, and any check
-# phrased as "compare what we read" would have nothing to compare and pass.
+# The harness has to have reached its last line, or a check phrased as "compare
+# what we read" would have nothing to compare and pass.
 TOTAL=$((TOTAL+1))
 if grep -q '^DONE ' "$OUT" 2>/dev/null; then
     PASS=$((PASS+1))
@@ -322,10 +285,8 @@ else
     grep -v '^$' "$OUT" 2>/dev/null | head -5 | sed 's/^/        /' || true
 fi
 
-# One assertion per request.  Request 1 failing means the proxy is broken
-# outright; request 2 onwards failing while request 1 passed is the keep-alive
-# defect, which is why they are counted separately instead of as one "all
-# requests answered" check.
+# One assertion per request, because request 1 failing means the proxy is
+# broken outright while request 2 onwards failing is the keep-alive defect.
 for i in $(seq 1 "$NREQ"); do
     TOTAL=$((TOTAL+1))
     if grep -qx "RESP $i OK" "$OUT" 2>/dev/null; then

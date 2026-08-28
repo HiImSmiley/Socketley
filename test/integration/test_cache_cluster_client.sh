@@ -2,55 +2,21 @@
 # An off-the-shelf cluster client routes for itself, and stops crossing.
 #
 # ─── WHAT THIS FILE IS ACTUALLY ASSERTING ───────────────────────────────────
-#
-# A sharded cache costs more CPU per request than the same work with no
-# crossings.  Measured on this tree, 8 client processes x 50 connections, three
-# interleaved passes per arm, medians, rps per server core: 63,849 on the shared
-# port against 87,401 routed, and four independent single-shard caches at
-# 87,663.  The crossing is not slow because of how it is implemented — it is on
-# the ring, it makes zero blocking syscalls, the daemon relay is out of the
-# path — it is slow because it EXISTS.  With N shards a random key is foreign (N-1)/N of the time, and until
-# now the client could not choose its shard: every shard joins one port under
-# SO_REUSEPORT and the kernel assigns by 4-tuple hash.
-#
-# So the fix is not a faster crossing, it is a client that never causes one, and
-# the only clients worth having are the ones already written.  That is the whole
-# reason the slot function is Redis's CRC16 and not ours.
-#
-# Which makes THROUGHPUT the wrong assertion here, and the count of crossings
-# the right one.  A build where the client is not actually routing still answers
-# every key correctly — over the mesh — and would pass any read-back test while
-# measuring exactly what it measured before.  `mesh_direct` and `mesh_relayed`
-# are per shard in `stats`, and for a cluster-aware client both must be about
-# zero.  If they are not, the client is not routing and nothing else here means
-# anything.
-#
-# ─── THE CONTROL THAT MAKES THAT NUMBER READABLE ────────────────────────────
-#
-# Zero crossings is also what a broken cache with no traffic reports.  So the
-# same keys are driven through the SHARED port in a second arm, where the
-# crossings MUST appear — that is the arm that says the counter works, the
-# fallback still exists, and this test could have failed.
-#
+# A crossing is slow because it exists rather than because of how it is
+# implemented, so the fix is a client that never causes one and the slot
+# function is Redis's CRC16 -- which makes the count of crossings the assertion
+# rather than throughput, since a build where the client is not routing still
+# answers every key correctly over the mesh; with the same keys driven through
+# the shared port as the control, because zero crossings is also what a broken
+# cache with no traffic reports.
 # ─── AND THAT IT IS OFF UNLESS ASKED FOR ────────────────────────────────────
-#
-# Client-side routing gives up an enforcement point: a routing client must reach
-# every shard's own port DIRECTLY, so a cache behind a proxy either has the
-# proxy's rules bypassed by a map it handed out, or sends its clients to an
-# address they cannot reach.  That is inherent — Redis Cluster has the same
-# property — so it is a decision the operator makes, with --cluster, and the
-# default is the shared-port cache that existed before any of this.
-#
-# The last two cases below are that default, and they are the ones most likely
-# to rot: a later change that made the ports unconditional again would leave
-# every assertion above green.
-#
+# Client-side routing gives up an enforcement point -- a routing client must
+# reach every shard's port directly -- so it is a decision the operator makes
+# with --cluster, and the last two cases are the shared-port default most
+# likely to rot.
 # ─── THE EXTERNAL ORACLE ────────────────────────────────────────────────────
-#
-# CLUSTER KEYSLOT is checked against numbers Redis itself publishes (foo=12182,
-# bar=5061, hello=866, key1=9189), not against this build.  An agreement
-# between our slot function and our own idea of it proves nothing: the entire
-# value of the function is that a STRANGER computes the same answer.
+# Checked against numbers Redis itself publishes, because the entire value of
+# the function is that a stranger computes the same answer.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -62,9 +28,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 daemon_isolate cacheclust
 
 # ── Why these are twenty apart ──────────────────────────────────────────────
-#
-# A cache with --shards N binds N+1 ports: the shared one, and base+1+i per
-# shard.  Adjacent bases collide, and the collision refuses the start.
+# A cache with --shards N binds N+1 ports, so adjacent bases collide and the
+# collision refuses the start.
 P4=$((SL_PORT_BASE+1470))       # four shards, --cluster  (+1471..1474)
 P1=$((SL_PORT_BASE+1490))       # one shard, the unsharded control
 PD=$((SL_PORT_BASE+1495))       # four shards, NO --cluster: the default
@@ -99,13 +64,10 @@ daemon_start "$BIN"
 "$BIN" create cache cl4 -p "$P4" --shards 4 --resp --cluster -s >/dev/null 2>&1 \
     || { echo "  FATAL: a four-shard --cluster cache would not start"; exit 2; }
 "$BIN" create cache cl1 -p "$P1" --resp -s >/dev/null 2>&1
-# ── The default arm, and the neighbour that makes it an assertion ───────────
-#
-# clsq takes PD+1 FIRST.  cldef then asks for four shards on PD without the
-# flag, so a build that bound base+1+i regardless would find PD+1 taken and
-# refuse to start -- which is exactly the behaviour --cluster is supposed to
-# have and the default is supposed not to.  The order matters and is why these
-# two are created in this one.
+# The neighbour takes PD+1 first, so a build that bound base+1+i without the
+# flag would find it taken and refuse -- which is the behaviour --cluster is
+# supposed to have and the default is not, and is why these two are created in
+# this order.
 "$BIN" create cache clsq -p "$PSQ" --resp -s >/dev/null 2>&1
 DEF_START_RC=1
 "$BIN" create cache cldef -p "$PD" --shards 4 --resp -s >/dev/null 2>&1 && DEF_START_RC=0
@@ -165,10 +127,8 @@ fi
 #
 # Parsed out of CLUSTER SLOTS the way a client reads it: start, end, host, port.
 MAP=$(redis-cli -p "$P4" CLUSTER SLOTS 2>/dev/null)
-# redis-cli writing to a pipe emits one bare token per line -- no "(integer)"
-# markers, no indices -- so the reply reads as: start, end, host, port, id, for
-# each range in turn.  Parsed as a token list rather than as redis-cli's
-# interactive rendering, which is what the first version of this test got wrong.
+# redis-cli writing to a pipe emits one bare token per line, so the reply is
+# parsed as a token list rather than as its interactive rendering.
 TOKENS=$(printf '%s\n' "$MAP" | sed 's/^ *//; s/ *$//' | grep -v '^$')
 PORTS_IN_MAP=0
 for i in 1 2 3 4; do
@@ -228,11 +188,8 @@ else
         "$NLINES lines, $NMY marked myself"
 fi
 
-# ── 6: the wrong shard says MOVED, and names the right port ─────────────────
-#
-# `foo` is slot 12182, which at four shards is 12182*4/16384 = shard 2, so its
-# owner is base+3.  Asked of base+1 the answer must be a redirect and NOT the
-# value: a crossing here would be correct and would defeat the entire change.
+# Asked of the wrong shard, the answer must be a redirect and not the value,
+# because a crossing here would be correct and would defeat the entire change.
 SLOT_FOO=12182
 OWNER=$(( SLOT_FOO * 4 / 16384 ))
 OWNER_PORT=$(( P4 + 1 + OWNER ))
@@ -273,9 +230,9 @@ mesh_total() {
 sleep 2
 BEFORE=$(mesh_total)
 
-# `redis-cli -c` is the client: it follows MOVED, reads the map, and thereafter
-# sends each key to its owner.  200 keys is enough that all four shards are
-# addressed and a client that ignored the map would cross about 150 times.
+# `redis-cli -c` is the client that follows MOVED and reads the map, with 200
+# keys so all four shards are addressed and a client ignoring the map would
+# cross about 150 times.
 for i in $(seq 1 200); do
     redis-cli -c -p $((P4+1)) SET "ck$i" "cv$i" >/dev/null 2>&1
 done
@@ -290,8 +247,8 @@ CROSS_CLUSTER=$((AFTER_CLUSTER - BEFORE))
 [ "$CMISS" -eq 0 ] && ok "a cluster-aware client reaches every key (200/200)" \
     || bad "a cluster-aware client reaches every key" "$CMISS of 200 missing"
 
-# Now the same keys through the SHARED port, where a crossing is the only way
-# an answer can be produced.  This is the arm that says the counter works.
+# The same keys through the shared port, where a crossing is the only way an
+# answer can be produced, which is the arm that says the counter works.
 for i in $(seq 1 200); do
     redis-cli -p "$P4" GET "ck$i" >/dev/null 2>&1
 done
@@ -309,11 +266,10 @@ else
         "with the counter reading near zero on both arms, arm 7 proves nothing"
 fi
 
-# The threshold, and why it is not zero: redis-cli -c learns the map from the
-# first MOVED, so the handful of commands before each refresh are answered by
-# whichever shard it was talking to.  Those are redirects, not crossings — but
-# the CLUSTER SLOTS and PING it sends are answered locally too, so the honest
-# claim is "an order of magnitude below the shared arm", not "exactly zero".
+# Not zero, because redis-cli -c learns the map from the first MOVED and the
+# handful of commands before each refresh are answered by whichever shard it
+# was talking to -- so the honest claim is an order of magnitude below the
+# shared arm.
 if [ "$CROSS_CLUSTER" -lt $((CROSS_SHARED / 4)) ]; then
     ok "the routed arm crossed $CROSS_CLUSTER times against $CROSS_SHARED on the shared port"
 else
@@ -352,10 +308,8 @@ else
 fi
 
 # ── 10: SCAN on a shard port ends ───────────────────────────────────────────
-#
-# The runtime-wide cursor walks shard 0, then shard 1, and so on.  Handed to a
-# client talking to ONE node that cursor never terminates: the "on to the next
-# shard" value is served here, from the start, forever.
+# The runtime-wide cursor walks the shards in turn, so handed to a client
+# talking to one node it never terminates.
 SC_OUT=$(mktemp)
 timeout 20 redis-cli -p $((P4+2)) --scan --pattern 'ck*' >"$SC_OUT" 2>/dev/null
 SC_RC=$?

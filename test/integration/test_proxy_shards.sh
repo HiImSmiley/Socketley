@@ -1,43 +1,14 @@
 #!/usr/bin/env bash
-# Integration test: --shards N on a proxy.
-#
-# ─── WHAT IS BEING ASSERTED, AND WHY EACH ASSERTION CAN FAIL ────────────────
-#
-# A shard is an implementation detail of a runtime and not a runtime, so the
-# whole of the surface has to keep answering about the runtime:
-#
-#   ls           one line, not N.          Broken build: N lines.
-#   CONN         the sum over the shards.  Broken build: whichever shard
-#                                          published last — which for 8
-#                                          connections over 4 shards is 1, 2 or
-#                                          3, never 8.  This is the assertion
-#                                          that catches apply_stats() writing
-#                                          the placeholder directly again.
-#   stop/remove  take all of them down.    Broken build: a port still bound by
-#                                          the shards nobody stopped.
-#   start        brings back the SAME       Broken build: one worker, and a
-#                number.                    quarter of the throughput the
-#                                           operator configured, reported by
-#                                           `ls` as Up and by nothing as wrong.
-#
-# `send` is not asserted here and that is not an omission: cmd_send refuses a
-# proxy outright ("send is only supported for server and client runtimes"), so
-# there is no path from `send` to a sharded runtime to test.  The fan-out in
-# deliver_to_worker() is written for the day a shardable type has one.
-#
+# A shard is an implementation detail of a runtime and not a runtime, so `ls`
+# shows one line, the connection count is the sum over the shards rather than
+# whichever published last, stop and remove take all of them down, and start
+# brings back the same number -- while `send` is not asserted because cmd_send
+# refuses a proxy outright.
 # ─── THE ONE THAT IS NOT ABOUT SHARDS ───────────────────────────────────────
-#
-# The last case is the parent-death guard, and it is the reason this file
-# exists at all: SO_REUSEPORT shares a port with whoever asks, so a worker that
-# outlived its daemon goes on serving 1/N of the traffic from a build nobody
-# believes is running.  It is tested the only way that means anything — by
-# deliberately leaving one behind, with SIGSTOP so it cannot act on the EOF and
-# SIGKILL on the daemon so nothing tidies up after it.
-#
-# That case FAILED before this was added, and not only with shards: with one
-# worker the frozen process was still alive and still bound fifteen seconds
-# later.  So the control below runs the same experiment at one shard, which is
-# the shape every runtime in this tree already had.
+# The parent-death guard is why this file exists, because SO_REUSEPORT lets a
+# worker that outlived its daemon serve 1/N of the traffic from a build nobody
+# believes is running -- tested by deliberately leaving one behind, with a
+# control at one shard since that case failed there too.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -119,16 +90,12 @@ for _ in range(procs - 1):
 serve()
 PY
 
-# Every worker process of THIS binary.  Never `pgrep -f`: -f matches the whole
-# command line, so it also matches the shell carrying the string in its own
-# arguments -- including the one doing the matching.
+# Every worker process of this binary, never `pgrep -f`, which also matches the
+# shell carrying the string in its own arguments.
 shard_pids() {
-    # Scoped to THIS run's daemon, not to the binary.  Matching the binary was
-    # enough while the suite ran one file at a time; it counts the siblings'
-    # workers the moment two files run together, and the failure reads as a
-    # product defect -- "four worker processes: expected '4', got '14'".  The
-    # socket path is in every worker's environ because the daemon inherited it
-    # and the fork carries it.
+    # Scoped to this run's daemon rather than to the binary, because matching
+    # the binary counts the siblings' workers the moment two files run together
+    # and the failure reads as a product defect.
     for p in $(pgrep -x socketley 2>/dev/null); do
         [[ "$(readlink /proc/$p/exe 2>/dev/null)" == "$BIN" ]] || continue
         grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
@@ -137,12 +104,9 @@ shard_pids() {
 }
 
 echo "== --shards is a declaration, and one type refuses it outright =="
-# A cache used to be the second, and is not any more.  The refusal named a real
-# failure -- N shards were N stores behind one port, so a SET landed in one
-# process and a later GET on a new connection asked another -- and what removed
-# it was ownership by key hash, not a decision to tolerate the miss.  The whole
-# of that is test_cache_shard_*.sh; this is the one line that keeps THIS file
-# honest about which types are absolute.
+# A cache used to be the second absolute refusal, and what removed it was
+# ownership by key hash rather than a decision to tolerate the miss -- this
+# line only keeps this file honest about which types are absolute.
 out=$("$BIN" create cache shc -p $P_SPARE1 --shards 4 2>&1); rc=$?
 check "cache accepts --shards" "$rc" "0"
 [[ "$out" != *"not available on a cache"* ]] && ok "and no longer says it cannot" \
@@ -152,10 +116,9 @@ check "cache accepts --shards" "$rc" "0"
 out=$("$BIN" create client shk -t 127.0.0.1:$P_BACK --shards 4 2>&1); rc=$?
 check "client refuses --shards" "$rc" "1"
 
-# A server used to be the third.  It is not any more: with no --lua it has no
-# cross-connection state to lose and may shard, and with one it still may not.
-# The whole of that rule and its five doors are test_server_shards.sh; this is
-# the one line that keeps THIS file honest about which types are absolute.
+# A server used to be the third, and may now shard without --lua and still may
+# not with one -- this line only keeps this file honest about which types are
+# absolute.
 out=$("$BIN" create server shs -p $P_SPARE2 --shards 4 2>&1); rc=$?
 check "a server with no script is no longer refused" "$rc" "0"
 "$BIN" remove shs >/dev/null 2>&1
@@ -204,15 +167,10 @@ sleep 2.0
 CONN=$("$BIN" ls 2>/dev/null | awk '$2=="shp" {print $5}')
 check "CONN is the sum over shards" "$CONN" "8"
 
-# The oracle for the assertion above: no single shard is holding all eight, so
-# a build that reports one shard's figure cannot report 8 by accident.  Without
-# this the assertion could pass on a broken build that happened to put every
-# connection on one shard.
-# `shard_connections`, one line per shard, and NOT `connections`: that one is now
-# the runtime's own line and is the SUM, so an awk that matched it would read
-# busiest == 8 and fail this every time, on a build whose shards are sharing the
-# work perfectly.  The two names exist to keep the runtime's figure and a
-# shard's from being mistaken for one another — see aggregate_worker_stats().
+# The oracle for the assertion above is that no single shard holds all eight,
+# read from `shard_connections` rather than `connections`, which is now the
+# runtime's own summed line and would fail this on a build whose shards share
+# the work perfectly.
 MAXSHARD=$("$BIN" stats shp 2>/dev/null | awk -F: '/^shard_connections:/ {if ($2+0>m) m=$2+0} END {print m+0}')
 [[ "$MAXSHARD" -gt 0 && "$MAXSHARD" -lt 8 ]] \
     && ok "no single shard holds all 8 (busiest has $MAXSHARD) — the sum is a real sum" \
@@ -229,10 +187,9 @@ n=$(ss -ltn 2>/dev/null | grep -c ":$P_PROXY ")
 check "nothing bound to the port after stop" "$n" "0"
 
 echo "== show | import is a round trip, not a quiet reset =="
-# `show` emits shards and `import` used to parse it and never apply it, so a
-# round trip brought a four-shard proxy back with one -- Up in `ls`, and wrong
-# nowhere.  Asserted while STOPPED, because the same field is refused while
-# running; both halves are checked.
+# `import` used to parse the shard count and never apply it, bringing a
+# four-shard proxy back with one, and it is asserted while stopped because the
+# same field is refused while running.
 DOC=$("$BIN" show shp 2>/dev/null)
 [[ "$DOC" == *'"shards"'* ]] && ok "show emits the shard count" \
                              || bad "show dropped the shard count: $DOC"
@@ -243,10 +200,8 @@ sleep 1.0
 n=$(shard_pids | grep -c .)
 check "four shards survive show|import" "$n" "4"
 
-# Refused only when it would CHANGE the count: re-importing the same document
-# into a running runtime asks for nothing and is allowed, which is what makes
-# the round trip above legal in the first place.  So the refusal has to be
-# provoked with a different number, or the assertion passes on a build that
+# Refused only when it would change the count, so the refusal has to be
+# provoked with a different number or the assertion passes on a build that
 # refuses nothing.
 out=$(printf '%s' "$DOC" | "$BIN" import shp 2>&1); rc=$?
 check "an unchanged import is accepted while running" "$rc" "0"
@@ -278,12 +233,9 @@ check "no worker processes after remove" "$n" "0"
 kill -9 $BACK_PID 2>/dev/null
 
 echo "== a shard proves it belongs to the current daemon =="
-# The whole point, and the only way to test it that means anything: leave one
-# behind on purpose.  SIGSTOP so the shard cannot act on the EOF its control
-# socket is about to get, then SIGKILL the daemon so nothing tidies up.
-#
-# Run against a daemon of its own -- this kills a daemon, and the suite's
-# daemon has the rest of the tests to serve.
+# Leave one behind on purpose -- SIGSTOP so the shard cannot act on the EOF and
+# SIGKILL on the daemon so nothing tidies up -- against a daemon of its own,
+# since the suite's has the rest of the tests to serve.
 STALE_HOME=$(mktemp -d); STALE_SOCK=/tmp/skl-stale-$$.sock
 python3 "$BACKEND_PY" $P_STALEB 2 >/dev/null 2>&1 &
 SBACK=$!
