@@ -1,9 +1,7 @@
 #pragma once
-// Before <liburing.h>, so that a liburing too old for this file says so instead
-// of producing `not declared in this scope` for the identifiers below.  Also
-// force-included into every translation unit by premake5.lua; here as well
-// because a header must not depend on the build system to be correct, and the
-// clang advisory job in CI compiles these sources without premake.
+// Before <liburing.h>, so a liburing too old for this file says so, and here
+// as well as in premake5.lua because a header must not depend on the build
+// system to be correct.
 #include "liburing_version.h"
 
 #include <atomic>
@@ -23,20 +21,10 @@ struct buf_ring_pool
     uint32_t buf_size{0};
 
     // ── Consumption cursor ──────────────────────────────────────────────────
-    // How many ring entries the kernel has consumed, counted at dispatch.  The
-    // kernel takes entries strictly in the order they were provided, and every
-    // provision goes through setup_buf_ring()/return_buf() — so the entry at
-    // (consumed & (buf_count-1)) in the ring's own memory names the next buffer
-    // the kernel will hand out.  That is the only way to name buffers 2..k of a
-    // BUNDLE completion: the CQE carries the FIRST buffer id and nothing else
-    // (measured — with buffers provided in the order 5,2,7,... a 600-byte
-    // bundle reported bid 5 and packed the rest into 2 and 7).
-    //
-    // cursor_ok is the tripwire.  Every buffered completion's reported first
-    // bid is compared against the cursor's prediction; a mismatch means the
-    // ordering assumption broke, the mismatch is logged once, and bundles stop
-    // being armed for this group — non-bundle completions never need the
-    // cursor, so they continue on the CQE's own bid.
+    // How many ring entries the kernel has consumed, which is the only way to
+    // name buffers 2..k of a bundle -- the CQE carries the first bid alone --
+    // with cursor_ok the tripwire that stops bundles being armed once a
+    // reported bid misses the prediction.
     uint32_t consumed{0};
     bool     cursor_ok{true};
 };
@@ -48,61 +36,22 @@ public:
     ~event_loop();
 
     // ── Ring policy ─────────────────────────────────────────────────────────
-    // Both take effect at init() and only there.  io_uring fixes a ring's flags
-    // when the ring is created and offers no way to change them afterwards, so
-    // these are not settings a running daemon can be asked to change — and that
-    // is also why neither is a per-runtime choice today: every in-process
-    // runtime shares this one ring, created before the first `create` command
-    // has been read.
-    //
-    // Calling either after init() is a no-op and says so in the log rather than
-    // leaving the caller believing a ring changed shape.  Which is why a
-    // process that will be told what shape its ring should be has to hold init()
-    // until it has been told: see proxy_worker, which builds its ring on the
-    // config frame.
-    //
-    // SQPOLL costs a kernel thread per ring for as long as the ring exists, and
-    // that thread spins on the submission queue whether or not anything is
-    // being submitted.  It is therefore off unless asked for.
-    //
-    // Calling either marks the choice explicit, and an explicit choice beats the
-    // environment at init().  The distinction is what makes `--no-sqpoll` and
-    // `--cpus max` mean anything: without it init() cannot tell "nobody chose,
-    // so the default is off" from "the command line said off", and
-    // SOCKETLEY_SQPOLL=1 in the environment would turn the poller back on under
-    // a flag that had just asked for it to be gone.
+    // Both take effect at init() and only there, because io_uring fixes a
+    // ring's flags at creation, and calling either marks the choice explicit
+    // so a flag beats the environment.
     void set_sqpoll(bool on);
     void set_cpus(const cpu_set_spec& cpus);
 
     bool init();
     void run();
 
-    // End the ring.  run() returning does not do this, on purpose: a daemon
-    // shutting down still has runtimes to stop, and stopping one submits —
-    // teardown() cancels the operations attached to its descriptors and
-    // withdraws its own timers, both of which need a ring to submit into.
-    //
-    // Call it once those are done and before anything an in-flight operation
-    // could still be naming is freed.  That is the one point where both halves
-    // hold: nothing more will be submitted, and nothing has been released yet.
-    // Afterwards every submit_* answers false instead of reaching into an
-    // unmapped queue, and the kernel can no longer be writing into memory the
-    // process is about to give back.  Idempotent; the destructor calls it.
+    // End the ring, which run() returning deliberately does not do, at the one
+    // point where nothing more will be submitted and nothing has been released
+    // yet; idempotent.
     void shutdown_ring();
 
-    // One pass of run()'s completion drain, without its loop and without its
-    // unbounded wait.  Dispatches every completion the ring has ready and
-    // returns how many; waits up to timeout_ms for the first one, or not at all
-    // when that is zero.
-    //
-    // This exists for a caller that owns the thread and cannot give it to run()
-    // — the operation-sequence fuzz targets, which have to interleave "arm
-    // something" and "let the ring report" under their own control.  It is the
-    // same body run() uses, deliberately: a harness with a drain loop of its own
-    // would be checking a dispatcher the daemon does not have.
-    //
-    // Not a substitute for run() in the daemon.  It never observes the stop
-    // eventfd, so nothing here ends on request_stop().
+    // One pass of run()'s completion drain for a caller that owns the thread,
+    // using the same body run() does, and observing no stop eventfd.
     uint32_t poll_completions(int timeout_ms = 0);
 
     void request_stop();
@@ -110,151 +59,67 @@ public:
 
     // ── Owner registration ──────────────────────────────────────────────────
     // The loop delivers a completion only while the handler that submitted it
-    // is still the handler that owns it.  Registration hands out that identity;
-    // deregistration revokes it, and from that moment every completion still in
-    // the ring for that handler is dropped — with whatever it carries released
-    // — instead of dispatched.
-    //
-    // Registration is implicit: the first submission from an unregistered
-    // handler registers it.  Nothing has to remember to call this, because
-    // forgetting to would mean the loop silently swallowing all of that
-    // handler's I/O — a far worse failure than forgetting to deregister, which
-    // only costs the check.  Call it explicitly when the identity is wanted
-    // before the first submission.  Idempotent.
+    // still owns it, and registration is implicit on first submission, because
+    // forgetting to register would silently swallow all of a handler's I/O.
     uint32_t register_owner(io_handler* owner);
 
-    // Submissions queued with no owner, whose completions were therefore
-    // dropped.  Never anything but a defect; see arm().  Counted as well as
-    // logged so a test can assert zero rather than grep a log the daemon
-    // deletes.
+    // Submissions queued with no owner, whose completions were dropped,
+    // counted as well as logged so a test can assert zero.
     uint64_t stat_ownerless() const { return m_stat_ownerless; }
 
-    // Call when the handler can no longer service a completion: a runtime that
-    // has torn down, a timer about to free itself.  A handler that frees itself
-    // from inside its own on_cqe must deregister there and not earlier —
-    // deregistering while its last completion is still in flight means that
-    // completion is dropped and the callback that would have freed it never
-    // runs.
+    // Call when the handler can no longer service a completion, and a handler
+    // that frees itself from its own on_cqe must deregister there and not
+    // earlier.
     void deregister_owner(io_handler* owner);
 
     bool owner_registered(const io_handler* owner) const;
 
-    // Submissions by this handler that are still owed a final completion, over
-    // every registration it has held.  Zero means no request the handler
-    // submitted is still in the ring, so the storage those requests live in —
-    // the handler itself, the connection structs it kept alive for exactly this
-    // reason — can finally be freed.  Note that dropping a completion still
-    // reads the request it points at, so "deregistered" is not on its own a
-    // licence to free that storage; this reaching zero is.
+    // Submissions still owed a final completion over every registration this
+    // handler has held, whose reaching zero -- and not being deregistered --
+    // is the licence to free their storage.
     uint32_t owner_inflight(const io_handler* owner) const;
 
-    // The same figure broken down by operation kind, summed over every
-    // registration the handler has held.  out must hold op_type_count entries.
-    // A count alone says an owner cannot be released; the kind says why.
+    // The same figure broken down by operation kind, into op_type_count
+    // entries, because a count says an owner cannot be released and the kind
+    // says why.
     void owner_inflight_breakdown(const io_handler* owner, uint32_t* out) const;
 
-    // The same question asked of a token instead of a handler, for a caller
-    // that is holding storage it may not free yet.
-    //
-    // Both of the above take an io_handler*, and neither can be asked once the
-    // handler is on its way out.  deregister_owner() clears the handler's copy
-    // of its token as its first act, and it is deregistered precisely when its
-    // storage is about to go — so the moment the question matters is the moment
-    // the handler can no longer be named.  Matching on the pointer instead is
-    // worse, not better: the address is exactly what a later allocation may
-    // reuse, so a fresh object at the old address would answer for the dead
-    // one.  A token cannot be confused that way — the slot's epoch changes on
-    // every re-registration, so a token names one registration for good.
-    //
-    // A caller that means to defer a free therefore captures the token BEFORE
-    // deregistering, and asks here afterwards.  Zero means nothing in the ring
-    // will name that registration again, which is the only licence to free the
-    // storage its io_requests live in.  Note that this is a stronger condition
-    // than "deregistered": a dropped completion is still a completion, and
-    // dropping one reads the owner token out of the request to decide.
+    // The same question asked of a token, captured before deregistering,
+    // because a handler is deregistered exactly when it can no longer be named
+    // and its address is what a later allocation may reuse.
     uint32_t token_inflight(uint32_t token) const;
 
     // True once the owner table has run out and handlers began sharing one
-    // identity.  From that point owner_inflight() cannot answer for any single
-    // one of them — it reports zero for a handler that never got a slot, which
-    // is indistinguishable from a handler that has fully drained.  A caller
-    // that frees storage on the strength of a zero has to stop doing so.
+    // identity, from which point a zero from owner_inflight() proves nothing.
     bool owner_table_full() const { return m_owner_table_full_logged; }
 
-    // Give back the provided buffer a completion is carrying, for a caller that
-    // is about to drop that completion — a connection index that no longer
-    // resolves, a handler that cannot place the request.  A buffer dropped with
-    // its completion never comes back to the group, and the groups are shared
-    // by every instance of a runtime type on this loop, so one instance leaking
-    // them starves all of them.  No-op unless the completion actually carries
-    // one.
+    // Give back the provided buffer a completion is carrying, for a caller
+    // about to drop it, because the groups are shared by every instance of a
+    // runtime type on this loop.
     void return_cqe_buf(const struct io_uring_cqe* cqe, const io_request* req);
 
     // ── Descriptor lifetime ─────────────────────────────────────────────────
-    // The only safe way to close a descriptor this loop has ever submitted for.
-    //
-    // An SQE carries a descriptor *number*; the kernel resolves it when it
-    // consumes the SQE, which under SQPOLL is another thread at a moment
-    // nothing here can observe.  close() does not withdraw a queued operation —
-    // it only frees the number, and the next accept takes it, so the queued
-    // operation is redirected onto a stranger.  That is not a theory: on the
-    // proxy it put an aborting client's 8192 bytes into the middle of 6% of
-    // healthy connections' streams, and the pairing checks on the forwarding
-    // path could not see it because they were right when they ran.
-    //
-    // Neither flush() nor submit_cancel_fd() is a defence.  flush() hands the
-    // SQE to the ring and returns; under SQPOLL it does not even make a
-    // syscall, so it says nothing about consumption.  And a cancel is itself an
-    // SQE naming that same number, so it inherits the whole problem: closing
-    // before it is consumed lets it cancel whatever inherited the number
-    // instead — a healthy connection's read completing -ECANCELED for no
-    // reason anyone can trace.
-    //
-    // This closes the descriptor now when nothing in the ring names it, and
-    // otherwise holds the number — the descriptor stays open, so every queued
-    // operation still resolves to the file it was submitted for — and closes it
-    // from disarm() once the last of them has reported.  Submitting a cancel
-    // for the ones that would not end on their own is part of the same step,
-    // and that cancel is counted like any other submission, so the number
-    // outlives it too.
-    //
-    // Call it for every descriptor the loop may name, including ones it
-    // probably does not: with nothing armed it is exactly close(), so a
-    // needless call costs one indexed load.  shutdown() first where the caller
-    // already does — it is what makes a socket's pending reads and writes
-    // report at once, and holding the number does not change that.
+    // The only safe way to close a descriptor this loop has submitted for: it
+    // holds the number open until every queued operation naming it has
+    // reported, because close() frees the number and the next accept redirects
+    // those operations onto a stranger.
     void close_fd(int fd);
 
-    // Operations still in the ring that named this descriptor.  Zero is the
-    // condition for giving the *number* to someone else without closing it: a
-    // connection pool handing the socket to the next request, a fixed-file slot
-    // going back to the allocator.  Same hazard as close, same answer.
-    //
-    // Cancels are deliberately not counted here, only in what close_fd() waits
-    // for.  A cancel that lands on a number still bound to the same file is a
-    // no-op for a pool — the file did not change — but a caller that pools a
-    // descriptor with a cancel of its own outstanding must know that cancel has
-    // already run, or IORING_ASYNC_CANCEL_ALL will take back the *next*
-    // request's I/O on that socket.  detach_and_pool_backend has that proof and
-    // says so; nothing else submits a cancel it does not close behind.
+    // Operations still in the ring that named this descriptor, which is the
+    // condition for giving the number away without closing it, and
+    // deliberately excluding cancels.
     uint32_t fd_inflight(int fd) const;
 
-    // The same question for a registered file.  A submission that names one is
-    // counted here and not in the descriptor table, so an operation invisible
-    // to fd_inflight() is either on a fixed index or counted nowhere — and
-    // those two are very different faults.  Exists so a report can tell them
-    // apart; nothing in the runtimes needs it.
+    // The same question for a registered file, so a report can tell an
+    // operation on a fixed index from one counted nowhere.
     uint32_t fixed_inflight(uint32_t idx) const
     {
         return idx < MAX_FIXED_FILES ? m_fixed_armed[idx] : 0;
     }
 
-    // Batched submissions - these queue SQEs without submitting
-    // The submit_* helpers return false when no SQE could be obtained even after
-    // flushing the ring.  Nothing is queued in that case, so a caller that has
-    // already marked an operation in flight must undo that and give up on the
-    // connection — otherwise nothing will ever complete for it and it hangs
-    // until the runtime stops.
+    // The submit_* helpers queue an SQE without submitting and return false
+    // when none could be obtained, in which case nothing is queued and a
+    // caller that marked an operation in flight must undo that.
     bool submit_accept(int listen_fd, struct sockaddr_in* addr, socklen_t* addrlen, io_request* req);
     bool submit_multishot_accept(int listen_fd, io_request* req);
     // Direct-descriptor multishot accept: accepted fds go straight into the
@@ -267,59 +132,19 @@ public:
     bool submit_recvmsg(int fd, struct msghdr* msg, io_request* req);
     bool submit_timeout(struct __kernel_timespec* ts, io_request* req);
 
-    // A submission that does nothing but report.  The completion arrives on the
-    // next pass of the drain, so this is how a handler asks the loop to come
-    // back to it once the current one has unwound — no descriptor, no timer, no
-    // wait.  request_channel uses it to get a cross-runtime request off the
-    // stack of the handler that made it.
-    //
-    // Cheaper than a zero-length timeout, which is the obvious alternative: a
-    // timeout arms an hrtimer and is charged to the kernel's timer wheel, and
-    // its completion carries -ETIME that every caller then has to ignore.  This
-    // one is consumed and reported in the same pass the SQE is read.
-    //
-    // Counted like every other submission, so an owner with one outstanding is
-    // not quiescent and its storage may not be freed.
+    // A submission that does nothing but report, so a handler can ask the loop
+    // to come back once the current pass has unwound -- cheaper than a
+    // zero-length timeout, which arms an hrtimer and completes with -ETIME.
     bool submit_nop(io_request* req);
 
-    // Withdraw a timeout that submit_timeout() put in the ring, named by the
-    // request it was submitted with — a timeout hangs off no descriptor, so
-    // there is nothing else to name it by, and neither close() nor
-    // submit_cancel_fd() reaches one.  Every teardown used to close its sockets
-    // and leave its own timers counting down; the loop went on owing that owner
-    // a completion for up to thirty seconds, reap_retired() frees an instance
-    // only once that count is zero, and so the instance was never freed at all —
-    // about 6 MB per removed runtime, held until the daemon exited.
-    //
-    // Two completions follow this, and only one of them is accounted for:
-    //
-    //   * The withdrawn timeout reports once more, with -ECANCELED and without
-    //     IORING_CQE_F_MORE.  That is the completion its own submit_timeout()
-    //     was already owed, so its arm() is answered by that single disarm()
-    //     exactly as if it had run to term.  This call changes no count; it only
-    //     makes the completion arrive now instead of when the timer would have
-    //     fired.
-    //
-    //   * The withdrawal itself reports whether the kernel found the timeout (0)
-    //     or not (-ENOENT).  Nothing acts on either answer, so it goes out with
-    //     no request attached and run() skips it without dispatching or
-    //     counting — which is why this is deliberately not arm()ed.  An arm()
-    //     with no disarm to answer it is this very bug again, and a disarm with
-    //     no arm wraps the counter so the owner's slot is never reusable.
-    //
-    // Only call this for a request a completion is genuinely owed on: the
-    // kernel compares the key without ever dereferencing it, but the cancelled
-    // timeout is delivered carrying that same pointer, and run() does read it.
-    // Calling it for a timeout that has already fired is still safe — the kernel
-    // answers -ENOENT and the completion it already posted does the disarm — but
-    // the storage behind the request has to be alive either way.
-    //
-    // False means the submission never reached the ring, so the timeout stays
-    // armed and ends only when it fires.
+    // Withdraw a timeout by the request it was submitted with, which is the
+    // only thing naming it, so a teardown does not leave the loop owing an
+    // owner a completion for thirty seconds -- the withdrawal itself is
+    // deliberately not arm()ed, since nothing acts on its answer.
     bool submit_timeout_remove(io_request* target);
 
-    // Fixed-file variants: use registered fd index instead of raw fd.
-    // Avoids fget/fput per I/O op (hot path).
+    // Fixed-file variants using a registered index instead of a raw fd,
+    // avoiding an fget/fput per operation.
     bool submit_read_fixed_file(int fixed_idx, char* buf, uint32_t len, io_request* req);
     bool submit_write_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
     bool submit_writev_fixed_file(int fixed_idx, struct iovec* iovs, uint32_t count, io_request* req);
@@ -335,121 +160,64 @@ public:
     bool submit_write_fixed_buf(int fd, const char* buf, uint32_t len, uint16_t buf_idx, io_request* req);
     bool buffers_registered() const { return m_bufs_registered; }
 
-    // Provided buffer ring API
-    //
-    // A group belongs to a runtime *type*, not to an instance: the ids are
-    // compile-time constants in the runtime headers and there are only
-    // MAX_BUF_GROUPS of them, so every server on this loop draws from one pool,
-    // every proxy from another, and so on.  The first instance of a type to
-    // reach here therefore decides the geometry for all of them; a later one
-    // asking for a different buf_count or buf_size gets the pool that already
-    // exists and a WARN saying so, rather than the silent substitution this used
-    // to perform.  True means there is a usable pool under group_id — not that
-    // it is the one this caller asked for.
+    // A buffer group belongs to a runtime type and not an instance, so the
+    // first instance to reach here decides the geometry and a later one asking
+    // for different dimensions gets the existing pool and a warning.
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
     bool submit_read_provided(int fd, uint16_t group_id, io_request* req);
-    // Cancel every pending operation on a descriptor in one SQE
-    // (IORING_ASYNC_CANCEL_ALL — without it only one is taken back per SQE, and
-    // the second completion arrives after whatever was waiting on the first has
-    // given up and freed itself).
-    //
-    // This is itself an SQE naming a descriptor number, so it is subject to the
-    // hazard it is usually submitted to help with: consumed after the number
-    // has been reissued, it cancels the new owner's operations.  It is
-    // therefore counted against that descriptor exactly like a read or a write,
-    // and close_fd() holds the number until it has reported.  Its completion
-    // carries no io_request — there is nothing to act on but "found it" or
-    // -ENOENT — so run() recognises it by a tag in the user_data and does the
-    // accounting without dispatching anything.
-    //
-    // Callers rarely need this directly: close_fd() submits one when, and only
-    // when, the descriptor has something armed.  Use it on its own only to take
-    // an operation back from a descriptor that is *staying* open.
+    // Cancel every pending operation on a descriptor in one SQE, counted
+    // against that descriptor like any other submission because it too names a
+    // number the kernel resolves late; close_fd() submits one when it needs
+    // to, so call this directly only for a descriptor that is staying open.
     bool submit_cancel_fd(int fd);
 
-    // The same, for an operation armed on a fixed-file index rather than on a
-    // descriptor number.  Submitted by free_fixed_file_slot() before it
-    // unregisters the file, because a cancel can only match while the index
-    // still resolves to one.
+    // The same for an operation armed on a fixed-file index, submitted before
+    // the file is unregistered because a cancel can only match while the index
+    // still resolves.
     bool submit_cancel_fixed(uint32_t idx);
     char* get_buf_ptr(uint16_t group_id, uint16_t buf_id);
     void return_buf(uint16_t group_id, uint16_t buf_id);
     void return_bufs_batch(uint16_t group_id, const uint16_t* buf_ids, uint32_t count);
     bool has_buf_ring(uint16_t group_id) const;
 
-    // Multishot recv: single SQE generates multiple CQEs until error or cancel.
-    // Uses provided buffer ring. Resubmit only when !(cqe->flags & IORING_CQE_F_MORE).
+    // Multishot recv, one SQE producing completions from the buffer ring until
+    // error or cancel, resubmitted only when IORING_CQE_F_MORE is clear.
     bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
     bool recv_multishot_supported() const;
 
     // ── Bundled multishot recv ──────────────────────────────────────────────
-    // IORING_RECVSEND_BUNDLE: one completion carries as many provided buffers
-    // as the socket queue could fill, instead of one completion per buffer.
-    // What it removes is kernel work per received byte — the task_work, the
-    // dispatch pass and the buffer-ring head advance that each extra CQE costs
-    // — and it removes it on the one side userspace batching cannot reach: the
-    // kernel picks receive granularity, not us.
-    //
-    // The completion is consumed differently, and a handler that arms this MUST
-    // consume it through cqe_buf_count()/cqe_buf_id() rather than the CQE's own
-    // buffer id: the CQE names only the FIRST buffer, the rest follow in the
-    // buffer ring's consumption order, and only the loop's cursor knows that
-    // order.  Bytes are packed contiguously — every buffer full except possibly
-    // the last (measured on this kernel; the probe is in the survey commit).
-    //
-    // Falls back to false when the kernel lacks the flag (probed by a real
-    // submission once, never inferred from a version), when SOCKETLEY_RECV_BUNDLE=0,
-    // or when the group's cursor has tripped.  The caller then arms the plain
-    // multishot variant, whose completions it must handle anyway — a bundle
-    // completion of one buffer and a plain completion look identical to a
-    // consumer of the span API.
+    // IORING_RECVSEND_BUNDLE packs as many provided buffers into one
+    // completion as the socket queue could fill, so a handler that arms it
+    // must consume through cqe_buf_count()/cqe_buf_id() rather than the CQE's
+    // own id, and falls back to the plain multishot variant whenever the flag,
+    // the environment or the group's cursor says no.
     bool submit_recv_multishot_bundle(int fd, uint16_t group_id, io_request* req);
     bool submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
 
-    // Whether arming a bundle is worth attempting: kernel support (functionally
-    // probed once, lazily) AND not disabled by SOCKETLEY_RECV_BUNDLE=0.
-    // Per-group cursor health is checked by the submit itself.
+    // Whether arming a bundle is worth attempting -- kernel support and not
+    // disabled by SOCKETLEY_RECV_BUNDLE=0 -- with per-group cursor health
+    // checked by the submit itself.
     bool recv_bundle_enabled() const;
 
-    // ── The buffers of the completion currently being dispatched ────────────
-    // Valid only inside on_cqe, and only for a completion carrying
-    // IORING_CQE_F_BUFFER.  count is 1 for every non-bundle operation; for a
-    // bundle it is how many buffers the kernel packed into this completion.
-    // cqe_buf_id(i) is the i-th buffer in packing order; the i-th holds
-    // min(buf_size, res - i*buf_size) bytes.  The handler returns each id with
-    // return_buf() exactly as before — the snapshot is taken before dispatch,
-    // so returning early entries cannot corrupt later ones.
+    // The buffers of the completion being dispatched, valid only inside on_cqe
+    // and only with IORING_CQE_F_BUFFER, snapshotted before dispatch so
+    // returning early entries cannot corrupt later ones.
     uint32_t cqe_buf_count() const { return m_cqe_buf_count; }
     uint16_t cqe_buf_id(uint32_t i) const
     {
         return i < m_cqe_buf_count ? m_cqe_bids[i] : 0;
     }
-    // The pool geometry a consumer needs to slice a bundle's bytes.  From the
-    // pool rather than the runtime's own constant, because a second instance of
-    // a type runs on whatever geometry the first one created.
+    // The pool geometry a consumer needs to slice a bundle's bytes, from the
+    // pool rather than the runtime's own constant.
     uint32_t buf_ring_buf_size(uint16_t group_id) const
     {
         return group_id < MAX_BUF_GROUPS ? m_buf_rings[group_id].buf_size : 0;
     }
 
-    // ── Every buffer of this completion, sliced and returned ────────────────
-    //
-    // The rule four runtimes would otherwise each have to remember, in one
-    // place.  A bundle CQE names only its FIRST buffer; the rest follow in the
-    // ring's consumption order, which only this loop's cursor knows.  The bytes
-    // are packed contiguously, every buffer full except possibly the last.  And
-    // a buffer whose pointer fails to resolve must STILL advance `remaining`,
-    // or every later slice is shifted by its length -- a silent corruption that
-    // looks like a protocol bug three layers up.
-    //
-    // `fn(char* data, uint32_t len)` gets each slice; what a runtime does with
-    // bytes is its own business and stays in the runtime.  Returning the buffer
-    // is not: a buffer left unreturned is one the group has permanently lost,
-    // so it happens here, on every path, including the failed pointer.
-    //
-    // Identical for a plain provided read, a non-bundled multishot and a
-    // bundle -- for the first two the count is one and this is the same single
-    // append it always was.
+    // Every buffer of this completion sliced and returned in one place,
+    // because a buffer whose pointer fails to resolve must still advance
+    // `remaining` and a buffer left unreturned is one the group has
+    // permanently lost.
     template <typename F>
     void for_each_cqe_buf(uint16_t group_id, const struct io_uring_cqe* cqe, F&& fn)
     {
@@ -475,54 +243,18 @@ public:
         }
     }
 
-    // Zero-copy send: kernel DMAs directly from user buffer.
-    // Generates TWO CQEs: completion + notification (IORING_CQE_F_NOTIF).
-    // Buffer must stay alive until NOTIF CQE arrives.
+    // Zero-copy send, which produces a completion and a separate notification,
+    // and whose buffer must stay alive until the notification arrives.
     bool submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
 
-    // Whether the kernel has the opcode.  Says nothing about whether using it
-    // is a good idea here — see send_zc_enabled().
+    // Whether the kernel has the opcode, which says nothing about whether
+    // using it is a good idea here.
     bool send_zc_supported() const;
 
-    // Whether a runtime should use it.  Off unless SOCKETLEY_SEND_ZC=1.
-    //
-    // A NOTIFICATION IS NOT A REQUEST, AND NOTHING LOCAL CAN MAKE IT ARRIVE.
-    //
-    // The notification is posted when the kernel has released the pages it
-    // borrowed, which for TCP means when the socket's write queue is freed.
-    // That is the peer's decision, not ours.  Measured directly against this
-    // kernel (test program in the commit message), on a loopback pair with a
-    // 544 KB zero-copy send and a receiver that does not read:
-    //
-    //     300 rounds of ring activity      no notification
-    //     close() the sender's descriptor  no notification
-    //     receiver reads the bytes         notification, immediately
-    //     SO_LINGER 0 + close (RST)        notification, immediately
-    //
-    // So the only two things that release it are the peer reading and an
-    // abortive close.  The second is not available to a graceful teardown: it
-    // would reset precisely those connections that have a large response in
-    // flight and have not read it yet, which turns "stop" into guaranteed
-    // truncation for the biggest responses.
-    //
-    // A plain write does not have this shape.  It is a request, so the cancel
-    // that free_fixed_file_slot() and close_fd() already submit withdraws it
-    // and it reports -ECANCELED.  A pending notification cannot be cancelled —
-    // there is no request left to name; the send has already completed.
-    // Observed on the seed that found this: the fixed-index cancel withdrew the
-    // multishot recv on the same index and left the notification standing.
-    //
-    // What that costs is a runtime that can never be freed.  retire()'s
-    // graveyard holds a stopped instance until owner_inflight() reaches zero,
-    // so one client that stops reading a >= 512 KB response pins the whole
-    // instance — its buffer rings, its connection table, all of it — for as
-    // long as it likes.  `socketley stop` returns, the runtime reports stopped,
-    // and the memory never comes back.
-    //
-    // The gain being given up is narrow by the callers' own rule: zero-copy is
-    // only ever reached for a single write of 512 KB or more, because below
-    // that the notification round trip costs more than the copy saves.  A
-    // deployment whose readers are known to drain can set SOCKETLEY_SEND_ZC=1.
+    // Off unless SOCKETLEY_SEND_ZC=1, because the notification is released
+    // only by the peer reading or an abortive close, cannot be cancelled, and
+    // one client that stops reading a large response therefore pins a stopped
+    // runtime's whole instance for as long as it likes.
     bool send_zc_enabled() const;
 
     // Registered files: pre-register fds to avoid fget/fput per op
@@ -535,91 +267,37 @@ public:
     // Allocate a slot in the registered file table, returns index or -1
     int alloc_fixed_file_slot();
 
-    // Give a slot back.  The file behind it is unregistered at once — until
-    // that happens the kernel still holds a reference to the socket and its
-    // close() did not really close it — but the *index* is only returned to the
-    // allocator once nothing in the ring still names it.
-    //
-    // A fixed-file SQE carries the index, not the file, and the kernel resolves
-    // it when it consumes the SQE, so an index handed straight back is the same
-    // redirection as a reissued descriptor number one level up: the next
-    // connection allocates the slot, points it at its own socket, and the
-    // previous connection's queued read lands there.  Nothing has ever measured
-    // this one — the fixed-file path is only taken when the accept registered a
-    // slot — but it is the same construction and it costs one counter to be rid
-    // of.
+    // Give a slot back, unregistering the file at once but returning the index
+    // to the allocator only once nothing in the ring still names it, because a
+    // fixed-file SQE carries the index and the kernel resolves it late.
     void free_fixed_file_slot(uint32_t idx);
 
-    // Splice: zero-copy data transfer between two fds through a pipe.
-    // fd_in -> fd_out, len bytes, off_in/off_out = -1 for pipes/sockets.
-    //
-    // This is the one submission here that never runs on the loop thread.
-    // IORING_OP_SPLICE has no non-blocking fast path: the kernel hands every
-    // one of them to an io-wq worker before it looks at whether the data is
-    // there, so the completion costs a worker round trip even when the
-    // operation could not possibly have blocked.  Measured directly, with the
-    // bytes already in the pipe and room at the far end (p50 over 3000
-    // submissions on 7.0.0-28):
-    //
-    //   read() from that same ready pipe        0.72 us
-    //   send() to that same ready socket        1.20 us
-    //   send() forced async with IOSQE_ASYNC   17.32 us
-    //   splice                                 17.19 us
-    //   splice + SPLICE_F_NONBLOCK             17.18 us
-    //   splice + SPLICE_F_FD_IN_FIXED          17.78 us
-    //
-    // Splice is indistinguishable from a submission deliberately forced onto a
-    // worker, and neither flag moves it.  There is no variant that stays on the
-    // fast path — registered pipes do not help, because the cost is the punt and
-    // not the descriptor lookup.
-    //
-    // What follows from that is a size rule, since the punt is a fixed cost per
-    // operation and a relay needs two of them per direction.  Over 16
-    // connections, 7 runs each:
-    //
-    //   128 B payload   splice 3037-83914 req/s   copy path 126673-152614 req/s
-    //   128 KB payload  splice 22286 req/s median, 5.06 us of loop-thread CPU
-    //                   copy   16014 req/s median, 55.89 us
-    //
-    // At small payloads splice is not merely slower, it is unstable: that 28x
-    // spread is one io-wq pool being contended by every connection at once, and
-    // the pool grew to 128 workers at 64 connections while throughput fell to
-    // 2676 req/s.  At large payloads the punt amortises and splice wins on both
-    // throughput and, by an order of magnitude, on loop-thread CPU.
-    //
-    // So: right for server_instance's file serving, wrong for a proxy relaying
-    // small messages.  A caller that cannot say which regime it is in should use
-    // the copy path, which is never catastrophic.
+    // Splice never runs on the loop thread -- the kernel punts every one to an
+    // io-wq worker, measured at 17 us against 1.2 us for a ready send -- so it
+    // is right for server_instance's file serving and wrong for a proxy
+    // relaying small messages.
     bool submit_splice(int fd_in, int fd_out, uint32_t len, io_request* req);
 
-    // Async file read: uses io_uring_prep_read (not recv) for regular files.
-    // req->fd should be set to the *socket* fd for CQE dispatch routing.
+    // Async file read using io_uring_prep_read, with req->fd set to the socket
+    // for CQE dispatch routing.
     bool submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req);
 
-    // Async connect: non-blocking connect via io_uring.
-    // CQE res is 0 on success, negative errno on failure.
+    // Async connect, whose completion is 0 on success and a negative errno on
+    // failure.
     bool submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
 
-    // Wait for readiness on an fd.  A connect() that returned EINPROGRESS is
-    // finished by polling for POLLOUT and then reading SO_ERROR — issuing a
-    // second connect on the same socket instead only ever answers EISCONN.
+    // Wait for readiness on an fd, which is how a connect() that returned
+    // EINPROGRESS is finished, since a second connect only ever answers
+    // EISCONN.
     bool submit_poll_add(int fd, unsigned mask, io_request* req);
 
-    // Withdraw a poll submitted with submit_poll_add.  Needed because a poll
-    // holds its own reference to the file: closing the descriptor does not end
-    // it, so a poll nobody withdraws is a completion the ring owes for as long
-    // as the file lives — see submit_cancel_fd for the same hazard on the
-    // whole-descriptor scale.  This one is keyed on the request rather than the
-    // descriptor, so it takes back exactly the poll it names and leaves a read
-    // or a write armed on the same socket alone.
+    // Withdraw a poll by the request that submitted it, needed because a poll
+    // holds its own reference to the file and closing the descriptor does not
+    // end it.
     bool submit_poll_remove(io_request* target);
 
-    // Hand every queued SQE to the ring.  Not a barrier, and in particular not
-    // a licence to close a descriptor one of them names: under SQPOLL this is a
-    // tail update with no syscall at all, and it returns long before the kernel
-    // thread has looked at anything.  Several teardowns used to read as
-    // "cancel, flush, close" and take the flush for the guarantee that made the
-    // order safe.  It never was one — close_fd() is.
+    // Hand every queued SQE to the ring, which is not a barrier and not a
+    // licence to close a descriptor one of them names -- close_fd() is.
     void flush();
 
     struct io_uring* get_ring();
@@ -630,23 +308,16 @@ public:
     // NAPI busy polling: reduce latency by busy-polling the NIC driver.
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
 
-    // Feature queries
-    //
-    // sqpoll_enabled() is what the ring actually got, which is not the same as
-    // what was asked for: SQPOLL needs a kernel that will grant it, and a
-    // request that was refused must not be reported back as if it had been
-    // honoured.  sqpoll_requested() is the asking side, so the two can be shown
-    // apart when they differ.
+    // sqpoll_enabled() is what the ring actually got and sqpoll_requested() is
+    // what was asked for, so a refused request is not reported as an honoured
+    // one.
     bool sqpoll_enabled() const { return m_sqpoll_enabled; }
     bool sqpoll_requested() const { return m_sqpoll_requested; }
     bool direct_accept_supported() const { return m_direct_accept_supported; }
 
-    // Whether a ring exists right now.  False before init() and again after
-    // shutdown_ring().  A caller that defers init() until it knows what shape
-    // the ring should be — a worker waiting for its config frame — needs to be
-    // able to ask, because until this is true poll_completions() returns
-    // immediately however long a timeout it was given, and a drain loop written
-    // against it would spin a core on nothing.
+    // Whether a ring exists right now, which a caller deferring init() until
+    // its config arrives has to ask, because poll_completions() returns
+    // immediately until then.
     bool ring_open() const { return m_ring_open; }
 
     // The CPU set this loop was configured with, and the one CPU the SQPOLL
@@ -655,18 +326,13 @@ public:
     const cpu_set_spec& cpus() const { return m_cpus; }
     int sq_thread_cpu() const { return m_sq_thread_cpu; }
 
-    // Whether the loop thread's affinity was actually narrowed.  False for an
-    // unrestricted set and for a sched_setaffinity that the kernel refused —
-    // the difference between "not asked" and "asked and did not get" belongs to
-    // the caller, not to a log line nobody reads.
+    // Whether the loop thread's affinity was actually narrowed, which
+    // distinguishes not asked from asked and refused.
     bool affinity_applied() const { return m_affinity_applied; }
 
-    // How often the submission queue was found full, and how often that ended
-    // in an operation being refused the ring anyway.  The second number is the
-    // one that costs something: every caller turns a refusal into dropped bytes
-    // or a closed connection, so a non-zero count is a delivery defect that has
-    // already happened.  Exposed because the alternative is a shortage that
-    // only shows up as unexplained losses somewhere else entirely.
+    // How often the submission queue was found full and how often that refused
+    // an operation, the second being a delivery defect that has already
+    // happened.
     uint64_t sq_full_count() const { return m_sq_full_count; }
     uint64_t sq_exhausted_count() const { return m_sq_exhausted_count; }
 
@@ -677,24 +343,18 @@ private:
     bool init_fd_tables();
     void apply_cpu_affinity();
 
-    // What run()'s drain loop must do after one completion.  `stop` is only
-    // ever the eventfd's own read reporting, which is how request_stop() ends
-    // the loop.  See the note above event_loop::dispatch_cqe in event_loop.cpp
-    // for why the decision below is a function at all.
+    // What run()'s drain loop must do after one completion, where `stop` is
+    // only ever the eventfd's own read reporting.
     enum class cqe_outcome : uint8_t { next, stop };
     cqe_outcome dispatch_cqe(struct io_uring_cqe* cqe);
 
-    // Dispatch every completion currently in the ring and advance the queue.
-    // Returns how many were consumed; sets got_signal when one of them was the
-    // stop eventfd, in which case the ones behind it are deliberately left for
-    // the next pass rather than dispatched into a daemon that is shutting down.
+    // Dispatch every completion currently in the ring, returning how many were
+    // consumed and leaving the ones behind the stop eventfd for the next pass.
     unsigned dispatch_ready(bool& got_signal);
 
-    // Stamp the owner identity and the descriptor(s) named onto a submission,
-    // count it as outstanding and count it towards the next flush.  Every
-    // submit_* helper ends with this, and passes the number it wrote into the
-    // SQE — encoded per IO_TARGET_* — rather than req->fd, which is a routing
-    // hint several helpers deliberately set to a different descriptor.
+    // Stamp the owner identity and the descriptors named onto a submission and
+    // count it, taking the number written into the SQE rather than req->fd,
+    // which several helpers set to something else.
     void arm(io_request* req, uint32_t target, uint32_t target2 = IO_TARGET_NONE);
     // One completion for that submission has landed and no more will follow.
     void disarm(uint32_t token, uint8_t type, uint32_t target, uint32_t target2);
@@ -702,8 +362,8 @@ private:
     void drop_completion(const struct io_uring_cqe* cqe, const io_request* req);
 
     // ── Per-descriptor accounting ───────────────────────────────────────────
-    // One counter per number a submission can name, and the release that number
-    // is waiting for.  See close_fd() for what the counters are protecting.
+    // One counter per number a submission can name, and the release that
+    // number is waiting for.
     void target_ref(uint32_t target);
     void target_unref(uint32_t target);
     // Perform a close or a slot release that was waiting on the count.
@@ -726,13 +386,12 @@ private:
     // because an unknown ioprio bit makes the kernel refuse every accept.
     bool m_accept_poll_first{false};
     bool m_sqpoll_enabled{false};
-    // Asked for, as opposed to granted.  Set before init() by set_sqpoll() or,
-    // when nothing called that, from the environment inside init().
+    // Asked for as opposed to granted, set before init() by set_sqpoll() or
+    // otherwise from the environment inside init().
     bool m_sqpoll_requested{false};
-    // Whether a caller chose, as opposed to the value merely being what it
-    // starts as.  Only these two say the environment has nothing left to
-    // decide; the values above cannot, because "off" and "unrestricted" are
-    // both a legitimate choice and the state of having made none.
+    // Whether a caller chose, which the values above cannot say because "off"
+    // and "unrestricted" are both a legitimate choice and the state of having
+    // made none.
     bool m_sqpoll_explicit{false};
     bool m_cpus_explicit{false};
     bool m_affinity_applied{false};
@@ -743,19 +402,16 @@ private:
     bool m_files_registered{false};
     bool m_bufs_registered{false};
     bool m_direct_accept_supported{false};
-    // Whether m_ring is a ring at all: false before init() and again after
-    // shutdown_ring().  get_sqe() is the single door every submission goes
-    // through, so testing it there covers all of them.
+    // Whether m_ring is a ring at all, tested in get_sqe(), which is the
+    // single door every submission goes through.
     bool m_ring_open{false};
-    // See get_sqe_when_full().  m_sq_full_logged keeps the warning to one line
-    // per ring: the condition repeats once per submission for the rest of a
-    // fan-out, and a line each would bury the thing it is reporting.
+    // See get_sqe_when_full(): one warning per ring, because the condition
+    // repeats once per submission for the rest of a fan-out.
     bool m_sq_full_logged{false};
     uint64_t m_sq_full_count{0};
     uint64_t m_sq_exhausted_count{0};
-    // How many times IORING_ENTER_SQ_WAIT may be re-entered for one SQE.  Each
-    // return either freed an entry or ended the loop, so this is a bound on
-    // signal interruptions and not a retry budget.
+    // How many times IORING_ENTER_SQ_WAIT may be re-entered for one SQE, which
+    // bounds signal interruptions rather than retries.
     static constexpr unsigned SQ_WAIT_ATTEMPTS = 8;
     uint32_t m_registered_file_count{0};
 
@@ -767,27 +423,18 @@ private:
     uint32_t m_file_bitmap_hint{0};  // hint for next scan start
 
     // ── Descriptor tables ───────────────────────────────────────────────────
-    // Submissions still in the ring that named each raw descriptor, and the two
-    // bits per descriptor that say what is waiting on that count: a close, and
-    // a cancel of our own we have not seen report yet.  Sized from
-    // RLIMIT_NOFILE at init(), because that is exactly the range of numbers the
-    // kernel can hand this process.
-    //
-    // uint16 is not a guess: a descriptor cannot have more submissions
-    // outstanding than the ring is deep, and the ring is two thousand entries.
-    // Two bytes per possible descriptor keeps a daemon at the usual 1024-file
-    // limit under 3 KB of tables.
+    // Submissions still naming each raw descriptor plus the two bits saying
+    // what waits on that count, sized from RLIMIT_NOFILE, in uint16 because a
+    // descriptor cannot outstand the ring's depth.
     uint16_t* m_fd_armed{nullptr};
     uint16_t* m_fd_cancels{nullptr};
     uint64_t* m_fd_close_deferred{nullptr};
     uint32_t  m_fd_table_size{0};
-    // Descriptors currently held open only because the ring still names them.
-    // Reported at shutdown if any are left, because a number that never drains
-    // is the one failure mode this scheme has and it is otherwise invisible.
+    // Descriptors held open only because the ring still names them, reported
+    // at shutdown because a number that never drains is otherwise invisible.
     uint32_t  m_fd_close_pending{0};
-    // Said once: a descriptor above the table cannot be tracked, so it is closed
-    // the old way and the hazard is open again for it.  Only reachable if the
-    // process's file limit rose after init(), which nothing here does.
+    // Said once: a descriptor above the table cannot be tracked, so it is
+    // closed the old way and the hazard is open again for it.
     bool      m_fd_untracked_logged{false};
 
     // The same two things for fixed-file table indices: submissions in the ring
@@ -800,42 +447,27 @@ private:
 
     uint64_t m_fixed_free_deferred[BITMAP_WORDS]{};
 
-    // Slots whose unregister is owed as well as their index.  Set when
-    // free_fixed_file_slot() had to cancel something first: the cancel names
-    // the index and the kernel resolves it when it consumes the SQE, so
-    // unregistering before then makes the cancel answer EBADF and withdraw
-    // nothing.  Cleared in settle_deferred(), once the operations have
-    // reported and the file has done its last work.
+    // Slots whose unregister is owed as well as their index, because
+    // unregistering before a cancel naming the index is consumed makes that
+    // cancel answer EBADF and withdraw nothing.
     uint64_t m_fixed_unreg_deferred[BITMAP_WORDS]{};
 
-    // The descriptor(s) named by the completion currently being dispatched, and
-    // only while it is the last completion that submission will produce.  A
-    // handler closing the descriptor it was just called about is the ordinary
-    // teardown in every runtime here, and that operation is still counted while
-    // the handler runs; close_fd() discounts it rather than making the most
-    // common close in the process pay for a cancel round trip.  IO_TARGET_NONE
-    // outside a dispatch.
+    // The descriptors named by the completion being dispatched while it is
+    // that submission's last, so close_fd() can discount it rather than make
+    // the commonest close pay for a cancel round trip.
     uint32_t m_cqe_target{IO_TARGET_NONE};
     uint32_t m_cqe_target2{IO_TARGET_NONE};
 
-    // ── Buffered-completion decode, dispatch-scoped like m_cqe_target ───────
-    // Filled by decode_cqe_bufs() before the handler runs, cleared after.  The
-    // snapshot is copied out of the buffer ring's entry array up front because
-    // the handler returns buffers as it consumes them, and a return writes at
-    // the ring's tail — which can wrap onto the very entries a long bundle is
-    // still reading.  MAX_CQE_BUFS bounds a bundle by construction: a
-    // completion cannot carry more buffers than the group holds, and no group
-    // here holds more than 1024.  A group configured larger simply never arms
-    // bundles (setup_buf_ring says so).
+    // Filled by decode_cqe_bufs() before the handler runs and cleared after,
+    // copied up front because a return writes at the ring's tail and can wrap
+    // onto entries a long bundle is still reading.
     static constexpr uint32_t MAX_CQE_BUFS = 1024;
     uint16_t m_cqe_bids[MAX_CQE_BUFS];
     uint32_t m_cqe_buf_count{0};
     const struct io_uring_cqe* m_cqe_current{nullptr};
-    // Advance the group cursor for one buffered completion and snapshot the
-    // buffer ids it consumed.  Called for EVERY completion carrying
-    // IORING_CQE_F_BUFFER, bundle or not — the cursor only stays truthful if
-    // every consumption passes this one chokepoint, and dispatch_cqe is the one
-    // place every completion already goes.
+    // Advance the group cursor and snapshot the buffer ids for every
+    // completion carrying IORING_CQE_F_BUFFER, because the cursor stays
+    // truthful only if every consumption passes this one chokepoint.
     void decode_cqe_bufs(const struct io_uring_cqe* cqe, const io_request* req,
                          uint8_t rtype);
     // Kernel support for IORING_RECVSEND_BUNDLE, established by one real
@@ -846,36 +478,29 @@ private:
     buf_ring_pool m_buf_rings[MAX_BUF_GROUPS]{};
 
     // ── Owner table ─────────────────────────────────────────────────────────
-    // run() asks "is this owner still there?" of every single completion, so
-    // the answer has to be one indexed load and one compare — an array reached
-    // through a small id the owner was given, never a lookup keyed on the
-    // handler pointer.
-    //
-    // A power of two so a token from a corrupted request still indexes inside
-    // the array; the compare that follows then rejects it.
+    // An array reached through a small id rather than a lookup keyed on the
+    // handler pointer, because run() asks this of every completion; a power of
+    // two so a corrupted token still indexes inside it.
     static constexpr uint32_t MAX_OWNERS = 1024;
     static constexpr uint32_t OWNER_SLOT_MASK = MAX_OWNERS - 1;
 
-    // Slot 0 is never handed out.  It is what a handler gets when the table is
-    // full: its completions still validate, so a runtime that is doing nothing
-    // wrong keeps working, it just cannot be told apart from the others in the
-    // same position.  That is precisely the guarantee the loop gave before this
-    // table existed, and far better than refusing to deliver its I/O.  Epoch 1,
-    // slot 0.
+    // Slot 0 is never handed out and is what a handler gets when the table is
+    // full, so its completions still validate and it merely cannot be told
+    // apart from the others.
     static constexpr uint32_t OWNER_UNVERIFIED = 1u << 16;
 
     struct owner_slot
     {
         io_handler* handler{nullptr};
-        // The same total split by operation kind.  Diagnostics only: when a
-        // slot will not drain, this says which operation is holding it.
+        // The same total split by operation kind, for diagnostics: when a slot
+        // will not drain, this says which operation is holding it.
         uint32_t    by_type[op_type_count]{};
         // The one value run() compares against; 0 while no registration holds
         // this slot, which no stamped token can equal.
         uint32_t    token{0};
-        // Submissions stamped with this slot that are still owed a final
-        // completion.  Kept accurate on the drop path too, or a slot whose
-        // owner is gone would never look drained.
+        // Submissions stamped with this slot still owed a final completion,
+        // kept accurate on the drop path too or a slot whose owner is gone
+        // would never look drained.
         uint32_t    inflight{0};
         // Survives the slot being freed, so a later registration on the same
         // slot cannot reproduce a token that a request in the ring still holds.
