@@ -26,7 +26,7 @@
 # ─── WHAT THIS ASSERTS ──────────────────────────────────────────────────────
 #
 # The field list is read out of state_persistence.h and checked against what
-# runtime_config_apply.cpp and proxy_worker.cpp actually read. A field that is
+# runtime_config_apply.cpp and worker_main.cpp actually read. A field that is
 # neither applied nor named in the exception list below is a failure, so adding
 # one to runtime_config forces a decision rather than allowing a silent drop.
 #
@@ -87,7 +87,7 @@ fields = list(dict.fromkeys(
 
 applied = set()
 for f in ('socketley/shared/runtime_config_apply.cpp',
-          'socketley/runtime/proxy/proxy_worker.cpp'):
+          'socketley/runtime/worker/worker_main.cpp'):
     applied |= set(re.findall(r'cfg\.(\w+)', open(os.path.join(root, f)).read()))
 
 # Fields a worker has no business applying, each with the reason it is here.
