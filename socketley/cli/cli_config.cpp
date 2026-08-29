@@ -1,4 +1,6 @@
 #include "cli.h"
+#include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -7,6 +9,401 @@
 #include "runtime_type_parser.h"
 #include "ipc_client.h"
 #include "command_hashing.h"
+
+namespace {
+
+// What a value in a configuration is allowed to be, which is also what it
+// becomes on the command line.
+enum class key_kind : uint8_t
+{
+    text,       // --flag <string>
+    integer,    // --flag <whole number>
+    number,     // --flag <number>
+    scalar,     // --flag <string or number>, for values like 256M and 0-3
+    boolean,    // --flag, emitted only when the value is true
+    list,       // --flag a,b,c
+    list_semi,  // --flag a;b;c
+};
+
+struct config_key
+{
+    std::string_view name;
+    std::string_view flag;
+    key_kind         kind;
+};
+
+// Every flag a create accepts, one row each, because the two sets drifting
+// apart is the whole defect this table exists to close: a key this file did
+// not name used to be dropped in silence, and the health-check, circuit,
+// retry and TLS families could not be reached from a configuration at all.
+// Keys the daemon has no flag for are handled beside the table, not in it.
+constexpr config_key config_keys[] = {
+    // ── Every type ──────────────────────────────────────────────────────────
+    { "port",               "-p",                   key_kind::integer },
+    { "listen",             "--listen",             key_kind::text    },
+    { "shards",             "--shards",             key_kind::integer },
+    { "log",                "--log",                key_kind::text    },
+    { "write",              "-w",                   key_kind::text    },
+    { "group",              "-g",                   key_kind::text    },
+    { "cpus",               "--cpus",               key_kind::scalar  },
+    { "max_connections",    "--max-connections",    key_kind::integer },
+    { "rate_limit",         "--rate-limit",         key_kind::number  },
+    { "global_rate_limit",  "--global-rate-limit",  key_kind::number  },
+    { "idle_timeout",       "--idle-timeout",       key_kind::integer },
+    { "drain",              "--drain",              key_kind::boolean },
+    { "test",               "--test",               key_kind::boolean },
+    { "tls",                "--tls",                key_kind::boolean },
+    { "cert",               "--cert",               key_kind::text    },
+    { "key",                "--key",                key_kind::text    },
+    { "ca",                 "--ca",                 key_kind::text    },
+
+    // ── Server ──────────────────────────────────────────────────────────────
+    { "mode",               "--mode",               key_kind::text    },
+    { "udp",                "--udp",                key_kind::boolean },
+    { "http",               "--http",               key_kind::text    },
+    { "http_cache",         "--http-cache",         key_kind::boolean },
+    { "master_pw",          "--master-pw",          key_kind::text    },
+    { "master_forward",     "--master-forward",     key_kind::boolean },
+    { "cache",              "--cache",              key_kind::text    },
+    { "upstreams",          "--upstream",           key_kind::list_semi },
+
+    // ── Client ──────────────────────────────────────────────────────────────
+    { "target",             "-t",                   key_kind::text    },
+
+    // ── Proxy ───────────────────────────────────────────────────────────────
+    { "backends",           "--backend",            key_kind::list    },
+    { "protocol",           "--protocol",           key_kind::text    },
+    { "strategy",           "--strategy",           key_kind::text    },
+    { "health_check",       "--health-check",       key_kind::text    },
+    { "health_interval",    "--health-interval",    key_kind::integer },
+    { "health_path",        "--health-path",        key_kind::text    },
+    { "health_threshold",   "--health-threshold",   key_kind::integer },
+    { "circuit_threshold",  "--circuit-threshold",  key_kind::integer },
+    { "circuit_timeout",    "--circuit-timeout",    key_kind::integer },
+    { "backend_timeout",    "--backend-timeout",    key_kind::integer },
+    { "retry",              "--retry",              key_kind::integer },
+    { "retry_all",          "--retry-all",          key_kind::boolean },
+    { "client_ca",          "--client-ca",          key_kind::text    },
+    { "client_cert",        "--client-cert",        key_kind::text    },
+    { "client_key",         "--client-key",         key_kind::text    },
+    { "sidecar",            "--sidecar",            key_kind::boolean },
+
+    // ── Cache ───────────────────────────────────────────────────────────────
+    { "persistent",         "--persistent",         key_kind::text    },
+    { "maxmemory",          "--maxmemory",          key_kind::scalar  },
+    { "eviction",           "--eviction",           key_kind::text    },
+    { "resp",               "--resp",               key_kind::boolean },
+    { "replicate",          "--replicate",          key_kind::text    },
+    { "cluster",            "--cluster",            key_kind::boolean },
+};
+
+// Keys with no flag of their own, listed so an unknown key can still be
+// refused by name.
+constexpr std::string_view special_keys[] = {
+    "type", "name", "config", "lua", "bash", "start", "reconnect", "sqpoll",
+    "daemon_process",
+};
+
+// %.10g rather than std::to_string, which writes a rate of 1.5 as 1.500000 and
+// would put six digits of noise into every command the daemon logs.
+std::string number_to_text(double v)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.10g", v);
+    return buf;
+}
+
+// The daemon's parser splits on whitespace and has no quoting, so a value with
+// a space in it would arrive as two arguments and configure something else.
+std::string refuse_whitespace(std::string_view key, const std::string& value)
+{
+    if (value.find_first_of(" \t") == std::string::npos)
+        return {};
+
+    return std::string(key) + ": a value cannot contain whitespace, because the "
+           "daemon's command line has no quoting (\"" + value + "\")\n";
+}
+
+// One key, appended to the command or refused with the reason, returning the
+// empty string when the key was absent.
+std::string emit_key(const config_key& key, const sol::table& entry, std::string& command)
+{
+    const sol::object obj = entry[key.name];
+    if (!obj.valid() || obj == sol::nil)
+        return {};
+
+    const std::string name(key.name);
+
+    switch (key.kind)
+    {
+        case key_kind::boolean:
+        {
+            if (obj.get_type() != sol::type::boolean)
+                return name + ": expected true or false\n";
+            if (obj.as<bool>())
+                command += " " + std::string(key.flag);
+            return {};
+        }
+
+        case key_kind::integer:
+        case key_kind::number:
+        {
+            if (obj.get_type() != sol::type::number)
+                return name + ": expected a number\n";
+            const double v = obj.as<double>();
+            if (key.kind == key_kind::integer && v != std::floor(v))
+                return name + ": expected a whole number\n";
+            command += " " + std::string(key.flag) + " " + number_to_text(v);
+            return {};
+        }
+
+        case key_kind::text:
+        case key_kind::scalar:
+        {
+            std::string value;
+            if (obj.get_type() == sol::type::string)
+                value = obj.as<std::string>();
+            else if (key.kind == key_kind::scalar && obj.get_type() == sol::type::number)
+                value = number_to_text(obj.as<double>());
+            else if (key.kind == key_kind::scalar)
+                return name + ": expected a string or a number\n";
+            else
+                return name + ": expected a string\n";
+
+            if (value.empty())
+                return name + ": the value is empty\n";
+            if (std::string why = refuse_whitespace(key.name, value); !why.empty())
+                return why;
+
+            command += " " + std::string(key.flag) + " " + value;
+            return {};
+        }
+
+        case key_kind::list:
+        case key_kind::list_semi:
+        {
+            if (obj.get_type() != sol::type::table)
+                return name + ": expected a list of strings\n";
+
+            const char sep = key.kind == key_kind::list ? ',' : ';';
+            std::string joined;
+
+            for (auto& element : obj.as<sol::table>())
+            {
+                if (element.second.get_type() != sol::type::string)
+                    return name + ": every entry has to be a string\n";
+
+                const std::string value = element.second.as<std::string>();
+                if (value.empty())
+                    return name + ": an entry is empty\n";
+                if (std::string why = refuse_whitespace(key.name, value); !why.empty())
+                    return why;
+
+                if (!joined.empty())
+                    joined += sep;
+                joined += value;
+            }
+
+            // An empty list is the operator asking for nothing rather than for
+            // a flag with no value, which the daemon would refuse.
+            if (!joined.empty())
+                command += " " + std::string(key.flag) + " " + joined;
+            return {};
+        }
+    }
+
+    return {};
+}
+
+// The keys with no straightforward flag: an alias, a tri-state, a value that
+// may be a bool or a number, and one key that is refused outright.
+std::string emit_special_keys(const sol::table& entry, std::string& command, bool& autostart)
+{
+    // `daemon_process` is refused rather than ignored, for either value,
+    // because a key that means nothing still implies this build has an
+    // opinion about it.
+    if (entry["daemon_process"].valid())
+        return "daemon_process is no longer a setting: every runtime runs in "
+               "its own process. Remove the line.\n";
+
+    // Two spellings of the handler script, with `config` winning, because a
+    // file naming both means two different scripts and only one can run.
+    {
+        const sol::object cfg = entry["config"];
+        const sol::object lua = entry["lua"];
+        const bool has_cfg = cfg.valid() && cfg != sol::nil;
+        const bool has_lua = lua.valid() && lua != sol::nil;
+
+        if (has_cfg && has_lua)
+            return "config and lua are two spellings of one key: name the "
+                   "handler script once\n";
+
+        if (has_cfg || has_lua)
+        {
+            const sol::object& obj = has_cfg ? cfg : lua;
+            if (obj.get_type() != sol::type::string)
+                return "config: expected a string\n";
+            const std::string value = obj.as<std::string>();
+            if (value.empty())
+                return "config: the value is empty\n";
+            if (std::string why = refuse_whitespace("config", value); !why.empty())
+                return why;
+            command += " --lua " + value;
+        }
+    }
+
+    // Infinite when true and bounded when a number, which is the flag's own
+    // shape: --reconnect alone means keep trying.
+    {
+        const sol::object obj = entry["reconnect"];
+        if (obj.valid() && obj != sol::nil)
+        {
+            if (obj.get_type() == sol::type::boolean)
+            {
+                if (obj.as<bool>())
+                    command += " --reconnect";
+            }
+            else if (obj.get_type() == sol::type::number)
+            {
+                const double v = obj.as<double>();
+                if (v != std::floor(v) || v < 0)
+                    return "reconnect: expected true or a count of attempts\n";
+                command += " --reconnect " + number_to_text(v);
+            }
+            else
+            {
+                return "reconnect: expected true or a count of attempts\n";
+            }
+        }
+    }
+
+    // Three states rather than two, because the daemon has a default of its
+    // own and "absent" has to stay distinguishable from "off".
+    {
+        const sol::object obj = entry["sqpoll"];
+        if (obj.valid() && obj != sol::nil)
+        {
+            if (obj.get_type() != sol::type::boolean)
+                return "sqpoll: expected true or false\n";
+            command += obj.as<bool>() ? " --sqpoll" : " --no-sqpoll";
+        }
+    }
+
+    {
+        const sol::object obj = entry["bash"];
+        if (obj.valid() && obj != sol::nil)
+        {
+            if (obj.get_type() != sol::type::string)
+                return "bash: expected a string\n";
+
+            switch (fnv1a(obj.as<std::string>()))
+            {
+                case fnv1a("pt"):
+                case fnv1a("tp"):
+                case fnv1a("bpt"):
+                case fnv1a("btp"):
+                    command += " -bpt";
+                    break;
+                case fnv1a("p"):
+                case fnv1a("bp"):
+                    command += " -bp";
+                    break;
+                case fnv1a("t"):
+                case fnv1a("bt"):
+                    command += " -bt";
+                    break;
+                default:
+                    command += " -b";
+                    break;
+            }
+        }
+    }
+
+    {
+        const sol::object obj = entry["start"];
+        if (obj.valid() && obj != sol::nil)
+        {
+            if (obj.get_type() != sol::type::boolean)
+                return "start: expected true or false\n";
+            autostart = obj.as<bool>();
+        }
+    }
+
+    return {};
+}
+
+// A key nobody handles is a typo, and a typo used to configure nothing while
+// the runtime came up looking correct.
+std::string refuse_unknown_keys(const sol::table& entry)
+{
+    for (auto& pair : entry)
+    {
+        if (pair.first.get_type() != sol::type::string)
+            return "a runtime entry takes named keys, not a list\n";
+
+        const std::string name = pair.first.as<std::string>();
+        bool known = false;
+
+        for (const config_key& key : config_keys)
+            if (key.name == name) { known = true; break; }
+
+        if (!known)
+            for (std::string_view key : special_keys)
+                if (key == name) { known = true; break; }
+
+        if (!known)
+            return "unknown key: " + name + "\n";
+    }
+
+    return {};
+}
+
+// The whole entry, in table order so two runs of one file produce the same
+// command, with the first refusal ending it because a half-built command line
+// configures something nobody asked for.
+std::string build_create_command(const std::string& type_str, const std::string& name,
+                                 const sol::table& entry, std::string& command)
+{
+    bool autostart = false;
+
+    if (std::string why = refuse_unknown_keys(entry); !why.empty())
+        return why;
+
+    command = "create " + type_str + " " + name;
+
+    for (const config_key& key : config_keys)
+        if (std::string why = emit_key(key, entry, command); !why.empty())
+            return why;
+
+    if (std::string why = emit_special_keys(entry, command, autostart); !why.empty())
+        return why;
+
+    // Last, so a runtime is fully configured before it is asked to run.
+    if (autostart)
+        command += " -s";
+
+    return {};
+}
+
+// A daemon setting the daemon reads at startup and cannot be told afterwards,
+// refused by name rather than dropped, because a file that sets a log level
+// nothing applies reads as if it did.
+std::string refuse_startup_only_daemon_keys(const sol::table& daemon)
+{
+    for (std::string_view key : { "log_level", "metrics_port", "cpus", "sqpoll" })
+    {
+        if (!daemon[key].valid())
+            continue;
+
+        return std::string(key) + " is read when the daemon starts and cannot be "
+               "set on a running one: put it in the daemon's own configuration "
+               "file and point SOCKETLEY_CONFIG at it\n";
+    }
+
+    return {};
+}
+
+} // namespace
 
 int cli_config(int argc, char** argv)
 {
@@ -17,7 +414,12 @@ int cli_config(int argc, char** argv)
     }
 
     sol::state lua;
-    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::table);
+
+    // string and math are open because a configuration builds names and port
+    // numbers, while os and io stay shut: this file describes runtimes and
+    // reaching the filesystem from it is a second thing to review.
+    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::table,
+                       sol::lib::string, sol::lib::math);
 
     sol::load_result script = lua.load_file(argv[2]);
 
@@ -44,6 +446,12 @@ int cli_config(int argc, char** argv)
     sol::optional<sol::table> daemon = lua["daemon"].get<sol::optional<sol::table>>();
     if (daemon)
     {
+        if (std::string why = refuse_startup_only_daemon_keys(*daemon); !why.empty())
+        {
+            std::cerr << why;
+            return 1;
+        }
+
         sol::optional<std::string> name = (*daemon)["name"].get<sol::optional<std::string>>();
         if (name && !name->empty())
         {
@@ -111,136 +519,14 @@ int cli_config(int argc, char** argv)
             continue;
         }
 
-        std::string command = "create " + type_str + " " + name;
+        std::string command;
 
-        sol::optional<int> port = t["port"].get<sol::optional<int>>();
-        if (port)
-            command += " -p " + std::to_string(*port);
-
-        sol::optional<std::string> target = t["target"].get<sol::optional<std::string>>();
-        if (target)
-            command += " -t " + *target;
-
-        sol::optional<std::string> mode = t["mode"].get<sol::optional<std::string>>();
-        if (mode)
-            command += " --mode " + *mode;
-
-        sol::optional<std::string> log = t["log"].get<sol::optional<std::string>>();
-        if (log)
-            command += " --log " + *log;
-
-        sol::optional<std::string> write_file = t["write"].get<sol::optional<std::string>>();
-        if (write_file)
-            command += " -w " + *write_file;
-
-        sol::optional<std::string> persistent = t["persistent"].get<sol::optional<std::string>>();
-        if (persistent)
-            command += " --persistent " + *persistent;
-
-        sol::optional<std::string> protocol = t["protocol"].get<sol::optional<std::string>>();
-        if (protocol)
-            command += " --protocol " + *protocol;
-
-        sol::optional<std::string> strategy = t["strategy"].get<sol::optional<std::string>>();
-        if (strategy)
-            command += " --strategy " + *strategy;
-
-        sol::optional<sol::table> backends = t["backends"].get<sol::optional<sol::table>>();
-        if (backends)
+        if (std::string why = build_create_command(type_str, name, t, command); !why.empty())
         {
-            std::string joined;
-            for (auto& p : *backends)
-            {
-                if (!joined.empty())
-                    joined += ",";
-                joined += p.second.as<std::string>();
-            }
-            command += " --backend " + joined;
+            std::cerr << "could not create " << name << ":\n  " << why;
+            ++failed;
+            continue;
         }
-
-        sol::optional<std::string> lua_script = t["config"].get<sol::optional<std::string>>();
-        if (!lua_script || lua_script->empty())
-            lua_script = t["lua"].get<sol::optional<std::string>>();
-        if (lua_script && !lua_script->empty())
-            command += " --lua " + *lua_script;
-
-        sol::optional<std::string> bash = t["bash"].get<sol::optional<std::string>>();
-        if (bash)
-        {
-            switch (fnv1a(*bash))
-            {
-                case fnv1a("pt"):
-                case fnv1a("tp"):
-                case fnv1a("bpt"):
-                case fnv1a("btp"):
-                    command += " -bpt";
-                    break;
-                case fnv1a("p"):
-                case fnv1a("bp"):
-                    command += " -bp";
-                    break;
-                case fnv1a("t"):
-                case fnv1a("bt"):
-                    command += " -bt";
-                    break;
-                default:
-                    command += " -b";
-                    break;
-            }
-        }
-
-        sol::optional<std::string> cache_name = t["cache"].get<sol::optional<std::string>>();
-        if (cache_name)
-            command += " --cache " + *cache_name;
-
-        sol::optional<std::string> group = t["group"].get<sol::optional<std::string>>();
-        if (group && !group->empty())
-            command += " -g " + *group;
-
-        sol::optional<std::string> master_pw = t["master_pw"].get<sol::optional<std::string>>();
-        if (master_pw && !master_pw->empty())
-            command += " --master-pw " + *master_pw;
-
-        bool master_forward = t["master_forward"].get_or(false);
-        if (master_forward)
-            command += " --master-forward";
-
-        sol::optional<std::string> http_dir = t["http"].get<sol::optional<std::string>>();
-        if (http_dir && !http_dir->empty())
-            command += " --http " + *http_dir;
-
-        bool http_cache = t["http_cache"].get_or(false);
-        if (http_cache)
-            command += " --http-cache";
-
-        bool udp = t["udp"].get_or(false);
-        if (udp)
-            command += " --udp";
-
-        bool test = t["test"].get_or(false);
-        if (test)
-            command += " --test";
-
-        // `daemon_process` is refused rather than ignored, for either value,
-        // because a key that means nothing still implies this build has an
-        // opinion about it.
-        if (t["daemon_process"].valid())
-        {
-            std::cerr << "daemon_process is no longer a setting: every runtime "
-                         "runs in its own process. Remove the line.\n";
-            return 1;
-        }
-
-        // How many worker processes serve this runtime, emitted only when
-        // asked for and not validated here, because a property a config file
-        // cannot express is one that cannot be set afterwards.
-        const int shards = t["shards"].get_or(0);
-        if (shards > 0)
-            command += " --shards " + std::to_string(shards);
-
-        bool start = t["start"].get_or(false);
-        if (start)
-            command += " -s";
 
         std::string response;
         const int rc = ipc_send(command, response);

@@ -35,9 +35,22 @@ static void signal_handler(int)
     }
 }
 
-static uint16_t load_daemon_config(const std::string& config_path)
+// Everything a daemon configuration file can say, read in one pass and
+// applied in three places, because the ring settings have to reach the loop
+// before init() while the identity needs a handler that is already serving.
+struct daemon_config
 {
-    uint16_t metrics_port = 0;
+    uint16_t    metrics_port = 0;
+    std::string name;
+    std::string cluster;
+    std::string cpus;
+    bool        sqpoll     = false;
+    bool        sqpoll_set = false;
+};
+
+static daemon_config load_daemon_config(const std::string& config_path)
+{
+    daemon_config out;
     std::string path = config_path;
 
     // Check SOCKETLEY_CONFIG env var first
@@ -46,16 +59,20 @@ static uint16_t load_daemon_config(const std::string& config_path)
         path = env;
 
     if (path.empty())
-        return 0;
+        return out;
 
     // Check if file exists
     std::ifstream check(path);
     if (!check.good())
-        return 0;
+        return out;
     check.close();
 
     sol::state lua;
-    lua.open_libraries(sol::lib::base, sol::lib::string);
+
+    // The same set `socketley --lua` opens, so one file can be read by either
+    // and os and io stay shut in both.
+    lua.open_libraries(sol::lib::base, sol::lib::package, sol::lib::table,
+                       sol::lib::string, sol::lib::math);
 
     // Bounded like every other chunk in this process, against the process
     // default rather than a `callback_timeout_ms` of the config's own, because
@@ -70,16 +87,28 @@ static uint16_t load_daemon_config(const std::string& config_path)
     {
         sol::error err = result;
         std::cerr << "[config] error loading " << path << ": " << err.what() << "\n";
-        return 0;
+        return out;
     }
 
-    // Parse config table
+    // `daemon` is the table `socketley --lua` already reads and the one this
+    // file is documented under; `config` is the spelling that shipped first
+    // and still works, with both at once refused rather than merged because
+    // two tables setting one field is a file nobody can read.
+    sol::optional<sol::table> daemon = lua["daemon"].get<sol::optional<sol::table>>();
     sol::optional<sol::table> config = lua["config"].get<sol::optional<sol::table>>();
-    if (!config)
-        return 0;
 
-    // log_level
-    sol::optional<std::string> ll = (*config)["log_level"].get<sol::optional<std::string>>();
+    if (daemon && config)
+    {
+        std::cerr << "[config] " << path << " has both a `daemon` and a `config` "
+                     "table: they are two spellings of one thing, so name it once\n";
+        return out;
+    }
+
+    sol::optional<sol::table>& table = daemon ? daemon : config;
+    if (!table)
+        return out;
+
+    sol::optional<std::string> ll = (*table)["log_level"].get<sol::optional<std::string>>();
     if (ll)
     {
         log_level level;
@@ -87,12 +116,30 @@ static uint16_t load_daemon_config(const std::string& config_path)
             logger::g_level = level;
     }
 
-    // metrics_port
-    sol::optional<int> mp = (*config)["metrics_port"].get<sol::optional<int>>();
+    sol::optional<int> mp = (*table)["metrics_port"].get<sol::optional<int>>();
     if (mp && *mp > 0 && *mp <= 65535)
-        metrics_port = static_cast<uint16_t>(*mp);
+        out.metrics_port = static_cast<uint16_t>(*mp);
 
-    return metrics_port;
+    sol::optional<std::string> name = (*table)["name"].get<sol::optional<std::string>>();
+    if (name && !name->empty())
+        out.name = *name;
+
+    sol::optional<std::string> cluster = (*table)["cluster"].get<sol::optional<std::string>>();
+    if (cluster && !cluster->empty())
+        out.cluster = *cluster;
+
+    sol::optional<std::string> cpus = (*table)["cpus"].get<sol::optional<std::string>>();
+    if (cpus && !cpus->empty())
+        out.cpus = *cpus;
+
+    sol::optional<bool> sqpoll = (*table)["sqpoll"].get<sol::optional<bool>>();
+    if (sqpoll)
+    {
+        out.sqpoll     = *sqpoll;
+        out.sqpoll_set = true;
+    }
+
+    return out;
 }
 
 // The first time a keyed state directory is used, whatever was in the
@@ -387,7 +434,8 @@ static void restore_runtimes(state_persistence& persistence,
 // yet, because a ring is fixed at creation and only the environment could
 // reach init() in time -- and unknown arguments are refused rather than
 // ignored.
-static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
+static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
+                               bool& saw_sqpoll, bool& saw_cpus)
 {
     // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
     // no arguments decides nothing and leaves the environment in charge.
@@ -399,10 +447,12 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
         {
             case fnv1a("--sqpoll"):
                 loop.set_sqpoll(true);
+                saw_sqpoll = true;
                 break;
 
             case fnv1a("--no-sqpoll"):
                 loop.set_sqpoll(false);
+                saw_sqpoll = true;
                 break;
 
             case fnv1a("--cpus"):
@@ -423,6 +473,7 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop)
                     return false;
                 }
                 loop.set_cpus(cpus);
+                saw_cpus = true;
                 break;
             }
 
@@ -445,7 +496,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Before anything else, including the "is one already running" check: a
     // command line the daemon cannot honour is worth an exit code whether or
     // not this process was going to be the one serving the socket.
-    if (!parse_daemon_flags(argc, argv, loop))
+    bool saw_sqpoll = false;
+    bool saw_cpus   = false;
+    if (!parse_daemon_flags(argc, argv, loop, saw_sqpoll, saw_cpus))
         return 1;
 
     // Resolve paths (system vs dev mode)
@@ -462,7 +515,24 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         paths.system_mode && paths.socket_path == paths.default_socket_path;
 
     // Load config file (sets log level, metrics port, etc.) before anything else
-    uint16_t metrics_port = load_daemon_config(paths.config_path.string());
+    const daemon_config config = load_daemon_config(paths.config_path.string());
+    const uint16_t metrics_port = config.metrics_port;
+
+    // The ring settings reach the loop here because init() is a few lines
+    // down, and only where the command line said nothing: a flag typed at the
+    // daemon outranks a file it did not read.
+    if (config.sqpoll_set && !saw_sqpoll)
+        loop.set_sqpoll(config.sqpoll);
+
+    if (!config.cpus.empty() && !saw_cpus)
+    {
+        cpu_set_spec cpus;
+        std::string err;
+        if (parse_cpu_set(config.cpus, cpus, err))
+            loop.set_cpus(cpus);
+        else
+            std::cerr << "[config] invalid cpus value: " << err << "\n";
+    }
 
     // And on to whatever this daemon forks, exported unconditionally in the
     // parent at startup, because a worker reads no configuration file and a
@@ -505,6 +575,18 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     {
         LOG_ERROR("failed to setup ipc socket");
         return 1;
+    }
+
+    // After setup and before any runtime is restored, because a restored
+    // runtime publishes into the cluster this names -- and reported rather
+    // than fatal, since a daemon that cannot join is still a daemon that
+    // serves its own socket.
+    if (!config.name.empty() || !config.cluster.empty())
+    {
+        if (const std::string why =
+                handler.apply_startup_identity(config.name, config.cluster);
+            !why.empty())
+            std::cerr << "[config] " << why;
     }
 
     // Start metrics endpoint if configured

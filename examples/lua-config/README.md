@@ -94,12 +94,33 @@ consults the callback.
 `full-setup.lua` + `full-setup-handler.lua` — cache, three services, an HTTP
 gateway and two clients, one handler branching on `self.name`.
 
+### Resilient Gateway
+`resilient-gateway.lua` — health checks, circuit breaker, retries, mutual TLS
+and rate limits, all from a configuration file. None of these were reachable
+from one until the key table below named every flag `create` accepts.
+
 ## Key Concepts
 
 ### Runtimes table keys
-`type`, `name`, `port`, `target`, `mode`, `log`, `write`, `persistent`,
-`protocol`, `strategy`, `backends`, `config`/`lua`, `bash`, `cache`, `group`,
-`master_pw`, `master_forward`, `http`, `http_cache`, `udp`, `test`, `start`.
+Every flag `create` accepts is reachable from a configuration file.
+
+**Any type:** `port`, `listen`, `shards`, `log`, `write`, `group`, `cpus`,
+`max_connections`, `rate_limit`, `global_rate_limit`, `idle_timeout`, `drain`,
+`test`, `tls`, `cert`, `key`, `ca`, `reconnect`, `sqpoll`, `config`/`lua`,
+`bash`, `start`.
+
+**server:** `mode`, `udp`, `http`, `http_cache`, `master_pw`, `master_forward`,
+`cache`, `upstreams`.
+
+**client:** `target`, `mode`, `udp`.
+
+**proxy:** `backends`, `protocol`, `strategy`, `health_check`,
+`health_interval`, `health_path`, `health_threshold`, `circuit_threshold`,
+`circuit_timeout`, `backend_timeout`, `retry`, `retry_all`, `client_ca`,
+`client_cert`, `client_key`, `sidecar`.
+
+**cache:** `persistent`, `maxmemory`, `eviction`, `resp`, `replicate`,
+`cluster`.
 
 `daemon_process` was in this list and is refused now, naming the line, rather
 than ignored — see [The cross-runtime API in a
@@ -107,9 +128,15 @@ worker](#the-cross-runtime-api-in-a-worker-all-of-it-works) below. Refusing it
 rather than dropping it is deliberate: a silently ignored key would leave you
 believing a runtime is somewhere it is not.
 
-An unrecognised key is ignored in silence. Flags this list does not reach — the
-health-check, circuit-breaker, retry and TLS families — cannot be set from a
-configuration at all; use `create` or `edit`.
+An unrecognised key is refused, naming it, rather than dropped in silence: a
+misspelled `http_cache` used to configure nothing while the runtime came up
+looking correct. A value of the wrong shape is refused the same way, and so is
+a value containing whitespace — the daemon's command line has no quoting, so a
+password with a space in it would arrive as two arguments.
+
+A key the daemon then refuses on that type — `client_ca` on a cleartext proxy,
+say — comes back in the daemon's own words, under the name of the runtime it
+belongs to. The remaining entries are still applied, and the exit code is 1.
 
 ### Cache Modes
 | Mode | Allowed Commands |

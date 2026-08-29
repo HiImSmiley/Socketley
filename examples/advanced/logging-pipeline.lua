@@ -13,8 +13,8 @@
 --
 -- WHY THE mkdir IS A SHELL COMMAND
 --
--- This file is read by the CLI's own interpreter, which opens base, package
--- and table and nothing else.  There is no `os` here, so
+-- This file is read by the CLI's own interpreter, which opens base, package,
+-- table, string and math and nothing else.  There is no `os` here, so
 --
 --     os.execute("mkdir -p " .. LOG_DIR)
 --

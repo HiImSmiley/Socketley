@@ -4,7 +4,9 @@
 #include <string_view>
 #include "command_hashing.h"
 
-constexpr size_t MAX_ARGS = 32;
+// Wide enough for the longest create a configuration file can ask for, which
+// is a proxy carrying every flag its type accepts at sixty-nine tokens.
+constexpr size_t MAX_ARGS = 96;
 
 struct parsed_args
 {

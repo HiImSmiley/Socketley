@@ -68,6 +68,12 @@ public:
     void set_cluster_discovery(cluster_discovery* cd);
     void set_metrics_port(uint16_t port);
 
+    // The identity a daemon configuration file asks for, applied at startup
+    // because `daemon-name` and `daemon-cluster` both need a daemon that is
+    // already serving, returning the reason on refusal and nothing on success.
+    std::string apply_startup_identity(const std::string& name,
+                                       const std::string& cluster_dir);
+
     static std::string socket_path;
 
     // Whether the path above is the packaged deployment's socket rather than

@@ -5323,6 +5323,48 @@ std::string daemon_handler::cluster_off_reason() const
          + m_cluster_want_dir + "\n";
 }
 
+// One rule for a name that becomes a path component, here because a
+// configuration file is a second way in and a second copy of it would drift.
+static std::string daemon_name_refusal(const std::string& name)
+{
+    for (char c : name)
+        if (c == '/' || c == '\\' || c == '\0')
+            return "invalid daemon name: contains path separator\n";
+
+    if (name == "." || name == ".." || name.empty())
+        return "invalid daemon name\n";
+
+    return {};
+}
+
+std::string daemon_handler::apply_startup_identity(const std::string& name,
+                                                   const std::string& cluster_dir)
+{
+    if (!name.empty())
+    {
+        if (std::string why = daemon_name_refusal(name); !why.empty())
+            return why;
+
+        m_daemon_name = name;
+        m_cluster_error.clear();
+    }
+
+    if (cluster_dir.empty())
+        return {};
+
+    // Named first for the same reason `daemon-cluster` asks for it: a cluster
+    // directory identifies its members by name and this daemon has none yet.
+    if (m_daemon_name.empty())
+        return "cluster requires a daemon name: set both in the same table\n";
+
+    if (!start_cluster(m_daemon_name, cluster_dir))
+        return "cluster mode not enabled: " + m_cluster_error + "\n"
+               "  this daemon keeps serving, but it publishes nothing into "
+               + cluster_dir + " and no peer can see it.\n";
+
+    return {};
+}
+
 int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
@@ -5338,18 +5380,9 @@ int daemon_handler::cmd_daemon_name(ipc_connection* conn, const parsed_args& pa)
 
     std::string new_name(pa.args[1]);
 
-    // Validate name: reject path-unsafe characters
-    for (char c : new_name)
+    if (std::string why = daemon_name_refusal(new_name); !why.empty())
     {
-        if (c == '/' || c == '\\' || c == '\0')
-        {
-            conn->write_buf = "invalid daemon name: contains path separator\n";
-            return 1;
-        }
-    }
-    if (new_name == "." || new_name == ".." || new_name.empty())
-    {
-        conn->write_buf = "invalid daemon name\n";
+        conn->write_buf = why;
         return 1;
     }
 

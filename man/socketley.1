@@ -862,7 +862,7 @@ T}
 .TP
 .B dashboard
 Print the URL of the built-in web dashboard. Requires
-.B config.metrics_port
+.B daemon.metrics_port
 to be set in the daemon configuration file (see
 .BR "Daemon Configuration" ).
 The dashboard provides a live-updating view of all runtimes, connections,
@@ -3512,7 +3512,7 @@ and
 stay \(em those are reads.
 .SS Configuration File Format
 .nf
-\-\- Optional: configure daemon name and cluster directory
+\-\- Optional: configure the daemon itself
 daemon = {
     name = "node1",
     cluster = "/shared/cluster"
@@ -3534,32 +3534,101 @@ The
 table is processed first (name, then cluster). If omitted, the daemon
 runs without cluster mode.
 .PP
+Four of its keys \(em
+.BR name ", " cluster ", " log_level ", " metrics_port ", " cpus " and " sqpoll
+\(em are read by the daemon itself from the file
+.B SOCKETLEY_CONFIG
+names, at startup. The last four of those are settled before the ring exists
+and cannot be told to a daemon that is already serving, so
+.B "socketley \-\-lua"
+refuses them by name rather than dropping them. A flag typed on
+.B "socketley daemon"
+outranks the same setting in the file.
+.B config
+is the table's older spelling and still works; naming both in one file is
+refused.
+.PP
 Recognised
 .B runtimes
-keys, and the flag each becomes:
+keys, and the flag each becomes. Every flag a
+.B create
+accepts is reachable from here, which is what makes a configuration file and a
+command line two spellings of one thing rather than two capabilities:
 .nf
+\(em\(em every type \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
 type, name                 (required)
 port                       \-p
-target                     \-t
-mode                       \-\-mode
+listen                     \-\-listen
+shards                     \-\-shards
 log                        \-\-log
 write                      \-w
-persistent                 \-\-persistent
-protocol                   \-\-protocol
-strategy                   \-\-strategy
-backends (array)           \-\-backend a,b,c
+group                      \-g
+cpus                       \-\-cpus
+max_connections            \-\-max\-connections
+rate_limit                 \-\-rate\-limit
+global_rate_limit          \-\-global\-rate\-limit
+idle_timeout               \-\-idle\-timeout
+drain (bool)               \-\-drain
+test (bool)                \-\-test
+tls (bool)                 \-\-tls
+cert, key, ca              \-\-cert / \-\-key / \-\-ca
+reconnect (bool or n)      \-\-reconnect     true keeps trying
+sqpoll (bool)              \-\-sqpoll / \-\-no\-sqpoll
 config / lua               \-\-lua           the runtime's handler script
 bash                       \-b / \-bp / \-bt / \-bpt
-cache                      \-\-cache
-group                      \-g
-master_pw                  \-\-master\-pw
-master_forward (bool)      \-\-master\-forward
+start (bool)               \-s
+\(em\(em server \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
+mode                       \-\-mode
+udp (bool)                 \-\-udp
 http                       \-\-http
 http_cache (bool)          \-\-http\-cache
+master_pw                  \-\-master\-pw
+master_forward (bool)      \-\-master\-forward
+cache                      \-\-cache
+upstreams (array)          \-\-upstream a;b;c
+\(em\(em client \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
+target                     \-t
+mode                       \-\-mode
 udp (bool)                 \-\-udp
-test (bool)                \-\-test
-start (bool)               \-s
+\(em\(em proxy \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
+backends (array)           \-\-backend a,b,c
+protocol                   \-\-protocol
+strategy                   \-\-strategy
+health_check               \-\-health\-check
+health_interval            \-\-health\-interval
+health_path                \-\-health\-path
+health_threshold           \-\-health\-threshold
+circuit_threshold          \-\-circuit\-threshold
+circuit_timeout            \-\-circuit\-timeout
+backend_timeout            \-\-backend\-timeout
+retry                      \-\-retry
+retry_all (bool)           \-\-retry\-all
+client_ca                  \-\-client\-ca
+client_cert                \-\-client\-cert
+client_key                 \-\-client\-key
+sidecar (bool)             \-\-sidecar
+\(em\(em cache \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
+persistent                 \-\-persistent
+maxmemory                  \-\-maxmemory     256M, or a byte count
+eviction                   \-\-eviction
+resp (bool)                \-\-resp
+replicate                  \-\-replicate
+cluster (bool)             \-\-cluster
 .fi
+.PP
+A key this list does not name is refused, naming it, rather than dropped in
+silence: a misspelled
+.B http_cache
+used to configure nothing while the runtime came up looking correct. A value of
+the wrong shape is refused the same way, and so is a value containing
+whitespace \(em the daemon's command line has no quoting, so a password with a
+space in it would arrive as two arguments.
+.PP
+A key the daemon then refuses on that type \(em
+.B \-\-client\-ca
+on a cleartext proxy, say \(em is refused by the daemon, in the daemon's own
+words, under the name of the runtime it belongs to. The remaining entries are
+still applied, and the exit code is 1.
 .PP
 .B daemon_process
 was in this list and is gone with the flag it emitted. A configuration file
@@ -3587,43 +3656,33 @@ reach a runtime in another process. See
 .B "Process Isolation"
 above.
 .PP
-A key this list does not name is ignored in silence, and a flag this list does
-not reach \(em the whole health\-check, circuit\-breaker, retry and TLS families
-among them \(em cannot be set from a configuration at all. Create those runtimes
-with
-.B create
-directly, or
-.B edit
-them afterwards.
+The health\-check, circuit\-breaker, retry and TLS families were unreachable
+from a configuration until the table above named every flag; a file written
+against that build still reads the same way.
 .PP
 The interpreter that reads this file is not the daemon's, and it is much
 smaller. It opens
 .BR base ,
-.B package
-and
-.B table
-only \(em there is no
-.BR os ,
-.BR io ,
+.BR package ,
+.BR table ,
 .B string
-or
-.BR math .
+and
+.B math
+\(em there is no
+.B os
+and no
+.BR io .
 .RB ` "os.execute(\(dqmkdir -p /tmp/logs\(dq)" `
 at the top of a configuration is not a sandbox refusal but
 .BR "attempt to index global 'os' (a nil value)" :
-the whole file is refused, exit 1, and no runtime is created. Without
+the whole file is refused, exit 1, and no runtime is created. Create the
+directories a configuration needs from the shell that invokes it.
 .B string
-the method form goes too, so
-.B "path:match(...)"
 and
-.B string.format
-are unavailable here; concatenation with
-.B ..
-and
-.BR tostring ()
-are core and still work. Create the directories a configuration needs from the
-shell that invokes it, and do the string work in the handler, whose interpreter
-has all of these.
+.B math
+are open because a configuration computes names and port numbers, and the
+daemon's own configuration file opens the same set, so one file can be read
+by either.
 .SS Handler Privileges
 .B "A Lua handler runs with the daemon's full privileges."
 It is not sandboxed and there is no supported way to sandbox it. Read a
@@ -5291,7 +5350,7 @@ end
 .fi
 .SH DASHBOARD
 When
-.B config.metrics_port
+.B daemon.metrics_port
 is set in the daemon configuration file, the metrics endpoint serves
 multiple routes:
 .TP
@@ -6548,7 +6607,7 @@ under
 .BR "STATE PERSISTENCE" .
 .TP
 .I /etc/socketley/config.lua
-Daemon configuration (log_level, metrics_port).
+Daemon configuration (name, cluster, log_level, metrics_port, cpus, sqpoll).
 .SS Development Mode (no system install)
 .TP
 .I /tmp/socketley.sock
@@ -6718,14 +6777,35 @@ sent to either deletes a state file the other is still serving \(em and there is
 no undo for that.
 .SS Daemon Configuration
 The daemon config file is a Lua script that sets a
-.B config
+.B daemon
 table:
 .nf
-config = {
+daemon = {
+    name = "node1",          -- this daemon's name in a cluster
+    cluster = "/shared/dir", -- cluster directory; needs name
     log_level = "info",      -- debug, info, warn, error
-    metrics_port = 9100      -- Prometheus metrics HTTP endpoint
+    metrics_port = 9100,     -- Prometheus metrics HTTP endpoint
+    cpus = "0-3",            -- where this daemon's I/O runs
+    sqpoll = true            -- kernel-side submission polling
 }
 .fi
+.PP
+.B config
+is the same table under its older name and still works; a file naming both is
+refused rather than merged.
+.B name
+and
+.B cluster
+are the two keys
+.B "socketley \-\-lua"
+can also set on a daemon that is already running \(em the other four are settled
+before the ring exists, so they are read only from here, and a
+.B \-\-cpus
+or
+.B \-\-sqpoll
+typed on
+.B "socketley daemon"
+outranks the file.
 .PP
 When
 .B metrics_port

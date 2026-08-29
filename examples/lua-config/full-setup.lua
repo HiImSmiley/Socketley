@@ -15,16 +15,13 @@
 --
 -- WHY THE mkdir IS A SHELL COMMAND AND NOT A LINE IN THIS FILE
 --
--- This file is read by the CLI's own interpreter, which opens base, package
--- and table -- and nothing else.  There is no `os` here at all, so
+-- This file is read by the CLI's own interpreter, which opens base, package,
+-- table, string and math -- and nothing else.  There is no `os` here at all, so
 --
 --     os.execute("mkdir -p " .. CONFIG.log_dir)
 --
 -- is not a sandbox refusal but `attempt to index global 'os' (a nil value)`:
 -- the whole file fails on that line, exit 1, and not one runtime is created.
--- There is no `string` either, so `string.format` and `path:match()` are out.
--- Concatenation with `..` and tostring() are core and still work, which is all
--- the arithmetic below needs.
 --
 -- WHY THE CALLBACKS ARE IN full-setup-handler.lua
 --

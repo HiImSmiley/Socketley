@@ -50,21 +50,39 @@ echo "=== Integration: arguments past the parser's last slot ==="
 daemon_start "$BIN"
 P=$((SL_PORT_BASE + 890))
 
+# The limit is read out of the daemon's own refusal rather than written down
+# here, because a test carrying the constant goes quietly green the next time
+# the parser grows -- which is what happened when it went from 32 to 96.  The
+# overflow is judged before the command is dispatched, so a name that resolves
+# to nothing still gets this answer.
+PROBE=$(python3 -c "print(' '.join('probe' for _ in range(256)))")
+PROBE_OUT=$("$BIN" stop $PROBE 2>&1 || true)
+LIMIT=$(sed -n 's/.*at most \([0-9]\{1,\}\).*/\1/p' <<<"$PROBE_OUT")
+if [ -n "$LIMIT" ]; then pass
+else fail "the daemon names its own argument limit" \
+          "256 arguments came back as: ${PROBE_OUT:-<nothing>}"; fi
+LIMIT=${LIMIT:-31}
+
 "$BIN" create cache ov_cache -p "$P" -s >/dev/null 2>&1 || true
 
 # ─── Free text: a long value arrives entire ─────────────────────────────────
-LONG=$(python3 -c "print(' '.join('w%d' % i for i in range(40)))")
+#
+# Past the limit on purpose, because a value that fits in the slots never
+# reaches the merge this half is about.
+WORDS=$((LIMIT + 10))
+LONG=$(python3 -c "print(' '.join('w%d' % i for i in range($WORDS)))")
 "$BIN" ov_cache set k_long $LONG >/dev/null 2>&1 || true
 GOT=$("$BIN" ov_cache get k_long 2>/dev/null | wc -w)
-if [ "$GOT" -eq 40 ]; then pass
-else fail "a forty-word value is stored whole" \
-          "stored $GOT of 40 words" \
+if [ "$GOT" -eq "$WORDS" ]; then pass
+else fail "a value longer than the parser's slots is stored whole" \
+          "stored $GOT of $WORDS words" \
           "everything past the parser's last slot used to be dropped, with exit 0."; fi
 
 # The words at the END are the ones that used to go.  A count alone would pass
 # on a value that kept forty words of the wrong thing.
-if "$BIN" ov_cache get k_long 2>/dev/null | grep -qw "w39"; then pass
-else fail "the last word of the value survived" "w39 is not in the stored value"; fi
+LAST="w$((WORDS - 1))"
+if "$BIN" ov_cache get k_long 2>/dev/null | grep -qw "$LAST"; then pass
+else fail "the last word of the value survived" "$LAST is not in the stored value"; fi
 
 # A short value is unaffected — the ordinary path has to keep working.
 "$BIN" ov_cache set k_short hello world >/dev/null 2>&1 || true
@@ -82,7 +100,7 @@ else fail "an ordinary two-word value still round trips" \
 "$BIN" create server ov_a -p $((P + 2)) >/dev/null 2>&1 || true
 "$BIN" create server ov_b -p $((P + 3)) >/dev/null 2>&1 || true
 
-MANY=$(python3 -c "print(' '.join('ov_a' for _ in range(40)))")
+MANY=$(python3 -c "print(' '.join('ov_a' for _ in range($LIMIT + 10)))")
 RC=0
 OUT=$("$BIN" stop $MANY 2>&1) || RC=$?
 if [ "$RC" -ne 0 ]; then pass
@@ -119,7 +137,7 @@ else fail "an ordinary two-name list still works" "stop exited $RC: ${OUT:-<noth
 
 # And exactly at the limit is not an overflow: the last slot then holds one
 # token and there is nothing merged into it.
-AT_LIMIT=$(python3 -c "print(' '.join('ov_a' for _ in range(30)))")
+AT_LIMIT=$(python3 -c "print(' '.join('ov_a' for _ in range($LIMIT - 2)))")
 RC=0
 OUT=$("$BIN" stop $AT_LIMIT 2>&1) || RC=$?
 if [ "$RC" -eq 0 ]; then pass
