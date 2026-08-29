@@ -6,6 +6,7 @@
 #include <set>
 #include <thread>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <filesystem>
 #include <cstdint>
@@ -24,6 +25,9 @@ struct runtime_config
     std::string name;
     std::string id;
     runtime_type type = runtime_server;
+    // The name the document spelled for "type", kept beside the resolved id so
+    // a reader can tell resolution from str_to_type's runtime_server fallback.
+    std::string type_name = "server";
     uint16_t port = 0;
     // `--listen unix:/path`, an AF_UNIX listener instead of a port, mutually
     // exclusive with `port` and refused where the flag is read.
@@ -123,6 +127,10 @@ struct runtime_config
     std::string replicate_target;
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
+
+    // A registered type's own fields in declaration order, opaque here, held
+    // as strings because the schema that gives them kinds lives in a manifest.
+    std::vector<std::pair<std::string, std::string>> extra;
 
     // Which keys the document actually named, so `import` can tell a default
     // from an omission, filled only by parse_json_string.

@@ -1,5 +1,7 @@
 #include "daemon_handler.h"
 #include "flag_handlers.h"
+#include "type_manifest.h"
+#include "../shared/type_registry.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/runtime_definitions.h"
@@ -1126,6 +1128,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                     result = parse_cache_flags(
                         static_cast<cache_instance*>(instance), pa, i, name);
                     break;
+                default:
+                    // A registered type's flags come from its manifest schema.
+                    result = type_manifest::parse_registered_flag(instance, pa, i);
+                    break;
             }
         }
 
@@ -1165,6 +1171,16 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // And the shard count, for the same reason, because --listen may be typed
     // on either side of --shards.
     if (const std::string msg = instance_shards_refusal(instance);
+        !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
+    // A registered type's required keys, at the point the TLS set is checked
+    // and for the same reason, with declared defaults filled in on the way.
+    if (const std::string msg = type_manifest::registered_create_refusal(instance);
         !msg.empty())
     {
         std::cout << msg;
@@ -2808,6 +2824,11 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                     // `import` rather than reading as a typo.
                     result = -1;
                     break;
+                default:
+                    // A registered type's fields reach its worker at the next
+                    // start, which is when the config frame is built.
+                    result = type_manifest::parse_registered_flag(instance, pa, i);
+                    break;
             }
         }
 
@@ -3005,6 +3026,16 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 
     if (const std::string msg = shards_config_refusal(type, eff_shards,
                                                       eff_listen);
+        !msg.empty())
+    {
+        conn->write_buf = msg;
+        return 1;
+    }
+
+    // A registered type's fields against its schema, here with the other
+    // refusals because import has no rollback, so a misspelled key is named
+    // before anything is stored.
+    if (const std::string msg = type_manifest::extra_refusal(type, cfg.extra);
         !msg.empty())
     {
         conn->write_buf = msg;
@@ -3264,6 +3295,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (has("eviction"))         cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
             break;
         }
+        default:
+            // Replaced only when the document names the object, like the
+            // upstream and backend lists above.
+            if (has("extra"))
+                instance->apply_extra(cfg.extra);
+            break;
     }
 
     if (renamed)
@@ -3827,7 +3864,7 @@ std::string daemon_handler::build_runtime_map_payload()
         {
             worker_proto::runtime_wire w;
             w.name        = name;
-            w.type        = static_cast<uint8_t>(inst->get_type());
+            w.type        = type_to_string(inst->get_type());
             w.state       = static_cast<uint8_t>(inst->get_state());
             w.port        = inst->get_port();
             w.connections = static_cast<uint64_t>(inst->reported_connection_count());
@@ -4257,6 +4294,24 @@ bool daemon_handler::serve_map_request(const std::string& op,
         // The name on the wire wins over the one in the config, which is what
         // stops a future field deciding it by accident.
         cfg.name = name;
+
+        // Refused before the fallback below it can act, because str_to_type
+        // answers runtime_server for a name it cannot resolve and a script's
+        // typo must not build a server.
+        if (!cfg.type_name.empty() && cfg.type_name != type_to_string(cfg.type))
+        {
+            err = "\"" + cfg.type_name + "\" is not a runtime type this daemon knows";
+            return false;
+        }
+
+        // A map-created runtime runs where this handler runs, and a registered
+        // type has nothing to run here -- its behaviour is a worker binary.
+        if (type_registry::is_registered(cfg.type))
+        {
+            err = "\"" + cfg.type_name + "\" is a registered type, which a "
+                  "script cannot create";
+            return false;
+        }
 
         switch (m_manager.try_create(cfg.type, name))
         {
@@ -4806,7 +4861,10 @@ void daemon_handler::reconcile_proxy_workers()
 
         while (shards.size() < want_count)
         {
-        auto sup = std::make_unique<proxy_supervisor>(inst, std::string{});
+        // Empty for a built-in, which the supervisor reads as "exec myself";
+        // a registered type's worker is the binary its manifest names.
+        auto sup = std::make_unique<proxy_supervisor>(
+            inst, type_manifest::exec_path(inst->get_type()));
 
         // Which of N this child is, where the position in this vector is the
         // index, so no counter has to be kept beside it.

@@ -904,10 +904,7 @@ std::string runtime_instance::stats_prefix() const
     out += "name:";
     out += m_name;
     out += "\ntype:";
-    out += (m_type == runtime_server ? "server" :
-            m_type == runtime_client ? "client" :
-            m_type == runtime_proxy  ? "proxy"  :
-            m_type == runtime_cache  ? "cache"  : "unknown");
+    out += type_to_string(m_type);
     out += "\nport:";
     append_u64(m_port);
     out += "\nconnections:";

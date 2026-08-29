@@ -1,4 +1,4 @@
-#include "proxy_worker.h"
+#include "worker_main.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -15,7 +15,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
-#include "proxy_instance.h"
+#include "../proxy/proxy_instance.h"
 #include "../server/server_instance.h"
 #include "../client/client_instance.h"
 #include "../../shared/request_channel.h"
@@ -26,6 +26,7 @@
 #include "../../shared/runtime_config_apply.h"
 #include "../../shared/route_relay.h"
 #include "../../shared/runtime_factory.h"
+#include "../../shared/type_registry.h"
 #include "../../shared/runtime_instance.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/state_persistence.h"
@@ -711,12 +712,36 @@ private:
         // registration and not before.
         m_writer.use_ring(&m_loop, this);
 
+        // A type name this binary cannot resolve is refused rather than
+        // repaired, because str_to_type falls back to runtime_server and a
+        // custom worker must not build a server nobody asked for.
+        if (!cfg.type_name.empty() && cfg.type_name != type_to_string(cfg.type))
+        {
+            const std::string why = "this worker binary has no runtime type "
+                                    "called \"" + cfg.type_name + "\"";
+            LOG_ERROR(why.c_str());
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::config_err, why))) {}
+            m_exit_code = worker_proto::exit_config_refused;
+            m_done      = true;
+            return;
+        }
+
         // The type comes from the frame the daemon sent rather than from this
         // file, so a worker is not a proxy worker any more.
         auto inst = create_runtime(cfg.type, cfg.name);
         if (!inst)
         {
-            LOG_ERROR("proxy worker: could not create proxy instance");
+            // A name this process interned off a map but never registered a
+            // factory for lands here, which for a custom binary means
+            // register_type was not called before run().
+            const std::string why = "this worker binary cannot build a \"" +
+                                    cfg.type_name + "\" runtime";
+            LOG_ERROR(why.c_str());
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::config_err, why))) {}
+            m_exit_code = worker_proto::exit_config_refused;
+            m_done      = true;
             return;
         }
         m_owned = std::move(inst);
@@ -934,10 +959,13 @@ private:
         entries.reserve(wire.size());
         for (const auto& w : wire)
         {
-            // A type or state this build has no name for comes from a newer
-            // daemon and is dropped rather than cast, because a runtime
-            // reported as the wrong kind is worse than one not reported.
-            if (w.type > static_cast<uint8_t>(runtime_cache) ||
+            // The type arrives by name and is interned to a local id, so a
+            // registered type this binary cannot build still shows up under
+            // its own name -- with a state this build has no name for dropped
+            // rather than cast, because a runtime reported as the wrong kind
+            // is worse than one not reported.
+            runtime_type wtype;
+            if (!type_registry::intern(w.type, wtype) ||
                 w.state > static_cast<uint8_t>(runtime_failed))
             {
                 LOG_WARN("proxy worker: runtime map entry of an unknown kind, skipped");
@@ -946,7 +974,7 @@ private:
 
             runtime_manager::replica_entry e;
             e.name        = w.name;
-            e.type        = static_cast<runtime_type>(w.type);
+            e.type        = wtype;
             e.state       = static_cast<runtime_state>(w.state);
             e.port        = w.port;
             e.connections = w.connections;
@@ -1567,7 +1595,7 @@ private:
 
 } // namespace
 
-int proxy_worker_main(int control_fd)
+int worker_main(int control_fd)
 {
     if (control_fd < 0)
         return 2;

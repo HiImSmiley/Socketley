@@ -22,13 +22,13 @@
 
 namespace {
 
-worker_proto::runtime_wire wire(std::string name, uint8_t type, uint8_t state,
+worker_proto::runtime_wire wire(std::string name, std::string type, uint8_t state,
                                 uint16_t port, uint64_t conns, std::string owner,
                                 std::string group = {})
 {
     worker_proto::runtime_wire w;
     w.name = std::move(name);
-    w.type = type;
+    w.type = std::move(type);
     w.state = state;
     w.port = port;
     w.connections = conns;
@@ -58,13 +58,13 @@ runtime_manager::replica_entry entry(std::string name, runtime_type type,
 TEST_CASE("runtime map survives the wire unchanged")
 {
     std::vector<worker_proto::runtime_wire> in;
-    in.push_back(wire("api", 0 /*server*/, 1 /*running*/, 8080, 42, "", "web"));
-    in.push_back(wire("kv", 3 /*cache*/, 0 /*created*/, 0, 0, "api"));
+    in.push_back(wire("api", "server", 1 /*running*/, 8080, 42, "", "web"));
+    in.push_back(wire("kv", "cache", 0 /*created*/, 0, 0, "api"));
     // A name with a space in it, because every string on this wire is
     // length-prefixed and nothing has to be escaped.  A port at the top of the
     // range and a count above 2^32, because both fields have been the wrong
     // width in a protocol before.
-    in.push_back(wire("a name", 2 /*proxy*/, 3 /*failed*/, 65535,
+    in.push_back(wire("a name", "proxy", 3 /*failed*/, 65535,
                       5'000'000'000ULL, "a parent", "a group"));
 
     const std::string payload = worker_proto::encode_runtime_map(in);
@@ -90,7 +90,7 @@ TEST_CASE("an empty map is a map, not a failure")
     // how the last one being removed reaches the replica.
     const std::string payload = worker_proto::encode_runtime_map({});
     std::vector<worker_proto::runtime_wire> out;
-    out.push_back(wire("stale", 0, 1, 1, 1, ""));
+    out.push_back(wire("stale", "server", 1, 1, 1, ""));
     REQUIRE(worker_proto::decode_runtime_map(payload, out));
     CHECK(out.empty());
 }
@@ -98,7 +98,7 @@ TEST_CASE("an empty map is a map, not a failure")
 TEST_CASE("a truncated map is refused rather than half-read")
 {
     std::vector<worker_proto::runtime_wire> in;
-    in.push_back(wire("api", 0, 1, 8080, 1, "parent"));
+    in.push_back(wire("api", "server", 1, 8080, 1, "parent"));
     const std::string payload = worker_proto::encode_runtime_map(in);
 
     // Every prefix short of the whole thing.  A decoder that reads past the end

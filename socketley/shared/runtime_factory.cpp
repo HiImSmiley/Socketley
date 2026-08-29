@@ -1,5 +1,6 @@
 #include "runtime_factory.h"
 #include "runtime_instance.h"
+#include "type_registry.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
@@ -18,6 +19,6 @@ std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_
         case runtime_proxy:
             return std::make_unique<proxy_instance>(name);
         default:
-            return nullptr;
+            return type_registry::make(type, name);
     }
 }

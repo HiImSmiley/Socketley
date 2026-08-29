@@ -16,6 +16,7 @@ file(GLOB_RECURSE SDK_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/shared/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/runtime/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/runtime/**/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../socketley/daemon/*.cpp"
 )
 
 add_library(socketley_sdk STATIC ${SDK_SOURCES})
@@ -96,6 +97,11 @@ if(SOCKETLEY_BUILD_EXAMPLES)
         add_executable(echo_server_lua examples/basic/echo_server_lua.cpp)
         target_link_libraries(echo_server_lua PRIVATE socketley_sdk)
     endif()
+
+    # ── Custom runtime type (worker binary + manifest) ───────────────
+
+    add_executable(greeter_worker examples/custom-type/greeter_worker.cpp)
+    target_link_libraries(greeter_worker PRIVATE socketley_sdk)
 
     # ── Advanced examples ────────────────────────────────────────────
 

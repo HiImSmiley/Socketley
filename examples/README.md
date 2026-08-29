@@ -147,3 +147,9 @@ own daemon, on its own socket, and removes what it made on the way out.
   routes to sub-servers. The lobby needed `daemon_process = true` and no longer
   does; see the file
   for why
+
+### Registered Types (SDK)
+- `sdk/examples/custom-type/` - a runtime type of your own: a TOML manifest the
+  daemon reads (name, worker binary, config-key schema) plus a worker built
+  with `<socketley/worker.h>`. The daemon never loads your code — it forks and
+  execs the binary like its own workers. See REGISTERED TYPES in `man socketley`

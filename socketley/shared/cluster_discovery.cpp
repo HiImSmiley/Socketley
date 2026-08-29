@@ -123,14 +123,7 @@ std::vector<std::string_view> json_get_array_objects(std::string_view json, std:
 
 const char* type_str(runtime_type t)
 {
-    switch (t)
-    {
-        case runtime_server: return "server";
-        case runtime_client: return "client";
-        case runtime_proxy:  return "proxy";
-        case runtime_cache:  return "cache";
-        default:             return "unknown";
-    }
+    return type_to_string(t);
 }
 
 const char* state_str(runtime_state s)

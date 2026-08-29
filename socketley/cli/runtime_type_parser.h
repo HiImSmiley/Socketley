@@ -4,6 +4,7 @@
 #include <string_view>
 #include "command_hashing.h"
 #include "../shared/runtime_definitions.h"
+#include "../shared/type_registry.h"
 
 inline bool parse_runtime_type(std::string_view str, runtime_type& out)
 {
@@ -22,6 +23,6 @@ inline bool parse_runtime_type(std::string_view str, runtime_type& out)
             out = runtime_cache;
             return true;
         default:
-            return false;
+            return type_registry::lookup(str, out);
     }
 }

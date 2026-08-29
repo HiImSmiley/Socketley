@@ -1669,7 +1669,7 @@ void lua_context::refuse_cross_runtime_api(sol::table& sk, sol::table& cluster_t
     // purpose.
 
     // MUTATE, refused only while this process has no sink to ask through,
-    // tested once while the bindings are built because proxy_worker installs
+    // tested once while the bindings are built because worker_main installs
     // the sink in its constructor.
     const runtime_manager* mgr = owner ? owner->get_runtime_manager() : nullptr;
     if (!mgr || !mgr->has_map_sink())

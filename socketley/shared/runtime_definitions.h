@@ -58,14 +58,6 @@ inline std::string shards_config_refusal(runtime_type type,
     return {};
 }
 
-inline constexpr const char* type_to_string(runtime_type t)
-{
-    switch (t)
-    {
-        case runtime_server: return "server";
-        case runtime_client: return "client";
-        case runtime_proxy:  return "proxy";
-        case runtime_cache:  return "cache";
-    }
-    return "unknown";
-}
+// Defined in type_registry.cpp, because a registered type's name lives in the
+// registry and cannot be a constant here.
+const char* type_to_string(runtime_type t);

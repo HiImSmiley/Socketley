@@ -425,14 +425,7 @@ std::string metrics_endpoint::build_metrics() const
 
 static const char* runtime_type_str(runtime_type t)
 {
-    switch (t)
-    {
-        case runtime_server: return "server";
-        case runtime_client: return "client";
-        case runtime_proxy:  return "proxy";
-        case runtime_cache:  return "cache";
-        default:             return "unknown";
-    }
+    return type_to_string(t);
 }
 
 static const char* runtime_state_str(runtime_state s)

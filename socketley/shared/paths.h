@@ -7,6 +7,9 @@ struct socketley_paths
     std::filesystem::path socket_path;
     std::filesystem::path state_dir;     // runtimes/ JSON configs
     std::filesystem::path config_path;   // daemon config.lua
+    // Registered-type manifests, beside config_path rather than the state dir,
+    // because a manifest describes an installation and not a daemon's state.
+    std::filesystem::path types_dir;
     bool system_mode = false;            // true if installed system-wide
 
     // Where runtimes lived before the state directory was keyed to the socket,

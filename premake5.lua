@@ -226,7 +226,9 @@ project "socketley"
         "thirdparty/luajit"
     }
     includedirs {
-        "socketley"
+        "socketley",
+        -- The SDK's public headers, because worker_api.cpp implements one.
+        "include/linux"
     }
 
     -- The liburing floor, checked before anything in this project compiles.
@@ -301,7 +303,11 @@ project "socketley_sdk"
         "socketley/shared/**.h",
         "socketley/shared/**.cpp",
         "socketley/runtime/**.h",
-        "socketley/runtime/**.cpp"
+        "socketley/runtime/**.cpp",
+        -- The daemon too, because an SDK binary may serve the control socket
+        -- itself via <socketley/daemon.h>.
+        "socketley/daemon/**.h",
+        "socketley/daemon/**.cpp"
     }
 
     filter "system:linux"
@@ -351,7 +357,8 @@ project "socketley_sdk_nolua"
 
     files {
         "socketley/shared/**.h", "socketley/shared/**.cpp",
-        "socketley/runtime/**.h", "socketley/runtime/**.cpp"
+        "socketley/runtime/**.h", "socketley/runtime/**.cpp",
+        "socketley/daemon/**.h", "socketley/daemon/**.cpp"
     }
 
     filter "system:linux"

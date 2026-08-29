@@ -7,6 +7,7 @@
 #include "route_table.h"
 #include <chrono>
 #include <sstream>
+#include <utility>
 #include <vector>
 #include <algorithm>
 #include <functional>
@@ -394,6 +395,11 @@ public:
     // membership change, ignored by default because only the proxy forwards to
     // other runtimes.
     virtual void set_endpoints(std::shared_ptr<const endpoint_table>) {}
+
+    // A registered type's own fields as an ordered string bag, no-ops for the
+    // built-ins, whose fields are named columns in runtime_config.
+    virtual void capture_extra(std::vector<std::pair<std::string, std::string>>&) const {}
+    virtual void apply_extra(const std::vector<std::pair<std::string, std::string>>&) {}
 
     // What answers requests addressed to this runtime's name, which only a
     // cache does, overridden for an out-of-process runtime to the supervisor

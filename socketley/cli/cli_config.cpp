@@ -9,6 +9,8 @@
 #include "runtime_type_parser.h"
 #include "ipc_client.h"
 #include "command_hashing.h"
+#include "../daemon/type_manifest.h"
+#include "../shared/paths.h"
 
 namespace {
 
@@ -334,7 +336,8 @@ std::string emit_special_keys(const sol::table& entry, std::string& command, boo
 
 // A key nobody handles is a typo, and a typo used to configure nothing while
 // the runtime came up looking correct.
-std::string refuse_unknown_keys(const sol::table& entry)
+std::string refuse_unknown_keys(const sol::table& entry,
+                                const type_manifest::manifest* man)
 {
     for (auto& pair : entry)
     {
@@ -351,8 +354,47 @@ std::string refuse_unknown_keys(const sol::table& entry)
             for (std::string_view key : special_keys)
                 if (key == name) { known = true; break; }
 
+        // A registered type's manifest schema is part of the key set, held to
+        // the same rule as the table above.
+        if (!known && man)
+            for (const auto& sk : man->schema)
+                if (sk.name == name) { known = true; break; }
+
         if (!known)
             return "unknown key: " + name + "\n";
+    }
+
+    return {};
+}
+
+// A registered type's schema keys through the same emit_key the table rows
+// take, one synthesized row each -- except a bool, which is emitted with an
+// explicit value because omitting it must mean "take the manifest's default"
+// rather than "false".
+std::string emit_manifest_keys(const type_manifest::manifest& man,
+                               const sol::table& entry, std::string& command)
+{
+    for (const auto& sk : man.schema)
+    {
+        const std::string flag = "--" + sk.name;
+
+        if (sk.kind == type_manifest::key_kind::bool_key)
+        {
+            const sol::object obj = entry[sk.name];
+            if (!obj.valid() || obj == sol::nil)
+                continue;
+            if (obj.get_type() != sol::type::boolean)
+                return sk.name + ": expected true or false\n";
+            command += " " + flag + (obj.as<bool>() ? " true" : " false");
+            continue;
+        }
+
+        const key_kind kind = sk.kind == type_manifest::key_kind::int_key
+                                  ? key_kind::integer
+                                  : key_kind::text;
+        const config_key row{sk.name, flag, kind};
+        if (std::string why = emit_key(row, entry, command); !why.empty())
+            return why;
     }
 
     return {};
@@ -362,17 +404,22 @@ std::string refuse_unknown_keys(const sol::table& entry)
 // command, with the first refusal ending it because a half-built command line
 // configures something nobody asked for.
 std::string build_create_command(const std::string& type_str, const std::string& name,
-                                 const sol::table& entry, std::string& command)
+                                 const sol::table& entry, std::string& command,
+                                 const type_manifest::manifest* man)
 {
     bool autostart = false;
 
-    if (std::string why = refuse_unknown_keys(entry); !why.empty())
+    if (std::string why = refuse_unknown_keys(entry, man); !why.empty())
         return why;
 
     command = "create " + type_str + " " + name;
 
     for (const config_key& key : config_keys)
         if (std::string why = emit_key(key, entry, command); !why.empty())
+            return why;
+
+    if (man)
+        if (std::string why = emit_manifest_keys(*man, entry, command); !why.empty())
             return why;
 
     if (std::string why = emit_special_keys(entry, command, autostart); !why.empty())
@@ -412,6 +459,10 @@ int cli_config(int argc, char** argv)
         std::cerr << "usage: socketley --lua <lua path>\n";
         return 1;
     }
+
+    // Registered types before any entry is read, because parse_runtime_type
+    // resolves through the registry these fill.
+    type_manifest::load_dir(socketley_paths::resolve().types_dir);
 
     sol::state lua;
 
@@ -502,7 +553,7 @@ int cli_config(int argc, char** argv)
         if (!type_opt || type_opt->empty())
         {
             std::cerr << "runtime \"" << *name_opt << "\" has no type "
-                         "(server, client, proxy or cache)\n";
+                         "(server, client, proxy, cache, or a registered type)\n";
             ++failed;
             continue;
         }
@@ -521,7 +572,9 @@ int cli_config(int argc, char** argv)
 
         std::string command;
 
-        if (std::string why = build_create_command(type_str, name, t, command); !why.empty())
+        if (std::string why = build_create_command(type_str, name, t, command,
+                                                   type_manifest::find(type));
+            !why.empty())
         {
             std::cerr << "could not create " << name << ":\n  " << why;
             ++failed;

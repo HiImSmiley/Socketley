@@ -170,7 +170,10 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
-    echo "  Create a new runtime"
+    echo "  Create a new runtime: server, client, proxy, cache, or a type"
+    echo "  registered by a manifest in the daemon's types directory"
+    echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
+    echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
     echo -e "  ${CYAN}socketley create server api -p 9000 -s${NC}"
     echo ""
 
@@ -2846,7 +2849,8 @@ USAGE
   socketley --lua <file>
 
 RUNTIMES
-  create <type> <name> [flags]   create a server, client, proxy or cache
+  create <type> <name> [flags]   create a server, client, proxy, cache, or a
+                                 manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime
   ls | ps [-a] [--json]          list runtimes

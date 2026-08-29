@@ -18,7 +18,7 @@
 #include "command_hashing.h"
 #include "ipc_client.h"
 #include "../daemon/daemon_handler.h"
-#include "../runtime/proxy/proxy_worker.h"
+#include "../runtime/worker/worker_main.h"
 #include "../shared/daemon_client.h"
 #include "../shared/paths.h"
 
@@ -239,7 +239,7 @@ int cli_dispatch(int argc, char** argv)
         // because the daemon execs itself with it after putting the control
         // socket on descriptor 3.
         case fnv1a("proxy-worker"):
-            return proxy_worker_main(3);
+            return worker_main(3);
 
         case fnv1a("daemon"):
         {

@@ -1,0 +1,22 @@
+# A registered runtime type, declared to the daemon without running any code.
+#
+# Install into the daemon's types directory --
+# /etc/socketley/types/ for a system daemon,
+# ~/.config/socketley/types/ for a dev daemon --
+# and point exec at the built greeter_worker binary.
+
+name = "greeter"
+exec = "/usr/local/lib/socketley/greeter-worker"
+manifest_version = 1
+
+[config.greeting]
+kind = "string"
+required = true
+
+[config.repeat]
+kind = "int"
+default = "1"
+
+[config.shout]
+kind = "bool"
+default = "false"

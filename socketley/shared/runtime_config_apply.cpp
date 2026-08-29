@@ -145,4 +145,8 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             break;
         }
     }
+
+    // Unconditional because it is a no-op for the built-ins, and a registered
+    // type's fields must arrive however the config did.
+    rt.apply_extra(cfg.extra);
 }

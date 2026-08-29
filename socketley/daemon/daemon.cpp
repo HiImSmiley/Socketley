@@ -1,6 +1,7 @@
 #include "daemon.h"
 #include "daemon_handler.h"
 #include "metrics_endpoint.h"
+#include "type_manifest.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
 #include "../shared/logging.h"
@@ -22,7 +23,9 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#ifndef SOCKETLEY_NO_LUA
 #include <sol/sol.hpp>
+#endif
 
 static int g_signal_write_fd = -1;
 
@@ -67,6 +70,12 @@ static daemon_config load_daemon_config(const std::string& config_path)
         return out;
     check.close();
 
+#ifdef SOCKETLEY_NO_LUA
+    // A build without an interpreter has nothing to run config.lua with, said
+    // once rather than failing on each key.
+    std::cerr << "[config] " << path << " ignored: built without Lua\n";
+    return out;
+#else
     sol::state lua;
 
     // The same set `socketley --lua` opens, so one file can be read by either
@@ -140,6 +149,7 @@ static daemon_config load_daemon_config(const std::string& config_path)
     }
 
     return out;
+#endif
 }
 
 // The first time a keyed state directory is used, whatever was in the
@@ -275,6 +285,16 @@ static void restore_runtimes(state_persistence& persistence,
     // Pass 1: Create all runtimes and apply configs
     for (const auto& cfg : configs)
     {
+        // Skipped rather than repaired, because str_to_type falls back to
+        // runtime_server and restoring a registered type whose manifest is
+        // gone would bind a server on its port.
+        if (!cfg.type_name.empty() && cfg.type_name != type_to_string(cfg.type))
+        {
+            LOG_WARN(("restore: " + cfg.name + " has type \"" + cfg.type_name +
+                      "\", which no manifest declares; not restored").c_str());
+            continue;
+        }
+
         if (!manager.create(cfg.type, cfg.name))
         {
             LOG_WARN("restore: could not create runtime (already exists?)");
@@ -412,6 +432,9 @@ static void restore_runtimes(state_persistence& persistence,
                 break;
             }
         }
+
+        // A registered type's fields, applied through the placeholder's bag.
+        instance->apply_extra(cfg.extra);
     }
 
     // Pass 2: Start runtimes that were running
@@ -559,6 +582,12 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // because the answer now depends on the socket path and cannot be a
     // constant in the man page.
     LOG_INFO(("state directory: " + paths.state_dir.string()).c_str());
+
+    // Registered types before the state files that may name them, because
+    // restore refuses a type name nothing has declared.
+    if (const size_t n = type_manifest::load_dir(paths.types_dir); n > 0)
+        LOG_INFO(("registered " + std::to_string(n) + " runtime type(s) from " +
+                  paths.types_dir.string()).c_str());
 
     // Before load_all(): an upgrade that keys this daemon's state directory to
     // its socket for the first time takes what it used to share with the

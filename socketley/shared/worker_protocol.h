@@ -22,7 +22,7 @@ namespace worker_proto
 
 // Bumped when the meaning of an existing frame type changes, not when one is
 // added, since an old receiver skips what it does not know.
-inline constexpr uint16_t version = 1;
+inline constexpr uint16_t version = 2;
 
 // The header is 8 bytes: [u32 payload_len][u16 version][u16 type].
 inline constexpr size_t header_size = 8;
@@ -666,12 +666,14 @@ inline bool decode_cluster_event(std::string_view payload, cluster_ev_wire& e)
 // What runtimes there are, which the endpoint table does not answer, pushed as
 // a whole map rather than asked per call so socketley.get() never blocks a
 // worker's loop on a round trip -- at the price of a replica as old as the
-// last push, with state and type as u8 because both enums are append-only.
+// last push.  State travels as u8 because that enum is append-only; the type
+// travels by name, as the cluster snapshot's already does, because a
+// registered type's id is assigned per process and two manifest sets disagree.
 
 struct runtime_wire
 {
     std::string name;
-    uint8_t     type{0};    // runtime_type
+    std::string type;       // type_to_string(runtime_type)
     uint8_t     state{0};   // runtime_state
     uint16_t    port{0};
     uint64_t    connections{0};
@@ -686,7 +688,7 @@ inline std::string encode_runtime_map(const std::vector<runtime_wire>& rts)
     for (const auto& r : rts)
     {
         put_str(out, r.name);
-        out.push_back(static_cast<char>(r.type));
+        put_str(out, r.type);
         out.push_back(static_cast<char>(r.state));
         put_u16(out, r.port);
         put_u64(out, r.connections);
@@ -711,7 +713,7 @@ inline bool decode_runtime_map(std::string_view payload, std::vector<runtime_wir
     {
         runtime_wire e;
         e.name        = std::string(r.str());
-        e.type        = r.u8();
+        e.type        = std::string(r.str());
         e.state       = r.u8();
         e.port        = r.u16();
         e.connections = r.u64();

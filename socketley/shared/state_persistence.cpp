@@ -5,6 +5,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../cli/command_hashing.h"
+#include "type_registry.h"
 
 #include "logging.h"
 
@@ -112,26 +113,17 @@ std::string json_unescape(std::string_view s)
 
 const char* type_str(runtime_type t)
 {
-    switch (t)
-    {
-        case runtime_server: return "server";
-        case runtime_client: return "client";
-        case runtime_proxy:  return "proxy";
-        case runtime_cache:  return "cache";
-        default:             return "unknown";
-    }
+    return type_to_string(t);
 }
 
 runtime_type str_to_type(std::string_view s)
 {
-    switch (fnv1a(s))
-    {
-        case fnv1a("server"): return runtime_server;
-        case fnv1a("client"): return runtime_client;
-        case fnv1a("proxy"):  return runtime_proxy;
-        case fnv1a("cache"):  return runtime_cache;
-        default:              return runtime_server;
-    }
+    // The historical fallback for a name this process cannot resolve; readers
+    // that must not silently repair compare cfg.type_name themselves.
+    runtime_type t;
+    if (type_registry::lookup(s, t))
+        return t;
+    return runtime_server;
 }
 
 const char* server_mode_str(uint8_t m)
@@ -451,6 +443,87 @@ std::vector<std::string> json_get_array(const std::string& json, std::string_vie
     return result;
 }
 
+// The one nested object in this format: "extra"'s string pairs in document
+// order, which the flat getters above cannot be pointed at.
+void json_get_extra(const std::string& json,
+                    std::vector<std::pair<std::string, std::string>>& out)
+{
+    out.clear();
+
+    // Find the "extra" key itself, colon-checked like json_has_key so a value
+    // spelled extra is not mistaken for it.
+    size_t pos = 0;
+    bool found = false;
+    while (pos < json.size())
+    {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return;
+        if (pos + 7 <= json.size() && json.compare(pos + 1, 5, "extra") == 0 &&
+            json[pos + 6] == '"')
+        {
+            const size_t after = json.find_first_not_of(" \t\n\r", pos + 7);
+            if (after != std::string::npos && json[after] == ':')
+            {
+                pos = after + 1;
+                found = true;
+                break;
+            }
+        }
+        pos++;
+    }
+    if (!found) return;
+
+    pos = json.find_first_not_of(" \t\n\r", pos);
+    if (pos == std::string::npos || json[pos] != '{')
+        return;
+    ++pos;
+
+    // Quote-delimited tokens alternate key and value, so a brace inside a
+    // string never ends the walk early.
+    auto take_string = [&](std::string& s) -> bool {
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return false;
+        ++pos;
+        s.clear();
+        while (pos < json.size() && json[pos] != '"')
+        {
+            if (json[pos] == '\\' && pos + 1 < json.size())
+            {
+                s += json[pos];
+                s += json[pos + 1];
+                pos += 2;
+            }
+            else
+            {
+                s += json[pos];
+                ++pos;
+            }
+        }
+        if (pos >= json.size()) return false;
+        ++pos;
+        return true;
+    };
+
+    while (pos < json.size())
+    {
+        const size_t next = json.find_first_not_of(" \t\n\r,", pos);
+        if (next == std::string::npos || json[next] == '}')
+            return;
+        pos = next;
+
+        std::string key, val;
+        if (!take_string(key))
+            return;
+        const size_t colon = json.find_first_not_of(" \t\n\r", pos);
+        if (colon == std::string::npos || json[colon] != ':')
+            return;
+        pos = colon + 1;
+        if (!take_string(val))
+            return;
+        out.emplace_back(json_unescape(key), json_unescape(val));
+    }
+}
+
 std::string resolve_absolute(std::string_view path)
 {
     if (path.empty()) return {};
@@ -599,6 +672,12 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             break;
         }
     }
+
+    cfg.type_name = type_str(cfg.type);
+
+    // A registered type's fields come from the instance, because this file
+    // knows neither their names nor their kinds.
+    instance->capture_extra(cfg.extra);
 
     return cfg;
 }
@@ -824,6 +903,26 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             break;
     }
 
+    // A registered type's fields as one nested object, absent when there are
+    // none, so a built-in's file does not change by a byte.
+    if (!cfg.extra.empty())
+    {
+        j += "    \"extra\": {";
+        bool first = true;
+        for (const auto& [k, v] : cfg.extra)
+        {
+            if (!first)
+                j += ", ";
+            first = false;
+            j += "\"";
+            json_escape_into(j, k);
+            j += "\": \"";
+            json_escape_into(j, v);
+            j += "\"";
+        }
+        j += "},\n";
+    }
+
     // Remove trailing comma+newline and close
     if (j.size() >= 2 && j[j.size()-2] == ',' && j[j.size()-1] == '\n')
     {
@@ -846,7 +945,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
 
     cfg.name = json_get_string(json, "name");
     cfg.id = json_get_string(json, "id");
-    cfg.type = str_to_type(json_get_string(json, "type"));
+    cfg.type_name = json_get_string(json, "type");
+    cfg.type = str_to_type(cfg.type_name);
     cfg.port = static_cast<uint16_t>(json_get_int(json, "port"));
     {
         // The prefix is stripped here and stored bare, so nothing downstream
@@ -944,6 +1044,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.eviction = str_to_eviction(json_get_string(json, "eviction"));
             break;
     }
+
+    json_get_extra(json, cfg.extra);
 
     return !cfg.name.empty();
 }
