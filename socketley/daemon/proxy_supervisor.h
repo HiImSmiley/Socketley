@@ -370,6 +370,9 @@ private:
     // the two are cleared on different asks.
     std::string  m_start_error;
     std::string  m_config_error;
+    // Whether this child ever spoke the protocol, which separates a worker
+    // that refused its configuration from a binary that was never a worker.
+    bool         m_saw_worker_frame{false};
 
     // The last state the child reported, observed and not adopted, which
     // await_startup() reads to tell "the child has bound its socket" from "the

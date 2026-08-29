@@ -359,6 +359,11 @@ private:
 
 public:
 
+    // A runtime whose own verbs collide with the sniffer's -- a store speaking
+    // GET and PUT reads as HTTP -- declares its wire protocol here and is not
+    // sniffed; proto_unknown, the default, keeps the auto-detection.
+    void set_wire_protocol(proto_state p) { m_wire_protocol = p; }
+
     size_t get_connection_count() const override;
 
     // Lua actions
@@ -478,6 +483,8 @@ public:
                           std::string_view reply) override;
 
 private:
+    proto_state m_wire_protocol{proto_unknown};
+
     // Ask the linked cache something on behalf of `conn`, where `silent` is
     // the auto-store, which wants no answer and is not charged to the
     // connection.

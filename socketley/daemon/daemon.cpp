@@ -15,6 +15,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 #include "../cli/command_hashing.h"
+#include "../runtime/worker/worker_main.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -497,6 +498,12 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
 int daemon_start(runtime_manager& manager, event_loop& loop,
                  int argc, char** argv)
 {
+    // The supervisor forks and execs this binary with `proxy-worker` to serve
+    // each runtime, so dispatching it here rather than at each caller is what
+    // lets an SDK daemon start a runtime at all.
+    if (argc > 1 && argv[1] && std::string_view(argv[1]) == "proxy-worker")
+        return worker_main(3);
+
     // Before anything else, including the "is one already running" check: a
     // command line the daemon cannot honour is worth an exit code whether or
     // not this process was going to be the one serving the socket.

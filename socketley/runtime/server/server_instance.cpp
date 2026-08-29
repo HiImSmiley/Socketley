@@ -2543,6 +2543,15 @@ reparse:
     // Multi-protocol auto-detection
     if (conn->proto == proto_unknown)
     {
+        // Declared beats sniffed, because the sniffer reads the first four
+        // bytes and a runtime of its own may legitimately open a line with
+        // GET or PUT.
+        if (m_wire_protocol != proto_unknown)
+        {
+            conn->proto = m_wire_protocol;
+            goto reparse;
+        }
+
         // Four bytes is what the tests below need, but a completed short line
         // is not ambiguous and is decided rather than waited on -- because a
         // line-protocol client writing "hi\n" will not send the fourth byte

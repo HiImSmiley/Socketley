@@ -1042,6 +1042,10 @@ void proxy_supervisor::ingest(const std::string&)
 
     while (worker_proto::take_frame(m_in, type, ver, payload, fatal))
     {
+        // Any frame at all proves the child became a worker, which is the one
+        // thing its exit status cannot tell us afterwards.
+        m_saw_worker_frame = true;
+
         switch (type)
         {
             case worker_proto::frame_type::stats:
@@ -1264,7 +1268,33 @@ bool proxy_supervisor::check_liveness()
     close_control();
     m_in.clear();
 
-    LOG_WARN("proxy worker exited unexpectedly");
+    // The binary and the status, because the usual cause is a worker binary
+    // that never became a worker and the bare sentence sent operators looking
+    // in the configuration path instead.
+    {
+        char msg[512];
+        if (WIFEXITED(status))
+            snprintf(msg, sizeof(msg),
+                     "worker %s exited unexpectedly with status %d",
+                     m_exec_path.c_str(), WEXITSTATUS(status));
+        else if (WIFSIGNALED(status))
+            snprintf(msg, sizeof(msg),
+                     "worker %s was killed by signal %d",
+                     m_exec_path.c_str(), WTERMSIG(status));
+        else
+            snprintf(msg, sizeof(msg), "worker %s exited unexpectedly",
+                     m_exec_path.c_str());
+        LOG_WARN(msg);
+    }
+
+    // A child that died without ever answering a frame never read the config
+    // it is about to be blamed for, and the one way to build that binary is to
+    // leave `proxy-worker` undispatched.
+    if (!m_saw_worker_frame && m_config_error.empty())
+        m_config_error = std::string(m_exec_path) +
+                         " exited before it answered anything; a custom daemon "
+                         "or worker binary must run worker_main() for argv[1] "
+                         "== \"proxy-worker\"";
 
     // The one thing a child can tell us on the way out -- not a crash but a
     // configuration it will never accept -- so the runtime is left `failed`
