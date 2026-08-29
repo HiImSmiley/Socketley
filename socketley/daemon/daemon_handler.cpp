@@ -1021,6 +1021,7 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         case fnv1a("owner"):     return cmd_owner(conn, pa);
         case fnv1a("attach"):    return cmd_attach(conn, pa);
         case fnv1a("add"):       return cmd_add(conn, pa);
+        case fnv1a("daemon-stop"): return cmd_daemon_stop(conn);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("cluster-status"): return cmd_cluster_status(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
@@ -5280,6 +5281,16 @@ void daemon_handler::check_managed_health()
             m_persistence->save_runtime(inst.get());
         return;  // restart one at a time per health check cycle
     }
+}
+
+// The same route a SIGTERM takes, because that path already stops every
+// runtime, drains the ring and removes this daemon's entry -- a second way out
+// would be a second thing to keep correct.
+int daemon_handler::cmd_daemon_stop(ipc_connection* conn)
+{
+    (void)conn;
+    ::kill(::getpid(), SIGTERM);
+    return 0;
 }
 
 int daemon_handler::cmd_cluster_dir(ipc_connection* conn)

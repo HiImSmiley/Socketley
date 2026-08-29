@@ -21,6 +21,8 @@
 #include "../runtime/worker/worker_main.h"
 #include "../shared/daemon_client.h"
 #include "../shared/paths.h"
+#include <algorithm>
+#include <filesystem>
 
 // Has this tree been rebuilt under a running daemon, decided on the inode
 // because two builds a minute apart carry the same version, and reported only
@@ -179,6 +181,87 @@ int cli_dispatch(int argc, char** argv)
 
     switch (fnv1a(cmd.data()))
     {
+        // Which daemons are serving, which is a question nothing could answer:
+        // SOCKETLEY_SOCKET moves the socket AND the state directory, so a
+        // second daemon left no trace anywhere a CLI would look.  Each daemon
+        // writes one file naming its socket; the probe below decides whether
+        // it is alive, because a daemon killed outright leaves that file.
+        case fnv1a("daemons"):
+        {
+            const auto paths = socketley_paths::resolve();
+
+            struct entry { std::string sock; long pid; };
+            std::vector<entry> found;
+
+            std::error_code ec;
+            for (const auto& e :
+                 std::filesystem::directory_iterator(paths.daemons_dir, ec))
+            {
+                if (e.path().extension() != ".daemon")
+                    continue;
+                std::ifstream f(e.path());
+                std::string sock;
+                if (!std::getline(f, sock) || sock.empty())
+                    continue;
+                found.push_back({sock, std::strtol(e.path().stem().c_str(),
+                                                   nullptr, 10)});
+            }
+
+            std::sort(found.begin(), found.end(),
+                      [](const entry& a, const entry& b) { return a.sock < b.sock; });
+
+            if (found.empty())
+            {
+                std::cout << "no daemon has registered under "
+                          << paths.daemons_dir.string() << "\n";
+                return 0;
+            }
+
+            std::cout << "  SOCKET                                   PID      "
+                         "STATUS  BINARY\n";
+
+            for (const auto& f : found)
+            {
+                socketley::daemon_ident id;
+                const auto st = socketley::daemon_probe(f.sock.c_str(), &id, 300);
+
+                const char* status = "dead";
+                switch (st)
+                {
+                    case socketley::daemon_identity::daemon:
+                    case socketley::daemon_identity::predates_ping: status = "up";      break;
+                    case socketley::daemon_identity::foreign:       status = "foreign"; break;
+                    case socketley::daemon_identity::absent:        status = "dead";    break;
+                    default:                                        status = "busy";    break;
+                }
+
+                // The one this CLI would talk to, because "which daemon am I
+                // configuring" is the question underneath the list.
+                // Removed only when both say so, because a daemon still
+                // restoring runtimes answers nothing and is not gone.
+                if (st == socketley::daemon_identity::absent && f.pid > 0 &&
+                    ::kill(static_cast<pid_t>(f.pid), 0) < 0 && errno == ESRCH)
+                {
+                    std::error_code rec;
+                    std::filesystem::remove(
+                        paths.daemons_dir / (std::to_string(f.pid) + ".daemon"), rec);
+                }
+
+                const bool current = (f.sock == daemon_handler::socket_path);
+
+                std::cout << (current ? "* " : "  ");
+                std::cout.width(41); std::cout << std::left << f.sock;
+                std::cout.width(9);  std::cout << std::left << f.pid;
+                std::cout.width(8);  std::cout << std::left << status;
+                std::cout << (id.has_exe && !id.exe_path.empty() ? id.exe_path : "-")
+                          << "\n";
+            }
+
+            std::cout << "\n* is the daemon this CLI talks to; set SOCKETLEY_SOCKET "
+                         "to pick another.\n";
+            return 0;
+        }
+
         case fnv1a("--version"):
         case fnv1a("-v"):
         case fnv1a("version"):
@@ -243,6 +326,24 @@ int cli_dispatch(int argc, char** argv)
 
         case fnv1a("daemon"):
         {
+            // `stop` before the flag scan, because it is a verb and not a
+            // setting: killing the process by hand was the only way to end a
+            // daemon, and an operator with several of them had to find the
+            // right pid first.
+            if (argc > 2 && std::string_view(argv[2]) == "stop")
+            {
+                std::string data;
+                const int rc = ipc_send("daemon-stop", data);
+                if (rc < 0)
+                {
+                    std::cerr << "no daemon is serving "
+                              << daemon_handler::socket_path << "\n";
+                    return 2;
+                }
+                if (rc != 0 && !data.empty()) std::cerr << data;
+                return rc;
+            }
+
             // Check for configuration flags (--name, --cluster)
             bool has_config = false;
             for (int i = 2; i < argc; ++i)

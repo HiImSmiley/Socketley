@@ -144,6 +144,31 @@ static daemon_config load_daemon_config(const std::string& config_path)
 #endif
 }
 
+// One line naming the socket this daemon serves, written where a CLI can find
+// it without knowing the path -- the state directory's key spells `/` as `_`
+// and cannot be turned back into a path.
+static std::filesystem::path register_daemon(const socketley_paths& paths)
+{
+    if (paths.daemons_dir.empty())
+        return {};
+
+    std::error_code ec;
+    std::filesystem::create_directories(paths.daemons_dir, ec);
+    if (ec)
+        return {};
+
+    // Keyed by pid, because two daemons may serve two sockets and a file per
+    // socket would need the same lossy spelling the state directory uses.
+    const std::filesystem::path entry =
+        paths.daemons_dir / (std::to_string(::getpid()) + ".daemon");
+
+    std::ofstream f(entry, std::ios::trunc);
+    if (!f.is_open())
+        return {};
+    f << paths.socket_path.string() << "\n";
+    return entry;
+}
+
 // The first time a keyed state directory is used, whatever was in the
 // directory it used to share is copied into it once -- marked on disk rather
 // than inferred, and only when nobody is serving the default socket, because
@@ -629,6 +654,10 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGHUP, &sa, nullptr);
 
+    // After the socket is served and before the loop, so an entry exists only
+    // for a daemon that is actually answering.
+    const std::filesystem::path daemon_entry = register_daemon(paths);
+
     LOG_INFO("daemon started");
 
     loop.run();
@@ -653,6 +682,14 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     handler.teardown();
 
     g_signal_write_fd = -1;
+
+    // A daemon killed outright leaves its entry behind, which `daemons` reports
+    // as dead rather than trusting -- the probe is the authority, not the file.
+    if (!daemon_entry.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(daemon_entry, ec);
+    }
 
     LOG_INFO("daemon stopped");
 

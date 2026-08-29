@@ -10,6 +10,11 @@ struct socketley_paths
     // Registered-type manifests, beside config_path rather than the state dir,
     // because a manifest describes an installation and not a daemon's state.
     std::filesystem::path types_dir;
+
+    // One file per daemon that is serving, so `socketley daemons` can find the
+    // ones on sockets nobody named -- the state directory cannot answer this,
+    // because its key spells `/` as `_` and does not come back.
+    std::filesystem::path daemons_dir;
     bool system_mode = false;            // true if installed system-wide
 
     // Where runtimes lived before the state directory was keyed to the socket,

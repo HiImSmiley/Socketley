@@ -430,6 +430,24 @@ appended when the pinning was attempted and refused.
 For a runtime running in its own process this describes that process's ring, not
 the daemon's.
 .TP
+.B daemon stop
+Stops the daemon this invocation would talk to, over its socket rather than by
+pid, taking every runtime it supervises with it. It answers before it goes, and
+exits 2 when nothing is serving that socket.
+.TP
+.B daemons
+Every daemon that has registered itself, with its pid, whether it still answers,
+and the executable serving it \(em which differs per socket once a daemon built
+on the SDK is running.
+.IP
+An asterisk marks the one this invocation would talk to;
+.B SOCKETLEY_SOCKET
+selects another. The list is a set of files, one per daemon, written after the
+socket is served and removed on a clean exit; every entry is probed rather than
+trusted, so a daemon that was killed outright is reported
+.B dead
+rather than listed as running, and its file is removed once its pid is gone too.
+.TP
 .BI "restart " "name " "[flags]"
 Stop and start a runtime in one step. The runtime keeps the
 configuration it already has. Equivalent to

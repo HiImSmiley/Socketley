@@ -120,6 +120,9 @@ private:
     int cmd_owner(ipc_connection* conn, const parsed_args& pa);
     int cmd_attach(ipc_connection* conn, const parsed_args& pa);
     int cmd_add(ipc_connection* conn, const parsed_args& pa);
+    // Ends this daemon, answered before it goes so the caller learns it was
+    // heard rather than seeing the socket close under the reply.
+    int cmd_daemon_stop(ipc_connection* conn);
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_cluster_status(ipc_connection* conn);
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);

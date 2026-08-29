@@ -69,6 +69,7 @@ socketley_paths socketley_paths::resolve()
         p.state_dir   = "/var/lib/socketley/runtimes";
         p.config_path = "/etc/socketley/config.lua";
         p.types_dir   = "/etc/socketley/types";
+        p.daemons_dir = "/run/socketley/daemons";
 
         std::error_code ec;
         fs::create_directories("/run/socketley", ec);
@@ -85,6 +86,7 @@ socketley_paths socketley_paths::resolve()
             p.state_dir   = home / ".local" / "share" / "socketley" / "runtimes";
             p.config_path = home / ".config" / "socketley" / "config.lua";
             p.types_dir   = home / ".config" / "socketley" / "types";
+            p.daemons_dir = home / ".local" / "share" / "socketley" / "daemons";
         }
         else
         {
