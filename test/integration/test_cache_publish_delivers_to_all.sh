@@ -1,56 +1,38 @@
 #!/usr/bin/env bash
 # Integration test: every subscriber gets the message, and every subscribe is
-# answered — even when the fan-out is wider than the submission queue is deep.
+# answered, at a fan-out of 3000.
 #
-# ─── WHAT THIS GUARDS ───────────────────────────────────────────────────────
+# ─── WHAT THIS COVERS NOW, AND WHAT IT USED TO ──────────────────────────────
 #
-# This is the delivery half of the pair.  Its sibling,
-# test_cache_publish_subscriber_reachable.sh, asserts that a subscriber
-# publish() gave up on can still be REACHED — that its armed read still has
-# something that can complete it.  That property held while the message it was
-# supposed to receive was thrown away, and the two are genuinely different
-# claims: a connection can be perfectly healthy and still never be told the
-# thing it subscribed for.
-#
-# The mechanism is one line in shared/event_loop.cpp.  get_sqe() recovered from
-# a full submission queue by calling io_uring_submit() and retrying once; under
-# IORING_SETUP_SQPOLL that call is a store to the ring tail and NOT a syscall,
-# so it frees no slot and the retry cannot succeed.  Every submit_* helper then
-# reported "this never reached the ring", and each runtime's flush path read
-# that transient local shortage as a permanent per-connection failure: the bytes
-# were dropped, the connection was marked `closing`, and nobody was told.
-#
-# Measured on this tree before the fix, SQPOLL on, 3000 subscribers, a 2048-entry
-# ring, one publish:
+# This file was a three-armed test for a defect that only occurred under SQPOLL.
+# get_sqe() recovered from a full submission queue by calling io_uring_submit()
+# and retrying once; under IORING_SETUP_SQPOLL that call was a store to the ring
+# tail and NOT a syscall, so it freed no slot and the retry could not succeed.
+# Each runtime's flush path then read a transient local shortage as a permanent
+# per-connection failure: bytes dropped, connection marked `closing`, nobody
+# told.  Measured then, 3000 subscribers against a 2048-entry ring:
 #
 #     delivered  2048 of 3000     (exactly the ring depth)
-#     gave up     952             silently — never retried, never reported
+#     gave up     952             silently -- never retried, never reported
+#     registered  2750 and 2996 of 3000, sending every subscribe before reading
 #
-# and, sending every subscribe before reading any acknowledgement, so the queue
-# runs out on the REPLY path instead:
+# With SQPOLL off the same runs delivered 3000 of 3000, which is what the third
+# arm existed to say.
 #
-#     registered  2750 of 3000 and 2996 of 3000 on two runs
-#
-# A client that asked to subscribe got silence and was not subscribed.
+# SQPOLL is gone from this build, so the provocation cannot be arranged and the
+# defect cannot recur.  What is left is the arm that always passed, in both of
+# its shapes, because it is not vacuous on its own: 3000 subscribers registered
+# and delivered to, once walking the fan-out and once with every subscribe sent
+# before any acknowledgement is read.  It no longer guards get_sqe(), and
+# nothing in this tree does -- said here rather than left to be inferred from a
+# file that still looks like a regression test.
 #
 # ─── WHY EACH ASSERTION CAN FAIL ────────────────────────────────────────────
 #
-#   sqpoll thread present  — the whole provocation rests on SQPOLL.  Without it
-#       get_sqe() recovers by submitting and nothing is ever dropped: measured
-#       3000 of 3000 in both modes with SOCKETLEY_SQPOLL=0.  An arm that
-#       quietly loses SQPOLL therefore LOOKS like a fix, so it is checked
-#       positively — the kernel poller is a thread named iou-sqp-<pid> inside
-#       the process that owns the ring, and it is either there or it is not.
-#   the ring ran out       — after the fix nothing is dropped, so no client-side
-#       count can say whether the mechanism was exercised at all.  The loop logs
-#       the first time it has to wait for the poller; that line is the proof
-#       this run provoked the thing it claims to test.  Without it, delivered ==
-#       SUBS is true of a run that never filled the queue.
-#   delivered == SUBS      — fails at 2048 of 3000 on the unfixed tree.
-#   registered == SUBS     — fails at 2750-2996 of 3000 on the unfixed tree,
-#       on the reply path rather than the publish path.
-#   control delivered      — SQPOLL off.  Not a second provocation: it is what
-#       says the harness can tell a delivered message from an undelivered one.
+#   registered == SUBS   — a subscriber that never registered is not in the set
+#       publish() walks, so its absence would read as a delivery failure.
+#   delivered == SUBS    — one short is one connection that subscribed and was
+#       never told the message existed.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -65,7 +47,6 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 # reached half of them" and is not this mechanism at all.
 PORT_FANOUT=$((SL_PORT_BASE+344))
 PORT_REPLY=$((SL_PORT_BASE+345))
-PORT_PLAIN=$((SL_PORT_BASE+346))
 NAME=pubdelivercache
 SUBS="${SUBS:-3000}"
 PASS=0; FAIL=0; TOTAL=0
@@ -82,7 +63,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Integration: a publish wider than the submission queue still reaches everyone ==="
+echo "=== Integration: a publish reaches every one of 3000 subscribers ==="
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "  SKIP: python3 is required"
@@ -206,42 +187,23 @@ for s in subs:
         pass
 PY
 
-# SQPOLL, checked positively rather than assumed.  The kernel poller is a thread
-# named iou-sqp-<pid> in the process that owns the ring; this counts them across
-# the processes belonging to THIS daemon only.  pgrep -x, never -f: -f matches
-# the whole command line and so matches the shell doing the matching.
-count_sqpoll_threads() {
-    local n=0 p
-    for p in $(pgrep -x socketley 2>/dev/null); do
-        grep -qs -- "$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
-        n=$((n + $(grep -l "^iou-sqp" /proc/"$p"/task/*/comm 2>/dev/null | wc -l)))
-    done
-    printf '%s\n' "$n"
-}
-
 # Redirected to a file and never captured with $( ).  A command substitution
 # runs the function in a SUBSHELL, so every variable daemon_isolate and
 # daemon_start export -- SOCKETLEY_DPID above all -- dies with it, and the
 # cleanup trap in this shell then finds nothing to stop: two daemons and two
 # workers left running per invocation, holding their ports.
-run_arm() {   # run_arm SQPOLL_VALUE LABEL PORT MODE
-    local sqp=$1 label=$2 port=$3 mode=$4
+run_arm() {   # run_arm LABEL PORT MODE
+    local label=$1 port=$2 mode=$3
     if [ -n "${SOCKETLEY_DPID:-}" ]; then
         "$BIN" stop "$NAME" 2>/dev/null || true
         "$BIN" remove "$NAME" 2>/dev/null || true
         daemon_stop 2>/dev/null || true
     fi
     daemon_isolate "cachepubdeliver-$label"
-    SOCKETLEY_SQPOLL="$sqp" daemon_start "$BIN"
+    daemon_start "$BIN"
     create_ok "cache created ($label)" "$BIN" create cache "$NAME" -p "$port" -s
     ready_resp 127.0.0.1 "$port" 20 || true
-    echo "sqpollthreads=$(count_sqpoll_threads)"
     timeout 300 python3 "$TMPD/subs.py" "$port" "$SUBS" "$mode" 2>&1 || true
-    # The loop says once, per ring, that it had to wait for the poller.  That is
-    # the only outside evidence the submission queue actually ran out.
-    local nfull
-    nfull=$(grep -c 'submission queue was full' "$SOCKETLEY_DLOG" 2>/dev/null) || nfull=0
-    echo "sqfull=$nfull"
 }
 
 field() { printf '%s\n' "$2" | sed -n "s/^$1=//p"; }
@@ -263,84 +225,29 @@ check() {   # check LABEL GOT WANT EXPLANATION
     return 0
 }
 
-# ── Arm 1: the fan-out.  The queue runs out while publish() walks subscribers ──
-run_arm 1 fanout "$PORT_FANOUT" serial > "$TMPD/arm1.out" 2>&1
+# ── The fan-out: publish() walks every subscriber ───────────────────────────
+run_arm fanout "$PORT_FANOUT" serial > "$TMPD/arm1.out" 2>&1
 OUT=$(cat "$TMPD/arm1.out")
-T=$(field sqpollthreads "$OUT"); T=${T:-0}
 R=$(field registered "$OUT");    R=${R:-0}
 D=$(field delivered "$OUT");     D=${D:-0}
 S=$(field silent "$OUT");        S=${S:-0}
-F=$(field sqfull "$OUT");        F=${F:-0}
-echo "  fanout arm: sqpoll_threads=$T registered=$R delivered=$D silent=$S sqfull_lines=$F"
-
-TOTAL=$((TOTAL+1))
-if [ "$T" -gt 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [the SQPOLL arm actually has a submission poller]: 0 iou-sqp threads."
-    echo "         Nothing below this line means anything: without SQPOLL the queue"
-    echo "         never runs out and every count below is trivially correct."
-fi
+echo "  fanout arm: registered=$R delivered=$D silent=$S"
 
 check "every subscriber registers (fanout)" "$R" "$SUBS" \
       "A subscriber that never registered is not in the set publish() walks."
-
-TOTAL=$((TOTAL+1))
-if [ "$F" -gt 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [the submission queue actually ran out]: the loop never logged a"
-    echo "         full queue, so this run did not exercise the mechanism and the"
-    echo "         delivery count below proves nothing.  Raise SUBS above the ring"
-    echo "         depth, or the ring grew."
-fi
-
 check "every subscriber is delivered to" "$D" "$SUBS" \
       "publish() gave up on $S of them without retrying and without telling anyone."
 
-# ── Arm 2: the reply path.  The queue runs out on the subscribe acks ──────────
-run_arm 1 reply "$PORT_REPLY" batch > "$TMPD/arm2.out" 2>&1
+# ── The reply path: every subscribe sent before any ack is read ─────────────
+run_arm reply "$PORT_REPLY" batch > "$TMPD/arm2.out" 2>&1
 OUT=$(cat "$TMPD/arm2.out")
-T2=$(field sqpollthreads "$OUT"); T2=${T2:-0}
 R2=$(field registered "$OUT");    R2=${R2:-0}
 D2=$(field delivered "$OUT");     D2=${D2:-0}
-echo "  reply arm:  sqpoll_threads=$T2 registered=$R2 delivered=$D2"
-
-TOTAL=$((TOTAL+1))
-if [ "$T2" -gt 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [the reply arm actually has a submission poller]: 0 iou-sqp threads."
-fi
+echo "  reply arm:  registered=$R2 delivered=$D2"
 
 check "every subscribe is answered" "$R2" "$SUBS" \
       "A client that asked to subscribe got silence and is not subscribed."
 check "every subscriber is delivered to (reply arm)" "$D2" "$SUBS" ""
-
-# ── Control: SQPOLL off ──────────────────────────────────────────────────────
-# Not a third provocation.  Without SQPOLL get_sqe() recovers by submitting, so
-# nothing is ever dropped; a run where this arm loses subscribers is measuring
-# something other than what the two arms above measure.
-run_arm 0 plain "$PORT_PLAIN" serial > "$TMPD/arm3.out" 2>&1
-OUT=$(cat "$TMPD/arm3.out")
-T3=$(field sqpollthreads "$OUT"); T3=${T3:-0}
-R3=$(field registered "$OUT");    R3=${R3:-0}
-D3=$(field delivered "$OUT");     D3=${D3:-0}
-echo "  control arm: sqpoll_threads=$T3 registered=$R3 delivered=$D3 of $SUBS"
-
-TOTAL=$((TOTAL+1))
-if [ "$T3" -eq 0 ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [the control has no submission poller]: $T3 iou-sqp threads with"
-    echo "         SOCKETLEY_SQPOLL=0.  The control is then a second provocation."
-fi
-
-check "control: every subscriber is served without SQPOLL" "$D3" "$SUBS" ""
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

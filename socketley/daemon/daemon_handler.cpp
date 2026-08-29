@@ -128,7 +128,7 @@ static std::string attach_pid_refusal(int conn_fd, pid_t pid)
     return {};
 }
 
-// Why this runtime's --cpus / --sqpoll request cannot be honoured, with the
+// Why this runtime's --cpus request cannot be honoured, with the
 // text on runtime_instance because the restore path meets the request again on
 // a ring created before the state file was read.
 static std::string instance_ring_refusal(const runtime_instance* inst,

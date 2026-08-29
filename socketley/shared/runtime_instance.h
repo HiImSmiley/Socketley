@@ -366,15 +366,12 @@ public:
     }
 
     // ── Ring policy ─────────────────────────────────────────────────────────
-    // What this runtime's I/O was asked to run as, a request and not a result,
+    // What this runtime's I/O was asked to run on, a request and not a result,
     // with asked-for and not-asked-for separate states so a plain `create` is
-    // not read as an explicit --no-sqpoll.
+    // not read as an explicit unrestricted set.
     void set_cpus(const cpu_set_spec& cpus);
     const cpu_set_spec& get_cpus() const;
     bool has_cpus_request() const;
-    void set_sqpoll(bool on);
-    bool get_sqpoll() const;
-    bool has_sqpoll_request() const;
 
     // Why this runtime's request cannot be honoured on `loop`'s ring, naming
     // the daemon setting that would satisfy it, asked by both `create` and
@@ -623,8 +620,6 @@ private:
     // true.
     cpu_set_spec m_cpus{};
     bool m_cpus_set = false;
-    bool m_sqpoll = false;
-    bool m_sqpoll_set = false;
 
     // Runtime manager / event loop (base class)
     runtime_manager* m_runtime_manager = nullptr;

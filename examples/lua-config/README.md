@@ -106,7 +106,7 @@ Every flag `create` accepts is reachable from a configuration file.
 
 **Any type:** `port`, `listen`, `shards`, `log`, `write`, `group`, `cpus`,
 `max_connections`, `rate_limit`, `global_rate_limit`, `idle_timeout`, `drain`,
-`test`, `tls`, `cert`, `key`, `ca`, `reconnect`, `sqpoll`, `config`/`lua`,
+`test`, `tls`, `cert`, `key`, `ca`, `reconnect`, `config`/`lua`,
 `bash`, `start`.
 
 **server:** `mode`, `udp`, `http`, `http_cache`, `master_pw`, `master_forward`,

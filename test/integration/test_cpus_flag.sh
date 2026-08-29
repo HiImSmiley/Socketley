@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Its own daemons on their own socket and state directory, because both
-# settings are fixed when a ring is created so seeing two values takes two
-# daemons -- and every one of them is killed by the pid this script started,
-# never by name, since other agents have socketley daemons on this machine.
+# Its own daemons on their own socket and state directory, because the CPU set
+# is fixed when a ring is created so seeing two values takes two daemons -- and
+# every one of them is killed by the pid this script started, never by name,
+# since other agents have socketley daemons on this machine.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -60,18 +60,6 @@ start_daemon() {
 # The state file a runtime was persisted to, wherever paths.h decided to put it.
 state_file() { find "$HOME" -name "$1.json" -print -quit 2>/dev/null; }
 
-# How many submission-polling kernel threads the daemon holds, which is the
-# figure the whole change is about: it used to be one per ring, and a ring
-# exists per process.
-iou_threads() {
-    local n=0 t
-    for t in /proc/"$DPID"/task/*; do
-        [ -r "$t/comm" ] || continue
-        case "$(cat "$t/comm" 2>/dev/null)" in iou-sqp-*) n=$((n+1));; esac
-    done
-    echo "$n"
-}
-
 # The reason is checked as well as the failure, because a build without the
 # flag answers "unknown flag: --cpus" with exit 1 and would satisfy an oracle
 # that stopped at those two.
@@ -106,29 +94,15 @@ stat_field() {   # <runtime> <field>
     "$BIN" stats "$1" 2>/dev/null | grep "^$2:" | head -1 | cut -d: -f2-
 }
 
-echo "=== Integration: --cpus / --sqpoll ($NCPU CPUs online) ==="
+echo "=== Integration: --cpus ($NCPU CPUs online) ==="
 
-# ─── 1. A daemon nobody asked for a poller ──────────────────────────────────
+# ─── 1. A daemon nobody pinned ──────────────────────────────────────────────
 start_daemon SOCKETLEY_TEST=1 || exit 1
 
 "$BIN" create server cpus_base -p $((SL_PORT_BASE+951)) -s >/dev/null 2>&1
 sleep 0.3
 
-[ "$(stat_field cpus_base sqpoll)" = "off" ] && ok || bad "default: stats says sqpoll=$(stat_field cpus_base sqpoll), expected off"
 [ "$(stat_field cpus_base cpus)" = "max" ]   && ok || bad "default: stats says cpus=$(stat_field cpus_base cpus), expected max"
-[ "$(stat_field cpus_base sq_thread_cpu)" = "-" ] && ok || bad "default: sq_thread_cpu should be - with no poller"
-
-# The claim, measured: no poller means no polling kernel thread.
-N=$(iou_threads)
-[ "$N" -eq 0 ] && ok || bad "default: $N io_uring polling kernel thread(s), expected 0"
-
-# A second and third runtime add no rings and so no threads, which is the whole
-# reason the switch is not per runtime.
-"$BIN" create cache cpus_c1 -p $((SL_PORT_BASE+952)) -s >/dev/null 2>&1
-"$BIN" create server cpus_s2 -p $((SL_PORT_BASE+953)) -s >/dev/null 2>&1
-sleep 0.3
-N=$(iou_threads)
-[ "$N" -eq 0 ] && ok || bad "three runtimes, no poller: $N polling thread(s), expected 0"
 
 # ─── 2. Sets this machine cannot satisfy ────────────────────────────────────
 refuses "a CPU that does not exist"     "does not exist on this machine" --cpus "$NCPU-$NCPU"
@@ -141,62 +115,30 @@ refuses "no value at all"               "--cpus requires a CPU set"      --cpus
 refuses "an absurd CPU number"          "not a CPU number"               --cpus 999
 
 accepts "max on any machine"            --cpus max
-accepts "--no-sqpoll on a poller-less ring" --no-sqpoll
-
-# A ring without a poller cannot be given one after the fact, and saying so is
-# the point — this must not silently succeed and do nothing.
-refuses "--sqpoll against a ring that has none" "created without a submission poller" --sqpoll
 
 if [ "$NCPU" -ge 2 ]; then
     refuses "a CPU set the shared I/O thread is not pinned to" "already pinned to" --cpus 0
 fi
 
-# ─── 3. edit cannot change either ───────────────────────────────────────────
+# ─── 3. edit cannot change it ───────────────────────────────────────────────
 # The reason is checked rather than the exit code, because "unknown flag" is
 # also a refusal with a message and is what a build without the feature
 # answers.
-for f in "--cpus max" "--sqpoll" "--no-sqpoll"; do
-    rc=0
-    out=$("$BIN" edit cpus_base $f 2>&1) || rc=$?
-    if [ "$rc" -eq 0 ]; then
-        bad "edit $f: succeeded, but a ring's flags cannot be changed"
-    else
-        case "$out" in
-            *"fixed when the ring is created"*) ok ;;
-            *) bad "edit $f: refused for the wrong reason: '$out'" ;;
-        esac
-    fi
-done
-
-# ─── 4. A daemon that was asked for a poller ────────────────────────────────
-start_daemon SOCKETLEY_SQPOLL=1 || exit 1
-"$BIN" create server cpus_sq -p $((SL_PORT_BASE+954)) -s >/dev/null 2>&1
-sleep 0.3
-
-MODE=$(stat_field cpus_sq sqpoll)
-if [ "$MODE" = "off(refused)" ]; then
-    echo "  SKIP: this kernel refuses an SQPOLL ring; the on-path cannot be checked here"
+rc=0
+out=$("$BIN" edit cpus_base --cpus max 2>&1) || rc=$?
+if [ "$rc" -eq 0 ]; then
+    bad "edit --cpus max: succeeded, but a ring's CPU set cannot be changed"
 else
-    [ "$MODE" = "on" ] && ok || bad "SOCKETLEY_SQPOLL=1: stats says sqpoll=$MODE, expected on"
-
-    # Exactly one, not one per runtime: the thread belongs to the ring.
-    N=$(iou_threads)
-    [ "$N" -eq 1 ] && ok || bad "SOCKETLEY_SQPOLL=1: $N polling thread(s), expected exactly 1"
-
-    "$BIN" create cache cpus_c2 -p $((SL_PORT_BASE+955)) -s >/dev/null 2>&1
-    "$BIN" create server cpus_s3 -p $((SL_PORT_BASE+956)) -s >/dev/null 2>&1
-    sleep 0.3
-    N=$(iou_threads)
-    [ "$N" -eq 1 ] && ok || bad "three runtimes on one ring: $N polling thread(s), expected 1"
-
-    accepts "--sqpoll against a ring that has one" --sqpoll
-    refuses "--no-sqpoll against a ring that has one" "created with a submission poller" --no-sqpoll
+    case "$out" in
+        *"fixed when the ring is created"*) ok ;;
+        *) bad "edit --cpus max: refused for the wrong reason: '$out'" ;;
+    esac
 fi
 
-# ─── 5. A pinned daemon ─────────────────────────────────────────────────────
+# ─── 4. A pinned daemon ─────────────────────────────────────────────────────
 if [ "$NCPU" -ge 2 ]; then
     SET="0-1"
-    start_daemon SOCKETLEY_SQPOLL=1 SOCKETLEY_CPUS="$SET" || exit 1
+    start_daemon SOCKETLEY_CPUS="$SET" || exit 1
     "$BIN" create server cpus_pin -p $((SL_PORT_BASE+957)) -s >/dev/null 2>&1
     sleep 0.3
 
@@ -210,20 +152,13 @@ if [ "$NCPU" -ge 2 ]; then
         *) bad "SOCKETLEY_CPUS=$SET: the I/O thread's real affinity is '$AFF'" ;;
     esac
 
-    if [ "$(stat_field cpus_pin sqpoll)" = "on" ]; then
-        # Documented behaviour: io_uring takes one CPU for the poller, not a
-        # mask, so it lands on the lowest member of the set.
-        [ "$(stat_field cpus_pin sq_thread_cpu)" = "0" ] && ok \
-            || bad "poller should be on CPU 0, stats says $(stat_field cpus_pin sq_thread_cpu)"
-    fi
-
-    accepts "a request that matches the ring" --sqpoll --cpus "$SET"
-    refuses "a request that does not"         "already pinned to" --sqpoll --cpus max
+    accepts "a request that matches the ring" --cpus "$SET"
+    refuses "a request that does not"         "already pinned to" --cpus max
 else
     echo "  SKIP: pinning checks need at least 2 CPUs"
 fi
 
-# ─── 6. The daemon's own command line ───────────────────────────────────────
+# ─── 5. The daemon's own command line ───────────────────────────────────────
 # `socketley daemon` used to ignore argv entirely, so each oracle here runs
 # under `timeout` and reaching it is the failure -- a daemon that discarded the
 # argument never returns -- and each names the reason it expects, since exit 1
@@ -279,15 +214,15 @@ if [ "$NCPU" -ge 2 ]; then
     accepts "a runtime request the flag satisfies" --cpus 0-1
 fi
 
-# A flag beats the environment, because SOCKETLEY_SQPOLL is exported once and
-# forgotten while --no-sqpoll is typed for this run.
-start_daemon SOCKETLEY_SQPOLL=1 -- --no-sqpoll || exit 1
-"$BIN" create server cpus_over -p $((SL_PORT_BASE+964)) -s >/dev/null 2>&1
-sleep 0.3
-[ "$(stat_field cpus_over sqpoll)" = "off" ] && ok \
-    || bad "--no-sqpoll under SOCKETLEY_SQPOLL=1: stats says sqpoll=$(stat_field cpus_over sqpoll)"
-N=$(iou_threads)
-[ "$N" -eq 0 ] && ok || bad "--no-sqpoll under SOCKETLEY_SQPOLL=1: $N polling thread(s), expected 0"
+# A flag beats the environment, because SOCKETLEY_CPUS is exported once and
+# forgotten while --cpus is typed for this run.
+if [ "$NCPU" -ge 2 ]; then
+    start_daemon SOCKETLEY_CPUS=max -- --cpus 0-1 || exit 1
+    "$BIN" create server cpus_over -p $((SL_PORT_BASE+964)) -s >/dev/null 2>&1
+    sleep 0.3
+    [ "$(stat_field cpus_over cpus)" = "0-1" ] && ok \
+        || bad "--cpus 0-1 under SOCKETLEY_CPUS=max: stats says cpus=$(stat_field cpus_over cpus)"
+fi
 
 # What was lost by not persisting these was the requirement rather than the
 # placement, so a runtime created with --cpus 0 came back on an unpinned ring
@@ -296,7 +231,6 @@ N=$(iou_threads)
 SET7=0
 start_daemon SOCKETLEY_CPUS="$SET7" || exit 1
 "$BIN" create server cpus_keep   -p $((SL_PORT_BASE+965)) --cpus "$SET7" -s >/dev/null 2>&1
-"$BIN" create server cpus_nosq   -p $((SL_PORT_BASE+966)) --no-sqpoll -s >/dev/null 2>&1
 "$BIN" create server cpus_plain  -p $((SL_PORT_BASE+967)) -s >/dev/null 2>&1
 sleep 0.5
 
@@ -308,20 +242,12 @@ else
         || bad "persistence: --cpus $SET7 is not in the state file: $(tr -d '\n' <"$F")"
 fi
 
-F=$(state_file cpus_nosq)
-if [ -z "$F" ]; then
-    bad "persistence: cpus_nosq has no state file at all"
-else
-    grep -q '"sqpoll": false' "$F" && ok \
-        || bad "persistence: --no-sqpoll is not in the state file: $(tr -d '\n' <"$F")"
-fi
-
-# A runtime that asked for neither must carry neither, or every plain `create`
-# becomes an explicit --no-sqpoll on the next boot.
+# A runtime that asked for nothing must carry nothing, or every plain `create`
+# becomes an explicit CPU set on the next boot.
 F=$(state_file cpus_plain)
 if [ -z "$F" ]; then
     bad "persistence: cpus_plain has no state file at all"
-elif grep -qE '"(cpus|sqpoll)"' "$F"; then
+elif grep -qE '"cpus"' "$F"; then
     bad "persistence: a runtime that asked for nothing carries a request: $(tr -d '\n' <"$F")"
 else
     ok

@@ -102,7 +102,7 @@ constexpr config_key config_keys[] = {
 // Keys with no flag of their own, listed so an unknown key can still be
 // refused by name.
 constexpr std::string_view special_keys[] = {
-    "type", "name", "config", "lua", "bash", "start", "reconnect", "sqpoll",
+    "type", "name", "config", "lua", "bash", "start", "reconnect",
     "daemon_process",
 };
 
@@ -279,18 +279,6 @@ std::string emit_special_keys(const sol::table& entry, std::string& command, boo
         }
     }
 
-    // Three states rather than two, because the daemon has a default of its
-    // own and "absent" has to stay distinguishable from "off".
-    {
-        const sol::object obj = entry["sqpoll"];
-        if (obj.valid() && obj != sol::nil)
-        {
-            if (obj.get_type() != sol::type::boolean)
-                return "sqpoll: expected true or false\n";
-            command += obj.as<bool>() ? " --sqpoll" : " --no-sqpoll";
-        }
-    }
-
     {
         const sol::object obj = entry["bash"];
         if (obj.valid() && obj != sol::nil)
@@ -437,7 +425,7 @@ std::string build_create_command(const std::string& type_str, const std::string&
 // nothing applies reads as if it did.
 std::string refuse_startup_only_daemon_keys(const sol::table& daemon)
 {
-    for (std::string_view key : { "log_level", "metrics_port", "cpus", "sqpoll" })
+    for (std::string_view key : { "log_level", "metrics_port", "cpus" })
     {
         if (!daemon[key].valid())
             continue;

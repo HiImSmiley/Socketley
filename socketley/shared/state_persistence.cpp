@@ -599,11 +599,9 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.child_policy = (instance->get_child_policy() == runtime_instance::child_policy::remove) ? 1 : 0;
     cfg.shards = instance->get_shards();
     // Only a request that was actually made is written, or every plain
-    // `create` would become an explicit --no-sqpoll on the next restart.
+    // `create` would become an explicit CPU set on the next restart.
     if (instance->has_cpus_request())
         cfg.cpus = instance->get_cpus().to_string();
-    cfg.sqpoll_set = instance->has_sqpoll_request();
-    cfg.sqpoll = instance->get_sqpoll();
     cfg.external_runtime = instance->is_external();
     if (cfg.external_runtime)
     {
@@ -796,11 +794,6 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         append_int_field("shard_index", static_cast<int>(cfg.shard_index));
     if (!cfg.cpus.empty())
         append_str_field("cpus", cfg.cpus);
-    // Written for both values and omitted only when nothing was asked for,
-    // because unlike every other boolean here absence and `false` do not mean
-    // the same thing.
-    if (cfg.sqpoll_set)
-        append_bool_field("sqpoll", cfg.sqpoll);
     if (cfg.external_runtime)
     {
         append_bool_field("external_runtime", true);
@@ -986,14 +979,6 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     // Absent means shard 0, which is a real answer and not a missing one.
     cfg.shard_index = json_get_uint32(json, "shard_index");
     cfg.cpus = json_get_string(json, "cpus");
-    // Read through json_get_string rather than json_get_bool, because the
-    // question is whether the key is there and json_get_bool answers false to
-    // both absent and false.
-    {
-        const std::string v = json_get_string(json, "sqpoll");
-        cfg.sqpoll_set = (v == "true" || v == "false");
-        cfg.sqpoll = (v == "true");
-    }
     cfg.external_runtime = json_get_bool(json, "external_runtime");
     cfg.managed = json_get_bool(json, "managed");
     cfg.exec_path = json_get_string(json, "exec_path");

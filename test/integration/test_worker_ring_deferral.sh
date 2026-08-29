@@ -3,8 +3,8 @@
 #
 # io_uring fixes a ring's flags when the ring is created.  A worker that calls
 # init() before it has read anything can therefore never be told what shape its
-# ring should be — set_sqpoll()/set_cpus() on an open ring are no-ops by
-# contract, so the setting would parse, store, and be silently ignored.  This
+# ring should be — set_cpus() on an open ring is a no-op by contract, so the
+# setting would parse, store, and be silently ignored.  This
 # checks the ordering directly rather than through a setting that does not exist
 # yet, because the ordering is the part that has to hold first.
 #

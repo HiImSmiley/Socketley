@@ -333,17 +333,6 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Opt in to the submission poller for this runtime's ring, per runtime
-        // rather than per daemon, because it costs a kernel thread that spins
-        // for as long as the ring exists.
-        case fnv1a("--sqpoll"):
-            instance->set_sqpoll(true);
-            return 0;
-
-        case fnv1a("--no-sqpoll"):
-            instance->set_sqpoll(false);
-            return 0;
-
         default:
             return -1;
     }
@@ -1193,14 +1182,12 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
-        // Neither is editable, because io_uring fixes a ring's flags at
-        // creation and accepting the edit would store a value the next `stats`
+        // Not editable, because io_uring fixes a ring's CPU set at creation
+        // and accepting the edit would store a value the next `stats`
         // contradicts.
         case fnv1a("--cpus"):
-        case fnv1a("--sqpoll"):
-        case fnv1a("--no-sqpoll"):
-            std::cout << "the ring's CPU set and polling mode are fixed when the "
-                         "ring is created; recreate the runtime to change them\n";
+            std::cout << "the ring's CPU set is fixed when the ring is created; "
+                         "recreate the runtime to change it\n";
             return 1;
 
         default:

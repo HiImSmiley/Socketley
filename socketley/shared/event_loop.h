@@ -39,7 +39,6 @@ public:
     // Both take effect at init() and only there, because io_uring fixes a
     // ring's flags at creation, and calling either marks the choice explicit
     // so a flag beats the environment.
-    void set_sqpoll(bool on);
     void set_cpus(const cpu_set_spec& cpus);
 
     bool init();
@@ -308,11 +307,6 @@ public:
     // NAPI busy polling: reduce latency by busy-polling the NIC driver.
     bool enable_napi_busy_poll(uint32_t busy_poll_usec, bool prefer = false);
 
-    // sqpoll_enabled() is what the ring actually got and sqpoll_requested() is
-    // what was asked for, so a refused request is not reported as an honoured
-    // one.
-    bool sqpoll_enabled() const { return m_sqpoll_enabled; }
-    bool sqpoll_requested() const { return m_sqpoll_requested; }
     bool direct_accept_supported() const { return m_direct_accept_supported; }
 
     // Whether a ring exists right now, which a caller deferring init() until
@@ -320,20 +314,15 @@ public:
     // immediately until then.
     bool ring_open() const { return m_ring_open; }
 
-    // The CPU set this loop was configured with, and the one CPU the SQPOLL
-    // kernel thread was pinned to (-1 when there is none, either because the
-    // set is unrestricted or because SQPOLL is off).
+    // The CPU set this loop was configured with.
     const cpu_set_spec& cpus() const { return m_cpus; }
-    int sq_thread_cpu() const { return m_sq_thread_cpu; }
 
     // Whether the loop thread's affinity was actually narrowed, which
     // distinguishes not asked from asked and refused.
     bool affinity_applied() const { return m_affinity_applied; }
 
-    // How often the submission queue was found full and how often that refused
-    // an operation, the second being a delivery defect that has already
-    // happened.
-    uint64_t sq_full_count() const { return m_sq_full_count; }
+    // How often a full submission queue refused an operation, which is a
+    // delivery defect that has already happened.
     uint64_t sq_exhausted_count() const { return m_sq_exhausted_count; }
 
 private:
@@ -385,18 +374,12 @@ private:
     // IORING_ACCEPT_POLL_FIRST needs kernel 6.11; probed rather than assumed,
     // because an unknown ioprio bit makes the kernel refuse every accept.
     bool m_accept_poll_first{false};
-    bool m_sqpoll_enabled{false};
-    // Asked for as opposed to granted, set before init() by set_sqpoll() or
-    // otherwise from the environment inside init().
-    bool m_sqpoll_requested{false};
-    // Whether a caller chose, which the values above cannot say because "off"
-    // and "unrestricted" are both a legitimate choice and the state of having
-    // made none.
-    bool m_sqpoll_explicit{false};
+    // Whether a caller chose, which the value below cannot say because
+    // "unrestricted" is both a legitimate choice and the state of having made
+    // none.
     bool m_cpus_explicit{false};
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
-    int m_sq_thread_cpu{-1};
     bool m_send_zc_supported{false};
     bool m_recv_multishot_supported{false};
     bool m_files_registered{false};
@@ -405,14 +388,7 @@ private:
     // Whether m_ring is a ring at all, tested in get_sqe(), which is the
     // single door every submission goes through.
     bool m_ring_open{false};
-    // See get_sqe_when_full(): one warning per ring, because the condition
-    // repeats once per submission for the rest of a fan-out.
-    bool m_sq_full_logged{false};
-    uint64_t m_sq_full_count{0};
     uint64_t m_sq_exhausted_count{0};
-    // How many times IORING_ENTER_SQ_WAIT may be re-entered for one SQE, which
-    // bounds signal interruptions rather than retries.
-    static constexpr unsigned SQ_WAIT_ATTEMPTS = 8;
     uint32_t m_registered_file_count{0};
 
     // Fixed file slot allocation (bitmap-based)

@@ -47,8 +47,6 @@ struct daemon_config
     std::string name;
     std::string cluster;
     std::string cpus;
-    bool        sqpoll     = false;
-    bool        sqpoll_set = false;
 };
 
 static daemon_config load_daemon_config(const std::string& config_path)
@@ -140,13 +138,6 @@ static daemon_config load_daemon_config(const std::string& config_path)
     sol::optional<std::string> cpus = (*table)["cpus"].get<sol::optional<std::string>>();
     if (cpus && !cpus->empty())
         out.cpus = *cpus;
-
-    sol::optional<bool> sqpoll = (*table)["sqpoll"].get<sol::optional<bool>>();
-    if (sqpoll)
-    {
-        out.sqpoll     = *sqpoll;
-        out.sqpoll_set = true;
-    }
 
     return out;
 #endif
@@ -344,8 +335,6 @@ static void restore_runtimes(state_persistence& persistence,
             else
                 LOG_WARN("restore: this machine cannot satisfy a persisted --cpus set");
         }
-        if (cfg.sqpoll_set)
-            instance->set_sqpoll(cfg.sqpoll);
 
         // External (attached) runtimes: mark as external so start() skips io_uring setup
         if (cfg.external_runtime)
@@ -461,7 +450,7 @@ static void restore_runtimes(state_persistence& persistence,
 // reach init() in time -- and unknown arguments are refused rather than
 // ignored.
 static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
-                               bool& saw_sqpoll, bool& saw_cpus)
+                               bool& saw_cpus)
 {
     // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
     // no arguments decides nothing and leaves the environment in charge.
@@ -471,16 +460,6 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
 
         switch (fnv1a(arg))
         {
-            case fnv1a("--sqpoll"):
-                loop.set_sqpoll(true);
-                saw_sqpoll = true;
-                break;
-
-            case fnv1a("--no-sqpoll"):
-                loop.set_sqpoll(false);
-                saw_sqpoll = true;
-                break;
-
             case fnv1a("--cpus"):
             {
                 if (i + 1 >= argc)
@@ -505,8 +484,7 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
 
             default:
                 std::cout << "unknown daemon flag: " << arg << "\n"
-                          << "  socketley daemon takes --sqpoll, --no-sqpoll and "
-                             "--cpus <set>.\n"
+                          << "  socketley daemon takes --cpus <set>.\n"
                           << "  Runtime flags belong on `create`; this command "
                              "configures the process's ring.\n";
                 return false;
@@ -522,9 +500,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Before anything else, including the "is one already running" check: a
     // command line the daemon cannot honour is worth an exit code whether or
     // not this process was going to be the one serving the socket.
-    bool saw_sqpoll = false;
-    bool saw_cpus   = false;
-    if (!parse_daemon_flags(argc, argv, loop, saw_sqpoll, saw_cpus))
+    bool saw_cpus = false;
+    if (!parse_daemon_flags(argc, argv, loop, saw_cpus))
         return 1;
 
     // Resolve paths (system vs dev mode)
@@ -544,12 +521,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     const daemon_config config = load_daemon_config(paths.config_path.string());
     const uint16_t metrics_port = config.metrics_port;
 
-    // The ring settings reach the loop here because init() is a few lines
+    // The ring setting reaches the loop here because init() is a few lines
     // down, and only where the command line said nothing: a flag typed at the
     // daemon outranks a file it did not read.
-    if (config.sqpoll_set && !saw_sqpoll)
-        loop.set_sqpoll(config.sqpoll);
-
     if (!config.cpus.empty() && !saw_cpus)
     {
         cpu_set_spec cpus;

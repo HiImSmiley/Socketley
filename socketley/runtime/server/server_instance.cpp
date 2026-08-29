@@ -1700,10 +1700,10 @@ void server_instance::teardown(event_loop& loop)
     {
         if (m_udp_fd >= 0)
         {
-            // The recvmsg holds a reference to the socket, and
-            // cancel-flush-close was never a defence because flush() does not
-            // enter the kernel under SQPOLL -- close_fd submits the cancel and
-            // holds the number until both have reported.
+            // The recvmsg holds a reference to the socket, so close_fd submits
+            // the cancel and holds the number until both have reported, which
+            // is what keeps the descriptor from being reused under a
+            // completion still naming it.
             close_tracked(m_udp_fd);
             m_udp_fd = -1;
         }

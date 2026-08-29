@@ -640,9 +640,9 @@ bool cache_instance::setup(event_loop& loop)
     }
 
     // The TTL sweep starts only once a key carries an expiry, because a timer
-    // running for every cache runtime keeps the SQPOLL thread from ever
-    // sleeping -- and the interval trades memory against CPU, never
-    // correctness, since every read path checks expiry itself.
+    // running for every cache runtime wakes each idle loop for nothing -- and
+    // the interval trades memory against CPU, never correctness, since every
+    // read path checks expiry itself.
     long sweep_ms = 500;
     const char* sweep_env = getenv("SOCKETLEY_CACHE_TTL_SWEEP_MS");
     if (sweep_env)

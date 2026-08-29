@@ -414,10 +414,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         return false;
     }
 
-    // The daemon's ring policy wherever this runtime asked for none of its
-    // own, because a worker inherits the affinity mask in fact while its loop
-    // believes otherwise, and re-reads SOCKETLEY_SQPOLL from the environment
-    // it inherited.
+    // The daemon's CPU set wherever this runtime asked for none of its own,
+    // because a worker inherits the affinity mask in fact while its loop
+    // believes otherwise.
     runtime_config effective = cfg;
 
     // Which of N this child is, the only field that differs between the N
@@ -428,15 +427,6 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     {
         if (effective.cpus.empty() && !m_loop->cpus().all)
             effective.cpus = m_loop->cpus().to_string();
-
-        // Forwarded even when the answer is "off": off is a decision here, and
-        // leaving it unsaid lets an inherited environment variable answer in
-        // place of the operator.
-        if (!effective.sqpoll_set)
-        {
-            effective.sqpoll_set = true;
-            effective.sqpoll     = m_loop->sqpoll_requested();
-        }
     }
 
     // Keep the config so a restart can replay it without going back to disk,

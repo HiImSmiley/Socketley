@@ -93,14 +93,14 @@ unset SOCKETLEY_CONFIG
 
 # ─── A flag outranks the file ───────────────────────────────────────────────
 #
-# Both name the ring's submission polling, and the one the operator typed is
-# the one that has to win.
+# Both name the ring's CPU set, and the one the operator typed is the one that
+# has to win.
 daemon_isolate dcfg4
 cat > "$SOCKETLEY_TMPD/daemon.lua" <<'EOF'
-daemon = { sqpoll = true }
+daemon = { cpus = "max" }
 EOF
 export SOCKETLEY_CONFIG="$SOCKETLEY_TMPD/daemon.lua"
-daemon_start "$BIN" --no-sqpoll
+daemon_start "$BIN" --cpus max
 
 if [ -S "$SOCKETLEY_SOCKET" ]; then pass
 else fail "a daemon whose file and flag disagree still comes up" "no socket"; fi

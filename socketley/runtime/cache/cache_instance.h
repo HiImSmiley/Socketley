@@ -793,8 +793,8 @@ private:
     bool m_has_ttl_keys{false};
 
     // Whether a TTL sweep timeout is outstanding, because rearming
-    // unconditionally kept the SQPOLL poller from ever reaching its idle
-    // timeout and cost a full core at zero traffic.
+    // unconditionally wakes an otherwise idle loop twice a second for a scan
+    // that has nothing to find.
     bool m_ttl_timer_armed{false};
 
     // Submit the sweep timeout unless one is already pending.

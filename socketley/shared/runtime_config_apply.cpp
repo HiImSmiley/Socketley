@@ -84,8 +84,6 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
         if (parse_cpu_set(cfg.cpus, spec, err))
             rt.set_cpus(spec);
     }
-    if (cfg.sqpoll_set)
-        rt.set_sqpoll(cfg.sqpoll);
 }
 
 void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)

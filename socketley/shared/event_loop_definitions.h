@@ -27,14 +27,6 @@ struct cpu_set_spec
 
     bool empty() const { return !all && mask == 0; }
 
-    // io_uring pins its poller to a CPU NUMBER, not a mask, so the set bounds
-    // the loop thread and its lowest member carries the poller.
-    int first() const
-    {
-        if (all || mask == 0) return -1;
-        return __builtin_ctzll(mask);
-    }
-
     uint32_t count() const
     {
         return all ? 0u : static_cast<uint32_t>(__builtin_popcountll(mask));

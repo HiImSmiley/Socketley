@@ -16,11 +16,9 @@ daemon = {
     -- GET http://localhost:9100/metrics returns Prometheus exposition format
     metrics_port = 9100,
 
-    -- Where this daemon's I/O runs, and whether the ring polls kernel-side.
-    -- Both are settled before the ring exists, so they are read only from
-    -- here -- and `socketley daemon --cpus`/`--sqpoll` outranks this file.
-    cpus = "max",
-    sqpoll = true
+    -- Where this daemon's I/O runs.  Settled before the ring exists, so it is
+    -- read only from here -- and `socketley daemon --cpus` outranks this file.
+    cpus = "max"
 }
 
 -- `config` is this table's older name and still works.  Naming both in one

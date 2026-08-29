@@ -258,13 +258,13 @@ int cli_dispatch(int argc, char** argv)
             if (!has_config)
                 return cli_daemon(argc, argv);
 
-            // Configuration mode talks to a daemon that is already up and the
-            // ring flags configure one being started, so --sqpoll here would
-            // be read, sent nowhere and do nothing.
+            // Configuration mode talks to a daemon that is already up and
+            // --cpus configures one being started, so it would be read here,
+            // sent nowhere and do nothing.
             for (int i = 2; i < argc; ++i)
             {
                 std::string_view arg = argv[i];
-                if (arg == "--sqpoll" || arg == "--no-sqpoll" || arg == "--cpus")
+                if (arg == "--cpus")
                 {
                     std::cerr << arg << " cannot be combined with --name or --cluster\n"
                               << "  Those name a daemon that is already running; this "

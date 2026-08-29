@@ -114,8 +114,8 @@
 //
 // The kernel's half of any of it: whether a submission the loop counted was
 // really consumed, whether a descriptor number really was reissued between the
-// SQE and its consumption, CQ overflow, and the SQPOLL race the descriptor
-// counters exist for.  Those need a kernel and belong in the integration suite.
+// SQE and its consumption, and CQ overflow.  Those need a kernel and belong in
+// the integration suite.
 // This target checks that the loop's books balance for every order of arrivals,
 // which is the half that was getting them wrong.
 //

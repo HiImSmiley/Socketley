@@ -111,12 +111,12 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime
 - **Process isolation**:Every runtime is a supervised worker process, so one runtime cannot take the daemon down with it — there is no flag and no in-daemon mode; the whole cross-runtime Lua API works across the boundary
 - **Unix sockets**:`--listen unix:/path` on a listener and `--backend unix:/path` for a proxy's backends
-- **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run, and SQPOLL is a choice rather than always on
+- **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run
 - **Master mode**:One client claims master, broadcasts to all; optional forwarding
 - **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
 - **TLS/SSL**:Server, cache and proxy listeners terminate TLS (incl. mutual TLS); client runtimes and proxy backend legs dial over it — see the note at the top
 - **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
-- **io_uring**:Multishot accept, SQPOLL, provided buffers, writev coalescing
+- **io_uring**:Multishot accept, provided buffers, writev coalescing
 - **State persistence**:Runtime configs saved as JSON, auto-restored on daemon restart
 - **Ownership**:Parent-child runtime relationships with configurable `on_parent_stop` policies
 - **Monitoring**:`socketley stats` for live metrics, `--rate-limit` and `--max-connections` for resource control
@@ -171,12 +171,16 @@ show. Any claim of an advantage in either direction at this depth is noise.
 Pipelined, socketley is **2.4× to 4.6× faster than Redis 7**, and the margin is
 far larger than the spread. The advantage comes from:
 
-- **io_uring SQPOLL** — no `epoll_wait`/`sendmsg` syscalls in the hot path
 - **Zero-allocation RESP2 codec** — parse and encode directly into and out of
   the connection buffer with `to_chars` and `string_view`
 - **Batch CQE drain** — every completion from a submit round in one pass, one
   `io_uring_cq_advance`
 - **writev coalescing** — up to 16 responses in a single `writev` SQE
+
+These numbers were taken before io_uring's SQPOLL mode was removed, and the
+list above used to open with it. They have not been re-measured since, so treat
+the attribution as three causes and an unmeasured delta rather than as a
+complete account.
 
 The shape of these two tables is the interesting part: the advantage exists
 only when there is enough work per connection to amortise the per-operation
@@ -390,7 +394,7 @@ still want it to themselves.
 ## Architecture
 
 - Single-binary daemon + CLI communicating via Unix socket IPC
-- io_uring event loop (single-threaded, SQPOLL)
+- io_uring event loop (single-threaded, `SINGLE_ISSUER | DEFER_TASKRUN`)
 - Each runtime gets its own supervised worker process — always, for every
   type, with no flag and no in-daemon mode
 - FNV-1a hash switching for zero-allocation command dispatch

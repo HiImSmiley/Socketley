@@ -75,8 +75,6 @@ struct runtime_config
     // A request rather than a result, persisted because a restore that drops
     // the refusal silently meets no requirement.
     std::string cpus;
-    bool sqpoll = false;
-    bool sqpoll_set = false;
 
     // External (attach) mode
     bool external_runtime = false;

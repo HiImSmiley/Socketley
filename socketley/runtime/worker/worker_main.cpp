@@ -690,8 +690,6 @@ private:
             else
                 LOG_WARN("proxy worker: unusable --cpus in its config, ignored");
         }
-        if (cfg.sqpoll_set)
-            m_loop.set_sqpoll(cfg.sqpoll);
         // Guarded on ring_open() rather than on reaching here once, because a
         // config that built a ring and then failed to build a proxy must not
         // get a second ring from the next frame.

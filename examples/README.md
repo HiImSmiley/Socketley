@@ -137,8 +137,8 @@ own daemon, on its own socket, and removes what it made on the way out.
   quorum, and a partition nobody reports)
 
 ### Advanced
-- `io-tuning.sh` - `--cpus` and `--sqpoll`: where a runtime's I/O runs, and
-  whether its ring carries a polling kernel thread
+- `io-tuning.sh` - `--cpus`: where a runtime's I/O runs, and why the set is
+  chosen on the daemon rather than per runtime
 - `microservices.lua` + `microservices-handler.lua` - Microservice architecture
 - `high-availability.lua` + `high-availability-handler.lua` - HA with failover
 - `logging-pipeline.lua` + `logging-pipeline-handler.lua` - Centralized logging

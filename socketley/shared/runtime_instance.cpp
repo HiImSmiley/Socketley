@@ -747,9 +747,6 @@ runtime_instance::child_policy runtime_instance::get_child_policy() const { retu
 void runtime_instance::set_cpus(const cpu_set_spec& cpus) { m_cpus = cpus; m_cpus_set = true; }
 const cpu_set_spec& runtime_instance::get_cpus() const { return m_cpus; }
 bool runtime_instance::has_cpus_request() const { return m_cpus_set; }
-void runtime_instance::set_sqpoll(bool on) { m_sqpoll = on; m_sqpoll_set = true; }
-bool runtime_instance::get_sqpoll() const { return m_sqpoll; }
-bool runtime_instance::has_sqpoll_request() const { return m_sqpoll_set; }
 
 // io_uring fixes a ring's flags at creation and the ring belongs to the
 // process, not the runtime, so a request the existing ring does not satisfy is
@@ -759,25 +756,7 @@ std::string runtime_instance::ring_policy_refusal(const event_loop& loop) const
     std::string msg;
 
     // Only what was actually asked for is checked, because a runtime created
-    // without either flag has no request to disappoint.
-    const bool want_sqpoll = get_sqpoll();
-    if (has_sqpoll_request() && want_sqpoll != loop.sqpoll_enabled())
-    {
-        msg += want_sqpoll
-             ? "--sqpoll: this runtime shares a ring that was created without a "
-               "submission poller.\n"
-               "  A ring's polling mode is fixed when the ring is created, and this "
-               "one exists already.\n"
-               "  Start the daemon with --sqpoll (or SOCKETLEY_SQPOLL=1) to give "
-               "every runtime in it a poller.\n"
-             : "--no-sqpoll: this runtime shares a ring that was created with a "
-               "submission poller.\n"
-               "  A ring's polling mode is fixed when the ring is created, and this "
-               "one exists already.\n"
-               "  Start the daemon with --no-sqpoll (and without SOCKETLEY_SQPOLL) "
-               "to drop the poller.\n";
-    }
-
+    // without the flag has no request to disappoint.
     const cpu_set_spec& want = get_cpus();
     const cpu_set_spec& have = loop.cpus();
     if (has_cpus_request() &&
@@ -931,30 +910,23 @@ std::string runtime_instance::stats_prefix() const
 
 // ── How this runtime's I/O is running ───────────────────────────────────────
 // Read from the loop and not from what was asked for, because the kernel can
-// refuse an SQPOLL ring or a pinning, and these three fields are the ring's --
-// which is why a worker pushes them rather than the daemon writing them.
+// refuse a pinning, and this field is the ring's -- which is why a worker
+// pushes it rather than the daemon writing it.
 std::string runtime_instance::stats_ring() const
 {
     std::string out;
-    out += "sqpoll:";
+    out += "cpus:";
     if (m_event_loop)
     {
-        out += m_event_loop->sqpoll_enabled() ? "on"
-             : m_event_loop->sqpoll_requested() ? "off(refused)" : "off";
-        out += "\ncpus:";
         out += m_event_loop->cpus().to_string();
         if (!m_event_loop->cpus().all && !m_event_loop->affinity_applied())
             out += "(not applied)";
-        out += "\nsq_thread_cpu:";
-        const int sq_cpu = m_event_loop->sq_thread_cpu();
-        if (sq_cpu >= 0) out += std::to_string(sq_cpu);
-        else             out += "-";
     }
     else
     {
-        // No loop yet, which beats printing the defaults as if they had been
+        // No loop yet, which beats printing the default as if it had been
         // chosen.
-        out += "unknown\ncpus:unknown\nsq_thread_cpu:-";
+        out += "unknown";
     }
     out += '\n';
     return out;

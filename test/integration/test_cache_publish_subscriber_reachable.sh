@@ -36,33 +36,27 @@
 # gives up at all — and close_fd() cannot submit the cancel that would release
 # it.  There is then no path back, where before there was one.
 #
-# ─── THE PROVOCATION ────────────────────────────────────────────────────────
+# ─── THE PROVOCATION THIS FILE USED TO ARRANGE, AND CANNOT ANY MORE ─────────
 #
-# A flush fails when get_sqe() cannot produce an SQE.  Under SQPOLL that is
-# reachable: io_uring_submit() is a tail update and no syscall, so the retry
-# inside get_sqe() cannot drain a full submission queue the way it does
-# otherwise.  One publish to more subscribers than the ring has SQ entries
-# (2048 by default) runs out partway down the subscriber list — measured here at
-# exactly 2048 delivered of 3000, with 952 given up on.
+# A flush fails when get_sqe() cannot produce an SQE.  That was reachable under
+# SQPOLL, where io_uring_submit() was a tail update and no syscall, so the retry
+# inside get_sqe() could not drain a full submission queue: one publish to more
+# subscribers than the ring had SQ entries ran out partway down the list, at
+# exactly 2048 delivered of 3000 with 952 given up on.  This file had a second
+# arm with SQPOLL off as its control.
 #
-# ─── THE PROVOCATION NO LONGER FIRES, AND THAT IS THE POINT ─────────────────
+# SQPOLL is gone from this build.  io_uring_submit() is always a syscall that
+# drains the queue, so the two arms would now be the same run, and the mark this
+# file was built to provoke cannot be reached from any test at all.
 #
-# The paragraph above describes the tree as it was.  get_sqe() now waits for the
-# SQPOLL thread to drain the submission queue instead of reporting a permanent
-# failure, so publish() no longer gives up on anybody for a shortage of SQEs:
-# this file's sqpoll arm delivers 3000 of 3000 and prints its own "gave up on
-# nobody" note.  The delivery half of that is
-# test_cache_publish_delivers_to_all.sh, which is where the numbers above now
-# live as a regression guard.
-#
-# This file is NOT redundant and must not be deleted.  publish() still has two
-# marks that defer a `closing` connection's teardown to its armed read — the
-# 8 MB write-queue cap and a flush that genuinely could not reach the ring — and
-# the assertion below is the only thing standing between them and the "obvious
-# repair" that routes them through classify(), which was measured at 0 of 952
-# reachable.  What it no longer does is provoke the second mark; its own NOTE
-# says so on every run, and that honesty is worth more than a green tick that
-# would be true of a build with nothing in it.
+# This file is NOT redundant and must not be deleted.  publish() still has one
+# mark that defers a `closing` connection's teardown to its armed read -- the
+# 8 MB write-queue cap -- and the assertion below is the only thing standing
+# between it and the "obvious repair" that routes those subscribers through
+# classify(), measured at 0 of 952 reachable.  What this file does not do is
+# provoke that mark: it prints a NOTE on every run saying publish() gave up on
+# nobody, and that honesty is worth more than a green tick that would be true of
+# a build with nothing in it.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -77,8 +71,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 # reached half of them" and is not this mechanism at all.  Measured while
 # writing this: the control arm reported 1466, 1507, 1511 and 1526 of 3000 on
 # four runs, all approximately half, and 3000 of 3000 once the ports differed.
-PORT_SQPOLL=$((SL_PORT_BASE+330))
-PORT_PLAIN=$((SL_PORT_BASE+331))
+PORT_PUB=$((SL_PORT_BASE+330))
 NAME=pubreachcache
 SUBS="${SUBS:-3000}"
 PASS=0; FAIL=0; TOTAL=0
@@ -206,15 +199,15 @@ PY
 # and two workers left running per invocation, holding their ports, which is
 # what makes the next run of the suite report "no free 2000-port window" as a
 # product failure.
-run_arm() {   # run_arm SQPOLL_VALUE LABEL PORT
-    local sqp=$1 label=$2 port=$3
+run_arm() {   # run_arm LABEL PORT
+    local label=$1 port=$2
     if [ -n "${SOCKETLEY_DPID:-}" ]; then
         "$BIN" stop "$NAME" 2>/dev/null || true
         "$BIN" remove "$NAME" 2>/dev/null || true
         daemon_stop 2>/dev/null || true
     fi
     daemon_isolate "cachepubreach-$label"
-    SOCKETLEY_SQPOLL="$sqp" daemon_start "$BIN"
+    daemon_start "$BIN"
     create_ok "cache created ($label)" "$BIN" create cache "$NAME" -p "$port" -s
     ready_resp 127.0.0.1 "$port" 20 || true
     timeout 300 python3 "$TMPD/subs.py" "$port" "$SUBS" 2>&1 || true
@@ -222,14 +215,14 @@ run_arm() {   # run_arm SQPOLL_VALUE LABEL PORT
 
 field() { printf '%s\n' "$2" | sed -n "s/^$1=//p"; }
 
-# ── Arm 1: SQPOLL on — publish() is made to give up on subscribers ──────────
-run_arm 1 sqpoll "$PORT_SQPOLL" > "$TMPD/arm1.out" 2>&1
+# ── The fan-out, and what is still reachable afterwards ─────────────────────
+run_arm pub "$PORT_PUB" > "$TMPD/arm1.out" 2>&1
 OUT=$(cat "$TMPD/arm1.out")
 R=$(field registered "$OUT");   R=${R:-0}
 D=$(field delivered "$OUT");    D=${D:-0}
 G=$(field gaveup "$OUT");       G=${G:-0}
 U=$(field unreachable "$OUT");  U=${U:-$SUBS}
-echo "  sqpoll arm: registered=$R delivered=$D gaveup=$G unreachable=$U of $SUBS"
+echo "  registered=$R delivered=$D gaveup=$G unreachable=$U of $SUBS"
 
 TOTAL=$((TOTAL+1))
 if [ "$R" -eq "$SUBS" ]; then
@@ -241,12 +234,21 @@ else
     echo "         registered is not in the set publish() walks."
 fi
 
+TOTAL=$((TOTAL+1))
+if [ "$D" -eq "$SUBS" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [every subscriber is served]: $D of $SUBS"
+fi
+
 # An assertion that cannot fail is not coverage, so say when it could not have.
-# If publish() served everyone, the submission queue never ran out and this
-# invocation did not exercise the mechanism at all.
+# publish() gives up only at the 8 MB write-queue cap now, which this file does
+# not arrange, so the reachability assertion below is expected to be vacuous.
 if [ "$G" -eq 0 ]; then
-    echo "  NOTE: publish() gave up on nobody — the SQ never ran out, so this run"
-    echo "        did not exercise the mechanism.  Raise SUBS above the ring depth."
+    echo "  NOTE: publish() gave up on nobody, so the reachability assertion below"
+    echo "        did not exercise the mechanism.  See the header: the mark this"
+    echo "        file was built to provoke no longer exists in this build."
 fi
 
 TOTAL=$((TOTAL+1))
@@ -259,24 +261,6 @@ else
     echo "         them.  Their armed read is the only way back to them and"
     echo "         something has taken it away.  See the header: this is what"
     echo "         routing publish()'s subscribers through classify() does."
-fi
-
-# ── Arm 2: SQPOLL off — the control ─────────────────────────────────────────
-# Not a second provocation.  Without SQPOLL get_sqe() recovers by submitting, so
-# publish() gives up on nobody; a run where this arm loses subscribers is
-# measuring something other than what arm 1 measures.
-run_arm 0 plain "$PORT_PLAIN" > "$TMPD/arm2.out" 2>&1
-OUT=$(cat "$TMPD/arm2.out")
-R2=$(field registered "$OUT"); R2=${R2:-0}
-D2=$(field delivered "$OUT");  D2=${D2:-0}
-echo "  control arm: registered=$R2 delivered=$D2 of $SUBS"
-
-TOTAL=$((TOTAL+1))
-if [ "$D2" -eq "$SUBS" ]; then
-    PASS=$((PASS+1))
-else
-    FAIL=$((FAIL+1))
-    echo "  FAIL [control: every subscriber is served without SQPOLL]: $D2 of $SUBS"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
