@@ -1,0 +1,24 @@
+# A document store as a runtime type, declared to the daemon without running
+# any code.
+#
+# Install into the daemon's types directory --
+# /etc/socketley/types/ for a system daemon,
+# ~/.config/socketley/types/ for a dev daemon --
+# and point exec at the built kvdb-worker binary.
+
+name = "kvdb"
+exec = "/usr/local/lib/socketley/kvdb-worker"
+manifest_version = 1
+
+# Where the journal lives.  Omitted means memory only, which is a real choice
+# and not a broken one: the fastest arm of the measurement in kvdb_worker.cpp.
+[config.path]
+kind = "string"
+
+[config.readonly]
+kind = "bool"
+default = "false"
+
+[config.maxdocs]
+kind = "int"
+default = "1000000"

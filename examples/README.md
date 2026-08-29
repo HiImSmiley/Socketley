@@ -148,6 +148,14 @@ own daemon, on its own socket, and removes what it made on the way out.
   does; see the file
   for why
 
+### Your own daemon and your own runtimes (SDK)
+- `sdk/examples/custom-daemon/` - one binary that is both: it serves the socket
+  the ordinary CLI dials, and the supervisor execs it again as the worker for a
+  runtime type it registers itself. Whoever binds the socket is the daemon
+- `sdk/examples/nosql-runtime/` - a document store as a runtime type, with the
+  measurement that matters: rewriting the file per write cost 11.5x, so the
+  journal is buffered and drained on a tick
+
 ### Registered Types (SDK)
 - `sdk/examples/custom-type/` - a runtime type of your own: a TOML manifest the
   daemon reads (name, worker binary, config-key schema) plus a worker built

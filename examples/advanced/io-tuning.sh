@@ -49,7 +49,8 @@ socketley remove api 2>/dev/null || true
 cat <<'NOTE'
 To run a daemon pinned to CPUs 0 and 1:
 
-    socketley daemon stop
+    # There is no `socketley daemon stop`: signal the process you started.
+    kill "$DAEMON_PID"
     socketley daemon --cpus 0-1 &
 
     socketley create cache hot -p 9100 --cpus 0-1 -s

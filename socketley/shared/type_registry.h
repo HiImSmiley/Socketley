@@ -29,6 +29,11 @@ bool lookup(std::string_view name, runtime_type& out);
 // name a type this process cannot build.
 bool intern(std::string_view name, runtime_type& out);
 
+// register_type() for a name that may already hold one, which only the
+// daemon's manifest loader does: a daemon holds a placeholder and must not
+// build the caller's object even when the same binary registered one.
+bool adopt(std::string_view name, factory make, runtime_type& out);
+
 // Builds an instance from the registered factory, nullptr when `t` has none.
 std::unique_ptr<runtime_instance> make(runtime_type t, std::string_view name);
 

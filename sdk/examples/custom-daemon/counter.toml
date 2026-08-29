@@ -1,0 +1,9 @@
+# The manifest for the type counter_daemon registers in its own main().
+#
+# `exec` points back at the daemon binary itself, which is what makes this one
+# program rather than two: the supervisor execs it with `proxy-worker`, and
+# daemon_start dispatches that to the worker half.
+
+name = "counter"
+exec = "/usr/local/bin/counter-daemon"
+manifest_version = 1

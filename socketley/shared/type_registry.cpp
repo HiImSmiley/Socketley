@@ -53,11 +53,13 @@ bool builtin_lookup(std::string_view name, runtime_type& out)
 
 // The shared claim-or-find walk under an exclusive lock, because register and
 // intern differ only in what they do to an entry that already exists.
+enum class claim_mode : uint8_t { intern_only, register_once, adopt };
+
 bool claim(std::string_view name, type_registry::factory make,
-           bool replace_factory, runtime_type& out)
+           claim_mode mode, runtime_type& out)
 {
     if (builtin_lookup(name, out))
-        return !make && !replace_factory;
+        return mode == claim_mode::intern_only && !make;
     if (!valid_type_name(name))
         return false;
 
@@ -69,11 +71,16 @@ bool claim(std::string_view name, type_registry::factory make,
         if (e[i].name != name)
             continue;
         // A factory-less entry came from a replica map and may be upgraded
-        // once; a second factory for one name is a programming error.
-        if (replace_factory)
+        // once; a second factory for one name is a programming error, except
+        // where the daemon deliberately takes the name over.
+        if (mode == claim_mode::register_once)
         {
             if (e[i].make)
                 return false;
+            e[i].make = std::move(make);
+        }
+        else if (mode == claim_mode::adopt)
+        {
             e[i].make = std::move(make);
         }
         out = static_cast<runtime_type>(type_registry::first_registered + i);
@@ -98,7 +105,14 @@ bool register_type(std::string_view name, factory make, runtime_type& out)
 {
     if (!make)
         return false;
-    return claim(name, std::move(make), true, out);
+    return claim(name, std::move(make), claim_mode::register_once, out);
+}
+
+bool adopt(std::string_view name, factory make, runtime_type& out)
+{
+    if (!make)
+        return false;
+    return claim(name, std::move(make), claim_mode::adopt, out);
 }
 
 bool lookup(std::string_view name, runtime_type& out)
@@ -121,7 +135,7 @@ bool lookup(std::string_view name, runtime_type& out)
 
 bool intern(std::string_view name, runtime_type& out)
 {
-    return claim(name, nullptr, false, out);
+    return claim(name, nullptr, claim_mode::intern_only, out);
 }
 
 std::unique_ptr<runtime_instance> make(runtime_type t, std::string_view name)

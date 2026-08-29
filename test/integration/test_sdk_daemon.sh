@@ -65,7 +65,9 @@ bad() {
 has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 
 SDK_PID=""
+ONE_PID=""
 cleanup() {
+    [ -n "$ONE_PID" ] && kill "$ONE_PID" 2>/dev/null
     [ -n "$SDK_PID" ] && kill "$SDK_PID" 2>/dev/null
     daemon_stop
 }
@@ -252,6 +254,91 @@ if command -v nc >/dev/null 2>&1; then
 else
     echo "  (nc absent -- the wire-protocol assertions did not run)"
 fi
+
+# ── One binary that is the daemon AND the worker for its own type ───────────
+#
+# main() registers the type before daemon_start, so by the time the manifest
+# loader runs the name is already taken.  register_type() refused it, the
+# manifest was dropped, and `create counter` then resolved to a runtime the
+# caller never asked for: exit 0, silent, "type": "server".  The loader adopts
+# the name instead, and takes the placeholder factory with it -- a daemon holds
+# a placeholder and must not build the caller's object, whose type is whatever
+# base it derives from.
+cat > "$SOCKETLEY_TMPD/one.cpp" <<'EOF'
+#include <socketley/daemon.h>
+#include <socketley/worker.h>
+#include <map>
+#include <memory>
+#include <string>
+#include "socketley/runtime/server/server_instance.h"
+namespace {
+class counter final : public server_instance
+{
+public:
+    explicit counter(std::string_view name) : server_instance(name)
+    {
+        set_wire_protocol(proto_tcp);
+        set_on_client_message([this](int fd, std::string_view line) {
+            while (!line.empty() && (line.back()=='\n'||line.back()=='\r'))
+                line.remove_suffix(1);
+            lua_send_to(fd, std::to_string(++m_hits[std::string(line)]) + "\n");
+        });
+    }
+private:
+    std::map<std::string, long> m_hits;
+};
+}
+int main(int argc, char** argv)
+{
+    socketley::worker::register_type("counter",
+        [](std::string_view n) -> std::unique_ptr<runtime_instance> {
+            return std::make_unique<counter>(n);
+        });
+    runtime_manager manager;
+    event_loop loop;
+    return socketley::daemon_start(manager, loop, argc, argv);
+}
+EOF
+
+if build "$SOCKETLEY_TMPD/one.cpp" "$SOCKETLEY_TMPD/onebin"; then ok; else
+    bad "a one-binary daemon builds" "$(tail -5 "$SOCKETLEY_TMPD/gxx.err")"
+fi
+
+cat > "$HOME/.config/socketley/types/counter.toml" <<EOF
+name = "counter"
+exec = "$SOCKETLEY_TMPD/onebin"
+manifest_version = 1
+EOF
+
+ONE_SOCK="$SOCKETLEY_TMPD/one.sock"
+ONE_LOG="$SOCKETLEY_TMPD/one.log"
+SOCKETLEY_SOCKET="$ONE_SOCK" "$SOCKETLEY_TMPD/onebin" daemon >"$ONE_LOG" 2>&1 &
+ONE_PID=$!
+for _ in $(seq 1 100); do [ -S "$ONE_SOCK" ] && break; sleep 0.1; done
+
+if SOCKETLEY_SOCKET="$ONE_SOCK" "$BIN" create counter hits -p $((PORT+6)) -s </dev/null >/dev/null 2>&1; then ok
+else bad "the one-binary daemon creates its own type" \
+         "$(SOCKETLEY_SOCKET="$ONE_SOCK" "$BIN" create counter h2 -p $((PORT+7)) -s </dev/null 2>&1)"; fi
+
+# The whole defect in one assertion: it used to answer "server" here, quietly.
+TYPE=$(SOCKETLEY_SOCKET="$ONE_SOCK" "$BIN" show hits </dev/null 2>/dev/null | sed -n 's/.*"type": "\([^"]*\)".*/\1/p')
+if [ "$TYPE" = "counter" ]; then ok; else
+    bad "and it is the type that was asked for" \
+        "show reports type '${TYPE:-<nothing>}', wanted 'counter'" \
+        "a refused manifest leaves the name resolving to something else"
+fi
+
+if command -v nc >/dev/null 2>&1; then
+    for _ in $(seq 1 60); do
+        ss -ltn 2>/dev/null | awk -v p=":$((PORT+6))\$" '$4 ~ p' | grep -q . && break
+        sleep 0.25
+    done
+    OUT=$(printf 'a\na\nb\n' | timeout 5 nc -q2 127.0.0.1 $((PORT+6)) 2>/dev/null | tr '\n' '|')
+    if [ "$OUT" = "1|2|1|" ]; then ok; else
+        bad "the one-binary daemon serves its own type" "got '$OUT', wanted '1|2|1|'"
+    fi
+fi
+kill "$ONE_PID" 2>/dev/null
 
 # ── A binary that is not a worker is diagnosed, not blamed for its config ───
 OUT=$("$BIN" create notaworker naw -p $((PORT+4)) -s </dev/null 2>&1)

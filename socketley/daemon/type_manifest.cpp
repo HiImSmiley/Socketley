@@ -422,7 +422,13 @@ size_t load_dir(const fs::path& dir)
 
         runtime_type id;
         const std::string tn = m.type_name;
-        if (!type_registry::register_type(
+
+        // adopt() rather than register_type(), because the daemon may be the
+        // same binary that registered this type for its worker role: the
+        // daemon holds a placeholder and must build registered_instance, or
+        // `show` reports whatever base the caller's class derives from.  The
+        // worker's own registry is a different process and keeps its factory.
+        if (!type_registry::adopt(
                 tn,
                 [tn](std::string_view name) -> std::unique_ptr<runtime_instance>
                 {
@@ -434,8 +440,19 @@ size_t load_dir(const fs::path& dir)
                 id))
         {
             LOG_WARN(("type manifest " + path.string() + " refused: \"" + tn +
-                      "\" is a built-in or already-registered type name").c_str());
+                      "\" is a built-in type name").c_str());
             continue;
+        }
+
+        // Two manifests for one name is still two answers to one question.
+        {
+            std::shared_lock lock(manifest_mutex());
+            if (manifests().count(static_cast<uint8_t>(id)))
+            {
+                LOG_WARN(("type manifest " + path.string() + " refused: \"" +
+                          tn + "\" is already declared").c_str());
+                continue;
+            }
         }
 
         {

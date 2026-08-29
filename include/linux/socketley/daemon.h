@@ -11,6 +11,12 @@
 //       event_loop loop;
 //       return socketley::daemon_start(manager, loop, argc, argv);
 //   }
+//
+// The supervisor serves each runtime by exec'ing THIS binary with
+// `proxy-worker`, which daemon_start() dispatches before it does anything
+// else.  Two things follow: the binary must stay at its path while the daemon
+// runs, and everything main() does before daemon_start() runs once per worker
+// as well -- so keep it to registration and leave side effects to a runtime.
 #pragma once
 
 #ifndef __linux__
