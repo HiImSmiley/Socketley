@@ -712,14 +712,19 @@ void runtime_instance::set_owner(std::string_view owner_name) { m_owner = std::s
 std::string_view runtime_instance::get_owner() const { return m_owner; }
 void runtime_instance::set_lua_created(bool v) { m_lua_created = v; }
 bool runtime_instance::is_lua_created() const { return m_lua_created; }
-void runtime_instance::mark_external() { m_external = true; }
+// The two roles are exclusive here rather than at each caller, because start()
+// dispatches on whichever flag it reads first and the marks arrive in no fixed
+// order.
+void runtime_instance::mark_external() { m_external = true; m_out_of_process = false; }
 bool runtime_instance::is_external() const { return m_external; }
 void runtime_instance::set_pid(pid_t pid) { m_pid = pid; }
 pid_t runtime_instance::get_pid() const { return m_pid; }
-void runtime_instance::mark_managed(std::string exec_path) { m_managed = true; m_external = true; m_exec_path = std::move(exec_path); }
+void runtime_instance::mark_managed(std::string exec_path) { m_managed = true; mark_external(); m_exec_path = std::move(exec_path); }
 bool runtime_instance::is_managed() const { return m_managed; }
 std::string_view runtime_instance::get_exec_path() const { return m_exec_path; }
-void runtime_instance::mark_out_of_process() { m_out_of_process = true; }
+// Refused for an external runtime, whose exec_path and pid a placeholder would
+// ignore.
+void runtime_instance::mark_out_of_process() { if (!m_external) m_out_of_process = true; }
 bool runtime_instance::is_out_of_process() const { return m_out_of_process; }
 
 // Clamped here rather than trusted, because the state file is read at startup

@@ -46,6 +46,42 @@ TEST_CASE("managed runtime flags")
         CHECK(inst->is_external());
         CHECK(inst->get_exec_path().empty());
     }
+
+    // start() dispatches on out_of_process before it reads external, so a
+    // runtime carrying both returns as a placeholder and never execs.
+    SUBCASE("out_of_process does not survive being marked external")
+    {
+        inst->mark_out_of_process();
+        CHECK(inst->is_out_of_process());
+        inst->mark_external();
+        CHECK(inst->is_external());
+        CHECK_FALSE(inst->is_out_of_process());
+    }
+
+    SUBCASE("out_of_process does not survive being marked managed")
+    {
+        inst->mark_out_of_process();
+        inst->mark_managed("/usr/bin/test");
+        CHECK(inst->is_managed());
+        CHECK_FALSE(inst->is_out_of_process());
+    }
+
+    // The restore path marks in this order, so the exclusion cannot depend on
+    // the marks arriving in the other one.
+    SUBCASE("marking out_of_process after external is declined")
+    {
+        inst->mark_external();
+        inst->mark_out_of_process();
+        CHECK(inst->is_external());
+        CHECK_FALSE(inst->is_out_of_process());
+    }
+
+    SUBCASE("a runtime that is neither still takes the placeholder mark")
+    {
+        inst->mark_out_of_process();
+        CHECK(inst->is_out_of_process());
+        CHECK_FALSE(inst->is_external());
+    }
 }
 
 // ─── State persistence round-trip ───

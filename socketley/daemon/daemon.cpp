@@ -323,10 +323,13 @@ static void restore_runtimes(state_persistence& persistence,
             cfg.child_policy == 1 ? runtime_instance::child_policy::remove
                                   : runtime_instance::child_policy::stop);
 
-        // Every runtime comes back in a process of its own whatever the state
-        // file says, unconditionally, because honouring `"out_of_process":
+        // Every runtime this daemon supervises comes back behind a worker
+        // whatever the state file says, because honouring `"out_of_process":
         // false` would restore an arrangement this build cannot create or
         // test.
+        // An external runtime is the exception, and the mark declines rather
+        // than this line testing for it, because the file is read here in no
+        // particular order.
         instance->mark_out_of_process();
 
         // What this runtime asked its I/O to run as, restored before start(),
