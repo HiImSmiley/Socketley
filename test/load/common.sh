@@ -2,42 +2,16 @@
 # Shared plumbing and measurement discipline for the load harnesses.
 #
 # ─── WHERE THESE CAME FROM ──────────────────────────────────────────────────
-#
-# These scripts were written one at a time while chasing defects by hand, and
-# they lived in a scratch directory with absolute paths baked into them.  CI
-# cannot depend on a temp directory, so they were moved here.  What survived the
-# move is not just the commands — it is the measurement discipline they encode,
-# which is the only reason their numbers meant anything:
-#
-#   1. A DEFINED STARTING STATE.  Nothing is measured until TIME_WAIT sockets
-#      and load average are back under a threshold.  A run started on top of the
-#      previous run's debris measures the debris.
-#
-#   2. 60 SECONDS OF IDLE BEFORE EACH BATCH.  Not a guess: it is how long this
-#      class of machine takes to settle after a batch of short-lived TCP
-#      connections.  Batches compared against each other must have started from
-#      the same place or the comparison is noise.
-#
-#   3. CPU PINNING.  Daemon on one pair of cores, load generator on another.
-#      Without it the generator and the daemon fight for the same core and the
-#      result measures the scheduler.
-#
-#   4. WARM-UPS DISCARDED.  The first few rounds pay for page faults, socket
-#      buffer growth and branch predictor training.  They are run and thrown
-#      away, never counted.
-#
-# Any of these can be turned off with an environment variable.  Doing so makes
-# the run faster and the numbers incomparable with every other run, so each one
-# prints a loud line when it is off.
-#
-# ─── WHAT THESE HARNESSES DO AND DO NOT PROVE ───────────────────────────────
-#
-# They are correctness-under-load harnesses, not benchmarks.  They report how
-# many rounds came back wrong (a missing response, a response delivered on the
-# wrong connection, a daemon that died), and whether descriptors and RSS grow
-# across cycles.  They do not measure throughput or latency; test/benchmark/ is
-# for that.  A clean run says the defect classes these were written for did not
-# reproduce in this many rounds on this machine.  It does not say they are gone.
+# What survived the move out of a scratch directory is the measurement
+# discipline: a defined starting state, because a run on the previous run's
+# debris measures the debris; sixty seconds of idle before each batch, because
+# batches compared against each other must start from the same place; CPU
+# pinning, without which the result measures the scheduler; and warm-ups
+# discarded, because the first rounds pay for page faults and buffer growth --
+# each disableable, and each printing a loud line when it is off, since the run
+# is then incomparable with every other; these are correctness-under-load
+# harnesses rather than benchmarks, so a clean run says the defect classes did
+# not reproduce in this many rounds on this machine and not that they are gone.
 
 set -uo pipefail
 
@@ -47,8 +21,8 @@ LIB="$LOAD_DIR/lib"
 
 # ─── binaries ────────────────────────────────────────────────────────────────
 
-# Which build to exercise.  Defaults to Release because that is what these
-# harnesses were calibrated against; the nightly sanitizer job overrides it.
+# Defaults to Release because that is what these harnesses were calibrated
+# against; the nightly sanitizer job overrides it.
 SOCKETLEY_CONFIG="${SOCKETLEY_CONFIG:-Release}"
 BIN="${SOCKETLEY_BIN:-$ROOT/bin/$SOCKETLEY_CONFIG/socketley}"
 BENCH="${SOCKETLEY_BENCH:-$ROOT/bin/$SOCKETLEY_CONFIG/socketley_bench}"
@@ -80,11 +54,10 @@ require_lib() {
 }
 
 # ─── CPU pinning ─────────────────────────────────────────────────────────────
-#
-# Two disjoint core sets: the daemon must not share a core with the thing
-# driving it.  On a machine with fewer than four cores that separation is not
-# possible, and a run without it is not comparable to one with it — so say so,
-# once, loudly, rather than quietly producing numbers that look like the others.
+# Two disjoint core sets, because the daemon must not share a core with the
+# thing driving it -- and on a machine with fewer than four cores that is
+# impossible, so say so once rather than quietly producing numbers that look
+# like the others.
 
 NPROC="$(nproc 2>/dev/null || echo 1)"
 PIN_AVAILABLE=0
@@ -105,24 +78,10 @@ pin_load() {
     if [ "$PIN_AVAILABLE" = 1 ]; then taskset -c "$LOAD_CPUS" "$@"; else "$@"; fi
 }
 
-# ─── backgrounding, and why it is not `pin_load cmd &` ───────────────────────
-#
-# `&` applied to a shell function runs the function in a subshell.  $! is then
-# the subshell's pid and the command is its child, so:
-#
-#   kill "$!"            kills bash and leaves the command running
-#   /proc/$!/fd          lists bash's descriptors
-#   /proc/$!/status      reports bash's RSS
-#
-# Every harness here backgrounded through pin_load or pin_daemon and kept $!, so
-# every one of those was true.  The two below background the command themselves,
-# in the current shell, so $! is the command's own pid — and taskset execs its
-# argument rather than forking, so the pinned branch keeps that pid too.
-#
-# Call them without a trailing `&`; they add it:
-#
-#   start_daemon_bg "$BIN" daemon >"$log" 2>&1   ; DAEMON_PID=$!
-#   start_load_bg   python3 "$LIB/x.py" >"$log" 2>&1 ; BPID=$!
+# `&` on a shell function runs it in a subshell, so $! named bash and every
+# harness here was killing, sampling descriptors from and reporting the RSS of
+# the wrong process -- these background the command in the current shell, and
+# taskset execs rather than forks, so the pinned branch keeps that pid too.
 start_daemon_bg() {
     if [ "$PIN_AVAILABLE" = 1 ]; then
         taskset -c "$DAEMON_CPUS" "$@" &
@@ -159,9 +118,9 @@ announce_environment() {
 
 # ─── settling and preflight ──────────────────────────────────────────────────
 
-# The idle period between batches.  Overridable so a smoke run can be quick;
-# every override is announced, because a 5-second settle and a 60-second settle
-# produce different numbers from identical code.
+# The idle period between batches, overridable for a smoke run and announced
+# when overridden, because a 5-second settle and a 60-second settle produce
+# different numbers from identical code.
 settle() {
     local secs="${LOAD_SETTLE_SECS:-60}"
     [ "$secs" -eq 0 ] 2>/dev/null && return 0
@@ -177,25 +136,11 @@ load_x100() {
     awk '{print int($1*100)}' /proc/loadavg 2>/dev/null || echo 0
 }
 
-# Wait for a defined starting state.  Returns 0 when reached, 1 when it gave up
-# — callers report that alongside their numbers so a batch measured on a dirty
-# machine is visible as such rather than silently mixed in with the clean ones.
-#
-# This waits.  It does not kill anything, and it must not: it used to open with
-#
-#     pkill -f "$BIN daemon"
-#
-# which matches every daemon started from this binary — including the one the
-# caller started moments earlier.  measure_tcp.sh calls preflight *before*
-# start_daemon and survived it; measure_http.sh and measure_ws.sh call it at the
-# top of each pass, after start_daemon, and killed their own daemon on the first
-# line of the first pass.  Everything after that measured an absent daemon:
-# every round reported connect-failed=20, and the harness closed with "the
-# daemon died during the run" — a true statement about a death it had caused
-# itself.  Nothing replaces the kill because nothing needs to: start_daemon
-# gives every run its own HOME and its own control socket, so a daemon left over
-# from another run is invisible to this one, each harness uses its own ports, and
-# each harness already kills the daemon it started.
+# This waits and must not kill anything, because the `pkill -f` it opened with
+# matched every daemon started from this binary -- including the caller's own,
+# which two harnesses then measured the absence of and reported as a death they
+# had caused; nothing replaces it, since every run has its own HOME, socket and
+# ports and already kills the daemon it started.
 preflight() {
     local tw_limit="${LOAD_TW_LIMIT:-200}"
     local load_limit="${LOAD_LOADAVG_LIMIT:-60}"     # x100, so 60 == 0.60
@@ -226,20 +171,10 @@ make_run_dir() {
     echo "$t"
 }
 
-# Start a daemon in the given run dir; sets DAEMON_PID to the daemon's own pid.
-# Fails loudly rather than letting the rest of the harness measure an absent
-# daemon.
-#
-# DAEMON_PID is the instrument the leak harnesses read: restart_under_load.sh and
-# runtime_churn_leak.sh both sample /proc/$DAEMON_PID for descriptors and RSS and
-# report the difference across their cycles.  It used to be set from
-# `pin_daemon "$BIN" daemon &`, which named the subshell — so both harnesses were
-# reporting bash's five descriptors and bash's two megabytes, unchanged across
-# every cycle because bash was doing nothing.  Nightly run 30719890629 printed
-# "baseline: 5 descriptors, 2136 kB RSS" and then, after twelve stop/start
-# cycles, "5 descriptors, 2136 kB RSS" — identical to the byte, as it always
-# would be.  Neither harness could fail its leak check.  See the note above
-# start_daemon_bg for the mechanism.
+# Sets DAEMON_PID to the daemon's own pid and fails loudly rather than letting
+# the harness measure an absent daemon -- it used to name the subshell, so both
+# leak harnesses reported bash's five descriptors and two megabytes, identical
+# to the byte across every cycle and unable to fail their leak check.
 start_daemon() {
     local rundir="$1"
     export HOME="$rundir/home"
@@ -273,11 +208,8 @@ daemon_rss_kb() {
 }
 
 # ─── result reporting ────────────────────────────────────────────────────────
-#
-# A harness that prints numbers and exits 0 is a harness CI cannot use: the
-# original versions of these scripts all did exactly that, which is how a run
-# that reported "12 of 40 rounds bad" still showed up as a green step.  Every
-# harness now ends in one of these.
+# A harness that prints numbers and exits 0 is one CI cannot use, which is how
+# a run reporting "12 of 40 rounds bad" still showed up as a green step.
 
 HARNESS_NAME="${HARNESS_NAME:-load}"
 
@@ -299,31 +231,10 @@ nothing_measured() {
     exit 2
 }
 
-# ─── a port window, claimed like everybody else's ───────────────────────────
-#
-# Every harness in this directory used to bind literals, and every one of those
-# literals sat inside a window integration/lib_ports.sh hands out: 19599, 19600
-# and 19700 in the FIRST window, the one a quiet run always takes; 23100, 23101,
-# 23200 and 23201 in the third; 25200, 25201, 26000 and 26010-26029 in the
-# fourth.  Nothing coordinated the two.
-#
-# It cost a nightly job on 2026-08-15:
-#
-#     OSError: [Errno 98] error while attempting to bind on address
-#              ('127.0.0.1', 23200): address already in use
-#     RESULT measure_ws: NO DATA — the WebSocket echo backend did not start
-#
-# The load phase runs alone, so the collision was not with another harness --
-# it was with something still holding a port out of a window a suite had
-# claimed.  Concurrent runs on this box are also handed blocks at 21000-23999 by
-# hand, which is the same range arriving from a third direction.
-#
-# Sited here because all seven harnesses source this file and none of them has
-# to know about it.  lib_ports.sh is idempotent -- it returns immediately when
-# SL_PORT_BASE is already set -- so a harness run from test/load/run_all.sh, or
-# under a suite that has already claimed a window, uses that one rather than
-# taking a second.
-#
-# The offsets each harness derives from SL_PORT_BASE are distinct across the
-# directory, so two of them running at once cannot collide either.
+# Every harness used to bind literals sitting inside windows lib_ports.sh hands
+# out, which cost a nightly job to a port still held from a claimed window --
+# sited here because all seven source this file, and lib_ports.sh returns
+# immediately when SL_PORT_BASE is already set, so a harness under a suite uses
+# that window rather than taking a second, with each harness's offsets distinct
+# across the directory.
 . "$(dirname "${BASH_SOURCE[0]}")/../integration/lib_ports.sh"

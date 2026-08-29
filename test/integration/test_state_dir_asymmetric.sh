@@ -1,65 +1,22 @@
 #!/usr/bin/env bash
-# Integration test: a second daemon must not adopt a running daemon's runtimes.
-#
-# The state directory is keyed to the socket path when that path is not the
-# default one, and the first start on a keyed directory copies the old shared
-# directory's runtimes into it so that an upgrade cannot look like everything
-# vanished.  Those two rules are correct separately and catastrophic together in
-# one arrangement, which is the arrangement this file drives:
-#
-#   daemon A on the TRUE default path -- the deployed one, the one the rule
-#   deliberately exempts so that its directory never moves
-#
-#   daemon B on an override -- an operator debugging beside it
-#
-# B's keyed directory is empty and the legacy directory is populated, which is
-# precisely the signature of the upgrade the adoption exists for.  It is also
-# the signature of this, and disk state cannot tell them apart.  One command was
-# enough:
-#
-#     SOCKETLEY_SOCKET=$HOME/b.sock socketley ls
-#
-#     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458701,fd=6))
-#     LISTEN 0 4096 0.0.0.0:19781 users:(("socketley",pid=458349,fd=6))
-#
-# Two daemons bound to one port, and the second holding a copy of the first's
-# state file that `remove` would delete -- which is the exact transcript the
-# keying was introduced to prevent, reproduced by the compatibility path for it.
-#
-# THE ORACLE IS THE PORT, NOT THE FILE.  A state file copied but never restored
-# is a different and much smaller defect; what costs an operator their afternoon
-# is the second bind.  So the assertion counts listening sockets, and a run in
-# which two daemons are serving one port fails whatever the directories look
-# like.
-#
-# AND THE OTHER DIRECTION, because "B adopted nothing" also passes on a build
-# where adoption has simply been deleted.  A is stopped, B is restarted, and B
-# has to adopt then -- the decline is a statement about who is using those
-# runtimes this minute, not a permanent refusal.
-#
-# ─── WHY THIS FILE TOUCHES THE DEFAULT SOCKET, WHEN NOTHING ELSE MAY ────────
-#
-# lib_daemon.sh exists to stop tests binding /tmp/socketley.sock: anything that
-# starts a daemon there is claiming the identity the real daemon runs under.
-# This file cannot avoid it.  The rule under test is "the path resolve() would
-# have produced with SOCKETLEY_SOCKET out of the picture", that path is
-# /tmp/socketley.sock in a dev tree, and an asymmetric case with both daemons on
-# overrides is not the asymmetric case -- it is the arrangement that already
-# passed ten checks while this defect was live.
-#
-# So it is careful instead:
-#   - it refuses to run at all if anything is already serving that path, and
-#     says so rather than passing;
-#   - it unlinks the socket file only if it was not there when the file started;
-#   - it kills only pids it started, by pid, and sweeps only its own two socket
-#     paths.
+# Keying the state directory to a non-default socket and copying the legacy
+# directory into a fresh keyed one are each correct and catastrophic together,
+# because an operator debugging beside the deployed daemon presents exactly the
+# signature of an upgrade -- one `ls` was enough to put two daemons on one
+# port, the second holding a copy of the first's state file that `remove` would
+# delete; the oracle is the port rather than the file, since the second bind
+# succeeds silently, and the other direction is asserted too because "B adopted
+# nothing" also passes where adoption was deleted; it must touch the default
+# socket, since an asymmetric case with both daemons on overrides is the
+# arrangement that already passed ten checks while this was live, so it refuses
+# to run if anything is serving that path, unlinks the socket only if it
+# created it, and kills only pids it started.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
-# For daemon_pids/daemon_sweep.  Sourcing defines functions and runs nothing, so
-# no isolation is claimed here -- this file arranges its own, deliberately.
-# shellcheck source=lib_daemon.sh
+# For daemon_pids and daemon_sweep only: sourcing defines functions and runs
+# nothing, and this file arranges its own isolation deliberately.
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ports.sh"
 
@@ -78,11 +35,8 @@ bad() {
 
 echo "=== Integration: a second daemon does not adopt a live daemon's runtimes ==="
 
-# ── The one thing that makes touching the default path acceptable ───────────
-#
-# Reported, not silent.  A check that quietly does not run is the failure mode
-# this suite has been paying down for a fortnight, so this prints the reason and
-# names the holder.
+# Reported rather than silent, because a check that quietly does not run is the
+# failure mode this suite has been paying down.
 if [ -n "$(daemon_pids "$DEFAULT_SOCK")" ]; then
     echo "  SKIP: something is already serving $DEFAULT_SOCK (pid$(daemon_pids "$DEFAULT_SOCK"))."
     echo "        This file has to start a daemon on the default path -- that is the"
@@ -109,27 +63,22 @@ cleanup() {
         kill -9 "$p" 2>/dev/null
         wait "$p" 2>/dev/null
     done
-    # Anything a CLI command auto-started on either of OUR two paths.  Never by
-    # name, never by command line -- daemon_sweep asks the socket who serves it.
+    # Anything a CLI command auto-started on either of our two paths, asked of
+    # the socket rather than by name or command line.
     daemon_sweep "$SOCK_B"
     daemon_sweep "$DEFAULT_SOCK"
-    # Only if this run created it.  A socket file belonging to somebody else's
-    # daemon is not ours to unlink, and the guard above means we only get here
-    # when nothing was serving it -- which is not the same as it not existing.
+    # Only if this run created it, because a socket file belonging to somebody
+    # else's daemon is not ours to unlink.
     [ "$SOCK_PREEXISTING" = "0" ] && rm -f "$DEFAULT_SOCK"
     rm -rf "$TMPD"
     return 0
 }
 trap cleanup EXIT
 
-# ── Counting listeners, which is the whole oracle ───────────────────────────
-#
-# From /proc/net/tcp rather than `ss`, so the count does not depend on iproute2
-# being installed.  Column 2 is local_address as HEX:HEX and column 4 is the
-# state, 0A being LISTEN.  Two daemons that have both bound the port under
-# SO_REUSEPORT are two separate sockets and therefore two rows, which is exactly
-# the distinction wanted -- and the reason the port is the oracle at all, since
-# the second bind SUCCEEDS and reports nothing.
+# Counted from /proc/net/tcp rather than `ss` so it does not depend on
+# iproute2, and two daemons that both bound the port under SO_REUSEPORT are two
+# rows -- which is the reason the port is the oracle at all, since the second
+# bind succeeds and reports nothing.
 listeners() {   # port -> count
     local hexp
     hexp=$(printf '%04X' "$1")
@@ -175,9 +124,8 @@ env -u SOCKETLEY_SOCKET "$BIN" create server asym_a -p "$PORT_A" -s >/dev/null 2
 env -u SOCKETLEY_SOCKET "$BIN" create server asym_b -p "$PORT_B" -s >/dev/null 2>&1 || true
 sleep 0.6
 
-# Setup guard.  Everything below is about a SECOND listener appearing, so one
-# listener has to be there first -- otherwise "not two" would pass on a run
-# where the runtime never started.
+# Setup guard: one listener has to be there first, or "not two" would pass on a
+# run where the runtime never started.
 A_L=$(listeners "$PORT_A")
 if [ "$A_L" = "1" ]; then
     ok
@@ -225,9 +173,9 @@ else
     ok
 fi
 
-# The decline has to be readable.  To the operator this looks exactly like their
-# runtimes vanishing, and the daemon log is the only place that can say
-# otherwise -- so it must name both directories, not merely mention a skip.
+# The decline has to be readable, because to the operator this looks exactly
+# like their runtimes vanishing and the daemon log is the only place that can
+# say otherwise.
 B_LOG=$(cat "$TMPD/b.log" 2>/dev/null || true)
 if grep -q "NOT adopting" <<<"$B_LOG" \
    && grep -q "$DEFAULT_SOCK" <<<"$B_LOG" \
@@ -262,11 +210,9 @@ else
 fi
 
 # ── The other direction ────────────────────────────────────────────────────
-#
-# Everything above passes on a build that simply never adopts anything, which
-# would be a silent regression of the upgrade path that adoption exists for.
-# So: stop A, restart B, and require the adoption to happen now.  Same daemon,
-# same two directories, one fact changed.
+# Everything above passes on a build that never adopts anything, so A is
+# stopped and B restarted with the adoption required to happen now -- same
+# daemon, same two directories, one fact changed.
 halt "$APID"; APID=""
 sleep 0.6
 halt "$BPID"

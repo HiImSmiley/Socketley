@@ -1,36 +1,15 @@
-# Readiness, proved rather than waited for.
-#
-# Not a test — run_all.sh globs test_*.sh, so this file is only ever sourced.
-#
+# Readiness, proved rather than waited for -- only ever sourced, since
+# run_all.sh globs test_*.sh.
 # ─── WHAT THIS REPLACES ─────────────────────────────────────────────────────
-#
-# Eleven tests opened with the same two lines:
-#
-#     for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PORT" && break; sleep 0.1; done
-#     sleep 0.3
-#
-# The first proves a TCP connection is accepted.  That happens the moment the
-# listening socket is armed, which is earlier than the runtime behind it can
-# answer anything: a proxy still has to health-check its backends before any of
-# them is in rotation, a cache has to finish loading, a server has to run its
-# on_start.  The second line is a guess about how much earlier, and a guess that
-# is generous on an idle machine is thin when the whole suite is running — which
-# is precisely when a test that fails intermittently gets waved through as
-# flaky.
-#
-# So these ask the thing under test to do its job, and wait until it does.  A
-# readiness check that goes through the same path as the measurement cannot be
-# satisfied earlier than the measurement can start.
-#
-# Every function takes a timeout in whole seconds and returns non-zero when it
-# expires; none of them sleeps after succeeding, because there is nothing left
-# to wait for.
+# An accepted connection happens the moment the listening socket is armed,
+# which is earlier than a proxy has health-checked its backends or a server has
+# run its on_start, and the fixed sleep after it is a guess that is thin
+# exactly when the whole suite is running -- so these ask the thing under test
+# to do its job through the same path as the measurement, with a whole-second
+# timeout and no sleep after success.
 
-# ready_tcp HOST PORT [TIMEOUT_S]
-#
-# A connection is accepted.  Still the right check when that is genuinely all
-# that is being claimed — a listener that must exist while its backends are
-# deliberately down, for instance — and the precondition the others build on.
+# A connection is accepted, which is still the right check when that is all
+# that is being claimed and is the precondition the others build on.
 ready_tcp() {
     local host=$1 port=$2 timeout=${3:-8}
     local deadline=$(( $(date +%s) + timeout ))
@@ -41,11 +20,8 @@ ready_tcp() {
     return 1
 }
 
-# ready_http HOST PORT [PATH] [TIMEOUT_S]
-#
-# A complete HTTP response comes back with a 2xx or 3xx status.  Through a proxy
-# this additionally proves at least one backend is in rotation and answering,
-# which is the part "nc -z" never showed and the fixed sleep was standing in for.
+# A complete HTTP response with a 2xx or 3xx status, which through a proxy
+# additionally proves at least one backend is in rotation and answering.
 ready_http() {
     local host=$1 port=$2 path=${3:-/} timeout=${4:-15}
     python3 - "$host" "$port" "$path" "$timeout" <<'PY'
@@ -94,12 +70,9 @@ sys.exit(1)
 PY
 }
 
-# ready_answers HOST PORT [PATH] [TIMEOUT_S]
-#
-# A complete status line comes back, whatever it says.  For listeners whose
-# correct answer to a plain GET is a refusal — a WebSocket endpoint replies 400
-# or 426 to a request carrying no Upgrade — where the point is that the runtime
-# read the request and produced a response, not what the response was.
+# A complete status line, whatever it says, for listeners whose correct answer
+# to a plain GET is a refusal -- where the point is that the runtime read the
+# request and produced a response.
 ready_answers() {
     local host=$1 port=$2 path=${3:-/} timeout=${4:-15}
     python3 - "$host" "$port" "$path" "$timeout" <<'PY'
@@ -129,18 +102,10 @@ sys.exit(1)
 PY
 }
 
-# ready_tls HOST PORT CAFILE [SERVERNAME] [TIMEOUT_S]
-#
-# A TLS handshake completes and the server's certificate verifies against
-# CAFILE.  "nc -z" is worth even less against a TLS listener than against a
-# plain one: the socket is accepted before a single record has crossed, and
-# the handshake it then has to complete is spread over several io_uring
-# completions.  A test that starts measuring at "connected" is measuring
-# against a listener that has not yet proved it can terminate anything.
-#
-# Verification is part of the check on purpose.  An unverified handshake would
-# also succeed against a listener serving the wrong certificate, which is one
-# of the two ways this feature can be wrong in a way nobody notices.
+# A TLS handshake completes and the certificate verifies, because the socket is
+# accepted before a single record has crossed -- and verification is part of
+# the check on purpose, since an unverified handshake also succeeds against a
+# listener serving the wrong certificate.
 ready_tls() {
     local host=$1 port=$2 cafile=$3 servername=${4:-localhost} timeout=${5:-15}
     python3 - "$host" "$port" "$cafile" "$servername" "$timeout" <<'PY'
@@ -171,11 +136,9 @@ sys.exit(1)
 PY
 }
 
-# ready_resp HOST PORT [TIMEOUT_S]
-#
-# A cache answers PING with +PONG.  Proves the RESP path is up, not merely the
-# socket: a cache that is still loading its state file accepts long before it
-# replies.
+# A cache answers PING with +PONG, which proves the RESP path is up rather than
+# merely the socket, since a cache still loading its state file accepts long
+# before it replies.
 ready_resp() {
     local host=$1 port=$2 timeout=${3:-15}
     python3 - "$host" "$port" "$timeout" <<'PY'
@@ -206,62 +169,18 @@ sys.exit(1)
 PY
 }
 
-# ready_conns BIN NAME COUNT [TIMEOUT_S]
-#
-# The runtime's published connection count is COUNT, in a figure the runtime
-# sampled after this call began.
-#
-# ─── WHAT THE SECOND HALF OF THAT SENTENCE WAS FOR ──────────────────────────
-#
-# It used to be the whole point.  Between the process split and the shared
-# figures table, a runtime in a worker did not have its connection count read
-# when it was printed: the worker sampled its own counters every 250 ms and
-# pushed them, and `stats`, `ls` and every Lua binding reported the last sample
-# that had arrived.  The figure lagged the truth by up to a quarter second,
-# which `stats` said out loud in figures:pushed / figures_age_ms and which was
-# invisible in the number itself.
-#
-# For a count that is RISING that lag was harmless: a test waiting for 3 cannot
-# be handed 3 by a sample taken before the third client connected.  For a count
-# that has just fallen it was not, and the direction that mattered most is the
-# fall to zero, because "nothing is connected" is the precondition every busy
-# assertion is read against.  Concretely, and this was a measured failure and
-# not a hypothetical: ready_tcp's `nc -z` opens and closes a connection, and the
-# worker goes on counting it until the ring reports the hangup after it reported
-# the accept.  A sample landing inside that window put a 1 into the daemon for
-# the quarter second that followed — during which a test that asked "0
-# connections, yes?" was told 1 about a runtime nothing was connected to.
-#
-# How wide that window was was measured rather than reasoned about, by reading
-# the figure straight after an isolated `nc -z`: 7 stale reads in 164 on an idle
-# machine, so a few percent of the 250 ms period.
-#
-# Polling until the number reads 0 does not fix that, and is the trap worth
-# naming: the first read could be answered from a sample taken BEFORE the probe
-# connected, so the loop exited on a stale zero having proved nothing at all.
-# That is a false pass in the same place, and it is the harder one to notice.
-#
+# The runtime's connection count is COUNT in a figure the runtime sampled after
+# this call began, which mattered while figures were pushed on a 250 ms timer:
+# a rising count could not be answered stale, but the fall to zero could, and
+# the readiness probe's own `nc -z` put a 1 into the daemon for a quarter
+# second -- measured at 7 stale reads in 164 -- while polling until it reads 0
+# exits on a stale zero having proved nothing.
 # ─── AND WHY THE TEST IS STILL ON THE AGE ───────────────────────────────────
-#
-# The counters live in shared memory now.  Each worker stores its line once per
-# turn of its event loop and the daemon sums the slots when it prints, so the
-# figure postdates the call by construction for EVERY runtime and `stats` prints
-# no age for any of them.  age reads 0, sampled reads now, and the second test
-# holds on the first pass.
-#
-# The arithmetic is kept rather than deleted, and this is not caution about a
-# rename.  It is the one reader in this tree that would ACT on an age
-# reappearing: a build that put a cached aggregate or a periodic refresh back in
-# front of these figures would print one again, and every caller of ready_conns
-# would go back to waiting for a sample taken after it asked — which is the
-# correct behaviour for that build and is not behaviour anyone would think to
-# restore. The guard below is what makes that free.
-#
-# `now` is read BEFORE the stats round-trip on purpose.  Reading it after would
-# add the round-trip to the computed sample instant and could date a figure into
-# the window this function exists to exclude; taken before, the arithmetic can
-# only ever place the sample earlier than it really was, and the error is on the
-# side of waiting one more turn.
+# The counters live in shared memory now, so the figure postdates the call by
+# construction and the second test holds on the first pass -- with the
+# arithmetic kept because this is the one reader that would act on an age
+# reappearing, and `now` read before the round trip so the error is always on
+# the side of waiting one more turn.
 ready_conns() {
     local bin=$1 name=$2 want=$3 timeout=${4:-15}
     local start deadline now out conn age sampled
@@ -272,11 +191,10 @@ ready_conns() {
         out=$("$bin" stats "$name" 2>/dev/null) || true
         conn=$(printf '%s\n' "$out" | awk -F: '$1 == "connections" { print $2; exit }')
         age=$(printf '%s\n'  "$out" | awk -F: '$1 == "figures_age_ms" { print $2; exit }')
-        # Absent, or anything that is not a count of milliseconds, means there
-        # is no pushed figure to date — which is now every runtime.  Guarded
-        # rather than trusted, because the alternative is arithmetic on whatever
-        # `stats` happened to print, which fails as a shell error in the middle
-        # of a wait and takes the caller's whole file with it.
+        # Anything that is not a count of milliseconds means there is no pushed
+        # figure to date, guarded rather than trusted because arithmetic on
+        # whatever `stats` printed fails as a shell error in the middle of a
+        # wait.
         case "$age" in ''|*[!0-9]*) age=0 ;; esac
         sampled=$(( now - age ))
         if [ "$conn" = "$want" ] && [ "$sampled" -ge "$start" ]; then

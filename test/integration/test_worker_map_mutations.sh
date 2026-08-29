@@ -3,46 +3,22 @@
 # worker reach the daemon's map and do what they say.
 #
 # ─── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
-#
-# These four raised in a worker process and worked in the daemon.  Since the
-# worker became the default that made them the third of the management API that
-# did not exist in the ordinary case, and the refusal said it never would.
-#
-# They travel now: the request goes to the daemon over a socket of its own —
-# child_map_fd, see proxy_supervisor — the daemon acts on the map it holds, and
-# the answer comes back before the Lua call returns.
-#
+# These four raised in a worker and worked in the daemon, so once the worker
+# became the default they were a third of the management API that did not exist
+# in the ordinary case -- they travel now over child_map_fd, and the answer
+# comes back before the Lua call returns.
 # ─── WHAT EACH ASSERTION HERE WOULD CATCH ───────────────────────────────────
-#
-# Written out per assertion because "socketley.create returned true" is exactly
-# what the OLD code would have printed if the refusal had merely been deleted:
-# a worker answering out of its own replica map returns true, having built a
-# runtime the daemon never hears about.  So `true` is never the evidence.  What
-# is asked, every time, is what the DAEMON says afterwards.
-#
-#   create   the runtime is in `ls`, which is the daemon's map and not the
-#            worker's.  A build that answered locally shows nothing here.
-#   start    the port is LISTENING and a connection to it is accepted.  A build
-#            that flipped a placeholder — which is what runtime_instance::start
-#            does for an out-of-process runtime with no child forked — shows
-#            `Up` in `ls` and binds nothing, so `ls` alone is not the oracle.
-#   stop     the port stops accepting.  Same reason.
-#   remove   the runtime is gone from `ls`.
-#
-# And the refusals, which are the half a script actually branches on:
-#
-#   a duplicate name, an absent name and an already-running runtime each answer
-#   false with the daemon's own wording.  Checked against the SAME script run
-#   in the daemon — not against a literal in this file — because the property
-#   being tested is that a script cannot tell which side of the boundary it is
-#   on, and a hardcoded expectation would pass on a build where both sides are
-#   wrong in the same way.
-#
+# `true` is never the evidence, because a worker answering out of its own
+# replica map returns it having built a runtime the daemon never hears about --
+# so what is asked every time is what the daemon says afterwards: the runtime
+# in `ls`, the port actually accepting a connection, the port ceasing to
+# accept, the runtime gone -- and the refusals, checked against the same script
+# run in the daemon rather than a literal, because the property is that a
+# script cannot tell which side of the boundary it is on.
 # ─── THE CONTROL ────────────────────────────────────────────────────────────
-#
-# The same script, byte for byte, on a runtime created with --daemon-process.
-# Without it, every assertion below also passes on a build that quietly moved
-# the whole runtime into the daemon.
+# The same script byte for byte on an in-daemon runtime, without which every
+# assertion below also passes on a build that quietly moved the whole runtime
+# into the daemon.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -79,19 +55,11 @@ echo "=== Integration: a worker's script changes the daemon's map ==="
 
 daemon_start "$BIN"
 
-# ── The script, run on both sides of the boundary ───────────────────────────
-#
-# One file, parameterised by the runtime's own name and port, so the two arms
-# are not two scripts that could drift.  Everything
-# it learns is written to the daemon's log with a tag this file greps for: the
-# worker's log lines land there too, which is the whole reason a worker's
-# stdout is inherited rather than closed.
-#
-# on_start, deliberately.  It is where these calls are actually written, and it
-# is the one place they are hardest to serve: the script runs INSIDE the start
-# that `create -s` is waiting for, so a daemon that only served these from its
-# event loop would be waiting for a worker that is waiting for it.  A build
-# with that deadlock fails this file at the create, not at an assertion.
+# One file parameterised by the runtime's own name and port so the two arms
+# cannot drift, logging everything with a tag this file greps for -- and in
+# on_start deliberately, because that is where these calls are written and the
+# hardest place to serve them: a daemon that only served them from its event
+# loop would be waiting for a worker that is waiting for it.
 LUA="$SOCKETLEY_TMPD/mapmut.lua"
 cat > "$LUA" <<'LUAEOF'
 local me  = self.name
@@ -138,11 +106,8 @@ state() {
 listed() {
     "$BIN" ls 2>/dev/null | awk -v n="$1" '$2 == n { f=1 } END { print f ? "yes" : "no" }'
 }
-# accepts PORT -> "yes" when a TCP connection to it is accepted.
-#
-# A connection and not `ss`: a listening socket the runtime never accepted from
-# is what a half-started runtime leaves behind, and this file is asserting that
-# the runtime is serving rather than that a port is bound.
+# A connection rather than `ss`, because a listening socket the runtime never
+# accepted from is what a half-started runtime leaves behind.
 accepts() {
     if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; then
         printf 'yes'
@@ -218,12 +183,9 @@ case "$ABSENT" in
              "wanted start_absent=false why=there is no runtime called ..." ;;
 esac
 
-# ── Assertion 4: stop from a worker frees the port ──────────────────────────
-#
-# Typed at the CLI rather than from the script, because what is being tested is
-# the daemon's half: `stop` served for a worker has to take the child down
-# before it answers, exactly as the CLI's does.  The script's own stop is
-# covered by the remove below, which stops first.
+# Typed at the CLI rather than from the script, because what is under test is
+# the daemon's half -- a `stop` served for a worker has to take the child down
+# before it answers.
 "$BIN" stop kid_oop >/dev/null 2>&1 || true
 sleep 0.5
 if [ "$(accepts "$KID_OOP_PORT")" = "no" ]; then pass; else
@@ -233,12 +195,9 @@ if [ "$(accepts "$KID_OOP_PORT")" = "no" ]; then pass; else
          "not the runtime is running, assertion 2 proves nothing"
 fi
 
-# ── Assertion 5: remove, from a worker's script, at reload time ─────────────
-#
 # reload-lua re-runs the script's top level in the worker, which is the second
-# place these calls are made and the second place the daemon is blocked waiting
-# for the child — await_routes, not await_startup.  A build that fixed only the
-# startup wait passes everything above and fails here.
+# place the daemon is blocked waiting for the child, so a build that fixed only
+# the startup wait passes everything above and fails here.
 RELOAD_LUA="$SOCKETLEY_TMPD/mapmut_reload.lua"
 cat > "$RELOAD_LUA" <<'LUAEOF'
 local ok, why = socketley.remove("kid_oop")
@@ -264,11 +223,9 @@ if [ "$(listed kid_oop)" = "no" ]; then pass; else
          "socket in only one of the two waits passes every assertion above"
 fi
 
-# ── The control: the same script, in the daemon ─────────────────────────────
-#
-# Byte for byte the same file — restored from the copy above — on a runtime
-# created with --daemon-process.  Without this arm, every assertion so far also
-# passes on a build that silently ran the "worker" inside the daemon.
+# Byte for byte the same file on an in-daemon runtime, without which every
+# assertion so far also passes on a build that silently ran the worker inside
+# the daemon.
 cat > "$LUA" <<'LUAEOF'
 local me  = self.name
 local kid = me == "parent_oop" and "kid_oop" or "kid_in"
@@ -307,12 +264,9 @@ else
          "about the process boundary, and prove nothing about either"
 fi
 
-# ── And the wording is the same on both sides ───────────────────────────────
-#
-# The point of the whole change, stated as an assertion: a script cannot tell
-# which process it is running in from what these calls say.  Compared against
-# the other ARM rather than against a literal, so a build that is wrong in the
-# same way on both sides cannot pass by matching a string this file chose.
+# The point of the whole change stated as an assertion, compared against the
+# other arm rather than against a literal, so a build that is wrong in the same
+# way on both sides cannot pass by matching a string this file chose.
 for tag in start_absent create_dup start_again; do
     A=$(saw "$tag" parent_oop | sed 's/^MAPMUT parent_oop //; s/kid_oop/KID/g')
     B=$(saw "$tag" parent_in  | sed 's/^MAPMUT parent_in //;  s/kid_in/KID/g')
