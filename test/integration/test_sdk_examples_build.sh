@@ -62,8 +62,13 @@ build_one() {
     local src=$1
     local tag
     tag=$(printf '%s' "${src#"$ROOT"/sdk/examples/}" | tr '/' '_')
+    # include/windows carries the cross-platform tier -- cache_client.h and
+    # ws_client.h, byte-identical to the darwin copy and absent from
+    # include/linux entirely.  premake gives the two unit tests that use them
+    # the same directory; an example that includes one does not build without
+    # it on any platform.
     if g++ -std=c++23 $SANFLAGS "$src" \
-         -I"$ROOT" -I"$ROOT/include/linux" \
+         -I"$ROOT" -I"$ROOT/include/linux" -I"$ROOT/include/windows" \
          -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
          -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
          -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
