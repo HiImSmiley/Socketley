@@ -136,6 +136,17 @@ static std::string instance_shards_refusal(const runtime_instance* inst)
                                  inst->get_listen_path());
 }
 
+// Who is on the other end of this connection, or 0 when the socket cannot say.
+static pid_t peer_pid(int conn_fd)
+{
+    struct ucred cred{};
+    socklen_t    len = sizeof(cred);
+    if (conn_fd < 0 ||
+        ::getsockopt(conn_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0)
+        return 0;
+    return cred.pid;
+}
+
 // The pid `attach --pid` names has to belong to the caller, judged from
 // SO_PEERCRED against the owner of /proc/<pid>, because the packaged socket is
 // group-readable and the daemon would otherwise lend out a privilege it was
@@ -1501,11 +1512,22 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
 
+    // A caller cannot mean "signal me".  Removing an external runtime SIGTERMs
+    // the pid it attached with, which is right for an operator and fatal for
+    // the process itself: daemon_detach() sends this command and then waits for
+    // the reply, so the signal landed on a program inside its own detach --
+    // and daemon_attach() registers that same call with atexit, so it landed
+    // on every SDK program that had ever attached, at exit.
+    const pid_t asking = peer_pid(conn ? conn->fd : -1);
+
     for (const auto& n : names)
     {
         auto* inst = m_manager.get(n);
-        if (inst && inst->get_state() == runtime_running)
-            m_manager.stop(n, m_loop);
+        if (!inst || inst->get_state() != runtime_running)
+            continue;
+        if (inst->is_external() && asking > 0 && inst->get_pid() == asking)
+            continue;   // unregistered below; the state it leaves in is not read
+        m_manager.stop(n, m_loop);
     }
 
     // Before the instances leave the map, because the supervisor holds a
