@@ -42,6 +42,7 @@
 #include <sstream>
 #include <iostream>
 #include <filesystem>
+#include <fstream>
 #include <sys/wait.h>
 #include <csignal>
 #include "../shared/logging.h"
@@ -69,6 +70,23 @@ static int col_width(int base, size_t longest)
                : static_cast<int>(std::max(static_cast<size_t>(base), longest + 2));
 }
 
+// A daemon whose parent has not reaped it answers kill(pid, 0) and is counted
+// live by it, so the state is read as well; over-reporting a daemon that is a
+// corpse is the failure this hint exists to prevent, in miniature.
+static bool is_zombie(pid_t pid)
+{
+    std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
+    std::string line;
+    if (!std::getline(f, line))
+        return false;
+
+    // From the last `)`, because a comm field may hold both spaces and parens.
+    const size_t close = line.rfind(')');
+    if (close == std::string::npos || close + 2 >= line.size())
+        return false;
+    return line[close + 2] == 'Z';
+}
+
 // A second daemon is invisible from inside the first: SOCKETLEY_SOCKET moves
 // the socket and the state directory together, so `ls` answers for whichever
 // one the environment points at and never says which.
@@ -92,7 +110,8 @@ static std::string daemon_hint()
         // The pid decides, not the file: a daemon killed outright leaves its
         // own behind, and EPERM is another user's live daemon.
         if (::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM)
-            ++live;
+            if (!is_zombie(static_cast<pid_t>(pid)))
+                ++live;
     }
 
     // One daemon is the ordinary case and needs no line about it; the hint is

@@ -198,6 +198,38 @@ if [ -n "$SDK_BIN" ]; then
     if ! grep -q "daemons are running" <<<"$(A ls)"; then ok; else
         bad "with one daemon left the hint is gone" "said: $(A ls)"
     fi
+
+    # ── A daemon that is dead but not yet reaped ────────────────────────────
+    #
+    # kill(pid, 0) succeeds on a zombie, so a corpse whose parent has not
+    # waited on it counted as a running daemon and the hint said two.  The
+    # parent here is a shell blocked in sleep, which is what keeps the entry
+    # in Z rather than letting bash reap it the moment it dies.
+    C_SOCK="$SOCKETLEY_TMPD/c.sock"
+    bash -c "SOCKETLEY_SOCKET=$C_SOCK '$BIN' daemon >/dev/null 2>&1 & echo \$! > $SOCKETLEY_TMPD/cpid; sleep 25" &
+    C_PARENT=$!
+    for _ in $(seq 1 60); do [ -S "$C_SOCK" ] && break; sleep 0.1; done
+    C_PID=$(cat "$SOCKETLEY_TMPD/cpid" 2>/dev/null || echo "")
+    if [ -n "$C_PID" ] && kill -9 "$C_PID" 2>/dev/null; then
+        sleep 0.7
+        # Asserted, because without a zombie there is nothing to measure and
+        # the check below would pass on any build.
+        if [ "$(ps -o stat= -p "$C_PID" 2>/dev/null | tr -d ' ')" = "Z" ]; then ok; else
+            bad "the corpse is actually a zombie" \
+                "state: $(ps -o stat= -p "$C_PID" 2>/dev/null | tr -d ' ')" \
+                "without one in Z the assertion below proves nothing"
+        fi
+        if ! grep -q "daemons are running" <<<"$(A ls)"; then ok; else
+            bad "a zombie daemon is not counted as running" \
+                "said: $(A ls)" \
+                "kill(pid, 0) succeeds on a zombie; the state has to be read too"
+        fi
+    else
+        echo "  (the zombie daemon did not start -- that assertion is skipped)"
+    fi
+    kill -9 "$C_PARENT" 2>/dev/null
+    wait "$C_PARENT" 2>/dev/null || true
+
     A remove dv_solo >/dev/null
 fi
 
