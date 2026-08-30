@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstring>
 #include <charconv>
+#include <cstdio>
 #include <shared_mutex>
 #include <thread>
 #include <chrono>
@@ -280,20 +281,40 @@ void metrics_endpoint::serve_loop()
     }
 }
 
-// Escape a JSON string value (minimal: just quotes and backslashes)
+// A control character has no literal spelling in a JSON string, and this
+// escaper passed every one but newline through raw -- reachable because
+// m_stat_detail is a registered type's own get_stats() text, which is whatever
+// the plugin author writes.
 static void json_escape_into(std::string& out, std::string_view s)
 {
     for (char c : s)
     {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else out += c;
+        switch (c)
+        {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                {
+                    char u[7];
+                    std::snprintf(u, sizeof(u), "\\u%04x",
+                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    out += u;
+                }
+                else
+                    out += c;
+        }
     }
 }
 
-// Prometheus escapes a label value as backslash, quote and newline and nothing
-// else, so this is not json_escape_into under another name.
+// The same three characters as json_escape_into was before it was fixed, and
+// separate from it because Prometheus takes a raw tab in a label value and
+// rejects the \t that JSON now requires.
 static void label_escape_into(std::string& out, std::string_view s)
 {
     for (char c : s)
