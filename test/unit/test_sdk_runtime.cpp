@@ -14,6 +14,7 @@
 #include "socketley/server.h"
 #include "socketley/client.h"
 #include "socketley/cache.h"
+#include "socketley/proxy.h"
 
 #include <atomic>
 #include <chrono>
@@ -87,6 +88,25 @@ std::string roundtrip(int fd, const std::string& msg)
     if (!reply.empty() && reply.back() == '\n')
         reply.pop_back();
     return reply;
+}
+
+// Bounded, and an empty answer is a legitimate result rather than a failure --
+// roundtrip() waits for a line because it expects one; this is for the client
+// that must NOT be sent anything.
+std::string read_line(int fd, int ms)
+{
+    struct timeval tv{};
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[512];
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n <= 0)
+        return {};
+    std::string out(buf, static_cast<size_t>(n));
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    return out;
 }
 
 std::string unix_path_for(const char* tag)
@@ -223,6 +243,131 @@ TEST_CASE("start() refuses instead of serving nothing when the port is taken")
         srv.stop();
     t.join();
     ::close(holder);
+}
+
+// The defect the shipped examples carried: the wrapper defaults to
+// mode_inout, in which the runtime is a hub and relays every inbound line to
+// every other client on top of whatever on_message sends.  A Lua script that
+// defines a message handler suppresses that relay; a C++ callback does not.
+// Every example whose on_message IS the protocol therefore double-delivered as
+// soon as a second client connected -- and with one client there is nobody to
+// relay to, which is why it was never seen.
+TEST_CASE("the default mode relays each client's bytes to the others")
+{
+    socketley::server srv(static_cast<uint16_t>(25892));
+    srv.on_message([&](int fd, std::string_view msg) {
+        srv.send(fd, "[fmt] " + std::string(msg));
+    });
+
+    std::thread t([&] { srv.start(); });
+
+    int a = dial_tcp(25892);
+    REQUIRE(a >= 0);
+    int b = dial_tcp(25892);
+    REQUIRE(b >= 0);
+
+    // A's own reply is the formatted one; B is the neighbour that should not
+    // have heard anything at all.
+    CHECK(roundtrip(a, "just one line") == "[fmt] just one line");
+
+    const std::string heard = read_line(b, 400);
+    CHECK(heard == "just one line");   // the raw relay, unformatted
+
+    ::close(a); ::close(b);
+    srv.stop();
+    t.join();
+}
+
+TEST_CASE("mode_in stops it, which is what the examples set")
+{
+    socketley::server srv(static_cast<uint16_t>(25893));
+    srv.mode(mode_in)
+       .on_message([&](int fd, std::string_view msg) {
+           srv.send(fd, "[fmt] " + std::string(msg));
+       });
+
+    std::thread t([&] { srv.start(); });
+
+    int a = dial_tcp(25893);
+    REQUIRE(a >= 0);
+    int b = dial_tcp(25893);
+    REQUIRE(b >= 0);
+
+    CHECK(roundtrip(a, "just one line") == "[fmt] just one line");
+    CHECK(read_line(b, 400).empty());
+
+    ::close(a); ::close(b);
+    srv.stop();
+    t.join();
+}
+
+// The proxy wrapper, and the hook contract that reads backwards.  Nothing in
+// the suite ran a proxy through the SDK, and the SDK's own engine test modelled
+// the trap: its example hook returned nullopt as "no edit", which DROPS.
+TEST_CASE("proxy wrapper forwards, and its hooks mean what the header says")
+{
+    constexpr uint16_t back_port  = 25894;
+    constexpr uint16_t front_pass = 25895;
+    constexpr uint16_t front_drop = 25896;
+
+    socketley::server backend(back_port, "_sdk_backend");
+    backend.mode(mode_in).on_message([&](int fd, std::string_view msg) {
+        backend.send(fd, "backend: " + std::string(msg));
+    });
+    std::thread bt([&] { backend.start(); });
+    REQUIRE(dial_tcp(back_port) >= 0);
+
+    // ── An empty string is "unchanged", and a non-empty one replaces ───────
+    {
+        socketley::proxy px(front_pass, "_sdk_px_pass");
+        px.backend("127.0.0.1:" + std::to_string(back_port))
+          .protocol(protocol_tcp)
+          .on_proxy_request([](int, std::string_view bytes) -> std::optional<std::string> {
+              if (bytes.rfind("swap", 0) == 0)
+                  return std::string("replaced\n");
+              return std::string{};          // pass through
+          });
+        std::thread pt([&] { px.start(); });
+
+        int c = dial_tcp(front_pass);
+        REQUIRE(c >= 0);
+        CHECK(roundtrip(c, "hello") == "backend: hello");
+        ::close(c);
+
+        int c2 = dial_tcp(front_pass);
+        REQUIRE(c2 >= 0);
+        CHECK(roundtrip(c2, "swap") == "backend: replaced");
+        ::close(c2);
+
+        px.stop();
+        pt.join();
+    }
+
+    // ── nullopt is a DROP, not "no edit" ──────────────────────────────────
+    {
+        socketley::proxy px(front_drop, "_sdk_px_drop");
+        px.backend("127.0.0.1:" + std::to_string(back_port))
+          .protocol(protocol_tcp)
+          .on_proxy_request([](int, std::string_view) -> std::optional<std::string> {
+              return std::nullopt;
+          });
+        std::thread pt([&] { px.start(); });
+
+        int c = dial_tcp(front_drop);
+        REQUIRE(c >= 0);
+        const std::string sent = "hello\n";
+        REQUIRE(::write(c, sent.data(), sent.size()) == static_cast<ssize_t>(sent.size()));
+        // The bytes are swallowed and the connection stays open, which is the
+        // asymmetry with a Lua hook's refusal that the header now names.
+        CHECK(read_line(c, 600).empty());
+        ::close(c);
+
+        px.stop();
+        pt.join();
+    }
+
+    backend.stop();
+    bt.join();
 }
 
 TEST_CASE("cache wrapper store operations work without the network")
