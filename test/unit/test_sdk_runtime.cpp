@@ -109,6 +109,22 @@ std::string read_line(int fd, int ms)
     return out;
 }
 
+// connect() returning is not the server having accepted: the relay only
+// reaches clients the runtime has registered, and dial_tcp comes back as soon
+// as the kernel completes the handshake.  Under the sanitizer that window is
+// wide enough to lose the relay, which is how the mode case failed there and
+// passed in Release -- a race in the test, not in the runtime.
+bool wait_for_connects(const std::atomic<int>& seen, int want, int ms = 5000)
+{
+    for (int i = 0; i < ms / 25; ++i)
+    {
+        if (seen.load() >= want)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+}
+
 std::string unix_path_for(const char* tag)
 {
     return "/tmp/sdk_runtime_" + std::string(tag) + "_" +
@@ -255,9 +271,11 @@ TEST_CASE("start() refuses instead of serving nothing when the port is taken")
 TEST_CASE("the default mode relays each client's bytes to the others")
 {
     socketley::server srv(static_cast<uint16_t>(25892));
-    srv.on_message([&](int fd, std::string_view msg) {
-        srv.send(fd, "[fmt] " + std::string(msg));
-    });
+    std::atomic<int> seen{0};
+    srv.on_connect([&](int) { ++seen; })
+       .on_message([&](int fd, std::string_view msg) {
+           srv.send(fd, "[fmt] " + std::string(msg));
+       });
 
     std::thread t([&] { srv.start(); });
 
@@ -265,12 +283,15 @@ TEST_CASE("the default mode relays each client's bytes to the others")
     REQUIRE(a >= 0);
     int b = dial_tcp(25892);
     REQUIRE(b >= 0);
+    // Both registered before either speaks, or the relay has nobody to reach
+    // and the assertion below measures the wait rather than the mode.
+    REQUIRE(wait_for_connects(seen, 2));
 
-    // A's own reply is the formatted one; B is the neighbour that should not
-    // have heard anything at all.
+    // A's own reply is the formatted one; B is the neighbour that hears the
+    // raw line on top of it.
     CHECK(roundtrip(a, "just one line") == "[fmt] just one line");
 
-    const std::string heard = read_line(b, 400);
+    const std::string heard = read_line(b, 5000);
     CHECK(heard == "just one line");   // the raw relay, unformatted
 
     ::close(a); ::close(b);
@@ -281,7 +302,9 @@ TEST_CASE("the default mode relays each client's bytes to the others")
 TEST_CASE("mode_in stops it, which is what the examples set")
 {
     socketley::server srv(static_cast<uint16_t>(25893));
+    std::atomic<int> seen{0};
     srv.mode(mode_in)
+       .on_connect([&](int) { ++seen; })
        .on_message([&](int fd, std::string_view msg) {
            srv.send(fd, "[fmt] " + std::string(msg));
        });
@@ -292,9 +315,13 @@ TEST_CASE("mode_in stops it, which is what the examples set")
     REQUIRE(a >= 0);
     int b = dial_tcp(25893);
     REQUIRE(b >= 0);
+    // The same wait as the case above, and it is what makes this one mean
+    // anything: B silent because it was never registered proves nothing about
+    // mode_in.
+    REQUIRE(wait_for_connects(seen, 2));
 
     CHECK(roundtrip(a, "just one line") == "[fmt] just one line");
-    CHECK(read_line(b, 400).empty());
+    CHECK(read_line(b, 1500).empty());
 
     ::close(a); ::close(b);
     srv.stop();
