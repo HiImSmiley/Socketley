@@ -64,9 +64,8 @@ public:
     client& lua(std::string_view path)     { raw()->load_lua_script(path); return *this; }
     client& tick_interval(uint32_t ms)     { raw()->set_tick_interval(ms); return *this; }
     client& group(std::string_view g)      { raw()->set_group(g); return *this; }
-    // See server::cpus / server::sqpoll — same contract, this wrapper's loop.
+    // See server::cpus — same contract, this wrapper's loop.
     client& cpus(std::string_view spec)    { detail::apply_cpus(m_loop, spec); return *this; }
-    client& sqpoll(bool on = true)         { m_loop.set_sqpoll(on); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
     client& on_start(std::function<void()> cb)                   { raw()->set_on_start(std::move(cb)); return *this; }
@@ -121,7 +120,6 @@ public:
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
         if (!m_loop.init()) return false;
-        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
             LOG_ERROR((std::string(raw()->get_name()) +

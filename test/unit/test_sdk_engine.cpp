@@ -40,7 +40,6 @@ int main()
     // Server on an AF_UNIX listener (constructor overload), and a named one
     {
         socketley::server srv("unix:/tmp/_sdk_compile_test.sock");
-        srv.sqpoll(false);
         srv.cpus("max");
     }
     {
@@ -58,8 +57,7 @@ int main()
         socketley::client cli("127.0.0.1", 9000);
         cli.reconnect(5)
            .tick_interval(2000)
-           .group("web")
-           .sqpoll(false);
+           .group("web");
 
         cli.on_start([]{ })
            .on_stop([]{ })
@@ -87,8 +85,7 @@ int main()
           .max_connections(500)
           .idle_timeout(60)
           .sidecar()
-          .drain()
-          .sqpoll(false);
+          .drain();
 
         px.on_start([]{ })
           .on_stop([]{ })
@@ -115,8 +112,7 @@ int main()
          .max_connections(200)
          .idle_timeout(120)
          .log_file("/tmp/test.log")
-         .drain()
-         .sqpoll(false);
+         .drain();
         (void)c.get_listen_path();
     }
 

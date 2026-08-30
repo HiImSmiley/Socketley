@@ -63,13 +63,5 @@ inline void apply_cpus(event_loop& loop, std::string_view spec) {
     loop.set_cpus(set);
 }
 
-// After init(): SQPOLL is a request the kernel may refuse, and a wrapper user
-// who asked for a poller deserves one line saying they did not get one.
-inline void warn_if_sqpoll_denied(event_loop& loop) {
-    if (loop.sqpoll_requested() && !loop.sqpoll_enabled())
-        LOG_WARN("sqpoll(true): the kernel refused a submission poller; "
-                 "running without one");
-}
-
 } // namespace detail
 } // namespace socketley

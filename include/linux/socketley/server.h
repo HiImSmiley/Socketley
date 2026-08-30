@@ -95,11 +95,6 @@ public:
     // `--cpus` spellings.  Applied to the loop this wrapper owns; a spec that
     // does not parse is logged and ignored (see detail::apply_cpus).
     server& cpus(std::string_view spec)    { detail::apply_cpus(m_loop, spec); return *this; }
-    // Ask for (or decline) an SQPOLL submission poller on this wrapper's ring.
-    // A request: the kernel may refuse it, and start() logs one line if it
-    // does.  Must be called before start() — a ring's polling mode is fixed
-    // when the ring is created.
-    server& sqpoll(bool on = true)         { m_loop.set_sqpoll(on); return *this; }
 
     // ── Callbacks (chainable) ───────────────────────────────────────────
     server& on_start(std::function<void()> cb)                              { raw()->set_on_start(std::move(cb)); return *this; }
@@ -184,7 +179,6 @@ public:
     // that produce none (a TCP bind failure returns false silently).
     bool start() {
         if (!m_loop.init()) return false;
-        detail::warn_if_sqpoll_denied(m_loop);
         detail::install_signal_handlers(&m_loop);
         if (!m_mgr.start(m_name, m_loop) || raw()->get_state() != runtime_running) {
             LOG_ERROR((std::string(raw()->get_name()) +
