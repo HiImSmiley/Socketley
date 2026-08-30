@@ -168,10 +168,12 @@ private:
     // still follows fsync, and one writer on one FIFO preserves order.
     struct job
     {
-        enum kind { write_cfg, remove_file, flip_running } k;
+        enum kind { write_cfg, remove_file, flip_running } k{write_cfg};
         runtime_config cfg;      // write_cfg
         std::string    name;     // remove_file, flip_running
-        bool           running;  // flip_running
+        // Initialised because every job is moved into the queue, and moving a
+        // write_cfg reads a bool no caller ever set.
+        bool           running{false};
     };
 
     void writer_loop();

@@ -257,6 +257,15 @@ done
 nodeA stop "$RT_N" >/dev/null 2>&1 || true
 sleep 0.3
 
+# Judged only on what arrives after the stop.  Until then this runtime is a
+# running member of group api and its own creation is what changes that group's
+# count -- cluster_discovery counts local members too -- so a NEVER_GROUP line
+# written before the stop is correct delivery to a live runtime, not the leak
+# this test is looking for.  Reopened per append by the script, so truncating
+# it here loses nothing the runtime still holds.
+NEVER_BEFORE=$(cat "$NEVER_OUT" 2>/dev/null || echo "")
+: > "$NEVER_OUT"
+
 
 # ─── Start daemon B ──────────────────────────────────────────────────────────
 start_node "$SOCK_B" nodeB
@@ -278,7 +287,7 @@ assert_contains "$OUT" "JOIN=nodeB"
 # proving the script ran and registered, which an absence cannot.
 echo "  Test 2b: a stopped runtime hears no cluster event"
 NEVER=$(cat "$NEVER_OUT" 2>/dev/null || echo "")
-assert_contains "$NEVER" "LOADED"
+assert_contains "$NEVER_BEFORE" "LOADED"
 TOTAL=$((TOTAL+1))
 case "$NEVER" in
     *NEVER_JOIN=*|*NEVER_LEAVE=*|*NEVER_GROUP=*)
