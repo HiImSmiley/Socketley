@@ -66,7 +66,9 @@ public:
 
     void set_state_persistence(state_persistence* sp);
     void set_cluster_discovery(cluster_discovery* cd);
-    void set_metrics_port(uint16_t port);
+    // Both, because a configured port and a bound one are different answers
+    // and `dashboard` was giving the first when it meant the second.
+    void set_metrics_port(uint16_t port, bool bound);
 
     // The identity a daemon configuration file asks for, applied at startup
     // because `daemon-name` and `daemon-cluster` both need a daemon that is
@@ -75,6 +77,11 @@ public:
                                        const std::string& cluster_dir);
 
     static std::string socket_path;
+
+    // Where every daemon writes the one file naming its socket, so a listing
+    // can say how many are running rather than answer for one and not say
+    // which -- empty when nothing registered this daemon.
+    static std::string daemons_dir;
 
     // Whether the path above is the packaged deployment's socket rather than
     // one this daemon owns alone, read only by setup(), and false by default
@@ -173,6 +180,7 @@ private:
     std::unique_ptr<cluster_discovery> m_owned_cluster;
     std::string m_daemon_name;
     uint16_t m_metrics_port{0};
+    bool     m_metrics_bound{false};
 
     // The last --cluster this daemon refused and why, so a node with
     // clustering off can say so rather than reporting the same as one never

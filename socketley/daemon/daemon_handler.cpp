@@ -56,7 +56,54 @@ constexpr auto worker_startup_bound = std::chrono::milliseconds(2000);
 }
 
 std::string daemon_handler::socket_path = "/tmp/socketley.sock";
+std::string daemon_handler::daemons_dir;
 bool        daemon_handler::system_socket = false;
+
+// A column is as wide as its widest value plus a gap, never narrower than its
+// heading: TYPE was a fixed eight and a registered type's name is arbitrary, so
+// `mdid_store` ran into PORT and left a row nothing could split into fields.
+static int col_width(int base, size_t longest)
+{
+    return std::max(static_cast<size_t>(base), longest + 2) > 200
+               ? 200
+               : static_cast<int>(std::max(static_cast<size_t>(base), longest + 2));
+}
+
+// A second daemon is invisible from inside the first: SOCKETLEY_SOCKET moves
+// the socket and the state directory together, so `ls` answers for whichever
+// one the environment points at and never says which.
+static std::string daemon_hint()
+{
+    if (daemon_handler::daemons_dir.empty())
+        return {};
+
+    int live = 0;
+    std::error_code ec;
+    for (const auto& e :
+         std::filesystem::directory_iterator(daemon_handler::daemons_dir, ec))
+    {
+        if (e.path().extension() != ".daemon")
+            continue;
+        const std::string stem = e.path().stem().string();
+        long pid = 0;
+        const auto* end = stem.data() + stem.size();
+        if (std::from_chars(stem.data(), end, pid).ptr != end || pid <= 0)
+            continue;
+        // The pid decides, not the file: a daemon killed outright leaves its
+        // own behind, and EPERM is another user's live daemon.
+        if (::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM)
+            ++live;
+    }
+
+    // One daemon is the ordinary case and needs no line about it; the hint is
+    // for the day the answer came from a daemon the operator forgot about.
+    if (live < 2)
+        return {};
+
+    return "\n" + std::to_string(live) + " daemons are running; this is pid " +
+           std::to_string(::getpid()) + " on " + daemon_handler::socket_path +
+           " -- `socketley daemons` lists them all\n";
+}
 
 // Why this runtime's TLS configuration cannot be honoured, repeated wherever a
 // runtime goes live because a state file written before the parse gate existed
@@ -1486,8 +1533,6 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     std::shared_lock lock(m_manager.mutex);
 
     const auto& runtimes = m_manager.list();
-    if (runtimes.empty())
-        return 0;
 
     bool silent = false;
     bool json_format = false;
@@ -1539,6 +1584,16 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_status || col_conn || col_owner || col_created || col_group;
 
+    // Checked here rather than at the top because an empty listing is exactly
+    // where the wrong daemon looks like an idle one, and the hint below is the
+    // only thing that would say otherwise.
+    if (runtimes.empty())
+    {
+        if (!json_format && !any_col && !silent)
+            conn->write_buf = daemon_hint();
+        return 0;
+    }
+
     if (json_format)
     {
         std::ostringstream out;
@@ -1588,13 +1643,24 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
 
     if (!any_col)
     {
+        size_t w_name = 0, w_type = 0, w_owner = 0;
+        for (const auto& [name, instance] : runtimes)
+        {
+            w_name  = std::max(w_name, name.size());
+            w_type  = std::max(w_type, std::strlen(type_to_string(instance->get_type())));
+            w_owner = std::max(w_owner, instance->get_owner().size());
+        }
+        const int cw_name  = col_width(16, w_name);
+        const int cw_type  = col_width(8,  w_type);
+        const int cw_owner = col_width(12, w_owner);
+
         if (!silent)
             out << std::setw(10) << "ID"
-                << std::setw(16) << "NAME"
-                << std::setw(8)  << "TYPE"
+                << std::setw(cw_name) << "NAME"
+                << std::setw(cw_type) << "TYPE"
                 << std::setw(8)  << "PORT"
                 << std::setw(6)  << "CONN"
-                << std::setw(12) << "OWNED BY"
+                << std::setw(cw_owner) << "OWNED BY"
                 << std::setw(20) << "STATUS"
                 << "CREATED\n";
 
@@ -1617,11 +1683,11 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             out << std::setw(10) << instance->get_id()
-                << std::setw(16) << name
-                << std::setw(8)  << type_to_string(instance->get_type())
+                << std::setw(cw_name) << name
+                << std::setw(cw_type) << type_to_string(instance->get_type())
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
                 << std::setw(6)  << instance->reported_connection_count()
-                << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
+                << std::setw(cw_owner) << (owner.empty() ? "-" : std::string(owner))
                 << std::setw(20) << status_str
                 << format_time_ago(instance->get_created_time()) << "\n";
         }
@@ -1673,6 +1739,9 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             out << '\n';
         }
     }
+
+    if (!any_col && !silent)
+        out << daemon_hint();
 
     conn->write_buf = out.str();
     return 0;
@@ -1735,10 +1804,6 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
     const auto listed = [&](const runtime_instance* inst)
     { return all || inst->get_state() == runtime_running; };
 
-    if (std::none_of(runtimes.begin(), runtimes.end(),
-                     [&](const auto& p) { return listed(p.second.get()); }))
-        return 0;
-
     // As in cmd_ls: `-s` alone is the names-only listing both the man page and
     // the help script promise; a named column keeps it meaning header-off.
     if (silent && !col_id && !col_name && !col_type && !col_port &&
@@ -1747,6 +1812,14 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 
     bool any_col = col_id || col_name || col_type || col_port ||
                    col_uptime || col_conn || col_owner || col_created;
+
+    if (std::none_of(runtimes.begin(), runtimes.end(),
+                     [&](const auto& p) { return listed(p.second.get()); }))
+    {
+        if (!json_format && !any_col && !silent)
+            conn->write_buf = daemon_hint();
+        return 0;
+    }
 
     if (json_format)
     {
@@ -1792,13 +1865,28 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
 
     if (!any_col)
     {
+        // Over the rows this will print, not every runtime: `ps` without -a
+        // leaves the stopped ones out and their names should not widen it.
+        size_t w_name = 0, w_type = 0, w_owner = 0;
+        for (const auto& [name, instance] : runtimes)
+        {
+            if (!listed(instance.get()))
+                continue;
+            w_name  = std::max(w_name, name.size());
+            w_type  = std::max(w_type, std::strlen(type_to_string(instance->get_type())));
+            w_owner = std::max(w_owner, instance->get_owner().size());
+        }
+        const int cw_name  = col_width(16, w_name);
+        const int cw_type  = col_width(8,  w_type);
+        const int cw_owner = col_width(12, w_owner);
+
         if (!silent)
             out << std::setw(10) << "ID"
-                << std::setw(16) << "NAME"
-                << std::setw(8)  << "TYPE"
+                << std::setw(cw_name) << "NAME"
+                << std::setw(cw_type) << "TYPE"
                 << std::setw(8)  << "PORT"
                 << std::setw(6)  << "CONN"
-                << std::setw(12) << "OWNED BY"
+                << std::setw(cw_owner) << "OWNED BY"
                 << std::setw(20) << "STATUS"
                 << "CREATED\n";
 
@@ -1809,11 +1897,11 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             out << std::setw(10) << instance->get_id()
-                << std::setw(16) << name
-                << std::setw(8)  << type_to_string(instance->get_type())
+                << std::setw(cw_name) << name
+                << std::setw(cw_type) << type_to_string(instance->get_type())
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
                 << std::setw(6)  << instance->reported_connection_count()
-                << std::setw(12) << (owner.empty() ? "-" : std::string(owner))
+                << std::setw(cw_owner) << (owner.empty() ? "-" : std::string(owner))
                 << std::setw(20) << state_column(instance.get())
                 << format_time_ago(instance->get_created_time()) << "\n";
         }
@@ -1854,6 +1942,9 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             out << '\n';
         }
     }
+
+    if (!any_col && !silent)
+        out << daemon_hint();
 
     conn->write_buf = out.str();
     return 0;
@@ -5527,8 +5618,9 @@ int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& 
     return 0;
 }
 
-void daemon_handler::set_metrics_port(uint16_t port)
+void daemon_handler::set_metrics_port(uint16_t port, bool bound)
 {
+    m_metrics_bound = bound;
     m_metrics_port = port;
 }
 
@@ -5538,6 +5630,19 @@ int daemon_handler::cmd_dashboard(ipc_connection* conn)
     {
         conn->write_buf = "metrics endpoint not configured\n"
             "add metrics_port = 9100 to socketley.conf to enable the dashboard\n";
+        return 1;
+    }
+
+    // Named as this daemon's failure rather than printed as a URL, because the
+    // process holding that port is almost always another daemon and its
+    // dashboard is the one the operator would have been reading.
+    if (!m_metrics_bound)
+    {
+        conn->write_buf =
+            "metrics_port " + std::to_string(m_metrics_port) +
+            " is configured but this daemon could not bind it\n"
+            "something else holds it; `socketley daemons` lists the daemons "
+            "running here\n";
         return 1;
     }
 

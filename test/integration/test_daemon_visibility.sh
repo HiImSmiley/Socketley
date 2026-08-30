@@ -140,6 +140,44 @@ if [ -n "$SDK_BIN" ]; then
         bad "the mark follows SOCKETLEY_SOCKET" "said: $OUT2"
     fi
 
+    # ── The hint in `ls`, which is where the question is actually asked ─────
+    #
+    # `socketley daemons` answers it only for someone who already suspects a
+    # second daemon.  The person who does not is looking at `ls`, and the two
+    # cases below are the ones that mislead: a listing that is right for the
+    # wrong daemon, and an empty one that reads as an idle machine.
+    A() { SOCKETLEY_SOCKET="$A_SOCK" "$BIN" "$@" </dev/null 2>&1; }
+    A create server dv_hint -p $((PORT+5)) -s >/dev/null
+    OUT=$(A ls)
+    if grep -q "2 daemons are running" <<<"$OUT"; then ok; else
+        bad "ls says how many daemons are running" "said: $OUT"
+    fi
+    if grep -qF "$A_SOCK" <<<"$OUT"; then ok; else
+        bad "and names the one that answered" "said: $OUT"
+    fi
+
+    # The empty listing, from the daemon that has nothing -- the case where
+    # there is no table for the line to hang under.
+    OUT=$(SOCKETLEY_SOCKET="$B_SOCK" "$BIN" ls </dev/null 2>&1)
+    if grep -q "2 daemons are running" <<<"$OUT"; then ok; else
+        bad "an empty ls still says which daemon answered" \
+            "said: [$OUT]" \
+            "nothing listed on the wrong daemon looks like an idle machine"
+    fi
+
+    # Anything a script reads must be untouched, or the hint has traded one
+    # silent wrong answer for another.
+    if [ -z "$(SOCKETLEY_SOCKET="$B_SOCK" "$BIN" ls --json </dev/null 2>&1)" ] &&
+       ! grep -q daemons <<<"$(A ls --json)" &&
+       ! grep -q daemons <<<"$(A ls -s)" &&
+       ! grep -q daemons <<<"$(A ls --name --port)"
+    then ok; else
+        bad "--json, -s and named columns carry no hint" \
+            "json: $(A ls --json)" "-s:   $(A ls -s)"
+    fi
+
+    A remove dv_hint >/dev/null
+
     # ── A daemon that cannot clean up after itself ──────────────────────────
     kill -9 "$B_PID" 2>/dev/null
     # Reaped here so the shell does not print its own "Killed" line into the
@@ -153,6 +191,14 @@ if [ -n "$SDK_BIN" ]; then
             "said: $OUT" \
             "the file it left behind must not be taken for a running daemon"
     fi
+
+    # One daemon is the ordinary case, and a line about it on every listing
+    # would be read past by the time it mattered.
+    A create server dv_solo -p $((PORT+6)) -s >/dev/null
+    if ! grep -q "daemons are running" <<<"$(A ls)"; then ok; else
+        bad "with one daemon left the hint is gone" "said: $(A ls)"
+    fi
+    A remove dv_solo >/dev/null
 fi
 
 # ── Stopping one, over the socket rather than by pid ────────────────────────

@@ -5,6 +5,9 @@
 #include "../shared/blocking_write.h"
 #include "../shared/logging.h"
 #include "../shared/version.h"
+#include "../shared/runtime_definitions.h"
+#include "../shared/daemon_client.h"
+#include "daemon_handler.h"
 
 #include <unistd.h>
 #include <cerrno>
@@ -289,6 +292,19 @@ static void json_escape_into(std::string& out, std::string_view s)
     }
 }
 
+// Prometheus escapes a label value as backslash, quote and newline and nothing
+// else, so this is not json_escape_into under another name.
+static void label_escape_into(std::string& out, std::string_view s)
+{
+    for (char c : s)
+    {
+        if (c == '\\')      out += "\\\\";
+        else if (c == '"')  out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else                out += c;
+    }
+}
+
 static void json_append_uint(std::string& out, uint64_t v)
 {
     char buf[24];
@@ -352,6 +368,27 @@ std::string metrics_endpoint::build_metrics() const
     out.reserve(2048 + snapshots.size() * 256);
 
     // Prometheus exposition format
+    //
+    // Which daemon answered, first: several may serve one machine and every
+    // series below is identically named on each of them.  The scrape target
+    // distinguishes them only for whoever configured the scrape.
+    std::string exe;
+    uint64_t dev = 0, ino = 0;
+    if (!socketley::self_exe_identity(exe, dev, ino))
+        exe.clear();
+
+    out += "# HELP socketley_daemon_info The daemon these numbers come from.\n"
+           "# TYPE socketley_daemon_info gauge\n"
+           "socketley_daemon_info{version=\"";
+    label_escape_into(out, SOCKETLEY_VERSION);
+    out += "\",pid=\"";
+    json_append_uint(out, static_cast<uint64_t>(::getpid()));
+    out += "\",socket=\"";
+    label_escape_into(out, daemon_handler::socket_path);
+    out += "\",exe=\"";
+    label_escape_into(out, exe);
+    out += "\"} 1\n\n";
+
     out += "# HELP socketley_runtimes_total Total number of runtimes.\n"
            "# TYPE socketley_runtimes_total gauge\n"
            "socketley_runtimes_total ";
@@ -390,19 +427,14 @@ std::string metrics_endpoint::build_metrics() const
         if (s.state != runtime_running)
             continue;
 
-        const char* type_str = "unknown";
-        switch (s.type)
-        {
-            case runtime_server: type_str = "server"; break;
-            case runtime_client: type_str = "client"; break;
-            case runtime_proxy:  type_str = "proxy";  break;
-            case runtime_cache:  type_str = "cache";  break;
-        }
+        // The registry, not a switch over the four built-ins: a registered
+        // type has no enumerator to name and was scraped as "unknown".
+        const char* type_str = type_to_string(s.type);
 
         out += "socketley_runtime_connections{name=\"";
-        out += s.name;
+        label_escape_into(out, s.name);
         out += "\",type=\"";
-        out += type_str;
+        label_escape_into(out, type_str);
         out += "\"} ";
         json_append_uint(out, static_cast<uint64_t>(s.active_connections));
         out += "\n";
@@ -414,7 +446,7 @@ std::string metrics_endpoint::build_metrics() const
     for (const auto& s : snapshots)
     {
         out += "socketley_runtime_messages_total{name=\"";
-        out += s.name;
+        label_escape_into(out, s.name);
         out += "\"} ";
         json_append_uint(out, s.total_messages);
         out += "\n";

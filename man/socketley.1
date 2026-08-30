@@ -888,6 +888,16 @@ for a server started with
 The PORT column shows
 .B \-
 for one of those, since it has none.
+.IP
+When more than one daemon is running, a line under the table says how many and
+which one answered \(em including when the table is empty, because a listing
+from the wrong daemon looks exactly like an idle machine. It is printed only for
+the default table:
+.BR \-\-json ,
+.B \-s
+and the column selectors are what scripts read and carry nothing extra.
+.B ps
+does the same.
 .RS
 .PP
 .B Column selectors

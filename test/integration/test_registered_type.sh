@@ -97,6 +97,15 @@ kind = "bool"
 default = "false"
 EOF
 
+# A second manifest whose only job is a name longer than the TYPE column.  Its
+# worker cannot build the type, so the runtime fails to start and is listed as
+# Failed -- which is all the column needs to be measured.
+cat > "$HOME/.config/socketley/types/wide.toml" <<EOF
+name = "a_registered_type_with_a_long_name"
+exec = $WORKER
+manifest_version = 1
+EOF
+
 daemon_start "$BIN"
 
 # ── The schema is the flag set ──────────────────────────────────────────────
@@ -127,6 +136,26 @@ LS=$("$BIN" ls 2>/dev/null)
 if has "$LS" "hi" && has "$LS" "greeter"; then ok; else
     bad "ls names the runtime and its type" "$LS"
 fi
+
+# The TYPE column is a fixed eight characters wide and a registered type's
+# name is whatever the manifest says, so a longer one ran into PORT and left a
+# row that could not be split into fields at all -- and awk over `ls` is how
+# half this suite reads a runtime's state.
+if [ "$(awk '$2 == "hi" { print $3 }' <<<"$LS")" = "greeter" ]; then ok; else
+    bad "the TYPE column is its own field" \
+        "awk gave: $(awk '$2 == "hi" { print $3 }' <<<"$LS")" \
+        "$LS"
+fi
+
+"$BIN" create a_registered_type_with_a_long_name wide1 -p $((PORT+8)) -s >/dev/null 2>&1
+WIDE=$("$BIN" ls 2>/dev/null)
+if [ "$(awk '$2 == "wide1" { print $3 }' <<<"$WIDE")" = \
+     "a_registered_type_with_a_long_name" ]; then ok; else
+    bad "and stays one when the type name is longer than the column" \
+        "awk gave: $(awk '$2 == "wide1" { print $3 }' <<<"$WIDE")" \
+        "$WIDE"
+fi
+"$BIN" remove wide1 >/dev/null 2>&1
 
 PS=$("$BIN" ps 2>/dev/null)
 if has "$PS" "hi"; then ok; else

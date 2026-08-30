@@ -541,6 +541,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Set socket path for daemon_handler and ipc_client
     daemon_handler::socket_path = paths.socket_path.string();
+    daemon_handler::daemons_dir = paths.daemons_dir.string();
 
     // Whether this daemon is the packaged one, decided from system_mode and
     // the default socket path together, because system_mode alone is settled
@@ -629,14 +630,19 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // Start metrics endpoint if configured
     metrics_endpoint metrics(manager);
+    bool metrics_bound = false;
     if (metrics_port > 0)
     {
-        if (metrics.start(metrics_port))
+        metrics_bound = metrics.start(metrics_port);
+        if (metrics_bound)
             LOG_INFO("metrics endpoint started");
         else
             LOG_WARN("failed to start metrics endpoint");
     }
-    handler.set_metrics_port(metrics_port);
+    // Whether it bound, and not just which port was asked for: `dashboard`
+    // prints this as a URL, and a second daemon that lost the bind was sending
+    // the operator to the first one's numbers.
+    handler.set_metrics_port(metrics_port, metrics_bound);
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
