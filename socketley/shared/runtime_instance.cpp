@@ -877,7 +877,7 @@ std::string runtime_instance::get_stats() const
         && get_state() == runtime_running)
         return stats_prefix() + "worker_report:none\n";
 
-    return stats_prefix() + stats_ring() + stats_extra();
+    return stats_prefix() + stats_ring() + stats_lines();
 }
 
 // The counters, and nothing that needs a connection table walked, which is

@@ -6,10 +6,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/custom-type/greeter_worker.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit -Lthirdparty/liburing \
-//       -lsocketley_sdk -lluajit -luring -lssl -lcrypto \
-//       -o /usr/local/lib/socketley/greeter-worker
+//       $(sdk/socketley-config --cflags --libs) -o /usr/local/lib/socketley/greeter-worker
 //
 // Install the manifest (greeter.toml beside this file) into the daemon's
 // types directory, point its `exec` at the binary above, then:
@@ -23,7 +20,7 @@
 #include <memory>
 #include <string>
 
-#include "socketley/runtime/server/server_instance.h"
+#include <socketley/runtime/server.h>
 
 namespace
 {
@@ -44,14 +41,14 @@ public:
                 for (char& c : out)
                     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
             out += "\n";
-            lua_send_to(fd, out);
+            send_to(fd, out);
             ++m_greetings;
         });
     }
 
     // The daemon validated every key against the manifest schema, so this
     // side only has to read them.
-    void apply_extra(const std::vector<std::pair<std::string, std::string>>& in) override
+    void apply_config(const std::vector<std::pair<std::string, std::string>>& in) override
     {
         m_extra = in;
         for (const auto& [k, v] : in)
@@ -65,14 +62,14 @@ public:
         }
     }
 
-    void capture_extra(std::vector<std::pair<std::string, std::string>>& out) const override
+    void capture_config(std::vector<std::pair<std::string, std::string>>& out) const override
     {
         out = m_extra;
     }
 
     // Travels to the daemon in the stats frame's free-text detail, so
     // `socketley stats` prints it beside the counters.
-    std::string stats_extra() const override
+    std::string stats_lines() const override
     {
         return "greetings:" + std::to_string(m_greetings) + "\n";
     }

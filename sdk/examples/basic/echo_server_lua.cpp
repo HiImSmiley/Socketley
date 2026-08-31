@@ -4,9 +4,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/basic/echo_server_lua.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/echo_server_lua
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/echo_server_lua
 //
 // Run: /tmp/echo_server_lua sdk/examples/server_config.lua
 //

@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/advanced/heartbeat_server.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/heartbeat_server
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/heartbeat_server
 //
 // Run: /tmp/heartbeat_server
 // Test: nc 127.0.0.1 9000   (idle for 30s to get kicked)

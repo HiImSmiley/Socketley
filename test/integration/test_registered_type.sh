@@ -62,12 +62,13 @@ SANFLAGS=""
 case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
 
 WORKER="$SOCKETLEY_TMPD/greeter-worker"
+SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) || {
+    echo "  FAIL [socketley-config answers]: $SDKFLAGS"
+    echo "  Results: 0/1 passed (1 failed)"
+    exit 1
+}
 if g++ -std=c++23 $SANFLAGS \
-       "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" \
-       -I"$ROOT" -I"$ROOT/include/linux" \
-       -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
-       -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
-       -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
+       "$ROOT/sdk/examples/custom-type/greeter_worker.cpp" $SDKFLAGS \
        -o "$WORKER" 2>"$SOCKETLEY_TMPD/gxx.err"; then
     ok
 else
@@ -200,7 +201,7 @@ if has "$STATS" "type:greeter"; then ok; else
 fi
 if command -v nc >/dev/null 2>&1; then
     if has "$STATS" "greetings:1"; then ok; else
-        bad "the worker's stats_extra() reaches the daemon" "$STATS"
+        bad "the worker's stats_lines() reaches the daemon" "$STATS"
     fi
 fi
 

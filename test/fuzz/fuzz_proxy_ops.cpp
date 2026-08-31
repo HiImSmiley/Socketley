@@ -576,7 +576,7 @@ void print_program()
             case OP_FIN:        std::fprintf(stderr, "client[%d].shutdown(SHUT_WR);\n", s.a % NCLIENTS); break;
             case OP_ABORT:      std::fprintf(stderr, "client[%d].close();   // RST\n", s.a % NCLIENTS); break;
             case OP_CLOSE_CLIENT:
-                std::fprintf(stderr, "rt.lua_close_client(client[%d]);\n", s.a % NCLIENTS); break;
+                std::fprintf(stderr, "rt.close_client(client[%d]);\n", s.a % NCLIENTS); break;
             case OP_BE_LISTEN:  std::fprintf(stderr, "backend[%d].listen = %s;\n",
                                              s.a % NBACKENDS, listen_mode_name(s.b)); break;
             case OP_BE_ACCEPT:  std::fprintf(stderr, "backend[%d].accept();\n", s.a % NBACKENDS); break;
@@ -3046,7 +3046,7 @@ void run_step(world& w, const step& s)
             {
                 const int target = c.proxy_fd >= 0 ? c.proxy_fd
                                                    : static_cast<int>(s.b);
-                w.rt->lua_close_client(target);
+                w.rt->close_client(target);
 
                 // Marked on the connection that was actually closed, not on the
                 // client this step names.

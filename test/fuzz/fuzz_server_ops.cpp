@@ -337,12 +337,12 @@ void print_program()
             case OP_RECV:       std::fprintf(stderr, "peer[%d].recv();\n", s.a % NPEERS); break;
             case OP_FIN:        std::fprintf(stderr, "peer[%d].shutdown(SHUT_WR);\n", s.a % NPEERS); break;
             case OP_ABORT:      std::fprintf(stderr, "peer[%d].close();   // RST\n", s.a % NPEERS); break;
-            case OP_BROADCAST:  std::fprintf(stderr, "rt.lua_broadcast(%s);\n", payload_at(s.b).name); break;
-            case OP_SEND_TO:    std::fprintf(stderr, "rt.lua_send_to(client[%d], %s);\n",
+            case OP_BROADCAST:  std::fprintf(stderr, "rt.broadcast(%s);\n", payload_at(s.b).name); break;
+            case OP_SEND_TO:    std::fprintf(stderr, "rt.send_to(client[%d], %s);\n",
                                              s.a, payload_at(s.b).name); break;
-            case OP_DISCONNECT: std::fprintf(stderr, "rt.lua_disconnect(client[%d]);\n", s.a); break;
-            case OP_PIPE:       std::fprintf(stderr, "rt.lua_pipe(client[%d], client[%d]);\n", s.a, s.b); break;
-            case OP_UNPIPE:     std::fprintf(stderr, "rt.lua_unpipe(client[%d]);\n", s.a); break;
+            case OP_DISCONNECT: std::fprintf(stderr, "rt.disconnect(client[%d]);\n", s.a); break;
+            case OP_PIPE:       std::fprintf(stderr, "rt.pipe(client[%d], client[%d]);\n", s.a, s.b); break;
+            case OP_UNPIPE:     std::fprintf(stderr, "rt.unpipe(client[%d]);\n", s.a); break;
             case OP_GROUP:      std::fprintf(stderr, "rt.group_%s(client[%d], \"g%d\");\n",
                                              (s.c % 3) == 0 ? "join" : (s.c % 3) == 1 ? "leave" : "send",
                                              s.a, s.b % 3); break;
@@ -491,10 +491,10 @@ void cb_on_client_message(int fd, std::string_view msg)
     switch (g_cb_mode % 6)
     {
         case 0: break;
-        case 1: rt->lua_broadcast(msg); break;
-        case 2: rt->lua_send_to(fd, "ack"); break;
-        case 3: rt->lua_disconnect(fd); break;
-        case 4: rt->lua_send_to(fd, "bye"); rt->lua_disconnect(fd); break;
+        case 1: rt->broadcast(msg); break;
+        case 2: rt->send_to(fd, "ack"); break;
+        case 3: rt->disconnect(fd); break;
+        case 4: rt->send_to(fd, "bye"); rt->disconnect(fd); break;
         default: break;
     }
 }
@@ -503,7 +503,7 @@ void cb_on_connect(int fd)
 {
     auto* rt = live_rt();
     if (rt && (g_cb_mode % 6) == 2)
-        rt->lua_send_to(fd, "welcome");
+        rt->send_to(fd, "welcome");
 }
 
 void cb_on_disconnect(int fd)
@@ -514,8 +514,8 @@ void cb_on_disconnect(int fd)
     // released, and it can put a message back on the connection that is leaving.
     if (rt && (g_cb_mode % 6) == 5)
     {
-        rt->lua_send_to(fd, "gone");
-        rt->lua_broadcast("someone left");
+        rt->send_to(fd, "gone");
+        rt->broadcast("someone left");
     }
 }
 
@@ -565,10 +565,10 @@ void stub_cache::serve_request(std::string_view payload, std::string& out)
             auto* rt = live_rt();
             if (rt)
             {
-                rt->lua_broadcast("from-the-cache\n");
-                std::vector<int> fds = rt->lua_clients();
+                rt->broadcast("from-the-cache\n");
+                std::vector<int> fds = rt->clients();
                 if (!fds.empty() && (payload.size() & 1))
-                    rt->lua_disconnect(fds[payload.size() % fds.size()]);
+                    rt->disconnect(fds[payload.size() % fds.size()]);
                 static unsigned n = 0;
                 if ((++n & 7) == 0)
                     rt->stop(*g_loop);
@@ -816,7 +816,7 @@ int client_fd(world& w, uint8_t sel)
 {
     if (!w.rt)
         return -1;
-    std::vector<int> fds = w.rt->lua_clients();
+    std::vector<int> fds = w.rt->clients();
     if (fds.empty())
         return static_cast<int>(sel) % 64;   // a number nobody is serving
     return fds[sel % fds.size()];
@@ -959,7 +959,7 @@ void run_step(world& w, const step& s)
             if (w.rt)
             {
                 const payload& p = payload_at(s.b);
-                w.rt->lua_broadcast(std::string_view(p.data, p.len));
+                w.rt->broadcast(std::string_view(p.data, p.len));
             }
             break;
 
@@ -967,23 +967,23 @@ void run_step(world& w, const step& s)
             if (w.rt)
             {
                 const payload& p = payload_at(s.b);
-                w.rt->lua_send_to(client_fd(w, s.a), std::string_view(p.data, p.len));
+                w.rt->send_to(client_fd(w, s.a), std::string_view(p.data, p.len));
             }
             break;
 
         case OP_DISCONNECT:
             if (w.rt)
-                w.rt->lua_disconnect(client_fd(w, s.a));
+                w.rt->disconnect(client_fd(w, s.a));
             break;
 
         case OP_PIPE:
             if (w.rt)
-                w.rt->lua_pipe(client_fd(w, s.a), client_fd(w, s.b));
+                w.rt->pipe(client_fd(w, s.a), client_fd(w, s.b));
             break;
 
         case OP_UNPIPE:
             if (w.rt)
-                w.rt->lua_unpipe(client_fd(w, s.a));
+                w.rt->unpipe(client_fd(w, s.a));
             break;
 
         case OP_GROUP:
@@ -991,9 +991,9 @@ void run_step(world& w, const step& s)
             {
                 const char* names[3] = { "g0", "g1", "g2" };
                 const char* g = names[s.b % 3];
-                if ((s.c % 3) == 0)      w.rt->lua_join_group(client_fd(w, s.a), g);
-                else if ((s.c % 3) == 1) w.rt->lua_leave_group(client_fd(w, s.a), g);
-                else                     w.rt->lua_group_send(g, "grp\n");
+                if ((s.c % 3) == 0)      w.rt->join_group(client_fd(w, s.a), g);
+                else if ((s.c % 3) == 1) w.rt->leave_group(client_fd(w, s.a), g);
+                else                     w.rt->group_send(g, "grp\n");
             }
             break;
 

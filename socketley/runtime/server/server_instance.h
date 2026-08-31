@@ -362,46 +362,51 @@ public:
     // A runtime whose own verbs collide with the sniffer's -- a store speaking
     // GET and PUT reads as HTTP -- declares its wire protocol here and is not
     // sniffed; proto_unknown, the default, keeps the auto-detection.
-    void set_wire_protocol(proto_state p) { m_wire_protocol = p; }
+    void set_wire_protocol(proto_state p) { m_wire_protocol = p; m_wire_protocol_declared = true; }
+
+    // Whether the type spoke, which is not what it said: a registered type
+    // that asks for proto_unknown wants the sniffer, and one that never called
+    // set_wire_protocol() has said nothing at all.
+    bool wire_protocol_declared() const { return m_wire_protocol_declared; }
 
     size_t get_connection_count() const override;
 
     // Lua actions
-    void lua_broadcast(std::string_view msg) override;
-    bool lua_send_to(int client_id, std::string_view msg) override;
-    bool        lua_disconnect(int client_fd);
-    std::string lua_peer_ip(int client_fd);
+    void broadcast(std::string_view msg) override;
+    bool send_to(int client_id, std::string_view msg) override;
+    bool        disconnect(int client_fd);
+    std::string peer_ip(int client_fd);
 
     // Lua client enumeration + multicast
-    std::vector<int> lua_clients();
+    std::vector<int> clients();
     int handle_for_sibling_ref(const conn_ref& r);
-    size_t lua_multicast(const std::vector<int>& fds, std::string_view msg);
+    size_t multicast(const std::vector<int>& fds, std::string_view msg);
 
     // Lua per-connection metadata
-    bool        lua_set_data(int fd, std::string_view key, std::string_view val);
-    bool        lua_del_data(int fd, std::string_view key);
-    std::string lua_get_data(int fd, std::string_view key) const;
+    bool        set_data(int fd, std::string_view key, std::string_view val);
+    bool        del_data(int fd, std::string_view key);
+    std::string get_data(int fd, std::string_view key) const;
 
     // Multicast groups
-    bool lua_join_group(int fd, std::string_view group);
-    bool lua_leave_group(int fd, std::string_view group);
-    size_t lua_group_send(std::string_view group, std::string_view msg);
+    bool join_group(int fd, std::string_view group);
+    bool leave_group(int fd, std::string_view group);
+    size_t group_send(std::string_view group, std::string_view msg);
 
     // Zero-copy pipe pairing (data forwarded directly, bypasses Lua callbacks)
-    bool lua_pipe(int fd_a, int fd_b);
-    bool lua_unpipe(int fd);
+    bool pipe(int fd_a, int fd_b);
+    bool unpipe(int fd);
 
     struct ws_headers_result {
         bool is_websocket{false};
         std::string cookie, origin, protocol, auth;
     };
-    ws_headers_result lua_ws_headers(int client_fd) const;
+    ws_headers_result ws_headers(int client_fd) const;
 
     // C++ WebSocket callback
     void set_on_websocket(std::function<void(int fd, const ws_headers_result&)> cb);
 
     // Stats
-    std::string stats_extra() const override;
+    std::string stats_lines() const override;
 
     // ── Client routing ──────────────────────────────────────────────────────
     // The Lua-facing half, taking a descriptor or a routed handle and never a
@@ -471,9 +476,9 @@ public:
     const std::vector<upstream_target>& get_upstream_targets() const;
 
     // Lua upstream actions
-    bool lua_upstream_send(int conn_id, std::string_view msg);
-    void lua_upstream_broadcast(std::string_view msg);
-    std::vector<int> lua_upstreams() const;
+    bool upstream_send(int conn_id, std::string_view msg);
+    void upstream_broadcast(std::string_view msg);
+    std::vector<int> upstreams() const;
 
     // ── request_origin ──────────────────────────────────────────────────────
     // An answer from the linked cache one turn later, whose cookie names the
@@ -484,6 +489,7 @@ public:
 
 private:
     proto_state m_wire_protocol{proto_unknown};
+    bool        m_wire_protocol_declared{false};
 
     // Ask the linked cache something on behalf of `conn`, where `silent` is
     // the auto-store, which wants no answer and is not charged to the
@@ -629,19 +635,19 @@ private:
     void upstream_disconnect(upstream_connection* uc);
     void handle_upstream_read(struct io_uring_cqe* cqe, upstream_connection* uc);
     void handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc);
-    void upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
+    void queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
     void upstream_flush_write_queue(upstream_connection* uc);
     void invoke_on_upstream(int conn_id, std::string_view data);
     void invoke_on_upstream_connect(int conn_id);
     void invoke_on_upstream_disconnect(int conn_id);
 
     void process_message(server_connection* sender, std::string_view msg);
-    void broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
+    void queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
     void remove_active_fd(int fd);
     // `even_when_closing` is for an answer that was already promised, which
     // nothing else may set: the socket is still open precisely because that
     // answer is owed.
-    void send_to(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+    void queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                  bool even_when_closing = false);
     void flush_write_queue(server_connection* conn);
 

@@ -534,7 +534,7 @@ private:
         s.bytes_in           = m_rt->m_stat_bytes_in.load(std::memory_order_relaxed);
         s.bytes_out          = m_rt->m_stat_bytes_out.load(std::memory_order_relaxed);
         s.active_connections = static_cast<uint64_t>(m_rt->get_connection_count());
-        s.detail             = m_rt->stats_ring() + m_rt->stats_extra();
+        s.detail             = m_rt->stats_ring() + m_rt->stats_lines();
 
         // The two numbers that make a mesh measurement mean anything, sent
         // unconditionally including by a shard with no links, because the
@@ -1305,7 +1305,7 @@ private:
             {
                 auto* srv = static_cast<server_instance*>(m_rt);
                 if (srv->get_mode() != mode_in)
-                    srv->lua_broadcast(message);
+                    srv->broadcast(message);
                 break;
             }
             case runtime_client:
@@ -1401,7 +1401,7 @@ private:
                 // Unconditional, with `--mode in` deliberately not consulted,
                 // because that flag says whether socketley.send reaches this
                 // runtime and not whether a sub-server may answer its clients.
-                srv->lua_broadcast(msg);
+                srv->broadcast(msg);
                 break;
             case worker_proto::route_op::forget:
                 // `frm` is the runtime that went away rather than one that

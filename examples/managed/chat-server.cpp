@@ -9,8 +9,8 @@
 // When managed: auto-restarts on crash, re-launches on daemon boot.
 //
 // BUILD:
-//   g++ -std=c++17 -O2 -Iinclude/linux chat-server.cpp \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat-server
+//   g++ -std=c++17 -O2 chat-server.cpp \
+//       $(sdk/socketley-config --cflags --libs) -o chat-server
 //
 // STANDALONE:
 //   ./chat-server

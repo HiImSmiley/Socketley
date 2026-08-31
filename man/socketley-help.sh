@@ -2531,8 +2531,8 @@ sdk_tier2() {
     echo -e "  Embed the full io_uring event loop + all runtime types in your binary."
     echo -e "  Maximum performance — no IPC overhead, direct C++ callbacks."
     echo ""
-    echo -e "  Compile: ${CYAN}g++ -std=c++23 app.cpp -I. -Iinclude/linux \\"
-    echo -e "      -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto${NC}"
+    echo -e "  Compile: ${CYAN}g++ -std=c++23 app.cpp \\"
+    echo -e "      \$(sdk/socketley-config --cflags --libs)${NC}"
     echo -e "  Add ${CYAN}-lluajit${NC} for Lua, or define ${CYAN}SOCKETLEY_NO_LUA${NC} to skip it."
     echo ""
 
@@ -2644,9 +2644,9 @@ sdk_tier2() {
 
     echo -e "${BOLD}Server-Specific:${NC}"
     echo -e "  set_mode(mode_inout | mode_in | mode_out | mode_master)"
-    echo -e "  lua_broadcast(msg)  lua_send_to(fd, msg)  lua_disconnect(fd)"
-    echo -e "  lua_peer_ip(fd)  lua_clients()  lua_multicast(fds, msg)"
-    echo -e "  add_upstream_target(addr)  lua_upstream_send(conn_id, msg)"
+    echo -e "  broadcast(msg)  send_to(fd, msg)  disconnect(fd)"
+    echo -e "  peer_ip(fd)  clients()  multicast(fds, msg)"
+    echo -e "  add_upstream_target(addr)  upstream_send(conn_id, msg)"
     echo ""
 
     echo -e "${BOLD}Cache-Specific:${NC}"
@@ -2748,8 +2748,8 @@ sdk_mixed() {
     echo ""
 
     echo -e "${BOLD}Compile:${NC}"
-    echo -e "  ${CYAN}g++ -std=c++23 app.cpp -I. -Iinclude/linux \\"
-    echo -e "      -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto${NC}"
+    echo -e "  ${CYAN}g++ -std=c++23 app.cpp \\"
+    echo -e "      \$(sdk/socketley-config --cflags --libs)${NC}"
     echo ""
 
     echo -e "${BOLD}Verify:${NC}"
@@ -2772,8 +2772,8 @@ sdk_cross() {
     echo ""
 
     echo -e "${BOLD}Headers:${NC}"
-    echo -e "  ${CYAN}include/windows/socketley/ws_client.h${NC}     — WebSocket + raw TCP"
-    echo -e "  ${CYAN}include/windows/socketley/cache_client.h${NC}  — Cache text protocol"
+    echo -e "  ${CYAN}include/portable/socketley/ws_client.h${NC}     — WebSocket + raw TCP"
+    echo -e "  ${CYAN}include/portable/socketley/cache_client.h${NC}  — Cache text protocol"
     echo -e "  ${CYAN}include/darwin/socketley/ws_client.h${NC}      — (identical copy)"
     echo -e "  ${CYAN}include/darwin/socketley/cache_client.h${NC}   — (identical copy)"
     echo ""
@@ -2799,7 +2799,7 @@ sdk_cross() {
     echo -e "  clang++ -std=c++17 -I include/darwin app.cpp -o app"
     echo ""
     echo -e "  # g++ (Linux)"
-    echo -e "  g++ -std=c++17 -I include/windows app.cpp -o app${NC}"
+    echo -e "  g++ -std=c++17 -I include/linux app.cpp -o app${NC}"
     echo ""
 
     read -p "Press Enter to continue..." || true

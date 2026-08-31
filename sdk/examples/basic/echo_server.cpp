@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/basic/echo_server.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/echo_server
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/echo_server
 //
 // Run: /tmp/echo_server
 // Test: echo "hello" | nc -q1 127.0.0.1 9000

@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/advanced/chat_server.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/chat_server
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/chat_server
 //
 // Run: /tmp/chat_server
 // Test: open multiple terminals with `nc 127.0.0.1 9000`

@@ -7097,7 +7097,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 // The cache-specific half of `stats`, which is the part a worker still pushes,
 // because rebuilding it in the daemon reads the placeholder's empty store and
 // prints keys:0 for a cache that had just served five SETs.
-std::string cache_instance::stats_extra() const
+std::string cache_instance::stats_lines() const
 {
     std::ostringstream out;
     out << "keys:" << m_store.size() << "\n"

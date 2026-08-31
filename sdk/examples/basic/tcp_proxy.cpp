@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/basic/tcp_proxy.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/tcp_proxy
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/tcp_proxy
 //
 // Run (start backends on ports 9001 and 9002 first):
 //   /tmp/tcp_proxy

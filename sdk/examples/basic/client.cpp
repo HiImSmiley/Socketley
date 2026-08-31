@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/basic/client.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/client
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/client
 //
 // Run (start an echo server first, e.g. /tmp/echo_server):
 //   /tmp/client

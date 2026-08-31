@@ -158,12 +158,12 @@ public:
     // another process can be printed from the two ends that know each part.
     //
     // ─── WHY THIS IS SPLIT AT ALL ───────────────────────────────────────────
-    // The worker publishes stats_ring() + stats_extra() and the daemon puts
+    // The worker publishes stats_ring() + stats_lines() and the daemon puts
     // stats_prefix() in front, so `stats` is byte-identical on both sides and
     // the split says which process stated which figure.
     std::string stats_prefix() const;
     std::string stats_ring() const;
-    virtual std::string stats_extra() const { return {}; }
+    virtual std::string stats_lines() const { return {}; }
 
     std::atomic<uint64_t> m_stat_total_connections{0};
     std::atomic<uint64_t> m_stat_total_messages{0};
@@ -340,7 +340,7 @@ public:
     // one.
     void broadcast_all(std::string_view msg)
     {
-        lua_broadcast(msg);
+        broadcast(msg);
         fanout_to_siblings(msg);
     }
 
@@ -395,8 +395,8 @@ public:
 
     // A registered type's own fields as an ordered string bag, no-ops for the
     // built-ins, whose fields are named columns in runtime_config.
-    virtual void capture_extra(std::vector<std::pair<std::string, std::string>>&) const {}
-    virtual void apply_extra(const std::vector<std::pair<std::string, std::string>>&) {}
+    virtual void capture_config(std::vector<std::pair<std::string, std::string>>&) const {}
+    virtual void apply_config(const std::vector<std::pair<std::string, std::string>>&) {}
 
     // What answers requests addressed to this runtime's name, which only a
     // cache does, overridden for an out-of-process runtime to the supervisor
@@ -454,10 +454,10 @@ public:
     // Whether the message was written or queued, false for a runtime with no
     // outward connection of its own.
     virtual bool lua_send(std::string_view /*msg*/) { return false; }
-    virtual void lua_broadcast(std::string_view /*msg*/) {}
+    virtual void broadcast(std::string_view /*msg*/) {}
     // Whether the bytes reached a connection, which the base holds none of, so
     // the honest answer here is no.
-    virtual bool lua_send_to(int /*client_id*/, std::string_view /*msg*/) { return false; }
+    virtual bool send_to(int /*client_id*/, std::string_view /*msg*/) { return false; }
 
     // Virtual methods for Lua cache access (overridden by cache_instance)
     virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }

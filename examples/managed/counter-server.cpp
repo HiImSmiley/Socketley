@@ -9,8 +9,8 @@
 // When managed: auto-restarts on crash, re-launches on daemon boot.
 //
 // BUILD:
-//   g++ -std=c++17 -O2 -Iinclude/linux counter-server.cpp \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -o counter-server
+//   g++ -std=c++17 -O2 counter-server.cpp \
+//       $(sdk/socketley-config --cflags --libs) -o counter-server
 //
 // STANDALONE:
 //   ./counter-server

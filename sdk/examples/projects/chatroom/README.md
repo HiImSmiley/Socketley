@@ -23,12 +23,10 @@ arrived on.
 
 ```bash
 g++ -std=c++23 sdk/examples/projects/chatroom/chatd.cpp \
-    -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-    -Lbin/Release -Lthirdparty/luajit \
-    -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o chatd
+    $(sdk/socketley-config --cflags --libs) -o chatd
 
 g++ -std=c++17 sdk/examples/projects/chatroom/chat_cli.cpp \
-    -Iinclude/windows -o chat_cli -pthread
+    $(sdk/socketley-config --cflags --libs) -o chat_cli
 ```
 
 ## Run

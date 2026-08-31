@@ -919,7 +919,7 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
             switch (inst->get_type())
             {
                 case runtime_server:
-                    static_cast<server_instance*>(inst)->lua_broadcast(line);
+                    static_cast<server_instance*>(inst)->broadcast(line);
                     break;
                 case runtime_client:
                     static_cast<client_instance*>(inst)->lua_send(line);
@@ -2072,7 +2072,7 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
     }
 
     // The connections are wherever the runtime is, because calling
-    // lua_broadcast() on a placeholder succeeded, returned 0, and sent the
+    // broadcast() on a placeholder succeeded, returned 0, and sent the
     // message nowhere.
     if (instance->is_out_of_process())
     {
@@ -2093,7 +2093,7 @@ bool daemon_handler::deliver_to_runtime(std::string_view name,
         case runtime_server:
         {
             if (auto* srv = instance->as_server(); srv && srv->get_mode() != mode_in)
-                srv->lua_broadcast(message);
+                srv->broadcast(message);
             break;
         }
         case runtime_client:
@@ -2690,7 +2690,7 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
             {
                 auto* srv = static_cast<server_instance*>(instance);
                 if (srv->get_mode() != mode_in)
-                    srv->lua_broadcast(message);
+                    srv->broadcast(message);
             }
             else
             {
@@ -3430,7 +3430,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             // Replaced only when the document names the object, like the
             // upstream and backend lists above.
             if (has("extra"))
-                instance->apply_extra(cfg.extra);
+                instance->apply_config(cfg.extra);
             break;
     }
 
@@ -4212,7 +4212,7 @@ void daemon_handler::route_dispatch(std::string_view to, std::string_view frm,
                 srv->drop_route(ref);
                 break;
             case worker_proto::route_op::broadcast:
-                srv->lua_broadcast(payload);
+                srv->broadcast(payload);
                 break;
             case worker_proto::route_op::forget:
                 // Not reachable through post(), because forget() fans out

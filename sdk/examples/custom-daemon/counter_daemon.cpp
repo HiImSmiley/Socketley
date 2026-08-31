@@ -11,10 +11,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/custom-daemon/counter_daemon.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit -Lthirdparty/liburing \
-//       -lsocketley_sdk -lluajit -luring -lssl -lcrypto \
-//       -o /usr/local/bin/counter-daemon
+//       $(sdk/socketley-config --cflags --libs) -o /usr/local/bin/counter-daemon
 //
 // Install counter.toml (beside this file) into the daemon's types directory
 // with its `exec` pointing back at this binary, then:
@@ -31,7 +28,7 @@
 #include <map>
 #include <memory>
 #include <string>
-#include "socketley/runtime/server/server_instance.h"
+#include <socketley/runtime/server.h>
 
 namespace {
 class counter final : public server_instance
@@ -39,11 +36,10 @@ class counter final : public server_instance
 public:
     explicit counter(std::string_view name) : server_instance(name)
     {
-        set_wire_protocol(proto_tcp);
         set_on_client_message([this](int fd, std::string_view line) {
             while (!line.empty() && (line.back()=='\n'||line.back()=='\r'))
                 line.remove_suffix(1);
-            lua_send_to(fd, std::to_string(++m_hits[std::string(line)]) + "\n");
+            send_to(fd, std::to_string(++m_hits[std::string(line)]) + "\n");
         });
     }
 private:

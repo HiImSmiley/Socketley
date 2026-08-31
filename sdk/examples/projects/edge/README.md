@@ -30,9 +30,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
     -days 30 -nodes -subj "/CN=localhost"
 
 g++ -std=c++23 sdk/examples/projects/edge/app.cpp \
-    -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-    -Lbin/Release -Lthirdparty/luajit \
-    -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o edge-app
+    $(sdk/socketley-config --cflags --libs) -o edge-app
 g++ -std=c++23 sdk/examples/projects/edge/gateway.cpp \
     ... same flags ... -o edge-gw
 

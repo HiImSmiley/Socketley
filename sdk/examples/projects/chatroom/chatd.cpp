@@ -16,9 +16,7 @@
 //
 // Build (from the repo root, after building libsocketley_sdk.a):
 //   g++ -std=c++23 sdk/examples/projects/chatroom/chatd.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit \
-//       -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o /tmp/chatd
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/chatd
 //
 // Run:   /tmp/chatd
 // Try:   nc 127.0.0.1 9000                (several terminals)

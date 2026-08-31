@@ -452,7 +452,7 @@ static void restore_runtimes(state_persistence& persistence,
         }
 
         // A registered type's fields, applied through the placeholder's bag.
-        instance->apply_extra(cfg.extra);
+        instance->apply_config(cfg.extra);
     }
 
     // Pass 2: Start runtimes that were running

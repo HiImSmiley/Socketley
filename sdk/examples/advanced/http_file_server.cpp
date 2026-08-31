@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/advanced/http_file_server.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/http_file_server
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/http_file_server
 //
 // Run: mkdir -p ./public && echo "<h1>Hello</h1>" > ./public/index.html
 //      /tmp/http_file_server

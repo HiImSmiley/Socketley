@@ -12,7 +12,7 @@
 //
 // Build (Linux):
 //   g++ -std=c++17 sdk/examples/projects/chatroom/chat_cli.cpp \
-//       -Iinclude/windows -o /tmp/chat_cli -pthread
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/chat_cli
 // (Windows: cl /std:c++17 /EHsc /I include\windows chat_cli.cpp
 //  macOS:   clang++ -std=c++17 -I include/darwin chat_cli.cpp -o chat_cli)
 //

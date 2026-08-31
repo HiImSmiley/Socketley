@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/advanced/reconnecting_client.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/reconnecting_client
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/reconnecting_client
 //
 // Run (start an echo server first):
 //   /tmp/reconnecting_client

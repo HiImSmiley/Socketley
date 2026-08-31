@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/advanced/tls_server.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/tls_server
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/tls_server
 //
 // Generate self-signed cert for testing:
 //   openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \

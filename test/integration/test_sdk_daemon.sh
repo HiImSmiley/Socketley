@@ -130,7 +130,7 @@ public:
         set_on_client_message([this](int fd, std::string_view line) {
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
                 line.remove_suffix(1);
-            lua_send_to(fd, run(line));
+            send_to(fd, run(line));
         });
     }
 private:
@@ -281,7 +281,7 @@ public:
         set_on_client_message([this](int fd, std::string_view line) {
             while (!line.empty() && (line.back()=='\n'||line.back()=='\r'))
                 line.remove_suffix(1);
-            lua_send_to(fd, std::to_string(++m_hits[std::string(line)]) + "\n");
+            send_to(fd, std::to_string(++m_hits[std::string(line)]) + "\n");
         });
     }
 private:

@@ -16,9 +16,7 @@
 //
 // Build (from the repo root, after building libsocketley_sdk.a):
 //   g++ -std=c++23 sdk/examples/projects/jobqueue/jobd.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit \
-//       -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o /tmp/jobd
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/jobd
 //
 // Run:   /tmp/jobd
 // Try:   echo "submit build-42" | nc -q1 127.0.0.1 9000
@@ -26,8 +24,8 @@
 //        /tmp/jobworker                (see worker.cpp)
 
 #include <socketley/core.h>
-#include "socketley/runtime/server/server_instance.h"
-#include "socketley/runtime/cache/cache_instance.h"
+#include <socketley/runtime/server.h>
+#include <socketley/runtime/cache.h>
 
 #include <atomic>
 #include <csignal>
@@ -75,18 +73,18 @@ int main()
             std::string_view payload = msg.substr(7);
             jobs->lua_rpush(k_queue_key, payload);
             ++submitted;
-            ingest->lua_send_to(fd,
+            ingest->send_to(fd,
                 "queued " + std::to_string(jobs->lua_llen(k_queue_key)) + "\n");
             return;
         }
         if (msg == "status")
         {
-            ingest->lua_send_to(fd,
+            ingest->send_to(fd,
                 "depth " + std::to_string(jobs->lua_llen(k_queue_key)) +
                 "  submitted " + std::to_string(submitted.load()) + "\n");
             return;
         }
-        ingest->lua_send_to(fd, "usage: submit <payload> | status\n");
+        ingest->send_to(fd, "usage: submit <payload> | status\n");
     });
 
     // ── lifecycle ───────────────────────────────────────────────────────

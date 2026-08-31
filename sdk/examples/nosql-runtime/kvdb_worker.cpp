@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "socketley/runtime/server/server_instance.h"
+#include <socketley/runtime/server.h>
 
 namespace
 {
@@ -43,9 +43,10 @@ class kvdb final : public server_instance
 public:
     explicit kvdb(std::string_view name) : server_instance(name)
     {
-        // My verbs are GET, PUT and DEL, which the connection sniffer would
-        // read as HTTP; this says the protocol is mine and lines are lines.
-        set_wire_protocol(proto_tcp);
+        // My verbs are GET, PUT and DEL, which the sniffer would read as
+        // HTTP -- but a registered type gets lines unless it says otherwise,
+        // so this constructor says nothing and a type that wants the
+        // auto-detection back calls set_wire_protocol(proto_unknown).
 
         // One read can carry several commands, so the buffer is split rather
         // than treated as one line -- a store that answers only the first
@@ -65,12 +66,12 @@ public:
                     out += dispatch(line);
             }
             if (!out.empty())
-                lua_send_to(fd, out);
+                send_to(fd, out);
         });
     }
 
     // Everything the manifest declared, already validated by the daemon.
-    void apply_extra(const std::vector<std::pair<std::string, std::string>>& in) override
+    void apply_config(const std::vector<std::pair<std::string, std::string>>& in) override
     {
         m_extra = in;
         for (const auto& [k, v] : in)
@@ -89,12 +90,12 @@ public:
         set_on_stop([this] { flush(); });
     }
 
-    void capture_extra(std::vector<std::pair<std::string, std::string>>& out) const override
+    void capture_config(std::vector<std::pair<std::string, std::string>>& out) const override
     {
         out = m_extra;
     }
 
-    std::string stats_extra() const override
+    std::string stats_lines() const override
     {
         std::string s = "documents:" + std::to_string(m_docs.size());
         s += "\nreads:"  + std::to_string(m_reads);

@@ -25,12 +25,10 @@ config=release_x64 socketley_sdk`:
 
 ```bash
 g++ -std=c++23 sdk/examples/projects/jobqueue/jobd.cpp \
-    -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-    -Lbin/Release -Lthirdparty/luajit \
-    -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o jobd
+    $(sdk/socketley-config --cflags --libs) -o jobd
 
 g++ -std=c++17 sdk/examples/projects/jobqueue/worker.cpp \
-    -Iinclude/windows -o jobworker
+    $(sdk/socketley-config --cflags --libs) -o jobworker
 ```
 
 ## Run

@@ -675,7 +675,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
 
     // A registered type's fields come from the instance, because this file
     // knows neither their names nor their kinds.
-    instance->capture_extra(cfg.extra);
+    instance->capture_config(cfg.extra);
 
     return cfg;
 }

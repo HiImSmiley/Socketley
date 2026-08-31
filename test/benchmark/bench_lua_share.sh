@@ -306,7 +306,7 @@ inclusive_rep() {  # floor, not ceiling: DWARF dies inside LuaJIT asm frames
     local tag=$1
     "$PERF" report -i "$OUT_DIR/perf_$tag.data" --stdio --children \
         --percent-limit 0.2 2>/dev/null \
-        | grep -E 'invoke_on_client_message|invoke_on_message|lua_send_to' \
+        | grep -E 'invoke_on_client_message|invoke_on_message|send_to' \
         | head -6 || true
 }
 

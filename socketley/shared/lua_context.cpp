@@ -2143,7 +2143,7 @@ void lua_context::register_bindings(runtime_instance* owner)
         return api_why(q(name) + " could not be removed");
     };
 
-    // The connections are wherever the runtime is, so calling lua_broadcast()
+    // The connections are wherever the runtime is, so calling broadcast()
     // on a placeholder succeeds, returns true and delivers nothing.
     sk["send"] = [owner](std::string_view name,
                          std::string_view msg) -> api_result {
@@ -2168,7 +2168,7 @@ void lua_context::register_bindings(runtime_instance* owner)
                                      "message could not be handed to it");
         }
         if (inst->get_type() == runtime_server)
-            inst->lua_broadcast(msg);
+            inst->broadcast(msg);
         else
             inst->lua_send(msg);
         return api_yes();
@@ -2458,7 +2458,7 @@ void lua_context::register_bindings(runtime_instance* owner)
                               "argument is the second one");
             if (owner->get_type() != runtime_server)
                 return refuse("only a server has connections to pipe");
-            if (!static_cast<server_instance*>(owner)->lua_pipe(src_fd, *dst_fd))
+            if (!static_cast<server_instance*>(owner)->pipe(src_fd, *dst_fd))
                 return refuse("one of those is not an open connection of this "
                               "server");
             return api_yes();
@@ -2767,7 +2767,7 @@ void lua_context::register_bindings(runtime_instance* owner)
 
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
 {
-    // broadcast_all() and not lua_broadcast(), which is this process's
+    // broadcast_all() and not broadcast(), which is this process's
     // connection table and under --shards reaches a quarter of the clients
     // while reporting success.
     self["broadcast"] = [owner](std::string_view msg) {
@@ -2780,7 +2780,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         if (owner->is_udp())
             return api_why("a UDP server has no connection to send to; use "
                            "self.broadcast");
-        if (owner->lua_send_to(client_id, msg))
+        if (owner->send_to(client_id, msg))
             return api_yes();
         // Four ways this used to be a silent no-op: an id that is not a
         // connection, one already closing, a routed-in handle whose origin is
@@ -2821,16 +2821,16 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // Connection control
     self["disconnect"] = [owner, this](
                                        int client_id) -> api_result {
-        if (static_cast<server_instance*>(owner)->lua_disconnect(client_id))
+        if (static_cast<server_instance*>(owner)->disconnect(client_id))
             return api_yes();
         return api_why("there is no open connection " + std::to_string(client_id)
                        + " on " + q(m_owner_name) + " to disconnect");
     };
     self["peer_ip"] = [owner](int client_id) -> std::string {
-        return static_cast<server_instance*>(owner)->lua_peer_ip(client_id);
+        return static_cast<server_instance*>(owner)->peer_ip(client_id);
     };
     self["ws_headers"] = [owner, this](int client_id) -> sol::object {
-        auto h = static_cast<server_instance*>(owner)->lua_ws_headers(client_id);
+        auto h = static_cast<server_instance*>(owner)->ws_headers(client_id);
         if (!h.is_websocket) return sol::nil;
         sol::table t = m_lua.create_table();
         if (!h.cookie.empty())   t["cookie"]        = h.cookie;
@@ -2842,7 +2842,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
 
     // Client enumeration
     self["clients"] = [owner, this]() -> sol::table {
-        auto ids = static_cast<server_instance*>(owner)->lua_clients();
+        auto ids = static_cast<server_instance*>(owner)->clients();
         sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
@@ -2877,7 +2877,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         }
         // The count, not a bool: every id was well formed, and how many still
         // name an open connection is the thing worth knowing.
-        return api_count(static_cast<server_instance*>(owner)->lua_multicast(fds, msg));
+        return api_count(static_cast<server_instance*>(owner)->multicast(fds, msg));
     };
 
     // Per-connection metadata: nil value deletes the key
@@ -2888,14 +2888,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         if (key.empty())
             return api_why("the metadata key is empty");
         auto* srv = static_cast<server_instance*>(owner);
-        const bool ok = val ? srv->lua_set_data(id, key, *val)
-                            : srv->lua_del_data(id, key);
+        const bool ok = val ? srv->set_data(id, key, *val)
+                            : srv->del_data(id, key);
         if (ok) return api_yes();
         return api_why("there is no open connection " + std::to_string(id)
                        + " on " + q(m_owner_name) + " to carry metadata");
     };
     self["get_data"] = [owner, this](int id, std::string key) -> sol::object {
-        auto v = static_cast<server_instance*>(owner)->lua_get_data(id, key);
+        auto v = static_cast<server_instance*>(owner)->get_data(id, key);
         if (v.empty()) return sol::nil;
         return sol::make_object(m_lua, v);
     };
@@ -2903,17 +2903,17 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // Upstream actions
     self["upstream_send"] = [owner](int conn_id,
                                     std::string_view msg) -> api_result {
-        if (static_cast<server_instance*>(owner)->lua_upstream_send(conn_id, msg))
+        if (static_cast<server_instance*>(owner)->upstream_send(conn_id, msg))
             return api_yes();
         return api_why("upstream " + std::to_string(conn_id)
                        + " is not connected — self.upstreams() lists the ones "
                          "that are");
     };
     self["upstream_broadcast"] = [owner](std::string_view msg) {
-        static_cast<server_instance*>(owner)->lua_upstream_broadcast(msg);
+        static_cast<server_instance*>(owner)->upstream_broadcast(msg);
     };
     self["upstreams"] = [owner, this]() -> sol::table {
-        auto ids = static_cast<server_instance*>(owner)->lua_upstreams();
+        auto ids = static_cast<server_instance*>(owner)->upstreams();
         sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
@@ -2924,7 +2924,7 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     self["join_group"] = [owner, this](int fd,
                                        std::string group) -> api_result {
         if (group.empty()) return api_why("the group name is empty");
-        if (static_cast<server_instance*>(owner)->lua_join_group(fd, group))
+        if (static_cast<server_instance*>(owner)->join_group(fd, group))
             return api_yes();
         return api_why("there is no open connection " + std::to_string(fd)
                        + " on " + q(m_owner_name) + " to put in a group");
@@ -2932,18 +2932,18 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     self["leave_group"] = [owner, this](int fd,
                                         std::string group) -> api_result {
         if (group.empty()) return api_why("the group name is empty");
-        if (static_cast<server_instance*>(owner)->lua_leave_group(fd, group))
+        if (static_cast<server_instance*>(owner)->leave_group(fd, group))
             return api_yes();
         return api_why("there is no open connection " + std::to_string(fd)
                        + " on " + q(m_owner_name));
     };
-    // The count, for the reason lua_group_send gives: a group that exists and is
+    // The count, for the reason group_send gives: a group that exists and is
     // empty is what a misspelled name looks like once its last real member has
     // left, and a bool cannot tell that from a group that is full.
     self["group_send"] = [owner](std::string group,
                                  std::string_view msg) -> api_result {
         if (group.empty()) return api_why("the group name is empty");
-        return api_count(static_cast<server_instance*>(owner)->lua_group_send(group, msg));
+        return api_count(static_cast<server_instance*>(owner)->group_send(group, msg));
     };
 
     // Zero-copy pipe pairing
@@ -2951,14 +2951,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                                  int fd_b) -> api_result {
         if (fd_a == fd_b)
             return api_why("a pipe joins two connections, and those are one");
-        if (static_cast<server_instance*>(owner)->lua_pipe(fd_a, fd_b))
+        if (static_cast<server_instance*>(owner)->pipe(fd_a, fd_b))
             return api_yes();
         return api_why("one of " + std::to_string(fd_a) + " and "
                        + std::to_string(fd_b) + " is not an open connection on "
                        + q(m_owner_name));
     };
     self["unpipe"] = [owner](int fd) -> api_result {
-        if (static_cast<server_instance*>(owner)->lua_unpipe(fd))
+        if (static_cast<server_instance*>(owner)->unpipe(fd))
             return api_yes();
         return api_why("connection " + std::to_string(fd) + " is not piped");
     };
@@ -3102,11 +3102,11 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
     };
     self["protocol"] = proxy->get_protocol() == protocol_http ? "http" : "tcp";
     self["peer_ip"] = [proxy](int client_id) -> std::string {
-        return proxy->lua_peer_ip(client_id);
+        return proxy->peer_ip(client_id);
     };
     self["close_client"] = [proxy](
                                    int client_id) -> api_result {
-        if (proxy->lua_close_client(client_id))
+        if (proxy->close_client(client_id))
             return api_yes();
         // Both halves of a proxied pair are ints, and handing this the backend
         // half is the mistake a script makes; it used to do nothing at all.
@@ -3116,19 +3116,19 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
                          "there are");
     };
     self["clients"] = [proxy, this]() -> sol::table {
-        auto ids = proxy->lua_clients();
+        auto ids = proxy->clients();
         sol::table t = m_lua.create_table(static_cast<int>(ids.size()), 0);
         for (int i = 0; i < (int)ids.size(); ++i) t[i + 1] = ids[i];
         return t;
     };
     self["backends"] = [proxy, this]() -> sol::table {
-        auto addrs = proxy->lua_backends();
+        auto addrs = proxy->backends();
         sol::table t = m_lua.create_table(static_cast<int>(addrs.size()), 0);
         for (int i = 0; i < (int)addrs.size(); ++i) t[i + 1] = addrs[i];
         return t;
     };
     self["backend_health"] = [proxy, this]() -> sol::table {
-        auto health = proxy->lua_backend_health();
+        auto health = proxy->backend_health_report();
         sol::table t = m_lua.create_table(0, static_cast<int>(health.size()));
         for (const auto& [idx, state] : health)
             t[idx + 1] = state;
@@ -3148,7 +3148,7 @@ void lua_context::register_proxy_table(runtime_instance* owner, sol::table& self
         t["bytes_out"] = f.bytes_out;
         t["total_connections"] = f.total_connections;
         t["total_messages"] = f.total_messages;
-        auto addrs = proxy->lua_backends();
+        auto addrs = proxy->backends();
         t["backend_count"] = addrs.size();
         return t;
     };

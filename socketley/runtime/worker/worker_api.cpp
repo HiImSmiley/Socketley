@@ -5,14 +5,28 @@
 
 #include "worker_main.h"
 #include "../../shared/type_registry.h"
+#include "../server/server_instance.h"
 
 namespace socketley {
 namespace worker {
 
 bool register_type(std::string_view type_name, factory make)
 {
+    // The sniffer decides from the first four bytes and cannot know verbs the
+    // daemon has never seen, so a store answering GET and PUT was read as HTTP
+    // until it said otherwise -- a footgun documented in an example rather
+    // than defaulted here.  A registered type that has not spoken gets lines.
+    factory lines_by_default = [make = std::move(make)](std::string_view n)
+    {
+        auto inst = make(n);
+        if (auto* srv = dynamic_cast<server_instance*>(inst.get()))
+            if (!srv->wire_protocol_declared())
+                srv->set_wire_protocol(proto_tcp);
+        return inst;
+    };
+
     runtime_type id;
-    return type_registry::register_type(type_name, std::move(make), id);
+    return type_registry::register_type(type_name, std::move(lines_by_default), id);
 }
 
 int run(int argc, char** argv)

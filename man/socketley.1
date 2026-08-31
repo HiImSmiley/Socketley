@@ -7196,8 +7196,7 @@ int main() {
 
     srv.start();
 }
-// g++ -std=c++23 echo.cpp -I. -Iinclude/linux \\
-//     -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto
+// g++ -std=c++23 echo.cpp $(sdk/socketley-config --cflags --libs)
 .fi
 .PP
 .B "Example: server with Lua scripting"
@@ -7276,9 +7275,9 @@ set_drain(bool)               load_lua_script(string_view)
 .nf
 set_mode(mode_inout|mode_in|mode_out|mode_master)
 set_udp(bool)          set_http_dir(string_view)
-lua_broadcast(msg)     lua_send_to(fd, msg)
-lua_disconnect(fd)     lua_peer_ip(fd)
-lua_clients()          lua_multicast(fds, msg)
+broadcast(msg)         send_to(fd, msg)
+disconnect(fd)         peer_ip(fd)
+clients()              multicast(fds, msg)
 .fi
 .PP
 .B "Cache-specific:"
@@ -7322,10 +7321,12 @@ loop.run();
 .fi
 .SS Cross-Platform SDK (Windows / macOS)
 Header-only TCP clients for connecting to Socketley runtimes from non-Linux platforms.
-Available in
-.B include/windows/socketley/
-and
-.BR include/darwin/socketley/ .
+One copy, in
+.BR include/portable/socketley/ ,
+reached as
+.B <socketley/ws_client.h>
+from any of
+.IR include/linux ", " include/darwin " or " include/windows .
 .PP
 .B socketley/ws_client.h
 \(em WebSocket (RFC 6455) + raw TCP client for server runtimes.
@@ -7351,7 +7352,7 @@ cl /std:c++17 /I include\\windows app.cpp
 clang++ -std=c++17 -I include/darwin app.cpp -o app
 
 # g++ (Linux)
-g++ -std=c++17 -I include/windows app.cpp -o app
+g++ -std=c++17 -I include/linux app.cpp -o app
 .fi
 .RE
 .SS Tier 3: Daemon Attach (header-only)

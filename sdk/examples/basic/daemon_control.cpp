@@ -2,7 +2,7 @@
 //
 // Build:
 //   g++ -std=c++17 sdk/examples/basic/daemon_control.cpp \
-//       -Iinclude/linux -o /tmp/daemon_control
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/daemon_control
 //
 // Run (requires a running socketley daemon):
 //   /tmp/daemon_control

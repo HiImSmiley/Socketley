@@ -2,9 +2,7 @@
 //
 // Build:
 //   g++ -std=c++23 sdk/examples/basic/redis_cache.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -lsocketley_sdk -luring -lssl -lcrypto -lluajit \
-//       -o /tmp/redis_cache
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/redis_cache
 //
 // Run: /tmp/redis_cache
 // Test: redis-cli -p 6379 SET foo bar && redis-cli -p 6379 GET foo

@@ -482,14 +482,14 @@ public:
     void set_on_proxy_response(proxy_hook cb);
 
     // Stats
-    std::string stats_extra() const override;
+    std::string stats_lines() const override;
 
     // Lua API
-    std::string lua_peer_ip(int client_fd);
-    bool lua_close_client(int client_fd);
-    std::vector<std::string> lua_backends() const;
-    std::vector<std::pair<int, std::string>> lua_backend_health() const;
-    std::vector<int> lua_clients() const;
+    std::string peer_ip(int client_fd);
+    bool close_client(int client_fd);
+    std::vector<std::string> backends() const;
+    std::vector<std::pair<int, std::string>> backend_health_report() const;
+    std::vector<int> clients() const;
 
 private:
     void handle_accept(struct io_uring_cqe* cqe);

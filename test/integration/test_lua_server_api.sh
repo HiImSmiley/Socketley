@@ -447,7 +447,7 @@ assert_eq "self.connections() on a server counts both connections" \
 
 # ── 3c. on_send fires for what the runtime broadcasts, and not for a reply ──
 #
-# invoke_on_send has two call sites — server lua_broadcast and the client's
+# invoke_on_send has two call sites — server broadcast and the client's
 # send — and self.send(id, msg) is not one of them.  That asymmetry is not
 # written down anywhere, and a script that logs outbound traffic in on_send
 # sees broadcasts and silently misses every targeted reply.  Pinned as it is so
@@ -460,7 +460,7 @@ assert_eq "control: the targeted send did arrive at the client" \
     "if it never arrived, the zero below is about a send that did not happen"
 assert_eq "on_send does NOT fire for self.send(id, msg)" \
           "0" "$(hits 'API on_send=\[DIRECT-SEND-PAYLOAD\]' "$SOCKETLEY_DLOG")" \
-    "current behaviour: invoke_on_send is reached from lua_broadcast and from" \
+    "current behaviour: invoke_on_send is reached from broadcast and from" \
     "the client's send, and from nowhere else"
 assert_eq "...and no on_send line was produced at all by that reply" \
           "$BEFORE_SEND" "$(hits 'API on_send=' "$SOCKETLEY_DLOG")" \

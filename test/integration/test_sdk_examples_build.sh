@@ -55,23 +55,25 @@ trap cleanup EXIT
 SANFLAGS=""
 case "$BINDIR" in *Sanitize*) SANFLAGS="-fsanitize=address,undefined";; esac
 
+SDKFLAGS=$("$ROOT/sdk/socketley-config" --config "$(basename "$BINDIR")" --cflags --libs) || {
+    echo "  FAIL [socketley-config answers]: $SDKFLAGS"
+    echo "  Results: 0/1 passed (1 failed)"
+    exit 1
+}
+
 # Exported for the subshells xargs spawns, which do not inherit shell functions.
-export ROOT BINDIR WORK SANFLAGS
+export ROOT BINDIR WORK SANFLAGS SDKFLAGS
 
 build_one() {
     local src=$1
     local tag
     tag=$(printf '%s' "${src#"$ROOT"/sdk/examples/}" | tr '/' '_')
-    # include/windows carries the cross-platform tier -- cache_client.h and
-    # ws_client.h, byte-identical to the darwin copy and absent from
-    # include/linux entirely.  premake gives the two unit tests that use them
-    # the same directory; an example that includes one does not build without
-    # it on any platform.
-    if g++ -std=c++23 $SANFLAGS "$src" \
-         -I"$ROOT" -I"$ROOT/include/linux" -I"$ROOT/include/windows" \
-         -isystem "$ROOT/thirdparty/sol2" -isystem "$ROOT/thirdparty/luajit" \
-         -L"$BINDIR" -L"$ROOT/thirdparty/luajit" -L"$ROOT/thirdparty/liburing" \
-         -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread \
+    # The flags come from socketley-config and nowhere else, which is the
+    # assertion: -I<repo-root> used to be on this line, so every public header
+    # was free to reach into the source tree and no test could tell.  An
+    # example that needs a path this script does not pass is an example nobody
+    # outside the checkout can build.
+    if g++ -std=c++23 $SANFLAGS "$src" $SDKFLAGS \
          -o "$WORK/$tag.bin" 2>"$WORK/$tag.err"
     then
         printf 'ok %s\n' "$tag" >> "$WORK/results"

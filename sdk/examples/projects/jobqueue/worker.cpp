@@ -11,7 +11,7 @@
 //
 // Build (Linux):
 //   g++ -std=c++17 sdk/examples/projects/jobqueue/worker.cpp \
-//       -Iinclude/windows -o /tmp/jobworker
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/jobworker
 // (On Windows: cl /std:c++17 /EHsc /I include\windows worker.cpp
 //  On macOS:   clang++ -std=c++17 -I include/darwin worker.cpp)
 //

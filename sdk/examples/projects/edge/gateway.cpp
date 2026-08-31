@@ -12,9 +12,7 @@
 //
 // Build (from the repo root, after building libsocketley_sdk.a):
 //   g++ -std=c++23 sdk/examples/projects/edge/gateway.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit \
-//       -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o /tmp/edge-gw
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/edge-gw
 //
 // Run:  /tmp/edge-gw            (edge-app must be up first; see app.cpp)
 // Try:  curl -k https://127.0.0.1:8443/gw/index.html

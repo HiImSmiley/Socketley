@@ -10,9 +10,7 @@
 //
 // Build (from the repo root, after building libsocketley_sdk.a):
 //   g++ -std=c++23 sdk/examples/projects/edge/app.cpp \
-//       -I. -Iinclude/linux -Ithirdparty/sol2 -Ithirdparty/luajit \
-//       -Lbin/Release -Lthirdparty/luajit \
-//       -lsocketley_sdk -luring -lssl -lcrypto -lluajit -o /tmp/edge-app
+//       $(sdk/socketley-config --cflags --libs) -o /tmp/edge-app
 //
 // Run:  /tmp/edge-app   (from the directory holding ./public)
 

@@ -37,8 +37,8 @@ public:
     bool setup(event_loop&) override { return false; }
     void teardown(event_loop&) override {}
 
-    void capture_extra(extra_bag& out) const override { out = m_extra; }
-    void apply_extra(const extra_bag& in) override { m_extra = in; }
+    void capture_config(extra_bag& out) const override { out = m_extra; }
+    void apply_config(const extra_bag& in) override { m_extra = in; }
 
     void set_field(std::string_view key, std::string_view value)
     {

@@ -51,7 +51,7 @@ void data(runtime_manager* mgr, std::string_view to, std::string_view from,
 void close(runtime_manager* mgr, std::string_view to, std::string_view from,
            const conn_ref& ref);
 
-// write_to_ref on the origin; "queued", the same contract send_to() has.
+// write_to_ref on the origin; "queued", the same contract queue_send() has.
 bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
            const conn_ref& ref, std::string_view msg);
 
@@ -59,7 +59,7 @@ bool write(runtime_manager* mgr, std::string_view to, std::string_view from,
 void drop(runtime_manager* mgr, std::string_view to, std::string_view from,
           const conn_ref& ref);
 
-// lua_broadcast on the origin; the one verb naming no connection.
+// broadcast on the origin; the one verb naming no connection.
 bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
                std::string_view msg);
 

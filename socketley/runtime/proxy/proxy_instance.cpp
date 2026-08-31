@@ -7479,7 +7479,7 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
 // The proxy-specific half of `stats`, every figure a walk of this process's
 // own tables, which is why it still crosses the socket while the counters no
 // longer do.
-std::string proxy_instance::stats_extra() const
+std::string proxy_instance::stats_lines() const
 {
     // Use char buffer for integer formatting to avoid ostringstream overhead in stats path
     char num_buf[32];
@@ -7584,7 +7584,7 @@ std::string proxy_instance::stats_extra() const
     return out;
 }
 
-std::string proxy_instance::lua_peer_ip(int client_fd)
+std::string proxy_instance::peer_ip(int client_fd)
 {
     struct sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
@@ -7603,7 +7603,7 @@ std::string proxy_instance::lua_peer_ip(int client_fd)
 // Whether there was a client connection here to close, with three silent
 // returns of which the backend half is the one a script gets wrong, because
 // both halves are ints.
-bool proxy_instance::lua_close_client(int client_fd)
+bool proxy_instance::close_client(int client_fd)
 {
     if (client_fd < 0 || client_fd >= MAX_FDS) return false;
     auto& ce = m_conn_idx[client_fd];
@@ -7616,7 +7616,7 @@ bool proxy_instance::lua_close_client(int client_fd)
     return true;
 }
 
-std::vector<std::string> proxy_instance::lua_backends() const
+std::vector<std::string> proxy_instance::backends() const
 {
     std::vector<std::string> result;
     result.reserve(m_backends.size());
@@ -7625,7 +7625,7 @@ std::vector<std::string> proxy_instance::lua_backends() const
     return result;
 }
 
-std::vector<std::pair<int, std::string>> proxy_instance::lua_backend_health() const
+std::vector<std::pair<int, std::string>> proxy_instance::backend_health_report() const
 {
     std::vector<std::pair<int, std::string>> result;
     result.reserve(m_circuit_breakers.size());
@@ -7643,7 +7643,7 @@ std::vector<std::pair<int, std::string>> proxy_instance::lua_backend_health() co
     return result;
 }
 
-std::vector<int> proxy_instance::lua_clients() const
+std::vector<int> proxy_instance::clients() const
 {
     std::vector<int> result;
     result.reserve(m_client_count);

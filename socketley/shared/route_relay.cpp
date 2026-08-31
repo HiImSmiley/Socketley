@@ -118,7 +118,7 @@ bool broadcast(runtime_manager* mgr, std::string_view to, std::string_view from,
 {
     if (auto* srv = local_server(mgr, to))
     {
-        srv->lua_broadcast(msg);
+        srv->broadcast(msg);
         return true;
     }
     if (auto* sink = mgr ? mgr->route_sink() : nullptr)
