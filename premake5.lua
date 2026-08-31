@@ -1081,7 +1081,7 @@ project "test_sdk_ws_client"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs { "include/windows" }
+    includedirs { "include/linux" }
 
     files { "test/unit/test_sdk_ws_client.cpp" }
 
@@ -1484,7 +1484,7 @@ project "test_sdk_cache_client"
     targetdir ("bin/%{cfg.buildcfg}")
     location("%{wks.location}")
 
-    includedirs { "include/windows" }
+    includedirs { "include/linux" }
 
     files { "test/unit/test_sdk_cache_client.cpp" }
 

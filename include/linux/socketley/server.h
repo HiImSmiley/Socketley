@@ -1,7 +1,7 @@
 // socketley/server.h — Server runtime (Tier 2, requires libsocketley_sdk.a)
 #pragma once
 #include "core.h"
-#include "socketley/runtime/server/server_instance.h"
+#include "runtime/server.h"
 
 namespace socketley {
 
@@ -107,31 +107,31 @@ public:
     server& on_websocket(std::function<void(int, const server_instance::ws_headers_result&)> cb) { srv()->set_on_websocket(std::move(cb)); return *this; }
 
     // ── Actions ─────────────────────────────────────────────────────────
-    void send(int fd, std::string_view msg)                          { srv()->lua_send_to(fd, msg); }
-    void broadcast(std::string_view msg)                             { srv()->lua_broadcast(msg); }
-    void disconnect(int fd)                                          { srv()->lua_disconnect(fd); }
-    std::string peer_ip(int fd)                                      { return srv()->lua_peer_ip(fd); }
-    std::vector<int> clients()                                       { return srv()->lua_clients(); }
-    void multicast(const std::vector<int>& fds, std::string_view m)  { srv()->lua_multicast(fds, m); }
-    void set_data(int fd, std::string_view k, std::string_view v)    { srv()->lua_set_data(fd, k, v); }
-    std::string get_data(int fd, std::string_view k)                 { return srv()->lua_get_data(fd, k); }
-    void del_data(int fd, std::string_view k)                        { srv()->lua_del_data(fd, k); }
-    server_instance::ws_headers_result ws_headers(int fd)            { return srv()->lua_ws_headers(fd); }
+    void send(int fd, std::string_view msg)                          { srv()->send_to(fd, msg); }
+    void broadcast(std::string_view msg)                             { srv()->broadcast(msg); }
+    void disconnect(int fd)                                          { srv()->disconnect(fd); }
+    std::string peer_ip(int fd)                                      { return srv()->peer_ip(fd); }
+    std::vector<int> clients()                                       { return srv()->clients(); }
+    void multicast(const std::vector<int>& fds, std::string_view m)  { srv()->multicast(fds, m); }
+    void set_data(int fd, std::string_view k, std::string_view v)    { srv()->set_data(fd, k, v); }
+    std::string get_data(int fd, std::string_view k)                 { return srv()->get_data(fd, k); }
+    void del_data(int fd, std::string_view k)                        { srv()->del_data(fd, k); }
+    server_instance::ws_headers_result ws_headers(int fd)            { return srv()->ws_headers(fd); }
     void rebuild_http_cache()                                        { srv()->rebuild_http_cache(); }
 
     // ── Multicast groups ────────────────────────────────────────────────
-    void join_group(int fd, std::string_view group)                  { srv()->lua_join_group(fd, group); }
-    void leave_group(int fd, std::string_view group)                 { srv()->lua_leave_group(fd, group); }
-    void group_send(std::string_view group, std::string_view msg)    { srv()->lua_group_send(group, msg); }
+    void join_group(int fd, std::string_view group)                  { srv()->join_group(fd, group); }
+    void leave_group(int fd, std::string_view group)                 { srv()->leave_group(fd, group); }
+    void group_send(std::string_view group, std::string_view msg)    { srv()->group_send(group, msg); }
 
     // ── Zero-copy pipe pairing ──────────────────────────────────────────
-    void pipe(int fd_a, int fd_b)                                    { srv()->lua_pipe(fd_a, fd_b); }
-    void unpipe(int fd)                                              { srv()->lua_unpipe(fd); }
+    void pipe(int fd_a, int fd_b)                                    { srv()->pipe(fd_a, fd_b); }
+    void unpipe(int fd)                                              { srv()->unpipe(fd); }
 
     // ── Upstream connections ────────────────────────────────────────────
-    void upstream_send(int conn_id, std::string_view msg)            { srv()->lua_upstream_send(conn_id, msg); }
-    void upstream_broadcast(std::string_view msg)                    { srv()->lua_upstream_broadcast(msg); }
-    std::vector<int> upstreams()                                     { return srv()->lua_upstreams(); }
+    void upstream_send(int conn_id, std::string_view msg)            { srv()->upstream_send(conn_id, msg); }
+    void upstream_broadcast(std::string_view msg)                    { srv()->upstream_broadcast(msg); }
+    std::vector<int> upstreams()                                     { return srv()->upstreams(); }
 
     // ── Ownership / hierarchy ───────────────────────────────────────────
     server& owner(std::string_view name)                   { raw()->set_owner(name); return *this; }

@@ -129,14 +129,14 @@ if(SOCKETLEY_BUILD_EXAMPLES)
     # cross-platform: needs only the client header
     add_executable(jobqueue_worker examples/projects/jobqueue/worker.cpp)
     target_include_directories(jobqueue_worker PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/windows")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux")
 
     add_executable(chatroom_chatd examples/projects/chatroom/chatd.cpp)
     target_link_libraries(chatroom_chatd PRIVATE socketley_sdk)
 
     add_executable(chatroom_cli examples/projects/chatroom/chat_cli.cpp)
     target_include_directories(chatroom_cli PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../include/windows")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include/linux")
     find_package(Threads REQUIRED)
     target_link_libraries(chatroom_cli PRIVATE Threads::Threads)
 

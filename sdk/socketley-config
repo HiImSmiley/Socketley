@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# socketley-config -- the flags a program needs to build against this SDK.
+#
+# The examples carried six -I/-L paths and five libraries on their build lines,
+# including -Ithirdparty/sol2 and -Ithirdparty/luajit to compile a program that
+# never mentions Lua.  Every one of them was a thing the reader had to know
+# before writing a line, and a wrong one failed at link time with a message
+# about a symbol rather than about a path.
+#
+#   g++ -std=c++23 my_worker.cpp $(sdk/socketley-config --cflags --libs) -o my_worker
+#
+# The standard is deliberately not emitted: it belongs on the compile line,
+# where a reader can see which one they are getting, and a -std buried in
+# --cflags would silently override theirs.
+#
+# --pc writes a pkg-config file for the same flags, for a build system that
+# would rather ask pkg-config than run this.
+#
+# liburing comes from thirdparty/, not from the system, because that is what
+# the engine in libsocketley_sdk.a was compiled against.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CONFIG=${SOCKETLEY_CONFIG:-Release}
+
+usage()
+{
+    echo "usage: socketley-config [--config <name>] [--cflags] [--libs] [--pc] [--root]"
+    echo "  --config   build directory under bin/ (default: \$SOCKETLEY_CONFIG or Release)"
+}
+
+want_cflags=0
+want_libs=0
+want_pc=0
+want_root=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --cflags)  want_cflags=1 ;;
+        --libs)    want_libs=1 ;;
+        --pc)      want_pc=1 ;;
+        --root)    want_root=1 ;;
+        --config)  shift; [ $# -gt 0 ] || { echo "--config needs a name"; exit 1; }
+                   CONFIG=$1 ;;
+        -h|--help) usage; exit 0 ;;
+        *)         echo "unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
+LIBDIR="$ROOT/bin/$CONFIG"
+
+# A missing library is the failure this script exists to make legible: without
+# the check the flags print happily and the link fails on socketley symbols.
+if [ "$want_libs" = 1 ] || [ "$want_pc" = 1 ]; then
+    if [ ! -f "$LIBDIR/libsocketley_sdk.a" ]; then
+        echo "no libsocketley_sdk.a in $LIBDIR -- build it with"
+        echo "  make -C make config=$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')_x64"
+        exit 2
+    fi
+fi
+
+CFLAGS="-I$ROOT/include/linux"
+CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/liburing"
+CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/sol2"
+CFLAGS="$CFLAGS -isystem $ROOT/thirdparty/luajit"
+
+LIBS="-L$LIBDIR -L$ROOT/thirdparty/luajit"
+LIBS="$LIBS -lsocketley_sdk -lluajit -luring -lssl -lcrypto -pthread"
+
+if [ "$want_pc" = 1 ]; then
+    cat <<EOF
+Name: socketley
+Description: Long-living network runtimes: server, client, proxy, cache
+Version: $("$ROOT/bin/$CONFIG/socketley" --version 2>/dev/null | head -1 || echo 0)
+Cflags: $CFLAGS
+Libs: $LIBS
+EOF
+    exit 0
+fi
+
+[ "$want_root" = 1 ] && printf '%s\n' "$ROOT"
+
+out=""
+[ "$want_cflags" = 1 ] && out="$CFLAGS"
+[ "$want_libs" = 1 ]   && out="${out:+$out }$LIBS"
+[ -n "$out" ] && printf '%s\n' "$out"
+
+if [ "$want_cflags" = 0 ] && [ "$want_libs" = 0 ] && [ "$want_root" = 0 ]; then
+    usage
+    exit 1
+fi
+exit 0

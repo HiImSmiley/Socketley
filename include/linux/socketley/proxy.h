@@ -1,7 +1,7 @@
 // socketley/proxy.h — Proxy runtime (Tier 2, requires libsocketley_sdk.a)
 #pragma once
 #include "core.h"
-#include "socketley/runtime/proxy/proxy_instance.h"
+#include "runtime/proxy.h"
 
 namespace socketley {
 
@@ -134,11 +134,11 @@ public:
     proxy& on_proxy_response(proxy_instance::proxy_hook cb){ prx()->set_on_proxy_response(std::move(cb)); return *this; }
 
     // ── Actions ─────────────────────────────────────────────────────────
-    std::string peer_ip(int fd)                               { return prx()->lua_peer_ip(fd); }
-    void close_client(int fd)                                 { prx()->lua_close_client(fd); }
-    std::vector<int> clients()                                { return prx()->lua_clients(); }
-    std::vector<std::string> backends()                       { return prx()->lua_backends(); }
-    std::vector<std::pair<int, std::string>> backend_health() { return prx()->lua_backend_health(); }
+    std::string peer_ip(int fd)                               { return prx()->peer_ip(fd); }
+    void close_client(int fd)                                 { prx()->close_client(fd); }
+    std::vector<int> clients()                                { return prx()->clients(); }
+    std::vector<std::string> backends()                       { return prx()->backends(); }
+    std::vector<std::pair<int, std::string>> backend_health_report() { return prx()->backend_health_report(); }
 
     // ── Ownership / hierarchy ───────────────────────────────────────────
     proxy& owner(std::string_view name)                    { raw()->set_owner(name); return *this; }
