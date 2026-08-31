@@ -1,5 +1,6 @@
 #pragma once
 #include "../../shared/conn_reachability.h"
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "../../shared/request_channel.h"
 #include "../../shared/cache_shard_map.h"
 #include "cache_store.h"
+#include "../../shared/mutation_journal.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/tls_context.h"
@@ -155,6 +157,11 @@ public:
 
     void set_persistent(std::string_view path);
     std::string_view get_persistent() const;
+
+    // Seconds between journal flushes, 0 meaning no journal at all, which is
+    // exactly what every cache before this flag existed had.
+    void set_persist_interval(uint32_t seconds);
+    uint32_t get_persist_interval() const;
 
     void set_mode(cache_mode mode);
     cache_mode get_mode() const;
@@ -506,6 +513,34 @@ private:
     bool        save_shard_dump() const;
     bool        load_shard_set();
 
+    // ── The mutation journal ────────────────────────────────────────────────
+    // Beside this shard's dump as `<dump>.journal`, holding every write the
+    // dump has not absorbed, flushed on --persistent-interval and truncated by
+    // the snapshot that supersedes it.
+    std::string journal_path(uint32_t index) const;
+    bool        journal_recover();                      // judge, replay, open
+    void        journal_mutation(std::string_view cmd); // buffer one write
+    void        journal_flush_now();                    // buffer to page cache
+    void        journal_after_snapshot(bool saved);     // truncate or flush
+    void        arm_journal_timer();
+
+    // A burst must not turn the buffer into the leak the interval avoids, so
+    // it reaches the disk early at this size.
+    static constexpr size_t journal_flush_bytes = 64 * 1024;
+
+    // Whether a mutation needs writing down at all, asked before the text of
+    // the command is built, because most caches neither lead nor journal.
+    bool mutation_log_wanted() const
+    {
+        return (m_repl_role == repl_leader && !m_followers.empty())
+            || (m_journal.is_open() && !m_journal_replaying);
+    }
+
+    // One Lua-facing mutation into the chokepoint, spelled as the text
+    // command a client would have typed, because this API used to walk past
+    // both the followers and the journal.
+    void log_lua_mutation(std::initializer_list<std::string_view> parts);
+
     uint32_t m_shard_n{1};
     uint32_t m_shard_i{0};
 
@@ -685,6 +720,20 @@ private:
     std::unique_ptr<timer_op> m_idle_sweep_timer;
 
     std::string m_persistent_path;
+    // 0 keeps exactly the behaviour every cache before the flag had: a dump at
+    // stop and at `flush`, and nothing in between.
+    uint32_t m_persist_interval{0};
+
+    mutation_journal m_journal;
+    std::unique_ptr<timer_op> m_journal_timer;
+    bool m_journal_timer_armed{false};
+    // Replayed commands go through the interpreter, whose write paths would
+    // journal them a second time.
+    bool m_journal_replaying{false};
+    // Warned once per run, because a full disk would otherwise say so once per
+    // interval for as long as the writes keep coming.
+    bool m_journal_write_warned{false};
+
     cache_mode m_mode = cache_mode_readwrite;
     bool m_resp_forced{false};
 

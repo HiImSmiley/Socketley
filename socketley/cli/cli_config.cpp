@@ -94,6 +94,7 @@ constexpr config_key config_keys[] = {
 
     // ── Cache ───────────────────────────────────────────────────────────────
     { "persistent",         "--persistent",         key_kind::text    },
+    { "persistent_interval","--persistent-interval",key_kind::scalar  },
     { "maxmemory",          "--maxmemory",          key_kind::scalar  },
     { "eviction",           "--eviction",           key_kind::text    },
     { "resp",               "--resp",               key_kind::boolean },

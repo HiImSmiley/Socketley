@@ -119,6 +119,9 @@ struct runtime_config
 
     // Cache
     std::string persistent_path;
+    // Seconds between journal flushes, 0 meaning no journal, which is what
+    // every state file written before the flag existed means.
+    uint32_t persistent_interval = 0;
     uint8_t cache_mode = 1;  // cache_mode (default readwrite)
     bool resp_forced = false;
     bool cluster = false;

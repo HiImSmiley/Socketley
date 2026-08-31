@@ -441,6 +441,8 @@ static void restore_runtimes(state_persistence& persistence,
             {
                 auto* cache = static_cast<cache_instance*>(instance);
                 if (!cfg.persistent_path.empty()) cache->set_persistent(cfg.persistent_path);
+                if (cfg.persistent_interval > 0)
+                    cache->set_persist_interval(cfg.persistent_interval);
                 cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
                 if (cfg.resp_forced) cache->set_resp_forced(true);
                 if (cfg.cluster) cache->set_cluster(true);

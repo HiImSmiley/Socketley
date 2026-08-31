@@ -153,6 +153,21 @@ static std::string instance_shards_refusal(const runtime_instance* inst)
                                  inst->get_listen_path());
 }
 
+// Why a cache's persistence pair cannot be honoured, judged as a set because
+// --persistent may be typed on either side of --persistent-interval.
+static std::string instance_cache_persist_refusal(const runtime_instance* inst)
+{
+    if (!inst || inst->get_type() != runtime_cache)
+        return {};
+
+    const auto* cache = static_cast<const cache_instance*>(inst);
+    if (cache->get_persist_interval() > 0 && cache->get_persistent().empty())
+        return "--persistent-interval needs --persistent: the interval says how "
+               "often the journal beside that file reaches the disk, and "
+               "without the file there is nothing to journal beside\n";
+    return {};
+}
+
 // Who is on the other end of this connection, or 0 when the socket cannot say.
 static pid_t peer_pid(int conn_fd)
 {
@@ -1254,6 +1269,16 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    // And the cache's persistence pair, whose halves may arrive in either
+    // order as well.
+    if (const std::string msg = instance_cache_persist_refusal(instance);
+        !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
     // A registered type's required keys, at the point the TLS set is checked
     // and for the same reason, with declared defaults filled in on the way.
     if (const std::string msg = type_manifest::registered_create_refusal(instance);
@@ -1421,6 +1446,16 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // state file, which start() also refuses -- but only this puts the
             // reason on the terminal of whoever typed `start`.
             if (const std::string msg = instance_shards_refusal(inst); !msg.empty())
+            {
+                conn->write_buf += std::string(n) + ": " + msg;
+                ++failed;
+                continue;
+            }
+
+            // The persistence pair on the same reasoning: only a hand-written
+            // state file can hold an interval without a path.
+            if (const std::string msg = instance_cache_persist_refusal(inst);
+                !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
                 ++failed;
@@ -2968,6 +3003,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             static constexpr uint32_t cache_only[] = {
                 fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
                 fnv1a("--replicate"), fnv1a("--resp"), fnv1a("--cluster"),
+                fnv1a("--persistent-interval"),
             };
             bool is_cache_flag = false;
             for (uint32_t h : cache_only)
@@ -3161,6 +3197,27 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     {
         conn->write_buf = msg;
         return 1;
+    }
+
+    // The cache's persistence pair judged on the result as well, because a
+    // document may set the interval while clearing or omitting the path.
+    if (type == runtime_cache)
+    {
+        const auto* cache = static_cast<const cache_instance*>(instance);
+        const std::string eff_path = merged("persistent_path",
+                                            cfg.persistent_path,
+                                            std::string(cache->get_persistent()));
+        const uint32_t eff_ival = merged("persistent_interval",
+                                         cfg.persistent_interval,
+                                         cache->get_persist_interval());
+        if (eff_ival > 0 && eff_path.empty())
+        {
+            conn->write_buf =
+                "persistent_interval needs persistent_path: the interval says "
+                "how often the journal beside that file reaches the disk, and "
+                "without the file there is nothing to journal beside\n";
+            return 1;
+        }
     }
 
     // A registered type's fields against its schema, here with the other
@@ -3418,6 +3475,8 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         {
             auto* cache = static_cast<cache_instance*>(instance);
             if (has("persistent_path"))  cache->set_persistent(cfg.persistent_path);
+            if (has("persistent_interval"))
+                cache->set_persist_interval(cfg.persistent_interval);
             if (has("cache_mode"))       cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
             if (has("resp_forced"))      cache->set_resp_forced(cfg.resp_forced);
             if (has("cluster"))          cache->set_cluster(cfg.cluster);

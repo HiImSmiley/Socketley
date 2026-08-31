@@ -133,6 +133,7 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             auto& cache = static_cast<cache_instance&>(rt);
             if (!cfg.persistent_path.empty())
                 cache.set_persistent(cfg.persistent_path);
+            cache.set_persist_interval(cfg.persistent_interval);
             cache.set_mode(static_cast<cache_mode>(cfg.cache_mode));
             cache.set_resp_forced(cfg.resp_forced);
             cache.set_cluster(cfg.cluster);

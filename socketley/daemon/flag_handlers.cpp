@@ -883,6 +883,28 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
             cache->set_persistent(pa.args[++i]);
             return 0;
         }
+        // How far behind the disk may run: writes are journaled beside the
+        // dump and flushed at this cadence, and whether --persistent was
+        // typed at all is judged once every flag has been seen.
+        case fnv1a("--persistent-interval"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--persistent-interval requires a value\n";
+                return 1;
+            }
+            uint64_t secs;
+            if (!parse_duration_flag("persistent-interval", pa.args[++i],
+                                     std::numeric_limits<uint32_t>::max(), secs))
+                return 1;
+            if (secs == 0)
+            {
+                std::cout << "invalid persistent-interval value\n";
+                return 1;
+            }
+            cache->set_persist_interval(static_cast<uint32_t>(secs));
+            return 0;
+        }
         case fnv1a("--mode"):
         {
             if (i + 1 >= pa.count)

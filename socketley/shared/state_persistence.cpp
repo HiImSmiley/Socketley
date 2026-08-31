@@ -661,6 +661,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
         {
             auto* cache = static_cast<const cache_instance*>(instance);
             cfg.persistent_path = cache->get_persistent();
+            cfg.persistent_interval = cache->get_persist_interval();
             cfg.cache_mode = static_cast<uint8_t>(cache->get_mode());
             cfg.resp_forced = cache->get_resp_forced();
             cfg.cluster = cache->get_cluster();
@@ -883,6 +884,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
         case runtime_cache:
             if (!cfg.persistent_path.empty())
                 append_str_field("persistent_path", cfg.persistent_path);
+            if (cfg.persistent_interval > 0)
+                append_int_field("persistent_interval", cfg.persistent_interval);
             append_str_field("cache_mode", cache_mode_str(cfg.cache_mode));
             if (cfg.resp_forced)
                 append_bool_field("resp_forced", true);
@@ -1021,6 +1024,8 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             break;
         case runtime_cache:
             cfg.persistent_path = json_get_string(json, "persistent_path");
+            { auto v = json_get_int(json, "persistent_interval");
+              if (v > 0) cfg.persistent_interval = static_cast<uint32_t>(v); }
             cfg.cache_mode = str_to_cache_mode(json_get_string(json, "cache_mode"));
             cfg.resp_forced = json_get_bool(json, "resp_forced");
             cfg.cluster = json_get_bool(json, "cluster");

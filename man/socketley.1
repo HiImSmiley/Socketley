@@ -835,6 +835,7 @@ l l lw(42).
 Field	Type	Description
 _
 persistent_path	string	Persistence file path
+persistent_interval	number	Journal flush cadence in seconds (0 = no journal) \fB(requires restart)\fR
 cache_mode	string	"readonly", "readwrite", or "admin"
 resp_forced	bool	Force RESP2 protocol \fB(requires restart)\fR
 replicate_target	string	Leader host:port \fB(requires restart)\fR
@@ -2857,6 +2858,44 @@ itself: a missing slice is named, and files that disagree about the shard count
 \(em two runs' dumps in one place \(em are refused together. Slices left by a
 run with more shards are removed by the dump that supersedes them.
 .TP
+.BI "\-\-persistent\-interval " "duration"
+Journal every accepted write beside the dump, flushed on this cadence: an
+acknowledged write reaches the kernel at most
+.I duration
+after it was accepted, so a killed or OOM\-killed worker loses at most the
+last interval of writes instead of everything since the last stop or FLUSH.
+Requires
+.BR \-\-persistent ;
+refused without it. Durations read as everywhere \(em
+.BR 30s ", " 5m ", " 1h
+\(em and a bare number is seconds.
+.IP
+The journal lives at
+.IB file .journal
+(per shard,
+.IB file .shardN.journal ),
+written
+.BR 0600 .
+A clean stop and the admin
+.B FLUSH
+command write the dump and cut the journal behind it; an unclean stop leaves a
+tail, which the next start replays on top of the dump before serving. A tail
+torn mid\-record by the crash is dropped at the last complete record, with the
+dropped byte count in the daemon log. TTLs are journaled as absolute
+deadlines, so a key that had five seconds left when it was written has
+whatever remains of those five seconds after a replay \(em possibly nothing.
+.IP
+The flush is a write into the kernel's page cache and deliberately not an
+fsync: the promise covers a dead process, not a dead machine. A power cut can
+additionally lose what the kernel had not yet written back.
+.IP
+A journal with records written under a different shard count (or a different
+ownership function) refuses the start rather than guessing at an order for
+one key's history across two files: recover under the split that wrote it and
+stop cleanly, or delete the
+.B .journal
+files to discard the tail.
+.TP
 .BI "\-\-mode " "mode"
 Access control mode:
 .B readonly
@@ -3680,6 +3719,7 @@ client_key                 \-\-client\-key
 sidecar (bool)             \-\-sidecar
 \(em\(em cache \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
 persistent                 \-\-persistent
+persistent_interval        \-\-persistent\-interval     5m, 30s, 1h
 maxmemory                  \-\-maxmemory     256M, or a byte count
 eviction                   \-\-eviction
 resp (bool)                \-\-resp

@@ -26,6 +26,7 @@
 #include <liburing.h>
 #include <fstream>
 #include <sstream>
+#include <limits>
 #include <sys/stat.h>
 #include <poll.h>
 
@@ -354,6 +355,16 @@ std::string_view cache_instance::get_persistent() const
     return m_persistent_path;
 }
 
+void cache_instance::set_persist_interval(uint32_t seconds)
+{
+    m_persist_interval = seconds;
+}
+
+uint32_t cache_instance::get_persist_interval() const
+{
+    return m_persist_interval;
+}
+
 void cache_instance::set_mode(cache_mode mode)
 {
     m_mode = mode;
@@ -465,6 +476,13 @@ bool cache_instance::setup(event_loop& loop)
     // writes its own self-describing file, and a set that cannot be trusted
     // refuses the start rather than being loaded in part.
     if (!load_shard_set())
+        return false;
+
+    // The journal replays onto the dumps just loaded, the only state it was
+    // ever relative to, and one that cannot be trusted refuses the start the
+    // same way an untrustworthy dump set does.
+    if (m_persist_interval > 0 && !m_persistent_path.empty()
+        && !journal_recover())
         return false;
 
     // ─── --listen unix:/path/to.sock ────────────────────────────────────────
@@ -662,6 +680,19 @@ bool cache_instance::setup(event_loop& loop)
     if (m_has_ttl_keys)
         arm_ttl_timer();
 
+    // A fresh journal timer per run for the same reason as the sweep's, and
+    // armed only once a write is buffered, because an idle cache owes the
+    // disk nothing.
+    if (m_journal.is_open())
+    {
+        m_journal_timer = std::make_unique<timer_op>();
+        m_journal_timer->ts.tv_sec  = m_persist_interval;
+        m_journal_timer->ts.tv_nsec = 0;
+        m_journal_timer->req = { this, nullptr, -1, 0, op_timeout };
+        m_journal_timer_armed  = false;
+        m_journal_write_warned = false;
+    }
+
     if (m_idle_timeout_cached > 0)
     {
         m_idle_sweep_timer = std::make_unique<timer_op>();
@@ -680,11 +711,18 @@ void cache_instance::teardown(event_loop& /*loop*/)
 {
     // This shard's own slice into its own file, atomically, and never the bare
     // path, because a dump has to say what split it holds.
-    if (!save_shard_dump())
+    const bool dumped = save_shard_dump();
+    if (!dumped)
         LOG_ERROR(("cache: could not write the dump for slice "
                    + std::to_string(m_shard_i) + " of "
                    + std::to_string(m_shard_n) + " beside " + m_persistent_path
                    + "; the next start will refuse the incomplete set").c_str());
+
+    // The dump now holds every journaled effect, or it failed and the journal
+    // is the only record of the tail; closed either way so the next setup()
+    // reopens it against whatever is then on disk.
+    journal_after_snapshot(dumped);
+    m_journal.close();
 
     // Shutdown before closing, because a multishot accept holds its own
     // reference and close() leaves the loop owing this owner an operation
@@ -855,6 +893,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
         bool withdrawn = true;
         if (m_ttl_timer_armed && m_ttl_timer)
             withdrawn &= m_loop->submit_timeout_remove(&m_ttl_timer->req);
+        if (m_journal_timer_armed && m_journal_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_journal_timer->req);
         if (m_idle_sweep_timer)
             withdrawn &= m_loop->submit_timeout_remove(&m_idle_sweep_timer->req);
         if (m_accept_backoff_timer)
@@ -886,6 +926,12 @@ void cache_instance::teardown(event_loop& /*loop*/)
             owed[0] = &m_ttl_timer->req;
             retire(std::shared_ptr<void>(std::move(m_ttl_timer)), owed, n);
         }
+        if (m_journal_timer)
+        {
+            const size_t n = m_journal_timer_armed ? 1 : 0;
+            owed[0] = &m_journal_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_journal_timer)), owed, n);
+        }
         if (m_idle_sweep_timer)
         {
             owed[0] = &m_idle_sweep_timer->req;
@@ -909,6 +955,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
     m_collect_fd = -1;
 
     m_ttl_timer_armed = false;
+    m_journal_timer_armed = false;
     m_loop = nullptr;
     m_multishot_active = false;
     m_cluster_multishot_active = false;
@@ -980,6 +1027,16 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         // sweep_expired() may have removed the last one.
         if (m_has_ttl_keys)
             arm_ttl_timer();
+        return;
+    }
+
+    // The journal's interval flush, disarmed here and re-armed by the next
+    // buffered write, because a timer that fires for an empty buffer wakes an
+    // idle loop for nothing.
+    if (m_journal_timer && req == &m_journal_timer->req)
+    {
+        m_journal_timer_armed = false;
+        journal_flush_now();
         return;
     }
 
@@ -2465,6 +2522,7 @@ bool cache_instance::save_shard_dump() const
     // them, from shard 0 alone and only at or above the current count, or the
     // next start sees two complete sets and refuses a legitimate shrink.
     if (ok && m_shard_i == 0)
+    {
         for (uint32_t j = (m_shard_n <= 1 ? 0 : m_shard_n); j < max_shards; ++j)
         {
             const std::string stale =
@@ -2472,7 +2530,15 @@ bool cache_instance::save_shard_dump() const
             if (::unlink(stale.c_str()) == 0)
                 LOG_INFO(("cache: removed " + stale
                           + ", superseded by this dump").c_str());
+            // Its journal goes with it: past this dump either it was empty or
+            // its split refused this start, so there is no record to lose.
+            if (::unlink((stale + ".journal").c_str()) == 0) {}
         }
+        // The bare name's journal is a one-shard run's, superseded the same
+        // way once more than one shard writes.
+        if (m_shard_n > 1)
+            if (::unlink((m_persistent_path + ".journal").c_str()) == 0) {}
+    }
 
     return ok;
 }
@@ -2638,6 +2704,273 @@ bool cache_instance::load_shard_set()
         m_store.adopt_owned(incoming, m_shard_i, m_shard_n);
     }
     return true;
+}
+
+// ─── THE MUTATION JOURNAL ───────────────────────────────────────────────────
+// `--persistent-interval` puts a journal beside each shard's dump: every
+// accepted write is appended as the same text command replication carries,
+// reaches the page cache at most one interval after it was acknowledged, and
+// is truncated by the snapshot that absorbs it -- so a killed worker replays
+// the tail the dump never saw instead of losing it.
+
+std::string cache_instance::journal_path(uint32_t index) const
+{
+    return shard_dump_path(index) + ".journal";
+}
+
+// Judge every journal beside the dump, replay this shard's own onto the dumps
+// just loaded, and leave it open for appending.
+bool cache_instance::journal_recover()
+{
+    const std::string own      = journal_path(m_shard_i);
+    const std::string own_head = encode_shard_dump_header(m_shard_n, m_shard_i);
+
+    const auto refuse_foreign = [](const std::string& p) {
+        LOG_ERROR(("cache: the journal at " + p + " was not written by this "
+                   "shard split, and its records cannot be ordered against "
+                   "another journal's history of the same key.  Start with "
+                   "the shard count that wrote it and stop cleanly to absorb "
+                   "it, or delete the .journal files to discard the "
+                   "unsnapshotted tail").c_str());
+        return false;
+    };
+
+    // One journal name judged: nothing there and nothing recorded are fine,
+    // anything else unowned refuses, because a journal holding records under
+    // another split is unsnapshotted data this run would serve without.
+    const auto judge = [&](const std::string& p, const std::string& expected) {
+        std::string owner;
+        switch (mutation_journal::probe(p, owner))
+        {
+            case mutation_journal::probe_result::absent:
+            case mutation_journal::probe_result::empty:
+                return true;
+            case mutation_journal::probe_result::unreadable:
+                LOG_ERROR(("cache: " + p + " exists and could not be read; "
+                           "refusing to guess whether it holds writes").c_str());
+                return false;
+            case mutation_journal::probe_result::not_a_journal:
+                LOG_ERROR(("cache: " + p + " is not a journal this build "
+                           "writes; refusing to start over it").c_str());
+                return false;
+            case mutation_journal::probe_result::has_records:
+                if (expected.empty() || owner != expected)
+                    return refuse_foreign(p);
+                return true;
+        }
+        return false;
+    };
+
+    // Every sharded name, where a slice of the current split is a sibling's
+    // business and everything else with records belongs to another run.
+    for (uint32_t j = 0; j < max_shards; ++j)
+    {
+        const std::string p = m_persistent_path + ".shard" + std::to_string(j)
+                            + ".journal";
+        const std::string expected =
+            (m_shard_n > 1 && j < m_shard_n)
+                ? encode_shard_dump_header(m_shard_n, j) : std::string{};
+        if (!judge(p, expected))
+            return false;
+    }
+    // And the bare name, which is this shard's own at one shard and a
+    // one-shard run's leftover above that.
+    if (!judge(m_persistent_path + ".journal",
+               m_shard_n <= 1 ? own_head : std::string{}))
+        return false;
+
+    std::string owner;
+    const auto pr = mutation_journal::probe(own, owner);
+
+    // A header-only journal from another split holds nothing, so it is
+    // replaced rather than refused.
+    if (pr == mutation_journal::probe_result::empty && owner != own_head
+        && ::unlink(own.c_str()) != 0)
+    {
+        LOG_ERROR(("cache: could not replace the stale journal at "
+                   + own).c_str());
+        return false;
+    }
+
+    if (pr == mutation_journal::probe_result::has_records)
+    {
+        // Replay bypasses the mode and the global rate limit, because both
+        // guard clients, and a recovery they throttle or refuse is data loss
+        // with a clean exit code.
+        const cache_mode saved_mode = m_mode;
+        const double     saved_rate = get_global_rate_limit();
+        m_mode = cache_mode_readwrite;
+        set_global_rate_limit(0.0);
+        m_journal_replaying = true;
+
+        mutation_journal::replay_stats st;
+        const bool ok = mutation_journal::replay(
+            own, [&](std::string_view rec) { apply_replicated(rec); }, st);
+
+        m_journal_replaying = false;
+        m_mode = saved_mode;
+        set_global_rate_limit(saved_rate);
+
+        if (!ok)
+        {
+            LOG_ERROR(("cache: the journal at " + own + " could not be read; "
+                       "refusing to start on part of a tail").c_str());
+            return false;
+        }
+
+        LOG_INFO(("cache: replayed " + std::to_string(st.records)
+                  + " journaled write(s) from " + own).c_str());
+        if (st.torn)
+            LOG_WARN(("cache: " + own + " ended mid-record; "
+                      + std::to_string(st.dropped_bytes)
+                      + " byte(s) after the last complete record were dropped")
+                     .c_str());
+    }
+
+    // Left as it stands rather than truncated, because the dump on disk does
+    // not hold what was just replayed; new writes append behind the old tail,
+    // and a second crash replays both from the same base.
+    if (!m_journal.open_append(own, own_head))
+    {
+        LOG_ERROR(("cache: could not open the journal at " + own).c_str());
+        return false;
+    }
+    return true;
+}
+
+// One accepted write into the buffer, with the relative-TTL spellings
+// rewritten to pexpireat, because "pexpire k 5000" replayed an hour later
+// grants an hour and the absolute deadline is what the write meant.
+void cache_instance::journal_mutation(std::string_view cmd)
+{
+    const cache_text_parts parts = cache_split_text(cmd);
+    const uint32_t         h     = fnv1a_lower(parts.cmd);
+
+    const auto int_of = [](std::string_view sv, int64_t& out) {
+        auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
+        return e == std::errc{} && p == sv.data() + sv.size();
+    };
+    // Saturating in both directions, because the deadline an absurd TTL means
+    // is "never" or "long gone", not a signed overflow.
+    const auto deadline_of = [](int64_t n, bool seconds) {
+        constexpr int64_t far = std::numeric_limits<int64_t>::max();
+        if (seconds)
+            n = n > far / 1000 ? far : n < -(far / 1000) ? -far : n * 1000;
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return n > far - now ? far : now + n;
+    };
+    const auto put_pexpireat = [&](std::string_view key, int64_t at) {
+        std::string rec;
+        rec.reserve(10 + key.size() + 21);
+        rec += "pexpireat ";
+        rec.append(key.data(), key.size());
+        rec += ' ';
+        rec += std::to_string(at);
+        m_journal.append(rec);
+    };
+
+    bool rewritten = false;
+    switch (h)
+    {
+        case fnv1a("expire"):
+        case fnv1a("pexpire"):
+        {
+            const size_t sp = parts.args.find(' ');
+            int64_t n = 0;
+            if (sp != std::string_view::npos && sp > 0
+                && int_of(parts.args.substr(sp + 1), n))
+            {
+                put_pexpireat(parts.args.substr(0, sp),
+                              deadline_of(n, h == fnv1a("expire")));
+                rewritten = true;
+            }
+            break;
+        }
+        case fnv1a("setex"):
+        case fnv1a("psetex"):
+        {
+            // "setex k n v" as the set and the deadline, the same split
+            // repl_set_effect makes for SET .. EX.
+            const size_t sp1 = parts.args.find(' ');
+            const size_t sp2 = sp1 == std::string_view::npos
+                             ? std::string_view::npos
+                             : parts.args.find(' ', sp1 + 1);
+            int64_t n = 0;
+            if (sp2 != std::string_view::npos && sp1 > 0
+                && int_of(parts.args.substr(sp1 + 1, sp2 - sp1 - 1), n))
+            {
+                const std::string_view key = parts.args.substr(0, sp1);
+                const std::string_view val = parts.args.substr(sp2 + 1);
+                std::string rec;
+                rec.reserve(5 + key.size() + val.size());
+                rec += "set ";
+                rec.append(key.data(), key.size());
+                rec += ' ';
+                rec.append(val.data(), val.size());
+                m_journal.append(rec);
+                put_pexpireat(key, deadline_of(n, h == fnv1a("setex")));
+                rewritten = true;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    if (!rewritten)
+        m_journal.append(cmd);
+
+    if (m_journal.pending_bytes() >= journal_flush_bytes)
+        journal_flush_now();
+    else
+        arm_journal_timer();
+}
+
+void cache_instance::journal_flush_now()
+{
+    if (!m_journal.flush() && !m_journal_write_warned)
+    {
+        m_journal_write_warned = true;
+        LOG_ERROR(("cache: could not append to the journal at "
+                   + journal_path(m_shard_i)
+                   + "; writes since the last flush are memory-only").c_str());
+    }
+}
+
+// What the journal does once a snapshot has been attempted: a dump that
+// succeeded holds every journaled effect, so the records behind it are cut
+// off; one that failed leaves the journal as the only record of the tail, so
+// the buffer goes to the disk instead.
+void cache_instance::journal_after_snapshot(bool saved)
+{
+    if (!m_journal.is_open())
+        return;
+    if (!saved)
+    {
+        journal_flush_now();
+        return;
+    }
+    if (!m_journal.reset())
+        LOG_WARN(("cache: could not truncate the journal at "
+                  + journal_path(m_shard_i) + " behind its snapshot; the next "
+                  "start will replay writes this dump already contains")
+                 .c_str());
+}
+
+void cache_instance::arm_journal_timer()
+{
+    if (m_journal_timer_armed || !m_loop || !m_journal_timer)
+        return;
+    m_journal_timer_armed = true;
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_journal_timer->ts,
+                                                   &m_journal_timer->req)))
+    {
+        // The interval cannot be promised without a timer, so the buffer goes
+        // now rather than never.
+        m_journal_timer_armed = false;
+        journal_flush_now();
+    }
 }
 
 // ─── THE CLUSTER VIEW ───────────────────────────────────────────────────────
@@ -4707,9 +5040,20 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
                 int64_t remaining_ms = unix_ms - now_ms;
-                if (remaining_ms <= 0) { m_store.del(key); rb.append("1\n", 2); }
+                // Verbatim like expireat and, like it once was, this was not
+                // replicated at all.
+                if (remaining_ms <= 0)
+                {
+                    m_store.del(key);
+                    rb.append("1\n", 2);
+                    replicate_command(line);
+                }
                 else if (m_store.set_expiry_ms(key, remaining_ms))
-                { mark_ttl_keys(); rb.append("1\n", 2); }
+                {
+                    mark_ttl_keys();
+                    rb.append("1\n", 2);
+                    replicate_command(line);
+                }
                 else rb.append("0\n", 2);
             }
             break;
@@ -4779,7 +5123,10 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             // This shard's own slice into its own file, the same write
             // teardown makes, fanned out to every shard so `all_ok` says so
             // only when every shard managed it.
-            rb.append(save_shard_dump() ? "ok\n" : "failed: flush failed\n");
+            const bool flushed = save_shard_dump();
+            if (flushed)
+                journal_after_snapshot(true);
+            rb.append(flushed ? "ok\n" : "failed: flush failed\n");
             break;
         }
         case fnv1a("load"):
@@ -4796,7 +5143,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             // The whole set judged as a set, so a gap or a contradiction
             // refuses rather than loading part of it, exactly as at start.
-            rb.append(load_shard_set() ? "ok\n" : "failed: load failed\n");
+            const bool loaded = load_shard_set();
+            // The journal's tail describes state the load just replaced, so a
+            // fresh snapshot of what is now in memory supersedes it before it
+            // is cut off.
+            if (loaded && m_journal.is_open() && save_shard_dump())
+                journal_after_snapshot(true);
+            rb.append(loaded ? "ok\n" : "failed: load failed\n");
             break;
         }
         case fnv1a("size"):
@@ -5056,19 +5409,46 @@ std::string cache_instance::lua_get(std::string_view key)
     return "";
 }
 
+// Spell a script's write as the text command a client would have typed and
+// hand it to replicate_command(), because the journal and the followers log
+// that chokepoint and this API used to walk past both.
+void cache_instance::log_lua_mutation(std::initializer_list<std::string_view> parts)
+{
+    if (!mutation_log_wanted())
+        return;
+    size_t n = 0;
+    for (const auto p : parts)
+        n += p.size() + 1;
+    std::string line;
+    line.reserve(n);
+    for (const auto p : parts)
+    {
+        if (!line.empty())
+            line += ' ';
+        line.append(p.data(), p.size());
+    }
+    replicate_command(line);
+}
+
 bool cache_instance::lua_set(std::string_view key, std::string_view value)
 {
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.set(key, value);
+    const bool did = m_store.set(key, value);
+    if (did)
+        log_lua_mutation({"set", key, value});
+    return did;
 }
 
 bool cache_instance::lua_del(std::string_view key)
 {
     if (m_mode == cache_mode_readonly)
         return false;
-    return m_store.del(key);
+    const bool did = m_store.del(key);
+    if (did)
+        log_lua_mutation({"del", key});
+    return did;
 }
 
 bool cache_instance::lua_lpush(std::string_view key, std::string_view val)
@@ -5076,7 +5456,10 @@ bool cache_instance::lua_lpush(std::string_view key, std::string_view val)
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.lpush(key, val);
+    const bool did = m_store.lpush(key, val);
+    if (did)
+        log_lua_mutation({"lpush", key, val});
+    return did;
 }
 
 bool cache_instance::lua_rpush(std::string_view key, std::string_view val)
@@ -5084,7 +5467,10 @@ bool cache_instance::lua_rpush(std::string_view key, std::string_view val)
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.rpush(key, val);
+    const bool did = m_store.rpush(key, val);
+    if (did)
+        log_lua_mutation({"rpush", key, val});
+    return did;
 }
 
 std::string cache_instance::lua_lpop(std::string_view key)
@@ -5094,7 +5480,10 @@ std::string cache_instance::lua_lpop(std::string_view key)
     m_store.check_expiry(key);
     std::string val;
     if (m_store.lpop(key, val))
+    {
+        log_lua_mutation({"lpop", key});
         return val;
+    }
     return "";
 }
 
@@ -5105,7 +5494,10 @@ std::string cache_instance::lua_rpop(std::string_view key)
     m_store.check_expiry(key);
     std::string val;
     if (m_store.rpop(key, val))
+    {
+        log_lua_mutation({"rpop", key});
         return val;
+    }
     return "";
 }
 
@@ -5147,7 +5539,10 @@ int cache_instance::lua_sadd(std::string_view key, std::string_view member)
     if (m_mode == cache_mode_readonly)
         return -1;
     m_store.check_expiry(key);
-    return m_store.sadd(key, member);
+    const int added = m_store.sadd(key, member);
+    if (added == 1)
+        log_lua_mutation({"sadd", key, member});
+    return added;
 }
 
 bool cache_instance::lua_srem(std::string_view key, std::string_view member)
@@ -5155,7 +5550,10 @@ bool cache_instance::lua_srem(std::string_view key, std::string_view member)
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.srem(key, member);
+    const bool did = m_store.srem(key, member);
+    if (did)
+        log_lua_mutation({"srem", key, member});
+    return did;
 }
 
 bool cache_instance::lua_sismember(std::string_view key, std::string_view member)
@@ -5196,7 +5594,10 @@ bool cache_instance::lua_hset(std::string_view key, std::string_view field, std:
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.hset(key, field, val);
+    const bool did = m_store.hset(key, field, val);
+    if (did)
+        log_lua_mutation({"hset", key, field, val});
+    return did;
 }
 
 std::string cache_instance::lua_hget(std::string_view key, std::string_view field)
@@ -5211,7 +5612,10 @@ bool cache_instance::lua_hdel(std::string_view key, std::string_view field)
     if (m_mode == cache_mode_readonly)
         return false;
     m_store.check_expiry(key);
-    return m_store.hdel(key, field);
+    const bool did = m_store.hdel(key, field);
+    if (did)
+        log_lua_mutation({"hdel", key, field});
+    return did;
 }
 
 int cache_instance::lua_hlen(std::string_view key)
@@ -5247,6 +5651,7 @@ bool cache_instance::lua_expire(std::string_view key, int seconds)
     if (m_store.set_expiry(key, seconds))
     {
         mark_ttl_keys();
+        log_lua_mutation({"expire", key, std::to_string(seconds)});
         return true;
     }
     return false;
@@ -5262,7 +5667,10 @@ bool cache_instance::lua_persist(std::string_view key)
 {
     if (m_mode == cache_mode_readonly)
         return false;
-    return m_store.persist(key);
+    const bool did = m_store.persist(key);
+    if (did)
+        log_lua_mutation({"persist", key});
+    return did;
 }
 
 uint32_t cache_instance::get_size() const
@@ -5552,7 +5960,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 
     // Helper: build text command from RESP args for replication
     auto repl = [&](std::string_view* a, int n) {
-        if (m_repl_role != repl_leader || m_followers.empty()) return;
+        if (!mutation_log_wanted()) return;
         std::string cmd;
         for (int i = 0; i < n; i++) {
             if (i > 0) cmd += ' ';
@@ -5567,7 +5975,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // the value "rv EX 100" with no expiry.
     auto repl_set_effect = [&](std::string_view key, std::string_view val,
                                int ex_sec, int64_t px_ms) {
-        if (m_repl_role != repl_leader || m_followers.empty()) return;
+        if (!mutation_log_wanted()) return;
 
         std::string cmd;
         cmd.reserve(5 + key.size() + val.size());
@@ -6777,6 +7185,12 @@ void cache_instance::refuse_follower_input(client_connection* conn)
 // emitter names.
 void cache_instance::replicate_command(std::string_view cmd)
 {
+    // Every mutation the followers would be told about is a mutation the
+    // journal has to hold, in one chokepoint, so a write path added later
+    // cannot reach one and miss the other.
+    if (SOCKETLEY_UNLIKELY(m_journal.is_open() && !m_journal_replaying))
+        journal_mutation(cmd);
+
     if (m_repl_role != repl_leader || m_followers.empty())
         return;
 
