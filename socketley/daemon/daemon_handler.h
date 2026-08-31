@@ -238,6 +238,21 @@ private:
     int await_worker_startup(std::string_view name, std::string& out,
                              std::chrono::steady_clock::time_point deadline);
 
+    // ── A cache command, run where the cache is ─────────────────────────────
+    // Every verb below `<name> <verb>` used to be a direct call on the
+    // placeholder, which since every runtime moved into a worker is a store no
+    // client can read.  This hands the same text a port client would send to
+    // the worker and waits, like await_worker_startup and with the same
+    // consequences for the loop.
+    //
+    // Shard zero and no key routing: a sharded cache forwards a key it does
+    // not own, which is what a client landing on the wrong shard already
+    // relies on.
+    int run_cache_action(ipc_connection* conn, std::string_view name,
+                         std::string_view action, std::string_view command);
+
+    uint64_t m_direct_ticket_seq{0};
+
     // Why this runtime's on_start raised, wherever the script ran, taken
     // rather than peeked, so it must be called once per start after the wait
     // that guarantees the frame arrived.

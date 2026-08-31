@@ -12,6 +12,11 @@
 #     attach server a 8080x    -> port 8080, runtime created
 #     <cache> expire k 5x      -> ttl 5
 #
+# The cache's own arm moved when CLI cache commands started running in the
+# worker: `expire 5x` is now refused by the cache's parser rather than by the
+# daemon's, and it is still refused, which is what this asserts.  The daemon's
+# copy stays for a runtime that is attached rather than forked.
+#
 # Each of these is a plausible typo -- 5m for a threshold, a stray character
 # from a shell history -- and every one of them configured something other than
 # what was typed, at exit 0.
@@ -109,9 +114,17 @@ fi
 
 refuses "expire 5x" "$BIN" cch expire k 5x
 
-# And the TTL it does take is the one asked for, not a prefix of it.
+# And the TTL it does take is the one asked for, not a prefix of it -- read
+# back over the PORT, not over the CLI.  When this was written both routes
+# ended in the daemon's placeholder, so the pair agreed with each other and
+# said nothing about the cache; they cross processes now and the read is put
+# where it proves that.
 "$BIN" cch expire k 30 >/dev/null 2>&1
-TTL=$("$BIN" cch ttl k 2>/dev/null | tr -dc '0-9')
+if command -v nc >/dev/null 2>&1; then
+    TTL=$(printf 'ttl k\n' | timeout 3 nc -q1 127.0.0.1 "$PORT_CACHE" 2>/dev/null | tr -dc '0-9')
+else
+    TTL=$("$BIN" cch ttl k 2>/dev/null | tr -dc '0-9')
+fi
 if [ -n "$TTL" ] && [ "$TTL" -ge 28 ] && [ "$TTL" -le 30 ]; then ok; else
     bad "a valid expire is stored" "ttl reported '${TTL:-<nothing>}', wanted 28..30"
 fi

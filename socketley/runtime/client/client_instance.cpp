@@ -132,8 +132,10 @@ bool client_instance::try_connect()
             host = std::string(target.substr(0, colon));
             auto port_sv = target.substr(colon + 1);
             uint32_t parsed_port = 0;
+            // The whole of it: `host:8080x` took the 8080 and connected there.
             auto [ptr, ec] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), parsed_port);
-            if (ec == std::errc{} && parsed_port > 0 && parsed_port <= 65535)
+            if (ec == std::errc{} && ptr == port_sv.data() + port_sv.size()
+                && parsed_port > 0 && parsed_port <= 65535)
                 port = static_cast<uint16_t>(parsed_port);
         }
     }

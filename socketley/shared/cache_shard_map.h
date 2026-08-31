@@ -180,6 +180,12 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("hset"):       case fnv1a("hget"):
         case fnv1a("hdel"):       case fnv1a("hlen"):
         case fnv1a("hgetall"):
+        // ── sorted sets ──
+        case fnv1a("zadd"):       case fnv1a("zrem"):
+        case fnv1a("zscore"):     case fnv1a("zcard"):
+        case fnv1a("zrank"):      case fnv1a("zrevrank"):
+        case fnv1a("zrange"):     case fnv1a("zrevrange"):
+        case fnv1a("zincrby"):
             return cache_cmd_class::single_key;
 
         case fnv1a("del"):        case fnv1a("exists"):

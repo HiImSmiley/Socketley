@@ -986,6 +986,74 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
     }
 }
 
+bool proxy_supervisor::send_direct(uint64_t ticket, std::string_view payload)
+{
+    if (!m_placeholder)
+        return false;
+
+    m_direct_ticket = ticket;
+    m_direct_done   = false;
+    m_direct_status = 0;
+    m_direct_reply.clear();
+
+    // The worker answers a chan_req by handing the payload to its own runtime,
+    // so the target is this supervisor's own name and the frame is the one
+    // serve_deferred writes.
+    return write_frame(worker_proto::frame(
+        worker_proto::frame_type::chan_req,
+        worker_proto::encode_chan_request(ticket, m_placeholder->get_name(),
+                                          payload)));
+}
+
+bool proxy_supervisor::await_direct(uint64_t ticket,
+                                    std::chrono::milliseconds bound,
+                                    uint8_t& status, std::string& reply)
+{
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+
+    for (;;)
+    {
+        poll();
+
+        // The map socket too, for the reason await_startup gives: a child
+        // blocked on a map answer would face a daemon blocked here.
+        poll_map();
+
+        if (m_direct_done && m_direct_ticket == ticket)
+        {
+            status = m_direct_status;
+            reply  = m_direct_reply;
+            m_direct_ticket = 0;
+            m_direct_done   = false;
+            return true;
+        }
+
+        // A child that died owes nothing, and waiting out the deadline for a
+        // corpse is the difference between a refusal and a hang.
+        if (check_liveness())
+            continue;
+        if (m_control_fd < 0)
+            return false;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return false;
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        int slice = static_cast<int>(std::min<std::chrono::milliseconds::rep>(
+            remaining.count(), 20));
+        if (slice < 0)
+            slice = 0;
+
+        struct pollfd pfds[2];
+        nfds_t        n = 0;
+        if (m_control_fd >= 0) pfds[n++] = {m_control_fd, POLLIN, 0};
+        if (m_map_fd     >= 0) pfds[n++] = {m_map_fd,     POLLIN, 0};
+        if (n && ::poll(pfds, n, slice) < 0) {}
+    }
+}
+
 // The reload half of the same idea, watching the declaration object the child
 // installs rather than the flag beside it, which the health tick consumes --
 // and a false here is not an error, because the declaration already held is
@@ -1118,7 +1186,21 @@ void proxy_supervisor::ingest(const std::string&)
                 // whose ticket is the channel's own, so nothing here has to
                 // know what was asked.
                 worker_proto::chan_reply_wire r;
-                if (m_channel && worker_proto::decode_chan_reply(payload, r))
+                if (!worker_proto::decode_chan_reply(payload, r))
+                    break;
+
+                // A ticket the daemon minted for itself is answered into the
+                // slot await_direct watches, and never into the channel, whose
+                // parked table has no entry for it.
+                if (r.ticket == m_direct_ticket && (r.ticket & direct_ticket_bit))
+                {
+                    m_direct_status = r.status;
+                    m_direct_reply.assign(r.payload);
+                    m_direct_done   = true;
+                    break;
+                }
+
+                if (m_channel)
                     m_channel->complete_deferred(
                         r.ticket, static_cast<request_status>(r.status), r.payload);
                 break;

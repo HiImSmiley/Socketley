@@ -57,6 +57,24 @@ struct client_connection
     // a crossing to run.
     bool cluster_port{false};
 
+    // ── MULTI ───────────────────────────────────────────────────────────────
+    // A transaction is a queue on the connection and nothing more: commands
+    // are stored verbatim between MULTI and EXEC and run back to back on the
+    // event loop, which is single-threaded, so nothing can interleave with
+    // them.  What this is not is a rollback -- EXEC runs what it queued, and a
+    // command that fails there fails alone, the way Redis has it.
+    bool                     in_multi{false};
+    // A command refused while queueing poisons the transaction, because
+    // running the rest of it would be running something the caller did not
+    // ask for.
+    bool                     multi_broken{false};
+    std::vector<std::string> multi_queue;
+    size_t                   multi_bytes{0};
+    // Enough for a batch worth queueing and small enough that a client cannot
+    // park unbounded memory on a connection by never sending EXEC.
+    static constexpr size_t  MULTI_MAX_BYTES = 8u << 20;
+    static constexpr size_t  MULTI_MAX_CMDS  = 100000;
+
     // A crossing this connection is waiting on, which stops the pipeline
     // because a client pipelining down one socket can only tell replies apart
     // by order -- an id and not a pointer, since the struct may be pooled by
@@ -123,6 +141,10 @@ struct client_connection
         closing = false;
         zc_notif_pending = false;
         cluster_port = false;
+        in_multi = false;
+        multi_broken = false;
+        multi_queue.clear();
+        multi_bytes = 0;
         batch_id = 0;
         peer_gone = false;
         resp_mode = false;

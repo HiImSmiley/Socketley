@@ -3279,6 +3279,74 @@ Return number of hash fields.
 .BI "hgetall " "key"
 Return all fields and values (multi-line "field value\\n", "end" terminator).
 .PP
+.B Sorted sets:
+.PP
+A score per member, read back in score order. The type is exclusive like the
+other four: a key that is a string refuses
+.BR zadd .
+.TP
+.BI "zadd " "key score member"
+Add or re-score a member. Returns "1" when the member is new and "0" when it
+was already there and only its score moved. A score may be fractional and is
+parsed whole \(em
+.B 1x
+is refused, not read as 1.
+.TP
+.BI "zrem " "key member"
+Remove a member. Returns "ok" or "nil". The key goes when its last member does.
+.TP
+.BI "zscore " "key member"
+Return the score, or "nil".
+.TP
+.BI "zcard " "key"
+Return the number of members.
+.TP
+.BI "zrank " "key member"
+Rank counting from the lowest score, zero-based, or "nil".
+.TP
+.BI "zrevrank " "key member"
+The same counting from the highest.
+.TP
+.BI "zrange " "key start stop" " [withscores]"
+Members by rank, ends inclusive, negative counting from the last \(em the rules
+.B lrange
+has. With
+.B withscores
+each line is "member score". Terminated by "end".
+.TP
+.BI "zrevrange " "key start stop" " [withscores]"
+The same walked from the highest score.
+.TP
+.BI "zincrby " "key delta member"
+Add to a member's score, creating it at
+.I delta
+if it is not there, and return the new score.
+.PP
+.B Transactions:
+.PP
+Grouping, not rollback. Between
+.B multi
+and
+.B exec
+a command is queued and answered "queued"; nothing has run, and a second
+connection reading the same key still sees the old value. EXEC then runs the
+queue back to back on an event loop that is single\-threaded, so no other
+connection's command lands in the middle of it. A command that fails inside
+.B exec
+fails alone \(em the ones before it stay.
+.TP
+.B multi
+Begin queueing. Nested
+.B multi
+is refused.
+.TP
+.B exec
+Run the queue in order, then "end". Refused without a
+.BR multi .
+.TP
+.B discard
+Throw the queue away.
+.PP
 .B TTL / Expiry:
 .TP
 .BI "expire " "key seconds"

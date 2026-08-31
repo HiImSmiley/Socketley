@@ -2201,7 +2201,13 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     auto* instance = m_manager.get(name);
     if (!instance)
     {
-        conn->write_buf = "runtime not found: " + std::string(name) + "\n";
+        // Both readings, leading with the typo, which is the rule
+        // test_cli_unknown_command.sh states for `socketley <word>` and which
+        // this arm was left out of: `socketley stpo c1` answered "runtime not
+        // found: stpo" and sent the reader looking for a runtime nobody meant.
+        conn->write_buf = "unknown command: " + std::string(name) + "\n"
+                        + "  If " + std::string(name) + " is a runtime, it does"
+                          " not exist here; `socketley ls` lists them.\n";
         return 1;
     }
 
@@ -2212,6 +2218,33 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
     }
 
     runtime_type type = instance->get_type();
+
+    // ── Where a cache command runs ──────────────────────────────────────────
+    // Every arm below calls the instance directly, which was right while a
+    // runtime could live in the daemon and has been wrong since none can: the
+    // object here is a placeholder, so `set` wrote a store no client reads,
+    // `get` read it back and agreed with itself, and `flush` saved it over the
+    // dump the worker's real keys were in.  The text goes to the worker
+    // instead, which is what a client on the port sends anyway.
+    //
+    // `send` is not a cache command and keeps its own path; `memory` is half
+    // configuration the daemon owns, so it is finished below rather than here.
+    if (type == runtime_cache && instance->is_out_of_process()
+        && action != "send" && action != "memory")
+        return run_cache_action(conn, name, action, pa.rest_from(2));
+
+    if (type == runtime_cache && instance->is_out_of_process()
+        && action == "memory")
+    {
+        // The cap is what this runtime was configured with and the daemon has
+        // it; the bytes in use are the worker's and only the worker knows.
+        auto* cache = static_cast<cache_instance*>(instance);
+        const std::string cap = std::to_string(cache->get_max_memory());
+        const int rc = run_cache_action(conn, name, action, "memory");
+        if (rc == 0)
+            conn->write_buf = cap + " " + conn->write_buf;
+        return rc;
+    }
 
     uint32_t action_hash = fnv1a_lower(action);
 
@@ -5193,6 +5226,83 @@ std::string daemon_handler::on_start_error(std::string_view name)
     }
 
     return {};
+}
+
+// The reply a port client would have read, turned back into what the CLI
+// promises: success is silent, and everything else is printed as it came.
+int daemon_handler::run_cache_action(ipc_connection* conn, std::string_view name,
+                                     std::string_view action,
+                                     std::string_view command)
+{
+    auto it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end() || it->second.empty() || !it->second[0])
+    {
+        conn->write_buf = "could not reach the worker holding "
+                        + std::string(name) + "\n";
+        return 2;
+    }
+
+    const uint64_t ticket = proxy_supervisor::direct_ticket_bit
+                          | ++m_direct_ticket_seq;
+
+    uint8_t     st = 0;
+    std::string reply;
+    {
+        // A ::poll inside a command handler, exactly as await_worker_startup
+        // does it and for the reason stated there.
+        const worker_wait_scope waiting{m_worker_wait_depth};
+
+        // Marked as exactly one command: the CLI's own framing carries a
+        // value with newlines in it, and the cache's line-split path would
+        // read everything past the first one as further commands.
+        std::string framed("\x01skl-one\n");
+        framed.append(command);
+
+        auto* sup = it->second[0].get();
+        if (!sup->send_direct(ticket, framed)
+            || !sup->await_direct(ticket, std::chrono::milliseconds(5000),
+                                  st, reply))
+        {
+            conn->write_buf = "no answer from the worker holding "
+                            + std::string(name) + "\n";
+            return 2;
+        }
+    }
+
+    if (st != static_cast<uint8_t>(request_status::ok))
+    {
+        conn->write_buf = "the worker holding " + std::string(name)
+                        + " refused the command\n";
+        return 2;
+    }
+
+    while (!reply.empty() && (reply.back() == '\n' || reply.back() == '\r'))
+        reply.pop_back();
+
+    // `ok` is the text protocol saying a mutation took, and this CLI does not
+    // print that: success is silent.
+    if (reply == "ok")
+        return 0;
+
+    // The one message the daemon says better, because it names the word that
+    // was not understood instead of the fact that something was not.
+    if (reply == "failed: unknown command")
+    {
+        conn->write_buf = "unknown action: " + std::string(action) + "\n";
+        return 1;
+    }
+
+    conn->write_buf = reply;
+    conn->write_buf += '\n';
+
+    // Everything the protocol refuses, kept at exit 1 -- bad input, not a
+    // fatal -- and told apart by the prefixes the cache itself uses.
+    if (reply.starts_with("usage:") || reply.starts_with("denied:")
+        || reply.starts_with("failed:") || reply.starts_with("error:")
+        || reply.starts_with("ERR"))
+        return 1;
+
+    return 0;
 }
 
 int daemon_handler::await_worker_startup(std::string_view name, std::string& out,

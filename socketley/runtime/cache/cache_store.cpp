@@ -33,6 +33,180 @@ size_t cache_store::entry_cost(const std::string& key, const set_inner& members)
     return bytes;
 }
 
+// ─── Sorted sets ────────────────────────────────────────────────────────────
+
+size_t cache_store::entry_cost(const std::string& key, const zset_inner& members)
+{
+    size_t bytes = stored_string(key);
+    // Twice per member, because the ordered view holds a copy of the name.
+    for (const auto& [m, sc] : members.score) bytes += 2 * stored_string(m);
+    return bytes;
+}
+
+bool cache_store::zadd(std::string_view key, double score, std::string_view member)
+{
+    check_expiry(key);
+    if (has_type_conflict_for_zset(key))
+        return false;
+
+    auto it = m_zsets.find(key);
+    if (it != m_zsets.end())
+    {
+        auto sit = it->second.score.find(member);
+        if (sit != it->second.score.end())
+        {
+            // A score that moves is a move in the ordered view too, and the
+            // old pair has to go before the new one arrives or the member is
+            // in there twice.
+            if (sit->second != score)
+            {
+                it->second.order.erase({sit->second, sit->first});
+                it->second.order.emplace(score, sit->first);
+                sit->second = score;
+            }
+            touch_lru(key);
+            return false;
+        }
+    }
+
+    if (!check_memory(2 * stored_string(member.size()) + new_key_cost(key.size())
+                      + zset_member_overhead, key))
+        return false;
+
+    if (it == m_zsets.end())
+        it = m_zsets.emplace(std::string(key), zset_inner{}).first;
+
+    const size_t before = entry_cost(it->first, it->second);
+    it->second.score.emplace(std::string(member), score);
+    it->second.order.emplace(score, std::string(member));
+    ++m_zset_members;
+    track_add(entry_cost(it->first, it->second) - before);
+    touch_lru(key);
+    return true;
+}
+
+bool cache_store::zrem(std::string_view key, std::string_view member)
+{
+    check_expiry(key);
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return false;
+    auto sit = it->second.score.find(member);
+    if (sit == it->second.score.end())
+        return false;
+
+    const size_t before = entry_cost(it->first, it->second);
+    it->second.order.erase({sit->second, sit->first});
+    it->second.score.erase(sit);
+    --m_zset_members;
+    track_sub(before - entry_cost(it->first, it->second));
+
+    // An empty sorted set is not a key, the way an empty list is not one here.
+    if (it->second.empty())
+    {
+        track_sub(entry_cost(it->first, it->second));
+        m_zsets.erase(it);
+        m_expiry.erase(std::string(key));
+        drop_lru(key);
+    }
+    return true;
+}
+
+bool cache_store::zscore(std::string_view key, std::string_view member, double& out) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return false;
+    auto sit = it->second.score.find(member);
+    if (sit == it->second.score.end())
+        return false;
+    out = sit->second;
+    return true;
+}
+
+size_t cache_store::zcard(std::string_view key) const
+{
+    auto it = m_zsets.find(key);
+    return it == m_zsets.end() ? 0 : it->second.size();
+}
+
+bool cache_store::zrank(std::string_view key, std::string_view member, size_t& out,
+                        bool reverse) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return false;
+    auto sit = it->second.score.find(member);
+    if (sit == it->second.score.end())
+        return false;
+
+    // Walked rather than indexed, because std::set has no order statistic and
+    // a second structure to carry one would be a second thing to keep true.
+    size_t rank = 0;
+    for (const auto& e : it->second.order)
+    {
+        if (e.first == sit->second && e.second == sit->first)
+            break;
+        ++rank;
+    }
+    out = reverse ? it->second.size() - 1 - rank : rank;
+    return true;
+}
+
+void cache_store::zrange(std::string_view key, int64_t start, int64_t stop,
+                         std::vector<std::pair<std::string_view, double>>& out,
+                         bool reverse) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return;
+
+    const int64_t n = static_cast<int64_t>(it->second.size());
+    if (start < 0) start += n;
+    if (stop  < 0) stop  += n;
+    if (start < 0) start = 0;
+    if (stop >= n) stop = n - 1;
+    if (start > stop || start >= n)
+        return;
+
+    out.reserve(out.size() + static_cast<size_t>(stop - start + 1));
+    int64_t i = 0;
+    if (!reverse)
+    {
+        for (const auto& e : it->second.order)
+        {
+            if (i > stop) break;
+            if (i >= start) out.emplace_back(std::string_view(e.second), e.first);
+            ++i;
+        }
+    }
+    else
+    {
+        for (auto rit = it->second.order.rbegin(); rit != it->second.order.rend(); ++rit)
+        {
+            if (i > stop) break;
+            if (i >= start) out.emplace_back(std::string_view(rit->second), rit->first);
+            ++i;
+        }
+    }
+}
+
+bool cache_store::zincrby(std::string_view key, double delta, std::string_view member,
+                          double& out)
+{
+    double current = 0.0;
+    if (zscore(key, member, current))
+        out = current + delta;
+    else
+        out = delta;
+
+    // zadd carries the type check and the memory refusal, and answers `new`
+    // rather than `stored`, so the score is what says this worked.
+    zadd(key, out, member);
+    double check = 0.0;
+    return zscore(key, member, check) && check == out;
+}
+
 size_t cache_store::entry_cost(const std::string& key, const hash_inner& fields)
 {
     size_t bytes = stored_string(key);
@@ -49,6 +223,7 @@ bool cache_store::has_type_conflict_for_string(std::string_view key) const
     if (__builtin_expect(!m_lists.empty() && m_lists.count(key), 0)) return true;
     if (__builtin_expect(!m_sets.empty() && m_sets.count(key), 0)) return true;
     if (__builtin_expect(!m_hashes.empty() && m_hashes.count(key), 0)) return true;
+    if (__builtin_expect(!m_zsets.empty() && m_zsets.count(key), 0)) return true;
     return false;
 }
 
@@ -57,6 +232,7 @@ bool cache_store::has_type_conflict_for_list(std::string_view key) const
     if (!m_data.empty() && m_data.count(key)) return true;
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
+    if (!m_zsets.empty() && m_zsets.count(key)) return true;
     return false;
 }
 
@@ -65,6 +241,7 @@ bool cache_store::has_type_conflict_for_set(std::string_view key) const
     if (!m_data.empty() && m_data.count(key)) return true;
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
+    if (!m_zsets.empty() && m_zsets.count(key)) return true;
     return false;
 }
 
@@ -73,6 +250,18 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
     if (!m_data.empty() && m_data.count(key)) return true;
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_sets.empty() && m_sets.count(key)) return true;
+    if (!m_zsets.empty() && m_zsets.count(key)) return true;
+    return false;
+}
+
+// The fifth type asks the same question the other four do, which is why this
+// is a fifth copy and not a loop: each one names the maps that are NOT its own.
+bool cache_store::has_type_conflict_for_zset(std::string_view key) const
+{
+    if (!m_data.empty()   && m_data.count(key))   return true;
+    if (!m_lists.empty()  && m_lists.count(key))  return true;
+    if (!m_sets.empty()   && m_sets.count(key))   return true;
+    if (!m_hashes.empty() && m_hashes.count(key)) return true;
     return false;
 }
 
@@ -718,13 +907,17 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     // The bucket count rides in the cursor so the next call can tell whether
     // the table it is resuming into is the one it left, truncated to 24 bits,
     // where a collision only misses a rehash.
-    const uint8_t  in_map     = static_cast<uint8_t>(cursor >> 56);
-    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFF);
+    // Three bits for the map, not two: the fifth map needed one and the only
+    // field with a bit to give is this bucket count, whose truncation is
+    // already a tolerated approximation -- a collision here misses a rehash,
+    // which is the same miss one bit fewer makes twice as often.
+    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
+    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
     uint64_t       in_bucket  = cursor & 0xFFFFFFFFu;
 
     auto pack = [](uint8_t map, size_t buckets, size_t bucket) -> uint64_t {
-        return (static_cast<uint64_t>(map) << 56)
-             | ((static_cast<uint64_t>(buckets) & 0xFFFFFF) << 32)
+        return (static_cast<uint64_t>(map & 0x7u) << 55)
+             | ((static_cast<uint64_t>(buckets) & 0x7FFFFF) << 32)
              | (static_cast<uint64_t>(bucket) & 0xFFFFFFFFu);
     };
 
@@ -746,7 +939,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         return 0;
     };
 
-    // The four in a fixed order, so a cursor names the same map on every call.
+    // The five in a fixed order, so a cursor names the same map on every call.
     const uint8_t last_map = scan_last_map;
     for (uint8_t idx = in_map; idx <= last_map; ++idx)
     {
@@ -759,8 +952,9 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
             const size_t now = (idx == 0 ? m_data.bucket_count()
                               : idx == 1 ? m_lists.bucket_count()
                               : idx == 2 ? m_sets.bucket_count()
-                                         : m_hashes.bucket_count());
-            start = (in_buckets == (now & 0xFFFFFF)) ? in_bucket : 0;
+                              : idx == 3 ? m_hashes.bucket_count()
+                                         : m_zsets.bucket_count());
+            start = (in_buckets == (now & 0x7FFFFF)) ? in_bucket : 0;
         }
 
         uint64_t next = 0;
@@ -769,7 +963,8 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
             case 0:  next = walk(m_data,   0, start); break;
             case 1:  next = walk(m_lists,  1, start); break;
             case 2:  next = walk(m_sets,   2, start); break;
-            default: next = walk(m_hashes, 3, start); break;
+            case 3:  next = walk(m_hashes, 3, start); break;
+            default: next = walk(m_zsets,  4, start); break;
         }
         if (next != 0)
             return next;
@@ -906,6 +1101,7 @@ std::string_view cache_store::type(std::string_view key) const
     if (!m_lists.empty() && m_lists.count(key)) return "list";
     if (!m_sets.empty() && m_sets.count(key)) return "set";
     if (!m_hashes.empty() && m_hashes.count(key)) return "hash";
+    if (!m_zsets.empty()  && m_zsets.count(key))  return "zset";
     return "none";
 }
 
@@ -925,6 +1121,8 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
     for (const auto& [key, _] : m_lists)
         if (match(key)) out.push_back(key);
     for (const auto& [key, _] : m_sets)
+        if (match(key)) out.push_back(key);
+    for (const auto& [key, _] : m_zsets)
         if (match(key)) out.push_back(key);
     for (const auto& [key, _] : m_hashes)
         if (match(key)) out.push_back(key);
@@ -967,12 +1165,20 @@ bool cache_store::del(std::string_view key)
         m_hashes.erase(it);
         return true;
     }
+    if (auto it = m_zsets.find(key); it != m_zsets.end())
+    {
+        track_sub(entry_cost(it->first, it->second));
+        m_zset_members -= it->second.size();
+        m_zsets.erase(it);
+        return true;
+    }
     return false;
 }
 
 uint32_t cache_store::size() const
 {
-    return static_cast<uint32_t>(m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size());
+    return static_cast<uint32_t>(m_data.size() + m_lists.size() + m_sets.size()
+                              + m_hashes.size() + m_zsets.size());
 }
 
 bool cache_store::exists(std::string_view key) const
@@ -982,6 +1188,7 @@ bool cache_store::exists(std::string_view key) const
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
+    if (!m_zsets.empty() && m_zsets.count(key)) return true;
     return false;
 }
 
@@ -1077,7 +1284,10 @@ void cache_store::dump_commands(std::string& buf) const
 
 static constexpr char MAGIC_V2[4] = {'S', 'K', 'V', '2'};
 
-enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3 };
+// Append-only: an older build reads a dump it does not know the types in,
+// which is why a new one goes on the end and never in the middle.
+enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3,
+                 TYPE_ZSET = 4 };
 
 void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
                               uint32_t shard_count)
@@ -1122,6 +1332,13 @@ void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
             carry_expiry(it->first);
             adopt_loaded_hash(std::string(it->first), std::move(it->second));
         }
+
+    for (auto it = other.m_zsets.begin(); it != other.m_zsets.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_zset(std::string(it->first), std::move(it->second));
+        }
 }
 
 bool cache_store::save(std::string_view path, std::string_view prefix) const
@@ -1165,6 +1382,14 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     {
         total_size += entry_overhead(key) + 4;
         for (const auto& [field, val] : h) total_size += string_size(field) + string_size(val);
+    }
+
+    // A score rides as its eight raw bytes, like every u32 in this file: the
+    // dump is native and carries a fingerprint that says so.
+    for (const auto& [key, z] : m_zsets)
+    {
+        total_size += entry_overhead(key) + 4;
+        for (const auto& [member, sc] : z.score) total_size += string_size(member) + 8;
     }
 
     // Phase 2: mmap temp file and serialize directly into mapped region
@@ -1265,6 +1490,18 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
         emit_expiry(key);
     }
 
+    for (const auto& [key, z] : m_zsets)
+    {
+        emit_key(TYPE_ZSET, key);
+        emit_u32(static_cast<uint32_t>(z.score.size()));
+        for (const auto& [member, sc] : z.score)
+        {
+            emit_string(member);
+            std::memcpy(p, &sc, 8); p += 8;
+        }
+        emit_expiry(key);
+    }
+
     if (msync(map, total_size, MS_SYNC) < 0) {}
     munmap(map, total_size);
     fsync(fd_raw);
@@ -1352,6 +1589,7 @@ bool cache_store::load_v2(const char* data, size_t size)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_zsets.clear();
     m_list_elems = 0;
     m_set_elems = 0;
     m_hash_fields = 0;
@@ -1488,6 +1726,26 @@ bool cache_store::load_v2(const char* data, size_t size)
                     adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
+            case TYPE_ZSET:
+            {
+                uint32_t count = 0;
+                if (!read_u32(count)) return false;
+                zset_inner z;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    std::string member;
+                    double      sc = 0.0;
+                    if (!read_string(member)) return false;
+                    if (remaining() < 8) return false;
+                    std::memcpy(&sc, p, 8); p += 8;
+                    z.order.emplace(sc, member);
+                    z.score.emplace(std::move(member), sc);
+                }
+                read_expiry(key);
+                if (!m_expiry.count(key) || m_expiry[key] > now)
+                    adopt_loaded_zset(std::move(key), std::move(z));
+                break;
+            }
             default:
                 return false;
         }
@@ -1503,6 +1761,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_zsets.clear();
     m_list_elems = 0;
     m_set_elems = 0;
     m_hash_fields = 0;
@@ -1621,6 +1880,27 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
+            case TYPE_ZSET:
+            {
+                uint32_t count = 0;
+                file.read(reinterpret_cast<char*>(&count), sizeof(count));
+                if (!file) return false;
+                zset_inner z;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    std::string member;
+                    double      sc = 0.0;
+                    if (!read_string(member)) return false;
+                    file.read(reinterpret_cast<char*>(&sc), sizeof(sc));
+                    if (!file) return false;
+                    z.order.emplace(sc, member);
+                    z.score.emplace(std::move(member), sc);
+                }
+                read_expiry(key);
+                if (!m_expiry.count(key) || m_expiry[key] > now)
+                    adopt_loaded_zset(std::move(key), std::move(z));
+                break;
+            }
             default:
                 return false;
         }
@@ -1635,6 +1915,7 @@ bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
+    m_zsets.clear();
     m_list_elems = 0;
     m_set_elems = 0;
     m_hash_fields = 0;
@@ -1717,6 +1998,14 @@ void cache_store::adopt_loaded_hash(std::string&& key, hash_inner&& fields)
 {
     m_hash_fields += fields.size();
     auto it = m_hashes.insert_or_assign(std::move(key), std::move(fields)).first;
+    track_add(entry_cost(it->first, it->second));
+    touch_lru(it->first);
+}
+
+void cache_store::adopt_loaded_zset(std::string&& key, zset_inner&& members)
+{
+    m_zset_members += members.size();
+    auto it = m_zsets.insert_or_assign(std::move(key), std::move(members)).first;
     track_add(entry_cost(it->first, it->second));
     touch_lru(it->first);
 }
@@ -1847,6 +2136,12 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
             track_sub(entry_cost(it->first, it->second));
             m_hash_fields -= it->second.size();
             m_hashes.erase(it);
+        }
+        else if (auto it = m_zsets.find(victim); it != m_zsets.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_zset_members -= it->second.size();
+            m_zsets.erase(it);
         }
     }
 

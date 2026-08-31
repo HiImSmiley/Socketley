@@ -107,6 +107,13 @@ static constexpr char shard_batch_marker = '\x01';
 static constexpr std::string_view shard_batch_text = "\x01skl-shard t\n";
 static constexpr std::string_view shard_batch_resp = "\x01skl-shard r\n";
 
+// One command and not a stream of them, under the same control byte and for a
+// reason the shard batch shares: a caller that has exactly one command whose
+// value may contain newlines cannot send it down a line-split path.  The CLI
+// is that caller -- its own framing carries a three-line value fine, and the
+// cache's text protocol ends a command at the first newline.
+static constexpr std::string_view one_command_text = "\x01skl-one\n";
+
 // `<len>\n<bytes>`, length-prefixed rather than newline-delimited because RESP
 // commands contain newlines and a text value may as well.
 static void shard_frame_append(std::string& out, std::string_view bytes)
@@ -2099,7 +2106,53 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 
 // ─── Helper: parse int from string_view ───
 
-static bool parse_int_sv(std::string_view sv, int& out)
+// A score is a double and is parsed whole, which from_chars cannot promise for
+// doubles on every libstdc++ this builds against -- so strtod with its own end
+// pointer, which reports the same thing.
+static bool parse_double_sv(std::string_view sv, double& out)
+{
+    if (sv.empty() || sv.size() > 63)
+        return false;
+    char buf[64];
+    std::memcpy(buf, sv.data(), sv.size());
+    buf[sv.size()] = '\0';
+    errno = 0;
+    char* end = nullptr;
+    const double v = std::strtod(buf, &end);
+    if (end != buf + sv.size() || errno == ERANGE)
+        return false;
+    out = v;
+    return true;
+}
+
+// A whole score prints as an integer, the way every other protocol here shows
+// one, and only a fractional score pays for a decimal point.
+static void append_score_bare(std::string& rb, double sc)
+{
+    if (sc == static_cast<double>(static_cast<int64_t>(sc))
+        && sc < 9.2e18 && sc > -9.2e18)
+    {
+        rb.append(std::to_string(static_cast<int64_t>(sc)));
+        return;
+    }
+    char buf[40];
+    const int n = std::snprintf(buf, sizeof(buf), "%.17g", sc);
+    if (n > 0)
+        rb.append(buf, static_cast<size_t>(n));
+}
+
+static void append_score(std::string& rb, double sc)
+{
+    append_score_bare(rb, sc);
+    rb.append("\n", 1);
+}
+
+// The whole string or nothing, for every width the commands below store into.
+// It was here, correct, and called five times: the other twenty-four sites
+// spelled from_chars by hand and none of them compared the end pointer, so
+// `EXPIRE k 5x` was five seconds and `INCRBY k 3q` was three.
+template <typename T>
+static bool parse_int_sv(std::string_view sv, T& out)
 {
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
     return ec == std::errc{} && ptr == sv.data() + sv.size();
@@ -2123,6 +2176,17 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
         if (split) run_request_lines(&nested, payload);
         else if (!payload.empty()) process_command(&nested, payload);
         out.append(nested.response_buf);
+        return;
+    }
+
+    // One command, whole, before the line splitter can see a newline inside a
+    // value and read the rest of it as the next command.
+    if (SOCKETLEY_UNLIKELY(split && payload.size() > one_command_text.size()
+                           && payload.front() == shard_batch_marker
+                           && payload.compare(0, one_command_text.size(),
+                                              one_command_text) == 0))
+    {
+        serve_payload(payload.substr(one_command_text.size()), out, false);
         return;
     }
 
@@ -3602,8 +3666,8 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
 // are free only while the store's map index fits in the two below them.
 static_assert(cache_scan_shard_shift == 64 - 6,
               "the sharded scan cursor assumes six shard bits");
-static_assert(cache_store::scan_last_map <= 3,
-              "cache_store::scan() now walks more than four maps, so its map "
+static_assert(cache_store::scan_last_map <= 7,
+              "cache_store::scan() now walks more than eight maps, so its map "
               "index no longer fits below the six bits the sharded scan cursor "
               "takes -- a cursor would silently name another shard");
 
@@ -4104,6 +4168,73 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 
     auto& rb = conn->response_buf;
 
+    // ── MULTI ───────────────────────────────────────────────────────────────
+    // Ahead of the dispatch, because between MULTI and EXEC a command is not
+    // run at all: it is text on a queue.  EXEC then re-enters this function
+    // once per queued line with the flag down, which is why the queue is moved
+    // out first -- a nested EXEC would otherwise walk a container it is
+    // appending to.
+    {
+        const uint32_t mh = fnv1a_lower(cmd);
+        if (mh == fnv1a("multi"))
+        {
+            if (conn->in_multi) { rb.append("error: MULTI nested\n", 20); return; }
+            conn->in_multi     = true;
+            conn->multi_broken = false;
+            conn->multi_queue.clear();
+            conn->multi_bytes  = 0;
+            rb.append("ok\n", 3);
+            return;
+        }
+        if (mh == fnv1a("discard"))
+        {
+            if (!conn->in_multi) { rb.append("error: DISCARD without MULTI\n", 29); return; }
+            conn->in_multi     = false;
+            conn->multi_broken = false;
+            conn->multi_queue.clear();
+            conn->multi_bytes  = 0;
+            rb.append("ok\n", 3);
+            return;
+        }
+        if (conn->in_multi && mh != fnv1a("exec"))
+        {
+            // A cap, because a client that never sends EXEC would otherwise
+            // park as much memory on this connection as it can type.
+            if (conn->multi_queue.size() >= client_connection::MULTI_MAX_CMDS
+                || conn->multi_bytes + line.size() > client_connection::MULTI_MAX_BYTES)
+            {
+                conn->multi_broken = true;
+                rb.append("error: transaction too large\n", 29);
+                return;
+            }
+            conn->multi_queue.emplace_back(line);
+            conn->multi_bytes += line.size();
+            rb.append("queued\n", 7);
+            return;
+        }
+        if (mh == fnv1a("exec"))
+        {
+            if (!conn->in_multi) { rb.append("error: EXEC without MULTI\n", 26); return; }
+            std::vector<std::string> queued;
+            queued.swap(conn->multi_queue);
+            const bool broken = conn->multi_broken;
+            conn->in_multi     = false;
+            conn->multi_broken = false;
+            conn->multi_bytes  = 0;
+            if (broken)
+            {
+                // Nothing ran, because running part of what was asked is worse
+                // than running none of it.
+                rb.append("error: transaction discarded\n", 29);
+                return;
+            }
+            for (const auto& q : queued)
+                process_command_local(conn, q);
+            rb.append("end\n", 4);
+            return;
+        }
+    }
+
     // Extract key from args (up to first space)
     auto extract_key = [](std::string_view a) -> std::pair<std::string_view, std::string_view> {
         size_t sp = a.find(' ');
@@ -4288,8 +4419,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             auto [key, delta_str] = extract_key(args);
             if (key.empty() || delta_str.empty()) { rb.append("usage: incrby key delta\n", 24); return; }
             int64_t delta = 0;
-            auto [p, e] = std::from_chars(delta_str.data(), delta_str.data() + delta_str.size(), delta);
-            if (e != std::errc{}) { rb.append("error: invalid delta\n", 21); return; }
+            if (!parse_int_sv(delta_str, delta)) { rb.append("error: invalid delta\n", 21); return; }
             int64_t result = 0;
             if (!m_store.incr(key, delta, result))
                 rb.append("error: not an integer\n", 22);
@@ -4306,8 +4436,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             auto [key, delta_str] = extract_key(args);
             if (key.empty() || delta_str.empty()) { rb.append("usage: decrby key delta\n", 24); return; }
             int64_t delta = 0;
-            auto [p2, e2] = std::from_chars(delta_str.data(), delta_str.data() + delta_str.size(), delta);
-            if (e2 != std::errc{}) { rb.append("error: invalid delta\n", 21); return; }
+            if (!parse_int_sv(delta_str, delta)) { rb.append("error: invalid delta\n", 21); return; }
             int64_t result = 0;
             if (!m_store.incr(key, -delta, result))
                 rb.append("error: not an integer\n", 22);
@@ -4622,6 +4751,121 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 
         // ─── Sets ───
 
+        // ─── Sorted sets ────────────────────────────────────────────────
+        // A score is a double parsed whole, like every number here: `zadd k 1x m`
+        // is refused rather than taken as 1.
+        case fnv1a("zadd"):
+        {
+            if (m_mode == cache_mode_readonly)
+            { rb.append("denied: readonly mode\n", 22); return; }
+            auto [key, rest] = extract_key(args);
+            auto [score_str, member] = extract_key(rest);
+            if (key.empty() || score_str.empty() || member.empty())
+            { rb.append("usage: zadd key score member\n", 29); return; }
+            double score = 0.0;
+            if (!parse_double_sv(score_str, score))
+            { rb.append("error: invalid score\n", 21); return; }
+            m_store.check_expiry(key);
+            const bool added = m_store.zadd(key, score, member);
+            if (!added && m_store.type(key) != "zset")
+            { rb.append("error: type conflict\n", 21); return; }
+            rb.append(added ? "1\n" : "0\n", 2);
+            replicate_command(line);
+            break;
+        }
+        case fnv1a("zrem"):
+        {
+            if (m_mode == cache_mode_readonly)
+            { rb.append("denied: readonly mode\n", 22); return; }
+            auto [key, member] = extract_key(args);
+            if (key.empty() || member.empty())
+            { rb.append("usage: zrem key member\n", 23); return; }
+            m_store.check_expiry(key);
+            if (m_store.zrem(key, member))
+            { rb.append("ok\n", 3); replicate_command(line); }
+            else
+                rb.append("nil\n", 4);
+            break;
+        }
+        case fnv1a("zscore"):
+        {
+            auto [key, member] = extract_key(args);
+            if (key.empty() || member.empty())
+            { rb.append("usage: zscore key member\n", 25); return; }
+            m_store.check_expiry(key);
+            double sc = 0.0;
+            if (!m_store.zscore(key, member, sc)) { rb.append("nil\n", 4); break; }
+            append_score(rb, sc);
+            break;
+        }
+        case fnv1a("zcard"):
+        {
+            auto [key, zextra] = extract_key(args);
+            (void)zextra;
+            if (key.empty()) { rb.append("usage: zcard key\n", 17); return; }
+            m_store.check_expiry(key);
+            rb.append(std::to_string(m_store.zcard(key))).append("\n", 1);
+            break;
+        }
+        case fnv1a("zrank"):
+        case fnv1a("zrevrank"):
+        {
+            auto [key, member] = extract_key(args);
+            if (key.empty() || member.empty())
+            { rb.append("usage: zrank key member\n", 24); return; }
+            m_store.check_expiry(key);
+            size_t rank = 0;
+            if (!m_store.zrank(key, member, rank,
+                               fnv1a_lower(cmd) == fnv1a("zrevrank")))
+            { rb.append("nil\n", 4); break; }
+            rb.append(std::to_string(rank)).append("\n", 1);
+            break;
+        }
+        case fnv1a("zrange"):
+        case fnv1a("zrevrange"):
+        {
+            auto [key, zrest]      = extract_key(args);
+            auto [start_s, zrest2] = extract_key(zrest);
+            auto [stop_s, ztail]   = extract_key(zrest2);
+            if (key.empty() || start_s.empty() || stop_s.empty())
+            { rb.append("usage: zrange key start stop [withscores]\n", 42); return; }
+            int64_t zstart = 0, zstop = 0;
+            if (!parse_int_sv(start_s, zstart) || !parse_int_sv(stop_s, zstop))
+            { rb.append("error: invalid index\n", 21); return; }
+            const bool with = !ztail.empty()
+                            && fnv1a_lower(ztail) == fnv1a("withscores");
+            m_store.check_expiry(key);
+            std::vector<std::pair<std::string_view, double>> zitems;
+            m_store.zrange(key, zstart, zstop, zitems,
+                           fnv1a_lower(cmd) == fnv1a("zrevrange"));
+            for (const auto& [zm, zsc] : zitems)
+            {
+                rb.append(zm.data(), zm.size());
+                if (with) { rb.append(" ", 1); append_score_bare(rb, zsc); }
+                rb.append("\n", 1);
+            }
+            rb.append("end\n", 4);
+            break;
+        }
+        case fnv1a("zincrby"):
+        {
+            if (m_mode == cache_mode_readonly)
+            { rb.append("denied: readonly mode\n", 22); return; }
+            auto [key, zrest] = extract_key(args);
+            auto [delta_str, member] = extract_key(zrest);
+            if (key.empty() || delta_str.empty() || member.empty())
+            { rb.append("usage: zincrby key delta member\n", 32); return; }
+            double zdelta = 0.0;
+            if (!parse_double_sv(delta_str, zdelta))
+            { rb.append("error: invalid score\n", 21); return; }
+            m_store.check_expiry(key);
+            double zout = 0.0;
+            if (!m_store.zincrby(key, zdelta, member, zout))
+            { rb.append("error: type conflict\n", 21); return; }
+            append_score(rb, zout);
+            replicate_command(line);
+            break;
+        }
         case fnv1a("sadd"):
         {
             if (m_mode == cache_mode_readonly)
@@ -4940,8 +5184,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || ms_str.empty() || val.empty()) { rb.append("usage: psetex key milliseconds value\n", 37); return; }
             int64_t ms = 0;
             {
-                auto [p, e] = std::from_chars(ms_str.data(), ms_str.data() + ms_str.size(), ms);
-                if (e != std::errc{} || ms <= 0) { rb.append("error: invalid milliseconds\n", 28); return; }
+                if (!parse_int_sv(ms_str, ms) || ms <= 0) { rb.append("error: invalid milliseconds\n", 28); return; }
             }
             if (!m_store.set(key, val))
             {
@@ -4974,8 +5217,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || ms_str.empty()) { rb.append("usage: pexpire key ms\n", 22); return; }
             int64_t ms = 0;
             {
-                auto [p, e] = std::from_chars(ms_str.data(), ms_str.data() + ms_str.size(), ms);
-                if (e != std::errc{} || ms <= 0) { rb.append("error: invalid ms\n", 18); return; }
+                if (!parse_int_sv(ms_str, ms) || ms <= 0) { rb.append("error: invalid ms\n", 18); return; }
             }
             if (m_store.set_expiry_ms(key, ms))
             {
@@ -5000,8 +5242,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || ts_str.empty()) { rb.append("usage: expireat key unix_seconds\n", 33); return; }
             int64_t unix_s = 0;
             {
-                auto [p, e] = std::from_chars(ts_str.data(), ts_str.data() + ts_str.size(), unix_s);
-                if (e != std::errc{}) { rb.append("error: invalid timestamp\n", 25); return; }
+                if (!parse_int_sv(ts_str, unix_s)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
@@ -5033,8 +5274,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || ts_str.empty()) { rb.append("usage: pexpireat key unix_ms\n", 29); return; }
             int64_t unix_ms = 0;
             {
-                auto [p, e] = std::from_chars(ts_str.data(), ts_str.data() + ts_str.size(), unix_ms);
-                if (e != std::errc{}) { rb.append("error: invalid timestamp\n", 25); return; }
+                if (!parse_int_sv(ts_str, unix_ms)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5066,8 +5306,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             std::string_view rest2 = (sp0 == std::string_view::npos) ? std::string_view{} : args.substr(sp0 + 1);
             uint64_t scan_cursor = 0;
             {
-                auto [p, e] = std::from_chars(cursor_str.data(), cursor_str.data() + cursor_str.size(), scan_cursor);
-                if (e != std::errc{}) { rb.append("error: invalid cursor\n", 22); return; }
+                if (!parse_int_sv(cursor_str, scan_cursor)) { rb.append("error: invalid cursor\n", 22); return; }
             }
             std::string_view scan_pattern = "*";
             size_t scan_count = 10;
@@ -5088,8 +5327,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     std::string_view cnt_str = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
                     rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
                     size_t cnt = 10;
-                    auto [p2, e2] = std::from_chars(cnt_str.data(), cnt_str.data() + cnt_str.size(), cnt);
-                    if (e2 == std::errc{}) scan_count = cnt;
+                    if (parse_int_sv(cnt_str, cnt)) scan_count = cnt;
                 }
             }
             std::vector<std::string_view> scan_keys;
@@ -6000,6 +6238,86 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
+    // ── MULTI, over RESP ────────────────────────────────────────────────────
+    // The same queue the text protocol fills, with the one difference RESP
+    // forces: EXEC answers ONE array holding every reply, so the replies are
+    // built into a scratch buffer and counted before the header can be
+    // written.
+    {
+        const uint32_t mh = fnv1a_lower(args[0]);
+        if (mh == fnv1a("multi"))
+        {
+            if (conn->in_multi) { resp::encode_error_into(rb, "MULTI calls can not be nested"); return; }
+            conn->in_multi = true; conn->multi_broken = false;
+            conn->multi_queue.clear(); conn->multi_bytes = 0;
+            resp::encode_simple_into(rb, "OK");
+            return;
+        }
+        if (mh == fnv1a("discard"))
+        {
+            if (!conn->in_multi) { resp::encode_error_into(rb, "DISCARD without MULTI"); return; }
+            conn->in_multi = false; conn->multi_broken = false;
+            conn->multi_queue.clear(); conn->multi_bytes = 0;
+            resp::encode_simple_into(rb, "OK");
+            return;
+        }
+        if (conn->in_multi && mh != fnv1a("exec"))
+        {
+            std::string framed;
+            rebuild_resp(framed, args, argc);
+            if (conn->multi_queue.size() >= client_connection::MULTI_MAX_CMDS
+                || conn->multi_bytes + framed.size() > client_connection::MULTI_MAX_BYTES)
+            {
+                conn->multi_broken = true;
+                resp::encode_error_into(rb, "transaction too large");
+                return;
+            }
+            conn->multi_bytes += framed.size();
+            conn->multi_queue.emplace_back(std::move(framed));
+            resp::encode_simple_into(rb, "QUEUED");
+            return;
+        }
+        if (mh == fnv1a("exec"))
+        {
+            if (!conn->in_multi) { resp::encode_error_into(rb, "EXEC without MULTI"); return; }
+            std::vector<std::string> queued;
+            queued.swap(conn->multi_queue);
+            const bool broken = conn->multi_broken;
+            conn->in_multi = false; conn->multi_broken = false; conn->multi_bytes = 0;
+            if (broken)
+            {
+                resp::encode_error_into(rb, "EXECABORT Transaction discarded because of previous errors.");
+                return;
+            }
+
+            // The replies are produced into the connection's own buffer, taken
+            // away between commands, because that is the only buffer the
+            // dispatch below writes to.
+            std::string body;
+            for (const auto& q : queued)
+            {
+                std::string held;
+                held.swap(rb);
+                // The same bound the other two RESP re-parse sites use.
+                static constexpr int QUEUED_MAX_ARGS = 64;
+                std::string_view qargs[QUEUED_MAX_ARGS];
+                int              qargc = 0;
+                size_t           qconsumed = 0;
+                if (resp::parse_message_views(q, qargs, QUEUED_MAX_ARGS, qargc,
+                                              qconsumed) == resp::parse_result::ok
+                    && qargc > 0)
+                    process_resp_command_local(conn, qargs, qargc);
+                else
+                    resp::encode_error_into(rb, "unparseable queued command");
+                body.append(rb);
+                rb.swap(held);
+            }
+            resp::encode_array_header_into(rb, static_cast<int>(queued.size()));
+            rb.append(body);
+            return;
+        }
+    }
+
     // A command added here must be classified in cache_shard_map.h, because an
     // unnamed hash reads `unknown` and is served where it was asked -- right
     // for a command that does not exist and wrong for a real one.
@@ -6057,15 +6375,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     case fnv1a("ex"):
                         if (i + 1 < argc)
                         {
-                            auto [p, e] = std::from_chars(args[i+1].data(), args[i+1].data() + args[i+1].size(), ex_sec);
-                            if (e == std::errc{}) i++;
+                            if (parse_int_sv(args[i+1], ex_sec)) i++;
                         }
                         break;
                     case fnv1a("px"):
                         if (i + 1 < argc)
                         {
-                            auto [p, e] = std::from_chars(args[i+1].data(), args[i+1].data() + args[i+1].size(), px_ms);
-                            if (e == std::errc{}) i++;
+                            if (parse_int_sv(args[i+1], px_ms)) i++;
                         }
                         break;
                     case fnv1a("nx"): nx = true; break;
@@ -6232,8 +6548,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t delta = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), delta);
-            if (e != std::errc{}) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], delta, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
@@ -6246,8 +6561,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t delta = 0;
-            auto [p2, e2] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), delta);
-            if (e2 != std::errc{}) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], -delta, result))
                 resp::encode_error_into(rb, "ERR value is not an integer or out of range");
@@ -6447,9 +6761,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int start = 0, stop = 0;
-            auto [p1, e1] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), start);
-            auto [p2, e2] = std::from_chars(args[3].data(), args[3].data() + args[3].size(), stop);
-            if (e1 != std::errc{} || e2 != std::errc{}) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], start) || !parse_int_sv(args[3], stop)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
             const auto* deq = m_store.list_ptr(args[1]);
             if (!deq || deq->empty()) { resp::encode_array_header_into(rb, 0); break; }
             int len = static_cast<int>(deq->size());
@@ -6468,11 +6780,120 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int idx = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), idx);
-            if (e != std::errc{}) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], idx)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
             const std::string* val = m_store.lindex(args[1], idx);
             if (val) resp::encode_bulk_into(rb, *val);
             else resp::encode_null_into(rb);
+            break;
+        }
+        // ─── Sorted sets, over RESP ─────────────────────────────────────
+        // ZADD takes score/member pairs, which is why the arity is checked as
+        // an even remainder rather than a minimum.
+        case fnv1a("zadd"):
+        {
+            if (argc < 4 || ((argc - 2) % 2) != 0)
+            { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly)
+            { resp::encode_error_into(rb, "readonly mode"); return; }
+            m_store.check_expiry(args[1]);
+            int zadded = 0;
+            for (int i = 2; i + 1 < argc; i += 2)
+            {
+                double zsc = 0.0;
+                if (!parse_double_sv(args[i], zsc))
+                { resp::encode_error_into(rb, "ERR value is not a valid float"); return; }
+                const bool zn = m_store.zadd(args[1], zsc, args[i + 1]);
+                if (!zn && m_store.type(args[1]) != "zset")
+                { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+                zadded += zn ? 1 : 0;
+            }
+            repl(args, argc);
+            resp::encode_integer_into(rb, zadded);
+            break;
+        }
+        case fnv1a("zrem"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly)
+            { resp::encode_error_into(rb, "readonly mode"); return; }
+            m_store.check_expiry(args[1]);
+            int zgone = 0;
+            for (int i = 2; i < argc; i++)
+                if (m_store.zrem(args[1], args[i])) zgone++;
+            if (zgone > 0) repl(args, argc);
+            resp::encode_integer_into(rb, zgone);
+            break;
+        }
+        case fnv1a("zscore"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            m_store.check_expiry(args[1]);
+            double zsc = 0.0;
+            if (!m_store.zscore(args[1], args[2], zsc)) { resp::encode_null_into(rb); break; }
+            std::string zs;
+            append_score_bare(zs, zsc);
+            resp::encode_bulk_into(rb, zs);
+            break;
+        }
+        case fnv1a("zcard"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            m_store.check_expiry(args[1]);
+            resp::encode_integer_into(rb, static_cast<int64_t>(m_store.zcard(args[1])));
+            break;
+        }
+        case fnv1a("zrank"):
+        case fnv1a("zrevrank"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            m_store.check_expiry(args[1]);
+            size_t zr = 0;
+            if (!m_store.zrank(args[1], args[2], zr, fnv1a_lower(args[0]) == fnv1a("zrevrank")))
+            { resp::encode_null_into(rb); break; }
+            resp::encode_integer_into(rb, static_cast<int64_t>(zr));
+            break;
+        }
+        case fnv1a("zrange"):
+        case fnv1a("zrevrange"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            int64_t zstart = 0, zstop = 0;
+            if (!parse_int_sv(args[2], zstart) || !parse_int_sv(args[3], zstop))
+            { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            const bool zwith = argc > 4 && fnv1a_lower(args[4]) == fnv1a("withscores");
+            m_store.check_expiry(args[1]);
+            std::vector<std::pair<std::string_view, double>> zitems;
+            m_store.zrange(args[1], zstart, zstop, zitems, fnv1a_lower(args[0]) == fnv1a("zrevrange"));
+            resp::encode_array_header_into(rb, static_cast<int>(zitems.size())
+                                             * (zwith ? 2 : 1));
+            for (const auto& [zm, zsc] : zitems)
+            {
+                resp::encode_bulk_into(rb, zm);
+                if (zwith)
+                {
+                    std::string zs;
+                    append_score_bare(zs, zsc);
+                    resp::encode_bulk_into(rb, zs);
+                }
+            }
+            break;
+        }
+        case fnv1a("zincrby"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly)
+            { resp::encode_error_into(rb, "readonly mode"); return; }
+            double zd = 0.0;
+            if (!parse_double_sv(args[2], zd))
+            { resp::encode_error_into(rb, "ERR value is not a valid float"); return; }
+            m_store.check_expiry(args[1]);
+            double zout = 0.0;
+            if (!m_store.zincrby(args[1], zd, args[3], zout))
+            { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            repl(args, argc);
+            std::string zs;
+            append_score_bare(zs, zout);
+            resp::encode_bulk_into(rb, zs);
             break;
         }
         case fnv1a("sadd"):
@@ -6612,8 +7033,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int sec = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), sec);
-            if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
+            if (!parse_int_sv(args[2], sec) || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
             if (m_store.set_expiry(args[1], sec))
             {
                 mark_ttl_keys();
@@ -6668,8 +7088,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int sec = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), sec);
-            if (e != std::errc{} || sec <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in SETEX"); return; }
+            if (!parse_int_sv(args[2], sec) || sec <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in SETEX"); return; }
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
@@ -6699,8 +7118,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), ms);
-            if (e != std::errc{} || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in PSETEX"); return; }
+            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in PSETEX"); return; }
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
@@ -6730,8 +7148,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), ms);
-            if (e != std::errc{} || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time"); return; }
+            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time"); return; }
             if (m_store.set_expiry_ms(args[1], ms))
             {
                 mark_ttl_keys();
@@ -6754,8 +7171,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t unix_s = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), unix_s);
-            if (e != std::errc{}) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
+            if (!parse_int_sv(args[2], unix_s)) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
             {
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -6772,8 +7188,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t unix_ms = 0;
-            auto [p, e] = std::from_chars(args[2].data(), args[2].data() + args[2].size(), unix_ms);
-            if (e != std::errc{}) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
+            if (!parse_int_sv(args[2], unix_ms)) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
             {
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -6790,8 +7205,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             uint64_t scan_cursor = 0;
             {
-                auto [p, e] = std::from_chars(args[1].data(), args[1].data() + args[1].size(), scan_cursor);
-                if (e != std::errc{}) { resp::encode_error_into(rb, "ERR invalid cursor"); return; }
+                if (!parse_int_sv(args[1], scan_cursor)) { resp::encode_error_into(rb, "ERR invalid cursor"); return; }
             }
             std::string_view scan_pattern = "*";
             size_t scan_count = 10;
@@ -6802,8 +7216,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 else if (fnv1a_lower(args[i]) == fnv1a("count") && i + 1 < argc)
                 {
                     size_t cnt = 10;
-                    auto [p2, e2] = std::from_chars(args[i+1].data(), args[i+1].data() + args[i+1].size(), cnt);
-                    if (e2 == std::errc{}) scan_count = cnt;
+                    if (parse_int_sv(args[i+1], cnt)) scan_count = cnt;
                     i++;
                 }
             }
@@ -7320,8 +7733,7 @@ bool cache_instance::connect_to_master()
     std::string host = m_replicate_target.substr(0, colon);
     uint16_t port = 0;
     auto port_sv = std::string_view(m_replicate_target).substr(colon + 1);
-    auto [p, e] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port);
-    if (e != std::errc{})
+    if (!parse_int_sv(port_sv, port))
         return false;
 
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

@@ -251,8 +251,9 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
         return parse_result::incomplete;
 
     int count = 0;
+    // Digits and then the CRLF, nothing between: `*3x\r\n` read as three.
     auto [ptr, ec] = std::from_chars(data + 1, crlf, count);
-    if (ec != std::errc{} || count < 0 || count > RESP_MAX_ARRAY_SIZE)
+    if (ec != std::errc{} || ptr != crlf || count < 0 || count > RESP_MAX_ARRAY_SIZE)
         return parse_result::error;
 
     size_t offset = static_cast<size_t>(crlf - data) + 2;
@@ -271,7 +272,7 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 
         int len = 0;
         auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
-        if (e2 != std::errc{} || len < 0 || len > RESP_MAX_BULK_LEN)
+        if (e2 != std::errc{} || p2 != end_crlf || len < 0 || len > RESP_MAX_BULK_LEN)
             return parse_result::error;
 
         offset = static_cast<size_t>(end_crlf - data) + 2;
@@ -365,7 +366,8 @@ inline parse_result parse_message_views(std::string_view buf,
             return parse_result::incomplete;
 
         auto [ptr, ec] = std::from_chars(data + 1, crlf, count);
-        if (__builtin_expect(ec != std::errc{} || count < 0 || count > RESP_MAX_ARRAY_SIZE, 0))
+        if (__builtin_expect(ec != std::errc{} || ptr != crlf
+                             || count < 0 || count > RESP_MAX_ARRAY_SIZE, 0))
             return parse_result::error;
 
         offset = static_cast<size_t>(crlf - data) + 2;
@@ -407,7 +409,8 @@ inline parse_result parse_message_views(std::string_view buf,
 
             int len = 0;
             auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
-            if (__builtin_expect(e2 != std::errc{} || len < 0 || len > RESP_MAX_BULK_LEN, 0))
+            if (__builtin_expect(e2 != std::errc{} || p2 != end_crlf
+                                 || len < 0 || len > RESP_MAX_BULK_LEN, 0))
                 return parse_result::error;
 
             offset = static_cast<size_t>(end_crlf - data) + 2;

@@ -256,6 +256,24 @@ public:
     // backstop for a wedged child rather than a budget.
     startup await_startup(std::chrono::milliseconds bound);
 
+    // ── A request the daemon itself makes ───────────────────────────────────
+    // The channel is the route between two runtimes and it drains on the ring,
+    // so a command handler that posted into it and then blocked would wait for
+    // a drain its own blocking prevents.  This is the same chan_req frame with
+    // a ticket the daemon mints, answered into a slot rather than into the
+    // channel's parked table.
+    //
+    // Tickets carry the top bit, which the channel's counter never reaches, so
+    // the two numbering schemes cannot name the same request.
+    static constexpr uint64_t direct_ticket_bit = 1ull << 63;
+
+    bool send_direct(uint64_t ticket, std::string_view payload);
+
+    // Blocks like await_startup and for the same reasons; false means the
+    // deadline passed or the child went away with nothing said.
+    bool await_direct(uint64_t ticket, std::chrono::milliseconds bound,
+                      uint8_t& status, std::string& reply);
+
     // waitpid(WNOHANG) plus the death policy, answering true if the child was
     // found dead so the caller can decide whether to persist a state change.
     bool check_liveness();
@@ -286,6 +304,14 @@ public:
 private:
     void   close_control();
     bool   write_frame(const std::string& framed);
+
+    // One outstanding direct request, because a command handler blocks until
+    // its own answer arrives and cannot start a second.
+    uint64_t    m_direct_ticket{0};
+    bool        m_direct_done{false};
+    uint8_t     m_direct_status{0};
+    std::string m_direct_reply;
+
     void   on_chan_req(std::string_view payload);
 
     // Arm the control socket for readability if there is a loop, a socket and

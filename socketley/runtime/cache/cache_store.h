@@ -3,6 +3,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <deque>
 #include <list>
 #include <vector>
@@ -42,6 +43,20 @@ using set_inner = std::unordered_set<std::string, string_hash, string_equal>;
 using set_map = std::unordered_map<std::string, set_inner, string_hash, string_equal>;
 using hash_inner = std::unordered_map<std::string, std::string, string_hash, string_equal>;
 using hash_map = std::unordered_map<std::string, hash_inner, string_hash, string_equal>;
+
+// A sorted set is two views of one thing: scores by member, and members in
+// score order.  Redis uses a skiplist; a std::set of (score, member) gives the
+// same O(log n) insert and ordered walk, and the pair's second element is what
+// keeps two members with equal scores apart and ordered.
+struct zset_inner
+{
+    std::unordered_map<std::string, double, string_hash, string_equal> score;
+    std::set<std::pair<double, std::string>>                           order;
+
+    size_t size() const { return score.size(); }
+    bool   empty() const { return score.empty(); }
+};
+using zset_map = std::unordered_map<std::string, zset_inner, string_hash, string_equal>;
 using expiry_map = std::unordered_map<std::string, std::chrono::steady_clock::time_point, string_hash, string_equal>;
 using channel_map = std::unordered_map<std::string, std::unordered_set<int>, string_hash, string_equal>;
 
@@ -113,7 +128,7 @@ public:
     // The cursor packs [map index : 8][bucket count : 24][bucket index : 32],
     // and the top six bits are free for a shard tag only while the map index
     // fits in the two below them.
-    static constexpr uint8_t scan_last_map = 3;   // m_data, m_lists, m_sets, m_hashes
+    static constexpr uint8_t scan_last_map = 4;   // m_data, m_lists, m_sets, m_hashes, m_zsets
     uint64_t scan(uint64_t cursor, std::string_view pattern,
                   size_t count, std::vector<std::string_view>& out) const;
 
@@ -129,6 +144,25 @@ public:
     size_t append(std::string_view key, std::string_view suffix);  // returns new length
     size_t strlen_key(std::string_view key) const;                  // 0 if missing
     bool getset(std::string_view key, std::string_view newval, std::string& oldval);
+
+    // --- Sorted sets ---
+    // zadd answers whether the member was new, which is what the protocols
+    // count; a score that changes is an update and not an addition.
+    bool   zadd(std::string_view key, double score, std::string_view member);
+    bool   zrem(std::string_view key, std::string_view member);
+    bool   zscore(std::string_view key, std::string_view member, double& out) const;
+    size_t zcard(std::string_view key) const;
+    // The rank a member holds counting from the low score, and false when the
+    // key or the member is not there -- the two the callers answer alike.
+    bool   zrank(std::string_view key, std::string_view member, size_t& out,
+                 bool reverse = false) const;
+    // Inclusive ends, negative counting from the last, empty when the range is
+    // inverted -- the same rules lrange has here.
+    void   zrange(std::string_view key, int64_t start, int64_t stop,
+                  std::vector<std::pair<std::string_view, double>>& out,
+                  bool reverse = false) const;
+    bool   zincrby(std::string_view key, double delta, std::string_view member,
+                   double& out);
 
     // --- Type / Keys ---
     std::string_view type(std::string_view key) const;
@@ -196,6 +230,7 @@ private:
     bool has_type_conflict_for_list(std::string_view key) const;
     bool has_type_conflict_for_set(std::string_view key) const;
     bool has_type_conflict_for_hash(std::string_view key) const;
+    bool has_type_conflict_for_zset(std::string_view key) const;
 
     bool save_v2(std::string_view path, std::string_view prefix) const;
     bool load_v2(const char* data, size_t size);
@@ -209,6 +244,7 @@ private:
     void adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq);
     void adopt_loaded_set(std::string&& key, set_inner&& members);
     void adopt_loaded_hash(std::string&& key, hash_inner&& fields);
+    void adopt_loaded_zset(std::string&& key, zset_inner&& members);
 
     // Populate the eviction order from data already resident, needed when a
     // limit is switched on after the fact.
@@ -239,6 +275,9 @@ private:
     static constexpr size_t list_elem_overhead    = 32;
     static constexpr size_t set_elem_overhead     = 64;
     static constexpr size_t hash_field_overhead   = 74;
+    // A member sits in two containers: an unordered_map node and a red-black
+    // node in the ordered view, whose pair also carries a copy of the name.
+    static constexpr size_t zset_member_overhead  = 74 + 64;
 
     // Longest string libstdc++ keeps inside the string object, derived rather
     // than written as 15, so a different layout moves this number instead of
@@ -311,17 +350,20 @@ private:
     static size_t entry_cost(const std::string& key, const std::deque<std::string>& deq);
     static size_t entry_cost(const std::string& key, const set_inner& members);
     static size_t entry_cost(const std::string& key, const hash_inner& fields);
+    static size_t entry_cost(const std::string& key, const zset_inner& members);
 
     // Derived from live container sizes rather than tracked incrementally, so
     // it cannot drift, with every term O(1).
     size_t structural_overhead() const
     {
-        return (m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size()) * key_entry_overhead
+        return (m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size()
+                + m_zsets.size()) * key_entry_overhead
              + m_lru_map.size() * lru_entry_overhead
              + m_expiry.size()  * expiry_entry_overhead
              + m_list_elems     * list_elem_overhead
              + m_set_elems      * set_elem_overhead
-             + m_hash_fields    * hash_field_overhead;
+             + m_hash_fields    * hash_field_overhead
+             + m_zset_members   * zset_member_overhead;
     }
 
     // Inline memory tracking — called on every set/del, must be fast
@@ -338,6 +380,7 @@ private:
     list_map m_lists;
     set_map m_sets;
     hash_map m_hashes;
+    zset_map m_zsets;
     expiry_map m_expiry;
 
     // Eviction / Memory
@@ -351,6 +394,7 @@ private:
     size_t m_list_elems = 0;
     size_t m_set_elems = 0;
     size_t m_hash_fields = 0;
+    size_t m_zset_members = 0;
     eviction_policy m_eviction = evict_none;
     std::list<std::string> m_lru_order;
     std::unordered_map<std::string, std::list<std::string>::iterator, string_hash, string_equal> m_lru_map;
