@@ -271,7 +271,7 @@ public:
     std::string_view get_group() const;
 
     // Ownership system
-    void set_owner(std::string_view owner_name);
+    bool set_owner(std::string_view owner_name);
     std::string_view get_owner() const;
     void set_lua_created(bool v);
     bool is_lua_created() const;

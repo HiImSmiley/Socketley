@@ -5,6 +5,7 @@
 #include "event_loop.h"
 #include "lua_context.h"
 #include "id_generator.h"
+#include "runtime_manager.h"
 #include <iostream>
 #include <iomanip>
 #include <ctime>
@@ -708,7 +709,16 @@ std::string_view runtime_instance::get_group() const { return m_group; }
 
 // ─── Ownership ───
 
-void runtime_instance::set_owner(std::string_view owner_name) { m_owner = std::string(owner_name); }
+// An owner is another runtime's name, and one row of `ls` is one line: an
+// unchecked --owner of 3000 characters was stored verbatim and printed a table
+// no field-splitter could read.
+bool runtime_instance::set_owner(std::string_view owner_name)
+{
+    if (!owner_name.empty() && !runtime_manager::valid_name(owner_name))
+        return false;
+    m_owner = std::string(owner_name);
+    return true;
+}
 std::string_view runtime_instance::get_owner() const { return m_owner; }
 void runtime_instance::set_lua_created(bool v) { m_lua_created = v; }
 bool runtime_instance::is_lua_created() const { return m_lua_created; }

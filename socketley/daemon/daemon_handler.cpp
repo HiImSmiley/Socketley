@@ -65,9 +65,7 @@ bool        daemon_handler::system_socket = false;
 // `mdid_store` ran into PORT and left a row nothing could split into fields.
 static int col_width(int base, size_t longest)
 {
-    return std::max(static_cast<size_t>(base), longest + 2) > 200
-               ? 200
-               : static_cast<int>(std::max(static_cast<size_t>(base), longest + 2));
+    return static_cast<int>(std::max(static_cast<size_t>(base), longest + 2));
 }
 
 // A daemon whose parent has not reaped it answers kill(pid, 0) and is counted
@@ -3866,7 +3864,13 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         }
         else if ((pa.args[i] == "--owner" || pa.args[i] == "-o") && i + 1 < pa.count)
         {
+            // Checked, like the pid above: an unvalidated owner reached `ls`.
             owner_name = std::string(pa.args[++i]);
+            if (!runtime_manager::valid_name(owner_name))
+            {
+                conn->write_buf = "invalid owner: " + owner_name + "\n";
+                return 1;
+            }
         }
     }
 
