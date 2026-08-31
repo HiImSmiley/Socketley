@@ -1,4 +1,5 @@
 #include "flag_handlers.h"
+#include "../shared/duration_parse.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/unix_listener.h"
 #include "../shared/lua_context.h"
@@ -29,6 +30,24 @@ static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
 // Defined further down, beside validate_listen_value; declared here because
 // the common create and edit parsers dispatch to it.
 static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i);
+
+// Every duration flag parses through here, so the next one cannot grow a
+// second grammar and no site can forget the range check.
+static bool parse_duration_flag(const char* flag, std::string_view value,
+                                uint64_t max_seconds, uint64_t& out)
+{
+    switch (parse_duration_seconds(value, max_seconds, out))
+    {
+        case duration_parse::ok:
+            return true;
+        case duration_parse::out_of_range:
+            std::cout << flag << " value out of range\n";
+            return false;
+        default:
+            std::cout << "invalid " << flag << " value\n";
+            return false;
+    }
+}
 
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script)
@@ -223,18 +242,16 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "--idle-timeout requires a value\n";
                 return 1;
             }
-            uint32_t secs;
-            if (!parse_uint32(pa.args[++i], secs))
-            {
-                std::cout << "invalid idle-timeout value\n";
+            uint64_t secs;
+            if (!parse_duration_flag("idle-timeout", pa.args[++i],
+                                     std::numeric_limits<uint32_t>::max(), secs))
                 return 1;
-            }
             if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
                                               "it reaps idle inbound connections, and "
                                               "a client's own connection is reconnected "
                                               "the moment it is dropped"))
                 return 1;
-            instance->set_idle_timeout(secs);
+            instance->set_idle_timeout(static_cast<uint32_t>(secs));
             return 0;
         }
 
@@ -682,15 +699,16 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 std::cout << "--health-interval requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
+            uint64_t secs;
+            if (!parse_duration_flag("health-interval", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
+                return 1;
+            if (secs == 0)
             {
                 std::cout << "invalid health-interval value\n";
                 return 1;
             }
-            proxy->set_health_interval(val);
+            proxy->set_health_interval(static_cast<int>(secs));
             return 0;
         }
         case fnv1a("--health-path"):
@@ -758,15 +776,16 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 std::cout << "--circuit-timeout requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
+            uint64_t secs;
+            if (!parse_duration_flag("circuit-timeout", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
+                return 1;
+            if (secs == 0)
             {
                 std::cout << "invalid circuit-timeout value\n";
                 return 1;
             }
-            proxy->set_circuit_timeout(val);
+            proxy->set_circuit_timeout(static_cast<int>(secs));
             return 0;
         }
         // How long a backend may take to produce the first byte, defaulted
@@ -779,15 +798,11 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 std::cout << "--backend-timeout requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val < 0)
-            {
-                std::cout << "invalid backend-timeout value\n";
+            uint64_t secs;
+            if (!parse_duration_flag("backend-timeout", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
                 return 1;
-            }
-            proxy->set_backend_timeout(val);
+            proxy->set_backend_timeout(static_cast<int>(secs));
             return 0;
         }
         case fnv1a("--retry"):
@@ -1118,18 +1133,16 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "--idle-timeout requires a value\n";
                 return 1;
             }
-            uint32_t secs;
-            if (!parse_uint32(pa.args[++i], secs))
-            {
-                std::cout << "invalid idle-timeout value\n";
+            uint64_t secs;
+            if (!parse_duration_flag("idle-timeout", pa.args[++i],
+                                     std::numeric_limits<uint32_t>::max(), secs))
                 return 1;
-            }
             if (refuse_inbound_flag_on_client(instance, "--idle-timeout",
                                               "it reaps idle inbound connections, and "
                                               "a client's own connection is reconnected "
                                               "the moment it is dropped"))
                 return 1;
-            instance->set_idle_timeout(secs);
+            instance->set_idle_timeout(static_cast<uint32_t>(secs));
             return 0;
         }
 
@@ -1433,15 +1446,16 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 std::cout << "--health-interval requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
+            uint64_t secs;
+            if (!parse_duration_flag("health-interval", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
+                return 1;
+            if (secs == 0)
             {
                 std::cout << "invalid health-interval value\n";
                 return 1;
             }
-            proxy->set_health_interval(val);
+            proxy->set_health_interval(static_cast<int>(secs));
             return 0;
         }
         case fnv1a("--health-path"):
@@ -1508,15 +1522,16 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 std::cout << "--circuit-timeout requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
+            uint64_t secs;
+            if (!parse_duration_flag("circuit-timeout", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
+                return 1;
+            if (secs == 0)
             {
                 std::cout << "invalid circuit-timeout value\n";
                 return 1;
             }
-            proxy->set_circuit_timeout(val);
+            proxy->set_circuit_timeout(static_cast<int>(secs));
             return 0;
         }
         // 0 is accepted and means "no deadline" — see the create-path handler
@@ -1528,15 +1543,11 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 std::cout << "--backend-timeout requires a value\n";
                 return 1;
             }
-            int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val < 0)
-            {
-                std::cout << "invalid backend-timeout value\n";
+            uint64_t secs;
+            if (!parse_duration_flag("backend-timeout", pa.args[++i],
+                                     std::numeric_limits<int>::max(), secs))
                 return 1;
-            }
-            proxy->set_backend_timeout(val);
+            proxy->set_backend_timeout(static_cast<int>(secs));
             return 0;
         }
         case fnv1a("--retry"):

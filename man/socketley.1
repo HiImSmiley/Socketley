@@ -1212,10 +1212,14 @@ Limit total messages per second across all connections using a shared
 token bucket. Excess messages are silently dropped (server) or responded
 with an error (cache). 0 means unlimited (default).
 .TP
-.BI "\-\-idle\-timeout " "seconds"
+.BI "\-\-idle\-timeout " "duration"
 Close connections that have been idle (no data received) for longer than
-the specified number of seconds. A sweep timer runs every 30 seconds to
+this. A sweep timer runs every 30 seconds to
 check for idle connections. 0 means disabled (default).
+A bare number is seconds; a suffix of
+.BR s ", " m ", " h ", " d " or " w
+spells seconds, minutes, hours, days or weeks
+.RB ( 300 " and " 5m " both work)."
 .TP
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener
@@ -2438,8 +2442,12 @@ and considers the backend healthy on a 2xx response.
 Unhealthy backends are removed from the load balancer pool until they
 recover.
 .TP
-.BI "\-\-health\-interval " "seconds"
-Interval between health checks in seconds. Default: 5.
+.BI "\-\-health\-interval " "duration"
+Interval between health checks. Default: 5 seconds. A bare number is
+seconds; the suffixes
+.BR s ", " m ", " h ", " d " and " w
+are accepted
+.RB ( 30 " and " 5m " both work)."
 .TP
 .BI "\-\-health\-path " "path"
 HTTP health check path. Default:
@@ -2461,14 +2469,17 @@ that trips the circuit breaker to the
 state. While open, all requests to that backend fail immediately without
 attempting a connection. Default: 5.
 .TP
-.BI "\-\-circuit\-timeout " "seconds"
-Seconds before an open circuit transitions to
+.BI "\-\-circuit\-timeout " "duration"
+How long an open circuit stays open before transitioning to
 .BR half-open .
 In half-open state, a single probe request is allowed through \(em if it
 succeeds, the circuit closes (fully healthy); if it fails, the circuit
-re-opens. Default: 30.
+re-opens. Default: 30 seconds. A bare number is seconds; the suffixes
+.BR s ", " m ", " h ", " d " and " w
+are accepted
+.RB ( 30 " and " 5m " both work)."
 .TP
-.BI "\-\-backend\-timeout " "seconds"
+.BI "\-\-backend\-timeout " "duration"
 How long a backend may take to produce the
 .I first
 byte of a response before the request is given up on. The request is
@@ -2477,8 +2488,12 @@ then retried on another backend if
 allows it, and answered
 .B 504 Gateway Timeout
 otherwise; either way the backend is charged with an error, so the
-circuit breaker above opens and takes it out of rotation. Default: 2.
-Set to 0 to wait indefinitely.
+circuit breaker above opens and takes it out of rotation. Default: 2
+seconds. Set to 0 to wait indefinitely. A bare number is seconds; the
+suffixes
+.BR s ", " m ", " h ", " d " and " w
+are accepted
+.RB ( 30 " and " 5m " both work)."
 .IP
 This is the only thing that notices a backend which accepts connections
 and then stops answering. Such a backend passes a TCP health check, and
@@ -3624,7 +3639,7 @@ cpus                       \-\-cpus
 max_connections            \-\-max\-connections
 rate_limit                 \-\-rate\-limit
 global_rate_limit          \-\-global\-rate\-limit
-idle_timeout               \-\-idle\-timeout
+idle_timeout               \-\-idle\-timeout  300, or 5m / 2h / 1d
 drain (bool)               \-\-drain
 test (bool)                \-\-test
 tls (bool)                 \-\-tls
@@ -3651,12 +3666,12 @@ backends (array)           \-\-backend a,b,c
 protocol                   \-\-protocol
 strategy                   \-\-strategy
 health_check               \-\-health\-check
-health_interval            \-\-health\-interval
+health_interval            \-\-health\-interval  30, or 5m / 2h
 health_path                \-\-health\-path
 health_threshold           \-\-health\-threshold
 circuit_threshold          \-\-circuit\-threshold
-circuit_timeout            \-\-circuit\-timeout
-backend_timeout            \-\-backend\-timeout
+circuit_timeout            \-\-circuit\-timeout  30, or 5m / 2h
+backend_timeout            \-\-backend\-timeout  30, or 5m / 2h
 retry                      \-\-retry
 retry_all (bool)           \-\-retry\-all
 client_ca                  \-\-client\-ca

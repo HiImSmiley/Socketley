@@ -116,3 +116,116 @@ TEST_CASE("parse_size_suffix: a size that would wrap is refused, not wrapped")
     CHECK(parse_size_suffix("17179869183G", n));
     CHECK(n == 17179869183ull * 1024ull * 1024ull * 1024ull);
 }
+
+// ─── parse_duration_seconds ─────────────────────────────────────────────────
+//
+// One grammar for every flag that takes a duration.  Before this parser,
+// three of the four duration flags never checked from_chars's end pointer, so
+// `--health-interval 5x` configured five seconds without a word about the x.
+
+#include "../../socketley/shared/duration_parse.h"
+
+static constexpr uint64_t dur_max = std::numeric_limits<int>::max();
+
+TEST_CASE("parse_duration_seconds: a bare number stays seconds")
+{
+    uint64_t s = 0;
+
+    CHECK(parse_duration_seconds("0", dur_max, s) == duration_parse::ok);
+    CHECK(s == 0u);
+    CHECK(parse_duration_seconds("300", dur_max, s) == duration_parse::ok);
+    CHECK(s == 300u);
+    CHECK(parse_duration_seconds("007", dur_max, s) == duration_parse::ok);
+    CHECK(s == 7u);
+
+    // The compatibility line: the uint32 ceiling --idle-timeout always had.
+    CHECK(parse_duration_seconds("4294967295",
+                                 std::numeric_limits<uint32_t>::max(), s)
+          == duration_parse::ok);
+    CHECK(s == 4294967295u);
+}
+
+TEST_CASE("parse_duration_seconds: the five suffixes it documents")
+{
+    uint64_t s = 0;
+
+    CHECK(parse_duration_seconds("5s", dur_max, s) == duration_parse::ok);
+    CHECK(s == 5u);
+    CHECK(parse_duration_seconds("5m", dur_max, s) == duration_parse::ok);
+    CHECK(s == 300u);
+    CHECK(parse_duration_seconds("5h", dur_max, s) == duration_parse::ok);
+    CHECK(s == 18000u);
+    CHECK(parse_duration_seconds("5d", dur_max, s) == duration_parse::ok);
+    CHECK(s == 432000u);
+    CHECK(parse_duration_seconds("5w", dur_max, s) == duration_parse::ok);
+    CHECK(s == 3024000u);
+    CHECK(parse_duration_seconds("0s", dur_max, s) == duration_parse::ok);
+    CHECK(s == 0u);
+}
+
+TEST_CASE("parse_duration_seconds: malformed is refused, and refused whole")
+{
+    uint64_t s = 12345;   // poisoned, so an accepted-but-unwritten case shows
+
+    CHECK(parse_duration_seconds("5x", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds("m", dur_max, s)    == duration_parse::malformed);
+    CHECK(parse_duration_seconds("-5s", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds("+5s", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5 s", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds(" 5s", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5s ", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds("", dur_max, s)     == duration_parse::malformed);
+    CHECK(parse_duration_seconds("s", dur_max, s)    == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5sm", dur_max, s)  == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5m5s", dur_max, s) == duration_parse::malformed);
+
+    // Fractions are refused: 90m already spells 1.5h, and a rule that takes
+    // 1.5h but must refuse 0.5s is two rules wearing one suffix.
+    CHECK(parse_duration_seconds("1.5h", dur_max, s) == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5.", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds(".5h", dur_max, s)  == duration_parse::malformed);
+
+    // Uppercase is refused: 5M reads as months everywhere else, and a guess
+    // wrong by a factor of 43200 is worse than a refusal.
+    CHECK(parse_duration_seconds("5S", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5M", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5H", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5D", dur_max, s)   == duration_parse::malformed);
+    CHECK(parse_duration_seconds("5W", dur_max, s)   == duration_parse::malformed);
+
+    CHECK(s == 12345u);   // nothing above wrote to it
+}
+
+TEST_CASE("parse_duration_seconds: a duration past the cap is refused, not wrapped")
+{
+    uint64_t s = 12345;
+
+    // The multiplied form: 99999999999w is ~6e16 seconds, comfortably inside
+    // uint64 but far past any caller's cap, so the cap is what refuses it.
+    CHECK(parse_duration_seconds("99999999999w", dur_max, s)
+          == duration_parse::out_of_range);
+
+    // The digits themselves overflow uint64 before any unit is applied.
+    CHECK(parse_duration_seconds("18446744073709551616", dur_max, s)
+          == duration_parse::out_of_range);
+    CHECK(parse_duration_seconds("18446744073709551616s", dur_max, s)
+          == duration_parse::out_of_range);
+
+    // A count whose product with the unit would wrap uint64: refused by the
+    // divided comparison, which cannot itself wrap.
+    CHECK(parse_duration_seconds("30516044060218w",
+                                 std::numeric_limits<uint64_t>::max(), s)
+          == duration_parse::out_of_range);
+
+    // One second over the int cap the proxy flags store into.
+    CHECK(parse_duration_seconds("2147483648", dur_max, s)
+          == duration_parse::out_of_range);
+    CHECK(s == 12345u);
+
+    // And the boundary itself is a legal duration.
+    CHECK(parse_duration_seconds("2147483647", dur_max, s)
+          == duration_parse::ok);
+    CHECK(s == 2147483647u);
+    CHECK(parse_duration_seconds("3550w", dur_max, s) == duration_parse::ok);
+    CHECK(s == 3550u * 604800u);
+}
