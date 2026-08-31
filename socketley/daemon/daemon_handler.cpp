@@ -1,6 +1,7 @@
 #include "daemon_handler.h"
 #include "flag_handlers.h"
 #include "type_manifest.h"
+#include "../shared/command_usage.h"
 #include "../shared/type_registry.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
@@ -1132,7 +1133,7 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 {
     if (pa.count < 3)
     {
-        std::cout << "usage: create <type> <name> [flags]\n";
+        std::cout << command_usage::line("create");
         return 1;
     }
 
@@ -1378,7 +1379,7 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        std::cout << "usage: start <name|pattern>... [-i]\n";
+        std::cout << command_usage::line("start");
         return 1;
     }
 
@@ -1531,7 +1532,7 @@ int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        conn->write_buf = "usage: stop <name|pattern>...\n";
+        conn->write_buf = command_usage::line("stop");
         return 1;
     }
 
@@ -1556,7 +1557,7 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        conn->write_buf = "usage: remove <name|pattern>...\n";
+        conn->write_buf = command_usage::line("remove");
         return 1;
     }
 
@@ -2053,7 +2054,7 @@ int daemon_handler::cmd_owner(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        conn->write_buf = "usage: owner <name>\n";
+        conn->write_buf = command_usage::line("owner");
         return 1;
     }
 
@@ -2149,7 +2150,7 @@ int daemon_handler::cmd_send(const parsed_args& pa)
 {
     if (pa.count < 3)
     {
-        std::cout << "usage: send <name> <message>\n";
+        std::cout << command_usage::line("send");
         return 1;
     }
 
@@ -2964,7 +2965,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 {
     if (pa.count < 3)
     {
-        std::cout << "usage: edit <name> [flags]\n";
+        std::cout << command_usage::line("edit");
         return 1;
     }
 
@@ -3098,7 +3099,7 @@ int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 2)
     {
-        conn->write_buf = "usage: show <name|pattern>...\n";
+        conn->write_buf = command_usage::line("show");
         return 1;
     }
 
@@ -3131,7 +3132,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 {
     if (pa.count < 3)
     {
-        conn->write_buf = "usage: import <name> <json>\n";
+        conn->write_buf = command_usage::line("import");
         return 1;
     }
 

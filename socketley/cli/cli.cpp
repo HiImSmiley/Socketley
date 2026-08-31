@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 
 #include "command_hashing.h"
+#include "../shared/command_usage.h"
 #include "ipc_client.h"
 #include "../daemon/daemon_handler.h"
 #include "../runtime/worker/worker_main.h"
@@ -447,6 +448,19 @@ int cli_dispatch(int argc, char** argv)
 
         default:
             break;
+    }
+
+    // A usage request is answered here and not forwarded, because reaching the
+    // daemon for one forks a daemon whose only work is to spell a sentence and
+    // then outlives the question.
+    if (argc > 2 && !command_usage::for_verb(cmd).empty())
+    {
+        const std::string_view second(argv[2]);
+        if (second == "--help" || second == "-h")
+        {
+            std::cout << command_usage::line(cmd);
+            return 0;
+        }
     }
 
     // All other commands need the daemon — auto-start if not running
