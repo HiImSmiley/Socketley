@@ -2546,7 +2546,7 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
             int seconds;
             auto sv = pa.args[4];
             auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), seconds);
-            if (ec != std::errc{} || seconds <= 0)
+            if (ec != std::errc{} || ptr != sv.data() + sv.size() || seconds <= 0)
             {
                 conn->write_buf = "error: invalid seconds\n";
                 return 1;
@@ -3827,8 +3827,7 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
     uint16_t port = 0;
     {
         auto sv = pa.args[3];
-        auto result = std::from_chars(sv.data(), sv.data() + sv.size(), port);
-        if (result.ec != std::errc{} || port == 0)
+        if (!parse_uint16(sv, port) || port == 0)
         {
             conn->write_buf = "invalid port: " + std::string(sv) + "\n";
             return 1;

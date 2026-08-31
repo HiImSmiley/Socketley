@@ -49,6 +49,28 @@ static bool parse_duration_flag(const char* flag, std::string_view value,
     }
 }
 
+// The counts, next to the durations and for the same reason: three flags spelled
+// this check by hand and all three forgot the end pointer, so `--retry 2x` was
+// two and said nothing about the x.
+static bool parse_count_flag(const char* flag, std::string_view value,
+                             int min, int& out)
+{
+    int val = 0;
+    auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), val);
+    if (ec == std::errc::result_out_of_range)
+    {
+        std::cout << flag << " value out of range\n";
+        return false;
+    }
+    if (ec != std::errc{} || ptr != value.data() + value.size() || val < min)
+    {
+        std::cout << "invalid " << flag << " value\n";
+        return false;
+    }
+    out = val;
+    return true;
+}
+
 int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                        size_t& i, bool& autostart, std::string& lua_script)
 {
@@ -741,13 +763,8 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
-            {
-                std::cout << "invalid health-threshold value\n";
+            if (!parse_count_flag("health-threshold", pa.args[++i], 1, val))
                 return 1;
-            }
             proxy->set_health_threshold(val);
             return 0;
         }
@@ -759,13 +776,8 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
-            {
-                std::cout << "invalid circuit-threshold value\n";
+            if (!parse_count_flag("circuit-threshold", pa.args[++i], 1, val))
                 return 1;
-            }
             proxy->set_circuit_threshold(val);
             return 0;
         }
@@ -813,13 +825,8 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val < 0)
-            {
-                std::cout << "invalid retry value\n";
+            if (!parse_count_flag("retry", pa.args[++i], 0, val))
                 return 1;
-            }
             proxy->set_retry_count(val);
             return 0;
         }
@@ -1487,13 +1494,8 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
-            {
-                std::cout << "invalid health-threshold value\n";
+            if (!parse_count_flag("health-threshold", pa.args[++i], 1, val))
                 return 1;
-            }
             proxy->set_health_threshold(val);
             return 0;
         }
@@ -1505,13 +1507,8 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val <= 0)
-            {
-                std::cout << "invalid circuit-threshold value\n";
+            if (!parse_count_flag("circuit-threshold", pa.args[++i], 1, val))
                 return 1;
-            }
             proxy->set_circuit_threshold(val);
             return 0;
         }
@@ -1558,13 +1555,8 @@ int parse_proxy_edit_flags(proxy_instance* proxy, const parsed_args& pa, size_t&
                 return 1;
             }
             int val;
-            auto sv = std::string_view(pa.args[++i]);
-            auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-            if (e != std::errc{} || val < 0)
-            {
-                std::cout << "invalid retry value\n";
+            if (!parse_count_flag("retry", pa.args[++i], 0, val))
                 return 1;
-            }
             proxy->set_retry_count(val);
             return 0;
         }
