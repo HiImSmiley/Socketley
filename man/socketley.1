@@ -1450,6 +1450,22 @@ so a proxy and the backend it fronts can talk on one host without a loopback
 TCP stack between them \(em or serve its own front door on one.
 .RS
 .PP
+What it is worth, measured on a cache serving the same client over both: a
+round trip falls from 11.01 to 6.80 microseconds, and throughput at pipeline
+depth 1 rises 2.4x. TCP exists to make an unreliable link reliable, and over
+loopback there is no link \(em but sequence numbers, windows, retransmit
+timers, an skb per direction through IP, and netfilter walking every packet all
+run regardless. An AF_UNIX socket has none of that. The saving is per
+\fImessage\fR and not per operation, so a pipelining client sees far less of
+it: at depth 100 the same change is 0.02 microseconds an operation and does not
+rise above the noise.
+.PP
+The cost is
+.BR \-\-shards ,
+which this flag refuses \(em see below \(em so a runtime on a unix socket is
+one core. Reach for it for a local sidecar, and for TCP with shards when one
+core is not enough.
+.PP
 Mutually exclusive with
 .BR \-p ,
 with
