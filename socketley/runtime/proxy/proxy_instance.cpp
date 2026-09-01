@@ -930,7 +930,12 @@ bool proxy_instance::resolve_backend(backend_info& b)
                 }
                 freeaddrinfo(result);
             }
-            // If DNS fails at setup, connect_to_backend will retry with blocking DNS
+            // A name that does not resolve now is retried by the idle sweep,
+            // once a tick, and not by the request path -- which does no DNS at
+            // all, because a getaddrinfo on the event-loop thread froze the
+            // whole daemon for the resolver's timeout.  See the sweep's own
+            // block, and backend_connect_addr(), which arms the sweep rather
+            // than resolving.
         }
         return true;
     }
