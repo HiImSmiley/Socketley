@@ -1,3 +1,4 @@
+#include "../../shared/socket_tuning.h"
 #include "server_instance.h"
 #include "../../shared/conn_reachability.h"
 
@@ -2301,7 +2302,12 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
         int opt = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        // Larger socket receive buffer reduces kernel-to-user copies
+        // A peer that loses power sends no FIN, and a server with no
+        // --idle-timeout holds that connection for ever.  TCP-level, so a
+        // client accepted off a unix listener does not spend the syscalls.
+        if (m_bound_listen_path.empty())
+            socket_tuning::keepalive_dead_peer(client_fd);
+
         // Larger socket receive buffer reduces kernel-to-user copies
         int rcvbuf = 131072;  // 128KB
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));

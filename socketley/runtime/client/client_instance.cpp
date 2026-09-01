@@ -1,3 +1,4 @@
+#include "../../shared/socket_tuning.h"
 #include "client_instance.h"
 #include "../../shared/unix_listener.h"
 #include "../../shared/event_loop.h"
@@ -73,9 +74,9 @@ size_t client_instance::get_connection_count() const
     return m_connected ? 1 : 0;
 }
 
-// Everything a client's socket needs in one place, TCP_NODELAY and
-// SO_KEEPALIVE at 60/10/3 -- because a peer that loses power sends nothing, an
-// idle client never writes, and --reconnect's promise is then never kept.
+// Everything a client's socket needs in one place: TCP_NODELAY, and the
+// keepalive every listener in this tree shares -- an idle client never writes,
+// so without it --reconnect's promise is never kept.
 static void tune_client_socket(int fd, bool udp)
 {
     if (udp)
@@ -84,11 +85,7 @@ static void tune_client_socket(int fd, bool udp)
     int opt = 1;
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {}
 
-    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0) {}
-    int idle = 60, intvl = 10, cnt = 3;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle))  < 0) {}
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {}
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt))   < 0) {}
+    socket_tuning::keepalive_dead_peer(fd);
 }
 
 bool client_instance::try_connect()

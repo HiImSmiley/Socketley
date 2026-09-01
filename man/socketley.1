@@ -1240,6 +1240,19 @@ A bare number is seconds; a suffix of
 .BR s ", " m ", " h ", " d " or " w
 spells seconds, minutes, hours, days or weeks
 .RB ( 300 " and " 5m " both work)."
+.IP
+This closes connections that are
+.IR quiet ,
+which is not the same as closing ones that are
+.IR dead ,
+and it is not needed for the second. Every accepted TCP connection is given
+TCP keepalive at 60/10/3 \(em a minute of silence, then three probes ten
+seconds apart \(em so a peer that loses power, or vanishes behind a NAT that
+forgot it, is reaped without any timeout being set. A websocket that says
+nothing for an hour is quiet and alive, and keepalive leaves it alone; only
+.B \-\-idle\-timeout
+closes that one. A unix listener is not given keepalive, having no peer that
+can disappear silently.
 .TP
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener

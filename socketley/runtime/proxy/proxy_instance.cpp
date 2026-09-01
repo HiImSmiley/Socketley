@@ -1,3 +1,4 @@
+#include "../../shared/socket_tuning.h"
 #include "proxy_instance.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
@@ -778,12 +779,7 @@ inline void proxy_instance::tune_socket(int fd)
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
-    // TCP keepalive: detect dead connections
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-    int idle = 60, intvl = 10, cnt = 3;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0) {}
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {}
-    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {}
+    socket_tuning::keepalive_dead_peer(fd);
 }
 
 // Make `b` a unix-socket backend or refuse and say why, in one function

@@ -1,3 +1,4 @@
+#include "../../shared/socket_tuning.h"
 #include "cache_instance.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
@@ -1258,6 +1259,11 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
         {
             int opt = 1;
             setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+            // A peer that loses power sends no FIN, and a cache with no
+            // --idle-timeout holds that connection -- and its entry in the
+            // subscriber table -- for ever.
+            socket_tuning::keepalive_dead_peer(client_fd);
         }
 
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
