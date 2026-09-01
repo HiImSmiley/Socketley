@@ -210,22 +210,39 @@ packet that never leaves the machine. `AF_UNIX` has no protocol at all; the
 bytes are copied into the peer socket's queue, and ordering and reliability come
 free because it is one kernel and one queue.
 
-In throughput, on the same two runtimes:
+The saving is **per message**, not per operation: 2.05 µs of server CPU at
+depth 1, where one message carries one operation. At depth 100 a message
+carries a hundred, so the same saving should read 0.0205 µs per operation — and
+it measures 0.019 and 0.020. Two instruments built separately, agreeing to 5%.
+It is also why the depth-100 figures barely move: the effect is real and
+genuinely too small to resolve there.
 
-| | TCP | AF_UNIX | Gain |
-|--------------------|-------------|-------------|-------|
-| depth 1, SET       | 285 K       | **681 K**   | 2.36× [2.12, 2.40] |
-| depth 1, GET       | 284 K       | **701 K**   | 2.48× [1.93, 2.69] |
-| depth 100, SET     | 11.31 M     | 14.43 M     | 1.30× [0.92, 1.60] |
-| depth 100, GET     | 12.70 M     | 17.14 M     | 1.32× [0.87, 1.62] |
+**None of this is socketley's doing, and Redis gets it too.** Measured with all
+four arms in one run — both servers over both transports, 5 passes, order
+rotated, every server at 1.0 core:
 
-The two depths look like they disagree and do not. The saving is **per message**,
-not per operation: 2.05 µs of server CPU at depth 1, where one message carries
-one operation. At depth 100 a message carries a hundred, so the same saving
-should read 0.0205 µs per operation — and it measures 0.019 and 0.020. Two
-instruments built separately, agreeing to 5%. It is also why the depth-100
-spreads contain 1.00: the effect is real and genuinely too small to resolve
-there.
+| depth 1 | over TCP | over AF_UNIX | transport gain |
+|-----------|----------|--------------|----------------|
+| socketley SET | 273 K | **704 K** | 2.58× [2.38, 3.11] |
+| Redis SET     | 263 K | **527 K** | 2.06× [1.77, 2.29] |
+| socketley GET | 254 K | **700 K** | 2.78× [2.14, 2.96] |
+| Redis GET     | 266 K | **523 K** | 2.16× [1.74, 2.54] |
+
+So most of the win belongs to Linux, not to this project: anything speaking a
+socket on one machine can have it. What is socketley's is the *difference* in
+how much each keeps, and it has a visible consequence:
+
+| socketley ÷ Redis, depth 1 | over TCP | over AF_UNIX |
+|------|----------|--------------|
+| SET  | 1.04× [0.84, 1.22] | **1.38× [1.24, 1.44]** |
+| GET  | 1.07× [0.92, 1.17] | **1.22× [1.20, 1.51]** |
+
+Over TCP both spreads contain 1.00 and the two are indistinguishable, which is
+what the depth-1 table below reports. Over AF_UNIX neither does. **The tie at
+depth 1 is a property of the transport, not of the servers** — take the kernel's
+per-message price out of the way and the difference in the code above it becomes
+measurable. The same effect shows at depth 100, where 4.02× over TCP becomes
+4.92× over AF_UNIX.
 
 **The trade-off is `--shards`.** It is refused with `--listen unix:`, and
 correctly: `SO_REUSEPORT` is not something a unix socket does, so N processes on
@@ -278,11 +295,16 @@ not pipeline, so depth 1 is the honest number for an ordinary client and depth
 | SADD      | 279 K ±17%  | 258 K ±32%   | 1.11× | [0.90, 1.52] | 1.000 / 1.000 |
 | HSET      | 213 K ±38%  | 216 K ±31%   | 1.07× | [0.92, 1.14] | 1.000 / 1.000 |
 
-At depth 1 the two are **indistinguishable**, and any claim of an advantage in
-either direction is noise. One row's spread does clear 1.00 here — LPUSH — but
-in a second run the same day it was SET instead, and LPUSH's contained 1.00.
-The exception moves, which is what a false positive out of six comparisons
-looks like. Neither is quoted as a result.
+At depth 1, **over TCP**, the two are indistinguishable, and any claim of an
+advantage in either direction is noise. One row's spread does clear 1.00 here —
+LPUSH — but in a second run the same day it was SET instead, and LPUSH's
+contained 1.00. The exception moves, which is what a false positive out of six
+comparisons looks like. Neither is quoted as a result.
+
+The qualifier matters: over `AF_UNIX` the same comparison is 1.22×–1.38× and
+its spreads do *not* contain 1.00 (see **What the transport costs**). This table
+is a TCP measurement, and at depth 1 that is mostly a measurement of the
+kernel's per-message price, which both servers pay alike.
 
 **Pipeline depth 100** — 2 M operations per test, 5 passes:
 

@@ -1452,7 +1452,9 @@ TCP stack between them \(em or serve its own front door on one.
 .PP
 What it is worth, measured on a cache serving the same client over both: a
 round trip falls from 11.01 to 6.80 microseconds, and throughput at pipeline
-depth 1 rises 2.4x. TCP exists to make an unreliable link reliable, and over
+depth 1 rises 2.6x. Most of that belongs to the kernel and not to this daemon
+\(em Redis over its own unix socket gains 2.1x on the same box, so any server
+on one machine can have it. TCP exists to make an unreliable link reliable, and over
 loopback there is no link \(em but sequence numbers, windows, retransmit
 timers, an skb per direction through IP, and netfilter walking every packet all
 run regardless. An AF_UNIX socket has none of that. The saving is per
