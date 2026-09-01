@@ -272,7 +272,21 @@ std::string state_column(const runtime_instance* inst)
     switch (inst->get_state())
     {
         case runtime_created: return "Created";
-        case runtime_running: return format_uptime(inst->get_start_time());
+        case runtime_running:
+        {
+            std::string up = format_uptime(inst->get_start_time());
+            // Said in the default column and not behind a flag, because the
+            // reading it corrects -- a long uptime on a runtime that has lost
+            // everything it held -- is the one an operator trusts.
+            if (const unsigned r = inst->restart_count(); r > 0)
+                up += " (" + std::to_string(r) + (r == 1 ? " restart)" : " restarts)");
+            // Said last so it is the end of the line an operator reads, and
+            // never instead of the uptime: the process is up, and that is the
+            // whole point of the warning.
+            if (inst->is_unresponsive())
+                up += " NOT RESPONDING";
+            return up;
+        }
         case runtime_stopped: return "Stopped";
         case runtime_failed:  return "Failed";
         default:              return "Unknown";
@@ -1703,7 +1717,8 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << (listen_path.empty() ? std::string()
                                         : "unix:" + sp_detail::json_escape(listen_path))
                 << "\",\"status\":\"" << state_str
-                << "\",\"connections\":" << instance->reported_connection_count()
+                << "\",\"restarts\":" << instance->restart_count()
+                << ",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << sp_detail::json_escape(owner)
                 << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
@@ -1718,16 +1733,18 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
 
     if (!any_col)
     {
-        size_t w_name = 0, w_type = 0, w_owner = 0;
+        size_t w_name = 0, w_type = 0, w_owner = 0, w_status = 0;
         for (const auto& [name, instance] : runtimes)
         {
             w_name  = std::max(w_name, name.size());
             w_type  = std::max(w_type, std::strlen(type_to_string(instance->get_type())));
             w_owner = std::max(w_owner, instance->get_owner().size());
+            w_status = std::max(w_status, state_column(instance.get()).size());
         }
-        const int cw_name  = col_width(16, w_name);
-        const int cw_type  = col_width(8,  w_type);
-        const int cw_owner = col_width(12, w_owner);
+        const int cw_name   = col_width(16, w_name);
+        const int cw_type   = col_width(8,  w_type);
+        const int cw_owner  = col_width(12, w_owner);
+        const int cw_status = col_width(20, w_status);
 
         if (!silent)
             out << std::setw(10) << "ID"
@@ -1736,25 +1753,13 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(8)  << "PORT"
                 << std::setw(6)  << "CONN"
                 << std::setw(cw_owner) << "OWNED BY"
-                << std::setw(20) << "STATUS"
+                << std::setw(cw_status) << "STATUS"
                 << "CREATED\n";
 
         for (const auto& [name, instance] : runtimes)
         {
-            runtime_state state = instance->get_state();
-            const char* status_str;
-            std::string uptime_buf;
-            switch (state)
-            {
-                case runtime_created: status_str = "Created"; break;
-                case runtime_running:
-                    uptime_buf = format_uptime(instance->get_start_time());
-                    status_str = uptime_buf.c_str();
-                    break;
-                case runtime_stopped: status_str = "Stopped"; break;
-                case runtime_failed:  status_str = "Failed";  break;
-                default:              status_str = "Unknown"; break;
-            }
+            const std::string status_buf = state_column(instance.get());
+            const char* status_str = status_buf.c_str();
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             out << std::setw(10) << instance->get_id()
@@ -1763,7 +1768,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
                 << std::setw(6)  << instance->reported_connection_count()
                 << std::setw(cw_owner) << (owner.empty() ? "-" : std::string(owner))
-                << std::setw(20) << status_str
+                << std::setw(cw_status) << status_str
                 << format_time_ago(instance->get_created_time()) << "\n";
         }
     }
@@ -1787,16 +1792,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
 
         for (const auto& [name, instance] : runtimes)
         {
-            runtime_state state = instance->get_state();
-            std::string status;
-            switch (state)
-            {
-                case runtime_created: status = "Created"; break;
-                case runtime_running: status = format_uptime(instance->get_start_time()); break;
-                case runtime_stopped: status = "Stopped"; break;
-                case runtime_failed:  status = "Failed";  break;
-                default:              status = "Unknown"; break;
-            }
+            std::string status = state_column(instance.get());
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
@@ -1925,7 +1921,8 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << "\",\"status\":\"" << state_json(instance->get_state())
                 << "\",\"uptime\":\""
                 << (running ? format_uptime(instance->get_start_time()) : std::string())
-                << "\",\"connections\":" << instance->reported_connection_count()
+                << "\",\"restarts\":" << instance->restart_count()
+                << ",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << sp_detail::json_escape(owner)
                 << "\",\"group\":\"" << sp_detail::json_escape(group)
                 << "\"}";
@@ -1942,7 +1939,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
     {
         // Over the rows this will print, not every runtime: `ps` without -a
         // leaves the stopped ones out and their names should not widen it.
-        size_t w_name = 0, w_type = 0, w_owner = 0;
+        size_t w_name = 0, w_type = 0, w_owner = 0, w_status = 0;
         for (const auto& [name, instance] : runtimes)
         {
             if (!listed(instance.get()))
@@ -1950,10 +1947,12 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             w_name  = std::max(w_name, name.size());
             w_type  = std::max(w_type, std::strlen(type_to_string(instance->get_type())));
             w_owner = std::max(w_owner, instance->get_owner().size());
+            w_status = std::max(w_status, state_column(instance.get()).size());
         }
-        const int cw_name  = col_width(16, w_name);
-        const int cw_type  = col_width(8,  w_type);
-        const int cw_owner = col_width(12, w_owner);
+        const int cw_name   = col_width(16, w_name);
+        const int cw_type   = col_width(8,  w_type);
+        const int cw_owner  = col_width(12, w_owner);
+        const int cw_status = col_width(20, w_status);
 
         if (!silent)
             out << std::setw(10) << "ID"
@@ -1962,7 +1961,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(8)  << "PORT"
                 << std::setw(6)  << "CONN"
                 << std::setw(cw_owner) << "OWNED BY"
-                << std::setw(20) << "STATUS"
+                << std::setw(cw_status) << "STATUS"
                 << "CREATED\n";
 
         for (const auto& [name, instance] : runtimes)
@@ -1977,7 +1976,7 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << std::setw(8)  << (port > 0 ? std::to_string(port) : "-")
                 << std::setw(6)  << instance->reported_connection_count()
                 << std::setw(cw_owner) << (owner.empty() ? "-" : std::string(owner))
-                << std::setw(20) << state_column(instance.get())
+                << std::setw(cw_status) << state_column(instance.get())
                 << format_time_ago(instance->get_created_time()) << "\n";
         }
     }
@@ -5528,6 +5527,10 @@ void daemon_handler::check_managed_health()
         // without something waiting on it.
         if (sup->take_reachability_change())
             routes_moved = true;
+
+        // Before liveness, because that call can reap the child and clear the
+        // pid this one reads.
+        sup->check_wedged();
 
         if (sup->check_liveness())
         {

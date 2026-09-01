@@ -278,6 +278,17 @@ public:
     // found dead so the caller can decide whether to persist a state change.
     bool check_liveness();
 
+    // A child that is alive and no longer serving, which waitpid cannot see.
+    // The worker sets stats_dirty on every completion, so a worker doing any
+    // work at all speaks within stats_interval_ms; one that is silent is either
+    // idle, which costs no cpu, or stuck inside a handler, which costs a core.
+    // Reads /proc/<pid>/stat and sends nothing, because a probe would wake the
+    // idle case sixteen times more often than its own loop intends to.
+    //
+    // Reports and never kills: a long computation in a script looks the same
+    // from out here, and the operator is the one who knows which it is.
+    void check_wedged();
+
     // True once for each state or route declaration the child reported: the
     // supervisor decides and the caller persists or republishes.
     bool take_routes_change() { const bool c = m_routes_changed; m_routes_changed = false; return c; }
@@ -391,6 +402,15 @@ private:
 
     // See published_stats above.
     published_stats m_last_stats;
+
+    // Stamped in ingest(), where every frame passes.
+    std::chrono::steady_clock::time_point m_last_frame_at{};
+
+    // The child's cpu time at the last sample, which is what tells silence
+    // apart from a spin.  Zero `m_last_cpu_at` means nothing sampled yet.
+    uint64_t                              m_last_cpu_ticks{0};
+    std::chrono::steady_clock::time_point m_last_cpu_at{};
+    bool                                  m_wedged{false};
 
     // Why this child's on_start raised, held apart from m_reload_error because
     // the two are cleared on different asks.

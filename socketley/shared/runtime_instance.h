@@ -65,6 +65,17 @@ public:
     std::chrono::system_clock::time_point get_created_time() const;
     std::chrono::system_clock::time_point get_start_time() const;
 
+    // A worker the supervisor replaced, which start() never sees: the uptime
+    // becomes the new child's or `ls` reports a life the process did not have,
+    // and the count is the only sign left that a store was lost.
+    void     note_restart();
+    unsigned restart_count() const { return m_restarts; }
+
+    // A live worker that has stopped answering, decided by the supervisor and
+    // held here because `ls` reads instances and not supervisors.
+    void set_unresponsive(bool v) { m_unresponsive = v; }
+    bool is_unresponsive() const  { return m_unresponsive; }
+
     void set_port(uint16_t port);
     uint16_t get_port() const;
 
@@ -535,6 +546,11 @@ private:
 
     std::chrono::system_clock::time_point m_created_time;
     std::chrono::system_clock::time_point m_start_time;
+
+    // Not persisted: a daemon that restarts did not witness these, and a count
+    // restored from a file would claim it had.
+    unsigned m_restarts{0};
+    bool     m_unresponsive{false};
 
     // Bash output settings
     bool m_bash_output = false;

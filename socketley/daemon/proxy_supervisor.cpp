@@ -1113,6 +1113,7 @@ void proxy_supervisor::ingest(const std::string&)
         // Any frame at all proves the child became a worker, which is the one
         // thing its exit status cannot tell us afterwards.
         m_saw_worker_frame = true;
+        m_last_frame_at    = std::chrono::steady_clock::now();
 
         switch (type)
         {
@@ -1331,6 +1332,128 @@ void proxy_supervisor::apply_stats(const std::string& payload)
     m_last_stats.seen               = true;
 }
 
+// Above lua_deadline::builtin_default_ms, deliberately: a runaway callback is
+// already ended by its own deadline, and reporting a wedge the runtime is about
+// to resolve is noise.  What is left over is what no deadline covers -- a
+// callback whose script set `callback_timeout_ms = 0`, and a loop that is not
+// in Lua at all.
+static constexpr auto wedge_silence = std::chrono::seconds(15);
+
+// Half a core, sustained across the whole silent window.  A worker with nothing
+// to do sits in poll_completions() and spends none.
+static constexpr double wedge_cpu_share = 0.5;
+
+// utime + stime out of /proc/<pid>/stat, counted from the last ')' because a
+// process name may contain both spaces and parentheses and the fields before it
+// cannot be split on whitespace.
+static bool read_cpu_ticks(pid_t pid, uint64_t& out)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+    FILE* f = ::fopen(path, "re");
+    if (!f)
+        return false;
+
+    char buf[4096];
+    const size_t n = ::fread(buf, 1, sizeof(buf) - 1, f);
+    ::fclose(f);
+    if (n == 0)
+        return false;
+    buf[n] = '\0';
+
+    const char* p = ::strrchr(buf, ')');
+    if (!p)
+        return false;
+
+    // Field 3 (state) begins after the ')'; utime is 14 and stime 15, so the
+    // twelfth and thirteenth values from here.
+    unsigned long long utime = 0, stime = 0;
+    int matched = 0;
+    ++p;
+    for (int field = 3; field <= 15 && *p; ++field)
+    {
+        while (*p == ' ') ++p;
+        char* end = nullptr;
+        const unsigned long long v = ::strtoull(p, &end, 10);
+        if (end == p)
+        {
+            // The state field is a letter, skipped rather than parsed.
+            while (*p && *p != ' ') ++p;
+            continue;
+        }
+        if (field == 14) { utime = v; ++matched; }
+        if (field == 15) { stime = v; ++matched; }
+        p = end;
+    }
+    if (matched != 2)
+        return false;
+    out = utime + stime;
+    return true;
+}
+
+void proxy_supervisor::check_wedged()
+{
+    if (m_pid <= 0)
+    {
+        m_wedged = false;
+        return;
+    }
+
+    uint64_t ticks = 0;
+    if (!read_cpu_ticks(m_pid, ticks))
+        return;   // the child is going away; check_liveness owns that
+
+    const auto now = std::chrono::steady_clock::now();
+
+    // The first sample establishes the baseline and accuses nobody, and so does
+    // the first tick after a restart, which resets it.
+    if (m_last_cpu_at.time_since_epoch().count() == 0)
+    {
+        m_last_cpu_ticks = ticks;
+        m_last_cpu_at    = now;
+        return;
+    }
+
+    const auto window = now - m_last_cpu_at;
+    const double secs = std::chrono::duration<double>(window).count();
+    const long   hz   = ::sysconf(_SC_CLK_TCK);
+    const double cores = (secs > 0 && hz > 0)
+        ? static_cast<double>(ticks - m_last_cpu_ticks) / static_cast<double>(hz) / secs
+        : 0.0;
+
+    m_last_cpu_ticks = ticks;
+    m_last_cpu_at    = now;
+
+    // A worker that has never spoken has no silence to measure yet; spawn()
+    // stamps nothing and await_startup owns that window.
+    const bool silent = m_last_frame_at.time_since_epoch().count() != 0
+                     && now - m_last_frame_at > wedge_silence;
+
+    const bool wedged = silent && cores >= wedge_cpu_share;
+    if (wedged == m_wedged)
+        return;
+
+    // On the edge only, because a stuck worker stays stuck and one line an
+    // operator can find beats one a second they cannot.
+    m_wedged = wedged;
+    if (m_placeholder)
+        m_placeholder->set_unresponsive(wedged);
+
+    char msg[256];
+    if (wedged)
+        snprintf(msg, sizeof(msg),
+                 "worker pid %d has answered nothing for %llds while spending "
+                 "%.2f cores; it is running and not serving",
+                 static_cast<int>(m_pid),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
+                     now - m_last_frame_at).count()),
+                 cores);
+    else
+        snprintf(msg, sizeof(msg), "worker pid %d is answering again",
+                 static_cast<int>(m_pid));
+    LOG_WARN(msg);
+}
+
 bool proxy_supervisor::check_liveness()
 {
     if (m_pid <= 0)
@@ -1427,6 +1550,19 @@ bool proxy_supervisor::check_liveness()
             m_placeholder->mark_failed();
         return true;
     }
+
+    // The replacement is a different process with an empty store, so the
+    // uptime restarts with it and the count is what tells an operator the
+    // difference between a cache that has served all day and one that has not.
+    if (m_placeholder)
+    {
+        m_placeholder->note_restart();
+        m_placeholder->set_unresponsive(false);
+    }
+    m_wedged      = false;
+    m_last_cpu_at = {};
+    m_last_frame_at = {};
+
     send_start();
     return true;
 }

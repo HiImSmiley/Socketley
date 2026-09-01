@@ -334,6 +334,12 @@ std::chrono::system_clock::time_point runtime_instance::get_start_time() const
     return m_start_time;
 }
 
+void runtime_instance::note_restart()
+{
+    ++m_restarts;
+    m_start_time = std::chrono::system_clock::now();
+}
+
 void runtime_instance::set_port(uint16_t port)
 {
     m_port = port;

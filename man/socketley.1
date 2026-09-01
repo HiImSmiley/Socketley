@@ -878,6 +878,25 @@ ID, NAME, TYPE, PORT, CONN (connections), OWNED BY, STATUS, CREATED, GROUP.
 With \fB\-\-json\fR or \fB\-\-format json\fR, outputs a JSON array of runtime objects.
 With \fB\-\-silent\fR or \fB\-s\fR, prints only runtime names (one per line).
 .IP
+The STATUS column of a running runtime is its uptime, followed by two notes
+when they apply.
+.BI ( N " restarts)"
+means the daemon found the worker dead and forked a replacement that many
+times; the uptime is the replacement's, and a runtime holding state in memory
+\(em a cache above all \(em lost it at every one of them. The JSON form
+reports the same number in
+.BR restarts .
+.IP
+.B NOT RESPONDING
+means the worker process is alive and has said nothing for fifteen seconds
+while spending at least half a core. A worker publishes on every completion, so
+one doing any work at all is heard from within a quarter second: silence means
+either idle, which costs no CPU, or stuck inside a callback, which costs a
+core. Only the second is reported, and it is only reported \(em nothing is
+killed, because a script deliberately computing for a long time looks the same
+from outside the process. A worker stuck without spending CPU, blocked rather
+than spinning, is indistinguishable from an idle one and is not reported.
+.IP
 The JSON form carries a
 .B listen
 field beside
