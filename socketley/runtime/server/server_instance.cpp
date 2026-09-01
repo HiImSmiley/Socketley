@@ -1587,6 +1587,30 @@ bool server_instance::setup(event_loop& loop)
                               : setup_unix_listener(listen_path)))
         return false;
 
+    // And a second one beside the port for callers already on this box.  Only
+    // beside a PORT -- a runtime already on a node has nothing to add -- and
+    // not under TLS, where a cleartext node would undo what the port was
+    // configured to give.  Its failure is not this runtime's failure: the port
+    // is up either way.
+    // get_port() and not `port`, which is 8000 by default a few lines up: the
+    // daemon asks this same question about the configured value, and feeding
+    // the two sides different numbers is exactly what one shared rule exists
+    // to prevent.
+    if (socketley::unix_sock::wants_companion(get_type(), get_port(), listen_path,
+                                              get_tls(), is_udp())
+        && !get_companion_path().empty())
+    {
+        // Made once and kept: the object owns an io_request the ring may still
+        // be holding, and freeing it on a stop leaves dispatch_cqe reading a
+        // token out of freed storage -- which is what the sanitizer found the
+        // first time this was written with a reset() in teardown.
+        if (!m_companion)
+            m_companion = std::make_unique<socketley::unix_companion>(
+                std::string(get_companion_path()),
+                [this](int fd) { return adopt_client(fd, /*from_unix=*/true); });
+        m_companion->start(loop);
+    }
+
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
@@ -1724,6 +1748,12 @@ void server_instance::teardown(event_loop& loop)
         close_tracked(m_listen_fd);
         m_listen_fd = -1;
     }
+
+    // Stopped, not freed: closed first and unlinked after, which its own stop()
+    // does in that order, while the object stays for as long as this instance
+    // does.  See setup() for why freeing it here was wrong.
+    if (m_companion)
+        m_companion->stop();
 
     // And the socket node for a unix listener, after the close, because
     // unlinking first leaves a live listener bound to a path no longer in the
@@ -2272,6 +2302,168 @@ inline void server_instance::release_fixed_slot(server_connection* conn)
     }
 }
 
+// Everything an accepted descriptor goes through before it is a connection,
+// lifted out of handle_accept because a second listener hands over a
+// descriptor and nothing else: it has no completion of this one to resubmit,
+// and copying the body would be two places to keep a connection contract in.
+//
+// `from_unix` and not m_bound_listen_path, because with two listeners the
+// question is about THIS descriptor and not about the runtime.
+//
+// False means the descriptor has been dealt with and is not a client.
+bool server_instance::adopt_client(int client_fd, bool from_unix)
+{
+    // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+    if (SOCKETLEY_UNLIKELY(client_fd >= MAX_FDS))
+    {
+        close_tracked(client_fd);
+        return false;
+    }
+
+    // Max connections check
+    if (SOCKETLEY_UNLIKELY(m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached))
+    {
+        close_tracked(client_fd);
+        return false;
+    }
+
+    int opt = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    // A peer that loses power sends no FIN, and a server with no
+    // --idle-timeout holds that connection for ever.  TCP-level, so a
+    // client accepted off a unix listener does not spend the syscalls.
+    if (!from_unix)
+        socket_tuning::keepalive_dead_peer(client_fd);
+
+    // Larger socket receive buffer reduces kernel-to-user copies
+    int rcvbuf = 131072;  // 128KB
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    auto conn = pool_acquire(client_fd);
+    conn->partial.reserve(8192);
+    conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE,
+                       op_read, conn->generation };
+    conn->write_req = { this, nullptr, client_fd, 0, op_write, conn->generation };
+
+    // Register fd in fixed file table for fget/fput-free I/O
+    int slot = m_loop->alloc_fixed_file_slot();
+    if (slot >= 0)
+    {
+        if (m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+        {
+            conn->fixed_idx = slot;
+            conn->direct_fd = true;
+        }
+        else
+        {
+            // The slot is already marked used, so a slot that cannot be
+            // pointed at this fd has to go back at once: the connection
+            // never learns its number.
+            m_loop->free_fixed_file_slot(static_cast<uint32_t>(slot));
+        }
+    }
+
+    auto* ptr = conn.get();
+    m_clients[client_fd] = std::move(conn);
+    m_conn_idx[client_fd] = ptr;
+    ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
+    m_active_fds.push_back(client_fd);
+
+    // And into the shared table at the same position, with the ref minted
+    // in pool_acquire() as this connection's name for its whole life.
+    shard_clients_table().push(conn_ref{owner_key(), ptr->ref_serial});
+
+    // A TLS listener gives every accepted socket a session before on_auth
+    // and on_connect, because what those queue is plaintext that must go
+    // through the record layer.
+    if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
+    {
+        ptr->ssl = m_tls->create_ssl_server();
+        if (SOCKETLEY_UNLIKELY(!ptr->ssl))
+        {
+            // No session, no encryption, so no connection, because serving
+            // this client in cleartext is worse than dropping it.
+            shutdown(client_fd, SHUT_RDWR);
+            ptr->closing = true;
+            close_conn(ptr, false);
+            return false;
+        }
+        ptr->tls_state = tls_conn_handshake;
+    }
+
+    auto now_tp = std::chrono::steady_clock::now();
+
+    if (m_idle_timeout_cached > 0)
+        ptr->last_activity = now_tp;
+
+    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+    auto current_size = static_cast<uint32_t>(m_clients.size());
+    if (current_size > m_stat_peak_connections)
+        m_stat_peak_connections = current_size;
+
+    // Initialize rate limiting
+    if (m_rate_limit_cached > 0)
+    {
+        ptr->rl_max = m_rate_limit_cached;
+        ptr->rl_tokens = m_rate_limit_cached;
+        ptr->rl_last = now_tp;
+    }
+
+    // The term is the failure table itself, because `!m_master_pw.empty()`
+    // skipped the whole lockout for a server using the documented
+    // on_master_auth callback -- and an empty table also means no
+    // getpeername per accept.
+    if (SOCKETLEY_UNLIKELY(!m_auth_ip_failures.empty()))
+    {
+        struct sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        uint32_t ip = 0;
+        if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0)
+            ip = peer.sin_addr.s_addr;
+        auto it = m_auth_ip_failures.find(ip);
+        if (it != m_auth_ip_failures.end())
+        {
+            auto elapsed = std::chrono::steady_clock::now() - it->second.last_failure;
+            if (elapsed > std::chrono::seconds(60))
+            {
+                m_auth_ip_failures.erase(it);
+            }
+            else if (it->second.failures >= 10)
+            {
+                // No on_disconnect: this client never got an on_connect.
+                shutdown(client_fd, SHUT_RDWR);
+                ptr->closing = true;
+                close_conn(ptr, false);
+                return false;
+            }
+        }
+    }
+
+    // on_auth fires before on_connect; a rejected client never triggers on_connect
+    if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
+    {
+        // A Lua on_auth that answers before rejecting leaves a write in
+        // the ring, so the struct goes through release_conn rather than
+        // straight back to the pool.
+        shutdown(client_fd, SHUT_RDWR);
+        ptr->closing = true;
+        close_conn(ptr, false);
+        return false;
+    }
+
+    invoke_on_connect(client_fd);
+
+    submit_conn_read(ptr);
+    return true;
+}
+
+void server_instance::on_loop_turn()
+{
+    if (m_companion)
+        m_companion->pump();
+}
+
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
 {
     int client_fd = cqe->res;
@@ -2285,148 +2477,8 @@ void server_instance::handle_accept(struct io_uring_cqe* cqe)
 
     if (SOCKETLEY_LIKELY(client_fd >= 0))
     {
-        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
-        if (SOCKETLEY_UNLIKELY(client_fd >= MAX_FDS))
-        {
-            close_tracked(client_fd);
+        if (!adopt_client(client_fd, !m_bound_listen_path.empty()))
             goto resubmit_accept;
-        }
-
-        // Max connections check
-        if (SOCKETLEY_UNLIKELY(m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached))
-        {
-            close_tracked(client_fd);
-            goto resubmit_accept;
-        }
-
-        int opt = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-        // A peer that loses power sends no FIN, and a server with no
-        // --idle-timeout holds that connection for ever.  TCP-level, so a
-        // client accepted off a unix listener does not spend the syscalls.
-        if (m_bound_listen_path.empty())
-            socket_tuning::keepalive_dead_peer(client_fd);
-
-        // Larger socket receive buffer reduces kernel-to-user copies
-        int rcvbuf = 131072;  // 128KB
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-        auto conn = pool_acquire(client_fd);
-        conn->partial.reserve(8192);
-        conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE,
-                           op_read, conn->generation };
-        conn->write_req = { this, nullptr, client_fd, 0, op_write, conn->generation };
-
-        // Register fd in fixed file table for fget/fput-free I/O
-        int slot = m_loop->alloc_fixed_file_slot();
-        if (slot >= 0)
-        {
-            if (m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
-            {
-                conn->fixed_idx = slot;
-                conn->direct_fd = true;
-            }
-            else
-            {
-                // The slot is already marked used, so a slot that cannot be
-                // pointed at this fd has to go back at once: the connection
-                // never learns its number.
-                m_loop->free_fixed_file_slot(static_cast<uint32_t>(slot));
-            }
-        }
-
-        auto* ptr = conn.get();
-        m_clients[client_fd] = std::move(conn);
-        m_conn_idx[client_fd] = ptr;
-        ptr->active_idx = static_cast<uint32_t>(m_active_fds.size());
-        m_active_fds.push_back(client_fd);
-
-        // And into the shared table at the same position, with the ref minted
-        // in pool_acquire() as this connection's name for its whole life.
-        shard_clients_table().push(conn_ref{owner_key(), ptr->ref_serial});
-
-        // A TLS listener gives every accepted socket a session before on_auth
-        // and on_connect, because what those queue is plaintext that must go
-        // through the record layer.
-        if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
-        {
-            ptr->ssl = m_tls->create_ssl_server();
-            if (SOCKETLEY_UNLIKELY(!ptr->ssl))
-            {
-                // No session, no encryption, so no connection, because serving
-                // this client in cleartext is worse than dropping it.
-                shutdown(client_fd, SHUT_RDWR);
-                ptr->closing = true;
-                close_conn(ptr, false);
-                goto resubmit_accept;
-            }
-            ptr->tls_state = tls_conn_handshake;
-        }
-
-        auto now_tp = std::chrono::steady_clock::now();
-
-        if (m_idle_timeout_cached > 0)
-            ptr->last_activity = now_tp;
-
-        m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
-        auto current_size = static_cast<uint32_t>(m_clients.size());
-        if (current_size > m_stat_peak_connections)
-            m_stat_peak_connections = current_size;
-
-        // Initialize rate limiting
-        if (m_rate_limit_cached > 0)
-        {
-            ptr->rl_max = m_rate_limit_cached;
-            ptr->rl_tokens = m_rate_limit_cached;
-            ptr->rl_last = now_tp;
-        }
-
-        // The term is the failure table itself, because `!m_master_pw.empty()`
-        // skipped the whole lockout for a server using the documented
-        // on_master_auth callback -- and an empty table also means no
-        // getpeername per accept.
-        if (SOCKETLEY_UNLIKELY(!m_auth_ip_failures.empty()))
-        {
-            struct sockaddr_in peer{};
-            socklen_t peer_len = sizeof(peer);
-            uint32_t ip = 0;
-            if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0)
-                ip = peer.sin_addr.s_addr;
-            auto it = m_auth_ip_failures.find(ip);
-            if (it != m_auth_ip_failures.end())
-            {
-                auto elapsed = std::chrono::steady_clock::now() - it->second.last_failure;
-                if (elapsed > std::chrono::seconds(60))
-                {
-                    m_auth_ip_failures.erase(it);
-                }
-                else if (it->second.failures >= 10)
-                {
-                    // No on_disconnect: this client never got an on_connect.
-                    shutdown(client_fd, SHUT_RDWR);
-                    ptr->closing = true;
-                    close_conn(ptr, false);
-                    goto resubmit_accept;
-                }
-            }
-        }
-
-        // on_auth fires before on_connect; a rejected client never triggers on_connect
-        if (SOCKETLEY_UNLIKELY(!invoke_on_auth(client_fd)))
-        {
-            // A Lua on_auth that answers before rejecting leaves a write in
-            // the ring, so the struct goes through release_conn rather than
-            // straight back to the pool.
-            shutdown(client_fd, SHUT_RDWR);
-            ptr->closing = true;
-            close_conn(ptr, false);
-            goto resubmit_accept;
-        }
-
-        invoke_on_connect(client_fd);
-
-        submit_conn_read(ptr);
     }
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit

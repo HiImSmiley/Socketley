@@ -1,5 +1,7 @@
 #include "proxy_supervisor.h"
 
+#include "../shared/peer_link.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -46,6 +48,12 @@ constexpr int child_map_fd = 6;
 // And the shard mesh, one descriptor per sibling at slot j for shard j, so
 // both sides do the same arithmetic and a child that finds none relays through
 // the daemon.
+// The grant channel, whose only cargo is the end of a link to another
+// runtime's process; the control socket cannot carry one, because its reads
+// are a standing recv and a recv with no control buffer drops the ancillary
+// data a descriptor travels in.
+constexpr int child_link_fd = 7;
+
 constexpr int child_mesh_base = 8;
 
 // A child that dies immediately and repeatedly is not fixed by forking it
@@ -220,11 +228,12 @@ void proxy_supervisor::on_cqe(struct io_uring_cqe* cqe)
 // follows on the next line.
 void proxy_supervisor::close_control()
 {
-    // Here rather than at the eight call sites, because the two descriptors
+    // Here rather than at the eight call sites, because the three descriptors
     // have one lifetime between them -- though not the converse, since
     // poll_map() closes on its own EOF and leaves the control socket to report
     // it.
     close_map();
+    close_link_chan();
 
     if (m_control_fd >= 0)
     {
@@ -259,6 +268,53 @@ void proxy_supervisor::close_map()
         m_map_fd = -1;
         m_map_in.clear();
     }
+}
+
+// The grant channel goes the way the map socket does, and for the same reason:
+// a descriptor left over from a previous child would be written to under a new
+// child's number.
+void proxy_supervisor::close_link_chan()
+{
+    if (m_link_chan_fd >= 0)
+    {
+        // Never armed on the ring -- the daemon only ever writes here -- so
+        // this is a close and not a withdrawal.
+        ::close(m_link_chan_fd);
+        m_link_chan_fd = -1;
+    }
+}
+
+bool proxy_supervisor::grant_peer_link(std::string_view peer, int fd)
+{
+    if (m_link_chan_fd < 0)
+        return false;
+    if (!socketley::peer_link::grant(m_link_chan_fd, peer, fd))
+    {
+        LOG_WARN(("peer links: could not hand " + std::string(peer)
+                  + " to a worker; its crossings keep relaying").c_str());
+        return false;
+    }
+    m_granted[std::string(peer)] = std::chrono::steady_clock::now();
+    return true;
+}
+
+bool proxy_supervisor::grant_suppressed(std::string_view peer)
+{
+    // A plain unordered_map, so the key is built rather than looked up
+    // through a transparent hash this one line does not justify.
+    const auto it = m_granted.find(std::string(peer));
+    if (it == m_granted.end())
+        return false;
+
+    // Long enough that a burst of relayed crossings produces one grant, short
+    // enough that a link which failed to arrive is retried while the operator
+    // is still looking at it.
+    constexpr auto window = std::chrono::seconds(2);
+    if (std::chrono::steady_clock::now() - it->second < window)
+        return true;
+
+    m_granted.erase(it);
+    return false;
 }
 
 void proxy_supervisor::arm_map_poll()
@@ -423,6 +479,11 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // frames, written into m_config_json so a restart replays the same index.
     effective.shard_index = m_shard_index;
 
+    // Set here rather than carried over from the parsed config, because a
+    // restart replays m_config_json and the ends this child was given have
+    // been closed by then; a stale true would point it at its own descriptors.
+    effective.mesh_wired = !m_mesh_fds.empty();
+
     if (m_loop)
     {
         if (effective.cpus.empty() && !m_loop->cpus().all)
@@ -464,10 +525,28 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         mv[0] = mv[1] = -1;
     }
 
+    // The grant channel, SEQPACKET so two grants cannot arrive as one read and
+    // leave the second one's descriptor behind.  Its failure is not a failure
+    // to spawn: this runtime's crossings relay through the daemon, which is
+    // what every crossing did before links existed.
+    int lv[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, lv) < 0)
+    {
+        LOG_WARN("proxy supervisor: no grant channel for this worker; its "
+                 "crossings to other runtimes will relay through the daemon");
+        lv[0] = lv[1] = -1;
+    }
+
     // Whatever this class was still holding from a previous child, because a
     // leftover map descriptor would be armed on the ring under a new child's
     // number.
     close_map();
+    close_link_chan();
+
+    // A new child holds no links, so the record of who it has been introduced
+    // to goes with the old one; keeping it would leave a restarted worker
+    // relaying for ever, since the grant that would fix it is suppressed.
+    m_granted.clear();
 
     const pid_t child = ::fork();
     if (child < 0)
@@ -476,6 +555,8 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         ::close(sv[1]);
         if (mv[0] >= 0) ::close(mv[0]);
         if (mv[1] >= 0) ::close(mv[1]);
+        if (lv[0] >= 0) ::close(lv[0]);
+        if (lv[1] >= 0) ::close(lv[1]);
         LOG_ERROR("proxy supervisor: fork failed");
         return false;
     }
@@ -491,13 +572,16 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         ::close(sv[0]);
         if (mv[0] >= 0)
             ::close(mv[0]);
+        if (lv[0] >= 0)
+            ::close(lv[0]);
 
         // dup2 destroys its destination, so a socketpair that came back
         // holding 4 is moved out of the way before either fixed number is
         // placed.
         if ((m_shard_region_fd >= 0 && sv[1] == child_shard_fd)
             || (m_shard_clients_fd >= 0 && sv[1] == child_clients_fd)
-            || (mv[1] >= 0 && sv[1] == child_map_fd))
+            || (mv[1] >= 0 && sv[1] == child_map_fd)
+            || (lv[1] >= 0 && sv[1] == child_link_fd))
         {
             const int moved = ::fcntl(sv[1], F_DUPFD, 16);
             if (moved < 0)
@@ -540,6 +624,19 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         place(region_src,  child_shard_fd);
         place(clients_src, child_clients_fd);
 
+        // The grant channel's source is moved with the mesh's rather than
+        // after it, because the mesh block is placed first and a source still
+        // sitting on one of its destinations would be destroyed by a
+        // placement that has not happened yet.
+        int link_src = lv[1];
+        if (link_src >= 0
+            && link_src <= child_mesh_base + static_cast<int>(m_mesh_fds.size()))
+        {
+            link_src = ::fcntl(link_src, F_DUPFD, 128);
+            if (link_src < 0)
+                _exit(127);
+        }
+
         // The mesh is a block rather than two descriptors, so every source is
         // moved above the whole destination block first -- one rule instead of
         // a case analysis that grows as N**2.
@@ -558,6 +655,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         }
         for (size_t j = 0; j < m_mesh_fds.size(); ++j)
             place(m_mesh_fds[j], child_mesh_base + static_cast<int>(j));
+
+        // Below the mesh block and above the map, so neither placement can
+        // reach it.
+        place(link_src, child_link_fd);
 
         // The map socket is placed last but one, because a source already on 6
         // belongs to a placement that has happened, and the control socket
@@ -605,9 +706,12 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     ::close(sv[1]);
     if (mv[1] >= 0)
         ::close(mv[1]);
-    m_pid        = child;
-    m_control_fd = sv[0];
-    m_map_fd     = mv[0];
+    if (lv[1] >= 0)
+        ::close(lv[1]);
+    m_pid          = child;
+    m_control_fd   = sv[0];
+    m_map_fd       = mv[0];
+    m_link_chan_fd = lv[0];
 
     // A new child has said nothing yet, or a restart would inherit the
     // previous one's report and await_startup() would answer for a process
@@ -1644,7 +1748,15 @@ void proxy_supervisor::on_chan_req(std::string_view payload)
         // Nothing was taken, so no reply is coming and answering here is the
         // whole difference between a refusal and a hang.
         refuse(request_status::no_target);
+        return;
     }
+
+    // This crossing was carried, which is the only evidence that exists that
+    // the two processes have something to say to each other.  Asked after the
+    // post so a target nothing answers for is never linked, and last so a
+    // refusal to introduce them cannot cost the request that revealed them.
+    if (m_on_peer)
+        m_on_peer(this, std::string(q.target));
 }
 
 void proxy_supervisor::on_request_reply(uint64_t cookie, request_status st,

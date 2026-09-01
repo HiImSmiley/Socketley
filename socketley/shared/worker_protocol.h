@@ -242,6 +242,12 @@ struct endpoint_wire
     std::string name;   // runtime name, or group name
     std::string host;
     uint16_t    port{0};
+
+    // The node this runtime also listens on, for a caller already on this box.
+    // Carried in a block of its own at the end of the frame rather than beside
+    // the port, so a build that predates it reads the endpoints and stops --
+    // the same rule the route declarations landed under.
+    std::string unix_path;
 };
 
 using route_decl_wire = std::vector<
@@ -287,6 +293,21 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     {
         put_str(out, g);
         put_str(out, encode_routes(*rt));
+    }
+
+    // The nodes, last and only for the names that have one, because most
+    // runtimes do not and a pair per name would be a block of empty strings.
+    uint32_t n_nodes = 0;
+    for (const auto& e : names)
+        if (!e.unix_path.empty())
+            ++n_nodes;
+    put_u32(out, n_nodes);
+    for (const auto& e : names)
+    {
+        if (e.unix_path.empty())
+            continue;
+        put_str(out, e.name);
+        put_str(out, e.unix_path);
     }
     return out;
 }
@@ -407,6 +428,26 @@ inline bool decode_endpoints(std::string_view payload,
                 return false;
             group_routes.emplace_back(std::move(g),
                                       std::shared_ptr<const route_table>(std::move(rt)));
+        }
+
+        // And the nodes, under the same rule one block further in: a frame
+        // from a build that predates them ends before this count.
+        if (!r.done())
+        {
+            const uint32_t n_nodes = r.u32();
+            if (!r.ok) return false;
+            for (uint32_t i = 0; i < n_nodes && r.ok; ++i)
+            {
+                std::string nm(r.str());
+                std::string path(r.str());
+                if (!r.ok) return false;
+                for (auto& e : names)
+                    if (e.name == nm)
+                    {
+                        e.unix_path = std::move(path);
+                        break;
+                    }
+            }
         }
     }
 

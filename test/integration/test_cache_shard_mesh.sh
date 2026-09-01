@@ -216,6 +216,34 @@ else
     bad "with the mesh disabled the daemon says so and still answers" \
         "$MISS of 20 missing; log says: $(grep -c 'shard mesh disabled' "$SOCKETLEY_DLOG" 2>/dev/null || echo 0)"
 fi
+
+# ── and a child the daemon did not wire holds nothing ──────────────────────
+#
+# The descriptor block starts at a fixed number, and with no mesh the worker's
+# own event-loop eventfd lands on it.  A worker that decides "the link to
+# sibling j is there" from the number being open adopted that eventfd, armed a
+# recv on it and then closed it on the first failure: measured, 7 of 8 shards.
+# Both assertions are about the CLAIM, because answering correctly is what the
+# fallback does either way and is therefore no evidence at all.
+sleep 3
+STOFF=$("$BIN" stats meshc 2>&1 || true)
+OFFLINES=$(printf '%s\n' "$STOFF" | grep -c '^mesh_links:')
+OFFHELD=$(printf '%s\n' "$STOFF" | awk -F: '/^mesh_links:/ && $2+0 != 0 {n++} END{print n+0}')
+OFFDOWN=$(grep -c "the link to shard" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "$OFFLINES" -eq 4 ] && [ "$OFFHELD" -eq 0 ]; then
+    ok "an unwired child claims no links (4 shards, 0 held)"
+else
+    bad "an unwired child claims no links" \
+        "$OFFHELD of $OFFLINES shards report a link the daemon never gave them;" \
+        "the descriptor at that slot is the worker's own, not a sibling's"
+fi
+if [ "${OFFDOWN:-0}" -eq 0 ]; then
+    ok "and none of them reports a link going down (0 warnings)"
+else
+    bad "and none of them reports a link going down" \
+        "$OFFDOWN 'link to shard ... is down' warnings with no mesh in play;" \
+        "a link that was never given cannot go down -- it was somebody else's fd"
+fi
 unset SOCKETLEY_NO_SHARD_MESH
 "$BIN" stop meshc >/dev/null 2>&1; sleep 0.3; "$BIN" remove meshc >/dev/null 2>&1
 daemon_stop

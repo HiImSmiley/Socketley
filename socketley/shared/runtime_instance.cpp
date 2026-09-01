@@ -360,6 +360,16 @@ std::string_view runtime_instance::get_listen_path() const
     return m_listen_path;
 }
 
+void runtime_instance::set_companion_path(std::string_view path)
+{
+    m_companion_path = path;
+}
+
+std::string_view runtime_instance::get_companion_path() const
+{
+    return m_companion_path;
+}
+
 void runtime_instance::set_log_file(std::string_view path)
 {
     m_log_file = path;

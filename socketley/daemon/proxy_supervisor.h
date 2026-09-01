@@ -7,6 +7,7 @@
 #include <chrono>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <sys/types.h>
 
 #include "../shared/conn_identity.h"
@@ -140,6 +141,23 @@ public:
                                            std::string op, std::string name,
                                            std::string config)>;
     void set_map_handler(map_handler h) { m_on_map = std::move(h); }
+
+    // ─── Peer links ─────────────────────────────────────────────────────────
+    // A crossing this worker made to another runtime, reported so the daemon
+    // can introduce the two processes to each other instead of carrying every
+    // one of them; called on the relay path, which stops happening once the
+    // link is up, so it needs no registry to know when to stop.
+    using peer_handler = std::function<void(proxy_supervisor* from,
+                                            std::string target)>;
+    void set_peer_handler(peer_handler h) { m_on_peer = std::move(h); }
+
+    // One end of a link, handed to this child.  False means it stays on the
+    // relay, which is where every crossing was before links existed.
+    bool grant_peer_link(std::string_view peer, int fd);
+
+    // Whether this child has been introduced to `peer` recently enough that a
+    // second grant would be waste rather than repair.
+    bool grant_suppressed(std::string_view peer);
 
     // One answer on the descriptor the request arrived on, static because the
     // supervisor may be gone, and a blocking write because the frame is tens
@@ -342,6 +360,7 @@ private:
     void   disarm_map_poll();
     void   poll_map();
     void   close_map();
+    void   close_link_chan();
 
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
@@ -391,6 +410,7 @@ private:
     route_handler    m_on_route;
     stats_handler   m_on_stats;
     map_handler      m_on_map;
+    peer_handler     m_on_peer;
 
     bool         m_state_changed{false};
     bool         m_routes_changed{false};
@@ -436,6 +456,12 @@ private:
     pid_t        m_pid{0};
     int          m_control_fd{-1};
     int          m_map_fd{-1};
+
+    // The grant channel to this child, and when each peer was last named on
+    // it, so a worker relaying a burst before its link arrives is introduced
+    // once rather than once per request.
+    int          m_link_chan_fd{-1};
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_granted;
     death_policy m_policy{death_policy::restart};
     unsigned     m_restarts{0};
     std::chrono::steady_clock::time_point m_last_restart{};

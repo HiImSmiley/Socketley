@@ -793,6 +793,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     // parses back as 0, which is what shard 0 is.
     if (cfg.shard_index > 0)
         append_int_field("shard_index", static_cast<int>(cfg.shard_index));
+    // Written only when true, so it reaches a child's config frame and never a
+    // state file: a restored runtime is forked fresh and wired anew.
+    if (cfg.mesh_wired)
+        append_bool_field("mesh_wired", true);
+    // Same rule, same reason: derived, so it belongs to the daemon that
+    // derived it and not to a document that outlives it.
+    if (!cfg.companion_path.empty())
+        append_str_field("companion_path", cfg.companion_path);
     if (!cfg.cpus.empty())
         append_str_field("cpus", cfg.cpus);
     if (cfg.external_runtime)
@@ -981,6 +989,10 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
         cfg.shards = s;
     // Absent means shard 0, which is a real answer and not a missing one.
     cfg.shard_index = json_get_uint32(json, "shard_index");
+    // Absent means no mesh, which is the answer for every runtime that is not
+    // a shard set forked whole.
+    cfg.mesh_wired = json_get_bool(json, "mesh_wired");
+    cfg.companion_path = json_get_string(json, "companion_path");
     cfg.cpus = json_get_string(json, "cpus");
     cfg.external_runtime = json_get_bool(json, "external_runtime");
     cfg.managed = json_get_bool(json, "managed");

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
@@ -31,6 +32,7 @@
 #include "../../shared/runtime_manager.h"
 #include "../../shared/state_persistence.h"
 #include "../../shared/frame_writer.h"
+#include "../../shared/peer_link.h"
 #include "../../shared/shard_mesh.h"
 #include "../../shared/shard_target.h"
 #include "../../shared/worker_protocol.h"
@@ -54,8 +56,16 @@ constexpr int worker_clients_fd = 5;
 // daemon's worker has always had.
 constexpr int worker_map_fd = 6;
 
+// The grant channel, read here in the constructor rather than at the point of
+// use, because by then this process has a ring and an eventfd of its own and
+// one of them is sitting on this number.
+constexpr int worker_link_fd = 7;
+
 // And the mesh block, which must agree with proxy_supervisor's
-// child_mesh_base, where absent means relay rather than error.
+// child_mesh_base.  Whether the block is there at all is read from the config
+// and never from the descriptors: with no mesh the loop's own eventfd lands on
+// this number, and a worker that probed it armed a recv on its own wakeup and
+// then closed it.
 constexpr int worker_mesh_base = 8;
 
 constexpr auto stats_interval =
@@ -174,6 +184,11 @@ public:
         // on_config(), because lua_context decides at binding time whether the
         // four calls are refused and the script's table is built during the
         // config frame's load.
+        // Taken here for the reason stated at worker_link_fd: this is the last
+        // moment the number can only be what the daemon placed.
+        if (::fcntl(worker_link_fd, F_GETFD, 0) >= 0)
+            m_link_chan_fd = worker_link_fd;
+
         if (::fcntl(worker_map_fd, F_GETFD, 0) >= 0)
         {
             m_map_fd = worker_map_fd;
@@ -318,9 +333,14 @@ public:
                 if (!m_ctl_armed || m_writer.needs_retry())
                     wait_ms = std::min(wait_ms, ctl_fallback_ms);
 
-                // The same two states per mesh link, because a standing recv
-                // is ended by a sibling's frame and only a submission
-                // get_sqe() refused needs a clamp.
+                // The grant channel too: a refused submission leaves this
+                // worker deaf to the link that would end its relaying.
+                if (m_link_recv && !m_link_recv->armed())
+                    wait_ms = std::min(wait_ms, ctl_fallback_ms);
+
+                // The same two states per link, because a standing recv is
+                // ended by a peer's frame and only a submission get_sqe()
+                // refused needs a clamp.
                 for (const auto& link : m_mesh_links)
                     if (link->needs_wake())
                     {
@@ -372,8 +392,18 @@ public:
             // send per frame produces a completion per crossing -- 5,920 ring
             // entries against 61,221 on the control socket -- and
             // unconditional, since a dying link still owes what it has queued.
-            for (auto& link : m_mesh_links)
-                link->pump();
+            for_each_link([](shard_link& link) { link.pump(); });
+            if (m_link_recv)
+                m_link_recv->pump();
+
+            // Once per turn, because the condition it waits for is a property
+            // of this turn and not of any one completion.
+            arm_pending_peers();
+
+            // And whatever the runtime itself has that no completion returns
+            // for, which today is a listener the ring refused to arm.
+            if (m_rt)
+                m_rt->on_loop_turn();
 
             const auto now = std::chrono::steady_clock::now();
             if (stats_dirty && now - last_stats >= stats_interval)
@@ -433,8 +463,9 @@ public:
         // which sweeps the crossings each was carrying and answers them
         // `no_target` -- before requests().detach(), which would answer them
         // `dropped` instead.
-        for (auto& link : m_mesh_links)
-            link->die("this shard is shutting down", /*expected=*/true);
+        for_each_link([](shard_link& link) {
+            link.die("this worker is shutting down", /*expected=*/true);
+        });
 
         // Before the ring, like every other owner registration: detach answers
         // whatever is still queued `dropped` and gives the owner token back.
@@ -546,6 +577,15 @@ private:
             s.detail += "mesh_links:"   + std::to_string(m_mesh_sinks.size()) + "\n";
             s.detail += "mesh_direct:"  + std::to_string(direct)  + "\n";
             s.detail += "mesh_relayed:" + std::to_string(relayed) + "\n";
+
+            // The same three for other runtimes, separate lines because a
+            // sibling crossing and a cross-runtime one are answered by
+            // different processes and only one of them has a mesh.
+            uint64_t pdirect = 0, prelayed = 0;
+            peer_counts(pdirect, prelayed);
+            s.detail += "peer_links:"   + std::to_string(m_peer_links.size()) + "\n";
+            s.detail += "peer_direct:"  + std::to_string(pdirect)  + "\n";
+            s.detail += "peer_relayed:" + std::to_string(prelayed) + "\n";
         }
 
         // Did anything the daemon can see actually move, which now decides
@@ -794,9 +834,9 @@ private:
         // ── The shard mesh ─────────────────────────────────────────────────
         // Built before the channel is attached, because these sinks must be in
         // the table by the first request, with the links themselves attached
-        // once the ring exists -- and an absent descriptor means relay rather
-        // than error.
-        if (cfg.shards > 1)
+        // once the ring exists -- and a child the daemon did not wire relays
+        // rather than errors.
+        if (cfg.shards > 1 && cfg.mesh_wired)
         {
             const uint32_t me = m_rt->get_shard_index();
             for (uint32_t j = 0; j < cfg.shards; ++j)
@@ -834,6 +874,20 @@ private:
             m_mesh_sinks.push_back(std::make_unique<mesh_sink>(link.get(), &m_remote));
             m_manager.requests().register_sink(
                 shard_target(cfg.name, link->peer()), m_mesh_sinks.back().get());
+        }
+
+        // ── Links to other runtimes ────────────────────────────────────────
+        // After the default sink, like the mesh's, so a peer this worker has
+        // not been introduced to is absent from the table and falls through to
+        // the daemon -- which is also what tells the daemon to introduce them.
+        if (m_link_chan_fd >= 0)
+        {
+            m_link_recv = std::make_unique<socketley::peer_link::receiver>(
+                m_link_chan_fd,
+                [this](std::string peer, int fd) { adopt_peer_link(std::move(peer), fd); });
+            if (!m_link_recv->attach(m_loop))
+                LOG_WARN("peer links: the grant channel could not be armed; "
+                         "crossings to other runtimes will relay through the daemon");
         }
         m_rt->set_runtime_manager(&m_manager);
 
@@ -1034,9 +1088,9 @@ private:
 
         auto tbl = std::make_shared<endpoint_table>();
         for (const auto& e : names)
-            tbl->set_name(e.name, runtime_endpoint{e.host, e.port});
+            tbl->set_name(e.name, runtime_endpoint{e.host, e.port, e.unix_path});
         for (const auto& e : groups)
-            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port});
+            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port, {}});
         for (auto& [n, rt] : name_routes)
             tbl->set_name_routes(n, std::move(rt));
         for (auto& [g, rt] : group_routes)
@@ -1067,6 +1121,184 @@ private:
             return false;
         sink->serve_request(payload, reply);
         return true;
+    }
+
+    // Every link this worker holds, siblings and other runtimes alike, so the
+    // three places the loop touches them cannot come to disagree about which
+    // kinds there are.
+    template <typename F>
+    void for_each_link(F&& f)
+    {
+        for (auto& link : m_mesh_links)
+            f(*link);
+        for (auto& e : m_peer_links)
+            if (e.link)
+                f(*e.link);
+    }
+
+    // One link to another runtime's process, as the daemon handed it over.
+    // Registering under the peer's NAME is the whole change: the request
+    // channel then finds this sink instead of falling through to the default
+    // one, which is the socket to the daemon.
+    void adopt_peer_link(std::string peer, int fd)
+    {
+        if (peer.empty() || fd < 0)
+            return;
+        if (m_rt && peer == m_rt->get_name())
+        {
+            // The daemon refuses this too; said here as well because a link to
+            // oneself would answer every request by asking itself for it.
+            ::close(fd);
+            return;
+        }
+
+        // One grant at a time per peer.  A worker that never falls quiet keeps
+        // relaying, so the daemon keeps offering, and without this every offer
+        // would leave behind a link attached to the ring that nothing can free.
+        for (const auto& e : m_peer_links)
+            if (e.name == peer && !e.live)
+            {
+                ::close(fd);
+                return;
+            }
+
+        // An earlier LIVE link to the same peer is left in place and in the
+        // table: it is either still carrying, or dead and relaying, and both
+        // are answers.  arm_pending_peers() retires it at the moment the new
+        // one takes over, which is a moment with nothing in flight.
+        peer_entry e;
+        e.name = peer;
+        e.link = std::make_unique<shard_link>(fd, 0, &m_manager.requests(),
+                                              &worker_serve_mesh, this,
+                                              "runtime " + peer,
+                                              &worker_serve_route);
+        if (!e.link->attach(m_loop))
+        {
+            // Not fatal: an unattached link never carries and the requests
+            // keep relaying, which is what was happening anyway.
+            LOG_WARN(("peer links: could not arm the link to " + peer
+                      + "; crossings keep relaying").c_str());
+        }
+        e.sink = std::make_unique<mesh_sink>(e.link.get(), &m_remote);
+        m_peer_links.push_back(std::move(e));
+    }
+
+    // A link is two routes to one runtime, and the moment it starts being used
+    // is the moment they both have traffic on them: a request handed to the
+    // daemon is ~12 us behind one sent direct, so a `get` posted after the
+    // switch can be answered before a `set` posted just before it.
+    //
+    // So the switch waits for a turn with nothing outstanding anywhere -- no
+    // queued request and no parked ticket -- at which point there is nothing
+    // for a direct crossing to overtake.  A worker that never falls quiet
+    // never switches, and keeps exactly the behaviour it has today.
+    void arm_pending_peers()
+    {
+        if (m_peer_links.empty())
+            return;
+
+        bool any = false;
+        for (const auto& e : m_peer_links)
+            if (!e.live) { any = true; break; }
+        if (!any)
+            return;
+
+        auto& ch = m_manager.requests();
+        if (ch.parked_count() != 0 || ch.pending() != 0)
+            return;
+
+        for (auto& e : m_peer_links)
+        {
+            if (e.live || !e.sink)
+                continue;
+
+            // Any earlier link to the same runtime leaves the table first, or
+            // register_sink would replace it while its object still owns the
+            // name it was registered under.
+            for (auto it = m_peer_links.begin(); it != m_peer_links.end(); )
+            {
+                if (&*it != &e && it->name == e.name)
+                {
+                    if (it->sink)
+                        ch.drop_sink(it->sink.get());
+                    if (it->link)
+                        it->link->die("replaced by a fresh link", /*expected=*/true);
+                    m_retired_peers.push_back(std::move(*it));
+                    it = m_peer_links.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            ch.register_sink(e.name, e.sink.get());
+            e.live = true;
+            LOG_INFO(("peer links: " + e.name + " is now one socket away").c_str());
+        }
+    }
+
+    // A routing frame that came over a link rather than down from the daemon,
+    // applied by the same function either way.
+    static void worker_serve_route(void* ctx, std::string_view payload)
+    {
+        auto* self = static_cast<worker*>(ctx);
+        if (self)
+            self->on_route_down(std::string(payload));
+    }
+
+    // A live link to `peer`, or null.  Not gated on the sink table's `live`
+    // flag: that gate exists for requests, which have no order between them
+    // and therefore need a quiet moment, while a routed connection is pinned
+    // to one path for its whole life and needs no moment at all.
+    shard_link* live_peer_link(std::string_view peer)
+    {
+        for (auto& e : m_peer_links)
+            if (e.name == peer && e.link && e.link->alive())
+                return e.link.get();
+        return nullptr;
+    }
+
+    // Which way this connection's frames go, decided once and kept.
+    //
+    // The decision cannot be made per frame: a link is ~12 us faster than the
+    // daemon, so a frame sent direct would overtake one sent a moment earlier
+    // the long way, and a routed connection is a stream where that is a
+    // corruption rather than a reordering.  Pinned per conn_ref, it cannot
+    // happen -- and the one permitted change, direct to relay after a link
+    // dies, is safe in the direction it goes: the slow path cannot overtake
+    // the fast one.
+    enum : uint8_t { pin_direct = 1, pin_relay = 2 };
+
+    shard_link* route_path(std::string_view to, const conn_ref& ref)
+    {
+        const auto it = m_route_pin.find(ref);
+        if (it != m_route_pin.end())
+            return it->second == pin_direct ? live_peer_link(to) : nullptr;
+
+        shard_link* link = live_peer_link(to);
+        m_route_pin.emplace(ref, link ? pin_direct : pin_relay);
+        return link;
+    }
+
+    // Crossings by route, told apart from the mesh's because the two answer
+    // different questions: one is about shards of this runtime, the other
+    // about other runtimes entirely.
+    void peer_counts(uint64_t& direct, uint64_t& relayed) const
+    {
+        direct = relayed = 0;
+        for (const auto& e : m_peer_links)
+            if (e.sink)
+            {
+                direct  += e.sink->stat_direct();
+                relayed += e.sink->stat_relayed();
+            }
+        for (const auto& e : m_retired_peers)
+            if (e.sink)
+            {
+                direct  += e.sink->stat_direct();
+                relayed += e.sink->stat_relayed();
+            }
     }
 
     // Crossings by route summed over this shard's links, reported because the
@@ -1410,6 +1642,10 @@ private:
                 srv->forget_runtime(frm);
                 break;
         }
+
+        // The other side of forget_route_pin's job: a route ends for both
+        // processes, and only one of them sent the frame that ended it.
+        forget_route_pin(op, ref);
     }
 
     // Everything this runtime does to another leaves here: four verbs as
@@ -1419,9 +1655,41 @@ private:
               worker_proto::route_op op, const conn_ref& ref,
               std::string_view payload) override
     {
+        const std::string frame =
+            worker_proto::encode_route_frame(to, frm, op, ref, payload);
+
+        // A broadcast names no connection, so there is no stream for a faster
+        // frame to overtake and no ref to pin the decision to; it keeps the
+        // daemon's leg, which is also the only one that reaches a peer this
+        // worker has no link to.
+        const bool pinnable = ref.valid() &&
+                              op != worker_proto::route_op::broadcast;
+
+        if (pinnable)
+            if (shard_link* link = route_path(to, ref))
+                if (link->send_route(frame))
+                {
+                    forget_route_pin(op, ref);
+                    return;
+                }
+
+        // Either no link, or one that gave up holding this very frame -- and
+        // the daemon's leg is slower, so a frame that changes route here
+        // arrives after the ones that went direct rather than before them.
+        if (pinnable)
+            m_route_pin[ref] = pin_relay;
+
         if (!m_writer.write(worker_proto::frame(
-                worker_proto::frame_type::route_up,
-                worker_proto::encode_route_frame(to, frm, op, ref, payload)))) {}
+                worker_proto::frame_type::route_up, frame))) {}
+        forget_route_pin(op, ref);
+    }
+
+    // A route that has ended takes its pin with it, on whichever side sent the
+    // frame that ended it.
+    void forget_route_pin(worker_proto::route_op op, const conn_ref& ref)
+    {
+        if (op == worker_proto::route_op::close || op == worker_proto::route_op::drop)
+            m_route_pin.erase(ref);
     }
 
     bool open(std::string_view target, const conn_ref& ref,
@@ -1558,6 +1826,38 @@ private:
     control_writer                         m_writer;
     std::vector<std::unique_ptr<shard_link>> m_mesh_links;
     std::vector<std::unique_ptr<mesh_sink>>  m_mesh_sinks;
+
+    // ── Links to other runtimes' processes ─────────────────────────────────
+    // The same two objects the mesh uses, keyed by a runtime name instead of a
+    // shard index, and arriving one at a time on the grant channel rather than
+    // all at once at the fork -- two runtimes are created at different
+    // moments, and there is no instant at which both processes exist and
+    // neither has started.
+    struct peer_entry
+    {
+        std::string                 name;
+        std::unique_ptr<shard_link> link;
+        std::unique_ptr<mesh_sink>  sink;
+
+        // Whether this link is in the sink table yet.  See arm_pending_peers()
+        // for what has to be true first, which is the whole reason a grant and
+        // its first use are two separate moments.
+        bool                        live{false};
+    };
+    std::vector<peer_entry> m_peer_links;
+
+    // A replaced link is kept rather than freed: its registration is still on
+    // the ring, and a dropped completion reads the owner token out of the
+    // object it names.
+    std::vector<peer_entry> m_retired_peers;
+
+    int m_link_chan_fd{-1};
+    std::unique_ptr<socketley::peer_link::receiver> m_link_recv;
+
+    // One entry per routed connection this worker has sent a frame for, gone
+    // when the route closes; bounded by the routes that are open, which is
+    // what the server's own table is bounded by.
+    std::unordered_map<conn_ref, uint8_t, conn_ref_hash> m_route_pin;
     remote_sink                            m_remote;
     // A replica of the daemon's map and a live channel, declared before the
     // runtime so it outlives it: a runtime revokes its origin as it is

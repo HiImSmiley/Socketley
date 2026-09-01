@@ -2349,7 +2349,7 @@ void publish_endpoints(world& w)
     {
         if (!(w.group_mask & (1u << i)))
             continue;
-        tbl->add_to_group("fuzzgrp", runtime_endpoint{"127.0.0.1", w.be[i].port});
+        tbl->add_to_group("fuzzgrp", runtime_endpoint{"127.0.0.1", w.be[i].port, {}});
     }
     w.rt->set_endpoints(std::move(tbl));
 }

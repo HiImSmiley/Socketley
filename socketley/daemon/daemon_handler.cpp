@@ -18,6 +18,8 @@
 #include "../shared/daemon_client.h"
 #include "../cli/cli.h"
 #include "../shared/tls_context.h"
+#include "../shared/paths.h"
+#include "../shared/unix_listener.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
 #include "../shared/runtime_config_apply.h"
@@ -4055,10 +4057,12 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
     std::vector<worker_proto::endpoint_wire> groups;
     names.reserve(tbl.name_count());
     for (const auto& [name, ep] : tbl.names())
-        names.push_back({name, ep.host, ep.port});
+        names.push_back({name, ep.host, ep.port, ep.unix_path});
     for (const auto& [group, eps] : tbl.groups())
+        // No node for a group member: a group is dialled by address, and the
+        // one place a node is chosen over a port is a backend named by runtime.
         for (const auto& ep : eps)
-            groups.push_back({group, ep.host, ep.port});
+            groups.push_back({group, ep.host, ep.port, {}});
 
     // The declarations travel with the table, because a proxy in a worker
     // enforces what this frame says and cannot read the daemon's
@@ -4161,6 +4165,85 @@ void daemon_handler::publish_cluster_view_to_workers()
 // map rides the stats cadence -- coalesced to one round per interval, because
 // pushing per arrival is N frames to N children and sixteen workers would be
 // 256 frames per 250 ms.
+void daemon_handler::link_peers(proxy_supervisor* from, const std::string& target)
+{
+    // The measurement control, so the link and the relay differ in the route
+    // alone rather than in the build -- the same switch the shard mesh has,
+    // for the same reason.
+    static const bool disabled = []
+    {
+        const char* off = ::getenv("SOCKETLEY_NO_PEER_LINKS");
+        return off && *off && *off != '0';
+    }();
+    if (disabled)
+        return;
+
+    if (!from || !from->placeholder() || target.empty())
+        return;
+
+    const std::string origin(from->placeholder()->get_name());
+    if (origin == target)
+        return;
+
+    // Here rather than at the two call sites, because a request and a routing
+    // frame are two kinds of evidence for the same thing and one window has to
+    // cover both.
+    if (from->grant_suppressed(target))
+        return;
+
+    const auto mine = m_proxy_workers.find(origin);
+    const auto theirs = m_proxy_workers.find(target);
+    if (mine == m_proxy_workers.end() || theirs == m_proxy_workers.end())
+        return;
+
+    // The asking side must be one worker: N shards asking would give the far
+    // side N links under one name, and the name is how a routing frame finds
+    // the link to send itself on.  Their own crossings already have the mesh.
+    if (mine->second.size() != 1)
+        return;
+
+    // The answering side may be any number.  front() is shard 0, which is
+    // where the daemon's own sink for the bare name points -- see the
+    // request_sink_override in reconcile_proxy_workers -- and the worker there
+    // answers a crossing the same way whether it arrived over a link or down
+    // the control socket.  So this replaces the daemon's leg and changes
+    // nothing about which process serves it.
+    proxy_supervisor* to = theirs->second.front().get();
+    if (!to || to == from)
+        return;
+
+    // The far side is asked too, because a target that has just been handed a
+    // link is one whose end of this pair is already on its way.
+    if (to->grant_suppressed(origin))
+        return;
+
+    int sv[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0)
+    {
+        LOG_WARN(("peer links: no socketpair for " + origin + " and " + target
+                  + "; their crossings keep relaying").c_str());
+        return;
+    }
+
+    // A half-delivered pair is not left half-delivered: closing both copies
+    // gives whichever end did arrive an immediate EOF, so that worker's link
+    // dies and it relays, rather than holding a socket nothing answers on.
+    if (!from->grant_peer_link(target, sv[0]) || !to->grant_peer_link(origin, sv[1]))
+    {
+        ::close(sv[0]);
+        ::close(sv[1]);
+        return;
+    }
+
+    // The daemon's copies go now: an end it still holds is an end whose peer
+    // never sees EOF when the process on the other side of it exits.
+    ::close(sv[0]);
+    ::close(sv[1]);
+
+    LOG_INFO(("peer links: " + origin + " and " + target
+              + " now cross directly").c_str());
+}
+
 void daemon_handler::on_worker_stats(const std::string& name)
 {
     // First and outside the floor, because the placeholder holds the sum over
@@ -4419,6 +4502,13 @@ void daemon_handler::on_worker_route(proxy_supervisor* from, std::string_view to
     }
 
     route_dispatch(to, frm, op, ref, payload);
+
+    // The same evidence a carried request gives: this daemon just moved bytes
+    // between two processes that could have moved them themselves.  A
+    // broadcast is excluded because it names no runtime to be linked to.
+    if (op != worker_proto::route_op::broadcast &&
+        op != worker_proto::route_op::forget && !to.empty())
+        link_peers(from, std::string(to));
 }
 
 // socketley.create/.start/.stop/.remove asked by a script in a worker,
@@ -4976,6 +5066,51 @@ void daemon_handler::reconcile_proxy_workers()
             continue;   // nothing to describe the runtime with
         }
 
+        // The node beside this runtime's port, decided here because this is
+        // the one place that knows both the configuration and this daemon's
+        // own socket -- and set on the placeholder as well as in the frame,
+        // since publish_endpoints reads it off the placeholder.
+        //
+        // Derived from the daemon socket, so two daemons never name one node,
+        // and the directory it goes in is 0700: only this user can put
+        // anything there, and this user can already reach the port.
+        {
+            static const std::string dsock =
+                socketley_paths::resolve().socket_path.string();
+
+            std::string node;
+            if (socketley::unix_sock::wants_companion(inst->get_type(),
+                                                      inst->get_port(),
+                                                      inst->get_listen_path(),
+                                                      inst->get_tls(),
+                                                      inst->is_udp()))
+            {
+                node = socketley::unix_sock::companion_path(dsock, name);
+
+                // Secured here and not in the worker, because publishing a path
+                // and binding it are two decisions and only one of them can be
+                // the one that fails: a path published into a directory this
+                // daemon does not own is a path a stranger can be serving.
+                if (!node.empty() &&
+                    !socketley::unix_sock::secure_node_dir(
+                        socketley::unix_sock::node_dir_of(node)))
+                {
+                    static bool said = false;
+                    if (!said)
+                    {
+                        said = true;
+                        LOG_WARN(("companion nodes are off: "
+                                  + socketley::unix_sock::node_dir_of(node)
+                                  + " is not a directory this daemon owns with "
+                                    "nothing but owner access").c_str());
+                    }
+                    node.clear();
+                }
+            }
+            inst->set_companion_path(node);
+            cfg.companion_path = node;
+        }
+
         // The shards forked in this pass, so `start` can be sent to all of
         // them after the endpoint table has been published once.
         std::vector<proxy_supervisor*> forked;
@@ -5122,6 +5257,11 @@ void daemon_handler::reconcile_proxy_workers()
                                       const conn_ref& r, std::string_view pl)
                                { on_worker_route(f, to, frm, op, r, pl); });
         sup->set_stats_handler([this, name] { on_worker_stats(name); });
+
+        // A crossing this worker made to another runtime, which is what tells
+        // the daemon the two processes have something to say to each other.
+        sup->set_peer_handler([this](proxy_supervisor* from, std::string target)
+                              { link_peers(from, target); });
 
         // The four map calls, recorded here and served a turn later, with
         // `this` outliving every supervisor it is installed on.

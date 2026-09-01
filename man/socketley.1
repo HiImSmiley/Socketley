@@ -1526,6 +1526,118 @@ socketley create proxy  gw  -p 8080 --backend app -s
 socketley create cache  kv  --listen unix:/run/kv.sock -s   # redis-cli -s works
 .fi
 .RE
+.SS The node beside the port
+A
+.B server
+that listens on a TCP port also listens on an AF_UNIX node, created by
+the daemon in a directory named after its own socket \(em
+.IR <socket> .rt/ \(em
+and named after the runtime. Named after the socket and not simply placed beside
+it, because the default socket is
+.I /tmp/socketley.sock
+and every user on the machine shares that directory. Nothing has to be
+configured for it, and nothing about the port changes: a runtime created with
+.B \-p 9000
+is reached on 9000 from anywhere, exactly as before. The node is additional,
+never a replacement \(em nothing outside this machine can reach one.
+.PP
+It exists for one caller: another runtime on this machine. A proxy whose backend
+is written as a
+.I runtime name
+takes it. So does one whose backend is written as an
+.I address
+\(em but only while a running runtime publishes exactly that host and port. A
+name asks for the runtime and may choose how to reach it; an address asks for
+the address, so the substitution holds only while the two are the same thing.
+Move the runtime to another port and the address means what it says again.
+.PP
+What it is worth, measured on this box on Linux 7.2.2 with the same proxy in
+front of the same server and only the backend leg differing: a request falls
+from 25.33 to 22.68 microseconds, and the whole process tree spends 4.0
+microseconds less CPU on each one \(em 12 of 12 interleaved passes, median of
+the per\-pass differences. The CPU saves more than the clock does, which is what
+a saving under load looks like: a serial round trip waits on wakeups, and the
+freed CPU has nowhere to go until there is a second request wanting it.
+.PP
+.B The node is 0600 in a directory the daemon creates 0700.
+Only the user the daemon runs as can reach it. Measured: another local user
+reaches the port and is refused on the node with
+.BR EACCES ,
+and cannot list the directory or create a node in it either. The port is not
+narrowed by any of this \(em it is exactly as open as it was \(em but the leg
+between two runtimes no longer travels over something every local user could
+also connect to.
+.PP
+The directory is checked and not merely created. A
+.BR mkdir (2)
+answering
+.B EEXIST
+says a directory is there and nothing about whose it is, so the daemon stats it:
+anything that is not a directory it owns, with no group or other access, turns
+companion nodes off for the whole daemon and says so once in the log. Without
+that check a stranger could create the directory first and hold a live node at a
+path the daemon was about to publish \(em and a live node is one the bind
+refuses to take, which would leave the path published and served by them.
+.PP
+Two things it takes away, both worth knowing before relying on them:
+.RS
+.IP \(bu 2
+.B A firewall rule on loopback does not apply.
+nftables and iptables see packets, and an AF_UNIX socket produces none. A rule
+that drops traffic to a runtime's port does not stop another runtime reaching it
+over the node.
+.IP \(bu 2
+.B tcpdump \-i lo shows nothing.
+The proxy writes one line to the daemon log per backend at start, naming the
+path it will use; that line is the only evidence the node was taken.
+.RE
+.PP
+A runtime gets no node when it is not a server, when it has no port \(em one
+already on
+.B \-\-listen unix:
+has nothing to add \(em when it is
+.BR \-\-udp ,
+or when its listener is TLS, since a cleartext node beside an encrypted port
+would undo what the port was configured to give. A proxy or a cache keeps its
+port alone: one rule decides both what the daemon publishes and what a runtime
+binds, so a type that is not wired to a listener is never advertised as having
+one \(em a path published into thin air is a backend that is simply down. A
+proxy configured with backend TLS keeps TCP for the same reason, rather than
+quietly dropping the encryption it was asked for.
+.SS Between runtimes on one machine
+Everything one runtime asks of another \(em
+.BR socketley.send ,
+.BR self.route ,
+and a server's
+.BI \-\-cache " name"
+\(em used to travel through the daemon: up one control socket and down the
+other. The daemon still carries the first such crossing, and then introduces
+the two processes to each other with a socket pair neither had before; the ones
+after it go straight across.
+.PP
+There is nothing to configure and nothing to see from outside. The pair has no
+path in the filesystem, so it can be neither connected to nor squatted \(em only
+the two processes that were handed the ends can use it. The daemon logs one line
+naming the pair when it introduces them, and
+.BI "socketley stats " name
+reports
+.BR peer_links ,
+.B peer_direct
+and
+.B peer_relayed
+so a crossing that went the long way can be told from one that went across.
+.PP
+What it is worth, measured with a server posting every cache command to a cache
+runtime, the two arms differing only in whether they were introduced: a round
+trip falls from 31.60 to 21.14 microseconds and the process tree spends 10.75
+microseconds less CPU per command \(em 12 of 12 interleaved passes, median of
+the per\-pass differences. A third of the round trip was the daemon.
+.PP
+A crossing falls back to the daemon whenever the link is not usable, so nothing
+depends on it: a link that never forms, or one whose peer has gone, costs the
+speed it would have saved and nothing else. Routed connections are pinned to
+whichever path they opened on and keep it for their whole life, because a
+message that changed route mid\-stream could arrive ahead of one sent before it.
 .SH SERVER FLAGS
 .TP
 .BI "\-\-mode " "mode"

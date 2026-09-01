@@ -848,9 +848,16 @@ void runtime_manager::publish_endpoints()
             // By name: no state filter, because this is what a backend given as
             // a bare runtime name resolves to, and that resolution happens while
             // the proxy itself is starting — before the target may have.
-            tbl->set_name(name, listen_path.empty()
-                                    ? runtime_endpoint{"127.0.0.1", port}
-                                    : runtime_endpoint{std::string(listen_path), 0});
+            // A runtime with a port may also have a node beside it; a runtime
+            // that has only a node keeps publishing it where it always did,
+            // in the host field with the port at 0.  The two are different
+            // runtimes and not two spellings of one, so they take different
+            // fields.
+            tbl->set_name(name,
+                listen_path.empty()
+                    ? runtime_endpoint{"127.0.0.1", port,
+                                       std::string(inst->get_companion_path())}
+                    : runtime_endpoint{std::string(listen_path), 0, {}});
 
             // By group: running and endpoint_live(), because a worker-backed
             // runtime is `running` from the fork rather than from the bind,
@@ -860,7 +867,7 @@ void runtime_manager::publish_endpoints()
             const bool running = (inst->get_state() == runtime_running) &&
                                  inst->endpoint_live();
             if (!group.empty() && running && listen_path.empty())
-                tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port});
+                tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port, {}});
 
             // And what this runtime says it will answer, taking the worker's
             // copy first because a runtime in another process has no
@@ -916,7 +923,7 @@ void runtime_manager::publish_endpoints()
             for (const auto& rt : daemon.runtimes)
             {
                 if (!rt.group.empty() && rt.state == "running" && rt.port > 0)
-                    tbl->add_to_group(rt.group, runtime_endpoint{rt.host, rt.port});
+                    tbl->add_to_group(rt.group, runtime_endpoint{rt.host, rt.port, {}});
             }
         }
     }

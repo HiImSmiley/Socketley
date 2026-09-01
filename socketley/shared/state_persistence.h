@@ -72,6 +72,17 @@ struct runtime_config
     // because a restore would give every shard index 0.
     uint32_t shard_index = 0;
 
+    // Whether the daemon handed this child a row of the shard mesh, told
+    // rather than inferred: a worker cannot tell a sibling's socketpair from
+    // its own descriptor sitting on the same number.
+    bool mesh_wired = false;
+
+    // A second listener beside the port, for callers already on this box.
+    // Derived by the daemon from its own socket and this runtime's name, never
+    // written to a state file, because a restore recomputes it and a daemon on
+    // a different socket would restore somebody else's path.
+    std::string companion_path;
+
     // A request rather than a result, persisted because a restore that drops
     // the refusal silently meets no requirement.
     std::string cpus;

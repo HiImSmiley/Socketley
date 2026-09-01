@@ -324,6 +324,12 @@ private:
     // per stats interval.
     void on_worker_stats(const std::string& name);
 
+    // Introduce two workers to each other: one socketpair, one end down each
+    // one's grant channel, after which their crossings stop coming through
+    // here.  Only for two runtimes of one worker apiece -- N shards on either
+    // side would need N*M links, and their crossings already have the mesh.
+    void link_peers(proxy_supervisor* from, const std::string& target);
+
     // When the last map push went out, set by every push, so a membership
     // change resets the window.
     std::chrono::steady_clock::time_point m_last_map_push{};

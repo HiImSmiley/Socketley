@@ -15,6 +15,7 @@
 
 #include "../../shared/conn_identity.h"
 #include "../../shared/runtime_instance.h"
+#include "../../shared/unix_companion.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
@@ -569,6 +570,18 @@ private:
     void flush_cache_store();
 
     void handle_accept(struct io_uring_cqe* cqe);
+
+    // What an accepted descriptor goes through before it is a connection,
+    // shared by the port's accept chain and the node's, because a connection
+    // must mean the same thing whichever way it arrived.
+    bool adopt_client(int client_fd, bool from_unix);
+
+public:
+    // The companion's re-arm, which has no completion of its own when the ring
+    // refused the submission that would have produced one.
+    void on_loop_turn() override;
+
+private:
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_file_read(struct io_uring_cqe* cqe, io_request* req);
@@ -702,6 +715,10 @@ private:
     // get_listen_path(), because a runtime edited between start and stop would
     // unlink a path it never bound.
     std::string m_bound_listen_path;
+
+    // The node beside the port, for callers already on this box.  Null for
+    // every runtime that has only one way in, which is most of them.
+    std::unique_ptr<socketley::unix_companion> m_companion;
     struct sockaddr_in m_accept_addr;
     socklen_t m_accept_addrlen;
     // One accept request per chain rather than per instance, because a stop

@@ -25,14 +25,26 @@
 using shard_mesh_server = bool (*)(void* ctx, std::string_view target,
                                    std::string_view payload, std::string& reply);
 
+// And what it hands a routing frame to.  Null for a sibling link, which never
+// carries one: a shard set routes through the daemon exactly as it did before
+// the mesh, and only a link between two runtimes has routes to carry.
+using shard_mesh_router = void (*)(void* ctx, std::string_view payload);
+
 // One link, to one sibling.
 class shard_link : public io_handler
 {
 public:
+    // `label` names the far end in the one place a reader meets it, a log
+    // line; empty means a sibling shard, which is what this class was for
+    // before a link could also reach another runtime.
     shard_link(int fd, uint32_t peer_index, request_channel* channel,
-               shard_mesh_server server, void* server_ctx)
+               shard_mesh_server server, void* server_ctx,
+               std::string label = {}, shard_mesh_router router = nullptr)
         : m_writer(fd), m_fd(fd), m_peer(peer_index),
-          m_channel(channel), m_server(server), m_ctx(server_ctx)
+          m_label(label.empty() ? "shard " + std::to_string(peer_index)
+                                : std::move(label)),
+          m_channel(channel), m_server(server), m_ctx(server_ctx),
+          m_router(router)
     {
         // Non-blocking, because a blocking descriptor here would stall this
         // shard's event loop on a sibling's scheduling.
@@ -94,6 +106,30 @@ public:
         }
 
         m_owed.insert(ticket);
+        return true;
+    }
+
+    // One routing frame to the peer, in the encoding the daemon's own leg uses,
+    // so the far side reads it with the function it already had.  False means
+    // this link is not carrying it and the caller sends it the long way --
+    // which is later and therefore still in order, since the slow route cannot
+    // overtake the fast one.
+    bool send_route(std::string_view payload)
+    {
+        if (!alive())
+            return false;
+
+        if (!m_writer.write(worker_proto::frame(
+                worker_proto::frame_type::route_down, payload)))
+        {
+            die("the backlog to a peer filled or its socket went");
+            return false;
+        }
+        if (m_writer.dead())
+        {
+            die("writing to a peer failed");
+            return false;
+        }
         return true;
     }
 
@@ -207,7 +243,7 @@ public:
         }
 
         const std::string note =
-            "shard mesh: the link to shard " + std::to_string(m_peer)
+            "shard mesh: the link to " + m_label
             + " is down (" + std::string(why) + "); " + std::to_string(swept)
             + " crossing(s) answered, the rest relay through the daemon";
         if (expected)
@@ -287,6 +323,16 @@ private:
                 m_channel->complete_deferred(
                     p.ticket, static_cast<request_status>(p.status), p.payload);
         }
+        if (type == worker_proto::frame_type::route_down)
+        {
+            // Applied by the far side with the same function the daemon's leg
+            // ends in, so a routed connection cannot behave differently
+            // depending on which way its bytes came.
+            if (m_router)
+                m_router(m_ctx, payload);
+            return;
+        }
+
         // Anything else travels the daemon's wire, not this one, and is skipped
         // rather than fatal — the length in the header is what makes that safe.
     }
@@ -294,10 +340,12 @@ private:
     frame_writer m_writer;
     int          m_fd{-1};
     uint32_t     m_peer{0};
+    std::string  m_label;
 
     request_channel*  m_channel{nullptr};
     shard_mesh_server m_server{nullptr};
     void*             m_ctx{nullptr};
+    shard_mesh_router m_router{nullptr};
 
     event_loop* m_loop{nullptr};
     io_request  m_req{};

@@ -814,6 +814,12 @@ static bool configure_unix_backend(backend_info& b, std::string_view path,
 
     b.is_unix = true;
     b.unix_path = std::string(path);
+
+    // Said out loud, because a backend written as a port and reached over a
+    // node is a transport nobody can see -- tcpdump on loopback shows nothing
+    // and the configuration still reads like TCP.
+    LOG_INFO(("proxy backend " + std::string(where) + " is reached over "
+              + std::string(path)).c_str());
     // The path is the endpoint with resolved_port at 0, and has_cached_addr is
     // true because there is no lookup to fail and nothing for the sweep to
     // retry.
@@ -884,6 +890,19 @@ bool proxy_instance::resolve_backend(backend_info& b)
             b.resolved_host = std::string(addr);
             b.resolved_port = default_port;
         }
+        // The same runtime, reached the short way.  Only when the address is
+        // exactly what a runtime publishes: `myserver` asks for a runtime and
+        // may choose its transport, while `127.0.0.1:9000` asks for an address
+        // -- so this fires only while that address IS that runtime, and the
+        // moment it stops being, the address means what it says again.
+        if (!b.tls && m_endpoints)
+        {
+            const std::string_view node =
+                m_endpoints->find_node_at(b.resolved_host, b.resolved_port);
+            if (!node.empty())
+                return configure_unix_backend(b, node, "\"" + b.address + "\"");
+        }
+
         if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
         {
             b.cached_addr.sin_family = AF_INET;
@@ -934,6 +953,13 @@ bool proxy_instance::resolve_backend(backend_info& b)
             return false;
         return configure_unix_backend(b, ep->host, "\"" + b.address + "\"");
     }
+
+    // A runtime with a port may also answer on a node.  A name asks for the
+    // runtime, so this leg is free to pick the shorter way to it -- except
+    // under backend TLS, which asks for something a node cannot give and is
+    // refused rather than quietly dropped one line further down.
+    if (!ep->unix_path.empty() && !b.tls)
+        return configure_unix_backend(b, ep->unix_path, "\"" + b.address + "\"");
 
     b.resolved_host = ep->host;
     const uint16_t port = ep->port;

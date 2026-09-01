@@ -85,6 +85,12 @@ public:
     void set_listen_path(std::string_view path);
     std::string_view get_listen_path() const;
 
+    // The node this runtime also answers on, beside its port.  Set by the
+    // daemon, empty for a runtime that has only one way in -- which is every
+    // runtime with TLS, with no port, or already listening on a path.
+    void set_companion_path(std::string_view path);
+    std::string_view get_companion_path() const;
+
     void set_log_file(std::string_view path);
     std::string_view get_log_file() const;
 
@@ -402,6 +408,11 @@ public:
     // A new name/group to endpoint snapshot pushed by the manager on every
     // membership change, ignored by default because only the proxy forwards to
     // other runtimes.
+    // One call per turn of the loop this runtime is on, for the work that has
+    // no completion to hang off: a submission the ring refused leaves a
+    // listener unarmed, and nothing else would come back to try again.
+    virtual void on_loop_turn() {}
+
     virtual void set_endpoints(std::shared_ptr<const endpoint_table>) {}
 
     // A registered type's own fields as an ordered string bag, no-ops for the
@@ -537,6 +548,7 @@ private:
     std::string m_on_start_error;
     uint16_t m_port = 0;
     std::string m_listen_path;
+    std::string m_companion_path;
     bool m_test_mode = false;
     std::string m_log_file;
     std::string m_write_file;
