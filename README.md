@@ -123,127 +123,164 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 
 ## Performance
 
-**How these were measured.** Development box, 4 cores, Linux 7.0, Release
-build, loopback TCP. The daemon is pinned to CPU 0,1 and the load generator to
-CPU 2,3, so the two are not competing for the same cores. Every measurement
-waits until fewer than 1000 sockets are in `TIME_WAIT` before it starts — a
-2000-connection run leaves ~10000 behind for a full 2×MSL, and a benchmark
-started on top of that measures port pressure rather than this daemon. Each
-figure is the median of three runs, and the spread across those runs is given
-beside it, because several of these numbers move by more than a fifth between
-runs on a machine this size.
+**How these were measured.** 16-core Linux 7.0 guest, Release build, loopback
+TCP, `2026-09-01`. Every figure below comes from **one run**, with all arms
+interleaved inside it and the order rotated between passes. Nothing here is
+compared against a number taken earlier, and neither should you compare it
+against yours.
 
-Numbers from a different machine are not comparable with these. That is what
-the spread column is for: treat anything inside it as unchanged.
+That is not caution for its own sake. This box is a guest: it has no
+`cpufreq`, and `/proc/cpuinfo` reports a constant `2995.200 MHz` no matter what
+the host is doing. A frequency change on the host is therefore **invisible from
+inside** and moves every absolute figure with no sign in the output. Measured
+here on one day, hours apart, with an unchanged binary:
+
+```
+morning   clock_probe ns_per_iter=2.4386  equiv_ghz=1.23
+midday    clock_probe ns_per_iter=1.3462  equiv_ghz=2.23
+```
+
+An 80% swing that nothing in the machine's own reporting would have shown. So
+every run records the probe before and after itself — the run below moved
+2.21 → 2.23 GHz, under 1% — and comparisons only ever live inside one run,
+where a clock change moves both arms together and the paired difference
+survives it.
+
+Each measurement is the **median of the per-pass differences**, not the
+difference of two medians, and the spread across passes is printed beside it.
+Treat anything whose spread contains the null result as unchanged; several
+numbers on a machine this size move by a third between passes.
+
+### Round trip against the C floor
+
+The only figure that says how much is left to win. `test/benchmark/floor_server.c`
+is a bare io_uring TCP echo with nothing of this project in it; the same client,
+the same six bytes in each direction, one connection, 20 000 round trips per
+pass, 9 passes.
+
+| Arm | p50 | p95 | Server CPU per round trip | Spread |
+|-------------------------------|-----------|-----------|--------|-------|
+| C floor (`floor_server`)      | 10.42 µs  | 11.20 µs  | 5.46 µs | 2.7% |
+| **cache**, `get` over TCP     | 11.01 µs  | 11.97 µs  | 6.36 µs | 2.2% |
+| **server**, Lua echo callback | 11.55 µs  | 12.63 µs  | 7.27 µs | 1.3% |
+
+Paired per pass, n = 9:
+
+| Over the floor | Latency | Range | CPU |
+|----------------|---------|-------|-----|
+| cache          | **+0.52 µs** | [+0.42, +0.85] | +0.91 µs |
+| server + Lua   | **+1.19 µs** | [+0.96, +1.28] | +1.36 µs |
+
+Neither range contains zero, so both are real rather than noise — unlike most
+of the depth-1 throughput ratios below. **0.5 µs buys** the key lookup, the
+runtime's connection state and its statistics; **another 0.7 µs buys the whole
+Lua dispatch**, a callback entered and returned per message. The optimum is +0
+and unreachable.
+
+The CPU column quantises: `CLK_TCK` is 100, so over 22 000 round trips one tick
+is 0.45 µs and every value in it is a multiple of that. The two differences are
+two and three ticks, which survives the resolution; a one-tick difference would
+not have been reportable.
 
 ### Cache vs Redis 7.0.15 (RESP2, `redis-benchmark`)
 
-> Both servers speak RESP2 and are driven by the same tool, `redis-benchmark`,
-> 50 clients. Socketley is single-threaded; Redis 7.x is also single-threaded.
+Both speak RESP2 and are driven by the same tool, **four** `redis-benchmark`
+processes per arm at 50 connections each. Four, not one: a single
+`redis-benchmark` pegs at 1.0 core on this box and then the number measured is
+the client's ceiling, not the server's. Client CPU is recorded beside every
+figure and averaged 0.35 cores per process here, well clear of the cap.
 
-**Pipeline depth 1** — 200K operations per test:
+**What `-P` changes, and why there are two tables.** Without pipelining the
+client sends one command and waits for its reply, so every operation costs a
+full round trip through the kernel and *that* dominates the measurement — which
+is why the two servers are indistinguishable at depth 1. At `-P 100` the client
+sends 100 commands before reading, so they arrive in one `read()` and the
+per-message syscall and wakeup cost is amortised by a hundred; what is left is
+the server's own parsing and execution. **Depth 1 measures the round trip.
+Depth 100 measures the code.** Most applications do not pipeline, so depth 1 is
+the honest number for an ordinary client and depth 100 is the ceiling for bulk
+work. Quoting either alone would mislead.
 
-| Operation | Socketley    | Redis 7.0.15 | Ratio |
-|-----------|--------------|--------------|-------|
-| SET       | 186K ±6%     | 192K ±7%     | 0.97× |
-| GET       | 180K ±7%     | 178K ±7%     | 1.01× |
-| LPUSH     | 173K ±12%    | 180K ±6%     | 0.96× |
-| LPOP      | 167K ±19%    | 170K ±26%    | 0.98× |
-| SADD      | 177K ±27%    | 164K ±28%    | 1.08× |
-| HSET      | 170K ±27%    | 165K ±27%    | 1.03× |
+**Pipeline depth 1** — 200 K operations per test, 5 passes:
 
-At depth 1 the two are **indistinguishable**: every ratio is inside the spread
-of the measurement. Throughput here is dominated by the loopback round trip,
-and neither server is doing enough work per operation for the difference to
-show. Any claim of an advantage in either direction at this depth is noise.
+| Operation | Socketley      | Redis 7.0.15   | Ratio | Ratio spread |
+|-----------|----------------|----------------|-------|--------------|
+| SET       | 288 K ±3%      | 268 K ±13%     | 1.09× | [1.06, 1.21] |
+| GET       | 249 K ±20%     | 267 K ±2%      | 0.93× | [0.88, 1.09] |
+| LPUSH     | 260 K ±31%     | 253 K ±24%     | 1.03× | [0.80, 1.44] |
+| LPOP      | 279 K ±32%     | 232 K ±24%     | 1.14× | [0.88, 1.25] |
+| SADD      | 240 K ±38%     | 244 K ±23%     | 0.99× | [0.93, 1.20] |
+| HSET      | 270 K ±30%     | 251 K ±7%      | 1.09× | [0.83, 1.10] |
 
-**Pipeline depth 100** — 2M operations per test:
+Five of the six ratio spreads contain 1.00: at depth 1 the two are
+**indistinguishable**, and any claim of an advantage in either direction is
+noise. SET is the one exception — its spread excluded 1.00 in this run and in a
+second run the same day (+9% and +10%) — and a 9% edge on one verb is worth
+noting and not worth building a claim on.
 
-| Operation | Socketley     | Redis 7.0.15 | Speedup |
-|-----------|---------------|--------------|---------|
-| SET       | 9.05M ±26%    | 2.79M ±29%   | 3.2×    |
-| GET       | 9.85M ±21%    | 3.36M ±18%   | 2.9×    |
-| LPUSH     | 9.48M ±14%    | 2.51M ±6%    | 3.8×    |
-| LPOP      | 10.36M ±31%   | 2.26M ±3%    | 4.6×    |
-| SADD      | 7.19M ±42%    | 3.03M ±15%   | 2.4×    |
-| HSET      | 8.97M ±30%    | 2.44M ±9%    | 3.7×    |
+**Pipeline depth 100** — 2 M operations per test, 5 passes:
 
-Pipelined, socketley is **2.4× to 4.6× faster than Redis 7**, and the margin is
-far larger than the spread. The advantage comes from:
+| Operation | Socketley       | Redis 7.0.15    | Speedup | Spread       |
+|-----------|-----------------|-----------------|---------|--------------|
+| SET       | 11.47 M ±36%    | 2.96 M ±18%     | 3.99×   | [2.78, 4.63] |
+| GET       | 13.09 M ±32%    | 3.70 M ±19%     | 3.35×   | [2.68, 4.34] |
+| LPUSH     | 8.92 M ±31%     | 2.76 M ±17%     | 3.23×   | [2.66, 4.23] |
+| LPOP      | 11.26 M ±11%    | 2.45 M ±8%      | 4.74×   | [4.28, 4.82] |
+| SADD      | 8.28 M ±21%     | 3.30 M ±16%     | 2.46×   | [2.23, 2.88] |
+| HSET      | 9.80 M ±22%     | 2.89 M ±17%     | 3.51×   | [2.84, 4.02] |
+
+Pipelined, socketley is **2.5× to 4.7× faster than Redis 7**, and every spread
+sits well above 1.00. A second run the same day reproduced all six within their
+spreads (3.23×–4.74× against 2.48×–4.66×), which is the only kind of
+cross-run agreement worth quoting: the conclusions repeat, the absolute figures
+do not have to.
+
+The same data read the other way is the clearer statement of cause. Pipelining
+is worth roughly **31× to 54×** to socketley and **10× to 14×** to Redis, and
+the mechanism is that a batch is where this tree does its work:
 
 - **Zero-allocation RESP2 codec** — parse and encode directly into and out of
   the connection buffer with `to_chars` and `string_view`
 - **Batch CQE drain** — every completion from a submit round in one pass, one
   `io_uring_cq_advance`
-- **writev coalescing** — up to 16 responses in a single `writev` SQE
+- **`writev` coalescing** — up to 16 responses in a single `writev` SQE
 
-These numbers were taken before io_uring's SQPOLL mode was removed, and the
-list above used to open with it. They have not been re-measured since, so treat
-the attribution as three causes and an unmeasured delta rather than as a
-complete account.
+None of the three has anything to bundle at depth 1, which is exactly why the
+advantage is absent there.
 
-The shape of these two tables is the interesting part: the advantage exists
-only when there is enough work per connection to amortise the per-operation
-cost. That is also where the weakness is — see below.
+### Not re-measured
 
-### Server, proxy and WebSocket
+The connection-rate and WebSocket-handshake rows that stood here were taken
+before this file recorded a clock probe, so there is no way to say what machine
+they describe. They are removed rather than restated: an absent row is a smaller
+error than one whose provenance is unknown. `test/benchmark/run_all.sh` produces
+them.
 
-Median of three runs, `socketley_bench`, same pinning and `TIME_WAIT`
-discipline.
-
-| Test                               | Result             | Spread |
-|------------------------------------|--------------------|--------|
-| Connection rate (2000 conns)       | **81K conn/s**     | ±16%   |
-| Burst (5000 simultaneous)          | **113K conn/s**    | ±2%    |
-| WebSocket handshakes (200)         | **30K/s**          | ±7%    |
-| WebSocket, 20 concurrent clients   | **80K/s**          | ±6%    |
-
-**Six rows have been withdrawn rather than restated.** Single client 64B and
-1KB, 100 clients × 500 msgs, proxy TCP forwarding, proxy 20 concurrent, and
-WebSocket frames were all produced by benchmarks that sent in a loop and never
-read a reply. What those measured was how fast the load generator could fill a
-socket buffer — roughly 1/latency of a `write()` — and not how fast anything was
-served. Their latency percentiles were the cost of `write()`. The figures were
-therefore too high by a large and *test-dependent* factor: measured on this tree
-after the loops were fixed, between 4× (single client) and 40× (100 concurrent
-clients).
-
-Those benchmarks now complete a round trip per operation against an echoing
-backend, so the numbers they produce are not comparable with the ones that stood
-here, and quoting either in the other's place would be wrong. They are left out
-until they have been re-recorded with the pinning and `TIME_WAIT` discipline the
-rest of this table was taken under — `test/benchmark/record_throughput.sh`. An
-absent row is a smaller error than a confident one.
-
-The two connection-rate rows and the two WebSocket handshake rows are unchanged:
-those never depended on a reply that was not being read. `socketley_bench` now
-states beside every figure whether it is a round trip, a write with nothing read
-back, or a connection establishment, and publishes each under a JSON key named
-for its kind, so this cannot happen again silently.
-
-One row that remains is still given without emphasis on purpose: the WebSocket
-concurrent figure is an aggregate test, and aggregates are where the spread on
-this machine is worst. See the weakness below.
+Six further rows were withdrawn earlier and have not returned — single client
+64 B and 1 KB, 100 clients × 500 msgs, proxy TCP forwarding, proxy 20 concurrent,
+and WebSocket frames. Those benchmarks sent in a loop and never read a reply, so
+what they measured was how fast the load generator could fill a socket buffer,
+roughly 1/latency of a `write()`, and their latency percentiles were the cost of
+`write()`. The overstatement was large and *test-dependent*: between 4× and 40×.
+They now complete a round trip per operation, which makes them incomparable with
+what stood here, and they stay out until re-recorded.
 
 **Known weakness, stated rather than omitted.** Single connections are fast and
 pipelined depth is fast; many *simultaneous* connections are not proportionally
 fast. The cost per connection has grown, and it disappears at one connection and
-dominates at a hundred.
+dominates at a hundred. How much of that survives the withdrawn rows is itself
+open — it was drawn by comparing aggregate figures that were both write-only, so
+it compared two socket-buffer fill rates rather than two service rates. The
+pipelined tables above are unaffected, since `redis-benchmark` reads its
+replies, and they show the same shape, which is why the weakness is still
+stated. It needs re-establishing on round trips before the figure attached to it
+means anything.
 
-How much of that conclusion survives the withdrawn rows is itself open. It was
-drawn by comparing aggregate figures against a February 2026 build measured on
-the same day — but both sides of that comparison were write-only numbers, so it
-compared two socket-buffer fill rates and not two service rates. The pipelined
-RESP tables above are unaffected (`redis-benchmark` reads its replies), and they
-show the same shape, which is why the weakness is still stated rather than
-withdrawn with the rows. It needs re-establishing on round trips before the
-figure attached to it means anything.
-
-Part of that is the price of correctness: the February build did not release
+Part of that is the price of correctness: an early build did not release
 registered file slots on teardown, did not cancel operations armed on them,
 leaked descriptors across `exec`, and closed clients without an answer. Some of
-it is probably not. Where it might be, and the experiment that would settle
-each candidate, is written down in `test/benchmark/hotspots.md`.
+it is probably not. Where it might be, and the experiment that would settle each
+candidate, is written down in `test/benchmark/hotspots.md`.
 
 ## Quick Start
 
