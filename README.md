@@ -123,11 +123,27 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 
 ## Performance
 
-**How these were measured.** 16-core Linux 7.0 guest, Release build, loopback
-TCP, `2026-09-01`. Every figure below comes from **one run**, with all arms
-interleaved inside it and the order rotated between passes. Nothing here is
+**How these were measured.** 16-core Linux **7.2.2** guest, Release build,
+loopback TCP, `2026-09-01`. Every figure below comes from **one run**, with all
+arms interleaved inside it and the order rotated between passes. Nothing here is
 compared against a number taken earlier, and neither should you compare it
 against yours.
+
+The kernel matters enough to name: this box ran 7.0.0-30 earlier the same day,
+and the whole section was re-measured after moving to 7.2.2. That move is the
+one comparison here that **cannot** be interleaved — two kernels do not run at
+once — so it is quoted with that on the label. Two independent instruments
+agreed, both arms of the floor moved together, and the clock probe read
+2.13–2.22 GHz on 7.0 against 2.15–2.18 GHz on 7.2, so if anything the newer
+kernel was measured on a slower clock:
+
+| | 7.0.0-30 | 7.2.2 | change |
+|---|---|---|---|
+| bare TCP loopback round trip | 10.63 µs | 10.14 µs | −0.49 µs |
+| cache server CPU per `get` | 3.98 µs | 3.64 µs | **−0.33 µs** |
+
+No line of this project changed. If you are reading these figures against your
+own box, its kernel is worth about as much as anything below.
 
 That is not caution for its own sake. This box is a guest: it has no
 `cpufreq`, and `/proc/cpuinfo` reports a constant `2995.200 MHz` no matter what
@@ -163,29 +179,35 @@ is a bare io_uring TCP echo with nothing of this project in it; the same client,
 the same six bytes in each direction, one connection, 20 000 round trips per
 pass, 9 passes.
 
+Six bytes each way is exact rather than approximate: the request is the inline
+`get k\n`, and the key holds a five-character value, so the reply `hello\n` is
+the same length. The floor and the Lua server echo those six bytes back, so all
+three arms move identical traffic and only the server differs.
+
 | Arm | p50 | p95 | Server CPU per round trip | Spread |
 |-------------------------------|-----------|-----------|--------|-------|
-| C floor (`floor_server`)      | 10.42 µs  | 11.20 µs  | 5.46 µs | 2.7% |
-| **cache**, `get` over TCP     | 11.01 µs  | 11.97 µs  | 6.36 µs | 2.2% |
-| **server**, Lua echo callback | 11.55 µs  | 12.63 µs  | 7.27 µs | 1.3% |
+| C floor (`floor_server`)      | 9.94 µs   | 11.18 µs  | 5.0 µs | 2.2% |
+| **cache**, `get` over TCP     | 10.65 µs  | 13.15 µs  | 6.0 µs | 1.4% |
+| **server**, Lua echo callback | 11.28 µs  | 14.20 µs  | 7.0 µs | 1.3% |
 
 Paired per pass, n = 9:
 
 | Over the floor | Latency | Range | CPU |
 |----------------|---------|-------|-----|
-| cache          | **+0.52 µs** | [+0.42, +0.85] | +0.91 µs |
-| server + Lua   | **+1.19 µs** | [+0.96, +1.28] | +1.36 µs |
+| cache          | **+0.70 µs** | [+0.59, +0.85] | +1.0 µs |
+| server + Lua   | **+1.33 µs** | [+1.11, +1.42] | +2.0 µs |
 
 Neither range contains zero, so both are real rather than noise — unlike most
-of the depth-1 throughput ratios below. **0.5 µs buys** the key lookup, the
-runtime's connection state and its statistics; **another 0.7 µs buys the whole
+of the depth-1 throughput ratios below. **0.7 µs buys** the key lookup, the
+runtime's connection state and its statistics; **another 0.6 µs buys the whole
 Lua dispatch**, a callback entered and returned per message. The optimum is +0
 and unreachable.
 
-The CPU column quantises: `CLK_TCK` is 100, so over 22 000 round trips one tick
-is 0.45 µs and every value in it is a multiple of that. The two differences are
-two and three ticks, which survives the resolution; a one-tick difference would
-not have been reportable.
+The CPU column quantises: `CLK_TCK` is 100, so over 20 000 round trips one tick
+is 0.5 µs and every value in it is a multiple of that. The two differences are
+two and four ticks, which survives the resolution; a one-tick difference would
+not have been reportable, and the column should not be read more finely than
+that.
 
 ### What the transport costs
 
@@ -194,12 +216,15 @@ over TCP on loopback and over an `AF_UNIX` socket:
 
 | Arm | p50 | User CPU/rt | Kernel CPU/rt |
 |-----------------------------|----------|---------|---------|
-| C floor over TCP            | 10.53 µs | 0.000 µs | 5.455 µs |
-| cache over **TCP**          | 11.01 µs | 0.909 µs | 5.455 µs |
-| cache over **AF_UNIX**      | **6.80 µs** | 0.909 µs | **3.636 µs** |
+| C floor over TCP            | 10.02 µs | 0.0 µs | 5.0 µs |
+| cache over **TCP**          | 10.64 µs | 0.5 µs | 5.5 µs |
+| cache over **AF_UNIX**      | **6.57 µs** | 1.0 µs | **3.5 µs** |
 
-Paired per pass: **−4.24 µs** [−4.29, −3.84] against the same cache over TCP,
-and −3.67 µs against a *bare C echo server* over TCP. Switching the transport
+The two CPU columns are at the same 0.5 µs quantum as the table above, so read
+the kernel column's 2 µs drop and not the user column's single tick.
+
+Paired per pass: **−4.10 µs** [−4.26, −4.00] against the same cache over TCP,
+and −3.45 µs against a *bare C echo server* over TCP. Switching the transport
 buys more than deleting every line this project contributes.
 
 TCP is a protocol for making an unreliable link reliable. Over loopback there is
@@ -210,23 +235,49 @@ packet that never leaves the machine. `AF_UNIX` has no protocol at all; the
 bytes are copied into the peer socket's queue, and ordering and reliability come
 free because it is one kernel and one queue.
 
-The saving is **per message**, not per operation: 2.05 µs of server CPU at
-depth 1, where one message carries one operation. At depth 100 a message
-carries a hundred, so the same saving should read 0.0205 µs per operation — and
-it measures 0.019 and 0.020. Two instruments built separately, agreeing to 5%.
-It is also why the depth-100 figures barely move: the effect is real and
-genuinely too small to resolve there.
+**How much netfilter is worth is measurable, and it is not socketley's to
+remove.** This box runs Docker, so it carries Docker's `nat` and `filter` tables
+and conntrack. Running the identical cache inside a fresh network namespace,
+where the ruleset is empty, is the same measurement with netfilter deleted:
+**0.93 µs per round trip at the floor** (12 of 12 passes, in a namespace checked
+first for the same loopback MTU, socket buffers and congestion control) and
+**0.51 µs of server CPU per `get`** at the product, worth about 16% of cache
+throughput. The same pair measured on 7.0 gave 0.91 µs and 0.68 µs, so the
+charge is the kernel-independent part of this section. `perf` attributes it: netfilter is 7.1% of the workload in the
+host namespace and 0.13% in the empty one.
+
+Two things follow. A TCP listener on a container host pays that for rules it
+never uses, and no rule of ours can skip it — `iptables … -j NOTRACK` on
+loopback measures **exactly nothing**, because `iptables-nft` implements that
+target through the xtables compatibility layer and it costs about what conntrack
+saves; written natively in `nft` it is still only 0.14 µs. And `--listen unix:`
+skips all of it for free, because `AF_UNIX` never enters netfilter at all — and
+at 4.10 µs against 0.93 µs that is more than four times the saving, in one flag.
+
+The saving is **per message**, not per operation: 2.00 µs of server CPU at
+depth 1, where one message carries one operation. At depth 100 a message carries
+a hundred, so the same saving should read 0.020 µs per operation — and it
+measures 0.016. The same order and the same mechanism, agreeing to about 20%
+rather than to 5%; an earlier run on the older kernel agreed more tightly, and
+quoting the looser figure is the honest one to keep.
+
+Whether the depth-100 figures "barely move" depends on which server. Redis gains
+1.02× from the transport at depth 100 — genuinely nothing, because its own
+per-message work of ~32 µs dwarfs a 2 µs saving. socketley gains **1.25×**,
+because its per-message work at that depth is only ~8 µs and the same saving is
+a quarter of it. The transport matters in proportion to how little else is
+left.
 
 **None of this is socketley's doing, and Redis gets it too.** Measured with all
-four arms in one run — both servers over both transports, 5 passes, order
-rotated, every server at 1.0 core:
+four arms in one run — both servers over both transports, 9 passes, order
+rotated, every server between 0.973 and 1.003 cores:
 
 | depth 1 | over TCP | over AF_UNIX | transport gain |
 |-----------|----------|--------------|----------------|
-| socketley SET | 273 K | **704 K** | 2.58× [2.38, 3.11] |
-| Redis SET     | 263 K | **527 K** | 2.06× [1.77, 2.29] |
-| socketley GET | 254 K | **700 K** | 2.78× [2.14, 2.96] |
-| Redis GET     | 266 K | **523 K** | 2.16× [1.74, 2.54] |
+| socketley SET | 273 K | **601 K** | 2.21× [1.98, 3.40] |
+| Redis SET     | 255 K | **502 K** | 1.96× [1.73, 2.15] |
+| socketley GET | 266 K | **650 K** | 2.40× [1.85, 2.66] |
+| Redis GET     | 246 K | **511 K** | 2.07× [1.78, 2.34] |
 
 So most of the win belongs to Linux, not to this project: anything speaking a
 socket on one machine can have it. What is socketley's is the *difference* in
@@ -234,21 +285,25 @@ how much each keeps, and it has a visible consequence:
 
 | socketley ÷ Redis, depth 1 | over TCP | over AF_UNIX |
 |------|----------|--------------|
-| SET  | 1.04× [0.84, 1.22] | **1.38× [1.24, 1.44]** |
-| GET  | 1.07× [0.92, 1.17] | **1.22× [1.20, 1.51]** |
+| SET  | 1.08× [0.81, 1.22] | **1.29× [1.13, 1.60]** |
+| GET  | 1.09× [0.96, 1.24] | 1.28× [0.99, 1.47] |
 
-Over TCP both spreads contain 1.00 and the two are indistinguishable, which is
-what the depth-1 table below reports. Over AF_UNIX neither does. **The tie at
-depth 1 is a property of the transport, not of the servers** — take the kernel's
-per-message price out of the way and the difference in the code above it becomes
-measurable. The same effect shows at depth 100, where 4.02× over TCP becomes
-4.92× over AF_UNIX.
+Over TCP both spreads contain 1.00. Over AF_UNIX **SET clears it and GET does
+not** — GET's lower bound is 0.99, which grazes. So the effect is one row
+short of the clean statement an earlier run on the older kernel produced, and
+the row that fell short is named rather than dropped.
+
+What survives is the direction and the mechanism: **take the kernel's
+per-message price out of the way and the difference in the code above it grows.**
+It shows again at depth 100, measured in the same four-arm shape — socketley ÷
+Redis goes from 3.94× over TCP to **4.63×** over AF_UNIX for SET, and 3.46× to
+**4.22×** for GET.
 
 **The trade-off is `--shards`.** It is refused with `--listen unix:`, and
 correctly: `SO_REUSEPORT` is not something a unix socket does, so N processes on
 one path would unlink each other's node and only the last to bind would answer.
-So the two levers exclude each other — `AF_UNIX` makes one connection ~2.4×
-cheaper on **one** core, and TCP with `--shards` pays the 4.24 µs to spread
+So the two levers exclude each other — `AF_UNIX` makes one connection ~2.2×
+cheaper on **one** core, and TCP with `--shards` pays the 4.10 µs to spread
 across cores. A local sidecar wants the first. Anything that needs more than a
 core wants the second.
 
@@ -265,16 +320,16 @@ the client's ceiling, not the server's. Client CPU is recorded beside every
 figure and averaged 0.35 cores per process here, well clear of the cap.
 
 **Both servers sit at 1.000 cores in every row below** — measured, across all
-60 runs socketley held 0.984–1.027 and Redis 0.996–1.009. Neither table is
+108 runs at depth 1 both held 0.992–1.002, and at depth 100 0.968–1.012. Neither table is
 limited by the client or by waiting on the network: each is a direct reading of
 **CPU cost per operation**, since throughput is one core divided by that cost.
 
 **What `-P` changes, then.** Without pipelining, one message carries one
 command, so each operation is charged a full trip through the kernel: syscall,
 socket, TCP, wakeup. That charge is the same for both servers and it is nearly
-all of the cost — 3.5 µs per operation at depth 1 against 0.083 µs at depth 100,
-so **97.7% of a depth-1 operation is per-message overhead rather than work on
-the data**. At `-P 100` a hundred commands arrive in one `read()` and that
+all of the cost — for `GET`, 3.71 µs of server CPU per operation at depth 1
+against 0.073 µs at depth 100, so **98% of a depth-1 operation is per-message
+overhead rather than work on the data**. At `-P 100` a hundred commands arrive in one `read()` and that
 charge is divided by a hundred; what remains is parsing and execution.
 
 So depth 1 is not "the round trip while the server idles" — the server is flat
@@ -284,52 +339,59 @@ spending it on its own code, which is where they differ. Most applications do
 not pipeline, so depth 1 is the honest number for an ordinary client and depth
 100 is the ceiling for bulk work; quoting either alone would mislead.
 
-**Pipeline depth 1** — 200 K operations per test, 5 passes:
+**Pipeline depth 1** — 200 K operations per test, 9 passes:
 
 | Operation | Socketley   | Redis 7.0.15 | Ratio | Ratio spread | Server cores |
 |-----------|-------------|--------------|-------|--------------|--------------|
-| SET       | 274 K ±13%  | 264 K ±7%    | 1.04× | [0.98, 1.08] | 1.000 / 1.000 |
-| GET       | 282 K ±24%  | 242 K ±21%   | 1.07× | [0.96, 1.17] | 1.000 / 0.997 |
-| LPUSH     | 282 K ±2%   | 250 K ±25%   | 1.13× | [1.07, 1.36] | 1.000 / 1.000 |
-| LPOP      | 280 K ±21%  | 233 K ±17%   | 1.19× | [0.88, 1.31] | 1.000 / 1.003 |
-| SADD      | 279 K ±17%  | 258 K ±32%   | 1.11× | [0.90, 1.52] | 1.000 / 1.000 |
-| HSET      | 213 K ±38%  | 216 K ±31%   | 1.07× | [0.92, 1.14] | 1.000 / 1.000 |
+| SET       | 261 K ±21%  | 228 K ±27%   | 1.15× | [0.86, 1.23] | 0.996 / 0.998 |
+| GET       | 269 K ±16%  | 253 K ±18%   | 1.08× | [1.01, 1.23] | 0.997 / 0.997 |
+| LPUSH     | 262 K ±25%  | 230 K ±23%   | 1.13× | [0.79, 1.30] | 0.998 / 0.998 |
+| LPOP      | 265 K ±16%  | 248 K ±16%   | 1.11× | [1.03, 1.40] | 0.996 / 0.998 |
+| SADD      | 266 K ±10%  | 256 K ±17%   | 1.05× | [0.99, 1.29] | 0.998 / 0.999 |
+| HSET      | 266 K ±9%   | 251 K ±14%   | 1.09× | [1.04, 1.20] | 0.998 / 0.998 |
 
-At depth 1, **over TCP**, the two are indistinguishable, and any claim of an
-advantage in either direction is noise. One row's spread does clear 1.00 here —
-LPUSH — but in a second run the same day it was SET instead, and LPUSH's
-contained 1.00. The exception moves, which is what a false positive out of six
-comparisons looks like. Neither is quoted as a result.
+At depth 1, **over TCP**, do not read any individual row as a result. Three
+spreads clear 1.00 here — GET, LPOP and HSET — but in a five-pass run of the
+same arms an hour earlier it was SET, GET, LPOP and SADD, and LPUSH and HSET
+contained 1.00. **Which rows clear keeps changing, which is what a false
+positive out of six comparisons looks like.**
 
-The qualifier matters: over `AF_UNIX` the same comparison is 1.22×–1.38× and
-its spreads do *not* contain 1.00 (see **What the transport costs**). This table
+What does not change is the direction: all twelve medians across those two runs
+sit above 1.00, between 1.05× and 1.15×. So the honest reading is a small
+advantage of **at most about 10%**, too close to resolve row by row — not the
+flat tie an earlier run reported, and not something to quote per operation.
+
+The qualifier matters: over `AF_UNIX` the same comparison is 1.28×–1.29×, and
+SET's spread does not contain 1.00 (see **What the transport costs**). This table
 is a TCP measurement, and at depth 1 that is mostly a measurement of the
 kernel's per-message price, which both servers pay alike.
 
-**Pipeline depth 100** — 2 M operations per test, 5 passes:
+**Pipeline depth 100** — 2 M operations per test, 9 passes:
 
 | Operation | Socketley    | Redis 7.0.15 | Speedup | Spread       | Server cores |
 |-----------|--------------|--------------|---------|--------------|--------------|
-| SET       | 10.07 M ±24% | 2.70 M ±18%  | 3.54×   | [3.03, 4.43] | 1.013 / 1.000 |
-| GET       | 12.03 M ±32% | 3.67 M ±10%  | 3.28×   | [2.58, 3.59] | 1.000 / 1.000 |
-| LPUSH     | 8.91 M ±15%  | 2.41 M ±14%  | 3.52×   | [3.29, 4.14] | 1.011 / 1.000 |
-| LPOP      | 11.46 M ±12% | 2.32 M ±12%  | 4.59×   | [4.48, 5.05] | 1.000 / 1.003 |
-| SADD      | 8.33 M ±17%  | 3.35 M ±16%  | 2.44×   | [2.16, 2.77] | 1.000 / 1.000 |
-| HSET      | 9.91 M ±6%   | 2.81 M ±6%   | 3.59×   | [3.43, 3.61] | 1.000 / 1.000 |
+| SET       | 10.31 M ±37% | 3.06 M ±13%  | 3.45×   | [3.27, 4.57] | 0.992 / 0.999 |
+| GET       | 13.39 M ±7%  | 3.63 M ±10%  | 3.68×   | [3.53, 4.04] | 0.982 / 0.996 |
+| LPUSH     | 8.90 M ±23%  | 2.78 M ±14%  | 3.32×   | [2.97, 3.91] | 0.993 / 0.998 |
+| LPOP      | 10.26 M ±25% | 2.43 M ±8%   | 4.27×   | [3.90, 4.99] | 0.996 / 0.998 |
+| SADD      | 8.86 M ±17%  | 3.23 M ±12%  | 2.62×   | [2.26, 2.95] | 0.994 / 0.997 |
+| HSET      | 10.12 M ±22% | 2.86 M ±9%   | 3.52×   | [2.91, 3.80] | 0.989 / 0.999 |
 
-Pipelined, socketley is **2.4× to 4.6× faster than Redis 7**, and every spread
-sits well above 1.00. A second run the same day reproduced all six within their
-spreads, which is the only kind of cross-run agreement worth quoting: the
-conclusions repeat, the absolute figures do not have to.
+Pipelined, socketley is **2.6× to 4.3× faster than Redis 7**, and every spread
+sits well above 1.00. The previous run, on the older kernel, gave 2.4× to 4.6×
+and reproduced all six within their spreads — which is the only kind of
+cross-run agreement worth quoting: the conclusions repeat, the absolute figures
+do not have to.
 
-At 12 M GET/s on one core at ~2.2 GHz an operation costs about 170 cycles —
-parse, hash lookup, encode, with no syscall of its own. That is tight enough to
-be worth a sanity check, and it passes: the same operation on the serial path
-costs ~1160 cycles, and the ~990-cycle difference is exactly the per-message
-charge that pipelining removes.
+At 13.4 M GET/s on one core at ~2.15 GHz an operation costs about **158 cycles**
+— parse, hash lookup, encode, with no syscall of its own. The same operation on
+the serial path costs about **7,970 cycles**, and the difference is the
+per-message charge that pipelining removes. (An earlier revision of this section
+put the serial figure at ~1,160 cycles, which cannot be right: it contradicts
+the 3.5 µs per operation quoted two paragraphs above it in the same text.)
 
 The same data read the other way is the clearer statement of cause. Pipelining
-is worth roughly **31× to 54×** to socketley and **10× to 14×** to Redis, and
+is worth roughly **33× to 50×** to socketley and **10× to 14×** to Redis, and
 the mechanism is that a batch is where this tree does its work:
 
 - **Zero-allocation RESP2 codec** — parse and encode directly into and out of

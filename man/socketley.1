@@ -1450,17 +1450,22 @@ so a proxy and the backend it fronts can talk on one host without a loopback
 TCP stack between them \(em or serve its own front door on one.
 .RS
 .PP
-What it is worth, measured on a cache serving the same client over both: a
-round trip falls from 11.01 to 6.80 microseconds, and throughput at pipeline
-depth 1 rises 2.6x. Most of that belongs to the kernel and not to this daemon
-\(em Redis over its own unix socket gains 2.1x on the same box, so any server
-on one machine can have it. TCP exists to make an unreliable link reliable, and over
-loopback there is no link \(em but sequence numbers, windows, retransmit
-timers, an skb per direction through IP, and netfilter walking every packet all
-run regardless. An AF_UNIX socket has none of that. The saving is per
-\fImessage\fR and not per operation, so a pipelining client sees far less of
-it: at depth 100 the same change is 0.02 microseconds an operation and does not
-rise above the noise.
+What it is worth, measured on a cache serving the same client over both, on
+Linux 7.2.2: a round trip falls from 10.64 to 6.57 microseconds, and throughput
+at pipeline depth 1 rises 2.2x to 2.4x. Most of that belongs to the kernel and
+not to this daemon \(em Redis over its own unix socket gains 2.0x on the same
+box, so any server on one machine can have it. TCP exists to make an unreliable
+link reliable, and over loopback there is no link \(em but sequence numbers,
+windows, retransmit timers, an skb per direction through IP, and netfilter
+walking every packet all run regardless. On a host running Docker, netfilter
+alone is 0.9 microseconds of that round trip. An AF_UNIX socket has none of it.
+.PP
+The saving is per \fImessage\fR and not per operation, so a pipelining client
+sees much less of it: at depth 100 it is 0.016 microseconds an operation. That
+is still 1.25x here, because at that depth the cache's own per-message work is
+only about 8 microseconds and the saving is a quarter of it; Redis, whose
+per-message work is nearer 32 microseconds, gains 1.02x and may as well not
+bother.
 .PP
 The cost is
 .BR \-\-shards ,
