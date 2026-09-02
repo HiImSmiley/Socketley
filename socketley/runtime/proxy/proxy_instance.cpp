@@ -557,6 +557,45 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // And the addresses for whatever the new snapshot added, after the
     // pruning, so a member that just left is not looked up on its way out.
     resolve_group_hosts();
+    announce_group_nodes();
+}
+
+// How a group member is dialled, decided here and nowhere else: over the node
+// it published when this leg is not TLS, spelled (path, 0) so the pool key,
+// the breaker key and the connect all name the same socket.
+resolved_backend proxy_instance::member_dial(const runtime_endpoint& ep) const
+{
+    if (!ep.unix_path.empty() && !(m_backend_tls && m_backend_tls_all))
+        return {ep.unix_path, 0};
+    return {ep.host, ep.port};
+}
+
+// Said once per node, because a member reached over a path is a transport
+// tcpdump on loopback cannot see while the group still reads like addresses.
+void proxy_instance::announce_group_nodes()
+{
+    if (!m_endpoints)
+        return;
+
+    for (const auto& b : m_backends)
+    {
+        if (!b.is_group)
+            continue;
+
+        const std::string_view group_name(b.address.data() + 1, b.address.size() - 1);
+        const auto* members = m_endpoints->find_group(group_name);
+        if (!members)
+            continue;
+
+        for (const auto& ep : *members)
+        {
+            const resolved_backend dial = member_dial(ep);
+            if (dial.port != 0 || !m_group_nodes_said.insert(dial.host).second)
+                continue;
+            LOG_INFO(("proxy backend " + b.address + " member " + ep.host + ":" +
+                      std::to_string(ep.port) + " is reached over " + dial.host).c_str());
+        }
+    }
 }
 
 // The declarations of this proxy's backends folded into one table, where one
@@ -700,8 +739,11 @@ void proxy_instance::drop_departed_endpoints()
             const std::string_view group(b.address.data() + 1, b.address.size() - 1);
             if (const auto* members = m_endpoints->find_group(group))
                 for (const auto& ep : *members)
-                    if (ep.port == port && ep.host == host)
+                {
+                    const resolved_backend dial = member_dial(ep);
+                    if (dial.port == port && dial.host == host)
                         return true;
+                }
         }
         return false;
     };
@@ -1242,6 +1284,7 @@ bool proxy_instance::setup(event_loop& loop)
     // may have arrived while m_backends was still empty and a view built from
     // none enforces nothing.
     rebuild_route_view();
+    announce_group_nodes();
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
@@ -4434,7 +4477,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                 if (const auto* members = m_endpoints->find_group(group_name))
                 {
                     for (const auto& ep : *members)
-                        pool.push_back({ep.host, ep.port});
+                        pool.push_back(member_dial(ep));
                 }
             }
         }
@@ -4519,12 +4562,23 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
     m_scratch_backend.resolved_host = std::move(selected->host);
     m_scratch_backend.resolved_port = selected->port;
     m_scratch_backend.has_cached_addr = false;
+    m_scratch_backend.is_unix = false;
+    m_scratch_backend.unix_path.clear();
     conn->backend_from_group = true;
     conn->backend_host = m_scratch_backend.resolved_host;
     conn->backend_port = m_scratch_backend.resolved_port;
     // Claim the single half-open probe if this selection is the one that gets
     // it — the group counterpart of note_backend_selected().
     note_group_selected(conn->backend_host, conn->backend_port);
+    // A member member_dial() spelled as its path is the whole address, with
+    // nothing to look up and nothing for the sweep to retry.
+    if (m_scratch_backend.resolved_port == 0)
+    {
+        m_scratch_backend.is_unix = true;
+        m_scratch_backend.unix_path = m_scratch_backend.resolved_host;
+        m_scratch_backend.has_cached_addr = true;
+        return &m_scratch_backend;
+    }
     if (inet_pton(AF_INET, m_scratch_backend.resolved_host.c_str(),
                   &m_scratch_backend.cached_addr.sin_addr) == 1)
     {
@@ -7270,7 +7324,7 @@ static inline void breaker_record_success(circuit_breaker& cb)
 static inline std::string_view endpoint_key(char* buf, size_t cap,
                                             std::string_view host, uint16_t port)
 {
-    if (host.empty() || port == 0 || host.size() + 8 > cap)
+    if (!pool_key_ok(host, port) || host.size() + 8 > cap)
         return {};
     std::memcpy(buf, host.data(), host.size());
     size_t n = host.size();

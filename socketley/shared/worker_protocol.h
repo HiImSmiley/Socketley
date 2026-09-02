@@ -309,6 +309,22 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
         put_str(out, e.name);
         put_str(out, e.unix_path);
     }
+
+    // And the group members' nodes, one block further under the same rule,
+    // keyed by position in the group block because two members of one group
+    // can share a host and a port and still be two runtimes with two nodes.
+    uint32_t n_group_nodes = 0;
+    for (const auto& e : groups)
+        if (!e.unix_path.empty())
+            ++n_group_nodes;
+    put_u32(out, n_group_nodes);
+    for (uint32_t i = 0; i < groups.size(); ++i)
+    {
+        if (groups[i].unix_path.empty())
+            continue;
+        put_u32(out, i);
+        put_str(out, groups[i].unix_path);
+    }
     return out;
 }
 
@@ -447,6 +463,22 @@ inline bool decode_endpoints(std::string_view payload,
                         e.unix_path = std::move(path);
                         break;
                     }
+            }
+        }
+
+        // The group members' nodes, by position, from a frame new enough to
+        // carry them.
+        if (!r.done())
+        {
+            const uint32_t n_group_nodes = r.u32();
+            if (!r.ok) return false;
+            for (uint32_t i = 0; i < n_group_nodes && r.ok; ++i)
+            {
+                const uint32_t idx = r.u32();
+                std::string path(r.str());
+                if (!r.ok) return false;
+                if (idx < groups.size())
+                    groups[idx].unix_path = std::move(path);
             }
         }
     }

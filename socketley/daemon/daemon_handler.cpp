@@ -4058,11 +4058,11 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
     names.reserve(tbl.name_count());
     for (const auto& [name, ep] : tbl.names())
         names.push_back({name, ep.host, ep.port, ep.unix_path});
+    // A member's node travels with it, exactly as a name's does, because the
+    // table decided who has one and this frame only carries the decision.
     for (const auto& [group, eps] : tbl.groups())
-        // No node for a group member: a group is dialled by address, and the
-        // one place a node is chosen over a port is a backend named by runtime.
         for (const auto& ep : eps)
-            groups.push_back({group, ep.host, ep.port, {}});
+            groups.push_back({group, ep.host, ep.port, ep.unix_path});
 
     // The declarations travel with the table, because a proxy in a worker
     // enforces what this frame says and cannot read the daemon's

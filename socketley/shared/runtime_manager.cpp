@@ -845,29 +845,35 @@ void runtime_manager::publish_endpoints()
             if (port == 0 && listen_path.empty())
                 continue;
 
-            // By name: no state filter, because this is what a backend given as
-            // a bare runtime name resolves to, and that resolution happens while
-            // the proxy itself is starting — before the target may have.
+            // Where this runtime is, as one value, because it is published
+            // twice below and a member reached one way by name and another
+            // way by group is the same process on the same box.
             // A runtime with a port may also have a node beside it; a runtime
             // that has only a node keeps publishing it where it always did,
             // in the host field with the port at 0.  The two are different
             // runtimes and not two spellings of one, so they take different
             // fields.
-            tbl->set_name(name,
+            const runtime_endpoint local =
                 listen_path.empty()
                     ? runtime_endpoint{"127.0.0.1", port,
                                        std::string(inst->get_companion_path())}
-                    : runtime_endpoint{std::string(listen_path), 0, {}});
+                    : runtime_endpoint{std::string(listen_path), 0, {}};
+
+            // By name: no state filter, because this is what a backend given as
+            // a bare runtime name resolves to, and that resolution happens while
+            // the proxy itself is starting — before the target may have.
+            tbl->set_name(name, local);
 
             // By group: running and endpoint_live(), because a worker-backed
             // runtime is `running` from the fork rather than from the bind,
             // and never a unix listener, which the group path has no route to
-            // dial.
+            // dial.  The node goes with it; a remote member, added below,
+            // never carries one because a path means nothing off this box.
             const std::string_view group = inst->get_group();
             const bool running = (inst->get_state() == runtime_running) &&
                                  inst->endpoint_live();
             if (!group.empty() && running && listen_path.empty())
-                tbl->add_to_group(group, runtime_endpoint{"127.0.0.1", port, {}});
+                tbl->add_to_group(group, local);
 
             // And what this runtime says it will answer, taking the worker's
             // copy first because a runtime in another process has no

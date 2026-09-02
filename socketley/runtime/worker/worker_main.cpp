@@ -1091,7 +1091,7 @@ private:
         for (const auto& e : names)
             tbl->set_name(e.name, runtime_endpoint{e.host, e.port, e.unix_path});
         for (const auto& e : groups)
-            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port, {}});
+            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port, e.unix_path});
         for (auto& [n, rt] : name_routes)
             tbl->set_name_routes(n, std::move(rt));
         for (auto& [g, rt] : group_routes)

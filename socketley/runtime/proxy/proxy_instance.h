@@ -2,6 +2,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <vector>
 #include <queue>
@@ -19,6 +20,8 @@
 #include "../../shared/trace.h"
 #include "../../shared/invariants.h"
 #include "../../shared/http_framing.h"
+
+struct runtime_endpoint;
 
 class runtime_manager;
 
@@ -629,6 +632,9 @@ private:
     // address arrives -- the membership snapshot -- rather than on the request
     // path the idle sweep never sees.
     void resolve_group_hosts();
+    // The one place a member's node is chosen over its port.
+    resolved_backend member_dial(const runtime_endpoint& ep) const;
+    void announce_group_nodes();
 
 #ifdef SOCKETLEY_INVARIANTS
     // Debug-only: see invariants.h.  Asserts over the pair, never over one half.
@@ -922,6 +928,8 @@ private:
     // port applied at selection, pruned to the size of the membership rather
     // than of its history.
     std::unordered_map<std::string, in_addr> m_group_addr;
+    // Nodes already announced in the log, so a republish does not repeat them.
+    std::unordered_set<std::string> m_group_nodes_said;
     // Some member did not resolve, so the idle sweep has a reason to run and
     // to keep running.
     bool m_group_unresolved = false;
