@@ -610,6 +610,21 @@ bool cache_instance::setup(event_loop& loop)
         }
     }
 
+    // A node beside the port for callers already on this box, the object the
+    // server keeps and for the same reason: made once, because it owns an
+    // io_request the ring may still hold, and a reset() in teardown had the
+    // sanitizer reading a token out of freed storage.
+    if (socketley::unix_sock::wants_companion(get_type(), get_port(), listen_path,
+                                              get_tls(), is_udp(), get_shards())
+        && !get_companion_path().empty())
+    {
+        if (!m_companion)
+            m_companion = std::make_unique<socketley::unix_companion>(
+                std::string(get_companion_path()),
+                [this](int fd) { return adopt_client(fd, false, true); });
+        m_companion->start(loop);
+    }
+
     // The dump set was read at the top of setup(), before anything could be
     // served out of a store that is only part of what was stored.
 
@@ -752,6 +767,10 @@ void cache_instance::teardown(event_loop& /*loop*/)
         close_tracked(m_cluster_listen_fd);
         m_cluster_listen_fd = -1;
     }
+
+    // Stopped, not freed, for the reason setup() gives.
+    if (m_companion)
+        m_companion->stop();
 
     // The socket node for a unix listener, exactly the one this run bound,
     // because closing the descriptor does not unlink the path.
@@ -1238,6 +1257,97 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
 }
 #endif
 
+bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_unix)
+{
+    // Reject fds beyond our O(1) lookup table — they'd become zombie connections
+    if (client_fd >= MAX_FDS)
+    {
+        close_tracked(client_fd);
+        return false;
+    }
+
+    if (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)
+    {
+        close_tracked(client_fd);
+        return false;
+    }
+
+    // TCP-level, so a client accepted off a unix listener would spend a
+    // syscall per accept on nothing; the cluster listener is TCP by
+    // construction.
+    if (!from_unix || from_cluster)
+    {
+        int opt = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+        // A peer that loses power sends no FIN, and a cache with no
+        // --idle-timeout holds that connection -- and its entry in the
+        // subscriber table -- for ever.
+        socket_tuning::keepalive_dead_peer(client_fd);
+    }
+
+    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+
+    auto conn = pool_acquire(client_fd);
+    SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
+    conn->partial.reserve(4096);
+    conn->response_buf.reserve(4096);
+    conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+    conn->write_req = { this, nullptr, client_fd, 0, op_write };
+
+    // Register fd in fixed file table for fget/fput-free I/O
+    int slot = m_loop->alloc_fixed_file_slot();
+    if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+    {
+        conn->fixed_idx = slot;
+        conn->direct_fd = true;
+    }
+
+    conn->cluster_port = from_cluster;
+
+    auto* ptr = conn.get();
+    m_clients[client_fd] = std::move(conn);
+    if (client_fd < MAX_FDS)
+        m_conn_idx[client_fd] = ptr;
+
+    // A TLS listener gives every accepted socket a session before anything
+    // else touches it, with the handshake starting on the first read
+    // because the client speaks first.
+    if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
+    {
+        ptr->ssl = m_tls->create_ssl_server();
+        if (SOCKETLEY_UNLIKELY(!ptr->ssl))
+        {
+            // No session means no encryption and so no connection, because
+            // serving this client in cleartext is worse than dropping it.
+            shutdown(client_fd, SHUT_RDWR);
+            close_client(ptr, client_fd, "tls-session-alloc-failed");
+            return false;
+        }
+        ptr->tls_state = tls_conn_handshake;
+    }
+
+    // Initialize rate limiting
+    auto now_tp = std::chrono::steady_clock::now();
+    if (m_rate_limit_cached > 0)
+    {
+        ptr->rl_max = m_rate_limit_cached;
+        ptr->rl_tokens = m_rate_limit_cached;
+        ptr->rl_last = now_tp;
+    }
+
+    ptr->last_activity = now_tp;
+
+    // A connection whose first read cannot be armed can make no progress,
+    // and nothing touches ptr after this, so the teardown is safe here.
+    if (SOCKETLEY_UNLIKELY(!submit_client_read(ptr, client_fd)))
+    {
+        close_client(ptr, client_fd, "read-submit-failed");
+        return false;
+    }
+    return true;
+}
+
 void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 {
     int client_fd = cqe->res;
@@ -1248,92 +1358,10 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
     const bool from_cluster =
         (m_cluster_accept != nullptr && req == &m_cluster_accept->req);
 
+    // False is a descriptor already dealt with, and the listener re-arms
+    // either way.
     if (client_fd >= 0)
-    {
-        // Reject fds beyond our O(1) lookup table — they'd become zombie connections
-        if (client_fd >= MAX_FDS)
-        {
-            close_tracked(client_fd);
-            goto cache_resubmit_accept;
-        }
-
-        if (m_max_conns_cached > 0 && m_clients.size() >= m_max_conns_cached)
-        {
-            close_tracked(client_fd);
-            goto cache_resubmit_accept;
-        }
-
-        // TCP-level, so a client accepted off a unix listener would spend a
-        // syscall per accept on nothing; the cluster listener is TCP by
-        // construction.
-        if (m_bound_listen_path.empty() || from_cluster)
-        {
-            int opt = 1;
-            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-            // A peer that loses power sends no FIN, and a cache with no
-            // --idle-timeout holds that connection -- and its entry in the
-            // subscriber table -- for ever.
-            socket_tuning::keepalive_dead_peer(client_fd);
-        }
-
-        m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
-
-        auto conn = pool_acquire(client_fd);
-        SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
-        conn->partial.reserve(4096);
-        conn->response_buf.reserve(4096);
-        conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
-        conn->write_req = { this, nullptr, client_fd, 0, op_write };
-
-        // Register fd in fixed file table for fget/fput-free I/O
-        int slot = m_loop->alloc_fixed_file_slot();
-        if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
-        {
-            conn->fixed_idx = slot;
-            conn->direct_fd = true;
-        }
-
-        conn->cluster_port = from_cluster;
-
-        auto* ptr = conn.get();
-        m_clients[client_fd] = std::move(conn);
-        if (client_fd < MAX_FDS)
-            m_conn_idx[client_fd] = ptr;
-
-        // A TLS listener gives every accepted socket a session before anything
-        // else touches it, with the handshake starting on the first read
-        // because the client speaks first.
-        if (SOCKETLEY_UNLIKELY(m_tls != nullptr))
-        {
-            ptr->ssl = m_tls->create_ssl_server();
-            if (SOCKETLEY_UNLIKELY(!ptr->ssl))
-            {
-                // No session means no encryption and so no connection, because
-                // serving this client in cleartext is worse than dropping it.
-                shutdown(client_fd, SHUT_RDWR);
-                close_client(ptr, client_fd, "tls-session-alloc-failed");
-                goto cache_resubmit_accept;
-            }
-            ptr->tls_state = tls_conn_handshake;
-        }
-
-        // Initialize rate limiting
-        auto now_tp = std::chrono::steady_clock::now();
-        if (m_rate_limit_cached > 0)
-        {
-            ptr->rl_max = m_rate_limit_cached;
-            ptr->rl_tokens = m_rate_limit_cached;
-            ptr->rl_last = now_tp;
-        }
-
-        ptr->last_activity = now_tp;
-
-        // A connection whose first read cannot be armed can make no progress,
-        // and nothing touches ptr after this, so the teardown is safe here.
-        if (SOCKETLEY_UNLIKELY(!submit_client_read(ptr, client_fd)))
-            close_client(ptr, client_fd, "read-submit-failed");
-    }
+        adopt_client(client_fd, from_cluster, !m_bound_listen_path.empty());
 
     // EMFILE/ENFILE: backoff 100ms to avoid CPU spin when fd limit is hit
     if (client_fd == -EMFILE || client_fd == -ENFILE)
@@ -1342,7 +1370,6 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-cache_resubmit_accept:
     // The listener that reported and only that one, because re-arming the
     // other would give it a second chain on one io_request and one address
     // buffer.
@@ -1355,6 +1382,12 @@ cache_resubmit_accept:
             else              rearm_accept();
         }
     }
+}
+
+void cache_instance::on_loop_turn()
+{
+    if (m_companion)
+        m_companion->pump();
 }
 
 bool cache_instance::submit_client_read(client_connection* conn, int fd)

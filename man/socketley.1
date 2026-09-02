@@ -1529,6 +1529,8 @@ socketley create cache  kv  --listen unix:/run/kv.sock -s   # redis-cli -s works
 .SS The node beside the port
 A
 .B server
+or an unsharded
+.B cache
 that listens on a TCP port also listens on an AF_UNIX node, created by
 the daemon in a directory named after its own socket \(em
 .IR <socket> .rt/ \(em
@@ -1592,18 +1594,22 @@ The proxy writes one line to the daemon log per backend at start, naming the
 path it will use; that line is the only evidence the node was taken.
 .RE
 .PP
-A runtime gets no node when it is not a server, when it has no port \(em one
-already on
+A runtime gets no node when it is neither a server nor a cache, when it has no
+port \(em one already on
 .B \-\-listen unix:
 has nothing to add \(em when it is
 .BR \-\-udp ,
 or when its listener is TLS, since a cleartext node beside an encrypted port
-would undo what the port was configured to give. A proxy or a cache keeps its
-port alone: one rule decides both what the daemon publishes and what a runtime
-binds, so a type that is not wired to a listener is never advertised as having
-one \(em a path published into thin air is a backend that is simply down. A
-proxy configured with backend TLS keeps TCP for the same reason, rather than
-quietly dropping the encryption it was asked for.
+would undo what the port was configured to give. A proxy keeps its port alone,
+and so does a cache with
+.BR \-\-shards :
+a path is one node and N processes would unlink each other's, the way
+.B \-\-listen
+is refused for shards. One rule decides both what the daemon publishes and what
+a runtime binds, so a type that is not wired to a listener is never advertised
+as having one \(em a path published into thin air is a backend that is simply
+down. A proxy configured with backend TLS keeps TCP for the same reason, rather
+than quietly dropping the encryption it was asked for.
 .SS Between runtimes on one machine
 Everything one runtime asks of another \(em
 .BR socketley.send ,

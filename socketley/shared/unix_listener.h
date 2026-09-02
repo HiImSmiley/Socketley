@@ -119,14 +119,21 @@ inline std::string node_dir_of(std::string_view path)
 // one, in one function because a daemon that publishes a node nothing bound
 // sends every caller to a path that is not there.
 inline bool wants_companion(runtime_type type, uint16_t port,
-                            std::string_view listen_path, bool tls, bool udp)
+                            std::string_view listen_path, bool tls, bool udp,
+                            uint32_t shards)
 {
     // Only a type that actually BINDS one.  The daemon publishes what this
     // says and a runtime binds what this says, so a type listed here and not
     // wired to a listener is a path published into thin air -- which a proxy
     // then dials instead of the port that works.  Measured as exactly that:
     // a cache backend, a node nobody bound, and every request unanswered.
-    if (type != runtime_server)
+    if (type != runtime_server && type != runtime_cache)
+        return false;
+
+    // Not a sharded cache: a path is one node and N processes would unlink
+    // each other's, as shards_config_refusal() says of --listen, so its
+    // shards stay on the port they share.
+    if (type == runtime_cache && shards > 1)
         return false;
 
     // The measurement control, so a node and a port differ in the route alone

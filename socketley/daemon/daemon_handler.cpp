@@ -5082,7 +5082,8 @@ void daemon_handler::reconcile_proxy_workers()
                                                       inst->get_port(),
                                                       inst->get_listen_path(),
                                                       inst->get_tls(),
-                                                      inst->is_udp()))
+                                                      inst->is_udp(),
+                                                      inst->get_shards()))
             {
                 node = socketley::unix_sock::companion_path(dsock, name);
 

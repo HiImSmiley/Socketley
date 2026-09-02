@@ -1639,7 +1639,7 @@ bool server_instance::setup(event_loop& loop)
     // the two sides different numbers is exactly what one shared rule exists
     // to prevent.
     if (socketley::unix_sock::wants_companion(get_type(), get_port(), listen_path,
-                                              get_tls(), is_udp())
+                                              get_tls(), is_udp(), get_shards())
         && !get_companion_path().empty())
     {
         // Made once and kept: the object owns an io_request the ring may still

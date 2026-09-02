@@ -22,6 +22,7 @@
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
 #include "../../shared/tls_context.h"
+#include "../../shared/unix_companion.h"
 
 struct client_connection
 {
@@ -193,6 +194,7 @@ public:
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
+    void on_loop_turn() override;
 
     size_t get_connection_count() const override;
 
@@ -343,6 +345,9 @@ public:
 
 private:
     void handle_accept(struct io_uring_cqe* cqe, io_request* req);
+    // One accepted descriptor into a connection, from whichever listener
+    // handed it over, where false means it was dealt with and is gone.
+    bool adopt_client(int client_fd, bool from_cluster, bool from_unix);
     void handle_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_write(struct io_uring_cqe* cqe, io_request* req);
 
@@ -716,6 +721,10 @@ private:
     std::string m_bound_listen_path;
     std::unique_ptr<accept_op> m_accept;
     bool m_multishot_active{false};
+
+    // The node beside the port, kept for as long as this instance is; see
+    // setup() for why it is never reset.
+    std::unique_ptr<socketley::unix_companion> m_companion;
 
     // ── The port this shard alone binds ─────────────────────────────────────
     // `base + 1 + shard index`, bound only when sharded and deliberately

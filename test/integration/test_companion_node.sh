@@ -168,28 +168,61 @@ else
         "$RTDIR/cn_own.sock exists; there is no port for it to be beside"
 fi
 
-# ── 6b. A type that binds no node is published none ────────────────────────
+# ── 6b. A cache gets a node too, and its proxy takes it ────────────────────
 #
-# Only a server binds a companion today.  If the daemon published one for a
-# cache as well, a proxy naming that cache would dial a path nobody is on and
-# every request would go unanswered -- which is exactly how the TCP half-close
-# test failed when this rule was missing the type.
+# This section used to assert the opposite -- "a cache gets no node" -- and
+# it was right to, because the daemon published one and the cache bound
+# nothing, so a proxy naming a cache dialled a path nobody was on and every
+# request went unanswered.  The cache binds one now, so both halves are
+# asserted together: the node is there, the proxy said it took it, and a
+# write and a read through the proxy agree -- which a build that publishes
+# without binding cannot pass.
 "$BIN" create cache  cn_kv -p $((PORT+7)) -s >/dev/null 2>&1
 "$BIN" create proxy  cn_kvpx -p $((PORT+8)) --backend cn_kv --protocol tcp -s >/dev/null 2>&1
 sleep 1.5
-KV_NODE_GONE=$([ -e "$RTDIR/cn_kv.sock" ] && echo no || echo yes)
-KV_SAID=$(grep -c "cn_kv\" is reached over" "$SOCKETLEY_DLOG" 2>/dev/null || true)
-KV_ANSWERED=$(printf 'PING\r\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+8)) 2>/dev/null | head -1)
-if [ "$KV_NODE_GONE" = "yes" ] && [ "${KV_SAID:-0}" -eq 0 ] && [ -n "$KV_ANSWERED" ]; then
-    ok "a cache gets no node, and a proxy in front of it still answers"
+KV_NODE=$([ -S "$RTDIR/cn_kv.sock" ] && echo yes || echo no)
+KV_SAID=$(grep -c "cn_kv\" is reached over $RTDIR/cn_kv.sock" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+KV_ANSWERED=$(printf 'set nodek nodev\nget nodek\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+8)) 2>/dev/null | tr -d '\r' | sed -n 2p)
+if [ "$KV_NODE" = "yes" ] && [ "${KV_SAID:-0}" -ge 1 ] && [ "$KV_ANSWERED" = "nodev" ]; then
+    ok "a cache gets a node, and a proxy in front of it takes it and answers"
 else
-    bad "a cache gets no node, and a proxy in front of it still answers" \
-        "node absent: $KV_NODE_GONE, log said it $KV_SAID time(s)," \
-        "the proxy answered '${KV_ANSWERED:-<nothing>}';" \
+    bad "a cache gets a node, and a proxy in front of it takes it and answers" \
+        "node present: $KV_NODE, log said it $KV_SAID time(s)," \
+        "the proxy read back '${KV_ANSWERED:-<nothing>}' for nodek;" \
         "a path published for a type that binds none is a backend that is simply down"
 fi
+KV_MODE=$(stat -c '%a' "$RTDIR/cn_kv.sock" 2>/dev/null || echo "?")
+if [ "$KV_MODE" = "600" ]; then ok "the cache's node is 0600 like the server's"
+else bad "the cache's node is 0600 like the server's" "node is $KV_MODE"; fi
 "$BIN" stop cn_kvpx >/dev/null 2>&1; "$BIN" remove cn_kvpx >/dev/null 2>&1
-"$BIN" stop cn_kv   >/dev/null 2>&1; "$BIN" remove cn_kv   >/dev/null 2>&1
+"$BIN" stop cn_kv   >/dev/null 2>&1
+sleep 0.8
+if [ ! -e "$RTDIR/cn_kv.sock" ]; then ok "stopping the cache removes its node"
+else bad "stopping the cache removes its node" "$RTDIR/cn_kv.sock is still there"; fi
+"$BIN" remove cn_kv   >/dev/null 2>&1
+
+# ── 6c. A sharded cache gets none ──────────────────────────────────────────
+#
+# A path is one node and N processes would unlink each other's, the way
+# --listen is refused for shards, so the shards stay on the port they share
+# -- and the proxy in front of them has to stay on TCP for the same reason
+# 6b exists: a node published for a set that binds none is a backend down.
+"$BIN" create cache  cn_kvs -p $((PORT+10)) --shards 2 -s >/dev/null 2>&1
+"$BIN" create proxy  cn_kvspx -p $((PORT+11)) --backend cn_kvs --protocol tcp -s >/dev/null 2>&1
+sleep 1.5
+KVS_NODE_GONE=$([ -e "$RTDIR/cn_kvs.sock" ] && echo no || echo yes)
+KVS_SAID=$(grep -c "cn_kvs\" is reached over" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+KVS_ANSWERED=$(printf 'set shk shv\nget shk\n' | timeout 5 nc -q1 127.0.0.1 $((PORT+11)) 2>/dev/null | tr -d '\r' | sed -n 2p)
+if [ "$KVS_NODE_GONE" = "yes" ] && [ "${KVS_SAID:-0}" -eq 0 ] && [ "$KVS_ANSWERED" = "shv" ]; then
+    ok "a sharded cache gets no node, and a proxy in front of it still answers"
+else
+    bad "a sharded cache gets no node, and a proxy in front of it still answers" \
+        "node absent: $KVS_NODE_GONE, log said it $KVS_SAID time(s)," \
+        "the proxy read back '${KVS_ANSWERED:-<nothing>}' for shk;" \
+        "two processes on one path would unlink each other's node"
+fi
+"$BIN" stop cn_kvspx >/dev/null 2>&1; "$BIN" remove cn_kvspx >/dev/null 2>&1
+"$BIN" stop cn_kvs   >/dev/null 2>&1; "$BIN" remove cn_kvs   >/dev/null 2>&1
 
 "$BIN" stop cn_own >/dev/null 2>&1; "$BIN" remove cn_own >/dev/null 2>&1
 
