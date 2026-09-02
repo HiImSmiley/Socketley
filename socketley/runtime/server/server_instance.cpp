@@ -706,6 +706,19 @@ static const std::shared_ptr<const std::string>& http_501_response()
     return resp;
 }
 
+// Closing too, because the body this refuses is still on its way and would
+// otherwise be read as the next request.
+static const std::shared_ptr<const std::string>& http_413_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 413 Content Too Large\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 18\r\n"
+        "Connection: close\r\n\r\n"
+        "Content Too Large\n");
+    return resp;
+}
+
 void server_instance::rebuild_http_cache()
 {
     m_http_cache.clear();
@@ -3009,6 +3022,16 @@ reparse:
         }
 
         const size_t content_length = framing.content_length;
+
+        // A body that cannot fit in `partial` is refused now, with an answer,
+        // because waiting for it ends at handle_read's size cap with the
+        // connection closed and nothing said.
+        if (SOCKETLEY_UNLIKELY(content_length >
+                               server_connection::MAX_PARTIAL_SIZE - (hdr_end + 4)))
+        {
+            refuse_http_request(conn, http_413_response());
+            return;
+        }
 
         // The header pairs for the Lua API, deciding nothing, because a second
         // walk that came to its own conclusions about Content-Length is what
