@@ -858,9 +858,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     if (url_path.find("..") != std::string::npos ||
         url_path.find('\0') != std::string::npos)
     {
-        conn->write_queue.push(http_404_response(conn->http_keep_alive));
-        if (!conn->write_pending)
-            flush_write_queue(conn);
+        queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -877,12 +875,9 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
     {
         // Cached mode: zero-copy lookup — just bump shared_ptr refcount
         auto it = m_http_cache.find(url_path);
-        conn->write_queue.push(it != m_http_cache.end()
+        queue_http_response(conn, it != m_http_cache.end()
             ? (conn->http_keep_alive ? it->second.response : it->second.response_close)
             : http_404_response(conn->http_keep_alive));
-
-        if (!conn->write_pending)
-            flush_write_queue(conn);
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -901,9 +896,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             open_http_root();
             if (ec)
             {
-                conn->write_queue.push(http_404_response(conn->http_keep_alive));
-                if (!conn->write_pending)
-                    flush_write_queue(conn);
+                queue_http_response(conn, http_404_response(conn->http_keep_alive));
                 if (!conn->http_keep_alive)
                     conn->closing = true;
                 else
@@ -936,10 +929,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
                     sx.stx_mtime.tv_sec == rit->second.mtime_sec &&
                     sx.stx_mtime.tv_nsec == rit->second.mtime_nsec)
                 {
-                    conn->write_queue.push(conn->http_keep_alive ? rit->second.response
-                                                                 : rit->second.response_close);
-                    if (!conn->write_pending)
-                        flush_write_queue(conn);
+                    queue_http_response(conn, conn->http_keep_alive ? rit->second.response
+                                                                    : rit->second.response_close);
                     if (!conn->http_keep_alive)
                         conn->closing = true;
                     else
@@ -982,9 +973,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             {
                 // EXDEV, ELOOP, ENOENT, EACCES — every one of them is "not a
                 // file this server may serve", and they are answered alike.
-                conn->write_queue.push(http_404_response(conn->http_keep_alive));
-                if (!conn->write_pending)
-                    flush_write_queue(conn);
+                queue_http_response(conn, http_404_response(conn->http_keep_alive));
                 if (!conn->http_keep_alive)
                     conn->closing = true;
                 else
@@ -1004,9 +993,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (ec || resolved_str.size() < base_str.size() ||
             resolved_str.compare(0, base_str.size(), base_str) != 0)
         {
-            conn->write_queue.push(http_404_response(conn->http_keep_alive));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, http_404_response(conn->http_keep_alive));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1020,9 +1007,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         }
         if (ffd < 0)
         {
-            conn->write_queue.push(http_404_response(conn->http_keep_alive));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, http_404_response(conn->http_keep_alive));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1034,9 +1019,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
         {
             close_tracked(ffd);
-            conn->write_queue.push(http_404_response(conn->http_keep_alive));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, http_404_response(conn->http_keep_alive));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1062,6 +1045,21 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
                                 fsize <= HTTP_REVAL_MAX_FILE &&
                                 m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
 
+        // A HEAD owes the headers a GET would send and no body, so a non-HTML
+        // file is answered from fstat() alone; HTML still takes the read below
+        // because its Content-Length counts the injected script.
+        if (conn->http_head && !is_html)
+        {
+            close_tracked(ffd);
+            queue_http_response(conn, std::make_shared<const std::string>(
+                build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
+        }
+
         // Splice path for non-HTML files, never on a TLS connection, because
         // it would hand the peer plaintext in the middle of an encrypted
         // stream.
@@ -1075,11 +1073,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
             m_splice_busy = true;
 
             // Send HTTP headers via normal write path; splice starts after headers are sent
-            conn->write_queue.push(
-                std::make_shared<const std::string>(
-                    build_http_headers_only(ct, fsize, conn->http_keep_alive)));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, std::make_shared<const std::string>(
+                build_http_headers_only(ct, fsize, conn->http_keep_alive)));
             return;
         }
 
@@ -1088,9 +1083,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (!fbuf)
         {
             close_tracked(ffd);
-            conn->write_queue.push(http_404_response(conn->http_keep_alive));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, http_404_response(conn->http_keep_alive));
             if (!conn->http_keep_alive)
                 conn->closing = true;
             else
@@ -1205,6 +1198,22 @@ static std::string_view http_reason(int status)
 }
 #endif
 
+// The one place an HTTP response enters the write queue, so a HEAD is cut to
+// its header block here rather than at each of the seventeen emitters.
+void server_instance::queue_http_response(server_connection* conn,
+                                          std::shared_ptr<const std::string> resp)
+{
+    if (SOCKETLEY_UNLIKELY(conn->http_head))
+    {
+        const auto hdr_end = resp->find("\r\n\r\n");
+        if (hdr_end != std::string::npos && hdr_end + 4 < resp->size())
+            resp = std::make_shared<const std::string>(resp->data(), hdr_end + 4);
+    }
+    conn->write_queue.push(std::move(resp));
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+}
+
 void server_instance::refuse_http_request(server_connection* conn,
                                           const std::shared_ptr<const std::string>& resp)
 {
@@ -1213,9 +1222,7 @@ void server_instance::refuse_http_request(server_connection* conn,
     // what is in doubt.
     conn->partial.clear();
 
-    conn->write_queue.push(resp);
-    if (!conn->write_pending)
-        flush_write_queue(conn);
+    queue_http_response(conn, resp);
 
     // Unconditional, and not conditioned on http_keep_alive the way the 404
     // path is: keep-alive means "the next request starts where this one ends",
@@ -1264,9 +1271,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
             auto response = build_http_response_full(500, http_reason(500), {},
                                                      "500 Internal Server Error",
                                                      keep_alive);
-            conn->write_queue.push(std::make_shared<const std::string>(std::move(response)));
-            if (!conn->write_pending)
-                flush_write_queue(conn);
+            queue_http_response(conn, std::make_shared<const std::string>(std::move(response)));
 
             conn->partial.erase(0, total_consumed);
 
@@ -1302,9 +1307,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 }
 
                 auto response = build_http_response_full(status, reason, resp_headers, body, keep_alive);
-                conn->write_queue.push(std::make_shared<const std::string>(std::move(response)));
-                if (!conn->write_pending)
-                    flush_write_queue(conn);
+                queue_http_response(conn, std::make_shared<const std::string>(std::move(response)));
 
                 conn->partial.erase(0, total_consumed);
 
@@ -1329,9 +1332,7 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
     else
     {
         // No http_dir and no Lua callback — 404
-        conn->write_queue.push(http_404_response(conn->http_keep_alive));
-        if (!conn->write_pending)
-            flush_write_queue(conn);
+        queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -2918,6 +2919,11 @@ reparse:
             return;
         }
 
+        // Down before the refusals below, which can answer ahead of the
+        // request line being parsed and would otherwise answer for the last
+        // request's method.
+        conn->http_head = false;
+
         // The block is judged before anything is parsed out of it, because a
         // bare LF makes "Host: x\nContent-Length: 38\r\n" one line whose
         // Content-Length is never seen and whose body bytes are read as the
@@ -2945,6 +2951,7 @@ reparse:
 
         http_request hreq;
         hreq.method = req_line.substr(0, sp1);
+        conn->http_head = (hreq.method == "HEAD");
         std::string_view raw_path = req_line.substr(sp1 + 1, sp2 - sp1 - 1);
         hreq.version = req_line.substr(sp2 + 1);
         hreq.client_id = conn->fd;
@@ -4328,9 +4335,7 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
-        conn->write_queue.push(http_404_response(conn->http_keep_alive));
-        if (!conn->write_pending)
-            flush_write_queue(conn);
+        queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
             conn->closing = true;
         else
@@ -4376,14 +4381,13 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
             build_http_response(conn->file_content_type, resp_body, true));
         auto cl = std::make_shared<const std::string>(
             build_http_response(conn->file_content_type, resp_body, false));
-        conn->write_queue.push(conn->http_keep_alive ? ka : cl);
+        queue_http_response(conn, conn->http_keep_alive ? ka : cl);
         http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
     }
     else
     {
-        conn->write_queue.push(
-            std::make_shared<const std::string>(
-                build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
+        queue_http_response(conn, std::make_shared<const std::string>(
+            build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
     }
     conn->file_url_path.clear();
 
@@ -4391,9 +4395,6 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     free(conn->file_buf);
     conn->file_buf = nullptr;
     conn->file_size = 0;
-
-    if (!conn->write_pending)
-        flush_write_queue(conn);
 
     if (!conn->http_keep_alive)
     {

@@ -62,6 +62,9 @@ struct alignas(64) server_connection
     bool routed{false};
     bool file_read_pending{false};
     bool http_keep_alive{false};
+    // The request being answered is a HEAD, read by queue_http_response()
+    // alone so no emitter has to know.
+    bool http_head{false};
     bool wr_shutdown{false};   // our FIN is already on the wire (shutdown SHUT_WR)
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
@@ -247,6 +250,7 @@ struct alignas(64) server_connection
         splice_in_pending = false;
         splice_out_pending = false;
         http_keep_alive = false;
+        http_head = false;
         proto = proto_unknown;
         routed = false;
         ws_cookie.clear();
@@ -635,6 +639,7 @@ private:
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
     void serve_http(server_connection* conn, std::string_view path);
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
+    void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp);
 
     // Answer a request whose framing could not be established and end the
     // connection, in one function because a refusal that forgets to clear
