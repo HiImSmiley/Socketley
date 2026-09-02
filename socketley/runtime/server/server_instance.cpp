@@ -719,6 +719,19 @@ static const std::shared_ptr<const std::string>& http_413_response()
     return resp;
 }
 
+// Closing, because the response the client was promised is not coming and
+// nothing else on the connection is owed.
+static const std::shared_ptr<const std::string>& http_500_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 500 Internal Server Error\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 26\r\n"
+        "Connection: close\r\n\r\n"
+        "500 Internal Server Error\n");
+    return resp;
+}
+
 void server_instance::rebuild_http_cache()
 {
     m_http_cache.clear();
@@ -4397,7 +4410,20 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         conn->file_fd = -1;
     }
 
-    // Use actual bytes read (handles short reads — Content-Length matches actual data)
+    // Fewer bytes than fstat() promised are not the file -- one read is capped
+    // by the kernel at MAX_RW_COUNT and its length was cut to 32 bits -- and a
+    // 200 built from them declared the truncation as the file's length.
+    if (SOCKETLEY_UNLIKELY(static_cast<size_t>(cqe->res) != conn->file_size))
+    {
+        free(conn->file_buf);
+        conn->file_buf = nullptr;
+        conn->file_size = 0;
+        conn->file_url_path.clear();
+        queue_http_response(conn, http_500_response());
+        conn->closing = true;
+        return;
+    }
+
     std::string_view file_content(conn->file_buf, static_cast<size_t>(cqe->res));
     std::string body;
     if (conn->file_is_html)
