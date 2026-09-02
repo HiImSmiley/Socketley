@@ -1016,7 +1016,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         }
 
         struct stat st;
-        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+        if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode))
         {
             close_tracked(ffd);
             queue_http_response(conn, http_404_response(conn->http_keep_alive));
@@ -1036,6 +1036,21 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         uint32_t ext_hash = fnv1a(ext);
         bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         auto ct = http_content_type(ext);
+
+        // An empty file exists, so it is a 200 with the body --http-cache
+        // would build for it and no read, since a zero-length read completes
+        // with 0 and 0 was being answered as 404.
+        if (fsize == 0)
+        {
+            close_tracked(ffd);
+            queue_http_response(conn, std::make_shared<const std::string>(build_http_response(
+                ct, is_html ? inject_ws_script({}) : std::string(), conn->http_keep_alive)));
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
+        }
 
         // Whether this miss may become a map entry, which needs the bytes in
         // user space, so a small non-HTML file takes the read path -- splice
