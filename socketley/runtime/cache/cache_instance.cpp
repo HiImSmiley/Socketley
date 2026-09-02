@@ -957,6 +957,17 @@ void cache_instance::teardown(event_loop& /*loop*/)
     // be stopped without being destroyed.
     if (auto* mgr = get_runtime_manager())
         mgr->requests().drop_origin(this);
+
+    // Every ticket still waiting is answered `dropped`, because a parked
+    // ticket nothing completes is a leak the channel's cap only delays.
+    for (auto& kv : m_batches)
+        if (kv.second.ticket != 0)
+            complete_ticket(kv.second.ticket, request_status::dropped, {});
+    for (const deferred_request& q : m_deferred_queue)
+        complete_ticket(q.ticket, request_status::dropped, {});
+    m_deferred_queue.clear();
+    m_deferred_inflight = 0;
+
     m_batches.clear();
     m_posts.clear();
     m_collect.reset();
@@ -2227,6 +2238,7 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
     conn->fd = -1;
     conn->rl_max = 0;
     conn->rl_tokens = 0.0;
+    conn->batch_id = 0;
     conn->response_buf.clear();
     if (split) run_request_lines(conn, payload);
     else if (!payload.empty()) process_command(conn, payload);
@@ -3383,6 +3395,110 @@ void cache_instance::emit_unrouted(client_connection* conn, std::string_view cmd
     }
 }
 
+// ─── the ticket side ────────────────────────────────────────────────────────
+// A request from another process reaches a sharded cache through the worker,
+// which parks it on the channel and hands the ticket here, so a key another
+// shard owns is crossed for and answered on the turn the crossing lands.
+
+// Whether a crossing opened for `conn` has somebody to come back to: a socket
+// always, the scratch connection only while a ticket is parked on it.
+bool cache_instance::can_cross(const client_connection* conn) const
+{
+    return conn->fd >= 0
+        || (m_serving_ticket != 0 && conn == m_request_conn.get());
+}
+
+bool cache_instance::serve_deferred(uint64_t ticket, std::string_view /*target*/,
+                                    std::string_view payload)
+{
+    // A sibling's framed run names only this shard's keys and a re-entrant
+    // ask has no later turn, so both finish now exactly as they did inline.
+    const bool framed =
+        !payload.empty() && payload.front() == shard_batch_marker
+        && payload.compare(0, one_command_text.size(), one_command_text) != 0;
+    if (m_serving || framed || m_shard_n <= 1)
+    {
+        std::string out;
+        serve_payload(payload, out, true);
+        complete_ticket(ticket, request_status::ok, out);
+        return true;
+    }
+
+    // Behind the one waiting on a sibling rather than ahead of it, because
+    // the asker pipelines by order and a local key answered first would
+    // reorder its replies.
+    if (m_deferred_inflight != 0)
+    {
+        if (m_deferred_queue.size() >= MAX_DEFERRED_QUEUE)
+            return false;
+        m_deferred_queue.push_back(deferred_request{ticket, std::string(payload)});
+        return true;
+    }
+
+    run_deferred(ticket, payload);
+    return true;
+}
+
+// One request on the scratch connection with a ticket to answer to, finished
+// now when nothing crossed and from batch_finish() otherwise.
+void cache_instance::run_deferred(uint64_t ticket, std::string_view payload)
+{
+    if (!m_request_conn)
+        m_request_conn = std::make_unique<client_connection>();
+
+    auto* conn = m_request_conn.get();
+    conn->fd        = -1;
+    conn->rl_max    = 0;
+    conn->rl_tokens = 0.0;
+    conn->batch_id  = 0;
+    conn->closing   = false;
+    conn->response_buf.clear();
+
+    struct ticket_guard
+    {
+        uint64_t& ticket;
+        bool&     serving;
+        ~ticket_guard() { ticket = 0; serving = false; }
+    } guard{m_serving_ticket, m_serving};
+    m_serving_ticket = ticket;
+    m_serving        = true;
+
+    // The CLI's one-command form, taken whole before the line splitter can
+    // see a newline inside its value.
+    if (payload.size() > one_command_text.size()
+        && payload.compare(0, one_command_text.size(), one_command_text) == 0)
+        process_command(conn, payload.substr(one_command_text.size()));
+    else
+        run_request_lines(conn, payload);
+
+    route_flush(conn);
+    if (conn->batch_id != 0)
+    {
+        m_deferred_inflight = ticket;   // answered from batch_finish()
+        return;
+    }
+    complete_ticket(ticket, request_status::ok, conn->response_buf);
+}
+
+void cache_instance::complete_ticket(uint64_t ticket, request_status st,
+                                     std::string_view reply)
+{
+    if (auto* mgr = get_runtime_manager())
+        mgr->requests().complete_deferred(ticket, st, reply);
+}
+
+// The requests queued behind a crossing, run once it is answered, until one
+// of them opens a crossing of its own.
+void cache_instance::drain_deferred()
+{
+    while (m_deferred_inflight == 0 && !m_deferred_queue.empty())
+    {
+        deferred_request q = std::move(m_deferred_queue.front());
+        m_deferred_queue.pop_front();
+        run_deferred(q.ticket, q.payload);
+    }
+}
+
 void cache_instance::route_flush(client_connection* conn)
 {
     if (SOCKETLEY_LIKELY(!m_collect))
@@ -3466,6 +3582,14 @@ void cache_instance::route_flush(client_connection* conn)
         return;
     }
 
+    // A batch answering a ticket carries what the scratch connection produced
+    // ahead of the crossing, because no socket keeps it.
+    if (m_serving_ticket != 0 && conn == m_request_conn.get())
+    {
+        batch->ticket = m_serving_ticket;
+        batch->head.swap(conn->response_buf);
+    }
+
     conn->batch_id = id;
     m_batches.emplace(id, std::move(*batch));
 }
@@ -3506,6 +3630,28 @@ void cache_instance::batch_finish(uint64_t id)
     const auto it = m_batches.find(id);
     if (it == m_batches.end())
         return;
+
+    // A batch answering a ticket has no socket to write to: its pieces go
+    // back through the channel and the next request waiting behind it runs.
+    if (it->second.ticket != 0)
+    {
+        shard_batch b = std::move(it->second);
+        m_batches.erase(it);
+
+        std::string out;
+        out.swap(b.head);
+        for (const reply_slot& sl : b.slots)
+            if (!slot_render(sl, b.resp, out))
+                append_error_reply(out, b.resp,
+                                   "this cache's shards answered in a shape this "
+                                   "build cannot put back together");
+
+        if (m_deferred_inflight == b.ticket)
+            m_deferred_inflight = 0;
+        complete_ticket(b.ticket, request_status::ok, out);
+        drain_deferred();
+        return;
+    }
 
     const int fd = it->second.fd;
     client_connection* conn =
@@ -4020,11 +4166,11 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                         });
                         return;
                     }
-                    // A crossing needs somebody to keep waiting and only a
-                    // socket can, so the scratch connection serve_payload()
-                    // uses is refused by name rather than served out of this
-                    // shard's slice.
-                    if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+                    // A crossing needs somebody to keep waiting, which the
+                    // scratch connection has only while a ticket is parked on
+                    // it, so anything else is refused by name rather than
+                    // served out of this shard's slice.
+                    if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
                     {
                         run_in_reply_order(conn, [&] {
                             emit_unrouted(conn, parts.cmd, false,
@@ -4047,7 +4193,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             // A crossing needs somebody to keep waiting, which the scratch
             // connection cannot: same gate as the single-key case and the same
             // reason.
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, parts.cmd, false,
@@ -4065,7 +4211,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
 
         case cache_cmd_class::keyspace:
         {
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, parts.cmd, false,
@@ -4085,7 +4231,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             const uint32_t owner = scan_cursor_owner(parts.args);
             if (owner == m_shard_i)
                 break;
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, parts.cmd, false,
@@ -4112,7 +4258,7 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
             // Every shard holds its own subscribers, so a publish that stops
             // here reaches a fraction of them and returns a count describing
             // that fraction — with nothing saying so.
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, parts.cmd, false,
@@ -6058,7 +6204,7 @@ void cache_instance::process_resp_command(client_connection* conn,
 
                     // The same gate the text router explains: a scratch
                     // connection has no later turn for a reply to arrive on.
-                    if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+                    if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
                     {
                         run_in_reply_order(conn, [&] {
                             emit_unrouted(conn, args[0], true,
@@ -6085,7 +6231,7 @@ void cache_instance::process_resp_command(client_connection* conn,
 
         case cache_cmd_class::multi_key:
         {
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, args[0], true,
@@ -6101,7 +6247,7 @@ void cache_instance::process_resp_command(client_connection* conn,
 
         case cache_cmd_class::keyspace:
         {
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, args[0], true,
@@ -6122,7 +6268,7 @@ void cache_instance::process_resp_command(client_connection* conn,
                 scan_cursor_owner(argc >= 2 ? args[1] : std::string_view{});
             if (owner == m_shard_i)
                 break;
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, args[0], true,
@@ -6147,7 +6293,7 @@ void cache_instance::process_resp_command(client_connection* conn,
 
         case cache_cmd_class::fanout:
         {
-            if (SOCKETLEY_UNLIKELY(conn->fd < 0))
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
             {
                 run_in_reply_order(conn, [&] {
                     emit_unrouted(conn, args[0], true,

@@ -178,6 +178,22 @@ void request_channel::complete_deferred(uint64_t ticket, request_status st,
         p.origin->on_request_reply(p.cookie, st, reply);
 }
 
+uint64_t request_channel::park(request_origin* origin, uint64_t cookie)
+{
+    if (!origin || m_parked.size() >= MAX_PARKED)
+        return 0;
+    if (!origin_live(origin))
+        m_origins.push_back(origin);
+    const uint64_t ticket = m_next_ticket++;
+    m_parked.emplace(ticket, parked_request{origin, cookie});
+    return ticket;
+}
+
+void request_channel::withdraw(uint64_t ticket)
+{
+    m_parked.erase(ticket);
+}
+
 void request_channel::drop_origin(const request_origin* origin)
 {
     // Parked requests first, since a ticket whose origin is gone can never be
@@ -244,23 +260,22 @@ void request_channel::drain()
             // The sink is on the other side of a socket and cannot fill
             // `reply` before returning, so the request parks against a ticket
             // and nothing here waits.
-            if (m_parked.size() >= MAX_PARKED)
+            const uint64_t ticket = park(e.origin, e.cookie);
+            if (ticket == 0)
             {
                 m_stat_deferred_refused++;
                 st = request_status::overloaded;
             }
+            else if (sink->serve_deferred(ticket, e.target, e.payload))
+            {
+                m_stat_deferred++;
+                continue;          // the reply comes from complete_deferred()
+            }
             else
             {
-                const uint64_t ticket = m_next_ticket++;
-                m_parked.emplace(ticket, parked_request{e.origin, e.cookie});
-                if (sink->serve_deferred(ticket, e.target, e.payload))
-                {
-                    m_stat_deferred++;
-                    continue;      // the reply comes from complete_deferred()
-                }
                 // It would not even take it, so nothing is going to complete
                 // this ticket and it must not stay parked.
-                m_parked.erase(ticket);
+                withdraw(ticket);
                 m_stat_no_target++;
                 st = request_status::no_target;
             }

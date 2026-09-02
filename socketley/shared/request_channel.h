@@ -110,6 +110,15 @@ public:
     void complete_deferred(uint64_t ticket, request_status st,
                            std::string_view reply);
 
+    // Park a request that arrived from outside this channel, so its answer
+    // comes through complete_deferred() like any other; 0 when the table is
+    // full.
+    uint64_t park(request_origin* origin, uint64_t cookie);
+
+    // Take back a ticket park() handed out when the sink would not take the
+    // request, because nothing is going to complete it.
+    void withdraw(uint64_t ticket);
+
     size_t parked_count() const { return m_parked.size(); }
 
     void on_cqe(struct io_uring_cqe* cqe) override;

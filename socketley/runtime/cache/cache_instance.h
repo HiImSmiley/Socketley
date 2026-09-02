@@ -14,6 +14,8 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
+
+#include <deque>
 #include "../../shared/cache_shard_map.h"
 #include "cache_store.h"
 #include "../../shared/mutation_journal.h"
@@ -263,6 +265,13 @@ public:
     // channel inside a completion the channel owns.
     void serve_request(std::string_view payload, std::string& out) override;
 
+    // The ticket half: a sharded cache answers a request on a later turn when
+    // the key is another shard's, and an unsharded one answers inline exactly
+    // as before.
+    bool serves_inline() const override { return m_shard_n <= 1; }
+    bool serve_deferred(uint64_t ticket, std::string_view target,
+                        std::string_view payload) override;
+
     // ── request_origin ──────────────────────────────────────────────────────
     // The other half of the same channel: a shard asking a sibling for a key
     // it does not own, with the cookie naming the group of commands this reply
@@ -390,6 +399,11 @@ private:
         // Crossings still owed an answer, one per shard rather than one per
         // command or per part.
         uint32_t outstanding{0};
+
+        // The ticket this batch answers to instead of a socket, and what the
+        // scratch connection produced ahead of the crossing.
+        uint64_t    ticket{0};
+        std::string head;
     };
 
     // Where one framed reply belongs: which command's answer, and which piece
@@ -882,6 +896,28 @@ private:
     // publishes into Lua.
     std::unique_ptr<client_connection> m_request_conn;
     bool m_serving{false};
+
+    // A request answered by ticket rather than down a socket, run one at a
+    // time in arrival order, because the asker pipelines by order.
+    struct deferred_request
+    {
+        uint64_t    ticket{0};
+        std::string payload;
+    };
+    std::deque<deferred_request> m_deferred_queue;
+    uint64_t                     m_deferred_inflight{0};
+    // Bounded like the channel's parked table, and past it a request is
+    // refused rather than queued.
+    static constexpr size_t MAX_DEFERRED_QUEUE = 4096;
+    // The ticket the scratch connection is serving right now, which is what
+    // lets it open a crossing.
+    uint64_t m_serving_ticket{0};
+
+    bool can_cross(const client_connection* conn) const;
+    void run_deferred(uint64_t ticket, std::string_view payload);
+    void complete_ticket(uint64_t ticket, request_status st,
+                         std::string_view reply);
+    void drain_deferred();
 
     // Connection struct pool — reuse allocations to avoid malloc/free per connect/disconnect
     static constexpr size_t CONN_POOL_INIT = 32;

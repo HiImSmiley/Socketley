@@ -169,7 +169,8 @@ private:
 // Arming the control fd on this worker's own ring makes the wait end when the
 // frame arrives, which took a cross-process `cache set` from 20.00 ms to the
 // cost of the command.
-class worker : public io_handler, public route_relay::sink
+class worker : public io_handler, public route_relay::sink,
+               public request_origin
 {
 public:
     explicit worker(int control_fd)
@@ -1109,18 +1110,85 @@ private:
     // A publish delivered through the same entry point an in-process dispatch
     // uses and dropped when there is no proxy yet -- and a request from
     // another runtime, whose payload is handed over untouched and whose ticket
-    // goes back with the answer.
-    static bool worker_serve_mesh(void* ctx, std::string_view /*target*/,
-                                  std::string_view payload, std::string& reply)
+    // goes back with the answer, on this turn or a later one.
+    static mesh_verdict worker_serve_mesh(void* ctx, shard_link* from,
+                                          uint64_t ticket,
+                                          std::string_view target,
+                                          std::string_view payload,
+                                          std::string& reply)
     {
         auto* self = static_cast<worker*>(ctx);
         if (!self || !self->m_rt)
-            return false;
+            return mesh_verdict::refused;
         auto* sink = self->m_rt->as_request_sink();
         if (!sink)
+            return mesh_verdict::refused;
+        if (sink->serves_inline())
+        {
+            sink->serve_request(payload, reply);
+            return mesh_verdict::served;
+        }
+        return self->defer_request(sink, ticket, from->serial(), target, payload)
+             ? mesh_verdict::deferred
+             : mesh_verdict::refused;
+    }
+
+    // A request the runtime answers on a later turn, parked on this worker's
+    // own channel so the answer comes back through on_request_reply() with a
+    // cookie naming the socket it goes out on.  False means nothing was taken
+    // and the caller answers no_target itself.
+    bool defer_request(request_sink* sink, uint64_t wire_ticket,
+                       uint64_t link_serial, std::string_view target,
+                       std::string_view payload)
+    {
+        auto& ch = m_manager.requests();
+        const uint64_t cookie = m_next_deferred++;
+        const uint64_t ticket = ch.park(this, cookie);
+        if (ticket == 0)
             return false;
-        sink->serve_request(payload, reply);
-        return true;
+        m_deferred.emplace(cookie, deferred_reply{wire_ticket, link_serial});
+        if (sink->serve_deferred(ticket, target, payload))
+            return true;
+        ch.withdraw(ticket);
+        m_deferred.erase(cookie);
+        return false;
+    }
+
+    // The runtime is done with a request that came in from outside, and the
+    // answer leaves the way the request arrived.
+    void on_request_reply(uint64_t cookie, request_status st,
+                          std::string_view reply) override
+    {
+        const auto it = m_deferred.find(cookie);
+        if (it == m_deferred.end())
+            return;
+        const deferred_reply to = it->second;
+        m_deferred.erase(it);
+
+        if (to.link_serial == 0)
+        {
+            if (!m_writer.write(worker_proto::frame(
+                    worker_proto::frame_type::chan_rep,
+                    worker_proto::encode_chan_reply(
+                        to.wire_ticket, static_cast<uint8_t>(st), reply)))) {}
+            return;
+        }
+
+        // A link that went while the answer was in flight answered its
+        // asker's tickets as it died, so there is nobody left to tell.
+        if (shard_link* link = find_link(to.link_serial))
+            link->send_reply(to.wire_ticket, st, reply);
+    }
+
+    shard_link* find_link(uint64_t serial)
+    {
+        shard_link* found = nullptr;
+        for_each_link([&](shard_link& link)
+        {
+            if (link.serial() == serial)
+                found = &link;
+        });
+        return found;
     }
 
     // Every link this worker holds, siblings and other runtimes alike, so the
@@ -1329,8 +1397,20 @@ private:
         {
             if (auto* sink = m_rt->as_request_sink())
             {
-                sink->serve_request(q.payload, reply);
-                st = 0;       // ok
+                // A runtime that answers on a later turn writes its chan_rep
+                // from on_request_reply() with the daemon's ticket carried
+                // through, so nothing is written here unless it was not even
+                // taken.
+                if (!sink->serves_inline())
+                {
+                    if (defer_request(sink, q.ticket, 0, q.target, q.payload))
+                        return;
+                }
+                else
+                {
+                    sink->serve_request(q.payload, reply);
+                    st = 0;       // ok
+                }
             }
         }
 
@@ -1865,6 +1945,17 @@ private:
     // what the server's own table is bounded by.
     std::unordered_map<conn_ref, uint8_t, conn_ref_hash> m_route_pin;
     remote_sink                            m_remote;
+
+    // Where a deferred answer goes back out, by the cookie the channel hands
+    // back: the control socket when the link serial is 0, else the link it
+    // came in on.
+    struct deferred_reply
+    {
+        uint64_t wire_ticket{0};
+        uint64_t link_serial{0};
+    };
+    std::unordered_map<uint64_t, deferred_reply> m_deferred;
+    uint64_t                                     m_next_deferred{1};
     // A replica of the daemon's map and a live channel, declared before the
     // runtime so it outlives it: a runtime revokes its origin as it is
     // destroyed and that call needs a channel that is still there.

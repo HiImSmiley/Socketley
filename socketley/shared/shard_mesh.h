@@ -20,10 +20,19 @@
 #include "request_channel.h"
 #include "worker_protocol.h"
 
+class shard_link;
+
+// What a served request came to: `deferred` means the answer is written later
+// through shard_link::send_reply() on the link it arrived on.
+enum class mesh_verdict : uint8_t { served, deferred, refused };
+
 // What a link hands a request to once it has arrived from a sibling, supplied
 // by the worker because the link knows nothing about runtimes.
-using shard_mesh_server = bool (*)(void* ctx, std::string_view target,
-                                   std::string_view payload, std::string& reply);
+using shard_mesh_server = mesh_verdict (*)(void* ctx, shard_link* from,
+                                           uint64_t ticket,
+                                           std::string_view target,
+                                           std::string_view payload,
+                                           std::string& reply);
 
 // And what it hands a routing frame to.  Null for a sibling link, which never
 // carries one: a shard set routes through the daemon exactly as it did before
@@ -80,6 +89,28 @@ public:
 
     bool alive() const { return !m_dead && m_fd >= 0 && !m_writer.dead(); }
     uint32_t peer() const { return m_peer; }
+
+    // A number no other link in this process has had, so a deferred answer
+    // can name the link it belongs on without holding a pointer to it.
+    uint64_t serial() const { return m_serial; }
+
+    // One answer back to the asker, with a write the link cannot take ending
+    // it exactly as an inline answer's would.
+    bool send_reply(uint64_t ticket, request_status st, std::string_view reply)
+    {
+        if (!alive())
+            return false;
+        if (!m_writer.write(worker_proto::frame(
+                worker_proto::frame_type::chan_rep,
+                worker_proto::encode_chan_reply(ticket,
+                                                static_cast<uint8_t>(st),
+                                                reply))))
+        {
+            die("could not answer a sibling: the backlog is full");
+            return false;
+        }
+        return true;
+    }
 
     // Send one request to the sibling, returning false so the caller can relay
     // it instead.
@@ -299,16 +330,19 @@ private:
                 return;
 
             std::string reply;
-            const bool ok = m_server && m_server(m_ctx, q.target, q.payload, reply);
+            const mesh_verdict v = m_server
+                ? m_server(m_ctx, this, q.ticket, q.target, q.payload, reply)
+                : mesh_verdict::refused;
 
-            if (!m_writer.write(worker_proto::frame(
-                    worker_proto::frame_type::chan_rep,
-                    worker_proto::encode_chan_reply(
-                        q.ticket,
-                        static_cast<uint8_t>(ok ? request_status::ok
-                                                : request_status::no_target),
-                        reply))))
-                die("could not answer a sibling: the backlog is full");
+            // The runtime answers on a later turn through send_reply(), so
+            // nothing is written for it here.
+            if (v == mesh_verdict::deferred)
+                return;
+
+            send_reply(q.ticket,
+                       v == mesh_verdict::served ? request_status::ok
+                                                 : request_status::no_target,
+                       reply);
             return;
         }
 
@@ -341,6 +375,13 @@ private:
     int          m_fd{-1};
     uint32_t     m_peer{0};
     std::string  m_label;
+    uint64_t     m_serial{next_serial()};
+
+    static uint64_t next_serial()
+    {
+        static uint64_t n = 0;
+        return ++n;
+    }
 
     request_channel*  m_channel{nullptr};
     shard_mesh_server m_server{nullptr};
