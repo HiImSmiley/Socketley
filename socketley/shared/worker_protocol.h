@@ -489,8 +489,7 @@ inline std::string encode_map_request(uint64_t ticket, std::string_view op,
     put_str(out, op);       // "create"|"start"|"stop"|"remove"|"route"
     put_str(out, name);
     put_str(out, config);   // create: the runtime_config JSON
-                            // route:  see encode_route_ask
-                            // empty for the other three
+                            // empty for the other four
     return out;
 }
 
@@ -625,30 +624,6 @@ inline bool decode_route_frame(std::string_view payload_in, std::string& to,
     reader r2(p, static_cast<size_t>(end - p));
     payload = std::string(r2.str());
     return r2.ok;
-}
-
-// The argument to the `route` op, riding in the map request's `config` field,
-// with the target runtime left in the request's `name` where every other op
-// puts it.
-inline std::string encode_route_ask(const conn_ref& ref, std::string_view origin)
-{
-    std::string out;
-    out.reserve(conn_ref_wire_size + 4 + origin.size());
-    put_conn_ref(out, ref);
-    put_str(out, origin);
-    return out;
-}
-
-inline bool decode_route_ask(std::string_view payload, conn_ref& ref,
-                             std::string& origin)
-{
-    const char* p   = payload.data();
-    const char* end = payload.data() + payload.size();
-    if (!take_conn_ref(p, end, ref))
-        return false;
-    reader r(p, static_cast<size_t>(end - p));
-    origin = std::string(r.str());
-    return r.ok;
 }
 
 // cluster_ev carries an observation only the daemon can make, with

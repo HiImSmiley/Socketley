@@ -212,9 +212,9 @@ public:
                 });
 
             // And routing, under the same condition and for the same
-            // binding-time reason, because four of its five verbs are frames
-            // on the control socket and `open` is a question with nowhere else
-            // to ask it.
+            // binding-time reason, because its verbs are frames on the control
+            // socket and `open` starts with a question the map socket alone
+            // can answer.
             m_manager.set_route_sink(this);
         }
     }
@@ -1648,9 +1648,9 @@ private:
         forget_route_pin(op, ref);
     }
 
-    // Everything this runtime does to another leaves here: four verbs as
-    // frames, and `open` up the map socket, which is the only descriptor this
-    // process may block on.
+    // Everything this runtime does to another leaves here as a frame, `open`
+    // included, so the pin below is made by the first frame of a connection
+    // and every later one follows it.
     void post(std::string_view to, std::string_view frm,
               worker_proto::route_op op, const conn_ref& ref,
               std::string_view payload) override
@@ -1692,11 +1692,17 @@ private:
             m_route_pin.erase(ref);
     }
 
+    // The map's verdict first, up the only descriptor this process may block
+    // on, and then the open as a frame on the connection's own path -- not
+    // dispatched by the daemon, whose leg into the target is a second socket
+    // that the first `data` over a link was seen to overtake.
     bool open(std::string_view target, const conn_ref& ref,
               std::string_view origin, std::string& err) override
     {
-        return map_request("route", target,
-                           worker_proto::encode_route_ask(ref, origin), err);
+        if (!map_request("route", target, {}, err))
+            return false;
+        post(target, origin, worker_proto::route_op::open, ref, {});
+        return true;
     }
 
     void forget(std::string_view) override

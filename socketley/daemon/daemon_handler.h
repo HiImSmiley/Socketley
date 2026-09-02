@@ -434,6 +434,9 @@ private:
     void route_dispatch(std::string_view to, std::string_view frm,
                         worker_proto::route_op op, const conn_ref& ref,
                         std::string_view payload);
+    // The map's verdict on `target` alone, which is what a worker asks before
+    // sending the open itself.
+    bool admit(std::string_view target, std::string& err);
     void on_worker_route(proxy_supervisor* from, std::string_view to,
                          std::string_view frm, worker_proto::route_op op,
                          const conn_ref& ref, std::string_view payload);

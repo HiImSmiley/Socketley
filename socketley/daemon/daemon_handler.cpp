@@ -4421,6 +4421,14 @@ void daemon_handler::post(std::string_view to, std::string_view frm,
 bool daemon_handler::open(std::string_view target, const conn_ref& ref,
                           std::string_view origin, std::string& err)
 {
+    if (!admit(target, err))
+        return false;
+    route_dispatch(target, origin, worker_proto::route_op::open, ref, {});
+    return true;
+}
+
+bool daemon_handler::admit(std::string_view target, std::string& err)
+{
     // Reached only when the target is not in this process, so the daemon
     // decides from the map -- and the three refusals are worded exactly as the
     // in-process path words them, because a script must not be able to tell
@@ -4441,8 +4449,6 @@ bool daemon_handler::open(std::string_view target, const conn_ref& ref,
         err = "\"" + std::string(target) + "\" is not running";
         return false;
     }
-
-    route_dispatch(target, origin, worker_proto::route_op::open, ref, {});
     return true;
 }
 
@@ -4693,19 +4699,12 @@ bool daemon_handler::serve_map_request(const std::string& op,
 
     // ── route ──────────────────────────────────────────────────────────────
     // The fifth op is not a map mutation and is on this socket because this
-    // socket is what a worker can block on, answered by open() so an in-daemon
-    // script and a worker script cannot drift apart in what they refuse.
+    // socket is what a worker can block on, answered by admit() so an
+    // in-daemon script and a worker script cannot drift apart in what they
+    // refuse -- and the verdict only, because the open frame itself travels
+    // with the connection's other frames, or the first of them overtakes it.
     if (h == fnv1a("route"))
-    {
-        conn_ref    ref{};
-        std::string origin;
-        if (!worker_proto::decode_route_ask(config, ref, origin))
-        {
-            err = "the routing request could not be read by the daemon";
-            return false;
-        }
-        return open(name, ref, origin, err);
-    }
+        return admit(name, err);
 
     // Word for word what the daemon's own bindings answer, because a script
     // must not be able to tell which side of the boundary it is on from the
