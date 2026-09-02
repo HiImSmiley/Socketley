@@ -400,7 +400,7 @@ def _sample_instant(name, now):
     return now        # no age printed: read at print time, wherever it lives
 
 
-def read_response(s):
+def read_response(s, method="GET"):
     """(status, headers, body).  Every way of not getting an answer has its own
     status, so a response that could not be read can never be mistaken for an
     empty one that happened to match."""
@@ -444,6 +444,12 @@ def read_response(s):
         return (status, hdrs, "")
     if clen is None:
         return ("NO-CONTENT-LENGTH:%s" % status, hdrs, "")
+    # RFC 9112 6.3: a response to HEAD carries the length its GET would have had
+    # and no body, so waiting for one here reads a correct answer as a hang.
+    if method == "HEAD":
+        # Bytes present prove a body was sent; bytes absent do not prove one was
+        # not, so this reports the defect it can see and never invents one.
+        return ("HEAD-WITH-BODY:%s" % status if body else status, hdrs, "")
     while len(body) < clen:
         try:
             chunk = s.recv(4096)
@@ -470,7 +476,7 @@ def request(path, method="GET", extra="", port=None, name=None, body=""):
     s.settimeout(20)
     try:
         s.sendall(req.encode())
-        r = read_response(s)
+        r = read_response(s, method)
     except OSError as e:
         r = ("SEND-FAILED:%s" % type(e).__name__, {}, "")
     try:
