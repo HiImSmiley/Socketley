@@ -130,10 +130,10 @@ inline bool wants_companion(runtime_type type, uint16_t port,
     if (type != runtime_server && type != runtime_cache)
         return false;
 
-    // Not a sharded cache: a path is one node and N processes would unlink
-    // each other's, as shards_config_refusal() says of --listen, so its
-    // shards stay on the port they share.
-    if (type == runtime_cache && shards > 1)
+    // Not a sharded runtime: a path is one node, so the first shard to bind
+    // it took every caller and the other N-1 served the port alone -- a proxy
+    // naming the runtime reached one shard of N and saw nothing wrong.
+    if (shards > 1)
         return false;
 
     // The measurement control, so a node and a port differ in the route alone

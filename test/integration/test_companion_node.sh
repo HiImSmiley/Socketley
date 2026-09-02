@@ -224,6 +224,49 @@ fi
 "$BIN" stop cn_kvspx >/dev/null 2>&1; "$BIN" remove cn_kvspx >/dev/null 2>&1
 "$BIN" stop cn_kvs   >/dev/null 2>&1; "$BIN" remove cn_kvs   >/dev/null 2>&1
 
+# ── 6d. A sharded server gets none either, and its proxy reaches every shard ─
+#
+# Every shard asked for the node and the first to bind it won; the other
+# three logged a refusal and served the port alone.  A proxy naming the
+# runtime then dialled the node and reached one shard of four -- measured as
+# every accepted socket on one pid -- with nothing to say so.  The number
+# here is the daemon's own per-shard count after 64 connections through a
+# TCP proxy, which relays each client connection to one backend connection
+# of its own: over the shared port SO_REUSEPORT spreads them, over one node
+# they all land on whoever bound it.
+"$BIN" create server cn_srvs -p $((PORT+12)) --shards 4 --http "$WWW" -s >/dev/null 2>&1
+"$BIN" create proxy  cn_srvspx -p $((PORT+13)) --backend cn_srvs --protocol tcp -s >/dev/null 2>&1
+sleep 2
+SRVS_NODE_GONE=$([ -e "$RTDIR/cn_srvs.sock" ] && echo no || echo yes)
+SRVS_SAID=$(grep -c "cn_srvs\" is reached over" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+SRVS_REFUSED=$(grep -c "companion node $RTDIR/cn_srvs.sock" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+SRVS_ANSWERED=$(python3 -c "
+import socket
+n=0
+for i in range(64):
+    try:
+        s=socket.create_connection(('127.0.0.1',$((PORT+13))),timeout=3)
+        s.sendall(b'GET / HTTP/1.0\r\nHost: p\r\n\r\n')
+        d=s.recv(4096); s.close()
+        n+= 1 if b'over-either' in d else 0
+    except Exception: pass
+print(n)" 2>/dev/null)
+sleep 0.5
+SRVS_PER_SHARD=$("$BIN" stats cn_srvs 2>/dev/null | sed -n 's/^shard_total_connections:\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ')
+SRVS_BUSY=$(printf '%s\n' $SRVS_PER_SHARD | awk '$1 > 0 { n++ } END { print n+0 }')
+if [ "$SRVS_NODE_GONE" = "yes" ] && [ "${SRVS_SAID:-0}" -eq 0 ] && [ "${SRVS_REFUSED:-0}" -eq 0 ] \
+   && [ "$SRVS_ANSWERED" = "64" ] && [ "$SRVS_BUSY" -ge 2 ]; then
+    ok "a sharded server gets no node, and 64 connections through its proxy reached $SRVS_BUSY of 4 shards ($SRVS_PER_SHARD)"
+else
+    bad "a sharded server gets no node, and its proxy reaches more than one shard" \
+        "node absent: $SRVS_NODE_GONE, log said a proxy took it $SRVS_SAID time(s)," \
+        "shards refused the node $SRVS_REFUSED time(s), the proxy answered $SRVS_ANSWERED of 64," \
+        "per-shard connections: ${SRVS_PER_SHARD:-<none>} -- $SRVS_BUSY shard(s) saw any;" \
+        "one node is one shard, and a proxy on it collapses --shards to 1/N"
+fi
+"$BIN" stop cn_srvspx >/dev/null 2>&1; "$BIN" remove cn_srvspx >/dev/null 2>&1
+"$BIN" stop cn_srvs   >/dev/null 2>&1; "$BIN" remove cn_srvs   >/dev/null 2>&1
+
 "$BIN" stop cn_own >/dev/null 2>&1; "$BIN" remove cn_own >/dev/null 2>&1
 
 "$BIN" stop cn_own >/dev/null 2>&1 || true
