@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -1340,6 +1341,44 @@ private:
         return nullptr;
     }
 
+    // The link to `peer` for a connection this ref names, which for a SHARDED
+    // peer is not the same question as "a link to that name".  Each shard of a
+    // sharded runtime holds its own link to this process, and the daemon named
+    // them `peer#k` because N links under one bare name are N answers to one
+    // question.  conn_ref carries the minting shard in the top six bits of its
+    // serial, so the ref itself says which one.
+    //
+    // One pass and no allocation: this runs per frame on a pinned connection,
+    // and building the qualified name would put a string on that path.
+    shard_link* live_peer_link_for(std::string_view peer, const conn_ref& ref)
+    {
+        const uint32_t want = conn_ref_shard(ref);
+        shard_link* bare = nullptr;
+        for (auto& e : m_peer_links)
+        {
+            if (!e.link || !e.link->alive())
+                continue;
+            if (e.name.size() > peer.size() + 1 &&
+                e.name.compare(0, peer.size(), peer.data(), peer.size()) == 0 &&
+                e.name[peer.size()] == '#')
+            {
+                uint32_t k = 0;
+                const char* first = e.name.data() + peer.size() + 1;
+                const char* last  = e.name.data() + e.name.size();
+                if (std::from_chars(first, last, k).ec == std::errc{} && k == want)
+                    return e.link.get();
+            }
+            else if (!bare && e.name.size() == peer.size() &&
+                     e.name.compare(0, peer.size(), peer.data(), peer.size()) == 0)
+            {
+                // The unsharded peer, and the fallback for a ref whose shard
+                // has no link of its own.
+                bare = e.link.get();
+            }
+        }
+        return bare;
+    }
+
     // Which way this connection's frames go, decided once and kept.
     //
     // The decision cannot be made per frame: a link is ~12 us faster than the
@@ -1355,9 +1394,9 @@ private:
     {
         const auto it = m_route_pin.find(ref);
         if (it != m_route_pin.end())
-            return it->second == pin_direct ? live_peer_link(to) : nullptr;
+            return it->second == pin_direct ? live_peer_link_for(to, ref) : nullptr;
 
-        shard_link* link = live_peer_link(to);
+        shard_link* link = live_peer_link_for(to, ref);
         m_route_pin.emplace(ref, link ? pin_direct : pin_relay);
         return link;
     }

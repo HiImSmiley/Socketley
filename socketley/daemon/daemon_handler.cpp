@@ -4202,11 +4202,23 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
     if (mine == m_proxy_workers.end() || theirs == m_proxy_workers.end())
         return;
 
-    // The asking side must be one worker: N shards asking would give the far
-    // side N links under one name, and the name is how a routing frame finds
-    // the link to send itself on.  Their own crossings already have the mesh.
-    if (mine->second.size() != 1)
-        return;
+    // A sharded origin gets one link PER SHARD, and the far side registers each
+    // under `origin#k`.  N links under one bare name are N answers to one
+    // question, which is why this used to refuse a sharded origin outright --
+    // and the refusal cost every shard of every sharded runtime 10.49 us of
+    // round trip and 10.75 us of CPU on every crossing, permanently.  The name
+    // a worker registers is who is on the other end, and when that end is one
+    // shard of N the name says which; the far side picks by conn_ref_shard().
+    size_t my_shard = 0;
+    bool   mine_found = false;
+    for (size_t k = 0; k < mine->second.size(); ++k)
+        if (mine->second[k].get() == from) { my_shard = k; mine_found = true; break; }
+    if (!mine_found)
+        return;   // not one of this name's workers; nothing to name it by
+
+    const std::string back_name =
+        mine->second.size() == 1 ? origin
+                                 : origin + "#" + std::to_string(my_shard);
 
     // The answering side may be any number.  front() is shard 0, which is
     // where the daemon's own sink for the bare name points -- see the
@@ -4219,8 +4231,10 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
         return;
 
     // The far side is asked too, because a target that has just been handed a
-    // link is one whose end of this pair is already on its way.
-    if (to->grant_suppressed(origin))
+    // link is one whose end of this pair is already on its way -- asked under
+    // the name it will register, so one shard's grant does not suppress
+    // another's.
+    if (to->grant_suppressed(back_name))
         return;
 
     int sv[2] = {-1, -1};
@@ -4234,7 +4248,7 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
     // A half-delivered pair is not left half-delivered: closing both copies
     // gives whichever end did arrive an immediate EOF, so that worker's link
     // dies and it relays, rather than holding a socket nothing answers on.
-    if (!from->grant_peer_link(target, sv[0]) || !to->grant_peer_link(origin, sv[1]))
+    if (!from->grant_peer_link(target, sv[0]) || !to->grant_peer_link(back_name, sv[1]))
     {
         ::close(sv[0]);
         ::close(sv[1]);
@@ -4246,7 +4260,7 @@ void daemon_handler::link_peers(proxy_supervisor* from, const std::string& targe
     ::close(sv[0]);
     ::close(sv[1]);
 
-    LOG_INFO(("peer links: " + origin + " and " + target
+    LOG_INFO(("peer links: " + back_name + " and " + target
               + " now cross directly").c_str());
 }
 
