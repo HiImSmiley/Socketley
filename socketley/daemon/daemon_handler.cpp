@@ -5764,11 +5764,42 @@ void daemon_handler::check_managed_health()
         if (ret <= 0)
             continue;  // still alive or error
 
-        // Process died — stop and restart
+        // Process died — stop and restart, unless it is dying faster than it
+        // is running.  Without this an `add` runtime whose program exits at
+        // once was forked again every two seconds for ever, and `ls` read `Up`
+        // the whole time because m_manager.start() sets the state back before
+        // the next tick finds the corpse.  The burst is the supervisor's, from
+        // the same two constants, because both paths restart a child and owe
+        // the operator one answer.
+        const auto now = std::chrono::steady_clock::now();
+        auto& burst = m_managed_restarts[std::string(name)];
+        if (now - burst.last > restart_burst_window)
+            burst.count = 0;
+        burst.last = now;
+
+        if (++burst.count > restart_burst_limit)
+        {
+            LOG_ERROR("managed runtime restarted too often, leaving it failed");
+            lock.unlock();
+            inst->mark_failed();
+            if (m_persistence)
+            {
+                // Or the next daemon start brings back a program that has
+                // already proved it cannot stay up.
+                m_persistence->set_was_running(name, false);
+                m_persistence->save_runtime(inst.get());
+            }
+            m_managed_restarts.erase(std::string(name));
+            return;
+        }
+
         LOG_WARN("managed runtime died, restarting");
         lock.unlock();
         inst->stop(m_loop);   // set state to stopped (no SIGTERM needed, process is dead)
         m_manager.start(name, m_loop);  // fork+exec again
+        // The count `stats` prints, which this path never touched: a runtime
+        // that had been restarting every two seconds reported 0 restarts.
+        inst->note_restart();
         if (m_persistence)
             m_persistence->save_runtime(inst.get());
         return;  // restart one at a time per health check cycle

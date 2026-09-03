@@ -22,6 +22,14 @@ class proxy_instance;
 class runtime_instance;
 struct runtime_config;
 
+// A child that dies immediately and repeatedly is not fixed by forking it
+// again, so after this many restarts inside the window the runtime is left
+// `failed`.  Here rather than in the .cpp because two paths restart children
+// -- this class for a worker, and daemon_handler's managed sweep for an `add`
+// runtime -- and they owe the operator the same answer.
+inline constexpr unsigned restart_burst_limit  = 5;
+inline constexpr auto     restart_burst_window = std::chrono::seconds(10);
+
 // Also the request_sink for the runtime it supervises and the request_origin
 // for requests coming the other way, because the daemon holds the whole map
 // and is the only process that can route.

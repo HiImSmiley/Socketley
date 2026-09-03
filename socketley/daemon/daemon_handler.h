@@ -238,6 +238,16 @@ private:
     // reconciling cannot be forgotten at a seventh call site.
     void reconcile_proxy_workers();
 
+    // Burst state for managed (`add`) runtimes, the counterpart of
+    // proxy_supervisor's own.  Not the instance's m_restarts: that is the
+    // lifetime count `stats` prints and a window must not reset it.
+    struct managed_restart
+    {
+        unsigned                              count{0};
+        std::chrono::steady_clock::time_point last{};
+    };
+    std::unordered_map<std::string, managed_restart> m_managed_restarts;
+
     // Wait for a just-started out-of-process runtime to say whether it can
     // serve its configuration, on one deadline shared across a multi-runtime
     // command -- and take a NAME across this call, never a pointer, because it

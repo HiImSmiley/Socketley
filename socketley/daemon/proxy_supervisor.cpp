@@ -56,12 +56,6 @@ constexpr int child_link_fd = 7;
 
 constexpr int child_mesh_base = 8;
 
-// A child that dies immediately and repeatedly is not fixed by forking it
-// again, so after this many restarts inside the window the runtime is left
-// `failed`.
-constexpr unsigned restart_burst_limit  = 5;
-constexpr auto     restart_burst_window = std::chrono::seconds(10);
-
 std::string self_exe()
 {
     char buf[4096];
