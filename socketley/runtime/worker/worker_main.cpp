@@ -401,6 +401,7 @@ public:
             // Once per turn, because the condition it waits for is a property
             // of this turn and not of any one completion.
             arm_pending_peers();
+            reap_retired_peers();
 
             // And whatever the runtime itself has that no completion returns
             // for, which today is a listener the ring refused to arm.
@@ -1320,6 +1321,45 @@ private:
         }
     }
 
+    // A link retired by arm_pending_peers() is held until the ring has
+    // finished with it, and it used to be held FOR EVER: the vector was
+    // pushed to and never read except to sum its counters.  Every peer
+    // restart -- and the supervisor's policy is restart -- left behind a
+    // 16 KiB read buffer, a shard_link and a mesh_sink, so a cache that fell
+    // a thousand times cost its server 16 MiB.
+    //
+    // owner_inflight() reaching zero without a deregistration is exactly the
+    // licence to free the storage, which event_loop.h says in those words.
+    // The counters are folded into a running total first, because `stats`
+    // reports crossings over the life of the runtime and a freed link's share
+    // of them is not less true for the link being gone.
+    void reap_retired_peers()
+    {
+        if (m_retired_peers.empty())
+            return;
+
+        // Once the owner table has run out, handlers share an identity and a
+        // zero here proves nothing -- so nothing is freed, and the leak is
+        // back to what it was rather than becoming a use-after-free.
+        if (m_loop.owner_table_full())
+            return;
+
+        for (auto it = m_retired_peers.begin(); it != m_retired_peers.end(); )
+        {
+            if (it->link && m_loop.owner_inflight(it->link.get()) != 0)
+            {
+                ++it;
+                continue;
+            }
+            if (it->sink)
+            {
+                m_retired_direct  += it->sink->stat_direct();
+                m_retired_relayed += it->sink->stat_relayed();
+            }
+            it = m_retired_peers.erase(it);
+        }
+    }
+
     // A routing frame that came over a link rather than down from the daemon,
     // applied by the same function either way.
     static void worker_serve_route(void* ctx, std::string_view payload)
@@ -1419,6 +1459,9 @@ private:
                 direct  += e.sink->stat_direct();
                 relayed += e.sink->stat_relayed();
             }
+        // And the ones already freed, whose crossings happened all the same.
+        direct  += m_retired_direct;
+        relayed += m_retired_relayed;
     }
 
     // Crossings by route summed over this shard's links, reported because the
@@ -1772,6 +1815,11 @@ private:
                 // asked for something, named because it is the kind of
                 // difference a reader supplies from the lines above it.
                 srv->forget_runtime(frm);
+                // And its pins, which neither verb that erases them reaches:
+                // forget_route_pin() answers to close and drop, and a peer
+                // that went away sends neither.  conn_ref carries the minting
+                // runtime in `owner`, so the departed name names them all.
+                forget_pins_of(frm);
                 break;
         }
 
@@ -1814,6 +1862,18 @@ private:
         if (!m_writer.write(worker_proto::frame(
                 worker_proto::frame_type::route_up, frame))) {}
         forget_route_pin(op, ref);
+    }
+
+    // Every pin for connections a departed runtime minted.  Without it the map
+    // grew by one entry per routed connection that ended in a `forget` and
+    // never shrank.
+    void forget_pins_of(std::string_view runtime_id)
+    {
+        if (runtime_id.empty() || m_route_pin.empty())
+            return;
+        const uint64_t owner = conn_owner_key(runtime_id);
+        for (auto it = m_route_pin.begin(); it != m_route_pin.end(); )
+            it = (it->first.owner == owner) ? m_route_pin.erase(it) : std::next(it);
     }
 
     // A route that has ended takes its pin with it, on whichever side sent the
@@ -1988,6 +2048,11 @@ private:
     // the ring, and a dropped completion reads the owner token out of the
     // object it names.
     std::vector<peer_entry> m_retired_peers;
+
+    // What the retired links carried before they were freed, so `stats` keeps
+    // reporting crossings over the life of the runtime.
+    uint64_t m_retired_direct{0};
+    uint64_t m_retired_relayed{0};
 
     int m_link_chan_fd{-1};
     std::unique_ptr<socketley::peer_link::receiver> m_link_recv;
