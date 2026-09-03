@@ -91,6 +91,11 @@ public:
     void set_companion_path(std::string_view path);
     std::string_view get_companion_path() const;
 
+    // Every node of this runtime, one per shard, held by the daemon's
+    // placeholder to publish; a worker holds only its own one, above.
+    void set_companion_paths(std::vector<std::string> paths);
+    const std::vector<std::string>& get_companion_paths() const;
+
     void set_log_file(std::string_view path);
     std::string_view get_log_file() const;
 
@@ -549,6 +554,7 @@ private:
     uint16_t m_port = 0;
     std::string m_listen_path;
     std::string m_companion_path;
+    std::vector<std::string> m_companion_paths;
     bool m_test_mode = false;
     std::string m_log_file;
     std::string m_write_file;

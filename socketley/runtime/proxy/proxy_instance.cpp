@@ -565,8 +565,8 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
 // the breaker key and the connect all name the same socket.
 resolved_backend proxy_instance::member_dial(const runtime_endpoint& ep) const
 {
-    if (!ep.unix_path.empty() && !(m_backend_tls && m_backend_tls_all))
-        return {ep.unix_path, 0};
+    if (ep.unix_paths.size() == 1 && !(m_backend_tls && m_backend_tls_all))
+        return {ep.unix_paths.front(), 0};
     return {ep.host, ep.port};
 }
 
@@ -939,10 +939,10 @@ bool proxy_instance::resolve_backend(backend_info& b)
         // moment it stops being, the address means what it says again.
         if (!b.tls && m_endpoints)
         {
-            const std::string_view node =
-                m_endpoints->find_node_at(b.resolved_host, b.resolved_port);
-            if (!node.empty())
-                return configure_unix_backend(b, node, "\"" + b.address + "\"");
+            const auto* nodes =
+                m_endpoints->find_nodes_at(b.resolved_host, b.resolved_port);
+            if (nodes && nodes->size() == 1)
+                return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
         }
 
         if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
@@ -1005,8 +1005,8 @@ bool proxy_instance::resolve_backend(backend_info& b)
     // runtime, so this leg is free to pick the shorter way to it -- except
     // under backend TLS, which asks for something a node cannot give and is
     // refused rather than quietly dropped one line further down.
-    if (!ep->unix_path.empty() && !b.tls)
-        return configure_unix_backend(b, ep->unix_path, "\"" + b.address + "\"");
+    if (ep->unix_paths.size() == 1 && !b.tls)
+        return configure_unix_backend(b, ep->unix_paths.front(), "\"" + b.address + "\"");
 
     b.resolved_host = ep->host;
     const uint16_t port = ep->port;

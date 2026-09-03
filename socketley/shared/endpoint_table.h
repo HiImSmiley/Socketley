@@ -48,10 +48,10 @@ struct runtime_endpoint
     uint16_t    port{0};
 
     // A second way to the same runtime, for callers already on this box: the
-    // node it also listens on.  Empty means there is none, and `port == 0`
-    // with a path in `host` still means a runtime that has ONLY a node --
-    // those are two different runtimes, not two spellings of one.
-    std::string unix_path;
+    // nodes it also listens on, one per shard.  Empty means there is none, and
+    // `port == 0` with a path in `host` still means a runtime that has ONLY a
+    // node -- those are two different runtimes, not two spellings of one.
+    std::vector<std::string> unix_paths;
 };
 
 class endpoint_table
@@ -83,18 +83,18 @@ public:
         return (it == m_by_name.end()) ? nullptr : &it->second;
     }
 
-    // The node of a runtime listening at exactly this address, or empty.  By
-    // host AND port: a port alone would match a foreign service on another
+    // The nodes of a runtime listening at exactly this address, or nullptr.
+    // By host AND port: a port alone would match a foreign service on another
     // interface, and the whole point of the address form is that it names an
     // address rather than a runtime.
-    std::string_view find_node_at(std::string_view host, uint16_t port) const
+    const std::vector<std::string>* find_nodes_at(std::string_view host, uint16_t port) const
     {
         if (port == 0)
-            return {};
+            return nullptr;
         for (const auto& [_, ep] : m_by_name)
-            if (ep.port == port && ep.host == host && !ep.unix_path.empty())
-                return ep.unix_path;
-        return {};
+            if (ep.port == port && ep.host == host && !ep.unix_paths.empty())
+                return &ep.unix_paths;
+        return nullptr;
     }
 
     const std::vector<runtime_endpoint>* find_group(std::string_view group) const

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "runtime_definitions.h"
 
@@ -51,8 +52,11 @@ inline std::string path_refusal(std::string_view path)
 // and leaves ~11 bytes of the kernel's 108.  One rule, called by the daemon to
 // publish it and by the worker to bind it, so the two cannot disagree about
 // which file they mean.  Empty means this runtime gets none.
+// Shard `shard` of `shards` gets name#shard.sock, because a path is one
+// listener and N processes binding one path unlink each other's.
 inline std::string companion_path(std::string_view daemon_socket,
-                                  std::string_view runtime_name)
+                                  std::string_view runtime_name,
+                                  uint32_t shard = 0, uint32_t shards = 1)
 {
     if (daemon_socket.empty() || runtime_name.empty())
         return {};
@@ -74,11 +78,36 @@ inline std::string companion_path(std::string_view daemon_socket,
     std::string p(daemon_socket);
     p += ".rt/";
     p += runtime_name;
+    if (shards > 1)
+    {
+        p += '#';
+        p += std::to_string(shard);
+    }
     p += ".sock";
 
     // Judged by the same rule every other path is: too long is not a warning
     // here, it is a different socket.
     return path_refusal(p).empty() ? p : std::string{};
+}
+
+// Every node of one runtime, one per shard and all or none: a set missing its
+// longest path would have a proxy spread over N-1 shards with nothing to say
+// the last one is only on the port.
+inline std::vector<std::string> companion_paths(std::string_view daemon_socket,
+                                                std::string_view runtime_name,
+                                                uint32_t shards)
+{
+    const uint32_t n = shards < 1 ? 1 : shards;
+    std::vector<std::string> out;
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        std::string p = companion_path(daemon_socket, runtime_name, i, n);
+        if (p.empty())
+            return {};
+        out.push_back(std::move(p));
+    }
+    return out;
 }
 
 // The directory companion nodes go in, created if it is absent and CHECKED if
@@ -130,10 +159,11 @@ inline bool wants_companion(runtime_type type, uint16_t port,
     if (type != runtime_server && type != runtime_cache)
         return false;
 
-    // Not a sharded runtime: a path is one node, so the first shard to bind
-    // it took every caller and the other N-1 served the port alone -- a proxy
-    // naming the runtime reached one shard of N and saw nothing wrong.
-    if (shards > 1)
+    // Not a sharded cache: only cache_shard_of(key, N) may answer a key, so a
+    // proxy spreading over N nodes would cross once per request, and N nodes
+    // wait on the runtime-map protocol carrying N.  A sharded server is fine:
+    // every shard answers every request, and each binds a node of its own.
+    if (type == runtime_cache && shards > 1)
         return false;
 
     // The measurement control, so a node and a port differ in the route alone

@@ -4057,12 +4057,12 @@ void daemon_handler::publish_endpoints_to_workers(const endpoint_table& tbl)
     std::vector<worker_proto::endpoint_wire> groups;
     names.reserve(tbl.name_count());
     for (const auto& [name, ep] : tbl.names())
-        names.push_back({name, ep.host, ep.port, ep.unix_path});
-    // A member's node travels with it, exactly as a name's does, because the
-    // table decided who has one and this frame only carries the decision.
+        names.push_back({name, ep.host, ep.port, ep.unix_paths});
+    // A member's nodes travel with it, exactly as a name's do, because the
+    // table decided who has them and this frame only carries the decision.
     for (const auto& [group, eps] : tbl.groups())
         for (const auto& ep : eps)
-            groups.push_back({group, ep.host, ep.port, ep.unix_path});
+            groups.push_back({group, ep.host, ep.port, ep.unix_paths});
 
     // The declarations travel with the table, because a proxy in a worker
     // enforces what this frame says and cannot read the daemon's
@@ -5065,19 +5065,20 @@ void daemon_handler::reconcile_proxy_workers()
             continue;   // nothing to describe the runtime with
         }
 
-        // The node beside this runtime's port, decided here because this is
-        // the one place that knows both the configuration and this daemon's
-        // own socket -- and set on the placeholder as well as in the frame,
-        // since publish_endpoints reads it off the placeholder.
+        // The nodes beside this runtime's port, one per shard, decided here
+        // because this is the one place that knows both the configuration and
+        // this daemon's own socket -- set on the placeholder, since
+        // publish_endpoints reads them off it, and each shard's own one put
+        // in its frame below.
         //
         // Derived from the daemon socket, so two daemons never name one node,
-        // and the directory it goes in is 0700: only this user can put
+        // and the directory they go in is 0700: only this user can put
         // anything there, and this user can already reach the port.
+        std::vector<std::string> nodes;
         {
             static const std::string dsock =
                 socketley_paths::resolve().socket_path.string();
 
-            std::string node;
             if (socketley::unix_sock::wants_companion(inst->get_type(),
                                                       inst->get_port(),
                                                       inst->get_listen_path(),
@@ -5085,30 +5086,30 @@ void daemon_handler::reconcile_proxy_workers()
                                                       inst->is_udp(),
                                                       inst->get_shards()))
             {
-                node = socketley::unix_sock::companion_path(dsock, name);
+                nodes = socketley::unix_sock::companion_paths(
+                    dsock, name, static_cast<uint32_t>(want_count));
 
                 // Secured here and not in the worker, because publishing a path
                 // and binding it are two decisions and only one of them can be
                 // the one that fails: a path published into a directory this
                 // daemon does not own is a path a stranger can be serving.
-                if (!node.empty() &&
+                if (!nodes.empty() &&
                     !socketley::unix_sock::secure_node_dir(
-                        socketley::unix_sock::node_dir_of(node)))
+                        socketley::unix_sock::node_dir_of(nodes.front())))
                 {
                     static bool said = false;
                     if (!said)
                     {
                         said = true;
                         LOG_WARN(("companion nodes are off: "
-                                  + socketley::unix_sock::node_dir_of(node)
+                                  + socketley::unix_sock::node_dir_of(nodes.front())
                                   + " is not a directory this daemon owns with "
                                     "nothing but owner access").c_str());
                     }
-                    node.clear();
+                    nodes.clear();
                 }
             }
-            inst->set_companion_path(node);
-            cfg.companion_path = node;
+            inst->set_companion_paths(nodes);
         }
 
         // The shards forked in this pass, so `start` can be sent to all of
@@ -5287,6 +5288,11 @@ void daemon_handler::reconcile_proxy_workers()
             sup->send_cluster_view(cv);
             m_cluster_view_pushed = true;
         }
+
+        // Its own node out of the set, the one field beside the shard index
+        // that differs between the N frames.
+        cfg.companion_path = shards.size() < nodes.size() ? nodes[shards.size()]
+                                                          : std::string{};
 
         if (!sup->spawn(cfg))
         {

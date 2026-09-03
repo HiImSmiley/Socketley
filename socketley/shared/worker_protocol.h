@@ -243,11 +243,12 @@ struct endpoint_wire
     std::string host;
     uint16_t    port{0};
 
-    // The node this runtime also listens on, for a caller already on this box.
-    // Carried in a block of its own at the end of the frame rather than beside
-    // the port, so a build that predates it reads the endpoints and stops --
-    // the same rule the route declarations landed under.
-    std::string unix_path;
+    // The nodes this runtime also listens on, one per shard, for a caller
+    // already on this box.  Carried in a block of its own at the end of the
+    // frame rather than beside the port, so a build that predates it reads
+    // the endpoints and stops -- the same rule the route declarations landed
+    // under.
+    std::vector<std::string> unix_paths;
 };
 
 using route_decl_wire = std::vector<
@@ -295,19 +296,21 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
         put_str(out, encode_routes(*rt));
     }
 
-    // The nodes, last and only for the names that have one, because most
-    // runtimes do not and a pair per name would be a block of empty strings.
+    // The nodes, last and only for the names that have any, because most
+    // runtimes do not and a list per name would be a block of empty counts.
     uint32_t n_nodes = 0;
     for (const auto& e : names)
-        if (!e.unix_path.empty())
+        if (!e.unix_paths.empty())
             ++n_nodes;
     put_u32(out, n_nodes);
     for (const auto& e : names)
     {
-        if (e.unix_path.empty())
+        if (e.unix_paths.empty())
             continue;
         put_str(out, e.name);
-        put_str(out, e.unix_path);
+        put_u32(out, static_cast<uint32_t>(e.unix_paths.size()));
+        for (const auto& p : e.unix_paths)
+            put_str(out, p);
     }
 
     // And the group members' nodes, one block further under the same rule,
@@ -315,15 +318,17 @@ inline std::string encode_endpoints(const std::vector<endpoint_wire>& names,
     // can share a host and a port and still be two runtimes with two nodes.
     uint32_t n_group_nodes = 0;
     for (const auto& e : groups)
-        if (!e.unix_path.empty())
+        if (!e.unix_paths.empty())
             ++n_group_nodes;
     put_u32(out, n_group_nodes);
     for (uint32_t i = 0; i < groups.size(); ++i)
     {
-        if (groups[i].unix_path.empty())
+        if (groups[i].unix_paths.empty())
             continue;
         put_u32(out, i);
-        put_str(out, groups[i].unix_path);
+        put_u32(out, static_cast<uint32_t>(groups[i].unix_paths.size()));
+        for (const auto& p : groups[i].unix_paths)
+            put_str(out, p);
     }
     return out;
 }
@@ -455,12 +460,15 @@ inline bool decode_endpoints(std::string_view payload,
             for (uint32_t i = 0; i < n_nodes && r.ok; ++i)
             {
                 std::string nm(r.str());
-                std::string path(r.str());
+                std::vector<std::string> paths;
+                const uint32_t n_paths = r.u32();
+                for (uint32_t k = 0; k < n_paths && r.ok; ++k)
+                    paths.emplace_back(r.str());
                 if (!r.ok) return false;
                 for (auto& e : names)
                     if (e.name == nm)
                     {
-                        e.unix_path = std::move(path);
+                        e.unix_paths = std::move(paths);
                         break;
                     }
             }
@@ -475,10 +483,13 @@ inline bool decode_endpoints(std::string_view payload,
             for (uint32_t i = 0; i < n_group_nodes && r.ok; ++i)
             {
                 const uint32_t idx = r.u32();
-                std::string path(r.str());
+                std::vector<std::string> paths;
+                const uint32_t n_paths = r.u32();
+                for (uint32_t k = 0; k < n_paths && r.ok; ++k)
+                    paths.emplace_back(r.str());
                 if (!r.ok) return false;
                 if (idx < groups.size())
-                    groups[idx].unix_path = std::move(path);
+                    groups[idx].unix_paths = std::move(paths);
             }
         }
     }

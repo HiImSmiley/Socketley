@@ -1089,9 +1089,9 @@ private:
 
         auto tbl = std::make_shared<endpoint_table>();
         for (const auto& e : names)
-            tbl->set_name(e.name, runtime_endpoint{e.host, e.port, e.unix_path});
+            tbl->set_name(e.name, runtime_endpoint{e.host, e.port, e.unix_paths});
         for (const auto& e : groups)
-            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port, e.unix_path});
+            tbl->add_to_group(e.name, runtime_endpoint{e.host, e.port, e.unix_paths});
         for (auto& [n, rt] : name_routes)
             tbl->set_name_routes(n, std::move(rt));
         for (auto& [g, rt] : group_routes)

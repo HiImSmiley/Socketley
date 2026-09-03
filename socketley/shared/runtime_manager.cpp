@@ -855,8 +855,7 @@ void runtime_manager::publish_endpoints()
             // fields.
             const runtime_endpoint local =
                 listen_path.empty()
-                    ? runtime_endpoint{"127.0.0.1", port,
-                                       std::string(inst->get_companion_path())}
+                    ? runtime_endpoint{"127.0.0.1", port, inst->get_companion_paths()}
                     : runtime_endpoint{std::string(listen_path), 0, {}};
 
             // By name: no state filter, because this is what a backend given as

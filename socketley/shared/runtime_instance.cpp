@@ -370,6 +370,16 @@ std::string_view runtime_instance::get_companion_path() const
     return m_companion_path;
 }
 
+void runtime_instance::set_companion_paths(std::vector<std::string> paths)
+{
+    m_companion_paths = std::move(paths);
+}
+
+const std::vector<std::string>& runtime_instance::get_companion_paths() const
+{
+    return m_companion_paths;
+}
+
 void runtime_instance::set_log_file(std::string_view path)
 {
     m_log_file = path;
