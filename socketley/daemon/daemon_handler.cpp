@@ -5470,7 +5470,31 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
 {
     auto it = m_proxy_workers.find(std::string(name));
     if (it == m_proxy_workers.end())
-        return 0;   // in-daemon, or never spawned: nothing in another process
+    {
+        // Two unlike things shared this return, and one of them is a failure.
+        // An in-daemon runtime has no worker BY DESIGN.  A runtime whose fork
+        // failed has none because reconcile_proxy_workers() marked it failed
+        // and erased the name -- and answering 0 for that told the operator
+        // `start` had worked, with nothing on the terminal, `ls` reading
+        // Failed and the state file carrying was_running:true.
+        auto* inst = m_manager.get(name);
+        if (inst && inst->is_out_of_process() &&
+            inst->get_state() == runtime_failed)
+        {
+            // Not "did not accept its configuration": no worker ever read it.
+            out += "runtime ";
+            out += name;
+            out += " could not start: no worker process was created "
+                   "(the reason is in the daemon log)\n";
+
+            // On the same reasoning as the refused branch below: a runtime
+            // that never started must not be restored as running.
+            if (m_persistence)
+                m_persistence->set_was_running(name, false);
+            return 1;
+        }
+        return 0;   // in-daemon: nothing in another process
+    }
 
     // Whatever is left of the command's budget and never less than zero, which
     // costs nothing when the children ahead answered in 20 ms.
