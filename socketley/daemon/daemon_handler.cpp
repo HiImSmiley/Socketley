@@ -5079,12 +5079,15 @@ void daemon_handler::reconcile_proxy_workers()
             static const std::string dsock =
                 socketley_paths::resolve().socket_path.string();
 
+            // The shard count is want_count and not a second get_shards(),
+            // because the decision and the number of paths it produces have to
+            // come from one read.
             if (socketley::unix_sock::wants_companion(inst->get_type(),
                                                       inst->get_port(),
                                                       inst->get_listen_path(),
                                                       inst->get_tls(),
                                                       inst->is_udp(),
-                                                      inst->get_shards()))
+                                                      static_cast<uint32_t>(want_count)))
             {
                 nodes = socketley::unix_sock::companion_paths(
                     dsock, name, static_cast<uint32_t>(want_count));
