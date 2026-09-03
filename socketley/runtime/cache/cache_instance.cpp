@@ -1402,24 +1402,32 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
         // Bundle first and plain multishot behind it, because a refused bundle
         // is not an error and the plain arm serves the same bytes one buffer
         // per completion.
+        // Every arm on `!queued` and none on `else`: the chain used to read
+        // `if (!queued && m_recv_multishot) ... else if (!queued && ...)`, so
+        // taking the multishot branch skipped the two behind it even when it
+        // came back false.  With the bundle and the multishot both refused in
+        // one turn -- one ring under pressure, two null SQEs -- the caller saw
+        // false and closed a healthy client that a plain read would have
+        // served.
         if (m_recv_bundle)
             queued = m_loop->submit_recv_multishot_bundle_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued && m_use_provided_bufs)
+        if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued)
+        if (!queued)
             queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
     else
     {
+        // The same chain, and it had the same dead branches.
         if (m_recv_bundle)
             queued = m_loop->submit_recv_multishot_bundle(fd, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued && m_use_provided_bufs)
+        if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued)
+        if (!queued)
             queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
     }
 
