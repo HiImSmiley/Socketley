@@ -421,6 +421,19 @@ bool client_instance::schedule_reconnect()
     m_conn->timeout_ts.tv_sec = delay_sec;
     m_conn->timeout_ts.tv_nsec = jitter_ms * 1000000LL;
 
+    // The cached address goes with the attempt that just ended.  It was only
+    // ever cleared when connect() failed SYNCHRONOUSLY, and a non-blocking
+    // connect to a remote address answers EINPROGRESS -- the refusal arrives
+    // later as -ECONNREFUSED on a CQE, down a path that never touched the
+    // cache.  So a client dialling `app:9000` kept an address the container
+    // had already given up, for as long as the runtime lived, while the manual
+    // promises automatic reconnection for exactly that case.  Re-resolving is
+    // affordable here and nowhere else: the backoff is at least a second, and
+    // a literal address never reaches the resolver at all.
+    m_has_cached_addr = false;
+    m_cached_host.clear();
+    m_cached_port = 0;
+
     m_conn->timeout_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
     m_reconnect_pending = m_loop->submit_timeout(&m_conn->timeout_ts, &m_conn->timeout_req);
 

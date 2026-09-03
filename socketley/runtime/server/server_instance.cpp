@@ -5472,6 +5472,15 @@ void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
     int delay_sec = std::min(base_sec, 30);
     int jitter_ms = (uc->reconnect_attempt * 137) % 500;
 
+    // The address that just failed us goes with the attempt.  has_cached_addr
+    // was set once and never cleared -- there was no path that cleared it at
+    // all -- so a server with `-u app:9000` kept dialling the IP a recreated
+    // container had already released, for the life of the runtime, and
+    // on_upstream_connect never fired again.  Re-resolving costs a getaddrinfo
+    // at most once per second of backoff, and a literal address never reaches
+    // the resolver.
+    uc->has_cached_addr = false;
+
     uc->timeout_ts.tv_sec = delay_sec;
     uc->timeout_ts.tv_nsec = jitter_ms * 1000000LL;
     uc->timeout_req = { this, nullptr, -1, 0, op_timeout, uc->generation };
