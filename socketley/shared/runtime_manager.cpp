@@ -170,6 +170,15 @@ bool runtime_manager::valid_name(std::string_view name)
     // `create client --help` made a runtime that could not be removed.
     if (name.empty() || name.size() > 128 || name[0] == '.' || name[0] == '-')
         return false;
+
+    // And '..' anywhere, because state_persistence::config_path() already
+    // refuses it -- by answering an empty path, silently.  So a name like
+    // `a..b` passed this door, ran, and was never written down: it disappeared
+    // at the next daemon start with nothing having said no.  The two rules
+    // belong at one door, and this is the one that can still answer the
+    // operator.
+    if (name.find("..") != std::string_view::npos)
+        return false;
     for (char c : name)
     {
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')

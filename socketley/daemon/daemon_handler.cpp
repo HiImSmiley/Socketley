@@ -1178,7 +1178,8 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             std::cout << "invalid runtime name: " << name << "\n"
                          "  A name may contain letters, digits, '-', '_' and "
                          "'.', may not begin with '.',\n"
-                         "  and may be at most 128 characters.\n";
+                         "  may not contain '..', and may be at most 128 "
+                         "characters.\n";
             return 1;
 
         case runtime_manager::create_result::internal:
