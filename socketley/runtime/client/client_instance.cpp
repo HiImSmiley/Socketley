@@ -238,7 +238,13 @@ connected:
     m_connected = true;
     // Everything armed from here on says it belongs to this socket.
     m_conn_generation = next_io_generation();
-    m_reconnect_attempt = 0;
+    // The attempt counter is NOT reset here.  A non-blocking connect answers
+    // EINPROGRESS and falls straight through to this label, so zeroing it here
+    // zeroed it on every dial -- and `--reconnect N`, documented as a limit,
+    // could never reach one.  Measured with `-t 127.0.0.1:1 --reconnect 2`:
+    // still `Up` after twelve seconds, dialling for ever.  It is reset where a
+    // peer has actually answered, in note_established().
+
     m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
     invoke_on_connect(m_conn->fd);
     m_conn->partial.clear();
@@ -392,6 +398,14 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     {
         m_reconnect_pending = false;
     }
+}
+
+// A completion carrying bytes is the first thing that proves the peer accepted
+// the connection rather than that the kernel accepted the SQE, and it is where
+// the backoff and the --reconnect limit start counting from again.
+void client_instance::note_established()
+{
+    m_reconnect_attempt = 0;
 }
 
 // True means something will bring this client back rather than that a timer
@@ -670,6 +684,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         return;
     }
 
+    note_established();
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     if (m_udp)
@@ -822,6 +837,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
         return;
     }
 
+    note_established();
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     // Resume a short write before moving on to the next message.

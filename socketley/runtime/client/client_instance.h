@@ -106,6 +106,10 @@ private:
     // every path that gets here used to do the same five things in its own
     // copy.
     void drop_connection();
+    // The other half of that clock: reset the backoff and the attempt count,
+    // from the first completion that carries bytes and not from a connect()
+    // that answered EINPROGRESS.
+    void note_established();
     // Every descriptor this runtime gives back goes through here, because it
     // reuses one read and one write request across reconnects and the number
     // really does come straight back.
