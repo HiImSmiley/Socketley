@@ -1381,7 +1381,7 @@ void proxy_supervisor::ingest(const std::string&)
                     m_placeholder &&
                     m_placeholder->get_state() != runtime_failed)
                 {
-                    LOG_ERROR("worker reported its runtime failed to start");
+                    LOG_ERROR("worker reported its runtime failed");
                     m_placeholder->mark_failed();
                     m_state_changed = true;   // collected by check_managed_health
                 }

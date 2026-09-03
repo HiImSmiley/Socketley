@@ -406,6 +406,14 @@ public:
             if (m_rt)
                 m_rt->on_loop_turn();
 
+            // A state the runtime reached on its own, reported as soon as it
+            // changes.  send_state() ran on start, stop and config and nowhere
+            // else, so a mark_failed() out here was worker-local and the daemon
+            // went on printing `Up` -- runtime_instance.cpp names exactly that
+            // gap where it calls mark_failed().  One comparison per turn.
+            if (m_rt && m_rt->get_state() != m_last_sent_state)
+                send_state();
+
             const auto now = std::chrono::steady_clock::now();
             if (stats_dirty && now - last_stats >= stats_interval)
             {
@@ -535,12 +543,17 @@ private:
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::hello, payload))) {}
     }
 
+    // What the daemon has last been told this runtime's state is.
+    runtime_state m_last_sent_state{runtime_created};
+
     void send_state()
     {
+        // Recorded here and not at the call sites, so the per-turn check below
+        // and the start/stop/config reports cannot disagree about what the
+        // daemon has been told.
+        m_last_sent_state = m_rt ? m_rt->get_state() : runtime_created;
         std::string payload;
-        payload.push_back(static_cast<char>(
-            m_rt ? static_cast<uint8_t>(m_rt->get_state())
-                    : static_cast<uint8_t>(runtime_created)));
+        payload.push_back(static_cast<char>(static_cast<uint8_t>(m_last_sent_state)));
         if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
     }
 
