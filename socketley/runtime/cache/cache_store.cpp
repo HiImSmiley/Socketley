@@ -373,34 +373,7 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
                 // Expired — remove
                 m_expiry.erase(eit);
                 drop_lru(key);
-                auto sit = m_data.find(key);
-                if (sit != m_data.end())
-                {
-                    track_sub(entry_cost(sit->first, sit->second));
-                    m_data.erase(sit);
-                }
-                else
-                {
-                    // Could be in lists/sets/hashes — clean up with memory tracking
-                    if (auto lit = m_lists.find(key); lit != m_lists.end())
-                    {
-                        track_sub(entry_cost(lit->first, lit->second));
-                        m_list_elems -= lit->second.size();
-                        m_lists.erase(lit);
-                    }
-                    else if (auto eit2 = m_sets.find(key); eit2 != m_sets.end())
-                    {
-                        track_sub(entry_cost(eit2->first, eit2->second));
-                        m_set_elems -= eit2->second.size();
-                        m_sets.erase(eit2);
-                    }
-                    else if (auto hit = m_hashes.find(key); hit != m_hashes.end())
-                    {
-                        track_sub(entry_cost(hit->first, hit->second));
-                        m_hash_fields -= hit->second.size();
-                        m_hashes.erase(hit);
-                    }
-                }
+                drop_value(key);
                 return nullptr;
             }
         }
@@ -807,34 +780,7 @@ void cache_store::check_expiry(std::string_view key)
     // Expired — remove from all containers
     m_expiry.erase(it);
     drop_lru(key);
-
-    if (auto sit = m_data.find(key); sit != m_data.end())
-    {
-        track_sub(entry_cost(sit->first, sit->second));
-        m_data.erase(sit);
-        return;
-    }
-    if (auto lit = m_lists.find(key); lit != m_lists.end())
-    {
-        track_sub(entry_cost(lit->first, lit->second));
-        m_list_elems -= lit->second.size();
-        m_lists.erase(lit);
-        return;
-    }
-    if (auto eit = m_sets.find(key); eit != m_sets.end())
-    {
-        track_sub(entry_cost(eit->first, eit->second));
-        m_set_elems -= eit->second.size();
-        m_sets.erase(eit);
-        return;
-    }
-    if (auto hit = m_hashes.find(key); hit != m_hashes.end())
-    {
-        track_sub(entry_cost(hit->first, hit->second));
-        m_hash_fields -= hit->second.size();
-        m_hashes.erase(hit);
-        return;
-    }
+    drop_value(key);
 }
 
 std::vector<std::string> cache_store::sweep_expired()
@@ -1130,14 +1076,16 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
 
 // ─── General ───
 
-bool cache_store::del(std::string_view key)
+// The one place that knows every container a key can live in, and the one
+// place that keeps the element counters straight while removing it.
+//
+// Three callers used to spell this chain out and TWO of them stopped at
+// m_hashes.  A sorted set therefore survived its own expiry -- the deadline
+// erased, the members kept, and TTL answering -1 for ever afterwards -- as
+// soon as any read path reached the key before the 500 ms sweep did.
+bool cache_store::drop_value(std::string_view key)
 {
     // Use transparent find + erase-by-iterator to avoid allocating std::string(key)
-    if (auto eit = m_expiry.find(key); eit != m_expiry.end())
-        m_expiry.erase(eit);
-
-    drop_lru(key);
-
     if (auto it = m_data.find(key); it != m_data.end())
     {
         track_sub(entry_cost(it->first, it->second));
@@ -1173,6 +1121,15 @@ bool cache_store::del(std::string_view key)
         return true;
     }
     return false;
+}
+
+bool cache_store::del(std::string_view key)
+{
+    if (auto eit = m_expiry.find(key); eit != m_expiry.end())
+        m_expiry.erase(eit);
+
+    drop_lru(key);
+    return drop_value(key);
 }
 
 uint32_t cache_store::size() const
@@ -2016,6 +1973,10 @@ void cache_store::rebuild_lru()
     for (const auto& e : m_lists)  touch_lru(e.first);
     for (const auto& e : m_sets)   touch_lru(e.first);
     for (const auto& e : m_hashes) touch_lru(e.first);
+    // The same omission as the expiry chain: without this a maxmemory set
+    // after the fact could never evict a sorted set, because nothing had put
+    // one in the LRU.
+    for (const auto& e : m_zsets)  touch_lru(e.first);
 }
 
 void cache_store::drop_lru(std::string_view key)

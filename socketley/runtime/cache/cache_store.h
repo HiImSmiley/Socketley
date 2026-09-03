@@ -171,6 +171,12 @@ public:
 
     // --- General ---
     bool del(std::string_view key);
+
+    // Remove a key from whichever container holds it, with the element
+    // counters and the memory tally, and nothing else -- the caller owns the
+    // expiry entry and the LRU.  One chain, because three copies of it left
+    // two without m_zsets.
+    bool drop_value(std::string_view key);
     uint32_t size() const;
     bool exists(std::string_view key) const;
 
