@@ -867,8 +867,38 @@ bool client_instance::lua_send(std::string_view msg)
 
     if (m_udp)
     {
-        // UDP: send as-is, no newline needed
-        send_to_server(msg);
+        // The same queue the TCP arm below uses, minus the newline, because a
+        // datagram frames itself.  Without a queue every send made while a
+        // write was in flight was dropped and still answered true -- and no
+        // CQE can arrive during a callback, so "a second message in the same
+        // callback" was the ordinary case rather than the exception: a script
+        // sending ten lines from on_connect delivered one.
+        if (m_conn->closing)
+            return false;
+
+        if (m_conn->write_pending)
+        {
+            // The bound is memory and not entries, on the same reasoning the
+            // TCP arm gives below.
+            if (m_write_queue.bytes() >= socketley::write_queue_max_bytes)
+            {
+                if (!m_write_queue_full)
+                {
+                    m_write_queue_full = true;
+                    std::cerr << "[client] server is not reading ("
+                              << m_write_queue.bytes()
+                              << " bytes queued), dropping messages\n";
+                }
+                return false;
+            }
+            m_write_queue.push(std::string(msg.data(), msg.size()));
+            return true;
+        }
+
+        m_conn->write_buf.assign(msg.data(), msg.size());
+        m_conn->write_off = 0;
+        arm_write(m_conn->write_buf.data(),
+                  static_cast<uint32_t>(m_conn->write_buf.size()));
         return true;
     }
 
@@ -913,18 +943,6 @@ bool client_instance::lua_send(std::string_view msg)
     m_conn->write_off = 0;
     arm_write(m_conn->write_buf.data(), static_cast<uint32_t>(m_conn->write_buf.size()));
     return true;
-}
-
-// The datagram path, which knows nothing about the record layer because
-// setup() refuses --tls on a UDP client rather than dialling in the clear.
-void client_instance::send_to_server(std::string_view msg)
-{
-    if (!m_loop || !m_connected || m_mode == client_mode_in || m_conn->write_pending || m_conn->closing)
-        return;
-
-    m_conn->write_buf.assign(msg.data(), msg.size());
-    m_conn->write_off = 0;
-    arm_write(m_conn->write_buf.data(), static_cast<uint32_t>(m_conn->write_buf.size()));
 }
 
 // ─── TLS record layer ───────────────────────────────────────────────────────

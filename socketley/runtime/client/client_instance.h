@@ -89,11 +89,11 @@ private:
     void handle_timeout(struct io_uring_cqe* cqe);
 
     void process_message(std::string_view msg);
-    void send_to_server(std::string_view msg);
     // Returns whether the reconnect clock is actually armed, since a caller
     // that ignores it claims a client will dial again when nothing will make
     // it.
     [[nodiscard]] bool schedule_reconnect();
+
     bool try_connect();
     // The one place a read is armed, and only when one is not already armed.
     void arm_read();
