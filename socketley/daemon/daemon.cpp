@@ -575,9 +575,23 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // not.
     export_log_level(logger::g_level);
 
-    // If another daemon is already running on this socket, exit gracefully
-    if (daemon_handler::is_running())
-        return 0;
+    // A daemon of ours already on this socket is nothing to do and exits 0, in
+    // silence, because success is silent.  A socket we may not even connect to
+    // is a refusal and says so: the operator asked for a daemon and does not
+    // have one.
+    switch (daemon_handler::probe_socket())
+    {
+        case daemon_handler::socket_state::ours:
+            return 0;
+        case daemon_handler::socket_state::foreign:
+            std::cout << "not starting: " << daemon_handler::socket_path
+                      << " belongs to another user\n"
+                         "  Set SOCKETLEY_SOCKET to a path of your own, or ask "
+                         "the owner to stop that daemon.\n";
+            return 1;
+        case daemon_handler::socket_state::free:
+            break;
+    }
 
     if (!loop.init())
     {

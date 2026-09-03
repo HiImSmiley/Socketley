@@ -59,7 +59,12 @@ public:
     daemon_handler(runtime_manager& manager, event_loop& loop);
     ~daemon_handler() override;
 
-    static bool is_running();
+    // What is on socket_path.  "A daemon is already running" and "that socket
+    // belongs to somebody else" used to be one boolean, and the caller exits 0
+    // on it -- so `socketley daemon` against a foreign socket said nothing and
+    // reported success, with no daemon of the caller's anywhere.
+    enum class socket_state { free, ours, foreign };
+    static socket_state probe_socket();
     bool setup();
     void teardown();
     void on_cqe(struct io_uring_cqe* cqe) override;

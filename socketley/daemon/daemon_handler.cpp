@@ -441,31 +441,36 @@ void daemon_handler::set_cluster_discovery(cluster_discovery* cd)
     m_cluster = cd;
 }
 
-bool daemon_handler::is_running()
+daemon_handler::socket_state daemon_handler::probe_socket()
 {
     int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe < 0)
-        return false;
+        return socket_state::free;
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-    bool alive = connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
-
-    // EACCES/EPERM counts as running, because the caller's next move on false
-    // is a setup() that unlinks the path -- which in a directory with no
-    // sticky bit would take the socket from the daemon that owns it.
-    if (!alive)
-    {
-        const int err = errno;
-        alive = (err == EACCES || err == EPERM);
-    }
+    const bool connected =
+        connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0;
+    const int err = errno;
 
     // Raw close on purpose: this is a static probe with no event loop anywhere
     // in reach, so no SQE can ever have named this number and there is nothing
     // for close_fd() to hold it against.
     close(probe);
-    return alive;
+
+    if (connected)
+        return socket_state::ours;
+
+    // EACCES/EPERM is still "do not touch this path" -- the caller's next move
+    // on `free` is a setup() that unlinks it, which in a directory with no
+    // sticky bit would take the socket from the daemon that owns it.  What it
+    // is NOT is a daemon of ours already serving, and answering both with one
+    // boolean is what made the second exit 0 in silence.
+    if (err == EACCES || err == EPERM)
+        return socket_state::foreign;
+
+    return socket_state::free;
 }
 
 bool daemon_handler::setup()
