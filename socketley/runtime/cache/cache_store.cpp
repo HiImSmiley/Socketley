@@ -750,9 +750,13 @@ int64_t cache_store::get_ttl(std::string_view key) const
     if (it == m_expiry.end())
         return -1;
 
-    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-        it->second - std::chrono::steady_clock::now());
-    return remaining.count();
+    // Rounded, not truncated: duration_cast goes towards zero, so `SET k v EX
+    // 1` answered 0 immediately and `EX 10` read as 9 after one millisecond.
+    // Redis computes (ms + 500) / 1000, and a client treating TTL == 0 as
+    // "expiring now" acted a whole second early against the old answer.
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        it->second - std::chrono::steady_clock::now()).count();
+    return (ms + 500) / 1000;
 }
 
 bool cache_store::persist(std::string_view key)
