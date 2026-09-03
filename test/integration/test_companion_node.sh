@@ -224,51 +224,120 @@ fi
 "$BIN" stop cn_kvspx >/dev/null 2>&1; "$BIN" remove cn_kvspx >/dev/null 2>&1
 "$BIN" stop cn_kvs   >/dev/null 2>&1; "$BIN" remove cn_kvs   >/dev/null 2>&1
 
-# ── 6d. A sharded server gets one node per shard, and its proxy reaches every shard ─
+# ── 6d. A sharded server gets one node per shard, and its proxy spreads over them ─
 #
 # One path per shard, because a path is one listener: when all four asked
 # for cn_srvs.sock the first to bind it won, the other three logged a refusal
 # and served the port alone, and a proxy on that node reached one shard of
-# four -- measured as every accepted socket on one pid.  The number here is
+# four -- measured as every accepted socket on one pid.  Two numbers here:
 # the daemon's own per-shard count after 64 connections through a TCP proxy,
 # which relays each client connection to one backend connection of its own,
-# so a shard nobody reaches reads 0.
+# so a shard nobody reaches reads 0 -- and, with 16 more held open, what ss
+# sees on the server side, because over the port SO_REUSEPORT would spread
+# them just as well and only the transport says which way they went.
 "$BIN" create server cn_srvs -p $((PORT+12)) --shards 4 --http "$WWW" -s >/dev/null 2>&1
 "$BIN" create proxy  cn_srvspx -p $((PORT+13)) --backend cn_srvs --protocol tcp -s >/dev/null 2>&1
 sleep 2
 SRVS_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
 SRVS_ONE_GONE=$([ -e "$RTDIR/cn_srvs.sock" ] && echo no || echo yes)
 SRVS_REFUSED=$(grep -c "companion node $RTDIR/cn_srvs" "$SOCKETLEY_DLOG" 2>/dev/null || true)
-SRVS_ANSWERED=$(python3 -c "
+SRVS_SAID=$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+# N connections through PORT, each held open HOLD seconds after its answer so
+# the backend leg is there for ss to see; prints how many answered.  HTTP/1.1,
+# because a 1.0 answer closes the leg before ss looks.
+srvs_held() {   # srvs_held PORT N HOLD OUTFILE
+    python3 - "$1" "$2" "$3" >"$4" <<'PY' &
+import socket, sys, threading, time
+port, n, hold = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+got = [0] * n
+def one(i):
+    try:
+        s = socket.create_connection(('127.0.0.1', port), timeout=5)
+        s.sendall(b'GET / HTTP/1.1\r\nHost: p\r\n\r\n')
+        d = s.recv(4096)
+        got[i] = 1 if b'over-either' in d else 0
+        time.sleep(hold)
+        s.close()
+    except Exception:
+        pass
+ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(sum(got))
+PY
+    SRVS_HELD_PID=$!
+}
+srvs_run() {   # srvs_run PORT N -> how many answered, each connection closed as it finishes
+    python3 -c "
 import socket
 n=0
-for i in range(64):
+for i in range($2):
     try:
-        s=socket.create_connection(('127.0.0.1',$((PORT+13))),timeout=3)
+        s=socket.create_connection(('127.0.0.1',$1),timeout=3)
         s.sendall(b'GET / HTTP/1.0\r\nHost: p\r\n\r\n')
         d=s.recv(4096); s.close()
         n+= 1 if b'over-either' in d else 0
     except Exception: pass
-print(n)" 2>/dev/null)
+print(n)" 2>/dev/null
+}
+SRVS_ANSWERED=$(srvs_run $((PORT+13)) 64)
 sleep 0.5
 SRVS_PER_SHARD=$("$BIN" stats cn_srvs 2>/dev/null | sed -n 's/^shard_total_connections:\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ')
 SRVS_BUSY=$(printf '%s\n' $SRVS_PER_SHARD | awk '$1 > 0 { n++ } END { print n+0 }')
 if [ "$SRVS_NODES" -eq 4 ] && [ "$SRVS_ONE_GONE" = "yes" ] && [ "${SRVS_REFUSED:-0}" -eq 0 ] \
-   && [ "$SRVS_ANSWERED" = "64" ] && [ "$SRVS_BUSY" -ge 2 ]; then
-    ok "a sharded server binds 4 nodes, and 64 connections through its proxy reached $SRVS_BUSY of 4 shards ($SRVS_PER_SHARD)"
+   && [ "${SRVS_SAID:-0}" -eq 4 ] && [ "$SRVS_ANSWERED" = "64" ] && [ "$SRVS_BUSY" -eq 4 ]; then
+    ok "a sharded server binds 4 nodes, its proxy names all 4, and 64 connections reached 4 of 4 shards ($SRVS_PER_SHARD)"
 else
-    bad "a sharded server binds one node per shard, and its proxy reaches more than one shard" \
+    bad "a sharded server binds one node per shard, and its proxy spreads over every shard" \
         "nodes cn_srvs#*.sock: $SRVS_NODES of 4, the unsharded cn_srvs.sock absent: $SRVS_ONE_GONE," \
-        "shards refused a node $SRVS_REFUSED time(s), the proxy answered $SRVS_ANSWERED of 64," \
-        "per-shard connections: ${SRVS_PER_SHARD:-<none>} -- $SRVS_BUSY shard(s) saw any;" \
+        "shards refused a node $SRVS_REFUSED time(s), the proxy named a node $SRVS_SAID time(s) (expected 4)," \
+        "answered $SRVS_ANSWERED of 64, per-shard connections: ${SRVS_PER_SHARD:-<none>} -- $SRVS_BUSY shard(s) saw any;" \
         "one node is one shard, and a proxy on it collapses --shards to 1/N"
+fi
+srvs_held $((PORT+13)) 16 2.5 "$SOCKETLEY_TMPD/srvs_held.txt"
+sleep 1.2
+SRVS_NODE_LEGS=$(ss -xn state established 2>/dev/null | grep -cF "$RTDIR/cn_srvs#")
+SRVS_PORT_LEGS=$(ss -Htn state established "( dport = :$((PORT+12)) )" 2>/dev/null | wc -l)
+wait "$SRVS_HELD_PID"
+SRVS_HELD_ANSWERED=$(cat "$SOCKETLEY_TMPD/srvs_held.txt")
+if [ "$SRVS_HELD_ANSWERED" = "16" ] && [ "$SRVS_NODE_LEGS" -ge 16 ] && [ "$SRVS_PORT_LEGS" -eq 0 ]; then
+    ok "16 held connections through the proxy are all on nodes ($SRVS_NODE_LEGS rows on cn_srvs#*.sock, 0 TCP legs to the port)"
+else
+    bad "every leg to a sharded backend is a node" \
+        "answered $SRVS_HELD_ANSWERED of 16, ss rows on cn_srvs#*.sock: $SRVS_NODE_LEGS, TCP legs to :$((PORT+12)): $SRVS_PORT_LEGS;" \
+        "a leg over the port is the 17.93 us path the node exists to replace"
+fi
+
+# And the count following the runtime: two shards after an edit bind #0 and
+# #1, the proxy has to stop dialling #2 and #3 -- paths nobody serves -- and
+# the log has to say it took the new set.
+"$BIN" stop cn_srvs >/dev/null 2>&1
+"$BIN" edit cn_srvs --shards 2 >/dev/null 2>&1
+"$BIN" start cn_srvs >/dev/null 2>&1
+sleep 2
+SRVS2_NODES=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
+SRVS2_STALE=$( { [ -e "$RTDIR/cn_srvs#2.sock" ] || [ -e "$RTDIR/cn_srvs#3.sock" ]; } && echo yes || echo no)
+SRVS2_ANSWERED=$(srvs_run $((PORT+13)) 16)
+sleep 0.5
+SRVS2_PER_SHARD=$("$BIN" stats cn_srvs 2>/dev/null | sed -n 's/^shard_total_connections:\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ')
+SRVS2_BUSY=$(printf '%s\n' $SRVS2_PER_SHARD | awk '$1 > 0 { n++ } END { print n+0 }')
+SRVS2_SAID=$(grep -c "\"cn_srvs\" is reached over $RTDIR/cn_srvs#[01].sock" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "$SRVS2_NODES" -eq 2 ] && [ "$SRVS2_STALE" = "no" ] && [ "$SRVS2_ANSWERED" = "16" ] \
+   && [ "$SRVS2_BUSY" -eq 2 ] && [ "${SRVS2_SAID:-0}" -ge 4 ]; then
+    ok "after edit --shards 2 and a restart the proxy follows: 2 nodes, 16 of 16 answered over 2 of 2 shards ($SRVS2_PER_SHARD)"
+else
+    bad "the proxy follows a changed shard count" \
+        "nodes after the restart: $SRVS2_NODES (expected 2), a stale #2/#3 left: $SRVS2_STALE," \
+        "answered $SRVS2_ANSWERED of 16, per-shard: ${SRVS2_PER_SHARD:-<none>} -- $SRVS2_BUSY shard(s) saw any," \
+        "log named #0/#1 $SRVS2_SAID time(s) (expected 2 at first, 2 more after);" \
+        "a path nobody binds is the refused connect unix_listener.h describes"
 fi
 "$BIN" stop cn_srvspx >/dev/null 2>&1; "$BIN" remove cn_srvspx >/dev/null 2>&1
 "$BIN" stop cn_srvs   >/dev/null 2>&1
 sleep 0.8
 SRVS_LEFT=$(ls "$RTDIR"/cn_srvs#*.sock 2>/dev/null | wc -l)
-if [ "$SRVS_LEFT" -eq 0 ]; then ok "stopping the sharded server removes all four nodes"
-else bad "stopping the sharded server removes all four nodes" "$SRVS_LEFT of them are still there; each shard unlinks its own"; fi
+if [ "$SRVS_LEFT" -eq 0 ]; then ok "stopping the sharded server removes every node"
+else bad "stopping the sharded server removes every node" "$SRVS_LEFT of them are still there; each shard unlinks its own"; fi
 "$BIN" remove cn_srvs   >/dev/null 2>&1
 
 "$BIN" stop cn_own >/dev/null 2>&1; "$BIN" remove cn_own >/dev/null 2>&1

@@ -57,6 +57,14 @@ struct backend_info
     bool is_unix = false;
     std::string unix_path;
     struct sockaddr_in cached_addr{};
+
+    // The table's node list this backend was resolved against, empty when it
+    // took none, so a republish can tell a change from a repeat.
+    std::vector<std::string> node_paths;
+    // A sharded runtime's nodes, one unix backend each, chosen among per
+    // request from node_next; empty for a backend with one address.
+    std::vector<backend_info> nodes;
+    size_t node_next = 0;
 };
 
 struct resolved_backend
@@ -566,6 +574,14 @@ private:
     void queue_final_response(proxy_client_connection* conn, std::string&& response);
 
     bool resolve_backend(backend_info& b);
+    bool configure_node_backends(backend_info& b, const std::vector<std::string>& paths,
+                                 std::string_view where);
+    // The nodes the table publishes for this backend now, or nullptr.
+    const std::vector<std::string>* published_nodes(const backend_info& b) const;
+    // Re-resolve every backend whose published nodes changed.
+    void follow_published_nodes();
+    // The backend a selection lands on: the entry, or one of its nodes.
+    const backend_info* pick_node(proxy_client_connection* conn, size_t idx);
     const backend_info* select_and_resolve_backend(proxy_client_connection* conn);
     // A false return covers two different things, so *resource_failure says
     // when the backend said nothing at all -- blaming it for our own resource
@@ -632,8 +648,9 @@ private:
     // address arrives -- the membership snapshot -- rather than on the request
     // path the idle sweep never sees.
     void resolve_group_hosts();
-    // The one place a member's node is chosen over its port.
-    resolved_backend member_dial(const runtime_endpoint& ep) const;
+    // The one place a member's nodes are chosen over its port, appended to
+    // `out` because a sharded member is N dial targets.
+    void member_dial(const runtime_endpoint& ep, std::vector<resolved_backend>& out) const;
     void announce_group_nodes();
 
 #ifdef SOCKETLEY_INVARIANTS
@@ -718,7 +735,7 @@ private:
     void tune_socket(int fd);
 
     // Service mesh
-    bool is_backend_available(size_t idx) const;
+    bool is_backend_available(size_t idx);
     // Claim the single half-open probe when this selection is the one that
     // gets it; a no-op for a backend whose circuit is closed.
     void note_backend_selected(size_t idx);
@@ -904,6 +921,9 @@ private:
     // including a group's members, kept apart from the per-backend flag
     // because that is what a group-routed connection asks.
     bool m_backend_tls_all{false};
+    // Set once setup() has resolved every backend, so a table arriving
+    // before that is stashed for setup() rather than resolved against twice.
+    bool m_backends_resolved{false};
 
     // Service mesh
     mesh_config m_mesh{};

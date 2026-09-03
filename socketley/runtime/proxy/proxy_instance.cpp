@@ -545,6 +545,11 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     // already being routed keeps the table it started with.
     m_endpoints = std::move(tbl);
 
+    // The nodes a name or an address is reached over come out of this
+    // snapshot too, so a backend resolved against the last one is re-resolved
+    // before anything below judges what still belongs.
+    follow_published_nodes();
+
     // What the new snapshot says this proxy's backends will answer, rebuilt
     // here and in setup(), which are the only two moments it can change.
     rebuild_route_view();
@@ -560,14 +565,106 @@ void proxy_instance::set_endpoints(std::shared_ptr<const endpoint_table> tbl)
     announce_group_nodes();
 }
 
-// How a group member is dialled, decided here and nowhere else: over the node
-// it published when this leg is not TLS, spelled (path, 0) so the pool key,
-// the breaker key and the connect all name the same socket.
-resolved_backend proxy_instance::member_dial(const runtime_endpoint& ep) const
+// How a group member is dialled, decided here and nowhere else: over the
+// nodes it published when this leg is not TLS, spelled (path, 0) so the pool
+// key, the breaker key and the connect all name the same socket -- and one
+// entry per node, because a group is a set of equals and a shard is one.
+void proxy_instance::member_dial(const runtime_endpoint& ep,
+                                 std::vector<resolved_backend>& out) const
 {
-    if (ep.unix_paths.size() == 1 && !(m_backend_tls && m_backend_tls_all))
-        return {ep.unix_paths.front(), 0};
-    return {ep.host, ep.port};
+    if (!ep.unix_paths.empty() && !(m_backend_tls && m_backend_tls_all))
+    {
+        for (const auto& p : ep.unix_paths)
+            out.push_back({p, 0});
+        return;
+    }
+    out.push_back({ep.host, ep.port});
+}
+
+// The host and port an address spells out, false for a bare runtime name; a
+// port that is not a number comes back as 0, which resolve_backend refuses.
+static bool split_address(std::string_view addr, std::string_view& host,
+                          uint16_t& port, bool* tls)
+{
+    uint16_t default_port = 0;
+    if (addr.starts_with("https://"))
+    {
+        addr.remove_prefix(8);
+        if (tls)
+            *tls = true;
+        default_port = 443;
+    }
+    else if (addr.starts_with("http://"))
+    {
+        addr.remove_prefix(7);
+        default_port = 80;
+    }
+
+    const auto colon = addr.find(':');
+    if (colon == std::string_view::npos)
+    {
+        if (default_port == 0 || addr.empty())
+            return false;
+        host = addr;
+        port = default_port;
+        return true;
+    }
+    host = addr.substr(0, colon);
+    port = 0;
+    const char* pstart = addr.data() + colon + 1;
+    const char* pend   = addr.data() + addr.size();
+    const auto [pptr, pec] = std::from_chars(pstart, pend, port);
+    if (pec != std::errc{} || pptr != pend)
+        port = 0;
+    return true;
+}
+
+// Asked by resolve_backend and again on every republish, in one function so
+// the two cannot disagree about which runtime's nodes an address means: a
+// name's own, or those of the runtime at exactly the written address.
+const std::vector<std::string>* proxy_instance::published_nodes(const backend_info& b) const
+{
+    if (!m_endpoints || b.is_group || b.tls)
+        return nullptr;
+
+    const std::string_view addr(b.address);
+    if (addr.starts_with("unix:") || (addr.size() > 1 && addr[0] == '@'))
+        return nullptr;
+
+    std::string_view host;
+    uint16_t port = 0;
+    if (split_address(addr, host, port, nullptr))
+        return m_endpoints->find_nodes_at(host, port);
+
+    const runtime_endpoint* ep = m_endpoints->find_name(addr);
+    return (ep && ep->port != 0 && !ep->unix_paths.empty()) ? &ep->unix_paths : nullptr;
+}
+
+// A runtime restarted with another shard count binds other paths, and a
+// proxy left on the old ones dials files nobody serves -- so the backends
+// follow the table here, where the table arrives.
+void proxy_instance::follow_published_nodes()
+{
+    if (!m_backends_resolved)
+        return;
+
+    for (auto& b : m_backends)
+    {
+        if (b.is_group || b.tls || std::string_view(b.address).starts_with("unix:"))
+            continue;
+
+        const std::vector<std::string>* want = published_nodes(b);
+        if (want ? *want == b.node_paths : b.node_paths.empty())
+            continue;
+
+        // Resolved afresh rather than patched, so the one function that
+        // decides a backend's transport keeps deciding it.
+        backend_info fresh;
+        fresh.address = b.address;
+        fresh.tls     = m_backend_tls_all;
+        if (resolve_backend(fresh))
+            b = std::move(fresh);
+    }
 }
 
 // Said once per node, because a member reached over a path is a transport
@@ -587,13 +684,18 @@ void proxy_instance::announce_group_nodes()
         if (!members)
             continue;
 
+        std::vector<resolved_backend> dials;
         for (const auto& ep : *members)
         {
-            const resolved_backend dial = member_dial(ep);
-            if (dial.port != 0 || !m_group_nodes_said.insert(dial.host).second)
-                continue;
-            LOG_INFO(("proxy backend " + b.address + " member " + ep.host + ":" +
-                      std::to_string(ep.port) + " is reached over " + dial.host).c_str());
+            dials.clear();
+            member_dial(ep, dials);
+            for (const auto& dial : dials)
+            {
+                if (dial.port != 0 || !m_group_nodes_said.insert(dial.host).second)
+                    continue;
+                LOG_INFO(("proxy backend " + b.address + " member " + ep.host + ":" +
+                          std::to_string(ep.port) + " is reached over " + dial.host).c_str());
+            }
         }
     }
 }
@@ -726,23 +828,30 @@ void proxy_instance::drop_departed_endpoints()
         return;
 
     const auto still_a_member = [this](std::string_view host, uint16_t port) {
+        std::vector<resolved_backend> dials;
         for (const auto& b : m_backends)
         {
             if (!b.is_group)
             {
-                // A plain backend is not membership; it is configuration, and
-                // it does not change under us.
+                // A plain backend is configuration and does not change under
+                // us, except for the nodes it took from the table, which
+                // follow_published_nodes has just brought up to date.
                 if (b.resolved_port == port && b.resolved_host == host)
                     return true;
+                for (const auto& node : b.nodes)
+                    if (port == 0 && node.unix_path == host)
+                        return true;
                 continue;
             }
             const std::string_view group(b.address.data() + 1, b.address.size() - 1);
             if (const auto* members = m_endpoints->find_group(group))
                 for (const auto& ep : *members)
                 {
-                    const resolved_backend dial = member_dial(ep);
-                    if (dial.port == port && dial.host == host)
-                        return true;
+                    dials.clear();
+                    member_dial(ep, dials);
+                    for (const auto& dial : dials)
+                        if (dial.port == port && dial.host == host)
+                            return true;
                 }
         }
         return false;
@@ -871,6 +980,31 @@ static bool configure_unix_backend(backend_info& b, std::string_view path,
     return true;
 }
 
+// A runtime reached over its nodes: one node is the backend's own address,
+// and N keep the port as the address the health sweep probes, with a unix
+// backend per node for pick_node to choose among.
+bool proxy_instance::configure_node_backends(backend_info& b,
+                                             const std::vector<std::string>& paths,
+                                             std::string_view where)
+{
+    b.node_paths = paths;
+    if (paths.size() == 1)
+        return configure_unix_backend(b, paths.front(), where);
+
+    b.nodes.clear();
+    b.nodes.reserve(paths.size());
+    for (const auto& p : paths)
+    {
+        backend_info node;
+        node.address = b.address;
+        if (!configure_unix_backend(node, p, where))
+            return false;
+        b.nodes.push_back(std::move(node));
+    }
+    b.node_next = 0;
+    return true;
+}
+
 bool proxy_instance::resolve_backend(backend_info& b)
 {
     // Group references (@groupname) are resolved dynamically at connection time
@@ -887,63 +1021,33 @@ bool proxy_instance::resolve_backend(backend_info& b)
 
     // A scheme says how to reach this backend as well as where, and it only
     // ever turns TLS on; it stays on b.address because an operator reading
-    // `stats` has to see what they configured.
-    std::string_view addr(b.address);
-    uint16_t default_port = 0;
-    if (addr.starts_with("https://"))
+    // `stats` has to see what they configured.  A scheme with no port is a
+    // URL whose port is implied, which would otherwise fall through to the
+    // runtime-name lookup and be reported as an unknown runtime.
+    std::string_view host;
+    uint16_t port = 0;
+    if (split_address(b.address, host, port, &b.tls))
     {
-        addr.remove_prefix(8);
-        b.tls = true;
-        default_port = 443;
-    }
-    else if (addr.starts_with("http://"))
-    {
-        addr.remove_prefix(7);
-        default_port = 80;
-    }
-
-    const auto colon = addr.find(':');
-    // A scheme with no port is a URL whose port is implied, which would
-    // otherwise fall through to the runtime-name lookup and be reported as an
-    // unknown runtime.
-    const bool have_endpoint = (colon != std::string_view::npos) ||
-                               (default_port != 0 && !addr.empty());
-    if (have_endpoint)
-    {
-        if (colon != std::string_view::npos)
+        // Checked, and a failure fails the whole setup, because a discarded
+        // result left `host:abc` at port 0 -- an address that provably cannot
+        // work, reported at traffic time as a 503.
+        if (port == 0)
         {
-            b.resolved_host = std::string(addr.substr(0, colon));
-            const char* pstart = addr.data() + colon + 1;
-            const char* pend   = addr.data() + addr.size();
+            LOG_ERROR(("proxy backend \"" + b.address +
+                       "\": the port is not a number between 1 and 65535").c_str());
+            return false;
+        }
+        b.resolved_host = std::string(host);
+        b.resolved_port = port;
 
-            // Checked, and a failure fails the whole setup, because a
-            // discarded result left `host:abc` at port 0 -- an address that
-            // provably cannot work, reported at traffic time as a 503.
-            const auto [pptr, pec] = std::from_chars(pstart, pend, b.resolved_port);
-            if (pec != std::errc{} || pptr != pend || b.resolved_port == 0)
-            {
-                LOG_ERROR(("proxy backend \"" + b.address +
-                           "\": the port is not a number between 1 and 65535").c_str());
-                return false;
-            }
-        }
-        else
-        {
-            b.resolved_host = std::string(addr);
-            b.resolved_port = default_port;
-        }
         // The same runtime, reached the short way.  Only when the address is
         // exactly what a runtime publishes: `myserver` asks for a runtime and
         // may choose its transport, while `127.0.0.1:9000` asks for an address
         // -- so this fires only while that address IS that runtime, and the
         // moment it stops being, the address means what it says again.
-        if (!b.tls && m_endpoints)
-        {
-            const auto* nodes =
-                m_endpoints->find_nodes_at(b.resolved_host, b.resolved_port);
-            if (nodes && nodes->size() == 1)
-                return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
-        }
+        const std::vector<std::string>* nodes = published_nodes(b);
+        if (nodes && nodes->size() == 1)
+            return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
 
         if (inet_pton(AF_INET, b.resolved_host.c_str(), &b.cached_addr.sin_addr) == 1)
         {
@@ -979,6 +1083,10 @@ bool proxy_instance::resolve_backend(backend_info& b)
             // block, and backend_connect_addr(), which arms the sweep rather
             // than resolving.
         }
+        // N nodes beside the port just cached, which stays the address the
+        // health sweep probes.
+        if (nodes)
+            return configure_node_backends(b, *nodes, "\"" + b.address + "\"");
         return true;
     }
 
@@ -1001,20 +1109,22 @@ bool proxy_instance::resolve_backend(backend_info& b)
         return configure_unix_backend(b, ep->host, "\"" + b.address + "\"");
     }
 
-    // A runtime with a port may also answer on a node.  A name asks for the
+    // A runtime with a port may also answer on nodes.  A name asks for the
     // runtime, so this leg is free to pick the shorter way to it -- except
     // under backend TLS, which asks for something a node cannot give and is
     // refused rather than quietly dropped one line further down.
-    if (ep->unix_paths.size() == 1 && !b.tls)
-        return configure_unix_backend(b, ep->unix_paths.front(), "\"" + b.address + "\"");
+    const std::vector<std::string>* nodes = published_nodes(b);
+    if (nodes && nodes->size() == 1)
+        return configure_unix_backend(b, nodes->front(), "\"" + b.address + "\"");
 
     b.resolved_host = ep->host;
-    const uint16_t port = ep->port;
-    b.resolved_port = port;
+    b.resolved_port = ep->port;
     b.cached_addr.sin_family = AF_INET;
     b.cached_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    b.cached_addr.sin_port = htons(port);
+    b.cached_addr.sin_port = htons(ep->port);
     b.has_cached_addr = true;
+    if (nodes)
+        return configure_node_backends(b, *nodes, "\"" + b.address + "\"");
     return true;
 }
 
@@ -1260,6 +1370,7 @@ bool proxy_instance::setup(event_loop& loop)
             return false;
         any_backend_tls = any_backend_tls || b.tls;
     }
+    m_backends_resolved = true;
 
     if (any_backend_tls)
     {
@@ -1469,6 +1580,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
 #ifdef SOCKETLEY_TRACE
     trace_unregister(this);
 #endif
+    m_backends_resolved = false;
     // Everything here is closed and handed to the release path, which holds
     // what the ring is still working on -- nulling the owners only holds while
     // there is an object left to read the null out of.
@@ -4280,6 +4392,57 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
 #endif
 }
 
+// Recorded on the connection the way a group member is -- endpoint beside
+// index -- because for a sharded runtime the index alone no longer names the
+// socket: the breaker, the pool key and the Host header all read the node.
+const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, size_t idx)
+{
+    backend_info& b = m_backends[idx];
+    conn->backend_idx = idx;
+    conn->backend_from_group = false;
+    note_backend_selected(idx);
+    if (b.nodes.empty())
+        return &b;
+
+    const size_t n = b.nodes.size();
+    const bool gated = m_mesh.circuit_threshold > 0 && !m_group_breakers.empty();
+    const auto take = [&](size_t k) -> const backend_info* {
+        const backend_info& node = b.nodes[k];
+        conn->backend_from_group = true;
+        conn->backend_host = node.unix_path;
+        conn->backend_port = 0;
+        note_group_selected(node.unix_path, 0);
+        return &node;
+    };
+
+    // The node whose leg came back to the pool last, while the pool has one:
+    // a light load stays on the shard it just used rather than waking a
+    // halted one, and only a load the idle legs cannot carry spreads.
+    if (idx < m_backend_pool.size() && !m_backend_pool[idx].empty())
+    {
+        const pooled_backend& last = m_backend_pool[idx].back();
+        if (last.port == 0 && (!gated || group_endpoint_available(last.host, 0)))
+            for (size_t k = 0; k < n; ++k)
+                if (b.nodes[k].unix_path == last.host)
+                    return take(k);
+    }
+
+    const size_t start = m_strategy == strategy_random
+                             ? std::uniform_int_distribution<size_t>(0, n - 1)(m_rng)
+                             : b.node_next;
+    for (size_t attempt = 0; attempt < n; ++attempt)
+    {
+        const size_t k = (start + attempt) % n;
+        if (gated && !group_endpoint_available(b.nodes[k].unix_path, 0))
+            continue;
+        b.node_next = k + 1;
+        return take(k);
+    }
+    // Every node is out, which is_backend_available already said for every
+    // caller that asked; the single-backend path does not, and 503 is right.
+    return nullptr;
+}
+
 const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
@@ -4328,10 +4491,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                              std::chrono::seconds(m_mesh.circuit_timeout))
                     return nullptr;
             }
-            conn->backend_idx = 0;
             conn->retries_remaining = m_mesh.retry_count;
-            note_backend_selected(0);
-            return &m_backends[0];
+            return pick_node(conn, 0);
         }
 
         size_t pool_size = m_backends.size();
@@ -4366,10 +4527,8 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                     int idx = result.as<int>();
                     if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
                     {
-                        conn->backend_idx = static_cast<size_t>(idx);
                         conn->retries_remaining = m_mesh.retry_count;
-                        note_backend_selected(static_cast<size_t>(idx));
-                        return &m_backends[static_cast<size_t>(idx)];
+                        return pick_node(conn, static_cast<size_t>(idx));
                     }
                 }
             }
@@ -4453,17 +4612,15 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
         if (SOCKETLEY_UNLIKELY(!found))
             return nullptr;
 
-        conn->backend_idx = selected_idx;
         conn->retries_remaining = m_mesh.retry_count;
-        note_backend_selected(selected_idx);
-        return &m_backends[selected_idx];
+        return pick_node(conn, selected_idx);
     }
 
     // Slow path: has group backends — build pool and resolve dynamically
     std::vector<resolved_backend> pool;
     pool.reserve(m_backends.size());
 
-    for (const auto& b : m_backends)
+    for (auto& b : m_backends)
     {
         if (b.is_group)
         {
@@ -4477,9 +4634,15 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                 if (const auto* members = m_endpoints->find_group(group_name))
                 {
                     for (const auto& ep : *members)
-                        pool.push_back(member_dial(ep));
+                        member_dial(ep, pool);
                 }
             }
+        }
+        else if (!b.nodes.empty())
+        {
+            // One entry, chosen here, so beside a group's members this
+            // backend keeps the weight of one backend rather than of N.
+            pool.push_back({b.nodes[b.node_next++ % b.nodes.size()].unix_path, 0});
         }
         else
         {
@@ -6364,10 +6527,20 @@ void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
     conn->backend_half_closed = true;
 }
 
-bool proxy_instance::is_backend_available(size_t idx) const
+bool proxy_instance::is_backend_available(size_t idx)
 {
     if (SOCKETLEY_UNLIKELY(idx >= m_backends.size()))
         return false;
+
+    // A sharded runtime is reachable while any of its nodes is.
+    if (const auto& b = m_backends[idx]; !b.nodes.empty() && !m_group_breakers.empty())
+    {
+        bool any = false;
+        for (const auto& node : b.nodes)
+            any = any || group_endpoint_available(node.unix_path, 0);
+        if (!any)
+            return false;
+    }
 
     // Check health
     if (idx < m_backend_health.size() && !m_backend_health[idx].healthy)
@@ -7526,22 +7699,21 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     }
 
     // Select next healthy backend (skip the one that just failed)
-    size_t start_idx = (conn->backend_idx + 1) % m_backends.size();
+    const size_t failed = conn->backend_idx;
+    size_t start_idx = (failed + 1) % m_backends.size();
     for (size_t attempts = 0; attempts < m_backends.size(); attempts++)
     {
         size_t idx = (start_idx + attempts) % m_backends.size();
-        if (idx == conn->backend_idx)
+        if (idx == failed)
             continue;
         if (!is_backend_available(idx))
             continue;
 
-        auto* target = &m_backends[idx];
-        if (!connect_to_backend(conn, target))
+        // Recorded on the connection before the connect, as the first
+        // selection was, because pick_node is what names the socket.
+        const backend_info* target = pick_node(conn, idx);
+        if (!target || !connect_to_backend(conn, target))
             continue;
-
-        conn->backend_idx = idx;
-        conn->backend_from_group = false;
-        note_backend_selected(idx);
 
         // If async connect pending, handle_connect will forward saved_request
         if (conn->connect_pending)
