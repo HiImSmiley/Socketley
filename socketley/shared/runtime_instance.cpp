@@ -107,7 +107,14 @@ bool runtime_instance::start(event_loop& loop)
 {
     runtime_state current = m_state.load(std::memory_order_acquire);
 
-    if (current != runtime_created && current != runtime_stopped)
+    // `failed` is an entry state and not a grave: a worker that could not bind
+    // leaves the runtime here, and refusing to start it again made every such
+    // runtime dead until remove + create -- with `start` answering "failed to
+    // start" and no line anywhere saying why.  The daemon retires the dead
+    // workers of a runtime it is starting out of `failed`, in
+    // reconcile_proxy_workers(), or this would come up `running` with no child.
+    if (current != runtime_created && current != runtime_stopped &&
+        current != runtime_failed)
         return false;
 
     // Before every early return below, because the ring was created before the
@@ -234,6 +241,17 @@ bool runtime_instance::start(event_loop& loop)
 
 bool runtime_instance::stop(event_loop& loop)
 {
+    // A failed runtime has nothing armed and no child left -- start() marks it
+    // before arming anything, and check_liveness() reaps before it marks -- so
+    // stopping one is bookkeeping.  Answering false here made `stop` a silent
+    // no-op that still returned 0, which is how a runtime the operator had
+    // stopped came back `Failed` in `ls`.
+    if (m_state.load(std::memory_order_acquire) == runtime_failed)
+    {
+        m_state.store(runtime_stopped, std::memory_order_release);
+        return true;
+    }
+
     if (m_state.load(std::memory_order_acquire) != runtime_running)
         return false;
 

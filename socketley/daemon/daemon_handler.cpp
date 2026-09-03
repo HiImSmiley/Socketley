@@ -4995,7 +4995,18 @@ void daemon_handler::reconcile_proxy_workers()
         const auto w = std::find_if(wanted.begin(), wanted.end(),
                                     [&](const auto& p) { return p.first == it->first; });
 
-        if (w == wanted.end())
+        // A wanted name whose every child has been reaped is a runtime being
+        // started out of `failed`: check_liveness() zeroes the pid of a child
+        // it did not restart, and nothing else leaves a full set dead while the
+        // placeholder asks to run.  Their entries have to go before the spawn
+        // loop below, which counts supervisors and not children and would find
+        // the set complete and fork nothing.
+        const bool all_reaped =
+            w != wanted.end() && !it->second.empty() &&
+            std::none_of(it->second.begin(), it->second.end(),
+                         [](const auto& sup) { return sup->is_alive(); });
+
+        if (w == wanted.end() || all_reaped)
         {
             // Recorded before the retire, because retire() nulls the
             // supervisor's placeholder pointer and this is a name the map is
