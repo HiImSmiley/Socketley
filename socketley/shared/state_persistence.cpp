@@ -542,7 +542,18 @@ std::string resolve_absolute(std::string_view path)
 state_persistence::state_persistence(const fs::path& state_dir)
     : m_state_dir(state_dir)
 {
-    m_writer = std::thread(&state_persistence::writer_loop, this);
+    // An empty directory means this object is a parser and nothing else: five
+    // places build one only to decode a config, and each was starting and
+    // joining a thread to do it, two of them on the worker-restart path.
+    //
+    // The cost is not the thread.  It is that this constructor could not fail
+    // gracefully -- std::thread throws std::system_error on EAGAIN, nothing on
+    // these paths catches it, and a daemon that could not make one more thread
+    // died with `terminate called ... Resource temporarily unavailable` in
+    // place of refusing a single command.  Measured with RLIMIT_NPROC at 1:
+    // the daemon aborted and dumped core on `create`.
+    if (!m_state_dir.empty())
+        m_writer = std::thread(&state_persistence::writer_loop, this);
 }
 
 // Where this runtime's state file goes, or an empty path if it may not have one.
@@ -1153,6 +1164,13 @@ void state_persistence::remove_runtime(std::string_view name)
 
 void state_persistence::enqueue(job j)
 {
+    // No writer means no state directory, and config_path() would answer a
+    // bare "name.json" for one -- a relative path into whatever directory the
+    // daemon happens to be in.  Dropping is what a parser-only object already
+    // meant; queueing was the accident.
+    if (!m_writer.joinable())
+        return;
+
     {
         std::lock_guard<std::mutex> lk(m_mx);
         m_queue.push_back(std::move(j));
