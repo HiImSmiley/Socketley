@@ -3490,7 +3490,14 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             ? m_conn_idx[sender->pipe_peer_fd] : nullptr;
         if (peer && !peer->closing)
         {
-            auto shared_msg = std::make_shared<const std::string>(msg);
+            // With the separator, because parse_partial() hands the line
+            // WITHOUT it and this path forwarded exactly that.  Two lines from
+            // one client therefore arrived at the other as `xy`, which no
+            // reader can split again -- while broadcast(), send() and
+            // group_send() all put the newline back.  queue_send() strips it
+            // again for a websocket peer, so nothing changes there.
+            auto shared_msg = std::make_shared<const std::string>(
+                std::string(msg) + "\n");
             queue_send(peer, shared_msg);
         }
         return;
@@ -5204,7 +5211,12 @@ int server_instance::handle_for_sibling_ref(const conn_ref& r)
 size_t server_instance::multicast(const std::vector<int>& fds, std::string_view msg)
 {
     if (!m_loop || m_udp) return 0;
-    auto shared = std::make_shared<const std::string>(msg);
+    // The separator, on the same reasoning pipe() gives: every other send path
+    // frames its message and this one did not, so two multicasts merged into
+    // one unsplittable line.
+    auto shared = std::make_shared<const std::string>(
+        msg.empty() || msg.back() != '\n' ? std::string(msg) + "\n"
+                                          : std::string(msg));
     size_t sent = 0;
     for (int fd : fds)
     {

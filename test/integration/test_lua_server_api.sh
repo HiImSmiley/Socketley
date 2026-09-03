@@ -267,6 +267,21 @@ function on_client_message(id, msg)
     elseif cmd == "unpipe" then
         self.unpipe(id)
 
+    -- Driven from a client that is NOT in the pipe, because process_message()
+    -- forwards a piped client's bytes and RETURNS before on_client_message --
+    -- "bypassing Lua callbacks", as its own comment says.  A piped client
+    -- therefore cannot ask for anything at all, including its own unpipe, and
+    -- the two commands below are the only shape in which unpipe can be tested.
+    elseif cmd == "pipe2" then
+        local o = others(id)
+        if #o >= 2 then self.pipe(o[1], o[2]) end
+        reply(id, "ok")
+
+    elseif cmd == "unpipe2" then
+        local o = others(id)
+        if #o >= 1 then self.unpipe(o[1]) end
+        reply(id, "ok")
+
     elseif cmd == "upstreams" then
         reply(id, "upstreams=" .. tostring(#self.upstreams()))
     end
@@ -482,17 +497,41 @@ assert_eq "leave_group stops the delivery" \
     "of a group_send that never sends anything to anybody"
 
 # ── 5. pipe / unpipe ───────────────────────────────────────────────────────
-T=$(tx "$API_PORT" c1 c2 s1:whoami r1 s2:whoami r2 \
-        "s1:pipe" r1 w:0.3 \
-        "s1:THROUGH-THE-PIPE" w:0.4 r2 \
-        "s1:unpipe" w:0.4 \
-        "s1:AFTER-THE-PIPE" w:0.4 r2 x1 x2)
+#
+# THREE clients, and the one that gives the orders is not in the pipe.  The old
+# shape had two, with the piped client asking for its own unpipe -- which
+# process_message() can never deliver, because the pipe forwards and returns
+# before on_client_message runs.  That assertion passed anyway, and only
+# because pipe() forwarded the parsed line WITHOUT its newline: `unpipe` and
+# `AFTER-THE-PIPE` arrived merged as one unsplittable token, so the string the
+# assertion looked for was not there.  Framing the pipe made the vacuum
+# visible.
+T=$(tx "$API_PORT" c1 c2 c3 s1:whoami r1 s2:whoami r2 s3:whoami r3 \
+        "s1:pipe2" r1 w:0.3 \
+        "s2:THROUGH-THE-PIPE" w:0.4 r3 \
+        "s1:unpipe2" r1 w:0.4 \
+        "s2:AFTER-THE-PIPE" w:0.4 r3 x1 x2 x3)
 assert_eq "self.pipe() carries one client's bytes to the other" \
-          "1" "$(got "$T" 'R2:THROUGH-THE-PIPE')"
+          "1" "$(got "$T" 'R3:THROUGH-THE-PIPE')"
 assert_eq "self.unpipe() stops it" \
-          "0" "$(got "$T" 'R2:AFTER-THE-PIPE')" \
+          "0" "$(got "$T" 'R3:AFTER-THE-PIPE')" \
     "the pair is the assertion: a pipe that never carried anything satisfies" \
     "the second line on its own"
+
+# And the framing, which is the reason the pair above could be vacuous for so
+# long.  parse_partial() hands the line without its newline and pipe() used to
+# forward exactly that, so two lines arrived as one token the reader could
+# never split again -- while broadcast(), send() and group_send() all put the
+# separator back.
+T=$(tx "$API_PORT" c1 c2 c3 s1:whoami r1 s2:whoami r2 s3:whoami r3 \
+        "s1:pipe2" r1 w:0.3 \
+        "s2:LINE-ONE" "s2:LINE-TWO" w:0.5 r3 x1 x2 x3)
+assert_eq "two lines through a pipe arrive as two lines (first)" \
+          "1" "$(got "$T" 'R3:LINE-ONE')" \
+    "0 for both means they arrived merged as LINE-ONELINE-TWO, which is what" \
+    "forwarding the parsed line without its separator produces"
+assert_eq "two lines through a pipe arrive as two lines (second)" \
+          "1" "$(got "$T" 'R3:LINE-TWO')"
 
 # ── 6. on_message suppresses the default relay of --mode inout ─────────────
 #
