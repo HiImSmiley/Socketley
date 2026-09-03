@@ -2426,7 +2426,11 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
 
     if (resp)
     {
-        static constexpr int MAX_RESP_ARGS = 64;
+        // The parser's own limit, not a second one below it: 64 refused
+        // `MSET` with 32 pairs, `DEL` or `MGET` with 65 keys and `ZADD` with
+        // 32 pairs, all of which Redis takes.  16 KiB of stack, uninitialised,
+        // against a cap that made valid commands protocol errors.
+        static constexpr int MAX_RESP_ARGS = resp::RESP_MAX_ARRAY_SIZE;
         std::string_view args[MAX_RESP_ARGS];
         int    argc     = 0;
         size_t consumed = 0;
@@ -6124,8 +6128,10 @@ bool cache_instance::load_from(std::string_view path)
 
 void cache_instance::process_resp(client_connection* conn)
 {
-    // Fixed-size string_view array — zero heap allocations per command
-    static constexpr int MAX_RESP_ARGS = 64;
+    // Fixed-size string_view array — zero heap allocations per command, and
+    // the parser's own RESP_MAX_ARRAY_SIZE rather than a second, smaller cap
+    // that turned valid Redis commands into protocol errors.
+    static constexpr int MAX_RESP_ARGS = resp::RESP_MAX_ARRAY_SIZE;
     std::string_view args[MAX_RESP_ARGS];
     int argc = 0;
     size_t consumed = 0;
@@ -6147,8 +6153,16 @@ void cache_instance::process_resp(client_connection* conn)
 
         if (result == resp::parse_result::error)
         {
+            // Redis closes on a protocol error, and this path is the reason.
+            // partial.clear() also threw away whatever the client had already
+            // pipelined BEHIND the bad command, so it received fewer replies
+            // than it sent commands and waited for ever on a connection that
+            // stayed open.  Answering and then closing is the only outcome
+            // that cannot strand it: the stream is no longer framed, and
+            // nothing after this point can be read as anything.
             conn->response_buf.append("-ERR protocol error\r\n");
             conn->partial.clear();
+            conn->closing = true;
             return;
         }
 
