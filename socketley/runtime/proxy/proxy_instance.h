@@ -581,8 +581,15 @@ private:
     // Re-resolve every backend whose published nodes changed.
     void follow_published_nodes();
     // The backend a selection lands on: the entry, or one of its nodes.
-    const backend_info* pick_node(proxy_client_connection* conn, size_t idx);
-    const backend_info* select_and_resolve_backend(proxy_client_connection* conn);
+    const backend_info* pick_node(proxy_client_connection* conn, size_t idx,
+                                  const std::string* exclude_path = nullptr);
+    // `exclude_host` names an endpoint this selection may not return -- the
+    // one a retry has just given up on.  A group member and a shard node are
+    // both addressed by host and port rather than by index, so excluding one
+    // is the only way to ask for "another".
+    const backend_info* select_and_resolve_backend(proxy_client_connection* conn,
+                                                   const std::string* exclude_host = nullptr,
+                                                   uint16_t exclude_port = 0);
     // A false return covers two different things, so *resource_failure says
     // when the backend said nothing at all -- blaming it for our own resource
     // limit trips the breaker on a healthy backend.

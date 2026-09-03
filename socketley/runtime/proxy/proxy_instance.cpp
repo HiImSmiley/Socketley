@@ -4395,17 +4395,23 @@ bool proxy_instance::run_request_filters(proxy_client_connection* conn)
 // Recorded on the connection the way a group member is -- endpoint beside
 // index -- because for a sharded runtime the index alone no longer names the
 // socket: the breaker, the pool key and the Host header all read the node.
-const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, size_t idx)
+const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, size_t idx,
+                                              const std::string* exclude_path)
 {
     backend_info& b = m_backends[idx];
     conn->backend_idx = idx;
     conn->backend_from_group = false;
     note_backend_selected(idx);
     if (b.nodes.empty())
-        return &b;
+        return exclude_path ? nullptr : &b;   // one address, and it just failed
 
     const size_t n = b.nodes.size();
     const bool gated = m_mesh.circuit_threshold > 0 && !m_group_breakers.empty();
+    // A retry asks for a node OTHER than the one that just failed; the pooled
+    // preference below would otherwise hand back the same one.
+    const auto barred = [&](const std::string& path) {
+        return exclude_path && *exclude_path == path;
+    };
     const auto take = [&](size_t k) -> const backend_info* {
         const backend_info& node = b.nodes[k];
         conn->backend_from_group = true;
@@ -4421,7 +4427,8 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
     if (idx < m_backend_pool.size() && !m_backend_pool[idx].empty())
     {
         const pooled_backend& last = m_backend_pool[idx].back();
-        if (last.port == 0 && (!gated || group_endpoint_available(last.host, 0)))
+        if (last.port == 0 && !barred(last.host) &&
+            (!gated || group_endpoint_available(last.host, 0)))
             for (size_t k = 0; k < n; ++k)
                 if (b.nodes[k].unix_path == last.host)
                     return take(k);
@@ -4433,6 +4440,8 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
     for (size_t attempt = 0; attempt < n; ++attempt)
     {
         const size_t k = (start + attempt) % n;
+        if (barred(b.nodes[k].unix_path))
+            continue;
         if (gated && !group_endpoint_available(b.nodes[k].unix_path, 0))
             continue;
         b.node_next = k + 1;
@@ -4443,7 +4452,8 @@ const backend_info* proxy_instance::pick_node(proxy_client_connection* conn, siz
     return nullptr;
 }
 
-const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_connection* conn)
+const backend_info* proxy_instance::select_and_resolve_backend(
+    proxy_client_connection* conn, const std::string* exclude_host, uint16_t exclude_port)
 {
     if (SOCKETLEY_UNLIKELY(m_backends.empty()))
         return nullptr;
@@ -4492,7 +4502,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                     return nullptr;
             }
             conn->retries_remaining = m_mesh.retry_count;
-            return pick_node(conn, 0);
+            return pick_node(conn, 0, exclude_host);
         }
 
         size_t pool_size = m_backends.size();
@@ -4528,7 +4538,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
                     if (idx >= 0 && static_cast<size_t>(idx) < pool_size)
                     {
                         conn->retries_remaining = m_mesh.retry_count;
-                        return pick_node(conn, static_cast<size_t>(idx));
+                        return pick_node(conn, static_cast<size_t>(idx), exclude_host);
                     }
                 }
             }
@@ -4613,7 +4623,7 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
             return nullptr;
 
         conn->retries_remaining = m_mesh.retry_count;
-        return pick_node(conn, selected_idx);
+        return pick_node(conn, selected_idx, exclude_host);
     }
 
     // Slow path: has group backends — build pool and resolve dynamically
@@ -4652,6 +4662,24 @@ const backend_info* proxy_instance::select_and_resolve_backend(proxy_client_conn
 
     if (pool.empty())
         return nullptr;
+
+    // The member that just failed comes off before anything else, because a
+    // retry that can land on it again is not a retry.
+    if (exclude_host)
+    {
+        pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                  [&](const resolved_backend& rb) {
+                                      return rb.port == exclude_port && rb.host == *exclude_host;
+                                  }),
+                   pool.end());
+        if (pool.empty())
+            return nullptr;   // it was the only member; there is nowhere else
+    }
+
+    // `--backend @grp` never set this, so try_retry() answered false on its
+    // first line for every group -- while the manual promises the retry with
+    // no exception for them.
+    conn->retries_remaining = m_mesh.retry_count;
 
     // Members the breaker has taken out come off the list before anything is
     // selected, because choosing first means either using a broken member or
@@ -7696,6 +7724,26 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
         conn->pipe_to_backend[0] = -1;
         conn->pipe_to_backend[1] = -1;
         conn->splice_active = false;
+    }
+
+    // A member of a group, or a node of a sharded backend, is not an index into
+    // m_backends: `--backend @grp` is ONE entry, so the index walk below had
+    // nowhere to move to and every group request failed on its first refusal.
+    // The alternative is another ENDPOINT, which is the same selection asked
+    // again with the one that failed taken out.
+    if (conn->backend_from_group)
+    {
+        const std::string failed_host = conn->backend_host;
+        const uint16_t    failed_port = conn->backend_port;
+        const backend_info* target =
+            select_and_resolve_backend(conn, &failed_host, failed_port);
+        if (!target || !connect_to_backend(conn, target))
+            return false;
+        if (conn->connect_pending)
+            return true;    // handle_connect forwards saved_request
+        if (!conn->saved_request.empty())
+            forward_to_backend(conn, conn->saved_request);
+        return true;
     }
 
     // Select next healthy backend (skip the one that just failed)
