@@ -1841,7 +1841,13 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 auto now = std::chrono::steady_clock::now();
                 if (m_idle_timeout_cached > 0)
                 {
+                    // Collected and then closed, because close_pair() frees the
+                    // slot and lowers m_client_count, which this walk uses as
+                    // its bound -- closing inside it ends the sweep early and
+                    // leaves the clients after the first idle one for the next
+                    // tick.
                     auto timeout = std::chrono::seconds(m_idle_timeout_cached);
+                    std::vector<int> expired;
                     size_t found = 0;
                     for (int cfd = 0; cfd < MAX_FDS && found < m_client_count; cfd++)
                     {
@@ -1850,10 +1856,26 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                         found++;
                         if (cconn->closing) continue;
                         if ((now - cconn->last_activity) > timeout)
-                        {
-                            cconn->closing = true;
-                            shutdown(cfd, SHUT_RD);
-                        }
+                            expired.push_back(cfd);
+                    }
+
+                    // close_pair() and not `closing = true` plus SHUT_RD.  The
+                    // flag relied on an armed read coming back with res == 0 to
+                    // do the actual teardown, and a client whose read is NOT
+                    // armed -- an HTTP half-close hold, or a backpressure pause
+                    // -- has no completion coming.  Every later path is gated
+                    // on !closing, so the backend's answer was dropped by
+                    // forward_to_client, the leg was never pooled, no 504 could
+                    // fire because the deadline sweep skips closing
+                    // connections, and the pair lived until the backend gave
+                    // up.  For a client that DOES have a read armed this is the
+                    // same thing: close_pair sets the flag and shuts the read
+                    // side itself.
+                    for (int cfd : expired)
+                    {
+                        auto& cconn = m_client_slots[cfd];
+                        if (!cconn || cconn->closing) continue;
+                        close_pair(cfd, cconn->backend_fd, close_reason::force);
                     }
                 }
 
