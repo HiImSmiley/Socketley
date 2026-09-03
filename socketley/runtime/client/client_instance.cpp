@@ -609,7 +609,12 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
 
     bool is_provided = (m_conn->read_req.type == op_read_provided);
 
-    if (cqe->res <= 0)
+    // res == 0 is an end of stream on TCP and a legitimate empty datagram on
+    // UDP, and testing `<= 0` before the m_udp branch below made the second
+    // one a disconnect: a peer sending nothing, or a server's own
+    // broadcast(""), put every UDP client through drop_connection and a
+    // reconnect round -- or killed it outright without --reconnect.
+    if (cqe->res < 0 || (cqe->res == 0 && !m_udp))
     {
         // Return provided buffer if kernel allocated one before error
         if (is_provided && (cqe->flags & IORING_CQE_F_BUFFER))
@@ -780,7 +785,12 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
 {
     m_conn->write_pending = false;
 
-    if (cqe->res <= 0)
+    // A zero-length datagram reports 0 written and that is the whole message,
+    // so `self.send("")` on a UDP client used to close its own socket.
+    const bool empty_datagram_sent =
+        (cqe->res == 0 && m_udp && m_conn->write_buf.empty());
+
+    if (cqe->res < 0 || (cqe->res == 0 && !empty_datagram_sent))
     {
         m_conn->closing = true;
         if (!m_conn->read_pending)
