@@ -404,7 +404,18 @@ bool client_instance::schedule_reconnect()
         return true; // Reconnect disabled: nothing to arm, nothing wrong
 
     if (max > 0 && m_reconnect_attempt >= max)
-        return true; // The configured limit, reached as asked
+    {
+        // Reached as asked -- and nothing will ever wake this client again, so
+        // it is not a success.  Answering true here left `ps` reporting
+        // `running` with no socket and zero connections, and was_running
+        // brought it back into the same state at the next daemon start.  The
+        // contract of this function is "something will bring this client
+        // back", and at the limit nothing will, so drop_connection()'s
+        // mark_failed() is the honest end.
+        LOG_ERROR("client: the --reconnect limit was reached and this client "
+                  "will not dial again; it is left failed");
+        return false;
+    }
 
     // One timer and one request slot, because arming it again while the kernel
     // holds it races two reconnect chains and leaks the loser's fd.
