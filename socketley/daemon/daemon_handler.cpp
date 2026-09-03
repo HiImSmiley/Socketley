@@ -6025,6 +6025,13 @@ void daemon_handler::set_metrics_port(uint16_t port, bool bound)
     m_metrics_port = port;
 }
 
+// Named for what the caller means rather than exposing the reconciler itself,
+// which is an invariant of this class and not a service it offers.
+void daemon_handler::start_restored_workers()
+{
+    reconcile_proxy_workers();
+}
+
 int daemon_handler::cmd_dashboard(ipc_connection* conn)
 {
     if (m_metrics_port == 0)

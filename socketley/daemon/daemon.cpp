@@ -649,6 +649,12 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
 
+    // And fork their workers here rather than leaving it to the first health
+    // tick: restore puts a runtime in `running` and spawns nothing, so the
+    // daemon logged "daemon started" with every restored out-of-process
+    // runtime reading `Up` and no process behind it for up to two seconds.
+    handler.start_restored_workers();
+
     g_signal_write_fd = loop.get_signal_write_fd();
 
     // Ignore SIGPIPE — broken pipe errors are handled via io_uring CQE results (-EPIPE)

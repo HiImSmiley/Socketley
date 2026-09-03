@@ -70,6 +70,13 @@ public:
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);
 
+    // Called once after restore and before the loop runs.  restore_runtimes()
+    // puts a runtime in `running` and forks nothing, so the first child used
+    // to wait for the health tick: every restored out-of-process runtime read
+    // `Up` with no process behind it for up to two seconds after the daemon
+    // said it had started, and a request in that window was refused.
+    void start_restored_workers();
+
     // The identity a daemon configuration file asks for, applied at startup
     // because `daemon-name` and `daemon-cluster` both need a daemon that is
     // already serving, returning the reason on refusal and nothing on success.
