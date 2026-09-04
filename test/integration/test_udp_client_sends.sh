@@ -17,11 +17,17 @@
 #   self.send("") disconnected the sender, and a peer -- or a server's own
 #   broadcast("") -- disconnected every UDP client that received one.
 #
-# The server's total_messages is the instrument, because a Lua script cannot
-# write a file here: the sandbox opens base, package, table, string and math,
-# and io is shut.  It counts non-empty datagrams, which is what makes case B
+# The server's total_messages is the instrument because it is the SERVER's own
+# count, and what these cases assert is delivery rather than what the script
+# did with it.  It counts non-empty datagrams, which is what makes case B
 # readable -- the empty one is not in the total either way, so the number is
 # about what came AFTER it.
+#
+# (An earlier version of this comment said a Lua script cannot write a file
+# here.  That is the DAEMON CONFIG loader, which opens base, package, table,
+# string and math; a runtime script gets io and package too, and
+# lua_context's constructor says as much: "This is not a sandbox and says so".
+# Verified by writing a file from on_client_message.)
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
