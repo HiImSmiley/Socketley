@@ -593,8 +593,26 @@ and every cache flag \(em is refused with
 and exit status 1; change those through the editor or
 .BR import ,
 which reach the full field set.
-The TLS flags are the exception to that wording. Editing is the usual way to
-put encryption on something already running, so on
+.PP
+Every flag
+.B edit
+accepts on a
+.I running
+runtime is stored and takes effect at that runtime's next start, not at once.
+A runtime lives in its own process, and that process reads its configuration
+once, when it is forked; nothing sends it another. So
+.B show
+reports the new value while the runtime holding the port keeps the old one,
+until
+.RB "\(oq" "socketley restart " name "\(cq."
+The flags that cannot even be stored while running say so and change nothing:
+.BR \-p ,
+.B \-\-listen
+and
+.BR \-\-shards .
+.PP
+The TLS flags are an exception only in what they refuse. Editing is the usual
+way to put encryption on something that already exists, so on
 .I every
 runtime type
 .BR \-\-tls ,
@@ -607,10 +625,9 @@ and
 .B \-\-client\-cert
 and
 .B \-\-client\-key
-\(em are accepted here and take effect at the runtime's next start.
-Certificates are read when a runtime starts, so a running one keeps the
-identity it handshook with until it is restarted. An edit that would leave the
-set incomplete \(em a certificate with no
+\(em are accepted here. Certificates are read when a runtime starts, so a
+running one keeps the identity it handshook with until it is restarted. An edit
+that would leave the set incomplete \(em a certificate with no
 .BR \-\-tls ,
 .B \-\-tls
 with no key pair on a listener, half a client-certificate pair, or
