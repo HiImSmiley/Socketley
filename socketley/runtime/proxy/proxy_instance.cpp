@@ -1452,7 +1452,12 @@ bool proxy_instance::setup(event_loop& loop)
         int opt = 1;
         setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-        setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+        // Once here rather than seven times per accept: accept clones the
+        // listener's socket, so every client already carries these.  The
+        // backend connect below keeps tune_socket(), because a connect has no
+        // listener to inherit from.
+        socket_tuning::tcp_listener_defaults(m_listen_fd, SOCK_BUF_SIZE, SOCK_BUF_SIZE);
 
         // No TCP_DEFER_ACCEPT, because a client-speaks-first protocol does not
         // make it free -- a SYN-RECV connection is dropped without FIN or RST
@@ -2298,11 +2303,10 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
             }
         }
 
-        // Everything tune_socket sets is TCP-level, so a client accepted off a
-        // unix listener has nothing to hear from it — same reasoning, and the
-        // same cost argument, as the backend connect's family guard.
-        if (m_bound_listen_path.empty())
-            tune_socket(client_fd);
+        // Nothing here any more: the listener carries all seven, and accept
+        // hands them down.  A client accepted off a unix listener never had
+        // them -- everything tune_socket sets is TCP-level -- and still does
+        // not.
 
         // Auth check: reject before allocating connection state
         if (!invoke_on_auth(client_fd))

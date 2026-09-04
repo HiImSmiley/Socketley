@@ -26,4 +26,34 @@ inline void keepalive_dead_peer(int fd)
     if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt))   < 0) {}
 }
 
+// The options an accepted TCP socket takes from its listener, set once there
+// instead of once per connection.  Linux clones the listener's `sock` on
+// accept, so nonagle, SOCK_KEEPOPEN with its three timers and both buffer
+// sizes are already on every child.
+//
+// Verified on this kernel rather than assumed: a listener carrying all of them
+// hands each accepted socket exactly those values, while a plain listener's
+// children get the defaults (nodelay off, keepalive off, 7200/75/9).
+//
+// AF_UNIX is NOT the same, and that is why this is named for TCP: an accepted
+// unix socket takes the default receive buffer whatever its listener holds, so
+// a unix accept path still sets its own.
+//
+// Fixing the buffer sizes turns off TCP autotuning by setting SOCK_*BUF_LOCK.
+// That is unchanged by moving it here -- every accepted socket was locked
+// individually before -- but it is a decision, and it now sits in one place
+// where it can be revisited.
+inline void tcp_listener_defaults(int fd, int rcvbuf, int sndbuf)
+{
+    int on = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {}
+
+    keepalive_dead_peer(fd);
+
+    if (rcvbuf > 0)
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
+    if (sndbuf > 0)
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {}
+}
+
 }  // namespace socket_tuning

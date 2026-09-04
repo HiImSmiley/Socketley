@@ -1407,7 +1407,12 @@ bool server_instance::setup_tcp_listener(uint16_t port)
     int opt = 1;
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(m_listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(m_listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    // Once here rather than six times per accept: everything below is cloned
+    // onto every connection this listener hands out.  On a connection storm --
+    // which the comment below says this path is measured on -- that was six
+    // syscalls per accept for values the socket already had.
+    socket_tuning::tcp_listener_defaults(m_listen_fd, 131072, 0);
 
     // No TCP_DEFER_ACCEPT, because a connection in SYN-RECV is one this server
     // does not know exists -- no on_connect, no count, and silently dropped
@@ -2369,18 +2374,18 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
         return false;
     }
 
-    int opt = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    // A peer that loses power sends no FIN, and a server with no
-    // --idle-timeout holds that connection for ever.  TCP-level, so a
-    // client accepted off a unix listener does not spend the syscalls.
-    if (!from_unix)
-        socket_tuning::keepalive_dead_peer(client_fd);
-
-    // Larger socket receive buffer reduces kernel-to-user copies
-    int rcvbuf = 131072;  // 128KB
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    // Nothing for a TCP client: setup_tcp_listener() carries TCP_NODELAY, the
+    // keepalive trio and the receive buffer, and accept clones all of them.
+    //
+    // A unix client is not the same and keeps its own call: an accepted
+    // AF_UNIX socket takes the DEFAULT receive buffer whatever its listener
+    // holds -- measured, 212992 either way -- so this is the one of the six
+    // that a unix listener cannot hand down.
+    if (from_unix)
+    {
+        int rcvbuf = 131072;  // 128KB, fewer kernel-to-user copies
+        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
+    }
 
     auto conn = pool_acquire(client_fd);
     conn->partial.reserve(8192);
