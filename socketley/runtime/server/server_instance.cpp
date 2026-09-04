@@ -2907,10 +2907,23 @@ reparse:
                 continue;
             }
 
+            // Whether a fragmented message is open, read off the opcode rather
+            // than off ws_frag_len because a leading fragment may be empty.
+            const bool message_open = conn->ws_frag_opcode != 0;
+
+            // RFC 6455 5.4: a continuation belongs to a message that is open,
+            // and a new message may not start inside one -- both of which were
+            // silently concatenated into whatever was being reassembled.
+            if (SOCKETLEY_UNLIKELY((frame.opcode == WS_OP_CONT) != message_open))
+            {
+                fail_ws_connection(conn);
+                break;
+            }
+
             // Compact only when this frame is part of a reassembly, because
             // the unfragmented fast path reads from payload_ptr into partial
             // and compacting first shifts the payload by header and mask.
-            const bool needs_compaction = !frame.fin || conn->ws_frag_len > 0;
+            const bool needs_compaction = !frame.fin || message_open;
             if (frame.payload_len > 0 && needs_compaction)
             {
                 std::memmove(conn->partial.data() + conn->ws_frag_len,
@@ -2920,11 +2933,11 @@ reparse:
             if (!frame.fin)
             {
                 // Non-final fragment: record opcode from first fragment, accumulate
-                if (conn->ws_frag_len == 0)
+                if (!message_open)
                     conn->ws_frag_opcode = frame.opcode;
                 conn->ws_frag_len += frame.payload_len;
             }
-            else if (conn->ws_frag_len > 0)
+            else if (message_open)
             {
                 // Final fragment of a fragmented message — deliver complete reassembled payload
                 conn->ws_frag_len += frame.payload_len;

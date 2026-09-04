@@ -27,6 +27,17 @@
 # cache or proxy in front of this listener reads as a second request.  Measured
 # on 04ceac98, an unmasked TEXT frame came back echoed.
 #
+# ─── AND TWO THAT REASSEMBLED INTO SOMETHING NOBODY SENT ───────────────────
+#
+# RFC 6455 5.4 gives a fragmented message exactly one shape: one data frame
+# with FIN=0, then continuations, then a continuation with FIN=1.  Neither of
+# the two ways out of it was checked.  A CONTINUATION with no message open was
+# delivered as a message of its own; a new TEXT frame arriving INSIDE an open
+# message was appended to it, so two messages a client sent separately reached
+# the script as one string.  Measured on 04ceac98: a stray continuation
+# carrying "stray" echoed back "R:stray", and TEXT("AA") + TEXT("BB") with the
+# first not final echoed back "R:AABB".
+#
 # ─── HOW IT IS ASSERTED ────────────────────────────────────────────────────
 #
 # Each case opens its own connection, sends the bad frame, then sends a
@@ -154,6 +165,25 @@ classify("fragmented_ping", frame(b"ab", 0x9, fin=False))
 classify("oversize_ping",   frame(b"x" * 200, 0x9))
 classify("huge_declared",   frame(b"", 0x1, forced_len=100 * 1024 * 1024))
 classify("unmasked_text",   frame(b"unmasked", 0x1, mask=False))
+classify("stray_cont",      frame(b"stray", 0x0))
+classify("text_in_message", frame(b"AA", 0x1, fin=False) + frame(b"BB", 0x1))
+
+# The legal fragmentation, so that "refuse the illegal shapes" cannot be passed
+# by a build that refuses every fragmented message there is.
+s = handshake()
+if s is None:
+    print("legal_fragments NOUPGRADE")
+else:
+    s.sendall(frame(b"AA", 0x1, fin=False) + frame(b"BB", 0x0, fin=False)
+              + frame(b"CC", 0x0))
+    s.settimeout(2.0)
+    try:
+        d = s.recv(64)
+        print("legal_fragments " + ("CLOSE" if d and d[0] == 0x88
+                                    else "ECHO:" + d[2:].decode("latin1") if d else "EOF"))
+    except socket.timeout:
+        print("legal_fragments WEDGED")
+    s.close()
 PYEOF
 
 verdict() { awk -v k="$1" '$1 == k { print $2; exit }' "$SOCKETLEY_TMPD/out.txt"; }
@@ -167,7 +197,8 @@ else
         "nothing below can be told apart if a good frame is not answered"
 fi
 
-for case in fragmented_ping oversize_ping huge_declared unmasked_text; do
+for case in fragmented_ping oversize_ping huge_declared unmasked_text \
+            stray_cont text_in_message; do
     GOT=$(verdict "$case")
     case "$GOT" in
         CLOSE1002)
@@ -182,12 +213,24 @@ for case in fragmented_ping oversize_ping huge_declared unmasked_text; do
             bad "$case is failed with 1002" \
                 "the connection was answered with '${GOT#ECHO:}' instead;" \
                 "for unmasked_text that is the second defect: the frame was taken" \
-                "as data, where RFC 6455 5.1 says to fail the connection" ;;
+                "as data, where RFC 6455 5.1 says to fail the connection;" \
+                "for stray_cont and text_in_message it is the third: the frames were" \
+                "reassembled into a message no client sent as one" ;;
         *)
             bad "$case is failed with 1002" \
                 "the connection reported '${GOT:-<nothing>}' rather than a 1002 close" ;;
     esac
 done
+
+LEGAL=$(verdict legal_fragments)
+if [ "$LEGAL" = "ECHO:R:AABBCC" ]; then
+    ok "a legally fragmented message still reassembles ($LEGAL)"
+else
+    bad "the fragmentation rules refuse only what breaks them" \
+        "one message sent as TEXT(AA)+CONT(BB)+CONT(CC,fin) came back as '${LEGAL:-<nothing>}';" \
+        "R:AABBCC is what reassembly owes, and anything else means the checks above" \
+        "are passing by refusing fragmentation altogether"
+fi
 
 # The runtime survives all of it -- failing a connection is not failing a
 # server, and a build that closed by falling over would pass every line above.
