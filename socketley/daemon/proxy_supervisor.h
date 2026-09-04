@@ -221,7 +221,10 @@ public:
     // Block until this child has installed a declaration other than
     // `previous`, read before send_reload() so a frame arriving between the
     // two is not mistaken for the one waited on.
-    bool await_routes(const void* previous, std::chrono::milliseconds bound);
+    // A deadline and not a bound, because the caller waits on one of these per
+    // runtime and a bound each is a bound times however many were named.
+    bool await_routes(const void* previous,
+                      std::chrono::steady_clock::time_point deadline);
 
     // Why this child's last reload failed, cleared by send_reload() and set
     // before the `routes` frame, taken rather than peeked because one reload

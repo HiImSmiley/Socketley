@@ -3772,9 +3772,17 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
     // with the same consequence for map requests.
     const worker_wait_scope reload_waiting{m_worker_wait_depth};
 
+    // One deadline for the command and not one per runtime: `reload-lua` takes
+    // a pattern, and a bound each meant a wedged worker multiplied the whole
+    // daemon's blocked time by however many runtimes the pattern named --
+    // measured at exactly 2.0 s per runtime, until the CLI's own 5 s deadline
+    // cut in and reported the daemon as unreachable.  The restart loop a
+    // hundred lines above already shares one, for the same stated reason.
+    const auto routes_deadline = std::chrono::steady_clock::now() + worker_startup_bound;
+
     for (auto& [sup, prev, name] : pending)
     {
-        if (!sup->await_routes(prev, worker_startup_bound))
+        if (!sup->await_routes(prev, routes_deadline))
             LOG_WARN("reload-lua: a worker did not report its declaration in "
                      "time; the gateway keeps enforcing the previous one");
         // Read after the wait and asked of every shard, reported once from the

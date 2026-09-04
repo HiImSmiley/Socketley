@@ -1165,10 +1165,8 @@ bool proxy_supervisor::await_direct(uint64_t ticket,
 // and a false here is not an error, because the declaration already held is
 // still in force.
 bool proxy_supervisor::await_routes(const void* previous,
-                                    std::chrono::milliseconds bound)
+                                    std::chrono::steady_clock::time_point deadline)
 {
-    const auto deadline = std::chrono::steady_clock::now() + bound;
-
     for (;;)
     {
         poll();
