@@ -3743,7 +3743,16 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
             // Waited on through shard 0 alone, which is a statement about the
             // declaration rather than the reload, since every shard writes the
             // same `routes` frame into the same placeholder.
-            pending.emplace_back(it->second.front().get(), prev, n);
+            //
+            // And only for a runtime that HAS a script.  Without one the worker
+            // returns from on_reload() before it sends a declaration, so waiting
+            // spent the entire deadline on an answer nothing was going to send:
+            // measured 2.01s against 0.01s for a runtime carrying a script, with
+            // the daemon answering nothing at all meanwhile.  A scriptless
+            // runtime declares no routes either way, so there is nothing the
+            // publish below could carry that this wait would have improved.
+            if (inst && !inst->get_lua_script_path().empty())
+                pending.emplace_back(it->second.front().get(), prev, n);
             continue;
         }
 
