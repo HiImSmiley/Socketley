@@ -18,6 +18,9 @@
 // Properties checked, beyond "did it crash":
 //   * a frame the parser accepts must fit entirely inside the bytes it was
 //     given, and `consumed` must never exceed them;
+//   * `invalid` is final: once the parser calls a prefix invalid, every longer
+//     prefix of the same bytes must be invalid too, because the caller closes
+//     the connection on that verdict and cannot take it back;
 //   * the copying parser and the in-place parser must agree — they are two
 //     implementations of the same header decode plus the same unmask, and the
 //     in-place one is what the hot path uses;
@@ -44,7 +47,8 @@ void one_frame(const uint8_t* data, size_t size)
 
     // --- header decode ---
     ws_header hdr{};
-    bool hdr_ok = ws_parse_header(reinterpret_cast<const char*>(data), size, hdr);
+    ws_parse hdr_r = ws_parse_header(reinterpret_cast<const char*>(data), size, hdr);
+    const bool hdr_ok = hdr_r == ws_parse::ok;
 
     if (hdr_ok)
     {
@@ -65,8 +69,9 @@ void one_frame(const uint8_t* data, size_t size)
 
     // --- copying parse ---
     ws_frame copy_out;
-    bool copy_ok = ws_parse_frame(reinterpret_cast<const char*>(data), size, copy_out);
-    FUZZ_CHECK(copy_ok == hdr_ok, "ws_parse_frame and ws_parse_header disagree on whether the frame is complete");
+    ws_parse copy_r = ws_parse_frame(reinterpret_cast<const char*>(data), size, copy_out);
+    const bool copy_ok = copy_r == ws_parse::ok;
+    FUZZ_CHECK(copy_r == hdr_r, "ws_parse_frame and ws_parse_header disagree on what the frame is");
     if (copy_ok)
     {
         FUZZ_CHECK(copy_out.consumed <= size, "ws_parse_frame consumed more bytes than it was given");
@@ -76,8 +81,9 @@ void one_frame(const uint8_t* data, size_t size)
     // --- in-place parse, on a private copy since it rewrites the buffer ---
     std::vector<char> scratch(data, data + size);
     ws_frame_view view{};
-    bool inplace_ok = ws_parse_frame_inplace(scratch.data(), scratch.size(), view);
-    FUZZ_CHECK(inplace_ok == copy_ok, "the copying and in-place frame parsers disagree on whether the frame is complete");
+    ws_parse inplace_r = ws_parse_frame_inplace(scratch.data(), scratch.size(), view);
+    const bool inplace_ok = inplace_r == ws_parse::ok;
+    FUZZ_CHECK(inplace_r == copy_r, "the copying and in-place frame parsers disagree on what the frame is");
 
     if (inplace_ok)
     {
@@ -106,7 +112,7 @@ void round_trip(const uint8_t* data, size_t size)
 
     std::string framed = ws_frame_text(payload);
     ws_frame out;
-    FUZZ_CHECK(ws_parse_frame(framed.data(), framed.size(), out),
+    FUZZ_CHECK(ws_parse_frame(framed.data(), framed.size(), out) == ws_parse::ok,
                "a frame produced by ws_frame_text did not parse back");
     FUZZ_CHECK(out.opcode == WS_OP_TEXT, "a text frame round-tripped to a different opcode");
     FUZZ_CHECK(out.consumed == framed.size(), "a round-tripped frame reported the wrong consumed length");
@@ -114,7 +120,7 @@ void round_trip(const uint8_t* data, size_t size)
 
     std::string pong = ws_frame_pong(payload);
     ws_frame pout;
-    FUZZ_CHECK(ws_parse_frame(pong.data(), pong.size(), pout),
+    FUZZ_CHECK(ws_parse_frame(pong.data(), pong.size(), pout) == ws_parse::ok,
                "a frame produced by ws_frame_pong did not parse back");
     FUZZ_CHECK(pout.opcode == WS_OP_PONG, "a pong frame round-tripped to a different opcode");
     FUZZ_CHECK(pout.payload.size() <= 125, "ws_frame_pong emitted a control frame larger than RFC 6455 allows");
@@ -150,6 +156,30 @@ void accept_key(const uint8_t* data, size_t size)
     FUZZ_CHECK(resp.find(a) != std::string::npos, "the handshake response does not carry the accept key it derived");
 }
 
+// Invalidity has to be monotone in the bytes received, and that is the whole
+// point of the tri-state: a caller closes on `invalid` and waits on
+// `incomplete`, so a verdict that could go back from invalid to incomplete
+// would be a connection closed on a frame that was merely short -- and a
+// verdict that never reaches invalid at all is the hang this replaced.
+void invalid_is_final(const uint8_t* data, size_t size)
+{
+    if (size < 2 || size > 4096)
+        return;
+
+    bool seen_invalid = false;
+    for (size_t n = 2; n <= size; n++)
+    {
+        ws_header hdr{};
+        const ws_parse r = ws_parse_header(reinterpret_cast<const char*>(data), n, hdr);
+        if (seen_invalid)
+            FUZZ_CHECK(r == ws_parse::invalid,
+                       "a header called invalid at n bytes was called something else at n+1 -- "
+                       "a caller that closed on the first verdict closed on a short read");
+        else if (r == ws_parse::invalid)
+            seen_invalid = true;
+    }
+}
+
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -163,6 +193,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         return 0;
 
     one_frame(data, size);
+    invalid_is_final(data, size);
     round_trip(data, size);
     accept_key(data, size);
 
@@ -176,7 +207,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         while (off < scratch.size() && guard++ < 4096)
         {
             ws_frame_view v{};
-            if (!ws_parse_frame_inplace(scratch.data() + off, scratch.size() - off, v))
+            if (ws_parse_frame_inplace(scratch.data() + off, scratch.size() - off, v) != ws_parse::ok)
                 break;
             FUZZ_CHECK(v.consumed > 0, "an accepted frame consumed zero bytes — the drain loop would spin forever");
             FUZZ_CHECK(off + v.consumed <= scratch.size(), "a frame consumed past the end of the remaining buffer");

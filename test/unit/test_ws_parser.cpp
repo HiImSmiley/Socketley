@@ -35,8 +35,8 @@ TEST_CASE("ws_parse_frame: unmasked text frame")
 {
     std::string frame = ws_frame_text("test");
     ws_frame out;
-    bool ok = ws_parse_frame(frame.data(), frame.size(), out);
-    CHECK(ok);
+    ws_parse ok = ws_parse_frame(frame.data(), frame.size(), out);
+    CHECK(ok == ws_parse::ok);
     CHECK(out.opcode == WS_OP_TEXT);
     CHECK(out.payload == "test");
     CHECK(out.consumed == frame.size());
@@ -57,8 +57,8 @@ TEST_CASE("ws_parse_frame: masked text frame")
         raw[6 + i] = hello[i] ^ mask[i % 4];
 
     ws_frame out;
-    bool ok = ws_parse_frame(raw, sizeof(raw), out);
-    CHECK(ok);
+    ws_parse ok = ws_parse_frame(raw, sizeof(raw), out);
+    CHECK(ok == ws_parse::ok);
     CHECK(out.opcode == WS_OP_TEXT);
     CHECK(out.payload == "Hello");
     CHECK(out.consumed == 11);
@@ -68,13 +68,13 @@ TEST_CASE("ws_parse_frame: incomplete frame")
 {
     ws_frame out;
     // Too short
-    CHECK_FALSE(ws_parse_frame("a", 1, out));
+    CHECK(ws_parse_frame("a", 1, out) == ws_parse::incomplete);
     // Header says 5 bytes but only 4 available
     char raw[6];
     raw[0] = static_cast<char>(0x81);
     raw[1] = static_cast<char>(5);
     raw[2] = 'h'; raw[3] = 'e';
-    CHECK_FALSE(ws_parse_frame(raw, 4, out));
+    CHECK(ws_parse_frame(raw, 4, out) == ws_parse::incomplete);
 }
 
 TEST_CASE("ws_parse_frame: ping frame")
@@ -83,8 +83,8 @@ TEST_CASE("ws_parse_frame: ping frame")
     // Rewrite opcode to ping for testing
     frame[0] = static_cast<char>(0x80 | WS_OP_PING);
     ws_frame out;
-    bool ok = ws_parse_frame(frame.data(), frame.size(), out);
-    CHECK(ok);
+    ws_parse ok = ws_parse_frame(frame.data(), frame.size(), out);
+    CHECK(ok == ws_parse::ok);
     CHECK(out.opcode == WS_OP_PING);
     CHECK(out.payload == "data");
 }
@@ -93,8 +93,8 @@ TEST_CASE("ws_parse_frame: close frame")
 {
     std::string frame = ws_frame_close();
     ws_frame out;
-    bool ok = ws_parse_frame(frame.data(), frame.size(), out);
-    CHECK(ok);
+    ws_parse ok = ws_parse_frame(frame.data(), frame.size(), out);
+    CHECK(ok == ws_parse::ok);
     CHECK(out.opcode == WS_OP_CLOSE);
     CHECK(out.payload.size() == 2);
     // Status code 1000 (normal closure) in network byte order
@@ -113,8 +113,59 @@ TEST_CASE("ws_parse_frame: oversized payload rejected")
         raw[2 + i] = static_cast<char>((big_len >> (56 - 8 * i)) & 0xFF);
 
     ws_frame out;
-    // Should reject before trying to read the payload
-    CHECK_FALSE(ws_parse_frame(raw, 10, out));
+    // Rejected before trying to read the payload, and rejected as INVALID: a
+    // caller told "incomplete" here waits for 17 MB that must not arrive.
+    CHECK(ws_parse_frame(raw, 10, out) == ws_parse::invalid);
+}
+
+// ─── The three shapes that used to read as "wait for more" ───
+//
+// Each of these is a frame no peer may send, and each was answered with the
+// same `false` a two-byte prefix gets.  A server that reads that as a short
+// read holds the connection open, answers nothing further, and closes nothing.
+
+TEST_CASE("ws_parse_frame: a fragmented control frame is invalid, not incomplete")
+{
+    // FIN=0 + PING, masked, 2 bytes -- entirely present, and forbidden.
+    char raw[8];
+    raw[0] = static_cast<char>(WS_OP_PING);   // no FIN
+    raw[1] = static_cast<char>(0x82);         // masked + len 2
+    raw[2] = 0x01; raw[3] = 0x02; raw[4] = 0x03; raw[5] = 0x04;
+    raw[6] = 'a' ^ 0x01; raw[7] = 'b' ^ 0x02;
+
+    ws_frame out;
+    CHECK(ws_parse_frame(raw, sizeof(raw), out) == ws_parse::invalid);
+}
+
+TEST_CASE("ws_parse_frame: a control frame over 125 bytes is invalid")
+{
+    // PING with the 16-bit length form declaring 200 bytes (RFC 6455 5.5).
+    std::string raw;
+    raw.push_back(static_cast<char>(0x80 | WS_OP_PING));
+    raw.push_back(static_cast<char>(126));
+    raw.push_back(static_cast<char>(0));
+    raw.push_back(static_cast<char>(200));
+    raw.append(200, 'x');
+
+    ws_frame out;
+    CHECK(ws_parse_frame(raw.data(), raw.size(), out) == ws_parse::invalid);
+}
+
+TEST_CASE("ws_parse_frame: a reserved bit or a reserved opcode is invalid")
+{
+    ws_frame out;
+
+    // RSV1 set with no extension negotiated.
+    char rsv[2] = {static_cast<char>(0x81 | 0x40), 0};
+    CHECK(ws_parse_frame(rsv, sizeof(rsv), out) == ws_parse::invalid);
+
+    // Opcode 0x3: reserved for a future data frame.
+    char data_op[2] = {static_cast<char>(0x83), 0};
+    CHECK(ws_parse_frame(data_op, sizeof(data_op), out) == ws_parse::invalid);
+
+    // Opcode 0xB: reserved for a future control frame.
+    char ctrl_op[2] = {static_cast<char>(0x8B), 0};
+    CHECK(ws_parse_frame(ctrl_op, sizeof(ctrl_op), out) == ws_parse::invalid);
 }
 
 TEST_CASE("ws_accept_key: RFC 6455 example")

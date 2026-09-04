@@ -48,6 +48,19 @@ static constexpr char WS_CLOSE_FRAME_DATA[4] = {
     static_cast<char>(0xE8)                  // 1000 & 0xFF
 };
 
+// Pre-computed close frame, 1002 protocol error -- what RFC 6455 7.4.1 gives
+// for a frame that is not a frame, as against the 1000 above for a goodbye.
+static constexpr char WS_CLOSE_PROTOCOL_ERROR_DATA[4] = {
+    static_cast<char>(0x80 | WS_OP_CLOSE), // FIN + close
+    2,                                       // payload = 2 bytes
+    static_cast<char>(0x03),                 // 1002 >> 8
+    static_cast<char>(0xEA)                  // 1002 & 0xFF
+};
+
+// What a parse attempt found, because "not a frame yet" and "not a frame ever"
+// are different answers and a caller that reads both as "wait" waits forever.
+enum class ws_parse : uint8_t { ok, incomplete, invalid };
+
 struct ws_frame
 {
     uint8_t opcode;
@@ -301,14 +314,20 @@ struct ws_header
     size_t header_size;
 };
 
-// Parse WS frame header. Returns false if buffer is too short or frame is invalid.
-inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
+// Decode a WS frame header, separating a short read from a frame the peer may
+// not send at all.
+inline ws_parse ws_parse_header(const char* data, size_t len, ws_header& hdr)
 {
     if (len < 2)
-        return false;
+        return ws_parse::incomplete;
 
     uint8_t b0 = static_cast<uint8_t>(data[0]);
     uint8_t b1 = static_cast<uint8_t>(data[1]);
+
+    // The handshake response offers no Sec-WebSocket-Extensions, so a reserved
+    // bit set is a peer speaking something this end never agreed to.
+    if ((b0 & 0x70) != 0)
+        return ws_parse::invalid;
 
     hdr.opcode = b0 & 0x0F;
     hdr.fin = (b0 & 0x80) != 0;
@@ -316,16 +335,21 @@ inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
     hdr.payload_len = b1 & 0x7F;
     hdr.header_size = 2;
 
+    // 0x3-0x7 and 0xB-0xF are reserved (RFC 6455 5.2) and would otherwise be
+    // carried into reassembly as if they were data.
+    if ((hdr.opcode > WS_OP_BINARY && hdr.opcode < WS_OP_CLOSE) || hdr.opcode > WS_OP_PONG)
+        return ws_parse::invalid;
+
     if (hdr.payload_len == 126)
     {
-        if (len < 4) return false;
+        if (len < 4) return ws_parse::incomplete;
         hdr.payload_len = (static_cast<uint64_t>(static_cast<uint8_t>(data[2])) << 8) |
                            static_cast<uint64_t>(static_cast<uint8_t>(data[3]));
         hdr.header_size = 4;
     }
     else if (hdr.payload_len == 127)
     {
-        if (len < 10) return false;
+        if (len < 10) return ws_parse::incomplete;
         hdr.payload_len = 0;
         for (int i = 0; i < 8; i++)
             hdr.payload_len = (hdr.payload_len << 8) | static_cast<uint64_t>(static_cast<uint8_t>(data[2 + i]));
@@ -333,31 +357,32 @@ inline bool ws_parse_header(const char* data, size_t len, ws_header& hdr)
     }
 
     if (hdr.payload_len > WS_MAX_PAYLOAD)
-        return false;
+        return ws_parse::invalid;
 
     // Reject control frames with payload > 125 (RFC 6455 5.5)
     if (hdr.opcode >= 0x8 && hdr.payload_len > 125)
-        return false;
+        return ws_parse::invalid;
 
     // Control frames (opcode >= 0x8) MUST NOT be fragmented (RFC 6455 §5.5)
     if (hdr.opcode >= 0x8 && !hdr.fin)
-        return false;
+        return ws_parse::invalid;
 
     size_t mask_size = hdr.masked ? 4 : 0;
     size_t total = hdr.header_size + mask_size + hdr.payload_len;
     if (len < total)
-        return false;
+        return ws_parse::incomplete;
 
-    return true;
+    return ws_parse::ok;
 }
 
-// Parse one frame from the buffer, false when incomplete, unmasking the client
-// frames RFC 6455 requires be masked.
-inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
+// Parse one frame from the buffer, unmasking the client frames RFC 6455
+// requires be masked.
+inline ws_parse ws_parse_frame(const char* data, size_t len, ws_frame& out)
 {
     ws_header hdr;
-    if (!ws_parse_header(data, len, hdr))
-        return false;
+    const ws_parse r = ws_parse_header(data, len, hdr);
+    if (r != ws_parse::ok)
+        return r;
 
     out.opcode = hdr.opcode;
     size_t mask_size = hdr.masked ? 4 : 0;
@@ -379,7 +404,7 @@ inline bool ws_parse_frame(const char* data, size_t len, ws_frame& out)
     }
 
     out.consumed = total;
-    return true;
+    return ws_parse::ok;
 }
 
 // Zero-alloc frame view -- points into the (now unmasked) input buffer
@@ -394,11 +419,12 @@ struct ws_frame_view
 
 // In-place unmask parse that modifies the data buffer and points the views
 // into it.
-inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
+inline ws_parse ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
 {
     ws_header hdr;
-    if (!ws_parse_header(data, len, hdr))
-        return false;
+    const ws_parse r = ws_parse_header(data, len, hdr);
+    if (r != ws_parse::ok)
+        return r;
 
     out.opcode = hdr.opcode;
     size_t mask_size = hdr.masked ? 4 : 0;
@@ -416,7 +442,7 @@ inline bool ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& out)
     out.payload_ptr = payload_start;
     out.payload_len = hdr.payload_len;
     out.consumed = total;
-    return true;
+    return ws_parse::ok;
 }
 
 // ─── Append-to-buffer variants (zero intermediate allocation) ───
@@ -530,5 +556,12 @@ inline std::shared_ptr<const std::string> ws_frame_pong_shared(std::string_view 
 inline const std::shared_ptr<const std::string>& ws_frame_close_shared()
 {
     static const auto frame = std::make_shared<const std::string>(WS_CLOSE_FRAME_DATA, 4);
+    return frame;
+}
+
+// The same, carrying 1002 for a connection being failed over a bad frame.
+inline const std::shared_ptr<const std::string>& ws_frame_close_protocol_error_shared()
+{
+    static const auto frame = std::make_shared<const std::string>(WS_CLOSE_PROTOCOL_ERROR_DATA, 4);
     return frame;
 }

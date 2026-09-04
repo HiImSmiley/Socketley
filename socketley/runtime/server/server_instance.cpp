@@ -2850,9 +2850,24 @@ reparse:
         // Fragments are compacted in-place at partial[0..ws_frag_len) — zero heap allocs.
         ws_frame_view frame;
         size_t offset = conn->ws_frag_len; // skip accumulated fragment payloads
-        while (ws_parse_frame_inplace(conn->partial.data() + offset,
-                                       conn->partial.size() - offset, frame))
+        for (;;)
         {
+            const ws_parse got = ws_parse_frame_inplace(conn->partial.data() + offset,
+                                                        conn->partial.size() - offset, frame);
+            if (got == ws_parse::incomplete)
+                break;
+            if (SOCKETLEY_UNLIKELY(got == ws_parse::invalid))
+            {
+                // A frame that can never become one is not a short read.  Read
+                // as a short read it is asked again on every byte that follows,
+                // so the connection stops answering and is never closed either
+                // -- and with --idle-timeout off by default, that is forever.
+                conn->write_queue.push(ws_frame_close_protocol_error_shared());
+                if (!conn->write_pending)
+                    flush_write_queue(conn);
+                conn->closing = true;
+                break;
+            }
             offset += frame.consumed;
 
             // Control frames (opcode >= 0x8): process immediately, even mid-fragment
