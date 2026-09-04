@@ -335,6 +335,12 @@ int cli_dispatch(int argc, char** argv)
             {
                 std::string data;
                 const int rc = ipc_send("daemon-stop", data);
+                // Its own sentence for the absent daemon, because "no daemon is
+                // serving" is more use here than "failed to connect" -- but not
+                // for the busy one, which is serving and was being told it was
+                // not there.
+                if (rc == ipc_no_answer)
+                    return ipc_report_failure(rc);
                 if (rc < 0)
                 {
                     std::cerr << "no daemon is serving "
@@ -390,7 +396,7 @@ int cli_dispatch(int argc, char** argv)
                     std::string ipc_cmd = std::string("daemon-name ") + argv[++i];
                     std::string data;
                     int rc = ipc_send(ipc_cmd, data);
-                    if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+                    if (rc < 0) { return ipc_report_failure(rc); }
                     if (rc != 0) { if (!data.empty()) std::cerr << data; return rc; }
                 }
                 else if (arg == "--cluster" && i + 1 < argc)
@@ -398,7 +404,7 @@ int cli_dispatch(int argc, char** argv)
                     std::string ipc_cmd = std::string("daemon-cluster ") + argv[++i];
                     std::string data;
                     int rc = ipc_send(ipc_cmd, data);
-                    if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+                    if (rc < 0) { return ipc_report_failure(rc); }
                     if (rc != 0) { if (!data.empty()) std::cerr << data; return rc; }
                 }
             }
@@ -511,8 +517,7 @@ int cli_dispatch(int argc, char** argv)
             int rc = ipc_send(stop_cmd, stop_data);
             if (rc < 0)
             {
-                std::cerr << "failed to connect to daemon\n";
-                return 2;
+                return ipc_report_failure(rc);
             }
             if (rc != 0)
             {
@@ -538,8 +543,7 @@ int cli_dispatch(int argc, char** argv)
             rc = ipc_send(start_cmd, start_data);
             if (rc < 0)
             {
-                std::cerr << "failed to connect to daemon\n";
-                return 2;
+                return ipc_report_failure(rc);
             }
             if (!start_data.empty())
                 std::cout << start_data;
@@ -606,10 +610,7 @@ int cli_forward(int argc, char** argv)
     int exit_code = ipc_send(command, data);
 
     if (exit_code < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(exit_code);
 
     if (!data.empty())
         std::cout << data;
@@ -668,10 +669,7 @@ int cli_send(int argc, char** argv)
     int exit_code = ipc_send(command, data);
 
     if (exit_code < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(exit_code);
 
     if (!data.empty())
         std::cout << data;
@@ -708,10 +706,7 @@ int cli_stdin_send(int /*argc*/, char** argv)
     int exit_code = ipc_send(command, data);
 
     if (exit_code < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(exit_code);
 
     if (!data.empty())
         std::cout << data;
@@ -805,10 +800,7 @@ int cli_import(int argc, char** argv)
     int exit_code = ipc_send(command, data);
 
     if (exit_code < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(exit_code);
 
     if (!data.empty())
         std::cout << data;
@@ -870,8 +862,7 @@ int cli_edit(int argc, char** argv)
     int rc = ipc_send("dump " + name, dump_data);
     if (rc < 0)
     {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
+        return ipc_report_failure(rc);
     }
     if (rc != 0)
     {
@@ -962,8 +953,7 @@ int cli_edit(int argc, char** argv)
     rc = ipc_send(import_cmd, import_data);
     if (rc < 0)
     {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
+        return ipc_report_failure(rc);
     }
     if (rc != 0)
     {
@@ -979,8 +969,7 @@ int cli_edit(int argc, char** argv)
         rc = ipc_send("reload-lua " + name, reload_data);
         if (rc < 0)
         {
-            std::cerr << "failed to connect to daemon\n";
-            return 2;
+            return ipc_report_failure(rc);
         }
         if (rc != 0 && !reload_data.empty())
             std::cerr << reload_data;
@@ -1014,10 +1003,7 @@ int cli_interactive_command(const std::string& command)
     // Connect to daemon
     int ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (ipc_fd < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(ipc_unreachable);
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -1026,8 +1012,7 @@ int cli_interactive_command(const std::string& command)
     if (connect(ipc_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
     {
         close(ipc_fd);
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
+        return ipc_report_failure(ipc_unreachable);
     }
 
     // Send the start command
@@ -1159,10 +1144,7 @@ int cli_runtime_action(int argc, char** argv)
     int exit_code = ipc_send(command, data);
 
     if (exit_code < 0)
-    {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
-    }
+        return ipc_report_failure(exit_code);
 
     if (!data.empty())
         std::cout << data;

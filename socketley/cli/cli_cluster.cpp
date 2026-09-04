@@ -436,8 +436,7 @@ int cli_cluster(int argc, char** argv)
     int rc = ipc_send("cluster-status", status);
     if (rc < 0)
     {
-        std::cerr << "failed to connect to daemon\n";
-        return 2;
+        return ipc_report_failure(rc);
     }
 
     if (status_field(status, "cluster") != "on")

@@ -499,7 +499,7 @@ int cli_config(int argc, char** argv)
         {
             std::string response;
             int rc = ipc_send("daemon-name " + *name, response);
-            if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+            if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
 
@@ -508,7 +508,7 @@ int cli_config(int argc, char** argv)
         {
             std::string response;
             int rc = ipc_send("daemon-cluster " + *cluster, response);
-            if (rc < 0) { std::cerr << "failed to connect to daemon\n"; return 2; }
+            if (rc < 0) { return ipc_report_failure(rc); }
             if (rc != 0) { if (!response.empty()) std::cerr << response; return rc; }
         }
     }
@@ -579,8 +579,7 @@ int cli_config(int argc, char** argv)
         {
             // No daemon is a different thing from a runtime that would not
             // build: nothing after this can succeed either, so it stops here.
-            std::cerr << "failed to connect to daemon\n";
-            return 2;
+            return ipc_report_failure(rc);
         }
 
         if (rc != 0)
