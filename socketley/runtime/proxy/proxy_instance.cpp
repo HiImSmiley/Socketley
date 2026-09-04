@@ -6300,9 +6300,15 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     // leave no trace -- and this is the one cancel submitted for a descriptor
     // meant to change hands, made safe by pooling only once the read came back
     // -ECANCELED.
+    //
+    // By REQUEST and not by descriptor: only_read_pending above has already
+    // established that the read is the single thing armed here, so cancelling
+    // everything on the file asks the kernel to search for the rest -- and that
+    // search is as long as the ring is busy, which is the whole connection
+    // table.  Named directly, there is nothing to search for.
     if (only_read_pending && m_loop &&
         backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
-        m_loop->submit_cancel_fd(backend_fd))
+        m_loop->submit_cancel_request(&bconn->read_req))
     {
         // The fd stays registered and the struct alive until that cancellation
         // is accounted for, or the next request picks up the fd while a

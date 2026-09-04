@@ -1916,6 +1916,27 @@ bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
     return true;
 }
 
+// Withdraw exactly the submission this user_data names.  The kernel compares
+// the key without ever dereferencing it, so a retired request's address is
+// still a safe one -- the same property submit_poll_remove() relies on.
+bool event_loop::submit_cancel_request(const io_request* target)
+{
+    if (!target)
+        return false;
+
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_cancel64(
+        sqe, static_cast<__u64>(reinterpret_cast<std::uintptr_t>(target)), 0);
+
+    // No request of its own, so no arm() and no disarm() owed; the submission
+    // being withdrawn keeps the one it already had and reports -ECANCELED.
+    io_uring_sqe_set_data(sqe, nullptr);
+    m_pending_submissions++;
+    return true;
+}
+
 bool event_loop::submit_poll_remove(io_request* target)
 {
     if (!target)

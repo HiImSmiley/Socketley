@@ -295,6 +295,12 @@ public:
     // end it.
     bool submit_poll_remove(io_request* target);
 
+    // Withdraw ONE submission by the user_data it carries, where
+    // submit_cancel_fd() withdraws everything armed on a descriptor.  The
+    // difference is what the kernel has to do to find it: a match on the file
+    // walks the ring's live requests, a match on user_data does not.
+    bool submit_cancel_request(const io_request* target);
+
     // Hand every queued SQE to the ring, which is not a barrier and not a
     // licence to close a descriptor one of them names -- close_fd() is.
     void flush();
