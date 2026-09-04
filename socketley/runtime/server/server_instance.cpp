@@ -2632,6 +2632,16 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
     }
 }
 
+// A WebSocket connection is failed by telling the peer why and then closing,
+// in one function because both of its callers are one decision made twice.
+void server_instance::fail_ws_connection(server_connection* conn)
+{
+    conn->write_queue.push(ws_frame_close_protocol_error_shared());
+    if (!conn->write_pending)
+        flush_write_queue(conn);
+    conn->closing = true;
+}
+
 // ─── THE PARSE, MADE RE-DRIVABLE ────────────────────────────────────────────
 // Lifted out of handle_read() because a read completion is not the only moment
 // `partial` can hold an unanswered request, and put in the loop and the three
@@ -2862,10 +2872,15 @@ reparse:
                 // as a short read it is asked again on every byte that follows,
                 // so the connection stops answering and is never closed either
                 // -- and with --idle-timeout off by default, that is forever.
-                conn->write_queue.push(ws_frame_close_protocol_error_shared());
-                if (!conn->write_pending)
-                    flush_write_queue(conn);
-                conn->closing = true;
+                fail_ws_connection(conn);
+                break;
+            }
+            if (SOCKETLEY_UNLIKELY(!frame.masked))
+            {
+                // RFC 6455 5.1 requires every frame from a client to be masked,
+                // and the masking is what stops a chosen payload from reading
+                // as a request to a cache or proxy in front of this listener.
+                fail_ws_connection(conn);
                 break;
             }
             offset += frame.consumed;

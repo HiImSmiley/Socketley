@@ -19,6 +19,14 @@
 # The fix gives the parser a third answer and closes on it with 1002, the
 # protocol-error code, rather than the 1000 a goodbye uses.
 #
+# ─── AND ONE THAT WAS ACCEPTED RATHER THAN AWAITED ─────────────────────────
+#
+# An UNMASKED frame from a client was parsed, delivered and answered.  RFC 6455
+# 5.1 requires the server to fail the connection, and the reason is not
+# bookkeeping: the masking is what stops a peer choosing payload bytes that a
+# cache or proxy in front of this listener reads as a second request.  Measured
+# on 04ceac98, an unmasked TEXT frame came back echoed.
+#
 # ─── HOW IT IS ASSERTED ────────────────────────────────────────────────────
 #
 # Each case opens its own connection, sends the bad frame, then sends a
@@ -91,15 +99,18 @@ def handshake():
 
 # forced_len declares a length the payload does not have, which is the whole
 # point of the third case: the bytes never arrive and must not be waited for.
-def frame(payload, opcode, fin=True, forced_len=None):
+def frame(payload, opcode, fin=True, forced_len=None, mask=True):
     h = bytearray([(0x80 if fin else 0x00) | opcode])
     n = len(payload) if forced_len is None else forced_len
+    mb = 0x80 if mask else 0x00
     if n < 126:
-        h.append(0x80 | n)
+        h.append(mb | n)
     elif n < 65536:
-        h.append(0x80 | 126); h += struct.pack("!H", n)
+        h.append(mb | 126); h += struct.pack("!H", n)
     else:
-        h.append(0x80 | 127); h += struct.pack("!Q", n)
+        h.append(mb | 127); h += struct.pack("!Q", n)
+    if not mask:
+        return bytes(h) + payload
     m = os.urandom(4); h += m
     return bytes(h) + bytes(b ^ m[i % 4] for i, b in enumerate(payload))
 
@@ -142,6 +153,7 @@ else:
 classify("fragmented_ping", frame(b"ab", 0x9, fin=False))
 classify("oversize_ping",   frame(b"x" * 200, 0x9))
 classify("huge_declared",   frame(b"", 0x1, forced_len=100 * 1024 * 1024))
+classify("unmasked_text",   frame(b"unmasked", 0x1, mask=False))
 PYEOF
 
 verdict() { awk -v k="$1" '$1 == k { print $2; exit }' "$SOCKETLEY_TMPD/out.txt"; }
@@ -155,7 +167,7 @@ else
         "nothing below can be told apart if a good frame is not answered"
 fi
 
-for case in fragmented_ping oversize_ping huge_declared; do
+for case in fragmented_ping oversize_ping huge_declared unmasked_text; do
     GOT=$(verdict "$case")
     case "$GOT" in
         CLOSE1002)
@@ -166,6 +178,11 @@ for case in fragmented_ping oversize_ping huge_declared; do
                 "that is the defect: an invalid frame was reported as a short read," \
                 "so the loop waits for bytes that would not have helped, and with" \
                 "--idle-timeout unset nothing ever collects the connection" ;;
+        ECHO:*)
+            bad "$case is failed with 1002" \
+                "the connection was answered with '${GOT#ECHO:}' instead;" \
+                "for unmasked_text that is the second defect: the frame was taken" \
+                "as data, where RFC 6455 5.1 says to fail the connection" ;;
         *)
             bad "$case is failed with 1002" \
                 "the connection reported '${GOT:-<nothing>}' rather than a 1002 close" ;;

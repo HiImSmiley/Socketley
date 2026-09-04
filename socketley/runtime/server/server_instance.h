@@ -648,6 +648,10 @@ private:
     void refuse_http_request(server_connection* conn,
                              const std::shared_ptr<const std::string>& resp);
 
+    // End a WebSocket connection over a frame that broke the protocol, with
+    // 1002 rather than the 1000 a goodbye carries.
+    void fail_ws_connection(server_connection* conn);
+
     // Upstream helpers
     bool upstream_try_connect(upstream_connection* uc);
     void upstream_schedule_reconnect(upstream_connection* uc);

@@ -412,6 +412,9 @@ struct ws_frame_view
 {
     uint8_t opcode;
     bool fin;
+    // Whether the peer masked it, reported rather than judged here because RFC
+    // 6455 requires it of a client and forbids it of a server.
+    bool masked;
     const char* payload_ptr;
     size_t payload_len;
     size_t consumed;
@@ -439,6 +442,7 @@ inline ws_parse ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& ou
     }
 
     out.fin = hdr.fin;
+    out.masked = hdr.masked;
     out.payload_ptr = payload_start;
     out.payload_len = hdr.payload_len;
     out.consumed = total;
