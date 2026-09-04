@@ -5699,8 +5699,22 @@ bool cache_instance::flush_responses(client_connection* conn)
     if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() &&
                          !conn->zc_notif_pending && conn->ssl == nullptr))
     {
-        conn->write_batch[0] = std::move(conn->response_buf);
-        conn->response_buf.reserve(4096);
+        // swap and clear, not move and reserve.  The move destroyed
+        // write_batch[0]'s buffer and stole response_buf's, leaving
+        // response_buf empty -- so the reserve had to allocate again, and both
+        // sizes are over glibc's tcache bound (1032 B), which puts the pair in
+        // the small-bin path.  One free and one malloc per FLUSH, and with a
+        // pipeline depth of one that is per request.
+        //
+        // The swap keeps both buffers alive: the batch takes the answer, and
+        // response_buf takes the batch's previous allocation, cleared.  Safe
+        // here and only here, because the fast path is gated on
+        // !write_pending -- what write_batch[0] still holds is a write that
+        // has completed.  The two settle at the largest response this
+        // connection has sent, which is what reserve(4096) was already aiming
+        // at from below.
+        conn->write_batch[0].swap(conn->response_buf);
+        conn->response_buf.clear();
         conn->write_iovs[0].iov_base = conn->write_batch[0].data();
         conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
         conn->write_batch_count = 1;
