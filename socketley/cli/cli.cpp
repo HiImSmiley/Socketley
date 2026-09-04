@@ -487,11 +487,15 @@ int cli_dispatch(int argc, char** argv)
                 return 1;
             }
 
+            bool want_interactive = false;
             for (int i = 3; i < argc; ++i)
             {
                 std::string_view arg = argv[i];
                 if (arg == "-i")
+                {
+                    want_interactive = true;
                     continue;
+                }
                 std::cerr << "restart does not take " << arg << "\n"
                           << "  It stops the runtime and starts it again with the "
                              "configuration it already has.\n"
@@ -522,6 +526,14 @@ int cli_dispatch(int argc, char** argv)
                 start_cmd += ' ';
                 start_cmd += argv[i];
             }
+
+            // The half that -i belongs to, and the reason this is not a plain
+            // send: the daemon honours -i on whatever connection it arrives on,
+            // so ipc_send registered the session and closed it in the same
+            // breath.
+            if (want_interactive)
+                return cli_interactive_command(start_cmd);
+
             std::string start_data;
             rc = ipc_send(start_cmd, start_data);
             if (rc < 0)
@@ -994,7 +1006,11 @@ int cli_interactive(int argc, char** argv)
         if (i > 1) command += ' ';
         command += argv[i];
     }
+    return cli_interactive_command(command);
+}
 
+int cli_interactive_command(const std::string& command)
+{
     // Connect to daemon
     int ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (ipc_fd < 0)
