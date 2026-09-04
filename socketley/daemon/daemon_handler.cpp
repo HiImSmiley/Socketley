@@ -2760,19 +2760,18 @@ int daemon_handler::cmd_action(ipc_connection* conn, const parsed_args& pa)
                 conn->write_buf = "usage: <runtime> send <message>\n";
                 return 1;
             }
-            std::string_view message = pa.rest_from(3);
-
-            if (type == runtime_server)
+            // deliver_to_runtime(), which is what `socketley send NAME MSG`
+            // has always used.  This spelling called broadcast()/lua_send() on
+            // the PLACEHOLDER, and every CLI runtime is one -- cmd_create marks
+            // them out-of-process -- so its connection table is empty and the
+            // message went nowhere, with rc 0.  Two spellings of one verb, one
+            // of which worked; deliver_to_runtime says so in its own comment
+            // and routes to the worker.
+            std::string why;
+            if (!deliver_to_runtime(name, pa.rest_from(3), why))
             {
-                auto* srv = static_cast<server_instance*>(instance);
-                if (srv->get_mode() != mode_in)
-                    srv->broadcast(message);
-            }
-            else
-            {
-                auto* cli = static_cast<client_instance*>(instance);
-                if (cli->get_mode() != client_mode_in)
-                    cli->lua_send(message);
+                conn->write_buf = why + "\n";
+                return 1;
             }
             return 0;
         }
