@@ -15,9 +15,23 @@
 # runs in.  The window is not a race in the usual sense -- it is deterministic,
 # and it closes on a timer that has nothing to do with the runtime.
 #
-# So the assertion is made IMMEDIATELY after daemon_start returns, which waits
-# for "daemon started" and nothing more.  A sleep here would hide the defect
-# this file exists for.
+# So the assertion is made IMMEDIATELY after the daemon says it started.  A
+# sleep here would hide the defect this file exists for.
+#
+# ─── AND IT ASKS FOR THE CHILD, NOT FOR THE PORT ───────────────────────────
+#
+# The first version of this file asked whether the port answered on the first
+# request, and that is one step too far: the fix issues the FORK before the
+# loop runs, and the worker still has to exec, build its ring and bind.  Under
+# the sanitizer that takes long enough to lose the race -- measured, one run in
+# three failed alone -- so the file was reporting the build's startup cost as
+# the defect.
+#
+# What the fix establishes is that a child exists at all, and that separates
+# the two builds without a clock in it: measured right after "daemon started",
+# this build reports a pid and one daemon child in both configurations, and
+# 04ceac98 reports none and zero.  Serving is asserted below with a bounded
+# wait, where it belongs.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -83,18 +97,33 @@ restart_daemon() {
 restart_daemon
 
 # Everything from here to the first health tick is the window.
-FIRST=$(serves "$P")
-PIDCOL=$("$BIN" ls 2>/dev/null | awk '$2 == "rs" { print $1; exit }')
+FORKED_PID=$("$BIN" stats rs 2>/dev/null | awk -F: '$1=="pid"{print $2;exit}')
+KIDS=$(pgrep -P "$SOCKETLEY_DPID" 2>/dev/null | wc -l)
 STATE=$("$BIN" ls 2>/dev/null | awk '$2 == "rs" { print $7; exit }')
 
-if [ "$FIRST" = "yes" ]; then
-    ok "the restored runtime answers on the first request after 'daemon started'"
+if [ -n "$FORKED_PID" ] && [ "$FORKED_PID" != "0" ] && [ "${KIDS:-0}" -ge 1 ]; then
+    ok "the restored runtime already has a worker (pid $FORKED_PID, $KIDS daemon child)"
 else
     bad "a restored runtime has a process when the daemon says it is up" \
-        "the first request got '$FIRST' while ls said '${STATE:-<none>}' (id ${PIDCOL:-<none>});" \
-        "Up with a refused connection is restore_runtimes() setting the state and" \
-        "leaving the fork to the health tick, up to two seconds later -- which is" \
-        "the whole of a restart script, and of a supervisor restarting the daemon"
+        "stats reported pid '${FORKED_PID:-<none>}' and the daemon has ${KIDS:-0} child(ren)," \
+        "while ls said '${STATE:-<none>}';" \
+        "Up with no child is restore_runtimes() setting the state and leaving the fork" \
+        "to the health tick, up to two seconds later -- which is the whole of a restart" \
+        "script, and of a supervisor restarting the daemon"
+fi
+
+# And it serves, with a bound rather than on the first try: the fork is what
+# this fix owes, and binding is the worker's own startup, which the sanitizer
+# build makes slow enough to race.
+SERVED=no
+for _ in $(seq 1 60); do
+    [ "$(serves "$P")" = "yes" ] && { SERVED=yes; break; }
+    sleep 0.5
+done
+if [ "$SERVED" = "yes" ]; then
+    ok "and it answers once its worker has bound"
+else
+    bad "the restored runtime serves again" "it never answered within 30 s"
 fi
 
 # And it stays up, so the assertion above is about the window and not about a
