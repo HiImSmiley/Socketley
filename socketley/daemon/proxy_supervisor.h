@@ -214,7 +214,9 @@ public:
     // Ask the child to re-run its script, which is the only way `reload-lua`
     // reaches an out-of-process runtime, answered with the `routes` frame
     // await_routes() waits for.
-    void send_reload();
+    // `lua_path` is the script the daemon believes this runtime has, empty
+    // when the caller has nothing to add; the worker keeps its own on empty.
+    void send_reload(std::string_view lua_path = {});
 
     // Block until this child has installed a declaration other than
     // `previous`, read before send_reload() so a frame arriving between the

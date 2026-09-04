@@ -3737,7 +3737,8 @@ int daemon_handler::cmd_reload_lua(ipc_connection* conn, const parsed_args& pa)
             // leave the others serving the file the operator has just
             // replaced.
             for (auto& sup : it->second)
-                sup->send_reload();
+                sup->send_reload(inst ? inst->get_lua_script_path()
+                                      : std::string_view{});
 
             // Waited on through shard 0 alone, which is a statement about the
             // declaration rather than the reload, since every shard writes the

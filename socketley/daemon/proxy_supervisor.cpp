@@ -852,13 +852,21 @@ void proxy_supervisor::send_stop()
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::stop, {}))) {}
 }
 
-void proxy_supervisor::send_reload()
+void proxy_supervisor::send_reload(std::string_view lua_path)
 {
     // Cleared at the ask rather than at the answer, because a clean reload
     // sends nothing and "no reload_err since the ask" is the only shape
     // success has.
     m_reload_error.clear();
-    if (!write_frame(worker_proto::frame(worker_proto::frame_type::reload, {}))) {}
+
+    // The path goes with the ask.  The frame used to be empty, so the worker
+    // reloaded the path it was SPAWNED with -- and `socketley edit NAME -r`,
+    // which is dump, editor, import, reload-lua, changes exactly that path on
+    // the placeholder.  The documented way to edit a script therefore reloaded
+    // the old one.  An empty payload still means "the path you have", which is
+    // what every caller that has nothing better to say sends.
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::reload,
+                                         lua_path))) {}
 }
 
 std::string proxy_supervisor::take_reload_error()

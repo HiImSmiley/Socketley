@@ -704,7 +704,7 @@ private:
             case worker_proto::frame_type::deliver:   on_deliver(payload);   break;
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
-            case worker_proto::frame_type::reload:    on_reload();           break;
+            case worker_proto::frame_type::reload:    on_reload(payload);    break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
 
             // Anything else is a frame this build predates or one that only
@@ -1986,9 +1986,23 @@ private:
     // `reload-lua` reached this runtime, and the answer goes back
     // unconditionally -- unlike on_config() -- because an empty frame is what
     // withdraws a declaration the script has removed.
-    void on_reload()
+    void on_reload(std::string_view lua_path)
     {
-        if (!m_rt || m_rt->get_lua_script_path().empty())
+        if (!m_rt)
+            return;
+
+        // A path on the frame replaces the one this worker was spawned with.
+        // Without it, `socketley edit NAME -r` -- dump, editor, import,
+        // reload-lua -- reloaded the script the worker already had, because
+        // import changes the path on the PLACEHOLDER and nothing carried it
+        // down.  Empty means "keep yours", which is what a plain `reload-lua`
+        // sends.
+        if (!lua_path.empty() && lua_path != m_rt->get_lua_script_path())
+            if (!m_rt->load_lua_script(lua_path))
+                LOG_WARN("proxy worker: the new script path did not load; "
+                         "the previous script stays in force");
+
+        if (m_rt->get_lua_script_path().empty())
             return;
         // A script that will not compile leaves the previous one in force, so
         // the declaration below is still the right answer, but the reason goes
