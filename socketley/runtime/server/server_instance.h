@@ -6,6 +6,7 @@
 #include <memory>
 #include <queue>
 #include <vector>
+#include <chrono>
 #include <netinet/in.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -705,6 +706,26 @@ private:
     void udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
     int find_or_add_peer(const struct sockaddr_in& addr);
 
+    // The idle sweep's own arm, because setup() has two exits -- the UDP path
+    // returns before the TCP path ever reaches the arm, so --idle-timeout was
+    // accepted and did nothing on a UDP server.
+    void arm_idle_sweep();
+
+    // And its withdrawal, for the same reason at the other end: teardown() has
+    // the same two exits, and a timer this instance armed and did not withdraw
+    // is a completion the ring still owes it -- which keeps the whole instance
+    // in the manager's graveyard until the timeout fires on its own.
+    void withdraw_timers(event_loop& loop);
+
+    // Drop peers not heard from within `timeout`, keeping m_udp_peer_idx
+    // correct: removal is swap-and-pop, so the element that moves has its own
+    // index rewritten.  Returns how many went.
+    size_t forget_idle_udp_peers(std::chrono::steady_clock::time_point now,
+                                 std::chrono::seconds timeout);
+
+    // Remove one peer by its index, with the same swap-and-pop bookkeeping.
+    void drop_udp_peer(int idx);
+
     server_mode m_mode;
     bool m_udp{false};
     uint32_t m_idle_timeout_cached{0};  // cached at setup() to avoid virtual call per CQE
@@ -840,7 +861,14 @@ private:
 
     // UDP mode
     static constexpr size_t MAX_UDP_PEERS = 10000;
-    struct udp_peer { struct sockaddr_in addr; };
+    // `last_seen` is the whole difference between a peer table and a leak: a
+    // peer was entered on its first datagram and removed only by teardown, so
+    // every restart of every UDP client left one behind for ever.
+    struct udp_peer
+    {
+        struct sockaddr_in                    addr;
+        std::chrono::steady_clock::time_point last_seen{};
+    };
     int m_udp_fd{-1};
     // Everything one recvmsg names, held apart from the instance and replaced
     // per run, because a stop drops the completion that would lower

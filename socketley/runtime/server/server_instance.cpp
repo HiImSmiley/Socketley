@@ -1625,6 +1625,10 @@ bool server_instance::setup(event_loop& loop)
         m_udp_recv->req = { this, nullptr, m_udp_fd, 0, op_recvmsg };
         arm_udp_recv();
 
+        // Here as well as on the path below, because this return is what made
+        // --idle-timeout inert on a UDP server: the flag was accepted, `show`
+        // reported it, and no sweep was ever armed to act on it.
+        arm_idle_sweep();
         return true;
     }
 
@@ -1714,16 +1718,7 @@ bool server_instance::setup(event_loop& loop)
     if (m_http_cache_enabled && !m_http_dir.empty())
         rebuild_http_cache();
 
-    // A timeout hangs off no fd, so the previous run's sweep is still counting
-    // down on this very request and arming another gives the server a second
-    // chain per restart.
-    if (m_idle_timeout_cached > 0 && !m_idle_sweep_armed)
-    {
-        m_idle_sweep_ts.tv_sec = 30;
-        m_idle_sweep_ts.tv_nsec = 0;
-        m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
-        m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
-    }
+    arm_idle_sweep();
 
     // Create splice pipe for zero-copy HTTP file serving
     if (m_splice_pipe[0] < 0 && !m_http_dir.empty())
@@ -1781,6 +1776,12 @@ void server_instance::teardown(event_loop& loop)
         }
         m_udp_peers.clear();
         m_udp_peer_idx.clear();
+        // Before the return, and this is the other half of arming the sweep on
+        // the UDP path at all: this exit never reached the withdrawal below, so
+        // the first version of that change left a timeout owed and the fuzz
+        // target said so on the next run -- "the ring still owes this instance
+        // a completion long after it stopped".
+        withdraw_timers(loop);
         m_loop = nullptr;
         return;
     }
@@ -1950,23 +1951,7 @@ void server_instance::teardown(event_loop& loop)
     if (m_splice_pipe[1] >= 0) { close_tracked(m_splice_pipe[1]); m_splice_pipe[1] = -1; }
     m_splice_busy = false;
 
-    // The timers this server armed, withdrawn because a timeout reaches no
-    // shutdown or cancel and left the instance in the graveyard for as long as
-    // thirty seconds -- decided by the armed flags rather than by a guess.
-    if (m_idle_sweep_armed)
-        timers_withdrawn &= loop.submit_timeout_remove(&m_idle_sweep_req);
-    // 250 ms would end the retirement soon enough on its own, but a timer left
-    // in the ring is a completion this owner is still owed however short its
-    // fuse.
-    if (m_relay_deadline_armed)
-        timers_withdrawn &= loop.submit_timeout_remove(&m_relay_deadline_req);
-    if (m_accept_backoff_armed)
-        timers_withdrawn &= loop.submit_timeout_remove(&m_accept_backoff_req);
-    loop.flush();
-
-    if (SOCKETLEY_UNLIKELY(!timers_withdrawn))
-        LOG_WARN("server: a timer withdrawal did not reach the ring — this instance "
-                 "stays retired until the timer fires on its own");
+    withdraw_timers(loop);
 
     // The armed flags are left standing because a withdrawn timeout is still
     // owed a completion that cannot have landed yet, and m_idle_sweep_req
@@ -2146,6 +2131,16 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                     }
                 }
+                // A UDP peer has no connection to close, so the same timeout
+                // means forgetting it: it is out of the broadcast fan-out and
+                // out of the count `ps` prints, and its next datagram enters
+                // it again.  Without --idle-timeout nothing is swept and the
+                // eviction in find_or_add_peer is the only bound, which is
+                // what keeps this from changing behaviour for anyone who has
+                // not asked for a timeout.
+                if (m_udp && !m_udp_peers.empty())
+                    forget_idle_udp_peers(now, timeout);
+
                 if (m_idle_timeout_cached > 0)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
@@ -5125,19 +5120,115 @@ bool server_instance::owner_broadcast(std::string_view msg)
     return route_relay::broadcast(mgr, owner_name, get_name(), msg);
 }
 
+static inline uint64_t udp_peer_key(const struct sockaddr_in& addr)
+{
+    return (static_cast<uint64_t>(addr.sin_addr.s_addr) << 16) |
+            static_cast<uint64_t>(addr.sin_port);
+}
+
+void server_instance::drop_udp_peer(int idx)
+{
+    if (idx < 0 || static_cast<size_t>(idx) >= m_udp_peers.size())
+        return;
+
+    m_udp_peer_idx.erase(udp_peer_key(m_udp_peers[idx].addr));
+
+    const int last = static_cast<int>(m_udp_peers.size()) - 1;
+    if (idx != last)
+    {
+        // Swap and pop, so the element that moves has its own index rewritten
+        // -- the map holds indices into this vector and a stale one would name
+        // somebody else's address.
+        m_udp_peers[idx] = m_udp_peers[last];
+        m_udp_peer_idx[udp_peer_key(m_udp_peers[idx].addr)] = idx;
+    }
+    m_udp_peers.pop_back();
+}
+
+size_t server_instance::forget_idle_udp_peers(std::chrono::steady_clock::time_point now,
+                                              std::chrono::seconds timeout)
+{
+    size_t gone = 0;
+    for (int i = static_cast<int>(m_udp_peers.size()) - 1; i >= 0; --i)
+    {
+        // Backwards, because drop_udp_peer moves the LAST element into the
+        // hole and walking forwards would skip whatever landed there.
+        if (now - m_udp_peers[i].last_seen > timeout)
+        {
+            drop_udp_peer(i);
+            ++gone;
+        }
+    }
+    return gone;
+}
+
+// The timers this server armed, withdrawn because a timeout reaches no
+// shutdown or cancel and left the instance in the graveyard for as long as
+// thirty seconds -- decided by the armed flags rather than by a guess.
+void server_instance::withdraw_timers(event_loop& loop)
+{
+    bool timers_withdrawn = true;
+
+    if (m_idle_sweep_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_idle_sweep_req);
+    // 250 ms would end the retirement soon enough on its own, but a timer left
+    // in the ring is a completion this owner is still owed however short its
+    // fuse.
+    if (m_relay_deadline_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_relay_deadline_req);
+    if (m_accept_backoff_armed)
+        timers_withdrawn &= loop.submit_timeout_remove(&m_accept_backoff_req);
+    loop.flush();
+
+    if (SOCKETLEY_UNLIKELY(!timers_withdrawn))
+        LOG_WARN("server: a timer withdrawal did not reach the ring — this instance "
+                 "stays retired until the timer fires on its own");
+}
+
+// A timeout hangs off no fd, so the previous run's sweep is still counting down
+// on this very request and arming another gives the server a second chain per
+// restart.
+void server_instance::arm_idle_sweep()
+{
+    if (!m_loop || m_idle_timeout_cached <= 0 || m_idle_sweep_armed)
+        return;
+
+    m_idle_sweep_ts.tv_sec  = 30;
+    m_idle_sweep_ts.tv_nsec = 0;
+    m_idle_sweep_req = { this, nullptr, -1, 0, op_timeout };
+    m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
+}
+
 int server_instance::find_or_add_peer(const struct sockaddr_in& addr)
 {
-    uint64_t key = (static_cast<uint64_t>(addr.sin_addr.s_addr) << 16) |
-                    static_cast<uint64_t>(addr.sin_port);
+    const uint64_t key = udp_peer_key(addr);
+    const auto now = std::chrono::steady_clock::now();
+
     auto it = m_udp_peer_idx.find(key);
     if (it != m_udp_peer_idx.end())
+    {
+        m_udp_peers[static_cast<size_t>(it->second)].last_seen = now;
         return it->second;
+    }
 
     if (m_udp_peers.size() >= MAX_UDP_PEERS)
-        return -1;
+    {
+        // The table used to be a wall: at MAX_UDP_PEERS every datagram from a
+        // NEW address was dropped before process_message, silently and until
+        // the runtime stopped -- and a peer was entered on its first datagram
+        // and never removed, so ten thousand client restarts got there on
+        // their own.  The oldest goes instead, because a sender heard from
+        // longer ago than every other is the one a broadcast is least likely
+        // to be for.
+        int oldest = 0;
+        for (size_t i = 1; i < m_udp_peers.size(); ++i)
+            if (m_udp_peers[i].last_seen < m_udp_peers[oldest].last_seen)
+                oldest = static_cast<int>(i);
+        drop_udp_peer(oldest);
+    }
 
     int idx = static_cast<int>(m_udp_peers.size());
-    m_udp_peers.push_back({addr});
+    m_udp_peers.push_back({addr, now});
     m_udp_peer_idx[key] = idx;
     return idx;
 }
