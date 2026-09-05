@@ -70,6 +70,12 @@ enum class frame_type : uint16_t
     route_down  = 29,  // payload: see encode_route_frame -- the same
                        // codec travelling the other leg, for the
                        // reason send_ref/deliver_ref are one codec
+
+    // payload: one byte, '1' or '0' -- whether a publish leaving this worker
+    // has anywhere to go.  Only the daemon can see the other workers, and a
+    // worker that has never been told sends, so the frame narrows and never
+    // widens what this process does on its own.
+    publish_interest = 30,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload

@@ -271,6 +271,10 @@ public:
     // happened.
     void send_publish(const std::string& encoded_payload);
 
+    // Whether this child's publishes have anywhere to go, sent only when the
+    // answer changes, which for a daemon serving one runtime is once.
+    void send_publish_interest(bool on);
+
     // Drain whatever the child has sent and apply it to the placeholder, from
     // the health timer and before any command that reads figures.
     void poll();
@@ -422,6 +426,11 @@ private:
     std::string  m_map_in;            // partial map frames from the child
 
     publish_handler  m_on_publish;
+
+    // Tri-state, so the first answer is always sent: a child that starts
+    // assuming it has receivers must hear "no" even when "no" is the value
+    // this field would otherwise have been born with.
+    int m_publish_interest_sent{-1};
     deliver_handler  m_on_deliver;
     send_ref_handler m_on_send_ref;
     route_handler    m_on_route;

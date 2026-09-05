@@ -883,6 +883,20 @@ void proxy_supervisor::send_config(std::string_view json)
     if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, json))) {}
 }
 
+void proxy_supervisor::send_publish_interest(bool on)
+{
+    // Dropped when the child already has it, the same way send_runtime_map()
+    // drops a payload it has already sent: this is called on every health tick
+    // and the answer changes only when a worker appears or leaves.
+    const int want = on ? 1 : 0;
+    if (m_publish_interest_sent == want)
+        return;
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::publish_interest,
+                                         on ? "1" : "0")))
+        return;
+    m_publish_interest_sent = want;
+}
+
 std::string proxy_supervisor::take_reload_error()
 {
     // Cleared explicitly rather than left to the move, because a moved-from

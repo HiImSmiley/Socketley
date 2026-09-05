@@ -699,6 +699,11 @@ private:
             case worker_proto::frame_type::cluster:   on_cluster_view(payload); break;
             case worker_proto::frame_type::cluster_ev: on_cluster_event(payload); break;
             case worker_proto::frame_type::publish:   on_publish(payload);   break;
+            case worker_proto::frame_type::publish_interest:
+                // Narrowing only: true is what this process starts with, so a
+                // daemon that never sends this leaves the old behaviour intact.
+                m_publish_interest = !payload.empty() && payload[0] != '0';
+                break;
             case worker_proto::frame_type::chan_req:  on_chan_req(payload);  break;
             case worker_proto::frame_type::chan_rep:  on_chan_rep(payload);  break;
             case worker_proto::frame_type::deliver:   on_deliver(payload);   break;
@@ -960,7 +965,13 @@ private:
             [this](std::string_view cache_name, std::string_view channel,
                    std::string_view message)
             {
-                if (!m_writer.write(worker_proto::frame(
+                // Skipped when the daemon has said there is nobody on the
+                // other side, because encode_publish() and frame() each copy
+                // the whole payload and write() copies it a third time -- and
+                // on a busy channel the backlog is full, so all three copies
+                // are made on the way to being dropped.
+                if (m_publish_interest &&
+                    !m_writer.write(worker_proto::frame(
                         worker_proto::frame_type::publish,
                         worker_proto::encode_publish(cache_name, channel, message)))) {}
 
@@ -2116,6 +2127,12 @@ private:
     // better, set in on_cqe() and acted on by drain_frames().
     bool                                   m_ctl_eof{false};
     bool                                   m_done{false};
+
+    // Whether a publish leaving this process has anywhere to go, which only
+    // the daemon can see.  True until told otherwise, because the failure that
+    // costs a message is sending too little and the one that costs cycles is
+    // sending too much.
+    bool                                   m_publish_interest{true};
     int                                    m_exit_code{0};
 
     // ── The control plane ───────────────────────────────────────────────────

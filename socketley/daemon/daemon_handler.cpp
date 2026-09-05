@@ -4167,6 +4167,55 @@ void daemon_handler::publish_runtime_map_to_workers()
     m_last_map_push = std::chrono::steady_clock::now();
 }
 
+// A worker sends one control frame per PUBLISH so the daemon can fan it out to
+// the other workers and to whatever it is running in-process -- and when there
+// is neither, that frame is three copies of the payload on its way to being
+// dropped at MAX_BACKLOG.  Measured on a cache with fifty subscribers and
+// nothing else running: 0.079 microseconds of worker per delivery against
+// 0.063 with the frame suppressed, so a fifth of that worker was building
+// frames for nobody.
+//
+// The answer is the daemon's to give because only it can see the other
+// processes, and it is pushed rather than asked for, on the same tick as the
+// runtime map: a worker that has never been told sends, so this frame only
+// ever narrows what a process does on its own.
+void daemon_handler::refresh_publish_interest()
+{
+    if (m_proxy_workers.empty())
+        return;
+
+    size_t supervisors = 0;
+    for (const auto& [_, shards] : m_proxy_workers)
+        supervisors += shards.size();
+
+    // Walked once for all of them rather than once per supervisor, because the
+    // answer does not depend on which one is asking: with two processes every
+    // one of them has somebody else, with one none of them does.
+    bool daemon_side = false;
+    {
+        std::shared_lock lock(m_manager.mutex);
+        for (const auto& [n, inst] : m_manager.list())
+        {
+            (void)n;
+            // The same three tests dispatch_publish() applies, including the
+            // out-of-process one: a placeholder loads the runtime's script and
+            // so has a Lua VM, and counting it would keep every worker sending
+            // to an interpreter that serves nothing.
+            if (inst->get_state() == runtime_running && inst->lua() &&
+                !inst->is_out_of_process())
+            {
+                daemon_side = true;
+                break;
+            }
+        }
+    }
+
+    const bool interest = daemon_side || supervisors > 1;
+    for (auto& [_, shards] : m_proxy_workers)
+        for (auto& sup : shards)
+            sup->send_publish_interest(interest);
+}
+
 // What the cluster looks like for the workers that cannot look, with an empty
 // view sent as a withdrawal only once this daemon has ever had a cluster -- a
 // never-clustered one sends nothing, keeping those four calls honestly
@@ -5423,6 +5472,13 @@ void daemon_handler::reconcile_proxy_workers()
     // reduced to zero, a restore that no longer wants it.
     for (const auto& n : retired_names)
         route_relay::forget(&m_manager, n);
+
+    // Here and not only on the health tick, because a worker forked by a
+    // `create -s` must be announced to the workers already running before the
+    // command returns: on the tick alone, a cache told there was nobody would
+    // go on believing it for up to one tick after somebody arrived, and drop
+    // every publish in between.
+    refresh_publish_interest();
 }
 
 std::string daemon_handler::on_start_error(std::string_view name)
@@ -5803,6 +5859,11 @@ void daemon_handler::check_managed_health()
     // mark_failed() -- unconditionally, because send_runtime_map() drops a
     // payload the child already has.
     publish_runtime_map_to_workers();
+
+    // reconcile_proxy_workers() above has already refreshed the interest for
+    // anything it changed; this catches what it cannot see -- a runtime the
+    // daemon is running in-process reaching or leaving `running`.
+    refresh_publish_interest();
 
     // And what the cluster looks like on the same tick, which is exactly the
     // cadence cluster_discovery re-scans the shared directory at.

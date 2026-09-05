@@ -326,6 +326,10 @@ private:
     // replica socketley.list() and socketley.get() answer from.
     void publish_runtime_map_to_workers();
 
+    // Tell every worker whether its publishes have anywhere to go, which is
+    // the whole of what dispatch_publish() reaches from here.
+    void refresh_publish_interest();
+
     // Encode what the cluster looks like and push it to every worker, on the
     // cluster's own scan cadence, with a daemon in no cluster pushing nothing
     // so those four calls stay refused.
