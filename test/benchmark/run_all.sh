@@ -123,12 +123,15 @@ run_benchmarks() {
 
     # Redis comparison: this is the headline claim in the README, so it belongs
     # in the standard suite rather than being something one has to remember to
-    # run.  One repetition keeps it around 40s; use --cache-resp-only for the
-    # three-run median when the numbers actually matter.  It exits cleanly when
-    # redis-benchmark or a running Redis is missing.
-    export BENCH_RESP_RUNS=1
+    # run.  Three interleaved pairs, around 70s: this used to be one unpaired
+    # repetition at around 40s, and the thirty seconds bought a SADD reading
+    # that was 0.8x on a single unlucky run and 1.02x over five pairs.  Raise
+    # BENCH_RESP_PAIRS when the numbers matter; the interval narrows as
+    # 1/sqrt(pairs).  It exits cleanly when redis-benchmark or a running Redis
+    # is missing.
+    export BENCH_RESP_PAIRS=3
     run_bench_script "$script_dir/bench_cache_resp.sh"
-    unset BENCH_RESP_RUNS
+    unset BENCH_RESP_PAIRS
     restart_daemon
 
     run_bench_script "$script_dir/bench_proxy.sh"

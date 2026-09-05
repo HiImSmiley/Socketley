@@ -1607,6 +1607,18 @@ static void bench_proxy_overhead(struct bench_config *cfg)
      * its legs slowed and its ratio survives, which is the point of pairing. */
     double med_ratio = 0, half = 0, overhead_pct = 0, half_pct = 0;
     double med_direct = 0, med_proxied = 0;
+    /* The same overhead in microseconds, per pair and then the median of those.
+     *
+     * The percentage is the honest answer to "how much of the direct rate does
+     * the proxy keep", and it is the wrong number to carry between runs: it
+     * divides by whatever the direct arm was, so the identical proxy reads 46%
+     * against a socketley backend and 53% against the C floor.  On 2026-09-05
+     * those two figures were compared to each other and the slower baseline
+     * looked like the better proxy.  Microseconds do not move when the baseline
+     * does: the same measurement is +10.5 us either way, against a kernel that
+     * charges 11.9 us for the two extra handoffs. */
+    double med_added_us = 0, half_added_us = 0;
+    double *added = NULL;
     if (kept > 0) {
         double *tmp = (double *)malloc((size_t)kept * sizeof(double));
         memcpy(tmp, ratio, (size_t)kept * sizeof(double));
@@ -1615,6 +1627,15 @@ static void bench_proxy_overhead(struct bench_config *cfg)
         med_direct = median_double(tmp, kept);
         memcpy(tmp, proxied, (size_t)kept * sizeof(double));
         med_proxied = median_double(tmp, kept);
+
+        added = (double *)malloc((size_t)kept * sizeof(double));
+        for (int i = 0; i < kept; i++)
+            added[i] = (direct[i] > 0 && proxied[i] > 0)
+                     ? 1e6 / proxied[i] - 1e6 / direct[i] : 0.0;
+        memcpy(tmp, added, (size_t)kept * sizeof(double));
+        med_added_us  = median_double(tmp, kept);
+        half_added_us = ci95_half_width(added, kept);
+
         free(tmp);
         half         = ci95_half_width(ratio, kept);
         overhead_pct = (1.0 - med_ratio) * 100.0;
@@ -1642,6 +1663,8 @@ static void bench_proxy_overhead(struct bench_config *cfg)
         json_kv_dbl(stdout, "direct_msg_per_sec", med_direct);
         json_kv_dbl(stdout, "proxied_msg_per_sec", med_proxied);
         json_kv_dbl(stdout, "overhead_ci95_half_width_pct", half_pct);
+        json_kv_dbl(stdout, "overhead_added_us", med_added_us);
+        json_kv_dbl(stdout, "overhead_added_us_ci95_half_width", half_added_us);
         if (resolved)
             json_kv_dbl(stdout, "overhead_percent", overhead_pct);
         else
@@ -1662,6 +1685,8 @@ static void bench_proxy_overhead(struct bench_config *cfg)
         if (resolved) {
             printf("  Overhead: %11.1f%%  ±%.1f (95%% CI over the pairs)\n",
                    overhead_pct, half_pct);
+            printf("  Added:    %11.2f us ±%.2f  — this one keeps its meaning "
+                   "when the baseline changes\n", med_added_us, half_added_us);
         } else if (complete) {
             printf("  Overhead:  not resolved — the pairs span ±%.1f%%, which is "
                    "wider than the answer\n", half_pct);
@@ -1676,6 +1701,7 @@ static void bench_proxy_overhead(struct bench_config *cfg)
     free(ratio);
     free(direct);
     free(proxied);
+    free(added);
 
     /* A run that could not answer is a failed run.  Silence here is what let a
      * -106%% into a results file. */
