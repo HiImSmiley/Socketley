@@ -732,6 +732,15 @@ private:
 
     server_mode m_mode;
     bool m_udp{false};
+public:
+    void refresh_cached_limits() override
+    {
+        m_idle_timeout_cached = get_idle_timeout();
+        m_max_conns_cached    = get_max_connections();
+        m_rate_limit_cached   = get_rate_limit();
+    }
+
+private:
     uint32_t m_idle_timeout_cached{0};  // cached at setup() to avoid virtual call per CQE
     uint32_t m_max_conns_cached{0};
     double m_rate_limit_cached{0.0};

@@ -724,12 +724,20 @@ private:
             return;
         }
 
-        // A second config for a proxy that is already up would have to rebuild
-        // it, and the daemon does not send one: a change of backends is a stop
-        // and a start.
+        // A second config is an `edit` on a runtime that is already serving.
+        // Rebuilding here is not on the table -- a port is a bound socket, TLS
+        // is a context the open handshakes used, backends are open connections
+        // -- so what a live worker takes is the set of limits it reads at the
+        // moment it uses them, and the rest keeps waiting for the next start.
+        //
+        // The frame used to be dropped with a warning, which is why `edit
+        // NAME --max-connections 1` answered 0, made `show` report 1, and left
+        // the worker holding the port enforcing 10.
         if (m_rt)
         {
-            LOG_WARN("proxy worker: ignoring config for an already-configured worker");
+            apply_live_config(*m_rt, cfg);
+            LOG_INFO("worker: applied an edit to the running runtime "
+                     "(connection, rate and idle limits; the rest waits for a restart)");
             return;
         }
 

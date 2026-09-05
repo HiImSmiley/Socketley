@@ -138,6 +138,16 @@ public:
     }
 
     // Max connections
+    // Re-read the limits a runtime copies out of its configuration at setup.
+    //
+    // The hot paths compare against a cached copy rather than calling a virtual
+    // getter per accept and per message, which made every setter a lie for a
+    // runtime that was already running: `edit NAME --max-connections 1` reached
+    // the worker, set the field, and the accept path went on reading the value
+    // from before.  A type that caches overrides this; one that does not needs
+    // nothing.
+    virtual void refresh_cached_limits() {}
+
     void set_max_connections(uint32_t max);
     uint32_t get_max_connections() const;
 

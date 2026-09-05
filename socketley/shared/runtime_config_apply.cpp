@@ -87,6 +87,18 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     }
 }
 
+void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
+{
+    if (cfg.max_connections > 0)     rt.set_max_connections(cfg.max_connections);
+    if (cfg.rate_limit > 0.0)        rt.set_rate_limit(cfg.rate_limit);
+    if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
+    if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
+
+    // The setters above write fields the hot paths do not read; this is what
+    // makes them true for a runtime that is already serving.
+    rt.refresh_cached_limits();
+}
+
 void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
 {
     switch (rt.get_type())

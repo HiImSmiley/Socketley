@@ -1559,9 +1559,7 @@ bool server_instance::setup(event_loop& loop)
     }
 
     // Cache config getters once at setup to avoid virtual calls on the hot path
-    m_idle_timeout_cached = get_idle_timeout();
-    m_max_conns_cached = get_max_connections();
-    m_rate_limit_cached = get_rate_limit();
+    refresh_cached_limits();
 
     // Pre-allocate the connection pool if empty (first run or after teardown)
     if (m_conn_pool.empty())

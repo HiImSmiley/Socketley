@@ -869,6 +869,20 @@ void proxy_supervisor::send_reload(std::string_view lua_path)
                                          lua_path))) {}
 }
 
+void proxy_supervisor::send_config(std::string_view json)
+{
+    // Cleared at the ask for the reason send_reload() clears its own: a config
+    // a worker took sends nothing back, so "no config_err since the ask" is the
+    // only shape success has.
+    m_config_error.clear();
+
+    // The frame the worker was spawned with, sent again with the edited values
+    // in it.  What the worker does with a second one is its decision and not
+    // this side's: it takes the limits it reads per operation and leaves the
+    // rest for the next start.
+    if (!write_frame(worker_proto::frame(worker_proto::frame_type::config, json))) {}
+}
+
 std::string proxy_supervisor::take_reload_error()
 {
     // Cleared explicitly rather than left to the move, because a moved-from

@@ -1504,9 +1504,7 @@ bool proxy_instance::setup(event_loop& loop)
         m_multishot_active = false;
     }
 
-    m_idle_timeout_cached = get_idle_timeout();
-    m_max_conns_cached = get_max_connections();
-    m_rate_limit_cached = get_rate_limit();
+    refresh_cached_limits();
 
     // Fresh timer for this run, built whether or not it is armed here, because
     // the backend pool arms it on demand.

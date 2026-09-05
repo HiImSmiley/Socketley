@@ -3098,6 +3098,26 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     if (m_persistence)
         m_persistence->save_runtime(instance);
 
+    // A runtime in a worker keeps its own copy of the configuration, and the
+    // object edited above is the daemon's placeholder.  Without this the edit
+    // was stored, reported by `show`, answered 0 -- and the process holding the
+    // port went on enforcing the value it was spawned with.
+    //
+    // Sent to every shard, because leaving one on the old limit is a runtime
+    // that enforces two.  What arrives is the whole configuration and not a
+    // delta; the worker takes the part a live runtime can take.
+    if (is_running && m_persistence)
+    {
+        if (auto it = m_proxy_workers.find(std::string(name));
+            it != m_proxy_workers.end() && !it->second.empty())
+        {
+            const runtime_config cfg = m_persistence->read_from_instance(instance);
+            const std::string json = m_persistence->format_json_pretty(cfg);
+            for (auto& sup : it->second)
+                sup->send_config(json);
+        }
+    }
+
     return 0;
 }
 

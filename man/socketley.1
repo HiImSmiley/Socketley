@@ -594,13 +594,29 @@ and exit status 1; change those through the editor or
 .BR import ,
 which reach the full field set.
 .PP
-Every flag
-.B edit
-accepts on a
+Four flags reach a
 .I running
-runtime is stored and takes effect at that runtime's next start, not at once.
-A runtime lives in its own process, and that process reads its configuration
-once, when it is forked; nothing sends it another. So
+runtime at once:
+.BR \-\-max\-connections ,
+.BR \-\-rate\-limit ,
+.B \-\-global\-rate\-limit
+and
+.BR \-\-idle\-timeout .
+They are the limits a runtime reads at the moment it uses them \(em one per
+accept, one per message, one per idle sweep \(em so changing one changes the
+next decision and nothing already decided. The daemon sends the edited
+configuration to every shard.
+.PP
+Every other flag
+.B edit
+accepts on a running runtime is stored and takes effect at that runtime's next
+start. Not as policy: a
+.B \-p
+is a bound socket, the TLS flags are a context the open handshakes already
+used, a proxy's backends are open connections, and a server's
+.B \-\-http
+directory decides what a request in flight is being answered from. None of
+those can change under a connection that exists. So
 .B show
 reports the new value while the runtime holding the port keeps the old one,
 until

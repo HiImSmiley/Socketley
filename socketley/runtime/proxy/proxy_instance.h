@@ -999,6 +999,15 @@ private:
     void backend_pool_release(std::unique_ptr<proxy_backend_connection> conn);
 
     // Cached config to avoid virtual calls on hot path
+public:
+    void refresh_cached_limits() override
+    {
+        m_idle_timeout_cached = get_idle_timeout();
+        m_max_conns_cached    = get_max_connections();
+        m_rate_limit_cached   = get_rate_limit();
+    }
+
+private:
     uint32_t m_idle_timeout_cached{0};
     uint32_t m_max_conns_cached{0};
     // --rate-limit read once at setup, and read at all, which it was not: this
