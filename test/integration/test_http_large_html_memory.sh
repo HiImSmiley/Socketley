@@ -72,10 +72,17 @@ if [ -z "${WORKER:-}" ] || [ ! -d "/proc/$WORKER" ]; then
     exit 1
 fi
 
-# Peak RSS across one request, sampled: VmHWM is a high-water mark for the
-# process's whole life and would carry over between the two requests below.
-peak_rss_kb_during() {   # url -> peak KiB, and the response size on fd 3
-    local url=$1 peak=0 r
+# What one request ADDS to the worker's resident memory, sampled.
+#
+# The delta and not the peak: a sanitizer build's own baseline is 0.82x this
+# file before a byte is served, so an absolute peak would call the splice path
+# -- which holds none of the file -- a failure, and it did.  What the request
+# costs is the same question in both builds; what the process weighs at rest is
+# not.  VmHWM would answer neither, being a high-water mark for the whole life
+# of the process that carries over between the two requests below.
+peak_rss_kb_during() {   # url -> added KiB, and the response size on fd 3
+    local url=$1 peak=0 r base
+    base=$(awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null)
     ( while :; do
         r=$(awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null) || break
         [ -n "$r" ] && echo "$r"
@@ -85,7 +92,8 @@ peak_rss_kb_during() {   # url -> peak KiB, and the response size on fd 3
     curl -s -o /dev/null -w '%{http_code} %{size_download}' "$url" >&3
     kill "$sampler" 2>/dev/null
     wait "$sampler" 2>/dev/null
-    sort -n "$WWW/samples" | tail -1
+    peak=$(sort -n "$WWW/samples" | tail -1)
+    awk -v p="${peak:-0}" -v b="${base:-0}" 'BEGIN { d = p - b; print (d > 0 ? d : 0) }'
 }
 
 exec 3>"$WWW/curl_bin"
@@ -112,20 +120,20 @@ fi
 BIN_X=$(awk -v p="${BIN_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
 HTML_X=$(awk -v p="${HTML_PEAK:-0}" -v f="$FILE_BYTES" 'BEGIN{printf "%.2f", p*1024/f}')
 
-if awk -v x="$BIN_X" 'BEGIN{exit !(x < 0.5)}'; then
-    ok "the splice path holds none of the file (peak ${BIN_X}x)"
+if awk -v x="$BIN_X" 'BEGIN{exit !(x < 0.25)}'; then
+    ok "the splice path holds none of the file (added ${BIN_X}x)"
 else
     bad "a .bin is spliced and never held" \
-        "peak RSS was ${BIN_X}x the file; splice was expected to keep it near zero," \
+        "the request added ${BIN_X}x the file; splice was expected to add nothing," \
         "so this run measured the read path for both and the .html number below" \
         "no longer distinguishes anything"
 fi
 
 if awk -v x="$HTML_X" 'BEGIN{exit !(x < 2.5)}'; then
-    ok "the read path holds the file once, not three times (peak ${HTML_X}x)"
+    ok "the read path holds the file once, not three times (added ${HTML_X}x)"
 else
     bad "one large .html is one copy of itself, plus the response" \
-        "peak RSS was ${HTML_X}x the file, over the 2.5x threshold;" \
+        "the request added ${HTML_X}x the file, over the 2.5x threshold;" \
         "3.05x was file_buf, an injected copy and the response --- if a second" \
         "copy is back, the script belongs in the response as a third piece" \
         "rather than in a copy of the body"
