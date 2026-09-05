@@ -789,3 +789,37 @@ bench_nc() {
     fi
     return $rc
 }
+
+# CPU burned by this run's daemon and its workers, in ticks.
+#
+# Identity by /proc/PID/exe against our own binary, the same test stop_daemon
+# uses and for the same reason: another agent's socketley on this box answers
+# to the name and is not ours, and a rebuilt binary leaves the old one reading
+# "(deleted)".
+#
+# Wanted wherever a client-driven benchmark reports a rate.  k6 against a
+# static file reported 13,478 req/s on disk and 13,148 with --http-cache, which
+# invites reading the cache as 2.4% slower; the server was at a tenth of a core
+# for both and the numbers were k6's.  A rate without the server's own CPU
+# beside it cannot say whose ceiling it is.
+socketley_cpu_ticks() {
+    local own_exe p exe t=0
+    own_exe=$(readlink -f "$SOCKETLEY_BIN" 2>/dev/null) || { echo 0; return; }
+    [ -n "$own_exe" ] || { echo 0; return; }
+    for p in $(pgrep -x socketley 2>/dev/null || true); do
+        exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || continue
+        exe=${exe% (deleted)}
+        [ "$exe" = "$own_exe" ] || continue
+        t=$((t + $(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null || echo 0)))
+    done
+    echo "$t"
+}
+
+# Ticks between two socketley_cpu_ticks readings, as cores, over a wall window
+# in nanoseconds.  The parentheses around the conditional are load-bearing: awk
+# reads `printf fmt, a > b` as a redirection into the file named b.
+socketley_cores_since() {   # ticks_before ticks_after ns_before ns_after
+    awk -v c=$(( $2 - $1 )) -v hz="$(getconf CLK_TCK)" -v ns=$(( $4 - $3 )) \
+        'BEGIN { printf "%.2f", (ns > 0 ? c / hz / (ns / 1e9) : 0) }'
+}
+

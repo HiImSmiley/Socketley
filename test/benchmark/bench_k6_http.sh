@@ -85,6 +85,7 @@ parse_k6_summary() {
     local json_file=$1
     local test_name=$2
     local mode=$3  # "disk" or "cached"
+    local server_cores=$4
 
     local parsed
     parsed=$(python3 - "$json_file" <<'K6PARSE' 2>/dev/null
@@ -220,69 +221,59 @@ K6PARSE
             "latency_p99_ms" "$s_p99" \
             "latency_max_ms" "$s_max" \
             "failed_percent" "$failed_pct" \
+            "server_cores"   "$server_cores" \
             "usable"         "$usable" \
             "verdict"        "${fail_note:-ok}"
     done < <(echo "$parsed" | grep '^STAGE ')
 }
 
-# Test: HTTP static serving (disk)
-test_http_disk() {
-    local test_name="k6_http_disk"
+# Test: HTTP static serving, one arm.
+#
+# The two arms used to be two functions differing in a flag, a name and a path.
+# They are one because the thing worth reading is the difference between them,
+# and two copies of a measurement drift apart in exactly the part that makes
+# them comparable.
+#
+# The server's own CPU is sampled across the k6 run.  Without it the summary
+# puts 13,478 req/s (disk) next to 13,148 (--http-cache) and invites reading
+# the cache as 2.4% slower; both arms leave the server around a tenth of a
+# core, so both numbers are k6's ceiling and neither is the server's.  What the
+# flag actually removes is one statx(2) per request -- counted, 1.000 against
+# 0.000 -- and that is not visible at a rate the client sets.
+test_http_arm() {
+    local mode=$1 flag=$2
+    local test_name="k6_http_${mode}"
 
-    log_section "Test: k6 HTTP Static Serving (disk)"
+    log_section "Test: k6 HTTP Static Serving (${mode})"
 
     socketley_cmd stop bench_k6_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_http 2>/dev/null
     wait_for_port_free $HTTP_PORT
-    socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" -s
+    socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" $flag -s
     wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
     sleep 0.5
 
-    local k6_export="/tmp/k6_http_disk_${TIMESTAMP}.json"
+    local k6_export="/tmp/k6_http_${mode}_${TIMESTAMP}.json"
+    local c0 c1 t0 t1 server_cores
+    c0=$(socketley_cpu_ticks); t0=$(date +%s%N)
     timeout "$BENCH_TIMEOUT_K6" k6 run \
         --summary-export "$k6_export" \
         --env BASE_URL="http://localhost:${HTTP_PORT}" \
         --quiet \
         "${K6_DIR}/http_bench.js" 2>&1
     if [[ $? -eq 124 ]]; then
-        log_bench "TIMEOUT" "k6 http disk"
+        log_bench "TIMEOUT" "k6 http ${mode}"
     fi
+    t1=$(date +%s%N); c1=$(socketley_cpu_ticks)
+    server_cores=$(socketley_cores_since "$c0" "$c1" "$t0" "$t1")
 
-    if [[ -f "$k6_export" ]]; then
-        parse_k6_summary "$k6_export" "$test_name" "disk"
-        rm -f "$k6_export"
+    if awk -v c="$server_cores" 'BEGIN { exit !(c < 0.5) }'; then
+        log_warn "  server used ${server_cores} cores — this rate is k6's ceiling, not the server's"
     else
-        log_error "k6 summary export not found"
-    fi
-
-    socketley_cmd stop bench_k6_http
-    sleep 0.5
-    socketley_cmd remove bench_k6_http
-}
-
-# Test: HTTP static serving (cached)
-test_http_cached() {
-    local test_name="k6_http_cached"
-
-    log_section "Test: k6 HTTP Static Serving (--http-cache)"
-
-    socketley_cmd stop bench_k6_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_http 2>/dev/null
-    wait_for_port_free $HTTP_PORT
-    socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" --http-cache -s
-    wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
-    sleep 0.5
-
-    local k6_export="/tmp/k6_http_cached_${TIMESTAMP}.json"
-    timeout "$BENCH_TIMEOUT_K6" k6 run \
-        --summary-export "$k6_export" \
-        --env BASE_URL="http://localhost:${HTTP_PORT}" \
-        --quiet \
-        "${K6_DIR}/http_bench.js" 2>&1
-    if [[ $? -eq 124 ]]; then
-        log_bench "TIMEOUT" "k6 http cached"
+        log_info "  server used ${server_cores} cores"
     fi
 
     if [[ -f "$k6_export" ]]; then
-        parse_k6_summary "$k6_export" "$test_name" "cached"
+        parse_k6_summary "$k6_export" "$test_name" "$mode" "$server_cores"
         rm -f "$k6_export"
     else
         log_error "k6 summary export not found"
@@ -302,14 +293,14 @@ run_k6_http_benchmarks() {
     prepare_http_root
 
     log_bench "START" "k6_http_disk"
-    test_http_disk
+    test_http_arm disk ""
     log_bench "DONE" "k6_http_disk"
     fresh_daemon
 
     sleep 1
 
     log_bench "START" "k6_http_cached"
-    test_http_cached
+    test_http_arm cached "--http-cache"
     log_bench "DONE" "k6_http_cached"
 
     echo "]" >> "$RESULTS_FILE"
