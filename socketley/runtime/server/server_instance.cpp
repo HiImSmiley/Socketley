@@ -552,6 +552,19 @@ static constexpr std::string_view WS_INJECT_SCRIPT =
     "<script>const socketley=new WebSocket("
     "`ws${location.protocol==='https:'?'s':''}://${location.host}`);</script>";
 
+// Where the live-reload script goes: before </head>, else before </body>, else
+// at the end.  The offset rather than an injected copy, because that is what
+// lets a response be built in one pass instead of injecting into a copy of the
+// file and then copying that into the response.
+static size_t ws_inject_offset(std::string_view content)
+{
+    auto pos = content.find("</head>");
+    if (pos == std::string_view::npos) pos = content.find("</HEAD>");
+    if (pos == std::string_view::npos) pos = content.find("</body>");
+    if (pos == std::string_view::npos) pos = content.find("</BODY>");
+    return pos == std::string_view::npos ? content.size() : pos;
+}
+
 static std::string inject_ws_script(std::string_view content)
 {
     std::string result(content);
@@ -593,6 +606,39 @@ static std::string build_http_response(std::string_view content_type, std::strin
     resp.append(len_buf, len_end - len_buf);
     resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     resp.append(body);
+    return resp;
+}
+
+// One response, built once.  inject_at is npos for a body that takes no script;
+// otherwise the script is a third piece appended between two halves of the file
+// rather than a reason to hold an injected copy of it.
+static std::string build_http_response_at(std::string_view content_type,
+                                          std::string_view content,
+                                          size_t inject_at,
+                                          bool keep_alive)
+{
+    const bool inject = inject_at != std::string_view::npos;
+    const size_t body_len = content.size() + (inject ? WS_INJECT_SCRIPT.size() : 0);
+
+    std::string resp;
+    resp.reserve(128 + body_len);
+    resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
+    resp.append(content_type);
+    resp.append("\r\nContent-Length: ");
+    char len_buf[24];
+    auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body_len);
+    resp.append(len_buf, len_end - len_buf);
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
+    if (inject)
+    {
+        resp.append(content.substr(0, inject_at));
+        resp.append(WS_INJECT_SCRIPT);
+        resp.append(content.substr(inject_at));
+    }
+    else
+    {
+        resp.append(content);
+    }
     return resp;
 }
 
@@ -787,17 +833,25 @@ void server_instance::rebuild_http_cache()
 
 // One entry or none, called only for a read that completed in full through the
 // openat2(RESOLVE_BENEATH) path.
+// Whether a file of this cost can be kept, asked before it is built.
+//
+// The cap used to be tested on two finished responses, so a 400 MiB .html had
+// 800 MiB of them constructed and then dropped for being over a 64 MiB limit.
+// What this key already costs is reclaimed before the test, or a file edited
+// near the limit is refused on the strength of bytes it is about to give back.
+bool server_instance::http_reval_would_fit(const std::string& url_path, size_t cost) const
+{
+    auto it = m_http_reval.find(url_path);
+    const size_t reclaimed = (it != m_http_reval.end()) ? it->second.bytes : 0;
+    return m_http_reval_bytes - reclaimed + cost <= HTTP_REVAL_MAX_TOTAL;
+}
+
 void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
                                        std::shared_ptr<const std::string> ka,
                                        std::shared_ptr<const std::string> cl)
 {
     size_t cost = (ka ? ka->size() : 0) + (cl ? cl->size() : 0);
-    // What this key already costs is reclaimed before the cap is tested, or a
-    // file edited near the limit is refused on the strength of bytes it is
-    // about to give back.
-    auto old_it = m_http_reval.find(url_path);
-    size_t reclaimed = (old_it != m_http_reval.end()) ? old_it->second.bytes : 0;
-    if (m_http_reval_bytes - reclaimed + cost > HTTP_REVAL_MAX_TOTAL)
+    if (!http_reval_would_fit(url_path, cost))
     {
         // Full: stop taking new files rather than evicting one, because every
         // hit is revalidated so only speed is at stake and a stable answer
@@ -4475,33 +4529,40 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     }
 
     std::string_view file_content(conn->file_buf, static_cast<size_t>(cqe->res));
-    std::string body;
-    if (conn->file_is_html)
-        body = inject_ws_script(file_content);
 
-    std::string_view resp_body = conn->file_is_html
-        ? std::string_view(body)
-        : file_content;
+    // The script is a piece of the one response rather than a reason to hold an
+    // injected copy of the file as well.  Measured on a 400 MiB .html: 1219 MiB
+    // peak RSS for file_buf, the injected body and the response, against 20 MiB
+    // for the same bytes on the splice path.  One copy of the file remains --
+    // the response is a contiguous string and the bytes have to reach it --
+    // and getting below that needs the body streamed rather than assembled.
+    const size_t inject_at = conn->file_is_html
+        ? ws_inject_offset(file_content) : std::string_view::npos;
+    const size_t body_len = file_content.size() +
+        (inject_at == std::string_view::npos ? 0 : WS_INJECT_SCRIPT.size());
 
     // A short read is served and deliberately not stored, because bytes below
     // st_size are not the file and an entry built from them would miss forever
-    // or match a later truncation.
+    // or match a later truncation.  Whether it fits is asked here and not after
+    // the fact: the store branch builds a second full response, and building
+    // one to hand to a cache that will refuse it is the whole cost twice.
     const bool store = !conn->file_url_path.empty() &&
                        static_cast<uint64_t>(cqe->res) ==
-                           static_cast<uint64_t>(conn->file_st.st_size);
+                           static_cast<uint64_t>(conn->file_st.st_size) &&
+                       http_reval_would_fit(conn->file_url_path, 2 * (128 + body_len));
     if (store)
     {
-        auto ka = std::make_shared<const std::string>(
-            build_http_response(conn->file_content_type, resp_body, true));
-        auto cl = std::make_shared<const std::string>(
-            build_http_response(conn->file_content_type, resp_body, false));
+        auto ka = std::make_shared<const std::string>(build_http_response_at(
+            conn->file_content_type, file_content, inject_at, true));
+        auto cl = std::make_shared<const std::string>(build_http_response_at(
+            conn->file_content_type, file_content, inject_at, false));
         queue_http_response(conn, conn->http_keep_alive ? ka : cl);
         http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
     }
     else
     {
-        queue_http_response(conn, std::make_shared<const std::string>(
-            build_http_response(conn->file_content_type, resp_body, conn->http_keep_alive)));
+        queue_http_response(conn, std::make_shared<const std::string>(build_http_response_at(
+            conn->file_content_type, file_content, inject_at, conn->http_keep_alive)));
     }
     conn->file_url_path.clear();
 

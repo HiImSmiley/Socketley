@@ -947,6 +947,7 @@ private:
     // exactly, read once at start.
     bool m_http_reval_enabled{true};
     bool http_reval_active() const { return m_http_reval_enabled && m_http_root_fd >= 0; }
+    bool http_reval_would_fit(const std::string& url_path, size_t cost) const;
     void http_reval_store(const std::string& url_path, const struct stat& st,
                           std::shared_ptr<const std::string> ka,
                           std::shared_ptr<const std::string> cl);
