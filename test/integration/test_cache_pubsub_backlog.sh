@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Integration test: what a subscriber has to do to get itself disconnected.
 #
-# Every publish appends one entry to the subscriber's write queue. While that
-# queue was bounded by entry count, a subscriber reading slowly was dropped after
-# 4096 notifications — for the 30-byte messages pub/sub actually carries, that is
-# about 120 KB, which is not a backlog worth killing a connection over. The bound
-# is memory, so it has to be measured in bytes.
+# While the subscriber's write queue was bounded by entry count, a subscriber
+# reading slowly was dropped after 4096 notifications — for the 30-byte messages
+# pub/sub actually carries, that is about 120 KB, which is not a backlog worth
+# killing a connection over. The bound is memory, so it has to be measured in
+# bytes.
+#
+# A backlog is also the only state in which publish() coalesces: with an empty
+# queue each message is its own entry and goes straight out, and only a
+# subscriber that is behind ever has a tail to append to. So this test is the
+# one that exercises that path, and the order assertion below is why it can.
 #
 # The subscriber here reads nothing at all until every message has been sent, and
 # uses a small receive buffer so the backlog really does land in the runtime's
@@ -92,9 +97,15 @@ except OSError:
     closed_early = True
 sub.close()
 
-delivered = sum(1 for line in buf.split(b"\n") if line.startswith(b"message backlog"))
-print("delivered=%d" % delivered)
+lines = [l for l in buf.split(b"\n") if l.startswith(b"message backlog")]
+print("delivered=%d" % len(lines))
 print("closed_early=%d" % (1 if closed_early else 0))
+
+# Publish order, which is what appending into a shared tail entry could lose:
+# a message written into the middle of another one's bytes would arrive
+# reordered or malformed long before it would arrive missing.
+expected = [b"message backlog msg%06d" % i for i in range(len(lines))]
+print("ordered=%d" % (1 if lines == expected else 0))
 PY
 
 daemon_start "$BIN"
@@ -107,8 +118,10 @@ ready_resp 127.0.0.1 "$PORT" 20 || true
 OUT=$(timeout 60 python3 "$TMPD/slowsub.py" "$PORT" "$MSGS" 2>&1 || true)
 DELIVERED=$(printf '%s\n' "$OUT" | sed -n 's/^delivered=//p')
 CLOSED=$(printf '%s\n' "$OUT" | sed -n 's/^closed_early=//p')
+ORDERED=$(printf '%s\n' "$OUT" | sed -n 's/^ordered=//p')
 DELIVERED=${DELIVERED:-0}
 CLOSED=${CLOSED:-1}
+ORDERED=${ORDERED:-0}
 
 TOTAL=$((TOTAL+1))
 if [ "$CLOSED" = "0" ]; then
@@ -130,6 +143,17 @@ else
     if [ "$DELIVERED" -ge 4090 ] && [ "$DELIVERED" -le 4100 ]; then
         echo "         stopped at the 4096-entry queue cap, not at a memory limit"
     fi
+fi
+
+# Counted apart from the arrival count, because they fail for opposite reasons:
+# a short run is a queue that dropped something, a misordered one is a queue
+# that wrote something into the wrong place.
+TOTAL=$((TOTAL+1))
+if [ "$ORDERED" = "1" ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [publish order survives a backlog]: the messages did not arrive in the order they were published"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

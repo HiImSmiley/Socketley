@@ -7534,31 +7534,40 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 continue;
             }
 
-            if (sub_conn->resp_mode)
+            std::string& out = sub_conn->resp_mode ? resp_msg : text_msg;
+            if (out.empty())
             {
-                if (resp_msg.empty())
+                if (sub_conn->resp_mode)
                 {
                     // RESP pub/sub: *3\r\n$7\r\nmessage\r\n$<chanlen>\r\n<chan>\r\n$<msglen>\r\n<msg>\r\n
-                    resp_msg.reserve(32 + channel.size() + message.size());
-                    resp_msg.append("*3\r\n$7\r\nmessage\r\n");
-                    resp::encode_bulk_into(resp_msg, channel);
-                    resp::encode_bulk_into(resp_msg, message);
+                    out.reserve(32 + channel.size() + message.size());
+                    out.append("*3\r\n$7\r\nmessage\r\n");
+                    resp::encode_bulk_into(out, channel);
+                    resp::encode_bulk_into(out, message);
                 }
-                sub_conn->write_queue.push(resp_msg);
-            }
-            else
-            {
-                if (text_msg.empty())
+                else
                 {
-                    text_msg.reserve(8 + channel.size() + 1 + message.size() + 1);
-                    text_msg.append("message ");
-                    text_msg.append(channel.data(), channel.size());
-                    text_msg.push_back(' ');
-                    text_msg.append(message.data(), message.size());
-                    text_msg.push_back('\n');
+                    out.reserve(8 + channel.size() + 1 + message.size() + 1);
+                    out.append("message ");
+                    out.append(channel.data(), channel.size());
+                    out.push_back(' ');
+                    out.append(message.data(), message.size());
+                    out.push_back('\n');
                 }
-                sub_conn->write_queue.push(text_msg);
             }
+
+            // Appended to the tail rather than queued behind it while that
+            // keeps the entry a sensible size, which is what flush_responses
+            // does for a pipelined client and for the same reason one layer
+            // over: a subscriber that is not draining as fast as the channel
+            // fills otherwise collects thousands of separate entries, and only
+            // MAX_WRITE_BATCH of them reach the kernel per submission.
+            if (!sub_conn->write_queue.empty() &&
+                sub_conn->write_queue.back().size() + out.size()
+                    <= client_connection::WRITE_COALESCE_LIMIT)
+                sub_conn->write_queue.append_back(out);
+            else
+                sub_conn->write_queue.push(out);
 
             if (!sub_conn->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(sub_conn)))
             {
