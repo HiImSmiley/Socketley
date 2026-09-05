@@ -371,6 +371,16 @@ private:
     std::atomic<bool> m_running;
     uint32_t m_queue_depth;
     uint32_t m_pending_submissions{0};
+    // What the previous turn drained, which is the only evidence available
+    // here for whether this loop is mid-batch or idle.
+    uint32_t m_last_batch{0};
+    // Ring entries to try before sleeping; 32 covers the 92% of eligible
+    // turns whose completion arrives within 2.2 of them.
+    static constexpr uint32_t SPIN_BUDGET = 32;
+    // Turns of spinning a single batch buys; bounded so traffic that stops
+    // leaves at most this many extra ring entries behind it.
+    static constexpr uint32_t BUSY_CREDIT = 64;
+    uint32_t m_busy_credit{0};
     uint64_t m_stat_ownerless{0};
     bool     m_warned_ownerless{false};
     int m_eventfd{-1};

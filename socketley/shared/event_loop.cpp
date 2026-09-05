@@ -1119,22 +1119,50 @@ uint32_t event_loop::poll_completions(int timeout_ms)
             // kernel only runs the task work that posts completions when the
             // ring is entered.
             if (io_uring_get_events(&m_ring) < 0)
-                return 0;
+            { m_last_batch = 0; return 0; }
             if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
-                return 0;
+            { m_last_batch = 0; return 0; }
         }
         else
         {
-            struct __kernel_timespec ts{
-                timeout_ms / 1000,
-                static_cast<long long>(timeout_ms % 1000) * 1000000LL };
-            if (io_uring_wait_cqe_timeout(&m_ring, &cqe, &ts) < 0 || !cqe)
-                return 0;
+            // A turn that drained more than one completion is mid-batch and
+            // its next one is due in well under the sleep it would otherwise
+            // take, so it enters the ring again instead; one completion per
+            // turn is an idle loop and must sleep at once, or a runtime with
+            // no traffic burns a core.
+            // A turn is asked whether the loop is busy exactly when it is
+            // about to sleep, which is the one moment the previous turn is a
+            // poor witness; a credit that a batch refills and every quiet turn
+            // spends answers for the phase instead of the instant.
+            if (m_last_batch > 1) m_busy_credit = BUSY_CREDIT;
+            else if (m_busy_credit) --m_busy_credit;
+
+            for (uint32_t s = m_busy_credit ? SPIN_BUDGET : 0; s > 0; --s)
+            {
+                // Entering the ring is what runs the task work that posts
+                // completions under DEFER_TASKRUN, so this is a syscall and
+                // not a userspace read of the completion queue.
+                if (io_uring_get_events(&m_ring) < 0)
+                    break;
+                if (io_uring_peek_cqe(&m_ring, &cqe) == 0 && cqe)
+                    break;
+                cqe = nullptr;
+            }
+
+            if (!cqe)
+            {
+                struct __kernel_timespec ts{
+                    timeout_ms / 1000,
+                    static_cast<long long>(timeout_ms % 1000) * 1000000LL };
+                if (io_uring_wait_cqe_timeout(&m_ring, &cqe, &ts) < 0 || !cqe)
+                { m_last_batch = 0; return 0; }
+            }
         }
     }
 
     bool got_signal = false;
-    return dispatch_ready(got_signal);
+    m_last_batch = dispatch_ready(got_signal);
+    return m_last_batch;
 }
 
 void event_loop::run()
