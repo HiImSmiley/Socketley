@@ -48,6 +48,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 
 #define MAX_OPS        2000000
@@ -320,7 +321,12 @@ static void set_recv_timeout(int fd, int ms)
 enum metric_kind {
     METRIC_ROUND_TRIP = 0,  /* request sent, its reply read, before the next goes */
     METRIC_WRITE_ONLY,      /* bytes handed to the kernel; no reply is expected */
-    METRIC_CONNECT          /* completed TCP connection establishments */
+    METRIC_CONNECT,         /* completed TCP connection establishments */
+    /* One publish read by one subscriber.  Its own kind because it is neither
+     * of the other three: nobody asked for it, and one message in produces N of
+     * these -- so a rate here says what the runtime delivered, not what a
+     * client was served. */
+    METRIC_FANOUT
 };
 
 static const char *metric_name(enum metric_kind m)
@@ -328,6 +334,7 @@ static const char *metric_name(enum metric_kind m)
     switch (m) {
         case METRIC_ROUND_TRIP: return "round_trip";
         case METRIC_WRITE_ONLY: return "write_only";
+        case METRIC_FANOUT:     return "fanout_delivery";
         default:                return "connect";
     }
 }
@@ -340,7 +347,21 @@ static const char *metric_rate_key(enum metric_kind m)
     switch (m) {
         case METRIC_ROUND_TRIP: return "median_round_trips_per_sec";
         case METRIC_WRITE_ONLY: return "median_writes_per_sec";
+        case METRIC_FANOUT:     return "median_deliveries_per_sec";
         default:                return "median_connects_per_sec";
+    }
+}
+
+/* What a latency sample is, in the words the text output uses.  A ternary
+ * chain that already had three arms is where a fourth kind gets labelled as a
+ * connect. */
+static const char *metric_lat_label(enum metric_kind m)
+{
+    switch (m) {
+        case METRIC_ROUND_TRIP: return "Round-trip latency";
+        case METRIC_WRITE_ONLY: return "write() cost";
+        case METRIC_FANOUT:     return "Publish-to-subscriber latency";
+        default:                return "Connect latency";
     }
 }
 
@@ -349,6 +370,7 @@ static const char *metric_lat_prefix(enum metric_kind m)
     switch (m) {
         case METRIC_ROUND_TRIP: return "rtt";
         case METRIC_WRITE_ONLY: return "write";
+        case METRIC_FANOUT:     return "delivery";
         default:                return "connect";
     }
 }
@@ -363,6 +385,8 @@ static const char *metric_meaning(enum metric_kind m)
             return "completed round trips: each request's reply was read before the next was sent";
         case METRIC_WRITE_ONLY:
             return "writes accepted by the kernel; nothing was read back, so this is not a service rate";
+        case METRIC_FANOUT:
+            return "deliveries: one publish counted once per subscriber that read it, in order and exactly once";
         default:
             return "completed TCP connection establishments";
     }
@@ -2173,6 +2197,444 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * I. Fan-out — one publisher, N subscribers
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Every other category here measures a round trip: one client sends, reads its
+ * own reply, sends the next.  Fan-out is the other shape -- one message in, N
+ * messages out -- and the unit that makes the runtimes comparable is a
+ * *delivery*, because that is what each of them does N of.  Counting a publish
+ * once would report a runtime as slower for having more subscribers to serve.
+ *
+ * Three arms, all measured by this one function, because what differs belongs
+ * in the runtime and not in the client:
+ *
+ *   broadcast   a server runtime whose Lua calls self.broadcast
+ *   relay       a --mode inout server with no Lua, which fans out on its own
+ *   pubsub      a cache runtime's `publish` to `subscribe`d connections
+ *
+ * What is not symmetric, stated rather than hidden.  self.broadcast passes -1
+ * to queue_broadcast, so the publisher receives its own message and that arm
+ * does N+1 writes per publish where the other two do N: mode_inout excludes the
+ * sender and the cache never had the publisher subscribed.  At 50 subscribers
+ * that is 2% of the arm's work.  The cache also prefixes every delivery with
+ * `message <channel> `, so its wire bytes per delivery are higher at the same
+ * payload size -- which is why MB/s is reported from the delivered length and
+ * not from the payload.
+ *
+ * The sequence number is the last eight bytes before the newline and not the
+ * first, for that prefix: a fixed offset from the front would read filler on
+ * one arm and score every message as sequence zero.
+ *
+ * Flow control is a bounded number of publishes in flight rather than none.  A
+ * publisher that outruns its subscribers fills their write queues, and at
+ * write_queue_max_bytes the runtime marks them closing -- which arrives as a
+ * fast run with deliveries missing, which is to say as a good number.
+ *
+ * The subscribers on the two server arms have to speak once before they can be
+ * relayed to, and this is not a detail of the harness.  A connection that has
+ * said nothing is proto_unknown, and queue_broadcast() holds relay traffic for
+ * it rather than guessing its framing -- for RELAY_HOLD_DEADLINE_MS, and only
+ * up to RELAY_HOLD_MAX_BYTES, after which the oldest held message is dropped.
+ * Measured before the priming line below existed: 10 of 10 subscribers received
+ * 17030 of 20000, with a p95 of 251 ms.  That is the documented bound doing its
+ * job on a benchmark that never introduced itself, and reading it as a fan-out
+ * rate would have compared a server dropping messages against a cache
+ * delivering them.  The cache arm needs no priming: its subscribers speak by
+ * subscribing.
+ *
+ * The priming line ends in a sequence no publish uses, so a reader skips it
+ * wherever it surfaces -- which matters because it is itself relayed, to every
+ * other subscriber on both arms and back to the sender on the broadcast one.
+ *
+ * A run is a rate only if every subscriber received every sequence, in order,
+ * exactly once.  That is checked per connection, and a shortfall is reported
+ * through `expected` so run_and_report() calls the run INCOMPLETE rather than
+ * publishing it.
+ */
+
+#define FANOUT_MAX_SUBS  256
+#define FANOUT_READERS   4
+/* Publishes allowed in flight, chosen by measurement rather than by argument.
+ *
+ * The three workers sit at 0.7-0.9 cores here rather than at 1.0, which reads
+ * like the publisher being held back by this constant.  Raising it to 4096 to
+ * test that made everything worse: the workers fell to 0.52-0.92, queueing went
+ * from 3 ms to 24-51 ms, and the spread went from 0.2-12% to 5-23%.  A window
+ * that outruns the subscribers' socket buffers puts the worker back to waiting
+ * for writability, which is the same wait one layer down and a noisier one.
+ *
+ * What survived both settings unchanged is the microseconds of worker per
+ * delivery -- 0.089 / 0.080 / 0.22 at 512 against 0.089 / 0.079 / 0.23 at 4096,
+ * across rates that differed by a third.  That is the figure to read, and this
+ * constant is why it is the figure and the rate is not. */
+#define FANOUT_WINDOW    512
+#define FANOUT_SEQ       8              /* digits, at the end of the payload */
+#define FANOUT_SUBBUF    (64 * 1024)
+#define FANOUT_MAX_MSGS  2000000        /* pub_ns is eight bytes per sequence */
+#define FANOUT_LAT_EVERY 8              /* sample rate of the latency log */
+/* A sequence no publish uses, sent once by each subscriber that has to speak
+ * before it can be relayed to.  See the priming paragraph below. */
+#define FANOUT_PRIME_SEQ 99999999
+#define FANOUT_PRIME_MS  300
+
+/* Which arm this invocation is measuring.  Globals rather than fields on
+ * bench_config, because bench_fn is the one signature every test in this file
+ * shares and three fields only these tests read is the worse of the two. */
+static int         g_fanout_pub_reply;   /* is the publisher answered per publish */
+static const char *g_fanout_pub_prefix;  /* what a publish line starts with */
+static const char *g_fanout_sub_cmd;     /* what a subscriber sends first, or NULL */
+static size_t      g_fanout_extra;       /* bytes the runtime prepends per delivery */
+
+struct fanout_sub {
+    int    fd;
+    char  *buf;
+    size_t len;
+    int    got;        /* complete deliveries seen on this connection */
+    int    last_seq;
+    int    disorder;   /* a sequence repeated or gone backwards */
+    int    bad;        /* a line whose last eight bytes are not a sequence */
+};
+
+struct fanout_state {
+    struct fanout_sub *sub;
+    int       subs;
+    int       base_seq;       /* the first sequence that counts */
+    int64_t  *pub_ns;         /* when each sequence went out */
+    int       stop;
+    /* Per reader, so the hot path is a relaxed store to this thread's own slot
+     * rather than a contended increment: at a few million deliveries a second
+     * one shared counter is the client's own bottleneck. */
+    int       seen[FANOUT_READERS];
+    int64_t   last_ns[FANOUT_READERS];
+    int       counted[FANOUT_READERS];
+    struct latency_log lat[FANOUT_READERS];
+};
+
+struct fanout_reader_args {
+    struct fanout_state *st;
+    int idx, lo, hi;
+};
+
+/* Exactly n digits, or -1.  A subscriber handed anything else -- an `ok`, a
+ * `usage:` line, a RESP frame -- has been sent something this benchmark cannot
+ * count, and reading it as a sequence anyway is what would make the loss checks
+ * below pass on a broken run. */
+static int fanout_seq_at(const char *p, int n)
+{
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') return -1;
+        v = v * 10 + (p[i] - '0');
+    }
+    return v;
+}
+
+static void fanout_put_seq(char *p, int v)
+{
+    /* Hand-written rather than snprintf, which would put its NUL where the
+     * newline goes. */
+    for (int i = FANOUT_SEQ - 1; i >= 0; i--) { p[i] = (char)('0' + v % 10); v /= 10; }
+}
+
+/* One line, read to its newline.  The subscribe confirmation has to leave the
+ * socket here and not in a reader's buffer, where it would be charged to the
+ * run as a malformed delivery. */
+static int fanout_read_line(int fd, char *buf, size_t cap)
+{
+    size_t n = 0;
+    while (n + 1 < cap) {
+        ssize_t k = recv(fd, buf + n, 1, 0);
+        if (k <= 0) return -1;
+        if (buf[n] == '\n') return 0;
+        n++;
+    }
+    return -1;
+}
+
+static void *fanout_reader(void *arg)
+{
+    struct fanout_reader_args *a = (struct fanout_reader_args *)arg;
+    struct fanout_state *st = a->st;
+    const int n = a->hi - a->lo;
+    struct pollfd *pfd = (struct pollfd *)calloc((size_t)n, sizeof *pfd);
+    if (!pfd) return NULL;
+    for (int i = 0; i < n; i++) {
+        pfd[i].fd     = st->sub[a->lo + i].fd;
+        pfd[i].events = POLLIN;
+    }
+
+    int seen = 0, counted = 0;
+    int64_t last = 0;
+
+    while (!__atomic_load_n(&st->stop, __ATOMIC_RELAXED)) {
+        if (poll(pfd, (nfds_t)n, 20) <= 0) continue;
+        for (int i = 0; i < n; i++) {
+            if (!(pfd[i].revents & POLLIN)) continue;
+            struct fanout_sub *s = &st->sub[a->lo + i];
+            /* A parse pass leaves at most one partial line behind, so a full
+             * buffer is a line longer than this benchmark sends -- and recv()
+             * for zero bytes would return 0 and read as a closed peer. */
+            if (s->len >= FANOUT_SUBBUF) {
+                s->bad++;
+                __atomic_store_n(&st->stop, 1, __ATOMIC_RELAXED);
+                break;
+            }
+            const ssize_t k = recv(s->fd, s->buf + s->len, FANOUT_SUBBUF - s->len, 0);
+            if (k <= 0) { __atomic_store_n(&st->stop, 1, __ATOMIC_RELAXED); break; }
+            s->len += (size_t)k;
+
+            /* One timestamp per batch and not per line: the deliveries in one
+             * recv() arrived together, and calling the clock for each of them
+             * would spend more of this thread on measuring than on reading. */
+            const int64_t now = time_ns();
+            size_t start = 0;
+            /* memchr and not a byte loop.  At 200 bytes a delivery and millions
+             * of deliveries a second this scan is over a gigabyte a second, and
+             * a client that spends its cores finding newlines is a client that
+             * decides the rate. */
+            for (const char *nl;
+                 (nl = (const char *)memchr(s->buf + start, '\n', s->len - start));
+                 ) {
+                const size_t p    = (size_t)(nl - s->buf);
+                const size_t line = p - start;
+                const int seq = (line >= FANOUT_SEQ)
+                    ? fanout_seq_at(s->buf + p - FANOUT_SEQ, FANOUT_SEQ) : -1;
+                start = p + 1;
+                if (seq < 0) { s->bad++; continue; }
+                /* Ahead of the ordering check, not after it: the prime is the
+                 * highest sequence there is, so counting it would set last_seq
+                 * past every real one and score the whole run as disorder. */
+                if (seq == FANOUT_PRIME_SEQ) continue;
+                /* Both halves matter: a repeat is the crosstalk that
+                 * repro_ws_crosstalk.py exists for, and a gap is a delivery
+                 * this rate would otherwise be claiming. */
+                if (seq <= s->last_seq) { s->disorder++; continue; }
+                s->last_seq = seq;
+                s->got++;
+                seen++;
+                if (seq >= st->base_seq) {
+                    counted++;
+                    last = now;
+                    /* Every eighth, because a log that fills stops recording
+                     * and its percentiles then describe the first part of the
+                     * run rather than the run. */
+                    if ((counted % FANOUT_LAT_EVERY) == 0)
+                        lat_record(&st->lat[a->idx], now - st->pub_ns[seq]);
+                }
+            }
+            memmove(s->buf, s->buf + start, s->len - start);
+            s->len -= start;
+        }
+        __atomic_store_n(&st->seen[a->idx], seen, __ATOMIC_RELAXED);
+    }
+
+    __atomic_store_n(&st->seen[a->idx], seen, __ATOMIC_RELAXED);
+    st->counted[a->idx] = counted;
+    st->last_ns[a->idx] = last;
+    free(pfd);
+    return NULL;
+}
+
+static int fanout_seen_total(struct fanout_state *st, int readers)
+{
+    int seen = 0;
+    for (int t = 0; t < readers; t++)
+        seen += __atomic_load_n(&st->seen[t], __ATOMIC_RELAXED);
+    return seen;
+}
+
+static struct run_result bench_fanout(struct bench_config *cfg)
+{
+    struct run_result res = {0};
+    lat_init(&res.latencies, MAX_LATENCIES);
+
+    int subs = cfg->num_clients > 0 ? cfg->num_clients : 1;
+    if (subs > FANOUT_MAX_SUBS) subs = FANOUT_MAX_SUBS;
+    int msgs = cfg->num_ops;
+    if (msgs > FANOUT_MAX_MSGS) msgs = FANOUT_MAX_MSGS;
+    if (msgs < 1) msgs = 1;
+    int size = cfg->msg_size < FANOUT_SEQ + 1 ? FANOUT_SEQ + 1 : cfg->msg_size;
+
+    int readers = subs < FANOUT_READERS ? subs : FANOUT_READERS;
+
+    struct fanout_state st;
+    memset(&st, 0, sizeof st);
+    st.subs = subs;
+    st.sub    = (struct fanout_sub *)calloc((size_t)subs, sizeof *st.sub);
+    st.pub_ns = (int64_t *)calloc((size_t)msgs, sizeof *st.pub_ns);
+    /* A timed run has no sequence to start counting at, because msgs is then a
+     * cap rather than a plan and a percentage of it is a number of messages
+     * that will never be sent.  The whole-run warm-up (-W) is what removes the
+     * first-run cost there, which is the same answer bench_server_concurrent
+     * reaches by the other route. */
+    st.base_seq = (cfg->duration_ms > 0) ? 0 : msgs * cfg->warmup_pct / 100;
+    if (!st.sub || !st.pub_ns) { free(st.sub); free(st.pub_ns); return res; }
+
+    for (int t = 0; t < readers; t++)
+        lat_init(&st.lat[t], MAX_LATENCIES / FANOUT_READERS);
+
+    int pub = -1;
+    char *line = NULL;
+    pthread_t th[FANOUT_READERS];
+    struct fanout_reader_args ra[FANOUT_READERS];
+    int started = 0, published = 0, ok = 1;
+
+    for (int i = 0; i < subs; i++) {
+        st.sub[i].fd       = tcp_connect(cfg->host, cfg->port);
+        st.sub[i].last_seq = -1;
+        st.sub[i].buf      = (char *)malloc(FANOUT_SUBBUF);
+        if (st.sub[i].fd < 0 || !st.sub[i].buf) { ok = 0; break; }
+        set_recv_timeout(st.sub[i].fd, 5000);
+        if (g_fanout_sub_cmd) {
+            char ack[128];
+            const size_t cl = strlen(g_fanout_sub_cmd);
+            if (send_all(st.sub[i].fd, g_fanout_sub_cmd, cl) != (ssize_t)cl ||
+                fanout_read_line(st.sub[i].fd, ack, sizeof ack) < 0) { ok = 0; break; }
+        }
+    }
+
+    /* After every subscriber is connected and before any is published to, so
+     * that a hold armed by one subscriber's prime is flushed by that
+     * subscriber's own read rather than by the deadline. */
+    if (ok && !g_fanout_sub_cmd) {
+        char prime[64];
+        memset(prime, 'Y', sizeof prime);
+        fanout_put_seq(prime + sizeof(prime) - 1 - FANOUT_SEQ, FANOUT_PRIME_SEQ);
+        prime[sizeof(prime) - 1] = '\n';
+        for (int i = 0; i < subs && ok; i++)
+            if (send_all(st.sub[i].fd, prime, sizeof prime) != (ssize_t)sizeof prime)
+                ok = 0;
+        /* The classification deadline, so the wait covers the path where a
+         * prime is itself held rather than only the path where it is not. */
+        if (ok) {
+            struct timespec ts = { 0, FANOUT_PRIME_MS * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    if (ok) {
+        pub = tcp_connect(cfg->host, cfg->port);
+        if (pub < 0) ok = 0;
+    }
+
+    if (ok) {
+        const size_t plen = strlen(g_fanout_pub_prefix);
+        line = (char *)malloc(plen + (size_t)size + 2);
+        if (!line) ok = 0;
+        else {
+            memcpy(line, g_fanout_pub_prefix, plen);
+            memset(line + plen, 'Y', (size_t)size - FANOUT_SEQ);
+            line[plen + (size_t)size] = '\n';
+        }
+    }
+
+    if (ok) {
+        for (int t = 0; t < readers; t++) {
+            ra[t].st  = &st;
+            ra[t].idx = t;
+            ra[t].lo  = subs * t / readers;
+            ra[t].hi  = subs * (t + 1) / readers;
+            if (pthread_create(&th[t], NULL, fanout_reader, &ra[t]) != 0) { ok = 0; break; }
+            started++;
+        }
+    }
+
+    if (ok) {
+        const size_t plen    = strlen(g_fanout_pub_prefix);
+        const size_t linelen = plen + (size_t)size + 1;
+        char drain[16384];
+
+        for (int i = 0; bench_op_continue(i, cfg) && i < msgs; i++) {
+            /* Checked in blocks: summing four counters and draining the
+             * publisher's own socket once per publish is client CPU spent on
+             * the measurement rather than on the load. */
+            if ((i & 31) == 0) {
+                for (;;) {
+                    if (__atomic_load_n(&st.stop, __ATOMIC_RELAXED)) break;
+                    if (g_fanout_pub_reply)
+                        while (recv(pub, drain, sizeof drain, MSG_DONTWAIT) > 0) {}
+                    const int64_t outstanding =
+                        (int64_t)i * subs - (int64_t)fanout_seen_total(&st, readers);
+                    if (outstanding <= (int64_t)FANOUT_WINDOW * subs) break;
+                    if (deadline_passed()) break;
+                    struct timespec ts = { 0, 200000 };
+                    nanosleep(&ts, NULL);
+                }
+            }
+            fanout_put_seq(line + plen + (size_t)size - FANOUT_SEQ, i);
+            st.pub_ns[i] = time_ns();
+            if (send_all(pub, line, linelen) != (ssize_t)linelen) break;
+            published = i + 1;
+        }
+
+        /* Waited for rather than assumed.  The publisher being done says
+         * nothing about the fan-out being done, and stopping the readers here
+         * would score the run over a window with its tail cut off. */
+        const int64_t want     = (int64_t)published * subs;
+        const int64_t give_up  = time_ns() + 20LL * 1000000000LL;
+        while (!__atomic_load_n(&st.stop, __ATOMIC_RELAXED)) {
+            if (g_fanout_pub_reply)
+                while (recv(pub, drain, sizeof drain, MSG_DONTWAIT) > 0) {}
+            if ((int64_t)fanout_seen_total(&st, readers) >= want) break;
+            if (time_ns() > give_up) break;
+            struct timespec ts = { 0, 500000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    __atomic_store_n(&st.stop, 1, __ATOMIC_RELAXED);
+    for (int t = 0; t < started; t++) pthread_join(th[t], NULL);
+
+    int counted = 0;
+    int64_t close_ns = 0;
+    for (int t = 0; t < started; t++) {
+        counted += st.counted[t];
+        if (st.last_ns[t] > close_ns) close_ns = st.last_ns[t];
+        lat_merge(&res.latencies, &st.lat[t]);
+    }
+
+    const int64_t open_ns = (published > st.base_seq) ? st.pub_ns[st.base_seq] : 0;
+    const double  span    = (open_ns > 0 && close_ns > open_ns)
+                          ? ns_to_s(close_ns - open_ns) : 0.0;
+
+    res.success  = counted;
+    res.expected = (published > st.base_seq) ? (published - st.base_seq) * subs : 0;
+    res.throughput = span > 0 ? counted / span : 0.0;
+    /* The delivered length and not the payload, because the cache's
+     * `message <channel> ` goes over the same wire as the payload does. */
+    res.throughput_mb = span > 0
+        ? counted * (double)(g_fanout_extra + (size_t)size + 1) / span / 1e6 : 0.0;
+
+    int bad = 0, disorder = 0, short_subs = 0;
+    for (int i = 0; i < subs; i++) {
+        bad      += st.sub[i].bad;
+        disorder += st.sub[i].disorder;
+        if (st.sub[i].got < published) short_subs++;
+    }
+    res.failed = bad + disorder;
+    if (bad || disorder)
+        fprintf(stderr, "socketley-bench: FANOUT %d malformed and %d repeated or "
+                "out-of-order deliveries across %d subscribers — this is not a "
+                "fan-out rate\n", bad, disorder, subs);
+    if (short_subs)
+        fprintf(stderr, "socketley-bench: FANOUT %d of %d subscribers received "
+                "fewer than the %d messages published\n",
+                short_subs, subs, published);
+
+    for (int t = 0; t < readers; t++) lat_free(&st.lat[t]);
+    for (int i = 0; i < subs; i++) {
+        if (st.sub[i].fd >= 0) close(st.sub[i].fd);
+        free(st.sub[i].buf);
+    }
+    if (pub >= 0) close(pub);
+    free(line);
+    free(st.sub);
+    free(st.pub_ns);
+    return res;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Multi-run executor + output
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -2459,9 +2921,7 @@ static void run_and_report(struct bench_config *cfg, bench_fn fn,
 
         if (lat->count > 0) {
             printf("  %s (us):  min=%.1f  p50=%.1f  p95=%.1f  p99=%.1f  max=%.1f\n",
-                   metric == METRIC_ROUND_TRIP ? "Round-trip latency"
-                                               : (metric == METRIC_WRITE_ONLY ? "write() cost"
-                                                                              : "Connect latency"),
+                   metric_lat_label(metric),
                    ns_to_us(lat_percentile(lat, 0)),
                    ns_to_us(lat_percentile(lat, 50)),
                    ns_to_us(lat_percentile(lat, 95)),
@@ -2523,7 +2983,13 @@ static void usage(const char *prog)
         "\n"
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
-        "  ws concurrent <clients> <ops>         Multi-client WS\n",
+        "  ws concurrent <clients> <ops>         Multi-client WS\n"
+        "\n"
+        "  fanout broadcast <subs> <msgs> <size> One publisher, N subscribers, via self.broadcast\n"
+        "  fanout relay <subs> <msgs> <size>     The same, via a --mode inout server with no Lua\n"
+        "  fanout pubsub <subs> <msgs> <size>    The same, via a cache's publish/subscribe\n"
+        "                                        Rate is deliveries, not publishes: one message in\n"
+        "                                        is N out, and that is the work being compared.\n",
         prog, DEFAULT_RUNS, DEFAULT_WARMUP, DEFAULT_WARMUP_RUNS);
 }
 
@@ -2703,6 +3169,51 @@ int main(int argc, char **argv)
         }
         else {
             fprintf(stderr, "Unknown ws test: %s\n", test);
+            return 1;
+        }
+    }
+    /* ── fanout ── */
+    else if (strcmp(category, "fanout") == 0) {
+        /* Defaults chosen so the payload dominates the cache's per-delivery
+         * `message <channel> ` prefix rather than being dominated by it: at 200
+         * bytes the prefix is 5% of the wire, at 64 it would be 16% and the
+         * arms would differ in what they carry as much as in what they do. */
+        cfg.num_clients = 50;
+        cfg.num_ops     = 200000;
+        cfg.msg_size    = 200;
+        if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+        if (pcount >= 2) cfg.num_ops     = atoi(argv[pstart + 1]);
+        if (pcount >= 3) cfg.msg_size    = atoi(argv[pstart + 2]);
+
+        if (strcmp(test, "broadcast") == 0) {
+            /* self.broadcast excludes nobody, so the publisher is answered with
+             * its own message -- one line back, like the cache's publish count
+             * and unlike the relay's silence. */
+            g_fanout_pub_prefix = "";
+            g_fanout_sub_cmd    = NULL;
+            g_fanout_pub_reply  = 1;
+            g_fanout_extra      = 0;
+            run_and_report(&cfg, bench_fanout, "fanout", "broadcast", "delivery/sec", METRIC_FANOUT);
+        }
+        else if (strcmp(test, "relay") == 0) {
+            g_fanout_pub_prefix = "";
+            g_fanout_sub_cmd    = NULL;
+            g_fanout_pub_reply  = 0;
+            g_fanout_extra      = 0;
+            run_and_report(&cfg, bench_fanout, "fanout", "relay", "delivery/sec", METRIC_FANOUT);
+        }
+        else if (strcmp(test, "pubsub") == 0) {
+            /* A one-character channel, so the prefix the cache prepends is as
+             * small as its format allows and the two server arms are being
+             * compared against the cache rather than against a channel name. */
+            g_fanout_pub_prefix = "publish c ";
+            g_fanout_sub_cmd    = "subscribe c\n";
+            g_fanout_pub_reply  = 1;
+            g_fanout_extra      = sizeof("message c ") - 1;
+            run_and_report(&cfg, bench_fanout, "fanout", "pubsub", "delivery/sec", METRIC_FANOUT);
+        }
+        else {
+            fprintf(stderr, "Unknown fanout test: %s\n", test);
             return 1;
         }
     }

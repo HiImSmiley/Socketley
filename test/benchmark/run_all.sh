@@ -134,6 +134,16 @@ run_benchmarks() {
     unset BENCH_RESP_PAIRS
     restart_daemon
 
+    # Fan-out, which is the one shape none of the tests above measure: every
+    # rate before this point is a round trip, and one message in producing N out
+    # is a different question with a different answer.  Three passes and 2 s
+    # runs here, around 80 s; the standalone script defaults to five passes and
+    # 3 s, which is what narrows the interval enough to read a ratio off.
+    export BENCH_FANOUT_PASSES=3 BENCH_FANOUT_RUN_MS=2000
+    run_bench_script "$script_dir/bench_fanout.sh"
+    unset BENCH_FANOUT_PASSES BENCH_FANOUT_RUN_MS
+    restart_daemon
+
     run_bench_script "$script_dir/bench_proxy.sh"
     restart_daemon
 
