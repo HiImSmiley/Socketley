@@ -478,6 +478,7 @@ bool cache_instance::setup(event_loop& loop)
         m_base_port = 9000;
 
     m_route_payload.assign(m_shard_n, std::string{});
+    m_store.set_channel_observer(&on_channel_presence, this);
     m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
     // `--persistent` with more than one shard is no longer refused: each shard
@@ -4256,6 +4257,57 @@ void cache_instance::fan_all_shards(client_connection* conn, uint32_t h,
         route_part(conn, sh, slot, sh, raw, resp);
 }
 
+// The shards a publish has to reach: this one, and every sibling whose filter
+// says it can hold a subscriber of the channel.  Measured with fifty channels
+// over four shards, one subscriber each, that is 0.75 crossings per publish
+// against 3, and a sibling with nobody on the channel is not woken for it.
+void cache_instance::fan_publish(client_connection* conn, uint32_t h,
+                                 std::string_view raw, bool resp,
+                                 std::string_view channel)
+{
+    const auto& tbl = shard_stats_table();
+    if (SOCKETLEY_UNLIKELY(!tbl.mapped() || tbl.count() != m_shard_n))
+    {
+        fan_all_shards(conn, h, raw, resp);
+        return;
+    }
+
+    const uint32_t bit = shard_stats::channel_bit(channel);
+    uint32_t targets[max_shards];
+    uint32_t n = 0;
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+        if (sh == m_shard_i || tbl.channel_may_have(sh, bit))
+            targets[n++] = sh;
+
+    const uint32_t slot = slot_open(conn, resp, cache_merge_for(h), n);
+    for (uint32_t i = 0; i < n; ++i)
+        route_part(conn, targets[i], slot, i, raw, resp);
+}
+
+void cache_instance::on_channel_presence(void* ctx, std::string_view channel, bool present)
+{
+    static_cast<cache_instance*>(ctx)->channel_presence(channel, present);
+}
+
+void cache_instance::channel_presence(std::string_view channel, bool present)
+{
+    auto& tbl = shard_stats_table();
+    if (!tbl.writable())
+        return;
+    if (m_chan_buckets.empty())
+        m_chan_buckets.assign(shard_stats::channel_bits, 0);
+
+    const uint32_t bit = shard_stats::channel_bit(channel);
+    uint32_t&      n   = m_chan_buckets[bit];
+    if (present)
+    {
+        if (n++ == 0)
+            tbl.channel_set(bit);
+    }
+    else if (n > 0 && --n == 0)
+        tbl.channel_clear(bit);
+}
+
 // The one place the text interpreter asks who owns a key, because an invariant
 // sixty-odd handlers have to remember is one the next handler will not know
 // about.
@@ -4407,7 +4459,13 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
                 });
                 return;
             }
-            fan_all_shards(conn, h, line, false);
+            // The channel is the first word of the arguments; without one the
+            // interpreter's usage answer is the right one, from every shard.
+            const size_t sp = parts.args.find(' ');
+            if (sp == std::string_view::npos)
+                fan_all_shards(conn, h, line, false);
+            else
+                fan_publish(conn, h, line, false, parts.args.substr(0, sp));
             return;
         }
 
@@ -6469,7 +6527,10 @@ void cache_instance::process_resp_command(client_connection* conn,
             }
             std::string raw;
             rebuild_resp(raw, args, argc);
-            fan_all_shards(conn, h, raw, true);
+            if (argc < 2)
+                fan_all_shards(conn, h, raw, true);
+            else
+                fan_publish(conn, h, raw, true, args[1]);
             return;
         }
 

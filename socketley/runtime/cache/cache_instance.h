@@ -490,6 +490,16 @@ private:
                             std::string_view* args, int argc);
 
     // A keyspace-wide command: the same command to every shard, merged.
+    // A publish, to the shards whose channel filter says they can hold a
+    // subscriber of that channel, and always this one.
+    void fan_publish(client_connection* conn, uint32_t h, std::string_view raw,
+                     bool resp, std::string_view channel);
+    static void on_channel_presence(void* ctx, std::string_view channel, bool present);
+    void        channel_presence(std::string_view channel, bool present);
+    // Channels of this shard per filter bucket, so the bit clears with the
+    // bucket's last channel and not its first.
+    std::vector<uint32_t> m_chan_buckets;
+
     void fan_all_shards(client_connection* conn, uint32_t h,
                         std::string_view raw, bool resp);
 

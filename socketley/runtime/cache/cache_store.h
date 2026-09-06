@@ -228,6 +228,15 @@ public:
     void subscribe(int fd, std::string_view channel);
     void unsubscribe(int fd, std::string_view channel);
     void unsubscribe_all(int fd);
+
+    // Told when a channel gains its first subscriber here or loses its last,
+    // which is what a shard's channel filter is kept from.
+    using channel_observer = void (*)(void* ctx, std::string_view channel, bool present);
+    void set_channel_observer(channel_observer fn, void* ctx)
+    {
+        m_chan_observer     = fn;
+        m_chan_observer_ctx = ctx;
+    }
     const std::unordered_set<int>* get_subscribers(std::string_view channel) const;
     size_t channel_count() const { return m_channels.size(); }
 
@@ -407,4 +416,6 @@ private:
 
     // Pub/Sub
     channel_map m_channels;
+    channel_observer m_chan_observer{nullptr};
+    void*            m_chan_observer_ctx{nullptr};
 };

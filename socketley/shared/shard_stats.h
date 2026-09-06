@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "runtime_definitions.h"   // max_shards
+#include "../cli/command_hashing.h" // fnv1a, for the channel filter
 
 namespace shard_stats
 {
@@ -31,7 +32,7 @@ inline constexpr const char* region_name = "socketley-shards";
 
 inline constexpr size_t   line_size      = 64;
 inline constexpr uint32_t magic_value    = 0x534b4c53u;   // 'SKLS'
-inline constexpr uint32_t format_version = 2u;
+inline constexpr uint32_t format_version = 3u;
 
 // One shard's line, written by it alone, where `generation` counts attachments
 // so a reader can tell an unused slot from a legitimate zero.
@@ -46,6 +47,24 @@ struct alignas(line_size) slot
     std::atomic<uint64_t> reserved[2];
 };
 static_assert(sizeof(slot) == line_size);
+
+// One shard's channel filter: a bit per hash bucket of the channels it holds
+// a subscriber for, set before that subscriber is answered and cleared with
+// the bucket's last channel, so a publish crosses only to shards that can
+// hold somebody -- a set bit costs at worst the crossing every publish used
+// to cost, and a clear bit is never wrong.
+inline constexpr uint32_t channel_bits  = 1u << 16;
+inline constexpr uint32_t channel_words = channel_bits / 64;
+struct alignas(line_size) channel_filter
+{
+    std::atomic<uint64_t> word[channel_words];
+};
+static_assert(sizeof(channel_filter) == channel_words * sizeof(uint64_t));
+
+inline uint32_t channel_bit(std::string_view channel)
+{
+    return fnv1a(channel) & (channel_bits - 1);
+}
 
 // One struct so the writer cannot publish four of five, every field a number a
 // reader only adds.
@@ -73,10 +92,12 @@ static_assert(sizeof(header) == line_size);
 // negotiated across the exec; a region of the wrong length is refused.
 struct table
 {
-    header h;
-    slot   slots[max_shards];
+    header         h;
+    slot           slots[max_shards];
+    channel_filter channels[max_shards];
 };
-static_assert(sizeof(table) == line_size * (max_shards + 1));
+static_assert(sizeof(table) == line_size * (max_shards + 1)
+                               + sizeof(channel_filter) * max_shards);
 
 // "is fd 4 open" is the wrong test, because adopt() takes ownership and a guess
 // CLOSES somebody else's descriptor; memfd's name in /proc/self/fd is the test.
@@ -181,6 +202,8 @@ public:
         m_table->slots[i].total_messages.store(0, std::memory_order_relaxed);
         m_table->slots[i].bytes_in.store(0, std::memory_order_relaxed);
         m_table->slots[i].bytes_out.store(0, std::memory_order_relaxed);
+        for (auto& w : m_table->channels[i].word)
+            w.store(0, std::memory_order_relaxed);
         m_table->slots[i].generation.store(0, std::memory_order_release);
     }
 
@@ -238,6 +261,8 @@ public:
         m_table->slots[index].total_messages.store(0, std::memory_order_relaxed);
         m_table->slots[index].bytes_in.store(0, std::memory_order_relaxed);
         m_table->slots[index].bytes_out.store(0, std::memory_order_relaxed);
+        for (auto& w : m_table->channels[index].word)
+            w.store(0, std::memory_order_relaxed);
         m_table->slots[index].generation.fetch_add(1, std::memory_order_release);
         return true;
     }
@@ -316,6 +341,33 @@ public:
         // every freshness assertion in the tree reads, so a reader that sees a
         // new count also sees the counters that were taken with it.
         s.active_connections.store(f.active_connections, std::memory_order_release);
+    }
+
+    // This shard's own filter, one bit at a time.
+    void channel_set(uint32_t bit)
+    {
+        if (writable())
+            m_table->channels[m_index].word[bit / 64].fetch_or(
+                uint64_t{1} << (bit % 64), std::memory_order_release);
+    }
+    void channel_clear(uint32_t bit)
+    {
+        if (writable())
+            m_table->channels[m_index].word[bit / 64].fetch_and(
+                ~(uint64_t{1} << (bit % 64)), std::memory_order_release);
+    }
+
+    // Whether shard `i` can hold a subscriber of a channel in this bucket,
+    // with a slot nobody has adopted answering yes, because a shard that has
+    // not said what it holds is crossed to as every shard used to be.
+    bool channel_may_have(uint32_t i, uint32_t bit) const
+    {
+        if (!m_table || i >= m_count || i >= max_shards)
+            return true;
+        if (m_table->slots[i].generation.load(std::memory_order_acquire) == 0)
+            return true;
+        return (m_table->channels[i].word[bit / 64].load(std::memory_order_acquire)
+                >> (bit % 64)) & 1u;
     }
 
     // Wait-free: a descheduled or dead shard delays this by nothing, and a

@@ -2117,7 +2117,10 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
 
 void cache_store::subscribe(int fd, std::string_view channel)
 {
-    m_channels[std::string(channel)].insert(fd);
+    const auto [it, fresh] = m_channels.try_emplace(std::string(channel));
+    it->second.insert(fd);
+    if (fresh && m_chan_observer)
+        m_chan_observer(m_chan_observer_ctx, it->first, true);
 }
 
 void cache_store::unsubscribe(int fd, std::string_view channel)
@@ -2127,7 +2130,11 @@ void cache_store::unsubscribe(int fd, std::string_view channel)
     {
         it->second.erase(fd);
         if (it->second.empty())
+        {
+            if (m_chan_observer)
+                m_chan_observer(m_chan_observer_ctx, it->first, false);
             m_channels.erase(it);
+        }
     }
 }
 
@@ -2137,7 +2144,11 @@ void cache_store::unsubscribe_all(int fd)
     {
         it->second.erase(fd);
         if (it->second.empty())
+        {
+            if (m_chan_observer)
+                m_chan_observer(m_chan_observer_ctx, it->first, false);
             it = m_channels.erase(it);
+        }
         else
             ++it;
     }
