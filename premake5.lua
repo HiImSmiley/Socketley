@@ -970,7 +970,10 @@ project "socketley_bench"
 
     buildoptions { "-pipe" }
 
-    links { "pthread", "m" }
+    -- ssl and crypto because the fanout category can drive TLS connections, and
+    -- one client for both arms is the whole point: a separate TLS load
+    -- generator would compare two clients as well as two runtimes.
+    links { "pthread", "m", "ssl", "crypto" }
 
     files { "test/benchmark/bench.c" }
 

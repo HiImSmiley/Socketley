@@ -37,7 +37,7 @@ source "$(dirname "$0")/lib_paired.sh"
 BC_PORT=19741      # server, --lua fanout.lua, self.broadcast
 RL_PORT=19742      # server, --mode inout, no Lua
 PS_PORT=19743      # cache, publish/subscribe
-RESULTS_FILE="${RESULTS_DIR}/fanout_${TIMESTAMP}.json"
+RESULTS_FILE="${RESULTS_DIR}/fanout_${TIMESTAMP}${BENCH_FANOUT_TLS:+_tls}.json"
 
 PASSES=${1:-${BENCH_FANOUT_PASSES:-5}}
 RUN_MS=${BENCH_FANOUT_RUN_MS:-3000}
@@ -51,6 +51,18 @@ QUIET_CORES=${BENCH_QUIET_CORES:-1.0}
 TARGET_PCT=${BENCH_RESOLUTION_TARGET:-15}
 
 ARMS="broadcast relay pubsub"
+
+# TLS, which had no benchmark anywhere in this directory before this line.
+#
+# It is the same three arms over the record layer, and it is here because of a
+# prediction the plaintext measurement leaves behind: tls_flush() drives one
+# SSL_write per queue entry, so an entry costs a record header and an AEAD tag
+# on top of what it costs in segments.  Coalescing should therefore be worth
+# more here than it is in the clear.  If it is not, the model of the write path
+# that produced it is wrong, which is the only kind of measurement worth the
+# certificate.
+TLS=${BENCH_FANOUT_TLS:-0}
+TLS_ARG=""; TLS_FLAGS=""
 
 declare -A ARM_PORT=( [broadcast]=$BC_PORT [relay]=$RL_PORT [pubsub]=$PS_PORT )
 declare -A ARM_NAME=( [broadcast]=fbc     [relay]=frl      [pubsub]=fps )
@@ -71,7 +83,7 @@ arm_run() {
     local w0 w1 t0 t1 out rc bpid peak cur
 
     w0=$(cpu_ticks_of "$wpid"); t0=$(date +%s%N)
-    "$SOCKETLEY_BENCH" -j -r 1 -W 0 -w 0 -d "$RUN_MS" \
+    "$SOCKETLEY_BENCH" -j -r 1 -W 0 -w 0 -d "$RUN_MS" $TLS_ARG \
         fanout "$arm" 127.0.0.1 "$port" "$subs" 2000000 "$MSG_SIZE" \
         >"$TMPDIR_BENCH/$arm.out" 2>"$TMPDIR_BENCH/$arm.err" &
     bpid=$!
@@ -143,10 +155,24 @@ fi
 start_daemon || exit 1
 cleanup_runtimes >/dev/null 2>&1
 
+if [ "$TLS" = "1" ]; then
+    command -v openssl >/dev/null 2>&1 || { log_error "BENCH_FANOUT_TLS=1 needs the openssl CLI"; stop_daemon; exit 1; }
+    CERTS="$TMPDIR_BENCH/certs"; mkdir -p "$CERTS"
+    # Two days and no passphrase, the same throwaway the TLS integration tests
+    # generate; the client is told not to verify it.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+        -keyout "$CERTS/k.pem" -out "$CERTS/c.pem" \
+        -subj "/CN=localhost" >/dev/null 2>&1 \
+        || { log_error "could not generate a certificate"; stop_daemon; exit 1; }
+    TLS_FLAGS="--tls --cert $CERTS/c.pem --key $CERTS/k.pem"
+    TLS_ARG="-S"
+    log_info "TLS: the same three arms over the record layer"
+fi
+
 socketley_cmd create server "${ARM_NAME[broadcast]}" -p $BC_PORT --mode inout \
-    --lua "${SCRIPT_DIR}/fanout.lua" -s >/dev/null 2>&1
-socketley_cmd create server "${ARM_NAME[relay]}"     -p $RL_PORT --mode inout -s >/dev/null 2>&1
-socketley_cmd create cache  "${ARM_NAME[pubsub]}"    -p $PS_PORT -s >/dev/null 2>&1
+    --lua "${SCRIPT_DIR}/fanout.lua" $TLS_FLAGS -s >/dev/null 2>&1
+socketley_cmd create server "${ARM_NAME[relay]}"     -p $RL_PORT --mode inout $TLS_FLAGS -s >/dev/null 2>&1
+socketley_cmd create cache  "${ARM_NAME[pubsub]}"    -p $PS_PORT $TLS_FLAGS -s >/dev/null 2>&1
 
 for arm in $ARMS; do
     wait_for_port "${ARM_PORT[$arm]}" || { log_error "$arm never bound ${ARM_PORT[$arm]}"; stop_daemon; exit 1; }
