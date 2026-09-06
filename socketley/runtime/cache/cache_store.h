@@ -164,6 +164,50 @@ public:
     bool   zincrby(std::string_view key, double delta, std::string_view member,
                    double& out);
 
+    // --- Strings, the range and float spellings ---
+    // Inclusive ends, negative counting from the last, empty when inverted --
+    // the same rules lrange and zrange follow here.
+    bool   getrange(std::string_view key, int64_t start, int64_t end, std::string& out) const;
+    size_t setrange(std::string_view key, size_t offset, std::string_view value);
+    bool   incrbyfloat(std::string_view key, double delta, double& result);
+    bool   getdel(std::string_view key, std::string& out);
+
+    // --- Lists, the positional spellings ---
+    // 0 ok, -1 no such key, -2 index past the end.
+    int  lset(std::string_view key, int64_t idx, std::string_view val);
+    // Removes count occurrences from the head, or from the tail when negative,
+    // or every one when zero, and answers how many went.
+    int  lrem(std::string_view key, int64_t count, std::string_view val);
+    bool ltrim(std::string_view key, int64_t start, int64_t stop);
+    // The new length, 0 when the key is absent and -1 when the pivot is not.
+    int  linsert(std::string_view key, bool before, std::string_view pivot,
+                 std::string_view val);
+
+    // --- Sets, the sampling spellings ---
+    bool spop(std::string_view key, std::string& out);
+    bool srandmember(std::string_view key, std::string& out) const;
+
+    // --- Hashes, the field spellings ---
+    bool hexists(std::string_view key, std::string_view field) const;
+    bool hincrby(std::string_view key, std::string_view field, int64_t delta,
+                 int64_t& result);
+    // 1 set, 0 already there, -1 type conflict -- sadd's answers.
+    int  hsetnx(std::string_view key, std::string_view field, std::string_view val);
+
+    // --- Sorted sets, by score rather than by rank ---
+    // A score range with its two ends each open or closed, walked from the low
+    // end or the high one.
+    void zrangebyscore(std::string_view key, double min, double max,
+                       bool min_incl, bool max_incl, bool reverse,
+                       std::vector<std::pair<std::string_view, double>>& out) const;
+    size_t zcount(std::string_view key, double min, double max,
+                  bool min_incl, bool max_incl) const;
+    // The lowest-scoring member, or the highest, removed and handed back.
+    bool   zpop(std::string_view key, bool highest, std::string& member, double& score);
+    size_t zremrangebyrank(std::string_view key, int64_t start, int64_t stop);
+    size_t zremrangebyscore(std::string_view key, double min, double max,
+                            bool min_incl, bool max_incl);
+
     // --- Type / Keys ---
     std::string_view type(std::string_view key) const;
     // returns "string", "list", "set", "hash", or "none"

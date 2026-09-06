@@ -612,6 +612,10 @@ private:
 
     // Whether a mutation needs writing down at all, asked before the text of
     // the command is built, because most caches neither lead nor journal.
+    // The handful of INFO fields a client or a monitor actually reads back,
+    // and nothing invented to fill a section out.
+    void build_info_reply(std::string& out) const;
+
     bool mutation_log_wanted() const
     {
         return (m_repl_role == repl_leader && !m_followers.empty())

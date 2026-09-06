@@ -13,6 +13,7 @@
 #include "../../shared/unix_listener.h"
 #include "../../cli/command_hashing.h"
 #include "../../shared/shard_target.h"
+#include "../../shared/version.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -2256,6 +2257,39 @@ static void append_score_bare(std::string& rb, double sc)
         rb.append(buf, static_cast<size_t>(n));
 }
 
+// A score bound as ZRANGEBYSCORE spells it: a bare number is inclusive, a
+// leading "(" makes it exclusive, and -inf/+inf are the open ends.
+static bool parse_score_bound(std::string_view sv, double& out, bool& inclusive)
+{
+    inclusive = true;
+    if (!sv.empty() && sv.front() == '(')
+    {
+        inclusive = false;
+        sv.remove_prefix(1);
+    }
+    if (sv.size() == 3 || sv.size() == 4)
+    {
+        switch (fnv1a_lower(sv))
+        {
+            case fnv1a("-inf"):
+                out = -std::numeric_limits<double>::infinity(); return true;
+            case fnv1a("+inf"):
+            case fnv1a("inf"):
+                out =  std::numeric_limits<double>::infinity(); return true;
+            default: break;
+        }
+    }
+    return parse_double_sv(sv, out);
+}
+
+// One score, formatted the way every reply here formats one.
+static std::string score_text(double sc)
+{
+    std::string s;
+    append_score_bare(s, sc);
+    return s;
+}
+
 static void append_score(std::string& rb, double sc)
 {
     append_score_bare(rb, sc);
@@ -4199,13 +4233,24 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
     if (keys_all_local(keys.data(), keys.size()))
         return false;
 
+    // The same table, before the same irreversible step, because an `else`
+    // standing for mset would quietly turn the next multi-key spelling added
+    // here into a write.
+    std::string_view part_cmd;
+    switch (h)
+    {
+        case fnv1a("mget"): part_cmd = "get"; break;
+        case fnv1a("mset"): part_cmd = "set"; break;
+        default: return false;
+    }
+
     const uint32_t slot = slot_open(conn, false, cache_merge_for(h),
                                     static_cast<uint32_t>(keys.size()));
     std::string raw;
     for (size_t i = 0; i < keys.size(); ++i)
     {
-        if (h == fnv1a("mget")) build_text_cmd(raw, "get", keys[i]);
-        else                    build_text_cmd(raw, "set", keys[i], vals[i]);
+        if (h == fnv1a("mget")) build_text_cmd(raw, part_cmd, keys[i]);
+        else                    build_text_cmd(raw, part_cmd, keys[i], vals[i]);
         route_part(conn, cache_shard_of(keys[i], m_shard_n), slot,
                    static_cast<uint32_t>(i), raw, false);
     }
@@ -4246,6 +4291,25 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     if (local)
         return false;
 
+    // What each multi-key spelling becomes per key: one table, decided once,
+    // and BEFORE the slot is opened -- a refusal after that leaves a slot
+    // nothing will ever fill while the caller answers locally as well.  A
+    // chain here is what let EXISTS fall through to DEL and answer by
+    // deleting, so the mapping is written where it can be read at a glance.
+    std::string_view part_cmd;
+    switch (h)
+    {
+        case fnv1a("mset"):   part_cmd = "SET";    break;
+        case fnv1a("mget"):   part_cmd = "GET";    break;
+        case fnv1a("exists"):
+        case fnv1a("touch"):  part_cmd = "EXISTS"; break;
+        case fnv1a("del"):
+        case fnv1a("unlink"): part_cmd = "DEL";    break;
+        // Unreachable while cache_classify_resp names the multi-key set, and
+        // the local dispatch's answer if it ever stops.
+        default: return false;
+    }
+
     const uint32_t slot = slot_open(conn, true, cache_merge_for(h),
                                     static_cast<uint32_t>(n));
     std::string raw;
@@ -4255,16 +4319,10 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
         if (is_mset)
         {
             const std::string_view val = args[2 + i * 2];
-            build_resp_cmd(raw, "SET", key, &val);
+            build_resp_cmd(raw, part_cmd, key, &val);
         }
-        else if (h == fnv1a("mget"))
-        {
-            build_resp_cmd(raw, "GET", key);
-        }
-        else    // del
-        {
-            build_resp_cmd(raw, "DEL", key);
-        }
+        else
+            build_resp_cmd(raw, part_cmd, key);
         route_part(conn, cache_shard_of(key, m_shard_n), slot,
                    static_cast<uint32_t>(i), raw, true);
     }
@@ -5838,6 +5896,378 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             handle_replicate_request(conn);
             return;
         }
+        // ─── Strings, the range and float spellings ───
+        case fnv1a("getrange"):
+        case fnv1a("substr"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [s_s, r2]  = extract_key(r1);
+            auto [e_s, _r3] = extract_key(r2);
+            if (key.empty() || s_s.empty() || e_s.empty())
+            { rb.append("usage: getrange key start end\n", 30); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(s_s, s) || !parse_int_sv(e_s, e))
+            { rb.append("error: invalid index\n", 21); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            std::string out;
+            if (!m_store.getrange(key, s, e, out)) { rb.append("nil\n", 4); return; }
+            rb.append(out); rb.push_back('\n');
+            break;
+        }
+        case fnv1a("setrange"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [off_s, v] = extract_key(r1);
+            if (key.empty() || off_s.empty())
+            { rb.append("usage: setrange key offset value\n", 33); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t off = 0;
+            if (!parse_int_sv(off_s, off) || off < 0)
+            { rb.append("error: invalid offset\n", 22); return; }
+            const size_t n = m_store.setrange(key, static_cast<size_t>(off), v);
+            if (n == cache_store::append_wrong_type) rb.append("error: type conflict\n", 21);
+            else if (n == cache_store::append_denied) rb.append("error: out of memory\n", 21);
+            else { rb.append(std::to_string(n)); rb.push_back('\n'); replicate_command(line); }
+            break;
+        }
+        case fnv1a("incrbyfloat"):
+        {
+            auto [key, d_s] = extract_key(args);
+            if (key.empty() || d_s.empty())
+            { rb.append("usage: incrbyfloat key delta\n", 29); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            double d = 0, out = 0;
+            if (!parse_double_sv(d_s, d)) { rb.append("error: not a float\n", 19); return; }
+            if (!m_store.incrbyfloat(key, d, out)) { rb.append("error: not a float\n", 19); return; }
+            const std::string txt = score_text(out);
+            rb.append(txt); rb.push_back('\n');
+            // The result and not the command, for the reason the RESP spelling
+            // gives: two builds may round the same addition differently.
+            if (mutation_log_wanted())
+            {
+                std::string c = "set "; c.append(key.data(), key.size());
+                c += ' '; c += txt;
+                replicate_command(c);
+            }
+            break;
+        }
+        case fnv1a("getdel"):
+        {
+            auto [key, _r] = extract_key(args);
+            if (key.empty()) { rb.append("usage: getdel key\n", 18); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            std::string val;
+            if (!m_store.getdel(key, val)) { rb.append("nil\n", 4); return; }
+            rb.append(val); rb.push_back('\n');
+            if (mutation_log_wanted())
+            { std::string c = "del "; c.append(key.data(), key.size()); replicate_command(c); }
+            break;
+        }
+
+        // ─── Lists, the positional spellings ───
+        case fnv1a("lset"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [idx_s, v] = extract_key(r1);
+            if (key.empty() || idx_s.empty())
+            { rb.append("usage: lset key index value\n", 28); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t idx = 0;
+            if (!parse_int_sv(idx_s, idx)) { rb.append("error: invalid index\n", 21); return; }
+            const int rc = m_store.lset(key, idx, v);
+            if (rc == 0)       { rb.append("ok\n", 3); replicate_command(line); }
+            else if (rc == -1) rb.append("nil\n", 4);
+            else               rb.append("error: index out of range\n", 26);
+            break;
+        }
+        case fnv1a("lrem"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [cnt_s, v] = extract_key(r1);
+            if (key.empty() || cnt_s.empty())
+            { rb.append("usage: lrem key count value\n", 28); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t cnt = 0;
+            if (!parse_int_sv(cnt_s, cnt)) { rb.append("error: invalid count\n", 21); return; }
+            const int gone = m_store.lrem(key, cnt, v);
+            rb.append(std::to_string(gone)); rb.push_back('\n');
+            if (gone > 0) replicate_command(line);
+            break;
+        }
+        case fnv1a("ltrim"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [s_s, r2]  = extract_key(r1);
+            auto [e_s, _r3] = extract_key(r2);
+            if (key.empty() || s_s.empty() || e_s.empty())
+            { rb.append("usage: ltrim key start stop\n", 28); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(s_s, s) || !parse_int_sv(e_s, e))
+            { rb.append("error: invalid index\n", 21); return; }
+            m_store.ltrim(key, s, e);
+            rb.append("ok\n", 3);
+            replicate_command(line);
+            break;
+        }
+        case fnv1a("linsert"):
+        {
+            auto [key, r1]   = extract_key(args);
+            auto [where, r2] = extract_key(r1);
+            auto [pivot, v]  = extract_key(r2);
+            if (key.empty() || where.empty() || pivot.empty())
+            { rb.append("usage: linsert key before|after pivot value\n", 44); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            const uint32_t wh = fnv1a_lower(where);
+            if (wh != fnv1a("before") && wh != fnv1a("after"))
+            { rb.append("usage: linsert key before|after pivot value\n", 44); return; }
+            const int n = m_store.linsert(key, wh == fnv1a("before"), pivot, v);
+            rb.append(std::to_string(n)); rb.push_back('\n');
+            if (n > 0) replicate_command(line);
+            break;
+        }
+
+        // ─── Sets, the sampling spellings ───
+        case fnv1a("spop"):
+        {
+            auto [key, _r] = extract_key(args);
+            if (key.empty()) { rb.append("usage: spop key\n", 16); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            std::string member;
+            if (!m_store.spop(key, member)) { rb.append("nil\n", 4); return; }
+            rb.append(member); rb.push_back('\n');
+            // As the SREM it turned out to be: the member this process's
+            // iteration order picked is not the one a follower would pick.
+            if (mutation_log_wanted())
+            {
+                std::string c = "srem "; c.append(key.data(), key.size());
+                c += ' '; c += member;
+                replicate_command(c);
+            }
+            break;
+        }
+        case fnv1a("srandmember"):
+        {
+            auto [key, _r] = extract_key(args);
+            if (key.empty()) { rb.append("usage: srandmember key\n", 23); return; }
+            std::string member;
+            if (!m_store.srandmember(key, member)) { rb.append("nil\n", 4); return; }
+            rb.append(member); rb.push_back('\n');
+            break;
+        }
+
+        // ─── Hashes, the field spellings ───
+        case fnv1a("hexists"):
+        {
+            auto [key, f] = extract_key(args);
+            if (key.empty() || f.empty()) { rb.append("usage: hexists key field\n", 25); return; }
+            rb.append(m_store.hexists(key, f) ? "1\n" : "0\n", 2);
+            break;
+        }
+        case fnv1a("hincrby"):
+        {
+            auto [key, r1] = extract_key(args);
+            auto [f, d_s]  = extract_key(r1);
+            if (key.empty() || f.empty() || d_s.empty())
+            { rb.append("usage: hincrby key field delta\n", 31); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t d = 0, out = 0;
+            if (!parse_int_sv(d_s, d)) { rb.append("error: invalid delta\n", 21); return; }
+            if (!m_store.hincrby(key, f, d, out))
+            { rb.append("error: not an integer\n", 22); return; }
+            rb.append(std::to_string(out)); rb.push_back('\n');
+            replicate_command(line);
+            break;
+        }
+        case fnv1a("hsetnx"):
+        {
+            auto [key, r1] = extract_key(args);
+            auto [f, v]    = extract_key(r1);
+            if (key.empty() || f.empty()) { rb.append("usage: hsetnx key field value\n", 30); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            const int rc = m_store.hsetnx(key, f, v);
+            if (rc < 0) { rb.append("error: type conflict\n", 21); return; }
+            rb.append(rc ? "1\n" : "0\n", 2);
+            if (rc == 1) replicate_command(line);
+            break;
+        }
+        case fnv1a("hstrlen"):
+        {
+            auto [key, f] = extract_key(args);
+            if (key.empty() || f.empty()) { rb.append("usage: hstrlen key field\n", 25); return; }
+            const std::string* v = m_store.hget(key, f);
+            rb.append(std::to_string(v ? v->size() : 0)); rb.push_back('\n');
+            break;
+        }
+        case fnv1a("hkeys"):
+        case fnv1a("hvals"):
+        {
+            auto [key, _r] = extract_key(args);
+            if (key.empty()) { rb.append("usage: hkeys key\n", 17); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            const auto* hp = m_store.hash_ptr(key);
+            const bool want_keys = (fnv1a_lower(cmd) == fnv1a("hkeys"));
+            if (hp) for (const auto& [f, v] : *hp)
+            { rb.append(want_keys ? f : v); rb.push_back('\n'); }
+            rb.append("end\n", 4);
+            break;
+        }
+        case fnv1a("hmget"):
+        {
+            auto [key, rest] = extract_key(args);
+            if (key.empty() || rest.empty()) { rb.append("usage: hmget key field [field ...]\n", 35); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            std::string_view walk = rest;
+            while (!walk.empty())
+            {
+                auto [f, next] = extract_key(walk);
+                if (f.empty()) break;
+                const std::string* v = m_store.hget(key, f);
+                if (v) { rb.append(*v); rb.push_back('\n'); }
+                else   rb.append("nil\n", 4);
+                walk = next;
+            }
+            rb.append("end\n", 4);
+            break;
+        }
+        case fnv1a("hmset"):
+        {
+            auto [key, rest] = extract_key(args);
+            if (key.empty() || rest.empty())
+            { rb.append("usage: hmset key field value [field value ...]\n", 46); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            std::string_view walk = rest;
+            while (!walk.empty())
+            {
+                auto [f, r1] = extract_key(walk);
+                auto [v, r2] = extract_key(r1);
+                if (f.empty()) break;
+                m_store.hset(key, f, v);
+                walk = r2;
+            }
+            rb.append("ok\n", 3);
+            replicate_command(line);
+            break;
+        }
+
+        // ─── Sorted sets, by score rather than by rank ───
+        case fnv1a("zrangebyscore"):
+        case fnv1a("zrevrangebyscore"):
+        {
+            auto [key, r1]   = extract_key(args);
+            auto [a_s, r2]   = extract_key(r1);
+            auto [b_s, tail] = extract_key(r2);
+            if (key.empty() || a_s.empty() || b_s.empty())
+            { rb.append("usage: zrangebyscore key min max [withscores]\n", 46); return; }
+            const bool rev = (fnv1a_lower(cmd) == fnv1a("zrevrangebyscore"));
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(rev ? b_s : a_s, lo, lo_in)
+             || !parse_score_bound(rev ? a_s : b_s, hi, hi_in))
+            { rb.append("error: min or max is not a float\n", 33); return; }
+            const bool with = !tail.empty() && fnv1a_lower(tail) == fnv1a("withscores");
+            m_store.check_expiry(key);
+            std::vector<std::pair<std::string_view, double>> items;
+            m_store.zrangebyscore(key, lo, hi, lo_in, hi_in, rev, items);
+            for (const auto& [zm, zsc] : items)
+            {
+                rb.append(zm.data(), zm.size());
+                if (with) { rb.append(" ", 1); append_score_bare(rb, zsc); }
+                rb.push_back('\n');
+            }
+            rb.append("end\n", 4);
+            break;
+        }
+        case fnv1a("zcount"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [a_s, r2]  = extract_key(r1);
+            auto [b_s, _r3] = extract_key(r2);
+            if (key.empty() || a_s.empty() || b_s.empty())
+            { rb.append("usage: zcount key min max\n", 26); return; }
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(a_s, lo, lo_in) || !parse_score_bound(b_s, hi, hi_in))
+            { rb.append("error: min or max is not a float\n", 33); return; }
+            rb.append(std::to_string(m_store.zcount(key, lo, hi, lo_in, hi_in)));
+            rb.push_back('\n');
+            break;
+        }
+        case fnv1a("zpopmin"):
+        case fnv1a("zpopmax"):
+        {
+            auto [key, _r] = extract_key(args);
+            if (key.empty()) { rb.append("usage: zpopmin key\n", 19); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            std::string member; double score = 0;
+            if (!m_store.zpop(key, fnv1a_lower(cmd) == fnv1a("zpopmax"), member, score))
+            { rb.append("end\n", 4); return; }
+            rb.append(member); rb.push_back(' ');
+            append_score_bare(rb, score); rb.push_back('\n');
+            rb.append("end\n", 4);
+            // The ZREM it turned out to be, for SPOP's reason.
+            if (mutation_log_wanted())
+            {
+                std::string c = "zrem "; c.append(key.data(), key.size());
+                c += ' '; c += member;
+                replicate_command(c);
+            }
+            break;
+        }
+        case fnv1a("zremrangebyrank"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [s_s, r2]  = extract_key(r1);
+            auto [e_s, _r3] = extract_key(r2);
+            if (key.empty() || s_s.empty() || e_s.empty())
+            { rb.append("usage: zremrangebyrank key start stop\n", 38); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(s_s, s) || !parse_int_sv(e_s, e))
+            { rb.append("error: invalid index\n", 21); return; }
+            const size_t gone = m_store.zremrangebyrank(key, s, e);
+            rb.append(std::to_string(gone)); rb.push_back('\n');
+            if (gone > 0) replicate_command(line);
+            break;
+        }
+        case fnv1a("zremrangebyscore"):
+        {
+            auto [key, r1]  = extract_key(args);
+            auto [a_s, r2]  = extract_key(r1);
+            auto [b_s, _r3] = extract_key(r2);
+            if (key.empty() || a_s.empty() || b_s.empty())
+            { rb.append("usage: zremrangebyscore key min max\n", 36); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(a_s, lo, lo_in) || !parse_score_bound(b_s, hi, hi_in))
+            { rb.append("error: min or max is not a float\n", 33); return; }
+            const size_t gone = m_store.zremrangebyscore(key, lo, hi, lo_in, hi_in);
+            rb.append(std::to_string(gone)); rb.push_back('\n');
+            if (gone > 0) replicate_command(line);
+            break;
+        }
+
+        // ─── The handshake set, so a RESP client on a text-mode port is not
+        // stranded by a command it sends before anything else ───
+        case fnv1a("echo"):
+        {
+            rb.append(args.data(), args.size()); rb.push_back('\n');
+            break;
+        }
+        case fnv1a("select"):
+        {
+            auto [idx, _r] = extract_key(args);
+            int64_t db = 0;
+            if (!idx.empty() && (!parse_int_sv(idx, db) || db != 0))
+            { rb.append("error: DB index out of range\n", 29); return; }
+            rb.append("ok\n", 3);
+            break;
+        }
+        case fnv1a("info"):
+        {
+            std::string info;
+            build_info_reply(info);
+            rb.append(info);
+            break;
+        }
         default:
             rb.append("failed: unknown command\n", 24);
             break;
@@ -6723,7 +7153,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // A command added here must be classified in cache_shard_map.h, because an
     // unnamed hash reads `unknown` and is served where it was asked -- right
     // for a command that does not exist and wrong for a real one.
-    switch (fnv1a_lower(args[0]))
+    const uint32_t cmd_hash = fnv1a_lower(args[0]);
+    switch (cmd_hash)
     {
         case fnv1a("set"):
         {
@@ -6872,7 +7303,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             break;
         }
+        // UNLINK frees in the background on Redis and there is no background
+        // here, so it is del's other spelling rather than a second path.
         case fnv1a("del"):
+        case fnv1a("unlink"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
@@ -6916,11 +7350,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_integer_into(rb, deleted);
             break;
         }
+        // Every key given, counted with repeats -- Redis answers 2 for the same
+        // key named twice, and answering for args[1] alone read as 1 for any
+        // number of them.
         case fnv1a("exists"):
+        case fnv1a("touch"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.exists(args[1]) ? 1 : 0);
+            int64_t found = 0;
+            for (int i = 1; i < argc; ++i)
+            {
+                if (m_has_ttl_keys) m_store.check_expiry(args[i]);
+                if (m_store.exists(args[i])) ++found;
+            }
+            resp::encode_integer_into(rb, found);
             break;
         }
         case fnv1a("incr"):
@@ -7663,6 +8106,427 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_integer_into(rb, count);
             break;
         }
+        // ─── The handshake set: no key, and this process answers ───
+        //
+        // HELLO refuses RESP3 with -NOPROTO the way a Redis before 6 does, so
+        // a client that asks falls back to RESP2 instead of failing.
+        case fnv1a("hello"):
+        {
+            // Parsed and not compared: the argument is a number, so Redis
+            // reads "02" as 2 and a string compare would refuse it.
+            if (argc >= 2)
+            {
+                int64_t ver = 0;
+                if (!parse_int_sv(args[1], ver) || ver != 2)
+                {
+                    resp::encode_error_code_into(rb,
+                        "NOPROTO unsupported protocol version");
+                    break;
+                }
+            }
+            resp::encode_array_header_into(rb, 14);
+            resp::encode_bulk_into(rb, "server");   resp::encode_bulk_into(rb, "socketley");
+            resp::encode_bulk_into(rb, "version");  resp::encode_bulk_into(rb, SOCKETLEY_VERSION);
+            resp::encode_bulk_into(rb, "proto");    resp::encode_integer_into(rb, 2);
+            resp::encode_bulk_into(rb, "id");       resp::encode_integer_into(rb, conn->fd);
+            resp::encode_bulk_into(rb, "mode");
+            resp::encode_bulk_into(rb, m_shard_n > 1 && m_cluster_forced ? "cluster" : "standalone");
+            resp::encode_bulk_into(rb, "role");
+            resp::encode_bulk_into(rb, m_mode == cache_mode_readonly ? "replica" : "master");
+            resp::encode_bulk_into(rb, "modules");  resp::encode_array_header_into(rb, 0);
+            break;
+        }
+        case fnv1a("echo"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            resp::encode_bulk_into(rb, args[1]);
+            break;
+        }
+        // There is one keyspace here, so index zero is the only one that can
+        // be selected and anything else is refused rather than ignored.
+        case fnv1a("select"):
+        {
+            if (argc >= 2)
+            {
+                int64_t db = 0;
+                if (!parse_int_sv(args[1], db) || db != 0)
+                { resp::encode_error_code_into(rb, "ERR DB index is out of range"); break; }
+            }
+            resp::encode_ok_into(rb);
+            break;
+        }
+        // A cache with no password answers AUTH the way Redis does, which is
+        // an error naming the reason rather than a silent success.
+        case fnv1a("auth"):
+        {
+            resp::encode_error_code_into(rb,
+                "ERR Client sent AUTH, but no password is set");
+            break;
+        }
+        case fnv1a("client"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            switch (fnv1a_lower(args[1]))
+            {
+                case fnv1a("id"):      resp::encode_integer_into(rb, conn->fd); break;
+                case fnv1a("getname"): resp::encode_null_into(rb);              break;
+                // What a client library sends on connect; accepting them is
+                // what lets the connection finish being made.
+                case fnv1a("setname"):
+                case fnv1a("setinfo"):
+                case fnv1a("no-evict"):
+                case fnv1a("reply"):   resp::encode_ok_into(rb);                break;
+                default: resp::encode_error_into(rb, "unknown CLIENT subcommand"); break;
+            }
+            break;
+        }
+        case fnv1a("command"):
+        {
+            // A client asks COMMAND to learn arity and flags; this cache keeps
+            // no such table, and an empty reply says that rather than inventing
+            // one.  COUNT is answered the same way for the same reason.
+            resp::encode_array_header_into(rb, 0);
+            break;
+        }
+        // Only the two fields a client actually reads back are answered, and
+        // an unknown parameter comes back empty rather than invented.
+        case fnv1a("config"):
+        {
+            if (argc < 3 || fnv1a_lower(args[1]) != fnv1a("get"))
+            { resp::encode_array_header_into(rb, 0); break; }
+            switch (fnv1a_lower(args[2]))
+            {
+                case fnv1a("maxmemory"):
+                    resp::encode_array_header_into(rb, 2);
+                    resp::encode_bulk_into(rb, "maxmemory");
+                    resp::encode_bulk_into(rb, std::to_string(m_store.get_max_memory()));
+                    break;
+                // Both are empty here, and empty is the true answer rather
+                // than an absent one.
+                case fnv1a("save"):
+                case fnv1a("appendonly"):
+                    resp::encode_array_header_into(rb, 2);
+                    resp::encode_bulk_into(rb, args[2]);
+                    resp::encode_bulk_into(rb, "");
+                    break;
+                default: resp::encode_array_header_into(rb, 0); break;
+            }
+            break;
+        }
+        case fnv1a("info"):
+        {
+            std::string info;
+            build_info_reply(info);
+            resp::encode_bulk_into(rb, info);
+            break;
+        }
+
+        // ─── Strings, the range and float spellings ───
+        case fnv1a("getrange"):
+        case fnv1a("substr"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(args[2], s) || !parse_int_sv(args[3], e))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            std::string out;
+            m_store.getrange(args[1], s, e, out);
+            resp::encode_bulk_into(rb, out);
+            break;
+        }
+        case fnv1a("setrange"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t off = 0;
+            if (!parse_int_sv(args[2], off) || off < 0)
+            { resp::encode_error_code_into(rb, "ERR offset is out of range"); break; }
+            const size_t n = m_store.setrange(args[1], static_cast<size_t>(off), args[3]);
+            if (n == cache_store::append_wrong_type)   resp::encode_error_code_into(rb, "WRONGTYPE");
+            else if (n == cache_store::append_denied)  resp::encode_error_into(rb, "out of memory");
+            else { resp::encode_integer_into(rb, static_cast<int64_t>(n)); repl(args, argc); }
+            break;
+        }
+        // Replicated as its result and not as itself, because two builds may
+        // round the same addition differently and the follower would drift.
+        case fnv1a("incrbyfloat"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            double d = 0;
+            if (!parse_double_sv(args[2], d))
+            { resp::encode_error_code_into(rb, "ERR value is not a valid float"); break; }
+            double out = 0;
+            if (!m_store.incrbyfloat(args[1], d, out))
+            { resp::encode_error_code_into(rb, "ERR value is not a valid float"); break; }
+            const std::string txt = score_text(out);
+            resp::encode_bulk_into(rb, txt);
+            repl_set_effect(args[1], txt, 0, 0);
+            break;
+        }
+        case fnv1a("getdel"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            std::string val;
+            if (m_store.getdel(args[1], val))
+            {
+                resp::encode_bulk_into(rb, val);
+                std::string cmd = "del "; cmd.append(args[1].data(), args[1].size());
+                if (mutation_log_wanted()) replicate_command(cmd);
+            }
+            else resp::encode_null_into(rb);
+            break;
+        }
+
+        // ─── Lists, the positional spellings ───
+        case fnv1a("lset"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t idx = 0;
+            if (!parse_int_sv(args[2], idx))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            const int rc = m_store.lset(args[1], idx, args[3]);
+            if (rc == 0)       { resp::encode_ok_into(rb); repl(args, argc); }
+            else if (rc == -1) resp::encode_error_code_into(rb, "ERR no such key");
+            else               resp::encode_error_code_into(rb, "ERR index out of range");
+            break;
+        }
+        case fnv1a("lrem"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t cnt = 0;
+            if (!parse_int_sv(args[2], cnt))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            const int gone = m_store.lrem(args[1], cnt, args[3]);
+            resp::encode_integer_into(rb, gone);
+            if (gone > 0) repl(args, argc);
+            break;
+        }
+        case fnv1a("ltrim"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(args[2], s) || !parse_int_sv(args[3], e))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            m_store.ltrim(args[1], s, e);
+            resp::encode_ok_into(rb);
+            repl(args, argc);
+            break;
+        }
+        case fnv1a("linsert"):
+        {
+            if (argc < 5) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            const uint32_t where = fnv1a_lower(args[2]);
+            if (where != fnv1a("before") && where != fnv1a("after"))
+            { resp::encode_error_code_into(rb, "ERR syntax error"); break; }
+            const int n = m_store.linsert(args[1], where == fnv1a("before"), args[3], args[4]);
+            resp::encode_integer_into(rb, n);
+            if (n > 0) repl(args, argc);
+            break;
+        }
+
+        // ─── Sets, the sampling spellings ───
+        // SPOP picks a member this process's iteration order decides, so it
+        // replicates as the SREM it turned out to be rather than as itself.
+        case fnv1a("spop"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            std::string member;
+            if (m_store.spop(args[1], member))
+            {
+                resp::encode_bulk_into(rb, member);
+                if (mutation_log_wanted())
+                {
+                    std::string cmd = "srem ";
+                    cmd.append(args[1].data(), args[1].size());
+                    cmd += ' '; cmd += member;
+                    replicate_command(cmd);
+                }
+            }
+            else resp::encode_null_into(rb);
+            break;
+        }
+        case fnv1a("srandmember"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            std::string member;
+            if (m_store.srandmember(args[1], member)) resp::encode_bulk_into(rb, member);
+            else resp::encode_null_into(rb);
+            break;
+        }
+        case fnv1a("smismember"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            resp::encode_array_header_into(rb, argc - 2);
+            for (int i = 2; i < argc; ++i)
+                resp::encode_integer_into(rb, m_store.sismember(args[1], args[i]) ? 1 : 0);
+            break;
+        }
+
+        // ─── Hashes, the field spellings ───
+        case fnv1a("hexists"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            resp::encode_integer_into(rb, m_store.hexists(args[1], args[2]) ? 1 : 0);
+            break;
+        }
+        case fnv1a("hincrby"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t d = 0;
+            if (!parse_int_sv(args[3], d))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            int64_t out = 0;
+            if (m_store.hincrby(args[1], args[2], d, out))
+            { resp::encode_integer_into(rb, out); repl(args, argc); }
+            else resp::encode_error_code_into(rb, "ERR hash value is not an integer");
+            break;
+        }
+        case fnv1a("hsetnx"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            const int rc = m_store.hsetnx(args[1], args[2], args[3]);
+            if (rc < 0) { resp::encode_error_code_into(rb, "WRONGTYPE"); break; }
+            resp::encode_integer_into(rb, rc);
+            if (rc == 1) repl(args, argc);
+            break;
+        }
+        case fnv1a("hmset"):
+        {
+            if (argc < 4 || (argc - 2) % 2 != 0)
+            { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            for (int i = 2; i + 1 < argc; i += 2)
+                m_store.hset(args[1], args[i], args[i + 1]);
+            resp::encode_ok_into(rb);
+            repl(args, argc);
+            break;
+        }
+        case fnv1a("hmget"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            resp::encode_array_header_into(rb, argc - 2);
+            for (int i = 2; i < argc; ++i)
+            {
+                const std::string* v = m_store.hget(args[1], args[i]);
+                if (v) resp::encode_bulk_into(rb, *v);
+                else   resp::encode_null_into(rb);
+            }
+            break;
+        }
+        case fnv1a("hkeys"):
+        case fnv1a("hvals"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            const hash_inner* h = m_store.hash_ptr(args[1]);
+            const bool want_keys = (cmd_hash == fnv1a("hkeys"));
+            resp::encode_array_header_into(rb, h ? static_cast<int>(h->size()) : 0);
+            if (h) for (const auto& [f, v] : *h)
+                resp::encode_bulk_into(rb, want_keys ? f : v);
+            break;
+        }
+        case fnv1a("hstrlen"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            const std::string* v = m_store.hget(args[1], args[2]);
+            resp::encode_integer_into(rb, v ? static_cast<int64_t>(v->size()) : 0);
+            break;
+        }
+
+        // ─── Sorted sets, by score rather than by rank ───
+        case fnv1a("zrangebyscore"):
+        case fnv1a("zrevrangebyscore"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            const bool rev = (cmd_hash == fnv1a("zrevrangebyscore"));
+            // The reverse spelling takes max before min, which is the one place
+            // the two differ apart from the direction of the walk.
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(rev ? args[3] : args[2], lo, lo_in)
+             || !parse_score_bound(rev ? args[2] : args[3], hi, hi_in))
+            { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
+            bool withscores = false;
+            for (int i = 4; i < argc; ++i)
+                if (fnv1a_lower(args[i]) == fnv1a("withscores")) withscores = true;
+            std::vector<std::pair<std::string_view, double>> out;
+            m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, rev, out);
+            resp::encode_array_header_into(rb,
+                static_cast<int>(out.size()) * (withscores ? 2 : 1));
+            for (const auto& [m, sc] : out)
+            {
+                resp::encode_bulk_into(rb, m);
+                if (withscores) resp::encode_bulk_into(rb, score_text(sc));
+            }
+            break;
+        }
+        case fnv1a("zcount"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(args[2], lo, lo_in) || !parse_score_bound(args[3], hi, hi_in))
+            { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
+            resp::encode_integer_into(rb,
+                static_cast<int64_t>(m_store.zcount(args[1], lo, hi, lo_in, hi_in)));
+            break;
+        }
+        // Same rewrite SPOP needs, and for the same reason.
+        case fnv1a("zpopmin"):
+        case fnv1a("zpopmax"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            std::string member; double score = 0;
+            if (m_store.zpop(args[1], cmd_hash == fnv1a("zpopmax"), member, score))
+            {
+                resp::encode_array_header_into(rb, 2);
+                resp::encode_bulk_into(rb, member);
+                resp::encode_bulk_into(rb, score_text(score));
+                if (mutation_log_wanted())
+                {
+                    std::string cmd = "zrem ";
+                    cmd.append(args[1].data(), args[1].size());
+                    cmd += ' '; cmd += member;
+                    replicate_command(cmd);
+                }
+            }
+            else resp::encode_array_header_into(rb, 0);
+            break;
+        }
+        case fnv1a("zremrangebyrank"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            int64_t s = 0, e = 0;
+            if (!parse_int_sv(args[2], s) || !parse_int_sv(args[3], e))
+            { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
+            const size_t gone = m_store.zremrangebyrank(args[1], s, e);
+            resp::encode_integer_into(rb, static_cast<int64_t>(gone));
+            if (gone > 0) repl(args, argc);
+            break;
+        }
+        case fnv1a("zremrangebyscore"):
+        {
+            if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+            if (!parse_score_bound(args[2], lo, lo_in) || !parse_score_bound(args[3], hi, hi_in))
+            { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
+            const size_t gone = m_store.zremrangebyscore(args[1], lo, hi, lo_in, hi_in);
+            resp::encode_integer_into(rb, static_cast<int64_t>(gone));
+            if (gone > 0) repl(args, argc);
+            break;
+        }
         default:
         {
             rb.append("-ERR unknown command '", 22);
@@ -7671,6 +8535,34 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             break;
         }
     }
+}
+
+// ─── INFO ───
+
+void cache_instance::build_info_reply(std::string& out) const
+{
+    out.reserve(512);
+    out += "# Server\r\n";
+    out += "redis_version:7.0.0\r\n";        // the dialect spoken, not our own
+    out += "socketley_version:" SOCKETLEY_VERSION "\r\n";
+    out += "tcp_port:" + std::to_string(get_port()) + "\r\n";
+    out += "\r\n# Clients\r\n";
+    out += "connected_clients:" + std::to_string(m_clients.size()) + "\r\n";
+    out += "\r\n# Memory\r\n";
+    out += "used_memory:" + std::to_string(m_store.get_memory_used()) + "\r\n";
+    out += "maxmemory:" + std::to_string(m_store.get_max_memory()) + "\r\n";
+    out += "\r\n# Stats\r\n";
+    out += "total_commands_processed:" + std::to_string(m_stat_commands) + "\r\n";
+    out += "\r\n# Replication\r\n";
+    out += std::string("role:") + (m_mode == cache_mode_readonly ? "slave" : "master") + "\r\n";
+    out += "\r\n# Cluster\r\n";
+    out += std::string("cluster_enabled:") + (m_cluster_forced ? "1" : "0") + "\r\n";
+    out += "\r\n# Keyspace\r\n";
+    // This shard's slice, which is what a cluster client means when it asks a
+    // node, and what DBSIZE answers on a per-shard port for the same reason.
+    const uint32_t n = m_store.size();
+    if (n > 0)
+        out += "db0:keys=" + std::to_string(n) + ",expires=0,avg_ttl=0\r\n";
 }
 
 // ─── Pub/Sub publish ───

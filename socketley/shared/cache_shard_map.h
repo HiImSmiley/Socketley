@@ -133,7 +133,9 @@ constexpr cache_merge cache_merge_for(uint32_t h)
     {
         case fnv1a("mget"):   return cache_merge::elements;
         case fnv1a("mset"):   return cache_merge::all_ok;
-        case fnv1a("del"):    return cache_merge::sum;     // the RESP spelling
+        case fnv1a("del"):    case fnv1a("unlink"):
+        case fnv1a("touch"):  case fnv1a("exists"):
+            return cache_merge::sum;     // the RESP spellings, counted
         case fnv1a("keys"):   return cache_merge::key_list;
         case fnv1a("flush"):  case fnv1a("load"):
             return cache_merge::all_ok;
@@ -162,6 +164,9 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("getset"):     case fnv1a("type"):
         case fnv1a("setnx"):      case fnv1a("setex"):
         case fnv1a("psetex"):
+        case fnv1a("getrange"):   case fnv1a("setrange"):
+        case fnv1a("incrbyfloat"): case fnv1a("getdel"):
+        case fnv1a("getex"):      case fnv1a("substr"):
         // ── expiry ──
         case fnv1a("expire"):     case fnv1a("pexpire"):
         case fnv1a("expireat"):   case fnv1a("pexpireat"):
@@ -171,25 +176,37 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("lpush"):      case fnv1a("rpush"):
         case fnv1a("lpop"):       case fnv1a("rpop"):
         case fnv1a("llen"):       case fnv1a("lindex"):
-        case fnv1a("lrange"):
+        case fnv1a("lrange"):     case fnv1a("lset"):
+        case fnv1a("lrem"):       case fnv1a("ltrim"):
+        case fnv1a("linsert"):
         // ── sets ──
         case fnv1a("sadd"):       case fnv1a("srem"):
         case fnv1a("sismember"):  case fnv1a("scard"):
-        case fnv1a("smembers"):
+        case fnv1a("smembers"):   case fnv1a("spop"):
+        case fnv1a("srandmember"): case fnv1a("smismember"):
         // ── hashes ──
         case fnv1a("hset"):       case fnv1a("hget"):
         case fnv1a("hdel"):       case fnv1a("hlen"):
-        case fnv1a("hgetall"):
+        case fnv1a("hgetall"):    case fnv1a("hexists"):
+        case fnv1a("hincrby"):    case fnv1a("hsetnx"):
+        case fnv1a("hmget"):      case fnv1a("hmset"):
+        case fnv1a("hkeys"):      case fnv1a("hvals"):
+        case fnv1a("hstrlen"):
         // ── sorted sets ──
         case fnv1a("zadd"):       case fnv1a("zrem"):
         case fnv1a("zscore"):     case fnv1a("zcard"):
         case fnv1a("zrank"):      case fnv1a("zrevrank"):
         case fnv1a("zrange"):     case fnv1a("zrevrange"):
         case fnv1a("zincrby"):
+        case fnv1a("zrangebyscore"):    case fnv1a("zrevrangebyscore"):
+        case fnv1a("zcount"):          case fnv1a("zpopmin"):
+        case fnv1a("zpopmax"):         case fnv1a("zremrangebyrank"):
+        case fnv1a("zremrangebyscore"):
             return cache_cmd_class::single_key;
 
         case fnv1a("del"):        case fnv1a("exists"):
         case fnv1a("mget"):       case fnv1a("mset"):
+        case fnv1a("unlink"):     case fnv1a("touch"):
             return cache_cmd_class::multi_key;
 
         case fnv1a("keys"):
@@ -213,6 +230,10 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         // delivery crosses, registration does not.
         case fnv1a("ping"):
         case fnv1a("subscribe"):  case fnv1a("unsubscribe"):
+        case fnv1a("hello"):      case fnv1a("echo"):
+        case fnv1a("select"):     case fnv1a("auth"):
+        case fnv1a("client"):     case fnv1a("command"):
+        case fnv1a("config"):     case fnv1a("info"):
         // Every field is derived from the shard count and base port, which
         // each shard holds, so whoever has the socket answers for the map.
         case fnv1a("cluster"):
@@ -230,7 +251,8 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
 // construction because the multi-key spelling does not exist in that protocol.
 constexpr cache_cmd_class cache_classify_text(uint32_t h)
 {
-    if (h == fnv1a("del") || h == fnv1a("exists"))
+    if (h == fnv1a("del")    || h == fnv1a("exists")
+     || h == fnv1a("unlink") || h == fnv1a("touch"))
         return cache_cmd_class::single_key;
     return cache_classify(h);
 }
@@ -239,9 +261,10 @@ constexpr cache_cmd_class cache_classify_text(uint32_t h)
 // implementation rather than the protocol.
 constexpr cache_cmd_class cache_classify_resp(uint32_t h, int argc)
 {
-    if (h == fnv1a("exists"))
-        return cache_cmd_class::single_key;
-    if (h == fnv1a("del"))
+    // EXISTS counts every key it is given, so more than one of them routes the
+    // way DEL's do; narrowing it unconditionally answered for the first alone.
+    if (h == fnv1a("exists") || h == fnv1a("touch")
+     || h == fnv1a("del")    || h == fnv1a("unlink"))
         return argc == 2 ? cache_cmd_class::single_key
                          : cache_cmd_class::multi_key;
     return cache_classify(h);

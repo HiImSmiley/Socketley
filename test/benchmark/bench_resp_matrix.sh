@@ -74,11 +74,16 @@ V_SIZE=100       # bytes per string value
 # grow the set under the measurement and quietly change what the next command
 # in the table is reading.
 #
-# Six commands cannot be made idempotent that way and are deliberately absent:
-# LPOP, RPOP, DEL, HDEL, SREM and ZREM consume what they measure, so after the
-# structure is drained they time the empty path instead.  They need their own
-# key family reloaded between passes, which is a separate piece of work; a
-# number for them here would be a number for an empty list.
+# Some commands cannot be made idempotent that way and are deliberately absent:
+# LPOP, RPOP, DEL, HDEL, SREM, ZREM -- and now SPOP, ZPOPMIN, ZPOPMAX, LREM,
+# LINSERT, GETDEL, UNLINK and the ZREMRANGE pair -- consume what they measure,
+# so after the structure is drained they time the empty path instead.  They
+# need their own key family reloaded between passes, which is a separate piece
+# of work; a number for them here would be a number for an empty list.
+#
+# EXISTS appears twice on purpose.  The one-key row is what the table always
+# had; EXISTS3 is the arity that was answering 1 for any number of keys, and a
+# row that only ever passes one key is a row that could not have caught it.
 #
 # EXPIRE and its family get their own `ttl:` keys rather than sharing `str:`,
 # because a TTL set on a string is a string that disappears mid-table.
@@ -92,11 +97,16 @@ PSETEX|1000|PSETEX KEYTAGvolatile:__rand_int__ 10000000 v
 GETSET|1000|GETSET KEYTAGstr:__rand_int__ yyyyyyyyyyyyyyyyyyyy
 MSET|1000|MSET KEYTAGstr:__rand_int__ a KEYTAGstr:__rand_int__ b
 STRLEN|1000|STRLEN KEYTAGstr:__rand_int__
+GETRANGE|1000|GETRANGE KEYTAGstr:__rand_int__ 0 9
+SETRANGE|1000|SETRANGE KEYTAGstr:__rand_int__ 0 zzzz
 INCR|1000|INCR KEYTAGnum:__rand_int__
 DECR|1000|DECR KEYTAGnum:__rand_int__
 INCRBY|1000|INCRBY KEYTAGnum:__rand_int__ 3
 DECRBY|1000|DECRBY KEYTAGnum:__rand_int__ 3
+INCRBYFLOAT|1000|INCRBYFLOAT KEYTAGnum:__rand_int__ 0
 EXISTS|1000|EXISTS KEYTAGstr:__rand_int__
+EXISTS3|1000|EXISTS KEYTAGstr:__rand_int__ KEYTAGstr:__rand_int__ KEYTAGstr:__rand_int__
+TOUCH|1000|TOUCH KEYTAGstr:__rand_int__
 TYPE|1000|TYPE KEYTAGstr:__rand_int__
 EXPIRE|1000|EXPIRE KEYTAGttl:__rand_int__ 10000
 PEXPIRE|1000|PEXPIRE KEYTAGttl:__rand_int__ 10000000
@@ -109,15 +119,27 @@ HSET|100|HSET KEYTAGhash:__rand_int__ f3 v
 HGET|100|HGET KEYTAGhash:__rand_int__ f3
 HGETALL|100|HGETALL KEYTAGhash:__rand_int__
 HLEN|100|HLEN KEYTAGhash:__rand_int__
+HEXISTS|100|HEXISTS KEYTAGhash:__rand_int__ f3
+HSTRLEN|100|HSTRLEN KEYTAGhash:__rand_int__ f3
+HKEYS|100|HKEYS KEYTAGhash:__rand_int__
+HVALS|100|HVALS KEYTAGhash:__rand_int__
+HMGET|100|HMGET KEYTAGhash:__rand_int__ f1 f3 f5
+HMSET|100|HMSET KEYTAGhash:__rand_int__ f3 v f4 v
+HSETNX|100|HSETNX KEYTAGhash:__rand_int__ f3 v
+HINCRBY|100|HINCRBY KEYTAGhash:__rand_int__ ctr 1
 LPUSH|100|LPUSH pushKEYTAGlist:__rand_int__ e
 RPUSH|100|RPUSH pushKEYTAGlist:__rand_int__ e
 LLEN|100|LLEN KEYTAGlist:__rand_int__
 LINDEX|100|LINDEX KEYTAGlist:__rand_int__ 42
 LRANGE|100|LRANGE KEYTAGlist:__rand_int__ 0 9
+LSET|100|LSET KEYTAGlist:__rand_int__ 0 zz
+LTRIM|100|LTRIM KEYTAGlist:__rand_int__ 0 -1
 SADD|100|SADD KEYTAGset:__rand_int__ m42
 SCARD|100|SCARD KEYTAGset:__rand_int__
 SISMEMBER|100|SISMEMBER KEYTAGset:__rand_int__ m42
 SMEMBERS|100|SMEMBERS KEYTAGset:__rand_int__
+SMISMEMBER|100|SMISMEMBER KEYTAGset:__rand_int__ m42 m43 nope
+SRANDMEMBER|100|SRANDMEMBER KEYTAGset:__rand_int__
 ZADD|100|ZADD zKEYTAGset:__rand_int__ 42 m42
 ZCARD|100|ZCARD zKEYTAGset:__rand_int__
 ZSCORE|100|ZSCORE zKEYTAGset:__rand_int__ m42
@@ -126,6 +148,9 @@ ZRANK|100|ZRANK zKEYTAGset:__rand_int__ m42
 ZREVRANK|100|ZREVRANK zKEYTAGset:__rand_int__ m42
 ZRANGE|100|ZRANGE zKEYTAGset:__rand_int__ 0 9
 ZREVRANGE|100|ZREVRANGE zKEYTAGset:__rand_int__ 0 9
+ZRANGEBYSCORE|100|ZRANGEBYSCORE zKEYTAGset:__rand_int__ 0 9
+ZREVRANGEBYSCORE|100|ZREVRANGEBYSCORE zKEYTAGset:__rand_int__ 9 0
+ZCOUNT|100|ZCOUNT zKEYTAGset:__rand_int__ 0 9
 PUBLISH|1000|PUBLISH KEYTAGchan:__rand_int__ hello
 PING|1|PING
 DBSIZE|1|DBSIZE
@@ -182,6 +207,7 @@ emit_load() {   # emit_load [TAG] > file
                 printf "*3\r\n"; arg("RPUSH"); arg(sprintf("%spushlist:%012d", T, i)); arg("seed")
                 hk = sprintf("%shash:%012d", T, i)
                 for (j = 0; j < NFI; j++) { printf "*4\r\n"; arg("HSET"); arg(hk); arg("f" j); arg("v" j) }
+                printf "*4\r\n"; arg("HSET"); arg(hk); arg("ctr"); arg("0")
                 lk = sprintf("%slist:%012d", T, i)
                 sk = sprintf("%sset:%012d",  T, i)
                 zk = sprintf("%szset:%012d", T, i)
@@ -379,7 +405,7 @@ fi
 start_socketley
 start_redis
 
-log_info "loading both arms: ${K_STR} str/num keys, ${K_COLL} each of hash(${N_FIELD} fields), list/set/zset(${N_ELEM} elements), ${V_SIZE}-byte values"
+log_info "loading both arms: ${K_STR} str/num keys, ${K_COLL} each of hash(${N_FIELD} fields plus a numeric ctr), list/set/zset(${N_ELEM} elements), ${V_SIZE}-byte values"
 if [ "$R_FLAG" = "cluster" ]; then
     # One file per tag, each going to the master that owns that tag's slot, so
     # no write ever needs a redirect.  socketley is loaded with all of them; it

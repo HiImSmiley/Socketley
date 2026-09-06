@@ -6,6 +6,11 @@
 #include <cstring>
 #include <random>
 #include <charconv>
+#include <cmath>
+#include <cerrno>
+#include <cstdlib>
+#include <cstdio>
+#include <algorithm>
 #include <fnmatch.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1057,6 +1062,441 @@ bool cache_store::getset(std::string_view key, std::string_view newval, std::str
     return set(key, newval);
 }
 
+// ─── Strings, the range and float spellings ───
+
+// The two ends resolved the way lrange resolves them, so one reading of a
+// negative index serves every range command here.
+static bool resolve_range(int64_t len, int64_t& start, int64_t& stop)
+{
+    if (start < 0) start += len;
+    if (stop  < 0) stop  += len;
+    if (start < 0) start = 0;
+    if (stop >= len) stop = len - 1;
+    return start <= stop && start < len && len > 0;
+}
+
+bool cache_store::getrange(std::string_view key, int64_t start, int64_t end,
+                           std::string& out) const
+{
+    auto it = m_data.find(key);
+    if (it == m_data.end())
+        return false;
+    int64_t s = start, e = end;
+    if (!resolve_range(static_cast<int64_t>(it->second.size()), s, e))
+    {
+        out.clear();
+        return true;    // an empty range over a key that exists is still ""
+    }
+    out.assign(it->second, static_cast<size_t>(s), static_cast<size_t>(e - s + 1));
+    return true;
+}
+
+size_t cache_store::setrange(std::string_view key, size_t offset, std::string_view value)
+{
+    check_expiry(key);
+
+    const size_t need = offset + value.size();
+    auto it = m_data.find(key);
+    if (it == m_data.end())
+    {
+        if (has_type_conflict_for_string(key))
+            return append_wrong_type;
+        if (value.empty())
+            return 0;   // Redis creates nothing for an empty write
+        if (!check_memory(stored_string(need) + new_key_cost(key.size()), key))
+            return append_denied;
+        auto nit = m_data.emplace(std::string(key), std::string(need, '\0')).first;
+        nit->second.replace(offset, value.size(), value);
+        track_add(entry_cost(nit->first, nit->second));
+        touch_lru(key);
+        return nit->second.size();
+    }
+
+    if (value.empty())
+        return it->second.size();
+
+    if (__builtin_expect(m_max_memory != 0 && need > it->second.size(), 0))
+    {
+        const size_t held = stored_string(it->second);
+        const size_t want = rewritten_string(it->second, need);
+        if (want > held && !check_memory(want - held, key))
+            return append_denied;
+        it = m_data.find(key);      // see set(): re-acquired rather than trusted
+        if (it == m_data.end())
+            return append_denied;
+    }
+
+    track_sub(stored_string(it->second));
+    if (it->second.size() < need)
+        it->second.resize(need, '\0');
+    it->second.replace(offset, value.size(), value);
+    track_add(stored_string(it->second));
+    touch_lru(key);
+    return it->second.size();
+}
+
+bool cache_store::incrbyfloat(std::string_view key, double delta, double& result)
+{
+    check_expiry(key);
+
+    // The same shortcut incr() takes, and for the same reason.
+    double val = 0;
+    auto it = m_data.find(key);
+    if (it != m_data.end())
+    {
+        const std::string& cur = it->second;
+        char* end = nullptr;
+        errno = 0;
+        val = std::strtod(cur.c_str(), &end);
+        if (end != cur.c_str() + cur.size() || cur.empty() || errno == ERANGE)
+            return false;
+    }
+    else if (has_type_conflict_for_string(key))
+        return false;
+
+    val += delta;
+    if (!std::isfinite(val))
+        return false;   // Redis refuses NaN and infinity rather than storing them
+
+    result = val;
+
+    // Redis prints a float with up to seventeen significant digits and no
+    // trailing zeros, which is what round-trips through strtod.
+    char buf[40];
+    int n = std::snprintf(buf, sizeof(buf), "%.17g", val);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
+        return false;
+    return set(key, std::string_view(buf, static_cast<size_t>(n)));
+}
+
+bool cache_store::getdel(std::string_view key, std::string& out)
+{
+    check_expiry(key);
+    auto it = m_data.find(key);
+    if (it == m_data.end())
+        return false;
+    out = it->second;
+    track_sub(entry_cost(it->first, it->second));
+    m_data.erase(it);
+    m_expiry.erase(std::string(key));
+    drop_lru(key);
+    return true;
+}
+
+// ─── Lists, the positional spellings ───
+
+int cache_store::lset(std::string_view key, int64_t idx, std::string_view val)
+{
+    check_expiry(key);
+    auto it = m_lists.find(key);
+    if (it == m_lists.end())
+        return -1;
+    auto& dq = it->second;
+    if (idx < 0) idx += static_cast<int64_t>(dq.size());
+    if (idx < 0 || idx >= static_cast<int64_t>(dq.size()))
+        return -2;
+
+    auto& slot = dq[static_cast<size_t>(idx)];
+    if (__builtin_expect(m_max_memory != 0 && val.size() > slot.size(), 0))
+    {
+        const size_t held = stored_string(slot);
+        const size_t want = rewritten_string(slot, val.size());
+        if (want > held && !check_memory(want - held, key))
+            return -2;
+        it = m_lists.find(key);
+        if (it == m_lists.end() || idx >= static_cast<int64_t>(it->second.size()))
+            return -1;
+    }
+    auto& target = it->second[static_cast<size_t>(idx)];
+    track_sub(stored_string(target));
+    target.assign(val.data(), val.size());
+    track_add(stored_string(target));
+    touch_lru(key);
+    return 0;
+}
+
+int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
+{
+    check_expiry(key);
+    auto it = m_lists.find(key);
+    if (it == m_lists.end())
+        return 0;
+    auto& dq = it->second;
+
+    int removed = 0;
+    const size_t want = (count == 0) ? dq.size()
+                                     : static_cast<size_t>(count < 0 ? -count : count);
+    if (count >= 0)
+    {
+        for (auto e = dq.begin(); e != dq.end() && static_cast<size_t>(removed) < want; )
+        {
+            if (*e == val) { track_sub(stored_string(*e)); e = dq.erase(e); ++removed; --m_list_elems; }
+            else ++e;
+        }
+    }
+    else
+    {
+        for (auto e = dq.end(); e != dq.begin() && static_cast<size_t>(removed) < want; )
+        {
+            --e;
+            if (*e == val) { track_sub(stored_string(*e)); e = dq.erase(e); ++removed; --m_list_elems; }
+        }
+    }
+
+    // An empty list is not a key, the way an empty sorted set is not one here.
+    if (dq.empty())
+    {
+        track_sub(entry_cost(it->first, it->second));
+        m_lists.erase(it);
+        m_expiry.erase(std::string(key));
+        drop_lru(key);
+    }
+    else if (removed > 0)
+        touch_lru(key);
+    return removed;
+}
+
+bool cache_store::ltrim(std::string_view key, int64_t start, int64_t stop)
+{
+    check_expiry(key);
+    auto it = m_lists.find(key);
+    if (it == m_lists.end())
+        return true;     // trimming what is not there is not a failure
+    auto& dq = it->second;
+
+    int64_t s = start, e = stop;
+    const bool keep = resolve_range(static_cast<int64_t>(dq.size()), s, e);
+    if (!keep)
+    {
+        for (const auto& v : dq) { track_sub(stored_string(v)); --m_list_elems; }
+        track_sub(entry_cost(it->first, it->second));
+        m_lists.erase(it);
+        m_expiry.erase(std::string(key));
+        drop_lru(key);
+        return true;
+    }
+
+    while (static_cast<int64_t>(dq.size()) > e + 1)
+    { track_sub(stored_string(dq.back())); dq.pop_back(); --m_list_elems; }
+    for (int64_t i = 0; i < s; ++i)
+    { track_sub(stored_string(dq.front())); dq.pop_front(); --m_list_elems; }
+    touch_lru(key);
+    return true;
+}
+
+int cache_store::linsert(std::string_view key, bool before, std::string_view pivot,
+                         std::string_view val)
+{
+    check_expiry(key);
+    auto it = m_lists.find(key);
+    if (it == m_lists.end())
+        return 0;
+
+    if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
+        return -1;
+    it = m_lists.find(key);
+    if (it == m_lists.end())
+        return 0;
+
+    auto& dq = it->second;
+    auto at = std::find(dq.begin(), dq.end(), pivot);
+    if (at == dq.end())
+        return -1;
+    dq.insert(before ? at : std::next(at), std::string(val));
+    ++m_list_elems;
+    track_add(stored_string(val.size()));
+    touch_lru(key);
+    return static_cast<int>(dq.size());
+}
+
+// ─── Sets, the sampling spellings ───
+
+bool cache_store::spop(std::string_view key, std::string& out)
+{
+    check_expiry(key);
+    auto it = m_sets.find(key);
+    if (it == m_sets.end() || it->second.empty())
+        return false;
+
+    auto mit = it->second.begin();
+    out = *mit;
+    track_sub(stored_string(*mit));
+    it->second.erase(mit);
+    --m_set_elems;
+
+    if (it->second.empty())
+    {
+        track_sub(stored_string(it->first));
+        m_sets.erase(it);
+        m_expiry.erase(std::string(key));
+        drop_lru(key);
+    }
+    else
+        touch_lru(key);
+    return true;
+}
+
+bool cache_store::srandmember(std::string_view key, std::string& out) const
+{
+    auto it = m_sets.find(key);
+    if (it == m_sets.end() || it->second.empty())
+        return false;
+    out = *it->second.begin();
+    return true;
+}
+
+// ─── Hashes, the field spellings ───
+
+bool cache_store::hexists(std::string_view key, std::string_view field) const
+{
+    auto it = m_hashes.find(key);
+    return it != m_hashes.end() && it->second.count(field) > 0;
+}
+
+bool cache_store::hincrby(std::string_view key, std::string_view field,
+                          int64_t delta, int64_t& result)
+{
+    check_expiry(key);
+
+    int64_t val = 0;
+    auto it = m_hashes.find(key);
+    if (it != m_hashes.end())
+    {
+        auto fit = it->second.find(field);
+        if (fit != it->second.end())
+        {
+            auto [ptr, ec] = std::from_chars(fit->second.data(),
+                                             fit->second.data() + fit->second.size(), val);
+            if (ec != std::errc{} || ptr != fit->second.data() + fit->second.size())
+                return false;
+        }
+    }
+
+    val += delta;
+    result = val;
+
+    char buf[24];
+    auto [end, ec2] = std::to_chars(buf, buf + sizeof(buf), val);
+    (void)ec2;
+    return hset(key, field, std::string_view(buf, static_cast<size_t>(end - buf)));
+}
+
+int cache_store::hsetnx(std::string_view key, std::string_view field, std::string_view val)
+{
+    check_expiry(key);
+    auto it = m_hashes.find(key);
+    if (it != m_hashes.end() && it->second.count(field))
+        return 0;
+    return hset(key, field, val) ? 1 : -1;
+}
+
+// ─── Sorted sets, by score rather than by rank ───
+
+// Where a score range starts in the ordered view: the pair's second element
+// orders equal scores, so an inclusive low end must sit before every member
+// holding it and an exclusive one after all of them.
+static std::set<std::pair<double, std::string>>::const_iterator
+score_lower(const std::set<std::pair<double, std::string>>& ord, double min, bool incl)
+{
+    return incl ? ord.lower_bound({min, std::string{}})
+                : ord.upper_bound({min, std::string(1, '\xff')});
+}
+
+void cache_store::zrangebyscore(std::string_view key, double min, double max,
+                                bool min_incl, bool max_incl, bool reverse,
+                                std::vector<std::pair<std::string_view, double>>& out) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return;
+    const auto& ord = it->second.order;
+
+    for (auto e = score_lower(ord, min, min_incl); e != ord.end(); ++e)
+    {
+        if (e->first > max || (!max_incl && e->first == max))
+            break;
+        out.emplace_back(std::string_view(e->second), e->first);
+    }
+    if (reverse)
+        std::reverse(out.begin(), out.end());
+}
+
+size_t cache_store::zcount(std::string_view key, double min, double max,
+                           bool min_incl, bool max_incl) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return 0;
+    const auto& ord = it->second.order;
+    size_t n = 0;
+    for (auto e = score_lower(ord, min, min_incl); e != ord.end(); ++e)
+    {
+        if (e->first > max || (!max_incl && e->first == max))
+            break;
+        ++n;
+    }
+    return n;
+}
+
+bool cache_store::zpop(std::string_view key, bool highest, std::string& member, double& score)
+{
+    check_expiry(key);
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end() || it->second.empty())
+        return false;
+
+    auto e = highest ? std::prev(it->second.order.end()) : it->second.order.begin();
+    score  = e->first;
+    member = e->second;
+    zrem(key, member);      // one removal path, so the empty-key rule lives once
+    return true;
+}
+
+size_t cache_store::zremrangebyrank(std::string_view key, int64_t start, int64_t stop)
+{
+    check_expiry(key);
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return 0;
+
+    int64_t s = start, e = stop;
+    if (!resolve_range(static_cast<int64_t>(it->second.order.size()), s, e))
+        return 0;
+
+    std::vector<std::string> doomed;
+    int64_t i = 0;
+    for (const auto& m : it->second.order)
+    {
+        if (i > e) break;
+        if (i >= s) doomed.push_back(m.second);
+        ++i;
+    }
+    for (const auto& m : doomed)
+        zrem(key, m);
+    return doomed.size();
+}
+
+size_t cache_store::zremrangebyscore(std::string_view key, double min, double max,
+                                     bool min_incl, bool max_incl)
+{
+    check_expiry(key);
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end())
+        return 0;
+
+    std::vector<std::string> doomed;
+    for (auto e = score_lower(it->second.order, min, min_incl);
+         e != it->second.order.end(); ++e)
+    {
+        if (e->first > max || (!max_incl && e->first == max))
+            break;
+        doomed.push_back(e->second);
+    }
+    for (const auto& m : doomed)
+        zrem(key, m);
+    return doomed.size();
+}
+
 std::string_view cache_store::type(std::string_view key) const
 {
     if (m_data.count(key)) return "string";
@@ -1232,6 +1672,33 @@ void cache_store::dump_commands(std::string& buf) const
             cmd.append(field);
             cmd.push_back(' ');
             cmd.append(val);
+            emit();
+        }
+    }
+
+    // Sorted sets, which this walk did not have and every follower therefore
+    // started without -- silently, because the live stream carried the zadds
+    // that came after and only the leader's existing ones went missing.
+    for (const auto& [key, z] : m_zsets)
+    {
+        for (const auto& [score, member] : z.order)
+        {
+            cmd.append("zadd ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            // Whole scores print as integers, which is what the text
+            // interpreter reads back without a rounding step.
+            if (score == static_cast<double>(static_cast<int64_t>(score))
+                && score < 9.2e18 && score > -9.2e18)
+                cmd.append(std::to_string(static_cast<int64_t>(score)));
+            else
+            {
+                char sb[40];
+                const int n = std::snprintf(sb, sizeof(sb), "%.17g", score);
+                if (n > 0) cmd.append(sb, static_cast<size_t>(n));
+            }
+            cmd.push_back(' ');
+            cmd.append(member);
             emit();
         }
     }

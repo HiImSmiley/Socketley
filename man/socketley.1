@@ -3377,6 +3377,26 @@ Append to string value. Returns new length.
 .BI "strlen " "key"
 Return string length. Returns 0 if missing.
 .TP
+.BI "getrange " "key start end"
+.TQ
+.BI "substr " "key start end"
+Return the substring between two inclusive offsets, negative counting from the
+end, empty rather than an error when the range is inverted or the key absent.
+.TP
+.BI "setrange " "key offset value"
+Overwrite from
+.I offset
+onward, zero-padding a shorter value up to it, and return the new length.
+.TP
+.BI "incrbyfloat " "key delta"
+Add a floating-point delta and return the new value. Replicated as its
+.I result
+rather than as itself, because two builds may round the same addition
+differently and a follower would then drift from its leader.
+.TP
+.BI "getdel " "key"
+Return the value and remove the key in one step.
+.TP
 .BI "getset " "key newvalue"
 Set new value and return old value. Returns old value or "nil".
 .TP
@@ -3449,6 +3469,26 @@ Return element at index (negative = from end).
 .TP
 .BI "lrange " "key start stop"
 Return range of elements (multi-line, "end" terminator). Negative indices supported.
+.TP
+.BI "lset " "key index value"
+Replace the element at
+.IR index .
+Answers "nil" when the key is absent and refuses an index past the end.
+.TP
+.BI "lrem " "key count value"
+Remove up to
+.I count
+occurrences from the head, from the tail when negative, all of them when zero,
+and return how many went.
+.TP
+.BI "ltrim " "key start stop"
+Keep only the inclusive range and drop the rest; a range that selects nothing
+removes the key, because an empty list is not a key here.
+.TP
+.BI "linsert " "key before|after pivot value"
+Insert beside the first occurrence of
+.IR pivot ,
+returning the new length, 0 when the key is absent and \-1 when the pivot is.
 .PP
 .B Sets (unique unordered members):
 .TP
@@ -3463,6 +3503,20 @@ Check membership. Returns "1" or "0".
 .TP
 .BI "scard " "key"
 Return set cardinality.
+.TP
+.BI "spop " "key"
+Remove and return one member. The member is the one this process's iteration
+order reaches first, so it replicates as the
+.B srem
+it turned out to be rather than as itself \(em a follower running
+.B spop
+would pick a different one.
+.TP
+.BI "srandmember " "key"
+The same member, left in place.
+.TP
+.BI "smismember " "key member [member ...]"
+One 1 or 0 per member, in the order asked.
 .TP
 .BI "smembers " "key"
 Return all members (multi-line, "end" terminator).
@@ -3484,6 +3538,39 @@ Return number of hash fields.
 .TP
 .BI "hgetall " "key"
 Return all fields and values (multi-line "field value\\n", "end" terminator).
+.TP
+.BI "hkeys " "key"
+.TQ
+.BI "hvals " "key"
+The fields alone, or the values alone.
+.TP
+.BI "hmget " "key field [field ...]"
+One value per field, "nil" for a field that is not there.
+.TP
+.BI "hmset " "key field value [field value ...]"
+Several fields at once.
+.TP
+.BI "hexists " "key field"
+1 or 0.
+.TP
+.BI "hstrlen " "key field"
+The length of a field's value, 0 when it is not there.
+.TP
+.BI "hincrby " "key field delta"
+Add to a field read as an integer, creating it at
+.I delta
+if it is absent, and return the new value.
+.TP
+.BI "hsetnx " "key field value"
+Set the field only if it does not exist. Returns 1 or 0.
+.IP
+.B The order of fields is not the order they were set in.
+A hash is backed by an unordered map here, so
+.BR hgetall ", " hkeys " and " hvals
+return the fields in an order this process decides. Redis keeps insertion order
+for a small hash because a small hash is a listpack there, and stops keeping it
+once the hash grows into a hashtable \(em so a client that depends on the order
+is depending on Redis's encoding, not on its contract.
 .PP
 .B Sorted sets:
 .PP
@@ -3527,6 +3614,98 @@ The same walked from the highest score.
 Add to a member's score, creating it at
 .I delta
 if it is not there, and return the new score.
+.TP
+.BI "zrangebyscore " "key min max" " [withscores]"
+.TQ
+.BI "zrevrangebyscore " "key max min" " [withscores]"
+Members whose score falls in the range, which is what a sorted set is kept for.
+Both ends are inclusive; a leading
+.B (
+makes one exclusive, and
+.BR \-inf " and " +inf
+are the open ends. The reverse spelling takes its bounds the other way round,
+as Redis does.
+.TP
+.BI "zcount " "key min max"
+How many fall in that range, with the same bound spelling.
+.TP
+.BI "zpopmin " "key"
+.TQ
+.BI "zpopmax " "key"
+Remove and return the lowest-scoring member, or the highest, with its score.
+Replicated as the
+.B zrem
+it turned out to be, for the reason
+.B spop
+gives above.
+.TP
+.BI "zremrangebyrank " "key start stop"
+.TQ
+.BI "zremrangebyscore " "key min max"
+Remove a range by position or by score and return how many went. Emptying the
+set removes the key.
+.PP
+.B Connection and introspection:
+.PP
+The set a client library sends before it sends anything of its own. Answering
+them is what lets a connection finish being made; refusing them by name is what
+lets a client fall back rather than fail.
+.TP
+.BI "hello " "[protover]"
+The handshake. RESP2 only:
+.B hello
+with no argument or with
+.B 2
+answers a map naming the server, the version, the protocol, this connection's
+id, whether the cache is clustered and whether it is a replica.
+.B hello 3
+is refused with
+.BR \-NOPROTO ,
+which is what a Redis before 6 answers and what every client falls back from
+\(em an unknown-command error is not a protocol negotiation failure and need
+not be handled as one.
+.TP
+.B info
+The fields a monitor reads back: version, connected clients, memory, commands
+processed, role, whether clustering is on, and the key count. On a sharded
+cache the key count is
+.I this shard's
+slice, for the reason
+.B dbsize
+answers that way on a per-shard port.
+.TP
+.BI "config get " "parameter"
+.B maxmemory
+answers with the configured limit;
+.BR save " and " appendonly
+answer empty, which is true here; anything else answers an empty array rather
+than an invented value.
+.TP
+.B command
+An empty array. A client asks
+.B command
+for a table of arity and flags, this cache keeps no such table, and saying so
+is more useful than a table that is wrong.
+.TP
+.BI "echo " "message"
+.TQ
+.BI "select " "index"
+.B select 0
+succeeds because there is one keyspace here; any other index is refused rather
+than ignored, so a client addressing database 3 learns it rather than quietly
+sharing database 0 with everybody else.
+.TP
+.BI "client " "id|getname|setname|setinfo"
+.B setname
+and
+.B setinfo
+are what redis\-py and node\-redis send on connect and are accepted;
+.B id
+answers this connection's descriptor.
+.TP
+.B auth
+Refused by name. There is no password on a cache, and a silent success would
+tell a client it had authenticated.
 .PP
 .B Transactions:
 .PP
