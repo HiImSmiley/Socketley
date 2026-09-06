@@ -941,6 +941,12 @@ bool client_instance::lua_send(std::string_view msg)
                 }
                 return false;
             }
+            // push and not push_coalesced, which the TCP arm below uses: an
+            // entry here is a datagram, so merging two of them delivers one
+            // message where the script sent two.  Caught by
+            // test_udp_client_sends.sh at 2 of 10 -- and the same fact is
+            // written three functions away in udp_broadcast(), which has no
+            // queue at all for exactly this reason.
             m_write_queue.push(std::string(msg.data(), msg.size()));
             return true;
         }
@@ -976,7 +982,7 @@ bool client_instance::lua_send(std::string_view msg)
             std::string out(msg.data(), msg.size());
             if (out.empty() || out.back() != '\n')
                 out.push_back('\n');
-            m_write_queue.push(std::move(out));
+            m_write_queue.push_coalesced(std::move(out), WRITE_COALESCE_LIMIT);
         }
         // Nothing else will come back for this message on its own, so the
         // record layer is driven from here or the line sits in the queue.

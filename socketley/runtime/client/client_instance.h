@@ -156,6 +156,13 @@ private:
     bool m_connected;
 
     // Write queue (prevents silent message loss when write_pending)
+    // How large a coalesced entry may grow, the same 64 KB the other runtimes
+    // use.  This runtime has no writev batching at all -- flush() takes one
+    // entry and arms one write for it -- so coalescing is what stands in for
+    // it: a client that is behind sends its backlog in one write instead of
+    // one per message.
+    static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
+
     socketley::byte_counted_queue<std::string> m_write_queue;
     // Latches the "not draining" report, because one line per dropped message
     // would bury the first, which is the only one that says anything new.
