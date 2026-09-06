@@ -931,9 +931,9 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
 bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
 {
     check_expiry(key);
-    if (has_type_conflict_for_string(key))
-        return false;
 
+    // A key found here is a string, so the four cross-map probes are owed only
+    // when it is not -- the shortcut set() already takes.
     int64_t val = 0;
     auto it = m_data.find(key);
     if (it != m_data.end())
@@ -942,6 +942,8 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
         if (ec != std::errc{} || ptr != it->second.data() + it->second.size())
             return false;  // not an integer
     }
+    else if (has_type_conflict_for_string(key))
+        return false;
 
     val += delta;
     result = val;
@@ -982,8 +984,6 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
 size_t cache_store::append(std::string_view key, std::string_view suffix)
 {
     check_expiry(key);
-    if (has_type_conflict_for_string(key))
-        return append_wrong_type;
 
     auto it = m_data.find(key);
     if (it != m_data.end())
@@ -1018,6 +1018,11 @@ size_t cache_store::append(std::string_view key, std::string_view suffix)
         // returned the suffix's length as success.
     }
 
+    // Reached only with the key absent from m_data, which is the one case the
+    // cross-map probes can still refuse.
+    if (has_type_conflict_for_string(key))
+        return append_wrong_type;
+
     if (!check_memory(stored_string(suffix.size()) + new_key_cost(key.size()), key))
         return append_denied;
     auto nit = m_data.emplace(std::string(key), std::string(suffix)).first;
@@ -1037,11 +1042,18 @@ size_t cache_store::strlen_key(std::string_view key) const
 bool cache_store::getset(std::string_view key, std::string_view newval, std::string& oldval)
 {
     check_expiry(key);
-    if (has_type_conflict_for_string(key))
-        return false;
 
+    // Same shortcut, and set() below finds the key a second time rather than
+    // being handed an iterator it would have to trust across an eviction.
     auto it = m_data.find(key);
-    oldval = (it != m_data.end()) ? it->second : std::string{};
+    if (it != m_data.end())
+        oldval.assign(it->second);
+    else
+    {
+        if (has_type_conflict_for_string(key))
+            return false;
+        oldval.clear();
+    }
     return set(key, newval);
 }
 
