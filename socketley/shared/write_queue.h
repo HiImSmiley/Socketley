@@ -34,6 +34,53 @@ inline size_t write_queue_size_of(const std::shared_ptr<const std::string>& p)
     return (p ? p->size() : 0) + write_queue_entry_overhead;
 }
 
+// One queued write: either bytes this connection owns, or a reference to bytes
+// several connections are sending.
+//
+// The two halves are the two things a write queue can be good at and neither
+// is free.  Sharing is what makes a broadcast to N connections cost one copy
+// instead of N -- the server's queue held shared_ptr for that reason and could
+// not coalesce, because appending to a payload would change it for everybody
+// else holding it.  Owning is what lets a backlog become fewer, larger writes
+// -- the cache's queue held strings for that reason and pays N copies on a
+// fan-out.  Holding both is not a compromise between them: a connection that
+// is keeping up has nothing to coalesce into, and one that is behind has
+// already been copied to once, so the two cases never want the same entry.
+class write_chunk
+{
+public:
+    write_chunk() = default;
+    write_chunk(std::string s) : m_owned(std::move(s)) {}
+    write_chunk(std::shared_ptr<const std::string> p) : m_shared(std::move(p)) {}
+
+    const char* data() const { return m_shared ? m_shared->data() : m_owned.data(); }
+    size_t      size() const { return m_shared ? m_shared->size() : m_owned.size(); }
+    bool        empty() const { return size() == 0; }
+    std::string_view view() const { return { data(), size() }; }
+
+    // Whether this entry may still grow, which a shared one may not: those
+    // bytes are in somebody else's queue as well.
+    bool owns() const { return !m_shared; }
+    void append(std::string_view extra) { m_owned.append(extra); }
+
+    void clear() { m_owned.clear(); m_shared.reset(); }
+
+private:
+    std::string                        m_owned;
+    std::shared_ptr<const std::string> m_shared;
+};
+
+inline size_t write_queue_size_of(const write_chunk& c)
+{
+    return c.size() + write_queue_entry_overhead;
+}
+
+// Whether the tail entry may still be appended to.  An owned string always
+// may; anything holding bytes on somebody else's behalf never may, and says so
+// through its own overload rather than by being special-cased here.
+inline bool write_queue_can_grow(const std::string&) { return true; }
+inline bool write_queue_can_grow(const write_chunk& c) { return c.owns(); }
+
 template <typename T>
 class byte_counted_queue
 {
@@ -53,6 +100,77 @@ public:
     {
         m_queue.back().append(extra);
         m_bytes += extra.size();
+    }
+
+    // Grow the tail while that keeps it under `limit`, and queue a new entry
+    // otherwise.
+    //
+    // The decision and not the function: two call sites in the cache had
+    // worked out the same thing from opposite ends -- a pipelined client's
+    // three-byte replies, and a subscriber falling behind a busy channel --
+    // and both are one fact about this queue.  A stream of small messages to
+    // one connection becomes thousands of entries, of which only
+    // MAX_WRITE_BATCH reach the kernel per submission, so the cost is paid in
+    // segments rather than in bytes.  Measured on the second of those sites:
+    // 0.149 TCP segments per delivery against 0.036.
+    //
+    // `limit` belongs to the caller because it is a memory bound on one
+    // connection, not a property of the queue.
+    void push_coalesced(std::string_view value, size_t limit)
+    {
+        if (fits_in_tail(value.size(), limit))
+        {
+            append_back(value);
+            return;
+        }
+        push(T(std::string(value)));
+    }
+
+    // A payload several connections are sending, which is the same decision
+    // read from the other side.
+    //
+    // The threshold is what keeps this from being a loss.  For a queue of
+    // owned strings the choice is between copying into the tail and copying
+    // into a fresh entry, so coalescing is strictly cheaper and needs no
+    // condition.  Here the alternative costs nothing at all -- a refcount --
+    // so a copy has to buy something, and below `batch` entries it buys
+    // nothing: the whole queue leaves in one submission whatever its shape.
+    // At or above it, entries are what the kernel is charging for.
+    //
+    // The seeding push at the end is why the middle case is ever reached: a
+    // tail that is shared cannot grow, so the first message past the threshold
+    // queues a copy that the ones after it can append to.
+    void push_shared(const std::shared_ptr<const std::string>& value,
+                     size_t limit, size_t batch)
+    {
+        if (!value)
+            return;
+        if (m_queue.size() < batch)
+        {
+            push(T(value));
+            return;
+        }
+        if (fits_in_tail(value->size(), limit))
+        {
+            append_back(*value);
+            return;
+        }
+        push(T(std::string(*value)));
+    }
+
+    // The same decision for a caller that owns the bytes, which is not a
+    // convenience: the response path reached this queue through
+    // push(std::move(buf)) and routing it through the copying form above would
+    // have put an allocation and a copy on the hottest path in the runtime for
+    // the sake of one shared implementation.
+    void push_coalesced(std::string&& value, size_t limit)
+    {
+        if (fits_in_tail(value.size(), limit))
+        {
+            append_back(value);
+            return;
+        }
+        push(T(std::move(value)));
     }
 
     void push(const T& value)
@@ -100,6 +218,12 @@ public:
     }
 
 private:
+    bool fits_in_tail(size_t n, size_t limit) const
+    {
+        return !m_queue.empty() && write_queue_can_grow(m_queue.back()) &&
+               m_queue.back().size() + n <= limit;
+    }
+
     void charge_back(size_t n) noexcept
     {
         m_bytes = (m_bytes >= n) ? m_bytes - n : 0;

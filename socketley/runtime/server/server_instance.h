@@ -41,6 +41,11 @@ enum proto_state : uint8_t {
 struct alignas(64) server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
+
+    // How large a coalesced entry may grow, the same 64 KB the cache uses and
+    // for the same reason: past this the entry is large enough that another
+    // one costs nothing worth saving.
+    static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
@@ -84,7 +89,7 @@ struct alignas(64) server_connection
 
     // === WARM fields (message processing path) ===
     std::string partial;
-    socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
+    socketley::byte_counted_queue<socketley::write_chunk> write_queue;
 
     // Relay traffic that arrived before this connection said what it speaks,
     // held rather than dropped because writing it early puts it in front of
@@ -108,7 +113,7 @@ struct alignas(64) server_connection
     bool http_seen{false};
 
     // writev batch: holds refs alive until CQE completes
-    std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
+    socketley::write_chunk write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
 
     // === COLD fields (rarely accessed per-CQE) ===
@@ -227,7 +232,7 @@ struct alignas(64) server_connection
         // And a struct that carried an HTTP client would hand the next one a
         // permanent exclusion from the relay, silently receiving nothing.
         http_seen = false;
-        for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].reset();
+        for (uint32_t i = 0; i < write_batch_count; i++) write_batch[i].clear();
         write_batch_count = 0;
         read_pending = false;
         write_pending = false;
@@ -300,6 +305,11 @@ struct upstream_target
 struct upstream_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
+
+    // How large a coalesced entry may grow, the same 64 KB the cache uses and
+    // for the same reason: past this the entry is large enough that another
+    // one costs nothing worth saving.
+    static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
     static constexpr size_t READ_BUF_SIZE = 16384;  // 16KB read buffer
 
@@ -314,8 +324,8 @@ struct upstream_connection
     io_request write_req;
     char read_buf[READ_BUF_SIZE];
     std::string partial;
-    socketley::byte_counted_queue<std::shared_ptr<const std::string>> write_queue;
-    std::shared_ptr<const std::string> write_batch[MAX_WRITE_BATCH];
+    socketley::byte_counted_queue<socketley::write_chunk> write_queue;
+    socketley::write_chunk write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
     uint32_t write_batch_count{0};
     bool read_pending{false};

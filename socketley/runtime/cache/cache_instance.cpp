@@ -5755,16 +5755,12 @@ bool cache_instance::flush_responses(client_connection* conn)
     // a pipelined client's three-byte replies turn kilobytes into thousands of
     // entries -- and only the tail, since entries are moved out before
     // submission.
-    if (!conn->write_queue.empty() &&
-        conn->write_queue.back().size() + conn->response_buf.size() <= client_connection::WRITE_COALESCE_LIMIT)
-    {
-        conn->write_queue.append_back(conn->response_buf);
-        conn->response_buf.clear();
-    }
-    else
-    {
-        conn->write_queue.push(std::move(conn->response_buf));
-    }
+    // std::move, so the entry this queues is the buffer and not a copy of it;
+    // append_back() leaves the source alone either way, which is what the
+    // clear() below is for.
+    conn->write_queue.push_coalesced(std::move(conn->response_buf),
+                                     client_connection::WRITE_COALESCE_LIMIT);
+    conn->response_buf.clear();
     conn->response_buf.reserve(4096);
 
     if (!conn->write_pending)
@@ -7562,12 +7558,8 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             // over: a subscriber that is not draining as fast as the channel
             // fills otherwise collects thousands of separate entries, and only
             // MAX_WRITE_BATCH of them reach the kernel per submission.
-            if (!sub_conn->write_queue.empty() &&
-                sub_conn->write_queue.back().size() + out.size()
-                    <= client_connection::WRITE_COALESCE_LIMIT)
-                sub_conn->write_queue.append_back(out);
-            else
-                sub_conn->write_queue.push(out);
+            sub_conn->write_queue.push_coalesced(
+                out, client_connection::WRITE_COALESCE_LIMIT);
 
             if (!sub_conn->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(sub_conn)))
             {

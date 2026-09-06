@@ -239,7 +239,7 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->relay_hold_since = {};
     conn->spoke = false;
     conn->http_seen = false;
-    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].reset();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
     conn->write_batch_count = 0;
     conn->ws_cookie.clear();
     conn->ws_origin.clear();
@@ -376,7 +376,7 @@ bool server_instance::reap_retired(struct io_uring_cqe* cqe, io_request* req)
             // Nothing in the ring names it any more, so the messages it was
             // sending can go and the struct can serve somebody else.
             for (uint32_t k = 0; k < c->write_batch_count; k++)
-                c->write_batch[k].reset();
+                c->write_batch[k].clear();
             c->write_batch_count = 0;
 
             auto owned = std::move(m_conn_retired[i]);
@@ -1880,8 +1880,8 @@ void server_instance::teardown(event_loop& loop)
                 while (!conn->write_queue.empty())
                 {
                     const auto& msg = conn->write_queue.front();
-                    if (tls_context::ssl_write(conn->ssl, msg->data(),
-                                               static_cast<int>(msg->size())) <= 0)
+                    if (tls_context::ssl_write(conn->ssl, msg.data(),
+                                               static_cast<int>(msg.size())) <= 0)
                         break;
                     conn->write_queue.pop();
                 }
@@ -1902,7 +1902,7 @@ void server_instance::teardown(event_loop& loop)
                 const auto& msg = conn->write_queue.front();
                 // A short write leaves half a message on the wire; sending the
                 // next one after it would misframe everything that follows.
-                if (!socketley::write_all(fd, msg->data(), msg->size())) break;
+                if (!socketley::write_all(fd, msg.data(), msg.size())) break;
                 conn->write_queue.pop();
             }
         }
@@ -1951,7 +1951,7 @@ void server_instance::teardown(event_loop& loop)
         if (!conn->write_pending && !conn->zc_notif_pending)
         {
             for (size_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].reset();
+                conn->write_batch[i].clear();
             conn->write_batch_count = 0;
         }
     }
@@ -1983,7 +1983,7 @@ void server_instance::teardown(event_loop& loop)
         if (!uc->write_pending)
         {
             for (size_t j = 0; j < uc->write_batch_count; j++)
-                uc->write_batch[j].reset();
+                uc->write_batch[j].clear();
             uc->write_batch_count = 0;
         }
 
@@ -2895,7 +2895,8 @@ reparse:
                 auto resp_msg = std::make_shared<std::string>();
                 resp_msg->reserve(160);
                 ws_handshake_response_into(*resp_msg, ws_key);
-                conn->write_queue.push(std::move(resp_msg));
+                conn->write_queue.push(std::shared_ptr<const std::string>(
+                    std::move(resp_msg)));
                 if (!conn->write_pending)
                     flush_write_queue(conn);
 
@@ -3899,13 +3900,22 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
                     payload.remove_suffix(1);
                 ws_msg = ws_frame_text_shared(payload);
             }
-            conn->write_queue.push(ws_msg);
+            conn->write_queue.push_shared(ws_msg,
+                server_connection::WRITE_COALESCE_LIMIT,
+                server_connection::MAX_WRITE_BATCH);
             if (!conn->write_pending)
                 flush_write_queue(conn);
         }
         else
         {
-            conn->write_queue.push(msg);
+            // push_shared and not push: below MAX_WRITE_BATCH queued entries
+            // this is the same refcount it always was, and above it -- where
+            // the queue no longer empties in one submission -- the payload is
+            // copied into the tail instead, which is what turns entries back
+            // into bytes.  See write_queue.h for why the threshold is there.
+            conn->write_queue.push_shared(msg,
+                server_connection::WRITE_COALESCE_LIMIT,
+                server_connection::MAX_WRITE_BATCH);
             if (!conn->write_pending)
                 flush_write_queue(conn);
         }
@@ -3930,11 +3940,15 @@ void server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
-        conn->write_queue.push(ws_frame_text_shared(payload));
+        conn->write_queue.push_shared(ws_frame_text_shared(payload),
+            server_connection::WRITE_COALESCE_LIMIT,
+            server_connection::MAX_WRITE_BATCH);
     }
     else
     {
-        conn->write_queue.push(msg);
+        conn->write_queue.push_shared(msg,
+            server_connection::WRITE_COALESCE_LIMIT,
+            server_connection::MAX_WRITE_BATCH);
     }
 
     if (SOCKETLEY_LIKELY(!conn->write_pending))
@@ -4121,8 +4135,8 @@ void server_instance::tls_flush(server_connection* conn)
         while (!conn->write_queue.empty())
         {
             const auto& msg = conn->write_queue.front();
-            const int n = tls_context::ssl_write(conn->ssl, msg->data(),
-                                                 static_cast<int>(msg->size()));
+            const int n = tls_context::ssl_write(conn->ssl, msg.data(),
+                                                 static_cast<int>(msg.size()));
             if (n <= 0)
             {
                 // 0 is backpressure and the same buffer is offered again once
@@ -4135,7 +4149,7 @@ void server_instance::tls_flush(server_connection* conn)
             // Partial writes are not enabled on this context, so a short count
             // would mean the record layer and this queue disagree about what
             // has been sent.
-            if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg->size()))
+            if (SOCKETLEY_UNLIKELY(static_cast<size_t>(n) != msg.size()))
             {
                 conn->closing = true;
                 break;
@@ -4165,20 +4179,20 @@ void server_instance::tls_flush(server_connection* conn)
     // Nothing is in flight (checked above), so any refs still held are from a
     // completed write and are this function's to drop.
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].reset();
+        conn->write_batch[i].clear();
 
-    conn->write_batch[0] = std::move(cipher);
-    conn->write_iovs[0].iov_base = const_cast<char*>(conn->write_batch[0]->data());
-    conn->write_iovs[0].iov_len  = conn->write_batch[0]->size();
+    conn->write_batch[0] = socketley::write_chunk(std::move(cipher));
+    conn->write_iovs[0].iov_base = const_cast<char*>(conn->write_batch[0].data());
+    conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
     conn->write_batch_count = 1;
     conn->write_pending = true;
     conn->write_req.type = op_write;
 
-    const auto len = static_cast<uint32_t>(conn->write_batch[0]->size());
+    const auto len = static_cast<uint32_t>(conn->write_batch[0].size());
     const bool queued = conn->direct_fd
-        ? m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(),
+        ? m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(),
                                           len, &conn->write_req)
-        : m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+        : m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
 
     // Nothing reached the ring, so the in-flight bookkeeping is undone and the
     // connection dropped, because a write_pending that never clears keeps the
@@ -4186,7 +4200,7 @@ void server_instance::tls_flush(server_connection* conn)
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
-        conn->write_batch[0].reset();
+        conn->write_batch[0].clear();
         conn->write_batch_count = 0;
         conn->closing = true;
     }
@@ -4212,8 +4226,8 @@ void server_instance::flush_write_queue(server_connection* conn)
     {
         conn->write_batch[count] = conn->write_queue.take_front();
 
-        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count]->data());
-        conn->write_iovs[count].iov_len = conn->write_batch[count]->size();
+        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count].data());
+        conn->write_iovs[count].iov_len = conn->write_batch[count].size();
         count++;
     }
 
@@ -4223,7 +4237,7 @@ void server_instance::flush_write_queue(server_connection* conn)
     bool queued;
     if (count == 1)
     {
-        auto len = static_cast<uint32_t>(conn->write_batch[0]->size());
+        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
 
         // Use zero-copy send only for very large buffers (>= 512KB);
         // the NOTIF CQE round-trip kills throughput for smaller writes
@@ -4232,18 +4246,18 @@ void server_instance::flush_write_queue(server_connection* conn)
             conn->zc_notif_pending = true;
             conn->write_req.type = op_send_zc;
             if (conn->direct_fd)
-                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
         else
         {
             // Single message — use plain write (lower overhead than writev)
             conn->write_req.type = op_write;
             if (conn->direct_fd)
-                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
             else
-                queued = m_loop->submit_write(conn->fd, conn->write_batch[0]->data(), len, &conn->write_req);
+                queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
         }
     }
     else
@@ -4263,7 +4277,7 @@ void server_instance::flush_write_queue(server_connection* conn)
         conn->write_pending = false;
         conn->zc_notif_pending = false;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].reset();
+            conn->write_batch[i].clear();
         conn->write_batch_count = 0;
         conn->closing = true;
     }
@@ -4282,7 +4296,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->zc_notif_pending = false;
         // Release batch references now that kernel is done with buffers
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].reset();
+            conn->write_batch[i].clear();
         conn->write_batch_count = 0;
 
         // Drain queue if we were waiting for NOTIF
@@ -4303,7 +4317,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         if (!conn->zc_notif_pending)
         {
             for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].reset();
+                conn->write_batch[i].clear();
             conn->write_batch_count = 0;
         }
         conn->closing = true;
@@ -4333,7 +4347,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             // sent, and getting here means something queued output after the
             // FIN -- dropped rather than retried forever.
             for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].reset();
+                conn->write_batch[i].clear();
             conn->write_batch_count = 0;
             conn->closing = true;
             if (!conn_ops_pending(conn))
@@ -4367,7 +4381,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                     conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
                 }
                 for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].reset();
+                    conn->write_batch[i].clear();
             }
             conn->write_batch_count = new_count;
 
@@ -4399,7 +4413,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             {
                 conn->write_pending = false;
                 for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].reset();
+                    conn->write_batch[i].clear();
                 conn->write_batch_count = 0;
                 conn->closing = true;
             }
@@ -4411,7 +4425,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     if (!conn->zc_notif_pending)
     {
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].reset();
+            conn->write_batch[i].clear();
         conn->write_batch_count = 0;
     }
 
@@ -5717,7 +5731,7 @@ void server_instance::upstream_disconnect(upstream_connection* uc)
     // Release write queue refs
     uc->write_queue.clear();
     for (size_t i = 0; i < uc->write_batch_count; i++)
-        uc->write_batch[i].reset();
+        uc->write_batch[i].clear();
     uc->write_batch_count = 0;
 
     if (was_connected)
@@ -5803,7 +5817,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
     if (cqe->res <= 0)
     {
         for (uint32_t i = 0; i < uc->write_batch_count; i++)
-            uc->write_batch[i].reset();
+            uc->write_batch[i].clear();
         uc->write_batch_count = 0;
         uc->closing = true;
         if (!uc->read_pending)
@@ -5848,7 +5862,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
                     uc->write_batch[i] = std::move(uc->write_batch[first_iov + i]);
                 }
                 for (uint32_t i = new_count; i < uc->write_batch_count; i++)
-                    uc->write_batch[i].reset();
+                    uc->write_batch[i].clear();
             }
             uc->write_batch_count = new_count;
 
@@ -5870,7 +5884,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
             {
                 uc->write_pending = false;
                 for (uint32_t i = 0; i < uc->write_batch_count; i++)
-                    uc->write_batch[i].reset();
+                    uc->write_batch[i].clear();
                 uc->write_batch_count = 0;
                 uc->closing = true;
             }
@@ -5880,7 +5894,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
 
     // Full write completed — release batch
     for (uint32_t i = 0; i < uc->write_batch_count; i++)
-        uc->write_batch[i].reset();
+        uc->write_batch[i].clear();
     uc->write_batch_count = 0;
 
     if (!uc->write_queue.empty())
@@ -5904,7 +5918,13 @@ void server_instance::queue_upstream_send(upstream_connection* uc, const std::sh
         return;
     }
 
-    uc->write_queue.push(msg);
+    // The same decision queue_send() makes one function up, because
+    // upstream_broadcast() is the same shape pointed outwards: one payload,
+    // every upstream connection, and a queue that only deepens when one of
+    // them is not draining.
+    uc->write_queue.push_shared(msg,
+        upstream_connection::WRITE_COALESCE_LIMIT,
+        upstream_connection::MAX_WRITE_BATCH);
     if (!uc->write_pending)
         upstream_flush_write_queue(uc);
 }
@@ -5918,8 +5938,8 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     while (!uc->write_queue.empty() && count < upstream_connection::MAX_WRITE_BATCH)
     {
         uc->write_batch[count] = uc->write_queue.take_front();
-        uc->write_iovs[count].iov_base = const_cast<char*>(uc->write_batch[count]->data());
-        uc->write_iovs[count].iov_len = uc->write_batch[count]->size();
+        uc->write_iovs[count].iov_base = const_cast<char*>(uc->write_batch[count].data());
+        uc->write_iovs[count].iov_len = uc->write_batch[count].size();
         count++;
     }
 
@@ -5930,8 +5950,8 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     if (count == 1)
     {
         uc->write_req.type = op_write;
-        queued = m_loop->submit_write(uc->fd, uc->write_batch[0]->data(),
-            static_cast<uint32_t>(uc->write_batch[0]->size()), &uc->write_req);
+        queued = m_loop->submit_write(uc->fd, uc->write_batch[0].data(),
+            static_cast<uint32_t>(uc->write_batch[0].size()), &uc->write_req);
     }
     else
     {
@@ -5943,7 +5963,7 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     {
         uc->write_pending = false;
         for (uint32_t i = 0; i < uc->write_batch_count; i++)
-            uc->write_batch[i].reset();
+            uc->write_batch[i].clear();
         uc->write_batch_count = 0;
         uc->closing = true;
     }
