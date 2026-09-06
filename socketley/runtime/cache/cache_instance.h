@@ -84,6 +84,10 @@ struct client_connection
     // the time the reply lands.
     uint64_t batch_id{0};
 
+    // The read was withdrawn because the pipeline queued behind that crossing
+    // reached MAX_PARTIAL_SIZE, and comes back when the crossing is answered.
+    bool read_paused{false};
+
     // The peer sent its FIN while a crossing was still owed, so the close is
     // held rather than taken, because a crossing is answered on a later turn
     // and closing would throw away an answer the client is reading.
@@ -149,6 +153,7 @@ struct client_connection
         multi_queue.clear();
         multi_bytes = 0;
         batch_id = 0;
+        read_paused = false;
         peer_gone = false;
         resp_mode = false;
         resp_detected = false;
@@ -619,6 +624,8 @@ private:
     // Arm the read that fits the configured mode, false when nothing reached
     // the ring, with read_pending left clear so no one waits on it.
     bool submit_client_read(client_connection* conn, int fd);
+    void pause_read(client_connection* conn);
+    bool resume_read(client_connection* conn, int fd);
 
     // Re-arm the listener, falling back to the backoff timer when the
     // submission does not reach the ring, or the cache stops taking

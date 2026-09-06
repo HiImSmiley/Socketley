@@ -1229,6 +1229,9 @@ socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) 
     o.write    = conn->write_pending;
     o.zc_notif = conn->zc_notif_pending;
     o.read     = conn->read_pending;   // not counted; see the header
+    // A crossing answers through the request channel on a later turn, which
+    // is what keeps a connection with its read withdrawn reachable.
+    o.promised_reply = conn->batch_id != 0;
     return o;
 }
 
@@ -1246,7 +1249,8 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
 
     skl_inv::half c{};
     c.present   = true;
-    c.in_flight = conn->read_pending || conn->write_pending || conn->zc_notif_pending;
+    c.in_flight = conn->read_pending || conn->write_pending || conn->zc_notif_pending
+               || conn->batch_id != 0;
     // response_buf counts as queued too: it is answers already built and not yet
     // handed to the write path, which is the same loss with one hop less.
     c.queued    = !conn->write_queue.empty() || !conn->response_buf.empty();
@@ -1439,6 +1443,34 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
     return queued;
 }
 
+// Withdraw the read, or with none armed withhold the next one, so the kernel's
+// socket buffer holds the client for as long as the crossing takes.
+void cache_instance::pause_read(client_connection* conn)
+{
+    if (conn->read_paused)
+        return;
+    if (!conn->read_pending)
+    {
+        conn->read_paused = true;
+        return;
+    }
+    // A refused cancel leaves the read standing and the next completion asks
+    // again, so nothing is lost either way.
+    if (m_loop && m_loop->submit_cancel_request(&conn->read_req))
+        conn->read_paused = true;
+}
+
+// The read comes back once the crossing is answered and nothing is waiting on
+// another, with false meaning the ring refused it.
+bool cache_instance::resume_read(client_connection* conn, int fd)
+{
+    if (!conn->read_paused || conn->read_pending || conn->closing
+        || conn->batch_id != 0)
+        return true;
+    conn->read_paused = false;
+    return submit_client_read(conn, fd);
+}
+
 void cache_instance::schedule_accept_backoff()
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
@@ -1566,7 +1598,8 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
+                && conn->batch_id == 0)
             {
                 conn->closing = true;
                 break;
@@ -1835,6 +1868,15 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
+        // The read pause_read() withdrew, reporting; the crossing it waited
+        // for may have been answered in between, in which case it resumes here.
+        if (cqe->res == -ECANCELED && conn->read_paused)
+        {
+            if (!conn->closing && SOCKETLEY_UNLIKELY(!resume_read(conn, fd)))
+                close_client(conn, fd, "read-submit-failed");
+            return;
+        }
+
         // Connection closed or error, deferred if a write is still owed, with
         // the subscriptions dropped at once -- and conn_ops_pending rather
         // than write_pending, because a zero-copy send clears that on the
@@ -1903,16 +1945,29 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         SKL_TRACE_ADD(conn, reads, 1);
     }
 
-    if (conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
     {
-        conn->closing = true;
-        // Same as above: the notification of a zero-copy send is a completion
-        // this connection still owes, whatever write_pending says.
-        if (!conn->write_pending && !conn->zc_notif_pending)
+        // Behind a crossing these bytes are whole commands the pump is not
+        // allowed to run yet, so the client waits in the kernel's buffer
+        // rather than losing them.
+        if (conn->batch_id != 0)
         {
-            close_client(conn, fd, "partial-overflow");
+            pause_read(conn);
         }
-        return;
+        else
+        {
+            LOG_WARN("cache: a client sent over 1 MiB without a newline; "
+                     "its connection is closed");
+            conn->closing = true;
+            // Same as above: the notification of a zero-copy send is a
+            // completion this connection still owes, whatever write_pending
+            // says.
+            if (!conn->write_pending && !conn->zc_notif_pending)
+            {
+                close_client(conn, fd, "partial-overflow");
+            }
+            return;
+        }
     }
 
     // Auto-detect RESP mode on first data
@@ -1945,7 +2000,8 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (m_loop && !conn->closing)
     {
-        if (!conn->read_pending && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
+        if (!conn->read_pending && !conn->read_paused
+            && SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
         {
             close_client(conn, fd, "read-submit-failed");
             return;
@@ -3743,7 +3799,13 @@ void cache_instance::batch_finish(uint64_t id)
 
     if (conn->closing && !conn->write_pending && !conn->zc_notif_pending
         && !conn->read_pending)
+    {
         close_client(conn, fd, "crossing-answered");
+        return;
+    }
+
+    if (!conn->closing && SOCKETLEY_UNLIKELY(!resume_read(conn, fd)))
+        close_client(conn, fd, "read-submit-failed");
 }
 
 void cache_instance::on_request_reply(uint64_t cookie, request_status st,
