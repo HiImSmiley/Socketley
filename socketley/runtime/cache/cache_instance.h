@@ -78,14 +78,18 @@ struct client_connection
     static constexpr size_t  MULTI_MAX_BYTES = 8u << 20;
     static constexpr size_t  MULTI_MAX_CMDS  = 100000;
 
-    // A crossing this connection is waiting on, which stops the pipeline
-    // because a client pipelining down one socket can only tell replies apart
-    // by order -- an id and not a pointer, since the struct may be pooled by
-    // the time the reply lands.
-    uint64_t batch_id{0};
+    // The crossings this connection is waiting on, oldest first, because a
+    // client pipelining down one socket can only tell replies apart by order
+    // -- ids and not pointers, since the struct may be pooled by the time a
+    // reply lands.
+    std::vector<uint64_t> batches;
 
-    // The read was withdrawn because the pipeline queued behind that crossing
-    // reached MAX_PARTIAL_SIZE, and comes back when the crossing is answered.
+    // What those crossings carried and have not answered, which is the one
+    // thing that stops this connection being read.
+    size_t crossing_bytes{0};
+
+    // The read was withdrawn because crossing_bytes reached
+    // MAX_CROSSING_BYTES, and comes back as the crossings are answered.
     bool read_paused{false};
 
     // The peer sent its FIN while a crossing was still owed, so the close is
@@ -152,7 +156,8 @@ struct client_connection
         multi_broken = false;
         multi_queue.clear();
         multi_bytes = 0;
-        batch_id = 0;
+        batches.clear();
+        crossing_bytes = 0;
         read_paused = false;
         peer_gone = false;
         resp_mode = false;
@@ -371,14 +376,14 @@ private:
     // Run every line of a request payload through process_command in order,
     // because a payload is a stream and not a command.
     void run_request_lines(client_connection* conn, std::string_view payload);
-    void process_resp(client_connection* conn);
+    bool process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
     void process_resp_command_local(client_connection* conn, std::string_view* args, int argc);
 
     // The text line splitter, lifted out of handle_read so that a connection
     // whose crossing has just come back can be driven from the reply handler
     // with the same code the read handler uses.
-    void parse_text_lines(client_connection* conn);
+    bool parse_text_lines(client_connection* conn);
 
     // ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────
     // A pipeline is grouped by owner before anything is sent, so a run crosses
@@ -397,10 +402,17 @@ private:
     struct shard_batch
     {
         // Which connection is waiting, as a descriptor checked against
-        // m_conn_idx and the connection's batch_id, because the socket may
+        // m_conn_idx and the connection's own list, because the socket may
         // have closed and its number been reissued.
         int  fd{-1};
         bool resp{false};
+
+        // Answered, but behind an older batch of the same connection whose
+        // replies go first.
+        bool done{false};
+
+        // What it charged the connection's crossing_bytes.
+        size_t bytes{0};
 
         // One per command since the batch opened, in the order the client gave
         // them.
@@ -424,6 +436,11 @@ private:
         uint32_t part{0};
     };
 
+    // Crossed for and unanswered, per connection, past which the read is
+    // withdrawn and the kernel's socket buffer holds the client; the same
+    // figure as MAX_PARTIAL_SIZE because it bounds the same client's memory.
+    static constexpr size_t MAX_CROSSING_BYTES = 1u << 20;
+
     // A batch that could grow without bound is a memory path a client
     // controls, so a run of routed commands is cut and the rest left in
     // `partial` -- nothing lost and nothing reordered.
@@ -444,6 +461,7 @@ private:
 
     // Reserve this command's place in the reply order, returning its slot
     // index, with `parts` the number of pieces its answer needs.
+    void     open_collect(client_connection* conn, bool resp);
     uint32_t slot_open(client_connection* conn, bool resp, cache_merge merge,
                        uint32_t parts);
 
@@ -507,11 +525,15 @@ private:
     template <class Fn>
     void run_in_reply_order(client_connection* conn, Fn&& fn)
     {
-        if (SOCKETLEY_LIKELY(!m_collect))
+        if (SOCKETLEY_LIKELY(!m_collect && conn->batches.empty()))
         {
             fn();
             return;
         }
+        // Behind an older crossing the reply takes a slot even with nothing
+        // crossing now, or it would overtake the answers still out.
+        if (!m_collect)
+            open_collect(conn, conn->resp_mode);
         std::string held;
         held.swap(conn->response_buf);
         fn();

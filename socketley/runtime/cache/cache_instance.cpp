@@ -1231,7 +1231,7 @@ socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) 
     o.read     = conn->read_pending;   // not counted; see the header
     // A crossing answers through the request channel on a later turn, which
     // is what keeps a connection with its read withdrawn reachable.
-    o.promised_reply = conn->batch_id != 0;
+    o.promised_reply = !conn->batches.empty();
     return o;
 }
 
@@ -1250,7 +1250,7 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
     skl_inv::half c{};
     c.present   = true;
     c.in_flight = conn->read_pending || conn->write_pending || conn->zc_notif_pending
-               || conn->batch_id != 0;
+               || !conn->batches.empty();
     // response_buf counts as queued too: it is answers already built and not yet
     // handed to the write path, which is the same loss with one hop less.
     c.queued    = !conn->write_queue.empty() || !conn->response_buf.empty();
@@ -1444,7 +1444,7 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
 }
 
 // Withdraw the read, or with none armed withhold the next one, so the kernel's
-// socket buffer holds the client for as long as the crossing takes.
+// socket buffer holds the client for as long as its crossings take.
 void cache_instance::pause_read(client_connection* conn)
 {
     if (conn->read_paused)
@@ -1460,12 +1460,12 @@ void cache_instance::pause_read(client_connection* conn)
         conn->read_paused = true;
 }
 
-// The read comes back once the crossing is answered and nothing is waiting on
-// another, with false meaning the ring refused it.
+// The read comes back once enough crossings are answered, with false meaning
+// the ring refused it.
 bool cache_instance::resume_read(client_connection* conn, int fd)
 {
     if (!conn->read_paused || conn->read_pending || conn->closing
-        || conn->batch_id != 0)
+        || conn->crossing_bytes >= MAX_CROSSING_BYTES)
         return true;
     conn->read_paused = false;
     return submit_client_read(conn, fd);
@@ -1598,8 +1598,7 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE)
-                && conn->batch_id == 0)
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
             {
                 conn->closing = true;
                 break;
@@ -1739,18 +1738,22 @@ bool cache_instance::tls_flush(client_connection* conn)
 // The text line splitter, out of handle_read so a connection whose crossing
 // has come back is driven by the same code, because two drivers for one parser
 // stop matching.
-void cache_instance::parse_text_lines(client_connection* conn)
+bool cache_instance::parse_text_lines(client_connection* conn)
 {
+    bool   cut = false;
     size_t scan_from = 0;
     size_t pos;
     while ((pos = conn->partial.find('\n', scan_from)) != std::string::npos)
     {
         // A run of routed commands is cut here, in the loop that decides what
-        // has been consumed, with the rest left in `partial` for the turn
-        // after this crossing lands.
+        // has been consumed, with the rest left in `partial` for the batch
+        // after this one.
         if (SOCKETLEY_UNLIKELY(m_collect
                                && m_collect->slots.size() >= MAX_ROUTED_PER_BATCH))
+        {
+            cut = true;
             break;
+        }
 
         std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
 
@@ -1783,16 +1786,15 @@ void cache_instance::parse_text_lines(client_connection* conn)
     // Whatever was pipelined behind REPLICATE is refused, not executed.
     if (SOCKETLEY_UNLIKELY(conn->is_follower && !conn->partial.empty()))
         refuse_follower_input(conn);
+    return cut;
 }
 
-// Everything a connection's buffered bytes turn into, except a second crossing
-// for a connection already waiting on one -- which is a property of the socket
-// rather than of a command, because replies go back down one pipe in order.
+// Everything a connection's buffered bytes turn into, with a crossing already
+// out not stopping the next: replies go back down one pipe in order, and
+// batch_finish() keeps that order, so parsing need not wait.
 void cache_instance::pump(client_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->closing))
-        return;
-    if (SOCKETLEY_UNLIKELY(conn->batch_id != 0))
         return;
 
     if (SOCKETLEY_UNLIKELY(conn->is_follower))
@@ -1801,12 +1803,19 @@ void cache_instance::pump(client_connection* conn)
         return;
     }
 
-    if (conn->resp_mode)
-        process_resp(conn);
-    else
-        parse_text_lines(conn);
+    // Around again only when the parser stopped at MAX_ROUTED_PER_BATCH, so
+    // nothing parseable is left behind for a read that may never come.
+    for (;;)
+    {
+        const bool cut = conn->resp_mode ? process_resp(conn)
+                                         : parse_text_lines(conn);
+        route_flush(conn);
+        if (SOCKETLEY_LIKELY(!cut) || conn->closing)
+            break;
+    }
 
-    route_flush(conn);
+    if (SOCKETLEY_UNLIKELY(conn->crossing_bytes >= MAX_CROSSING_BYTES))
+        pause_read(conn);
 }
 
 void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
@@ -1887,7 +1896,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // in flight: flush_responses() drops a closing connection's buffer, so
         // one run in five of a twelve-command pipeline came back with the
         // first reply alone.
-        if (conn->batch_id != 0)
+        if (!conn->batches.empty())
         {
             // Held and not closed, because another shard owes this socket an
             // answer and a client half-closing the moment it finished asking
@@ -1947,27 +1956,18 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
     {
-        // Behind a crossing these bytes are whole commands the pump is not
-        // allowed to run yet, so the client waits in the kernel's buffer
-        // rather than losing them.
-        if (conn->batch_id != 0)
+        // A line that never ends and nothing else, because the pump parses
+        // every whole command as it arrives, crossing or no crossing.
+        LOG_WARN("cache: a client sent over 1 MiB without a newline; "
+                 "its connection is closed");
+        conn->closing = true;
+        // Same as above: the notification of a zero-copy send is a completion
+        // this connection still owes, whatever write_pending says.
+        if (!conn->write_pending && !conn->zc_notif_pending)
         {
-            pause_read(conn);
+            close_client(conn, fd, "partial-overflow");
         }
-        else
-        {
-            LOG_WARN("cache: a client sent over 1 MiB without a newline; "
-                     "its connection is closed");
-            conn->closing = true;
-            // Same as above: the notification of a zero-copy send is a
-            // completion this connection still owes, whatever write_pending
-            // says.
-            if (!conn->write_pending && !conn->zc_notif_pending)
-            {
-                close_client(conn, fd, "partial-overflow");
-            }
-            return;
-        }
+        return;
     }
 
     // Auto-detect RESP mode on first data
@@ -2335,7 +2335,8 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
     conn->fd = -1;
     conn->rl_max = 0;
     conn->rl_tokens = 0.0;
-    conn->batch_id = 0;
+    conn->batches.clear();
+    conn->crossing_bytes = 0;
     conn->response_buf.clear();
     if (split) run_request_lines(conn, payload);
     else if (!payload.empty()) process_command(conn, payload);
@@ -2517,16 +2518,19 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
 
 // Reserve a command's place in the reply order, where `parts` is how many
 // pieces its answer needs.
+void cache_instance::open_collect(client_connection* conn, bool resp)
+{
+    m_collect       = std::make_unique<shard_batch>();
+    m_collect->fd   = conn->fd;
+    m_collect->resp = resp;
+    m_collect_fd    = conn->fd;
+}
+
 uint32_t cache_instance::slot_open(client_connection* conn, bool resp,
                                    cache_merge merge, uint32_t parts)
 {
     if (!m_collect)
-    {
-        m_collect       = std::make_unique<shard_batch>();
-        m_collect->fd   = conn->fd;
-        m_collect->resp = resp;
-        m_collect_fd    = conn->fd;
-    }
+        open_collect(conn, resp);
 
     const uint32_t idx = static_cast<uint32_t>(m_collect->slots.size());
     reply_slot sl;
@@ -3551,7 +3555,8 @@ void cache_instance::run_deferred(uint64_t ticket, std::string_view payload)
     conn->fd        = -1;
     conn->rl_max    = 0;
     conn->rl_tokens = 0.0;
-    conn->batch_id  = 0;
+    conn->batches.clear();
+    conn->crossing_bytes = 0;
     conn->closing   = false;
     conn->response_buf.clear();
 
@@ -3573,7 +3578,7 @@ void cache_instance::run_deferred(uint64_t ticket, std::string_view payload)
         run_request_lines(conn, payload);
 
     route_flush(conn);
-    if (conn->batch_id != 0)
+    if (!conn->batches.empty())
     {
         m_deferred_inflight = ticket;   // answered from batch_finish()
         return;
@@ -3640,7 +3645,8 @@ void cache_instance::route_flush(client_connection* conn)
         return;
     }
 
-    const uint64_t id = m_next_batch++;
+    const uint64_t id    = m_next_batch++;
+    size_t         bytes = 0;
 
     // Posted first and counted first, with a refused post filled in on the
     // spot, because the alternative is a batch permanently one answer short of
@@ -3659,7 +3665,10 @@ void cache_instance::route_flush(client_connection* conn)
                         this, cookie, shard_target(get_name(), sh),
                         m_route_payload[sh], request_class::client);
             if (taken)
+            {
                 ++batch->outstanding;
+                bytes += m_route_payload[sh].size();
+            }
             else
                 m_posts.erase(cookie);
         }
@@ -3672,9 +3681,10 @@ void cache_instance::route_flush(client_connection* conn)
         m_route_slots[sh].clear();
     }
 
-    if (batch->outstanding == 0)
+    if (batch->outstanding == 0 && conn->batches.empty())
     {
-        // Nothing crossed, so nothing is owed and the connection never waits.
+        // Nothing crossed and nothing older is out, so the connection never
+        // waits.
         for (const reply_slot& sl : batch->slots)
             if (!slot_render(sl, batch->resp, conn->response_buf))
                 append_error_reply(conn->response_buf, batch->resp,
@@ -3691,7 +3701,10 @@ void cache_instance::route_flush(client_connection* conn)
         batch->head.swap(conn->response_buf);
     }
 
-    conn->batch_id = id;
+    batch->done  = batch->outstanding == 0;
+    batch->bytes = bytes;
+    conn->batches.push_back(id);
+    conn->crossing_bytes += bytes;
     m_batches.emplace(id, std::move(*batch));
 }
 
@@ -3717,10 +3730,10 @@ void cache_instance::batch_fill_error(shard_batch& b,
 
 void cache_instance::batch_drop(client_connection* conn)
 {
-    if (conn->batch_id == 0)
-        return;
-    m_batches.erase(conn->batch_id);
-    conn->batch_id = 0;
+    for (const uint64_t id : conn->batches)
+        m_batches.erase(id);
+    conn->batches.clear();
+    conn->crossing_bytes = 0;
     // The posts are left where they are, because each resolves through the
     // batch and a reply for a batch that has gone finds nothing and is
     // dropped.
@@ -3759,22 +3772,36 @@ void cache_instance::batch_finish(uint64_t id)
         (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
 
     // Both halves are load-bearing, because the descriptor may already belong
-    // to a client that never asked anything and would have a different
-    // batch_id or none.
-    if (!conn || conn->batch_id != id)
+    // to a client that never asked anything and would not list this batch.
+    if (!conn || std::find(conn->batches.begin(), conn->batches.end(), id)
+                     == conn->batches.end())
     {
         m_batches.erase(it);
         return;
     }
+    it->second.done = true;
 
-    for (const reply_slot& sl : it->second.slots)
-        if (!slot_render(sl, it->second.resp, conn->response_buf))
-            append_error_reply(conn->response_buf, it->second.resp,
-                               "this cache's shards answered in a shape this "
-                               "build cannot put back together");
-
-    m_batches.erase(it);
-    conn->batch_id = 0;
+    // Rendered from the oldest batch forward and only as far as the answered
+    // ones reach, because the client reads replies in the order it asked.
+    while (!conn->batches.empty())
+    {
+        const auto head = m_batches.find(conn->batches.front());
+        if (head == m_batches.end())
+        {
+            conn->batches.erase(conn->batches.begin());
+            continue;
+        }
+        if (!head->second.done)
+            break;
+        for (const reply_slot& sl : head->second.slots)
+            if (!slot_render(sl, head->second.resp, conn->response_buf))
+                append_error_reply(conn->response_buf, head->second.resp,
+                                   "this cache's shards answered in a shape this "
+                                   "build cannot put back together");
+        conn->crossing_bytes -= std::min(conn->crossing_bytes, head->second.bytes);
+        m_batches.erase(head);
+        conn->batches.erase(conn->batches.begin());
+    }
 
     // Whatever the client pipelined behind the crossing runs now and may open
     // a crossing of its own, because those commands arrived before the FIN and
@@ -3787,10 +3814,15 @@ void cache_instance::batch_finish(uint64_t id)
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr) && !tls_flush(conn))
         conn->closing = true;
 
-    // Another crossing opened by the pump above: the hold continues, and the
-    // reply that ends it will come back through here.
-    if (conn->batch_id != 0)
+    // Crossings still out: the hold continues and the reply that ends it comes
+    // back through here, with the read returning as soon as enough of them
+    // have answered.
+    if (!conn->batches.empty())
+    {
+        if (!conn->closing && SOCKETLEY_UNLIKELY(!resume_read(conn, fd)))
+            close_client(conn, fd, "read-submit-failed");
         return;
+    }
 
     // The debt is paid so a held close can be taken, after the flush, because
     // the write completion is what actually tears the connection down.
@@ -3889,7 +3921,8 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
     conn->fd        = -1;
     conn->rl_max    = 0;
     conn->rl_tokens = 0.0;
-    conn->batch_id  = 0;
+    conn->batches.clear();
+    conn->crossing_bytes = 0;
     conn->response_buf.clear();
 
     const char* p   = payload.data()
@@ -6206,7 +6239,7 @@ bool cache_instance::load_from(std::string_view path)
 
 // ─── RESP protocol support ───
 
-void cache_instance::process_resp(client_connection* conn)
+bool cache_instance::process_resp(client_connection* conn)
 {
     // Fixed-size string_view array — zero heap allocations per command, and
     // the parser's own RESP_MAX_ARRAY_SIZE rather than a second, smaller cap
@@ -6216,6 +6249,7 @@ void cache_instance::process_resp(client_connection* conn)
     int argc = 0;
     size_t consumed = 0;
     size_t offset = 0;
+    bool   cut = false;
 
     while (offset < conn->partial.size())
     {
@@ -6223,7 +6257,10 @@ void cache_instance::process_resp(client_connection* conn)
         // same place: the loop that consumes is the loop that decides how much.
         if (SOCKETLEY_UNLIKELY(m_collect
                                && m_collect->slots.size() >= MAX_ROUTED_PER_BATCH))
+        {
+            cut = true;
             break;
+        }
 
         std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
         auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
@@ -6243,7 +6280,7 @@ void cache_instance::process_resp(client_connection* conn)
             conn->response_buf.append("-ERR protocol error\r\n");
             conn->partial.clear();
             conn->closing = true;
-            return;
+            return false;
         }
 
         // Advance offset; args[] point into conn->partial which stays valid
@@ -6281,6 +6318,7 @@ void cache_instance::process_resp(client_connection* conn)
         else
             conn->partial.erase(0, offset);
     }
+    return cut;
 }
 
 // The same question asked once for the other interpreter, which is two sites
