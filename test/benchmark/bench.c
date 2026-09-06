@@ -2412,10 +2412,23 @@ static const char *g_fanout_pub_prefix;  /* what a publish line starts with */
 static const char *g_fanout_sub_cmd;     /* what a subscriber sends first, or NULL */
 static size_t      g_fanout_extra;       /* bytes the runtime prepends per delivery */
 static int         g_fanout_tls;         /* -S: the connections carry TLS */
+/* How many channels the subscribers are spread over (-C).
+ *
+ * One is the shape every fan-out measurement here started with: one channel,
+ * every subscriber on it, so a publish that crosses to another shard always
+ * finds somebody there.  That shape cannot see the cost this flag exists to
+ * expose.  A cache routes a publish through fan_all_shards(), which sends it to
+ * every shard exactly as `dbsize` goes to every shard -- so with many channels
+ * and few subscribers each, a publish still crosses N ways to produce one
+ * delivery, and the crossings to shards holding nobody are pure waste.  That is
+ * the ordinary pub/sub shape and the one the numbers were missing. */
+static int         g_fanout_channels = 1;
+#define FANOUT_CHAN_DIGITS 4
 
 struct fanout_sub {
     int    fd;
     SSL   *ssl;        /* NULL unless -S */
+    int    chan;       /* which channel this one subscribed to */
     char  *buf;
     size_t len;
     int    got;        /* complete deliveries seen on this connection */
@@ -2456,6 +2469,21 @@ static int fanout_seq_at(const char *p, int n)
         v = v * 10 + (p[i] - '0');
     }
     return v;
+}
+
+/* How many of the sequences in [base, end) land on one channel, in closed form
+ * because the loop it replaces is over messages and runs once per subscriber. */
+static int fanout_on_channel(int base, int end, int chan, int chans)
+{
+    if (chans <= 1) return end > base ? end - base : 0;
+    const int fe = (end  > chan) ? ((end  - chan + chans - 1) / chans) : 0;
+    const int fb = (base > chan) ? ((base - chan + chans - 1) / chans) : 0;
+    return fe > fb ? fe - fb : 0;
+}
+
+static void fanout_put_digits(char *p, int v, int n)
+{
+    for (int i = n - 1; i >= 0; i--) { p[i] = (char)('0' + v % 10); v /= 10; }
 }
 
 static void fanout_put_seq(char *p, int v)
@@ -2591,6 +2619,24 @@ static void *fanout_reader(void *arg)
     return NULL;
 }
 
+/* How many deliveries the first `end` publishes are worth.
+ *
+ * Not end * subs once there is more than one channel, and the difference is not
+ * cosmetic: this figure drives both the in-flight window and the wait for the
+ * fan-out to finish, so overstating it by the channel count leaves the
+ * publisher blocking against a target that can never be reached.  The first
+ * version of the multi-channel arm hung on exactly that.
+ *
+ * A full cycle of `chans` publishes is worth one delivery to every subscriber,
+ * so whole cycles are one multiply and only the remainder needs prefix sums. */
+static long long fanout_deliveries_upto(int end, int subs, int chans,
+                                        const long long *chan_prefix)
+{
+    if (chans <= 1) return (long long)end * subs;
+    if (end <= 0)   return 0;
+    return (long long)(end / chans) * subs + chan_prefix[end % chans];
+}
+
 static int fanout_seen_total(struct fanout_state *st, int readers)
 {
     int seen = 0;
@@ -2629,6 +2675,15 @@ static struct run_result bench_fanout(struct bench_config *cfg)
     for (int t = 0; t < readers; t++)
         lat_init(&st.lat[t], MAX_LATENCIES / FANOUT_READERS);
 
+    /* Subscribers per channel as a prefix sum, because subscriber i is on
+     * channel i % chans and nothing else needs to know that. */
+    long long *chan_prefix = (long long *)calloc((size_t)g_fanout_channels + 1,
+                                                 sizeof *chan_prefix);
+    if (!chan_prefix) { free(st.sub); free(st.pub_ns); return res; }
+    for (int c = 0; c < g_fanout_channels; c++)
+        chan_prefix[c + 1] = chan_prefix[c] +
+            fanout_on_channel(0, subs, c, g_fanout_channels);
+
     int   pub = -1;
     SSL  *pub_ssl = NULL;
     char *line = NULL;
@@ -2650,9 +2705,16 @@ static struct run_result bench_fanout(struct bench_config *cfg)
             if (!st.sub[i].ssl) { ok = 0; break; }
         }
         if (g_fanout_sub_cmd) {
-            char ack[128];
-            const size_t cl = strlen(g_fanout_sub_cmd);
-            if (!fanout_write_all(st.sub[i].fd, st.sub[i].ssl, g_fanout_sub_cmd, cl) ||
+            char ack[128], cmd[64];
+            st.sub[i].chan = i % g_fanout_channels;
+            /* Fixed width, so the publisher can patch the channel into a line
+             * it builds once rather than formatting one per message. */
+            const int cl = (g_fanout_channels > 1)
+                ? snprintf(cmd, sizeof cmd, "subscribe c%0*d\n",
+                           FANOUT_CHAN_DIGITS, st.sub[i].chan)
+                : snprintf(cmd, sizeof cmd, "%s", g_fanout_sub_cmd);
+            if (cl <= 0 ||
+                !fanout_write_all(st.sub[i].fd, st.sub[i].ssl, cmd, (size_t)cl) ||
                 fanout_read_line(st.sub[i].fd, st.sub[i].ssl, ack, sizeof ack) < 0)
             { ok = 0; break; }
         }
@@ -2689,15 +2751,25 @@ static struct run_result bench_fanout(struct bench_config *cfg)
         }
     }
 
+    char   chan_pfx[64];
+    size_t chan_at = 0;          /* where the channel digits sit in `line` */
     if (ok) {
-        const size_t plen = strlen(g_fanout_pub_prefix);
+        const char *pfx = g_fanout_pub_prefix;
+        if (g_fanout_channels > 1 && g_fanout_sub_cmd) {
+            snprintf(chan_pfx, sizeof chan_pfx, "publish c%0*d ",
+                     FANOUT_CHAN_DIGITS, 0);
+            pfx = chan_pfx;
+            chan_at = strlen("publish c");
+        }
+        const size_t plen = strlen(pfx);
         line = (char *)malloc(plen + (size_t)size + 2);
         if (!line) ok = 0;
         else {
-            memcpy(line, g_fanout_pub_prefix, plen);
+            memcpy(line, pfx, plen);
             memset(line + plen, 'Y', (size_t)size - FANOUT_SEQ);
             line[plen + (size_t)size] = '\n';
         }
+        g_fanout_pub_prefix = pfx;
     }
 
     if (ok) {
@@ -2725,14 +2797,24 @@ static struct run_result bench_fanout(struct bench_config *cfg)
                     if (__atomic_load_n(&st.stop, __ATOMIC_RELAXED)) break;
                     if (g_fanout_pub_reply)
                         while (fanout_read(pub, pub_ssl, drain, sizeof drain) > 0) {}
-                    const int64_t outstanding =
-                        (int64_t)i * subs - (int64_t)fanout_seen_total(&st, readers);
-                    if (outstanding <= (int64_t)FANOUT_WINDOW * subs) break;
+                    const long long owed =
+                        fanout_deliveries_upto(i, subs, g_fanout_channels, chan_prefix);
+                    const long long window =
+                        fanout_deliveries_upto(FANOUT_WINDOW, subs,
+                                               g_fanout_channels, chan_prefix);
+                    if (owed - (long long)fanout_seen_total(&st, readers) <= window)
+                        break;
                     if (deadline_passed()) break;
                     struct timespec ts = { 0, 200000 };
                     nanosleep(&ts, NULL);
                 }
             }
+            /* Round robin, so a subscriber on channel c sees exactly the
+             * sequences congruent to c and they still only ever ascend --
+             * which is what keeps the ordering check meaning the same thing. */
+            if (chan_at)
+                fanout_put_digits(line + chan_at, i % g_fanout_channels,
+                                  FANOUT_CHAN_DIGITS);
             fanout_put_seq(line + plen + (size_t)size - FANOUT_SEQ, i);
             st.pub_ns[i] = time_ns();
             if (!fanout_write_all(pub, pub_ssl, line, linelen)) break;
@@ -2742,12 +2824,13 @@ static struct run_result bench_fanout(struct bench_config *cfg)
         /* Waited for rather than assumed.  The publisher being done says
          * nothing about the fan-out being done, and stopping the readers here
          * would score the run over a window with its tail cut off. */
-        const int64_t want     = (int64_t)published * subs;
+        const long long want = fanout_deliveries_upto(published, subs,
+                                                      g_fanout_channels, chan_prefix);
         const int64_t give_up  = time_ns() + 20LL * 1000000000LL;
         while (!__atomic_load_n(&st.stop, __ATOMIC_RELAXED)) {
             if (g_fanout_pub_reply)
                 while (fanout_read(pub, pub_ssl, drain, sizeof drain) > 0) {}
-            if ((int64_t)fanout_seen_total(&st, readers) >= want) break;
+            if ((long long)fanout_seen_total(&st, readers) >= want) break;
             if (time_ns() > give_up) break;
             struct timespec ts = { 0, 500000 };
             nanosleep(&ts, NULL);
@@ -2770,7 +2853,17 @@ static struct run_result bench_fanout(struct bench_config *cfg)
                           ? ns_to_s(close_ns - open_ns) : 0.0;
 
     res.success  = counted;
-    res.expected = (published > st.base_seq) ? (published - st.base_seq) * subs : 0;
+    /* Summed per subscriber rather than published * subs, because with more
+     * than one channel a subscriber is owed only its own channel's share --
+     * and a run scored against the wrong total reports a healthy fan-out as
+     * INCOMPLETE, which is the failure that hides a real one. */
+    {
+        long long want = 0;
+        for (int i = 0; i < subs; i++)
+            want += fanout_on_channel(st.base_seq, published,
+                                      st.sub[i].chan, g_fanout_channels);
+        res.expected = (int)want;
+    }
     res.throughput = span > 0 ? counted / span : 0.0;
     /* The delivered length and not the payload, because the cache's
      * `message <channel> ` goes over the same wire as the payload does. */
@@ -2781,7 +2874,9 @@ static struct run_result bench_fanout(struct bench_config *cfg)
     for (int i = 0; i < subs; i++) {
         bad      += st.sub[i].bad;
         disorder += st.sub[i].disorder;
-        if (st.sub[i].got < published) short_subs++;
+        if (st.sub[i].got < fanout_on_channel(0, published, st.sub[i].chan,
+                                              g_fanout_channels))
+            short_subs++;
     }
     res.failed = bad + disorder;
     if (bad || disorder)
@@ -2802,6 +2897,7 @@ static struct run_result bench_fanout(struct bench_config *cfg)
     if (pub_ssl) SSL_free(pub_ssl);
     if (pub >= 0) close(pub);
     free(line);
+    free(chan_prefix);
     free(st.sub);
     free(st.pub_ns);
     return res;
@@ -3135,6 +3231,10 @@ static void usage(const char *prog)
         "              SLOWEST of its threads and the rate reported is that one's.\n"
         "  -W N        Run and discard N runs before the measured ones (default %d)\n"
         "  -u PATH     Request target for the HTTP tests (default /)\n"
+        "  -C N        Spread the fanout subscribers over N channels (pubsub only).\n"
+        "              One channel is the shape that cannot see what a sharded\n"
+        "              cache spends: a publish crosses to every shard whether or\n"
+        "              not one holds a subscriber of that channel.\n"
         "  -S          Drive the fanout arms over TLS.  The certificate is not\n"
         "              verified: what is being timed is the record layer, and a\n"
         "              throwaway certificate would only measure a failure.\n"
@@ -3210,6 +3310,10 @@ int main(int argc, char **argv)
              * discarded before the measured ones, so a typo of 1000 is an hour
              * of warm-up and no result. */
             if (cfg.warmup_runs > 10) cfg.warmup_runs = 10;
+            optind_local += 2;
+        } else if (strcmp(opt, "-C") == 0 && optind_local + 1 < argc) {
+            g_fanout_channels = atoi(argv[optind_local + 1]);
+            if (g_fanout_channels < 1) g_fanout_channels = 1;
             optind_local += 2;
         } else if (strcmp(opt, "-S") == 0) {
             g_fanout_tls = 1;
@@ -3390,7 +3494,8 @@ int main(int argc, char **argv)
             g_fanout_pub_prefix = "publish c ";
             g_fanout_sub_cmd    = "subscribe c\n";
             g_fanout_pub_reply  = 1;
-            g_fanout_extra      = sizeof("message c ") - 1;
+            g_fanout_extra      = (g_fanout_channels > 1)
+                ? sizeof("message cNNNN ") - 1 : sizeof("message c ") - 1;
             run_and_report(&cfg, bench_fanout, "fanout", "pubsub", "delivery/sec", METRIC_FANOUT);
         }
         else {
