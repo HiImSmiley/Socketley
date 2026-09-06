@@ -4184,36 +4184,43 @@ void daemon_handler::refresh_publish_interest()
     if (m_proxy_workers.empty())
         return;
 
-    size_t supervisors = 0;
-    for (const auto& [_, shards] : m_proxy_workers)
-        supervisors += shards.size();
-
-    // Walked once for all of them rather than once per supervisor, because the
-    // answer does not depend on which one is asking: with two processes every
-    // one of them has somebody else, with one none of them does.
-    bool daemon_side = false;
+    // A process without a Lua VM has nobody to give a publish to, so a sibling
+    // shard of a cache with no script is not "somebody else" -- and counting
+    // it as one sent every publish of a sharded cache through the daemon and
+    // back out to N-1 workers that decoded it for nothing.
+    bool                            daemon_side = false;
+    size_t                          scripted_procs = 0;
+    std::unordered_set<std::string> scripted;
     {
         std::shared_lock lock(m_manager.mutex);
         for (const auto& [n, inst] : m_manager.list())
         {
-            (void)n;
             // The same three tests dispatch_publish() applies, including the
             // out-of-process one: a placeholder loads the runtime's script and
             // so has a Lua VM, and counting it would keep every worker sending
             // to an interpreter that serves nothing.
             if (inst->get_state() == runtime_running && inst->lua() &&
                 !inst->is_out_of_process())
-            {
                 daemon_side = true;
-                break;
+
+            const auto wit = m_proxy_workers.find(n);
+            if (wit != m_proxy_workers.end() && !inst->get_lua_script_path().empty())
+            {
+                scripted.insert(n);
+                scripted_procs += wit->second.size();
             }
         }
     }
 
-    const bool interest = daemon_side || supervisors > 1;
-    for (auto& [_, shards] : m_proxy_workers)
+    // Per runtime rather than once for all, because a process with the only
+    // script has nobody else while every other process has it.
+    for (auto& [n, shards] : m_proxy_workers)
+    {
+        const size_t others   = scripted_procs - (scripted.count(n) ? 1 : 0);
+        const bool   interest = daemon_side || others > 0;
         for (auto& sup : shards)
             sup->send_publish_interest(interest);
+    }
 }
 
 // What the cluster looks like for the workers that cannot look, with an empty
