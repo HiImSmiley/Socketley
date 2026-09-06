@@ -481,9 +481,13 @@ private:
     // error for that command.
     bool slot_render(const reply_slot& sl, bool resp, std::string& out) const;
 
+    // True when no key names another shard, which is the case a hash tag is
+    // written to produce.
+    bool keys_all_local(const std::string_view* keys, size_t n) const;
+
     // The two multi-key spellings exploded into single-key commands, where
-    // false is a usage error answered by the local interpreter as it always
-    // was.
+    // false is a usage error or a command every key of which is this shard's,
+    // and the local interpreter answers both.
     bool explode_text_multi(client_connection* conn, uint32_t h,
                             std::string_view args);
     bool explode_resp_multi(client_connection* conn, uint32_t h,

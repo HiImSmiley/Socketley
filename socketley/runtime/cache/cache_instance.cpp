@@ -4141,6 +4141,15 @@ bool cache_instance::cluster_multi_verdict(client_connection* conn,
 // mget and mset in the text protocol exploded into single-key commands, split
 // exactly as the interpreter splits them, because the router and the store
 // must read a line the same way.
+// A multi-key command none of whose keys is foreign has nothing to cross for.
+bool cache_instance::keys_all_local(const std::string_view* keys, size_t n) const
+{
+    for (size_t i = 0; i < n; ++i)
+        if (cache_shard_of(keys[i], m_shard_n) != m_shard_i)
+            return false;
+    return true;
+}
+
 bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
                                         std::string_view args)
 {
@@ -4184,6 +4193,12 @@ bool cache_instance::explode_text_multi(client_connection* conn, uint32_t h,
         && cluster_multi_verdict(conn, keys, false))
         return true;
 
+    // Keys that are all this shard's are what a hash tag is written to produce,
+    // and false hands the whole command to the interpreter rather than one
+    // crossing per key that never leaves this process.
+    if (keys_all_local(keys.data(), keys.size()))
+        return false;
+
     const uint32_t slot = slot_open(conn, false, cache_merge_for(h),
                                     static_cast<uint32_t>(keys.size()));
     std::string raw;
@@ -4221,6 +4236,15 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
         if (cluster_multi_verdict(conn, ks, true))
             return true;
     }
+
+    // Same shortcut as the text spelling, walking the arguments in place
+    // because this port builds no vector to walk.
+    bool local = true;
+    for (size_t i = 0; i < n && local; ++i)
+        local = (cache_shard_of(is_mset ? args[1 + i * 2] : args[1 + i],
+                                m_shard_n) == m_shard_i);
+    if (local)
+        return false;
 
     const uint32_t slot = slot_open(conn, true, cache_merge_for(h),
                                     static_cast<uint32_t>(n));
