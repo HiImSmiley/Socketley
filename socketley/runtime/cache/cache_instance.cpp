@@ -334,7 +334,9 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
     // And a blocked pop on this descriptor, for the same reason and in the
     // same place: it holds the number, not the connection.
     drop_blocked(fd);
-    drop_watches(fd);
+    // With a connection in hand this touches only the keys THIS client
+    // watched; drop_watches is the fallback for the case without one.
+    if (conn) unwatch_all(conn); else drop_watches(fd);
     // A follower registered on this descriptor goes with it, because it holds
     // no reference of its own and would otherwise point replication at a
     // number the kernel reissued.
@@ -9333,9 +9335,12 @@ void cache_instance::watch_keys(client_connection* conn, std::string_view* args,
 {
     for (int i = 1; i < argc; ++i)
     {
-        conn->watched.emplace_back(args[i]);
-        m_watchers[std::string(args[i])].insert(conn->fd);
+        // The set already knows whether this connection watches this key, so the
+        // duplicate check is its insert result and not a scan of conn->watched.
+        if (m_watchers[std::string(args[i])].insert(conn->fd).second)
+            conn->watched.emplace_back(args[i]);
     }
+    if (!conn->watched.empty()) m_watching.insert(conn->fd);
 }
 
 void cache_instance::unwatch_all(client_connection* conn)
@@ -9350,11 +9355,16 @@ void cache_instance::unwatch_all(client_connection* conn)
     }
     conn->watched.clear();
     conn->watch_dirty = false;
+    m_watching.erase(conn->fd);
 }
 
+// The fallback for a close with no connection object to read the key list
+// from; the close path itself calls unwatch_all, which touches only this
+// client's keys.  Reached only by a descriptor that was actually watching, so
+// a busy cache does not walk the map on every disconnect.
 void cache_instance::drop_watches(int fd)
 {
-    if (SOCKETLEY_LIKELY(m_watchers.empty()))
+    if (SOCKETLEY_LIKELY(m_watching.erase(fd) == 0))
         return;
     for (auto it = m_watchers.begin(); it != m_watchers.end(); )
     {
@@ -9367,7 +9377,7 @@ void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, in
 {
     // Nobody is watching, which is nearly always, and this is the whole cost
     // of carrying the feature for everybody who does not use it.
-    if (SOCKETLEY_LIKELY(m_watchers.empty()))
+    if (SOCKETLEY_LIKELY(m_watching.empty()))
         return;
     if (cache_is_read_only(h))
         return;
@@ -9386,7 +9396,7 @@ void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, in
     // about: two clients on two different keys must not abort each other.
     if (argc >= 2 && cache_classify(h) == cache_cmd_class::single_key)
     {
-        auto it = m_watchers.find(std::string(args[1]));
+        auto it = m_watchers.find(args[1]);
         if (it != m_watchers.end()) dirty(it->second);
         return;
     }
@@ -9396,7 +9406,7 @@ void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, in
     // compare-and-set loop that is a retry rather than a wrong answer; the
     // other direction would be a transaction committing over a change it never
     // saw.
-    for (const auto& [key, fds] : m_watchers) { (void)key; dirty(fds); }
+    dirty(m_watching);
 }
 
 // ─── BLPOP / BRPOP ──────────────────────────────────────────────────────────
@@ -9448,25 +9458,52 @@ static void deliver_pop(client_connection* c, std::string_view key,
     c->write_queue.push_coalesced(out, client_connection::WRITE_COALESCE_LIMIT);
 }
 
+// Drops a waiter from the sequence map, from every key queue it sits in, and
+// from the descriptor index.  One place, because a waiter left in one of the
+// three and not the others is either a wake that never comes or a wake sent to
+// a descriptor the kernel has reissued.
+void cache_instance::forget_waiter(uint64_t seq)
+{
+    auto it = m_blocked.find(seq);
+    if (it == m_blocked.end())
+        return;
+    const blocked_pop& w = it->second;
+    for (size_t i = 0; i < w.keys.size() && i < w.slots.size(); ++i)
+    {
+        auto ki = m_wait_key.find(w.keys[i]);
+        if (ki == m_wait_key.end()) continue;
+        ki->second.erase(w.slots[i]);
+        if (ki->second.empty()) m_wait_key.erase(ki);
+    }
+    auto fi = m_wait_fd.find(w.fd);
+    if (fi != m_wait_fd.end() && fi->second == seq) m_wait_fd.erase(fi);
+    m_blocked.erase(it);
+}
+
 bool cache_instance::wake_one_waiter(std::string_view key)
 {
     if (SOCKETLEY_LIKELY(m_blocked.empty()))
         return false;
 
     // Longest-waiting first: a worker pool that served its newest member would
-    // starve the one that has been idle longest.
-    size_t pick = m_blocked.size();
-    uint64_t best = UINT64_MAX;
-    for (size_t i = 0; i < m_blocked.size(); ++i)
-    {
-        if (m_blocked[i].seq >= best) continue;
-        for (const auto& k : m_blocked[i].keys)
-            if (k == key) { pick = i; best = m_blocked[i].seq; break; }
-    }
-    if (pick == m_blocked.size())
+    // starve the one that has been idle longest.  The queue is appended in
+    // sequence order, so that client is its front and no comparison is needed
+    // to find it.
+    auto ki = m_wait_key.find(key);
+    if (ki == m_wait_key.end() || ki->second.empty())
         return false;
 
-    const blocked_pop w = m_blocked[pick];
+    const uint64_t seq = ki->second.front();
+    auto bi = m_blocked.find(seq);
+    if (bi == m_blocked.end())
+    {
+        // Cannot happen while forget_waiter is the only way out, and repaired
+        // rather than trusted: a stale sequence here would wedge this key's
+        // queue for good.
+        ki->second.pop_front();
+        return true;
+    }
+    const blocked_pop w = bi->second;
 
     // Revalidated rather than trusted: between the park and this push the
     // descriptor may have closed and been reissued to somebody else.
@@ -9475,7 +9512,7 @@ bool cache_instance::wake_one_waiter(std::string_view key)
     {
         // Its socket is gone, so it is dropped -- but the element stays, for
         // whoever is behind it.
-        m_blocked.erase(m_blocked.begin() + static_cast<long>(pick));
+        forget_waiter(seq);
         return true;
     }
 
@@ -9488,7 +9525,7 @@ bool cache_instance::wake_one_waiter(std::string_view key)
     const bool got = w.from_head ? m_store.lpop(key, val) : m_store.rpop(key, val);
     if (!got)
         return false;
-    m_blocked.erase(m_blocked.begin() + static_cast<long>(pick));
+    forget_waiter(seq);
 
     deliver_pop(c, key, &val);
     c->blocked = false;
@@ -9524,14 +9561,18 @@ void cache_instance::sweep_blocked()
         return;
 
     const auto now = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < m_blocked.size(); )
-    {
-        const auto& w = m_blocked[i];
-        if (w.deadline.time_since_epoch().count() == 0 || now < w.deadline)
-        { ++i; continue; }
+    // Collected first: forget_waiter rehashes the map it is walking.
+    std::vector<uint64_t> expired;
+    for (const auto& [seq, w] : m_blocked)
+        if (w.deadline.time_since_epoch().count() != 0 && now >= w.deadline)
+            expired.push_back(seq);
 
-        const blocked_pop done = w;
-        m_blocked.erase(m_blocked.begin() + static_cast<long>(i));
+    for (const uint64_t seq : expired)
+    {
+        auto bi = m_blocked.find(seq);
+        if (bi == m_blocked.end()) continue;
+        const blocked_pop done = bi->second;
+        forget_waiter(seq);
 
         client_connection* c =
             (done.fd >= 0 && done.fd < MAX_FDS) ? m_conn_idx[done.fd] : nullptr;
@@ -9551,13 +9592,12 @@ void cache_instance::drop_blocked(int fd)
 {
     if (SOCKETLEY_LIKELY(m_blocked.empty()))
         return;
-    for (size_t i = 0; i < m_blocked.size(); )
-    {
-        if (m_blocked[i].fd == fd)
-            m_blocked.erase(m_blocked.begin() + static_cast<long>(i));
-        else
-            ++i;
-    }
+    // A blocked connection stops reading, so it holds at most one waiter and
+    // the descriptor index is enough to find it.
+    auto it = m_wait_fd.find(fd);
+    if (it == m_wait_fd.end())
+        return;
+    forget_waiter(it->second);
 }
 
 bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
@@ -9578,7 +9618,17 @@ bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
         w.deadline = std::chrono::steady_clock::now()
                    + std::chrono::milliseconds(static_cast<int64_t>(secs * 1000.0));
 
-    m_blocked.push_back(std::move(w));
+    const uint64_t seq = w.seq;
+    auto [it, fresh] = m_blocked.emplace(seq, std::move(w));
+    (void)fresh;
+    blocked_pop& parked = it->second;
+    parked.slots.reserve(parked.keys.size());
+    for (const auto& k : parked.keys)
+    {
+        auto& q = m_wait_key[k];
+        parked.slots.push_back(q.insert(q.end(), seq));
+    }
+    m_wait_fd[conn->fd] = seq;
     conn->blocked = true;
     arm_block_timer();
     return true;

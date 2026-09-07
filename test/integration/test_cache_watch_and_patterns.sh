@@ -93,9 +93,29 @@ if mode == 'watch':
     send(b,['SET','k','egal'])
     send(a,['MULTI'],['SET','k','6'])
     out['unwatched'] = send(a,['EXEC'])
+    # A write that cannot name its keys must abort every watcher.  MSET, a
+    # multi-key DEL and EVAL all land in the pessimistic branch, and that
+    # branch walks the watchERS rather than the watched KEYS -- so it is the
+    # one that a wrong reverse index breaks, silently and in the direction
+    # that loses a write.
+    for tag, cmd in (('mset',   ['MSET','p','1','q','2']),
+                     ('multidel',['DEL','p','q']),
+                     ('eval',   ['EVAL','return 1','0'])):
+        send(a,['SET','k','1']); send(a,['WATCH','k']); send(a,['MULTI'],['SET','k','X'])
+        send(b,cmd)
+        out['pess_' + tag] = send(a,['EXEC'])
+    # and it must still be precise about the watcher who left in the meantime
+    send(a,['UNWATCH'])
     # a watcher that leaves takes its watch with it
     c = conn(port); send(c,['SET','k','1'],['WATCH','k']); c.close()
     out['after_close'] = send(a,['SET','k','9'])
+    # a client that watched a great many keys and then left must not leave the
+    # index holding its descriptor -- the close path reads the key list from
+    # the connection now rather than walking the whole map
+    d = conn(port); d.sendall(b''.join(enc(['WATCH','m:%d' % i]) for i in range(5000)))
+    time.sleep(0.4); d.close(); time.sleep(0.3)
+    send(a,['SET','k','1']); send(a,['WATCH','k']); send(a,['MULTI'],['SET','k','Z'])
+    out['after_bulk_close'] = send(a,['EXEC'])
     a.close(); b.close()
     print(json.dumps(out))
 
@@ -120,6 +140,34 @@ elif mode == 'patterns':
         c.sendall(enc(['PUBLISH',ch,msg])); time.sleep(0.15)
     c.close(); t.join()
     print(json.dumps(got[0].decode('latin1')))
+
+elif mode == 'repeat':
+    # 200,000 WATCHes of ONE key on one connection.  Both readings are taken
+    # here, with the connection still OPEN: the vector is freed on close, so a
+    # reading taken afterwards would measure nothing and pass either way.
+    def rss(pid):
+        with open('/proc/%s/status' % pid) as f:
+            for ln in f:
+                if ln.startswith('VmRSS'): return int(ln.split()[1])
+        return -1
+    wpid = sys.argv[3]
+    r0 = rss(wpid)
+    s = conn(port)
+    buf = enc(['WATCH','einer']) * 1000
+    seen = 0
+    for _ in range(200):
+        s.sendall(buf)
+        s.settimeout(4)
+        try:
+            while True:
+                x = s.recv(1 << 20)
+                if not x: break
+                seen += x.count(b'+OK')
+                if seen % 1000 == 0: break
+        except socket.timeout: break
+    r1 = rss(wpid)
+    s.close()
+    print(json.dumps({'acked': seen, 'grew': r1 - r0}))
 
 elif mode == 'punsub':
     s=conn(port)
@@ -153,6 +201,13 @@ case "$(printf '%s' "$W" | val unwatched)" in *'+OK'*) ok "UNWATCH lifts the wat
     *) bad "unwatch" "still aborted" ;; esac
 case "$(printf '%s' "$W" | val after_close)" in *'+OK'*) ok "a watcher that disconnects leaves nothing behind" ;;
     *) bad "close" "a write after a watcher left did not work" ;; esac
+for T in mset multidel eval; do
+    case "$(printf '%s' "$W" | val "pess_$T")" in *'*-1'*) ok "a $T the watcher could not see aborts it" ;;
+        *) bad "pessimistic" "$T did not abort a watching transaction" \
+               "got: $(printf '%s' "$W" | val "pess_$T")" ;; esac
+done
+case "$(printf '%s' "$W" | val after_bulk_close)" in *'+OK'*) ok "5000 watches left with their client" ;;
+    *) bad "close" "a departed bulk watcher still aborts other transactions" ;; esac
 
 echo "--- 2. the confirmation a client counts down from ---"
 P1=$(py patterns)
@@ -177,6 +232,30 @@ case "$U" in *punsubscribe*) ok "punsubscribe confirms" ;;
     *) bad "punsub" "no confirmation" "got: ${U:0:120}" ;; esac
 case "$U" in *danach*) bad "punsub" "a message arrived after unsubscribing" ;;
     *) ok "and nothing arrives afterwards" ;; esac
+
+echo "--- 5. WATCHing one key twice is one watch ---"
+# Redis dedupes a client's watched keys; without that, every WATCH appends and
+# a connection that watches without ever reaching EXEC grows without bound.
+# Measured at 300k WATCHes of one key: 22232 -> 29732 kB here against 8592 ->
+# 8600 in Redis.  The dedupe costs nothing because the set insert already
+# answers "was this connection watching this key" -- no scan.
+WPID=$(ss -ltnp 2>/dev/null | sed -n "s/.*:$P .*pid=\([0-9]*\).*/\1/p" | head -1)
+if [ -z "$WPID" ] || [ ! -r "/proc/$WPID/status" ]; then
+    ok "SKIP growth check: no readable pid for port $P"
+else
+    REP=$(python3 "$PY" repeat "$P" "$WPID" 2>/dev/null)
+    case "$REP" in *'"acked": 200000'*|*'"acked":200000'*) ok "200k repeated WATCHes all answered" ;;
+        *) bad "repeat" "not every WATCH was answered" "got: ${REP:0:80}" ;; esac
+    GROWTH=$(printf '%s' "$REP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("grew",99999))' 2>/dev/null || echo 99999)
+    # Undeduped this was ~5000 kB for this many; 2048 is far outside the noise
+    # of an idle worker and far under what the defect produced.
+    if [ "$GROWTH" -lt 2048 ]; then ok "and held one entry, not 200000 (RSS +${GROWTH} kB)"
+    else bad "repeat" "watched keys accumulate" "RSS grew ${GROWTH} kB over 200k WATCHes of one key"; fi
+fi
+# The guarantee must survive all that repetition.
+W2=$(py watch)
+case "$(printf '%s' "$W2" | val dirty)" in *'*-1'*) ok "and the abort still works afterwards" ;;
+    *) bad "repeat" "WATCH stopped aborting after the repeats" ;; esac
 
 echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

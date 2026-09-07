@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_set>
 #include <chrono>
+#include <list>
 #include <unordered_map>
 #include <memory>
 #include <queue>
@@ -664,19 +665,45 @@ private:
         // Zero means "no timeout": BLPOP key 0 waits for ever, as Redis does.
         std::chrono::steady_clock::time_point deadline{};
         uint64_t                 seq{0};
+        // Where this waiter sits in each of its keys' queues, so leaving one
+        // is an erase at a known node and not a search through the queue.
+        std::vector<std::list<uint64_t>::iterator> slots;
     };
 
-    // Arrival order, because Redis serves the longest-waiting client first and
-    // a worker pool that served the newest would starve its own oldest member.
-    // A linear walk, because the list is one entry per idle worker -- an index
-    // per key would be the optimisation to make when that stops being true.
-    std::vector<blocked_pop> m_blocked;
+    // It stopped being true.  The linear walk that used to live here compared
+    // every waiter's key list against the pushed key on EVERY push, and a
+    // thousand idle workers -- an ordinary queue, not an attack -- cost the
+    // pushing client 74% of its throughput while Redis lost 11%.  Profiled at
+    // that load: memcmp 35.4%, wake_one_waiter 23.4%, string_view::compare
+    // 16.9%, together 80% of the worker's CPU.
+    //
+    // So: waiters by sequence, and per key the sequences waiting on it in
+    // arrival order -- the front of that queue is the longest-waiting client,
+    // which is the order Redis serves and the reason the seq exists at all.
+    std::unordered_map<uint64_t, blocked_pop>             m_blocked;
+    std::unordered_map<std::string, std::list<uint64_t>,
+                       string_hash, string_equal>          m_wait_key;
+    std::unordered_map<int, uint64_t>                     m_wait_fd;
     uint64_t                 m_block_seq{0};
+
+    // Drops one waiter from all three, and is the only way any of them shrink.
+    void forget_waiter(uint64_t seq);
 
     // ─── WATCH ──────────────────────────────────────────────────────────────
     // key -> the descriptors watching it, the shape the subscriber set has and
     // for the same reason.  Empty is the usual state and the fast path.
-    std::unordered_map<std::string, std::unordered_set<int>> m_watchers;
+    // Transparent, so a write looks a key up as a view: the plain map made
+    // note_write_for_watch build a std::string on every single write.
+    std::unordered_map<std::string, std::unordered_set<int>,
+                       string_hash, string_equal> m_watchers;
+
+    // And the same thing the other way round: who is watching ANYTHING.  A
+    // write that cannot name its keys has to tell every watcher, and walking
+    // m_watchers to find them makes that cost the number of watched KEYS --
+    // so one client holding sixty thousand of them slows down every other
+    // client's EVAL and MSET.  This makes it cost the number of watching
+    // CLIENTS instead, where that client is one entry.
+    std::unordered_set<int> m_watching;
 
     void watch_keys(client_connection* conn, std::string_view* args, int argc);
     void unwatch_all(client_connection* conn);

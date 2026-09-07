@@ -116,6 +116,15 @@ V_SIZE=100       # bytes per string value
 # is not the first.  What it costs is measured separately, as a publish rate
 # with and without a pattern subscriber attached.
 #
+# WATCH is absent for the same reason and it printed 10.16x before anybody
+# checked.  Redis dedupes a client's watched keys with a linear scan of the
+# list, so its rate falls with the number of DISTINCT keys one connection has
+# watched -- measured at -c 1, 60k ops: 69204/s at r=1, 57143 at r=1000, 23220
+# at r=10000, 7964 at r=60000.  Ours is flat over the same sweep (71942 down to
+# 68729) because it deduped through a hash set.  At r=1 the two are level with
+# each other and with GET, which is the honest answer: one WATCH costs one
+# lookup on both sides, and the ratio the row printed was the keyspace size.
+#
 # RPOPLPUSH and LMOVE could be made idempotent by moving a list onto itself,
 # which rotates -- but only with the SAME key on both sides, and
 # __rand_int__ is substituted per occurrence, so the two would be different
@@ -148,7 +157,6 @@ SETGET|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx GET
 # warning at all.
 EVAL|1000|EVAL return(1) 0
 EVALKEY|1000|EVAL return(redis.call('get',KEYS[1])) 1 KEYTAGstr:__rand_int__
-WATCH|1000|WATCH KEYTAGstr:__rand_int__
 INCR|1000|INCR KEYTAGnum:__rand_int__
 DECR|1000|DECR KEYTAGnum:__rand_int__
 INCRBY|1000|INCRBY KEYTAGnum:__rand_int__ 3
