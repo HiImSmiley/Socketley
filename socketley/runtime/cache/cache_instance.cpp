@@ -18,7 +18,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
-#include <fnmatch.h>
+#include "../../shared/glob_match.h"
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -6366,7 +6366,10 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             { rb.append("usage: hscan key cursor [match pat] [count n]\n", 45); return; }
             uint64_t cur = 0;
             if (!parse_int_sv(cur_s, cur)) { rb.append("error: invalid cursor\n", 22); return; }
-            std::string_view pat; size_t want = 10;
+            // "*" and not empty: an ABSENT MATCH means everything, an explicit
+            // MATCH "" means the member whose name is empty, and the store can
+            // only tell them apart if the default is spelled here.
+            std::string_view pat = "*"; size_t want = 10;
             std::string_view walk = r2;
             while (!walk.empty())
             {
@@ -9165,7 +9168,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             uint64_t cur = 0;
             if (!parse_int_sv(args[2], cur))
             { resp::encode_error_into(rb, "invalid cursor"); break; }
-            std::string_view pat;
+            std::string_view pat = "*";   // absent MATCH is everything; see above
             size_t want = 10;                       // Redis's own default COUNT
             for (int i = 3; i + 1 < argc; i += 2)
             {
@@ -9754,10 +9757,12 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
     // cache nobody psubscribes to pays one empty() test.
     if (SOCKETLEY_UNLIKELY(m_store.has_patterns()))
     {
-        const std::string chan(channel);
         for (const auto& [pat, fds] : m_store.patterns())
         {
-            if (fnmatch(pat.c_str(), chan.c_str(), 0) != 0)
+            // Views on both sides: the channel was copied into a std::string
+            // only so fnmatch could have a terminator, and every pattern then
+            // cost two strlen calls on lengths both sides already knew.
+            if (!socketley::glob_match(pat, channel))
                 continue;
             for (int fd : fds)
             {

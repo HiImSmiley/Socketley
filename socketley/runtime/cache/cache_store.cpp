@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
-#include <fnmatch.h>
+#include "../../shared/glob_match.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -856,10 +856,13 @@ bool cache_store::setnx(std::string_view key, std::string_view value)
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out) const
 {
-    bool match_all = (pattern.empty() || pattern == "*");
+    // Not `pattern.empty() ||`: MATCH "" asks for the key that has no name,
+    // and answering it with the whole keyspace is the opposite of the request.
+    // Callers spell an absent MATCH as "*".
+    bool match_all = (pattern == "*");
     auto match = [&](std::string_view k) -> bool {
         if (match_all) return true;
-        return fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
+        return socketley::glob_match(pattern, k);
     };
 
     // The bucket count rides in the cursor so the next call can tell whether
@@ -1425,10 +1428,10 @@ template <typename Map, typename Emit>
 static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
                                     std::string_view pattern, size_t count, Emit emit)
 {
-    const bool match_all = (pattern.empty() || pattern == "*");
+    const bool match_all = (pattern == "*");   // see scan(): "" is a pattern
     const auto match = [&](std::string_view k) {
         return match_all
-            || fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
+            || socketley::glob_match(pattern, k);
     };
 
     const uint32_t was_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFFu);
@@ -1671,10 +1674,7 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
     bool match_all = (pattern == "*");
     auto match = [&](std::string_view key) -> bool {
         if (match_all) return true;
-        // fnmatch requires null-terminated strings
-        std::string key_str(key);
-        std::string pat_str(pattern);
-        return fnmatch(pat_str.c_str(), key_str.c_str(), 0) == 0;
+        return socketley::glob_match(pattern, key);
     };
 
     for (const auto& [key, _] : m_data)
