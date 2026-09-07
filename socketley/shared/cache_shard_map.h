@@ -179,6 +179,11 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("lrange"):     case fnv1a("lset"):
         case fnv1a("lrem"):       case fnv1a("ltrim"):
         case fnv1a("linsert"):
+        // Two keys, routed on the first.  The shard that owns it answers
+        // -CROSSSLOT when the second is a sibling's, which is what Redis says
+        // for a pair that does not hash together -- moving it would be a
+        // crossing that has to be undone if the far side refuses.
+        case fnv1a("rpoplpush"):  case fnv1a("lmove"):
         // ── sets ──
         case fnv1a("sadd"):       case fnv1a("srem"):
         case fnv1a("sismember"):  case fnv1a("scard"):
@@ -192,6 +197,11 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("hmget"):      case fnv1a("hmset"):
         case fnv1a("hkeys"):      case fnv1a("hvals"):
         case fnv1a("hstrlen"):
+        // A cursor over ONE key's collection, so it routes to that key's owner
+        // like any other single-key command -- unlike SCAN, whose cursor names
+        // a shard because the keyspace is spread over all of them.
+        case fnv1a("hscan"):      case fnv1a("sscan"):
+        case fnv1a("zscan"):
         // ── sorted sets ──
         case fnv1a("zadd"):       case fnv1a("zrem"):
         case fnv1a("zscore"):     case fnv1a("zcard"):

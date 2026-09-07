@@ -187,9 +187,28 @@ public:
     int  linsert(std::string_view key, bool before, std::string_view pivot,
                  std::string_view val);
 
+    // One element from one end of `src` to one end of `dst`, which is the
+    // reliable-queue move: the job is never in neither list.  Answers false
+    // when src is empty or either key is not a list; src == dst rotates.
+    bool lmove(std::string_view src, std::string_view dst,
+               bool from_head, bool to_head, std::string& out);
+
     // --- Sets, the sampling spellings ---
     bool spop(std::string_view key, std::string& out);
     bool srandmember(std::string_view key, std::string& out) const;
+
+    // One collection walked in whole buckets, cursor 0 to start and 0 again
+    // when it is done -- SCAN's contract, over one key instead of the
+    // keyspace.  A missing key is an immediate 0 with nothing emitted, which
+    // is what Redis answers rather than an error.
+    uint64_t hscan(std::string_view key, uint64_t cursor, std::string_view pattern,
+                   size_t count,
+                   std::vector<std::pair<std::string_view, std::string_view>>& out) const;
+    uint64_t sscan(std::string_view key, uint64_t cursor, std::string_view pattern,
+                   size_t count, std::vector<std::string_view>& out) const;
+    uint64_t zscan(std::string_view key, uint64_t cursor, std::string_view pattern,
+                   size_t count,
+                   std::vector<std::pair<std::string_view, double>>& out) const;
 
     // --- Hashes, the field spellings ---
     bool hexists(std::string_view key, std::string_view field) const;

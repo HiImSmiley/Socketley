@@ -3493,6 +3493,37 @@ Set key only if it does not exist. Returns "1" (set) or "0" (not set).
 .BI "setex " "key seconds value"
 Set key with expiry. Equivalent to SET + EXPIRE. Returns "ok".
 .TP
+.B "set " "key value [nx|xx] [ex " sec "|px " ms "] [keepttl] [get]"
+Over RESP,
+.B set
+takes Redis's options.
+.B nx
+writes only if the key is absent and
+.B xx
+only if it is there;
+.BR ex " and " px
+set a deadline in seconds or milliseconds.
+.IP
+.B keepttl
+leaves the deadline alone, which a plain
+.B set
+clears \(em it is what a session refresh needs, where the value changes and
+the hour it has left does not. Asking for
+.B keepttl
+together with
+.BR ex " or " px
+is a contradiction and is refused rather than resolved in one of the two
+directions.
+.IP
+.B get
+answers the value that was replaced instead of "ok", nil when there was none
+\(em and answers it even when
+.B nx
+refused the write, which is what makes it a read-and-write in one round trip.
+A key holding something other than a string answers
+.B \-WRONGTYPE
+rather than nil, because a caller asking for the old value wants to hear that.
+.TP
 .BI "psetex " "key milliseconds value"
 Set key with millisecond-precision expiry. Returns "ok".
 .TP
@@ -3564,6 +3595,31 @@ removes the key, because an empty list is not a key here.
 Insert beside the first occurrence of
 .IR pivot ,
 returning the new length, 0 when the key is absent and \-1 when the pivot is.
+.TP
+.BI "rpoplpush " "source destination"
+.TQ
+.BI "lmove " "source destination left|right left|right"
+Move one element from one end of
+.I source
+to one end of
+.IR destination ,
+returning it.
+.B rpoplpush
+is
+.B "lmove src dst right left"
+under its older name. The two keys may be the same, which rotates the list.
+.IP
+.B Every refusal happens before the element is taken.
+This is the reliable-queue move: a job leaves the pending list and arrives in
+the processing one, and a worker that dies between the two is why the pattern
+exists. A wrong-typed destination, a memory limit or a destination on another
+shard are therefore all decided first \(em the element is never in neither
+list.
+.IP
+On a sharded cache the pair must hash to one shard.
+.B \-CROSSSLOT
+otherwise, which is Redis's answer and not a crossing: moving it would be a
+write in one process that a refusal in another cannot undo.
 .PP
 .B Sets (unique unordered members):
 .TP
@@ -3638,6 +3694,23 @@ if it is absent, and return the new value.
 .TP
 .BI "hsetnx " "key field value"
 Set the field only if it does not exist. Returns 1 or 0.
+.TP
+.BI "hscan " "key cursor" " [match " pattern "] [count " n "]"
+.TQ
+.BI "sscan " "key cursor" " [match " pattern "] [count " n "]"
+.TQ
+.BI "zscan " "key cursor" " [match " pattern "] [count " n "]"
+.B scan
+over one key's collection instead of over the keyspace: start at 0, pass back
+the cursor each call, and 0 again means the walk is done.
+.I count
+is a hint and defaults to 10, as it does on Redis; a collection smaller than
+one bucket-load comes back whole with cursor 0.
+.IP
+The cursor carries the collection's bucket count as well as its position, so a
+resume can tell whether the table it is going back into is the one it left. A
+rehash between two calls restarts the walk rather than silently skipping the
+elements that moved.
 .IP
 .B The order of fields is not the order they were set in.
 A hash is backed by an unordered map here, so

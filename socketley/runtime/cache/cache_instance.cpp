@@ -6050,6 +6050,40 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             break;
         }
 
+        // ─── Lists, the reliable-queue move ───
+        // Present in the text protocol because replication goes through it:
+        // repl(args, argc) writes the command as a line, and a follower's text
+        // interpreter that does not know it applies nothing at all.
+        case fnv1a("rpoplpush"):
+        case fnv1a("lmove"):
+        {
+            const bool three = (fnv1a_lower(cmd) == fnv1a("rpoplpush"));
+            auto [src, r1] = extract_key(args);
+            auto [dst, r2] = extract_key(r1);
+            if (src.empty() || dst.empty())
+            { rb.append("usage: lmove src dst left|right left|right\n", 43); return; }
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+
+            bool from_head = false, to_head = true;
+            if (!three)
+            {
+                auto [fs, r3] = extract_key(r2);
+                auto [ts, _r4] = extract_key(r3);
+                const uint32_t f = fnv1a_lower(fs), t = fnv1a_lower(ts);
+                if ((f != fnv1a("left") && f != fnv1a("right"))
+                 || (t != fnv1a("left") && t != fnv1a("right")))
+                { rb.append("usage: lmove src dst left|right left|right\n", 43); return; }
+                from_head = (f == fnv1a("left"));
+                to_head   = (t == fnv1a("left"));
+            }
+            std::string moved;
+            if (!m_store.lmove(src, dst, from_head, to_head, moved))
+            { rb.append("nil\n", 4); return; }
+            rb.append(moved); rb.push_back('\n');
+            replicate_command(line);
+            break;
+        }
+
         // ─── Sets, the sampling spellings ───
         case fnv1a("spop"):
         {
@@ -6170,6 +6204,70 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             rb.append("ok\n", 3);
             replicate_command(line);
+            break;
+        }
+        // ─── One collection, scanned ───
+        // Read-only, so replication does not need these -- they are here so
+        // the two protocols do not drift, which is how a command ends up
+        // meaning one thing on a port and another on a node.
+        case fnv1a("hscan"):
+        case fnv1a("sscan"):
+        case fnv1a("zscan"):
+        {
+            auto [key, r1]   = extract_key(args);
+            auto [cur_s, r2] = extract_key(r1);
+            if (key.empty() || cur_s.empty())
+            { rb.append("usage: hscan key cursor [match pat] [count n]\n", 45); return; }
+            uint64_t cur = 0;
+            if (!parse_int_sv(cur_s, cur)) { rb.append("error: invalid cursor\n", 22); return; }
+            std::string_view pat; size_t want = 10;
+            std::string_view walk = r2;
+            while (!walk.empty())
+            {
+                auto [o, r3] = extract_key(walk);
+                auto [v, r4] = extract_key(r3);
+                if (o.empty()) break;
+                const uint32_t oh = fnv1a_lower(o);
+                if (oh == fnv1a("match")) pat = v;
+                else if (oh == fnv1a("count"))
+                {
+                    int64_t c = 0;
+                    if (!parse_int_sv(v, c) || c < 1)
+                    { rb.append("error: invalid count\n", 21); return; }
+                    want = static_cast<size_t>(c);
+                }
+                else { rb.append("error: syntax\n", 14); return; }
+                walk = r4;
+            }
+            if (m_has_ttl_keys) m_store.check_expiry(key);
+            const uint32_t which = fnv1a_lower(cmd);
+            uint64_t next = 0;
+            std::string listing;
+            if (which == fnv1a("hscan"))
+            {
+                std::vector<std::pair<std::string_view, std::string_view>> got;
+                next = m_store.hscan(key, cur, pat, want, got);
+                for (const auto& [f, v] : got)
+                { listing.append(f); listing += ' '; listing.append(v); listing += '\n'; }
+            }
+            else if (which == fnv1a("sscan"))
+            {
+                std::vector<std::string_view> got;
+                next = m_store.sscan(key, cur, pat, want, got);
+                for (const auto& m : got) { listing.append(m); listing += '\n'; }
+            }
+            else
+            {
+                std::vector<std::pair<std::string_view, double>> got;
+                next = m_store.zscan(key, cur, pat, want, got);
+                for (const auto& [m, sc] : got)
+                { listing.append(m); listing += ' '; append_score_bare(listing, sc);
+                  listing += '\n'; }
+            }
+            // The cursor first on its own line, the way `scan` answers here.
+            rb.append(std::to_string(next)); rb.push_back('\n');
+            rb.append(listing);
+            rb.append("end\n", 4);
             break;
         }
 
@@ -7220,8 +7318,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 break;
             }
 
-            // Slow path: SET with NX/XX/EX/PX options
-            bool nx = false, xx = false;
+            // Slow path: SET with NX/XX/EX/PX/KEEPTTL/GET options
+            bool nx = false, xx = false, keepttl = false, want_old = false;
             int ex_sec = 0;
             int64_t px_ms = 0;
             for (int i = 3; i < argc; i++)
@@ -7242,6 +7340,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         break;
                     case fnv1a("nx"): nx = true; break;
                     case fnv1a("xx"): xx = true; break;
+                    // A write clears the deadline unless this says otherwise,
+                    // which is the flag a session refresh needs: the value
+                    // changes and the hour it has left does not.
+                    case fnv1a("keepttl"): keepttl = true; break;
+                    // Answers the value SET replaced rather than +OK, so a
+                    // caller reads and writes in one round trip.
+                    case fnv1a("get"): want_old = true; break;
                     default:
                         // Refused rather than ignored, because `SET k v FOO`
                         // matched no case, fell through and reported success
@@ -7251,10 +7356,42 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         return;
                 }
             }
+            // KEEPTTL means "leave the deadline alone", and EX/PX mean "set
+            // this one" -- asking for both is a contradiction Redis refuses
+            // rather than resolving in one of the two directions.
+            if (keepttl && (ex_sec > 0 || px_ms > 0))
+            { resp::encode_error_into(rb, "syntax error"); return; }
+
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+
+            // Read before the write, because SET is what destroys it.  GET
+            // reports the type conflict itself: a caller asking for the old
+            // value of a list wants to hear that, not a null.
+            std::string old_val;
+            bool had_old = false;
+            if (want_old)
+            {
+                if (m_store.type(args[1]) != "string" && m_store.exists(args[1]))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                had_old = m_store.get(args[1], old_val);
+            }
+
             bool key_exists = m_store.exists(args[1]);
-            if (nx && key_exists)  { resp::encode_null_into(rb); break; }
-            if (xx && !key_exists) { resp::encode_null_into(rb); break; }
+            if (nx && key_exists)
+            {
+                if (want_old && had_old) resp::encode_bulk_into(rb, old_val);
+                else                     resp::encode_null_into(rb);
+                break;
+            }
+            if (xx && !key_exists)
+            {
+                resp::encode_null_into(rb);
+                break;
+            }
+
+            // The deadline as it stands, captured before set() drops it.
+            const int64_t kept = keepttl ? m_store.get_pttl(args[1]) : -1;
+
             if (!m_store.set(args[1], args[2]))
             {
                 resp::encode_error_code_into(rb, wrongtype_msg);
@@ -7262,6 +7399,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); mark_ttl_keys(); }
             else if (px_ms > 0) { m_store.set_expiry_ms(args[1], px_ms); mark_ttl_keys(); }
+            else if (keepttl && kept > 0) { m_store.set_expiry_ms(args[1], kept); mark_ttl_keys(); }
+
+            if (want_old)
+            {
+                if (had_old) resp::encode_bulk_into(rb, old_val);
+                else         resp::encode_null_into(rb);
+                repl_set_effect(args[1], args[2], ex_sec, px_ms);
+                break;
+            }
             resp::encode_ok_into(rb);
             repl_set_effect(args[1], args[2], ex_sec, px_ms);
 #ifndef SOCKETLEY_NO_LUA
@@ -8353,6 +8499,56 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             break;
         }
 
+        // ─── Lists, the reliable-queue move ───
+        case fnv1a("rpoplpush"):
+        case fnv1a("lmove"):
+        {
+            const bool three = (cmd_hash == fnv1a("rpoplpush"));
+            if (argc < (three ? 3 : 5))
+            { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+
+            bool from_head = false, to_head = true;   // RPOPLPUSH's directions
+            if (!three)
+            {
+                const uint32_t f = fnv1a_lower(args[3]), t = fnv1a_lower(args[4]);
+                if ((f != fnv1a("left") && f != fnv1a("right"))
+                 || (t != fnv1a("left") && t != fnv1a("right")))
+                { resp::encode_error_into(rb, "syntax error"); return; }
+                from_head = (f == fnv1a("left"));
+                to_head   = (t == fnv1a("left"));
+            }
+
+            // The destination has to be this shard's, because the element
+            // would otherwise leave one process and have to arrive in another
+            // with nothing to undo the pop if it did not.
+            if (SOCKETLEY_UNLIKELY(m_shard_n > 1)
+                && cache_shard_of(args[2], m_shard_n) != m_shard_i)
+            {
+                resp::encode_error_code_into(rb,
+                    "CROSSSLOT Keys in request don't hash to the same slot");
+                break;
+            }
+
+            std::string moved;
+            if (!m_store.lmove(args[1], args[2], from_head, to_head, moved))
+            {
+                // Absent source and wrong type are two different answers, and
+                // the store says false to both.
+                const std::string_view st = m_store.type(args[1]);
+                if (st != "none" && st != "list")
+                    resp::encode_error_code_into(rb, wrongtype_msg);
+                else if (m_store.type(args[2]) != "none" && m_store.type(args[2]) != "list")
+                    resp::encode_error_code_into(rb, wrongtype_msg);
+                else
+                    resp::encode_null_into(rb);
+                break;
+            }
+            resp::encode_bulk_into(rb, moved);
+            repl(args, argc);
+            break;
+        }
+
         // ─── Sets, the sampling spellings ───
         // SPOP picks a member this process's iteration order decides, so it
         // replicates as the SREM it turned out to be rather than as itself.
@@ -8463,6 +8659,66 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             const std::string* v = m_store.hget(args[1], args[2]);
             resp::encode_integer_into(rb, v ? static_cast<int64_t>(v->size()) : 0);
+            break;
+        }
+        // ─── One collection, scanned ───
+        case fnv1a("hscan"):
+        case fnv1a("sscan"):
+        case fnv1a("zscan"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            uint64_t cur = 0;
+            if (!parse_int_sv(args[2], cur))
+            { resp::encode_error_into(rb, "invalid cursor"); break; }
+            std::string_view pat;
+            size_t want = 10;                       // Redis's own default COUNT
+            for (int i = 3; i + 1 < argc; i += 2)
+            {
+                const uint32_t o = fnv1a_lower(args[i]);
+                if (o == fnv1a("match")) pat = args[i + 1];
+                else if (o == fnv1a("count"))
+                {
+                    int64_t c = 0;
+                    if (!parse_int_sv(args[i + 1], c) || c < 1)
+                    { resp::encode_error_into(rb, "syntax error"); return; }
+                    want = static_cast<size_t>(c);
+                }
+                else { resp::encode_error_into(rb, "syntax error"); return; }
+            }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+
+            // Two elements: the cursor to come back with, then the flat list.
+            // A hash and a zset emit two entries per element, a set one -- so
+            // the body is built first and counted, because the array header
+            // has to be written before it.
+            std::string body;
+            int n = 0;
+            uint64_t next = 0;
+            if (cmd_hash == fnv1a("hscan"))
+            {
+                std::vector<std::pair<std::string_view, std::string_view>> got;
+                next = m_store.hscan(args[1], cur, pat, want, got);
+                for (const auto& [f, v] : got)
+                { resp::encode_bulk_into(body, f); resp::encode_bulk_into(body, v); n += 2; }
+            }
+            else if (cmd_hash == fnv1a("sscan"))
+            {
+                std::vector<std::string_view> got;
+                next = m_store.sscan(args[1], cur, pat, want, got);
+                for (const auto& m : got) { resp::encode_bulk_into(body, m); ++n; }
+            }
+            else
+            {
+                std::vector<std::pair<std::string_view, double>> got;
+                next = m_store.zscan(args[1], cur, pat, want, got);
+                for (const auto& [m, sc] : got)
+                { resp::encode_bulk_into(body, m);
+                  resp::encode_bulk_into(body, score_text(sc)); n += 2; }
+            }
+            resp::encode_array_header_into(rb, 2);
+            resp::encode_bulk_into(rb, std::to_string(next));
+            resp::encode_array_header_into(rb, n);
+            rb.append(body);
             break;
         }
 

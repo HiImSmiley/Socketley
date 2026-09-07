@@ -99,10 +99,17 @@ V_SIZE=100       # bytes per string value
 #
 # Some commands cannot be made idempotent that way and are deliberately absent:
 # LPOP, RPOP, DEL, HDEL, SREM, ZREM -- and now SPOP, ZPOPMIN, ZPOPMAX, LREM,
-# LINSERT, GETDEL, UNLINK and the ZREMRANGE pair -- consume what they measure,
+# LINSERT, GETDEL, UNLINK, RPOPLPUSH, LMOVE and the ZREMRANGE pair -- consume
+# what they measure,
 # so after the structure is drained they time the empty path instead.  They
 # need their own key family reloaded between passes, which is a separate piece
 # of work; a number for them here would be a number for an empty list.
+#
+# RPOPLPUSH and LMOVE could be made idempotent by moving a list onto itself,
+# which rotates -- but only with the SAME key on both sides, and
+# __rand_int__ is substituted per occurrence, so the two would be different
+# keys.  A fixed key would hammer one list and, sharded, one shard.  Their path
+# is covered by test_cache_queue_and_scan.sh instead.
 #
 # EXISTS appears twice on purpose.  The one-key row is what the table always
 # had; EXISTS3 is the arity that was answering 1 for any number of keys, and a
@@ -122,6 +129,8 @@ MSET|1000|MSET KEYTAGstr:__rand_int__ a KEYTAGstr:__rand_int__ b
 STRLEN|1000|STRLEN KEYTAGstr:__rand_int__
 GETRANGE|1000|GETRANGE KEYTAGstr:__rand_int__ 0 9
 SETRANGE|1000|SETRANGE KEYTAGstr:__rand_int__ 0 zzzz
+SETKEEPTTL|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx KEEPTTL
+SETGET|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx GET
 INCR|1000|INCR KEYTAGnum:__rand_int__
 DECR|1000|DECR KEYTAGnum:__rand_int__
 INCRBY|1000|INCRBY KEYTAGnum:__rand_int__ 3
@@ -150,6 +159,7 @@ HMGET|100|HMGET KEYTAGhash:__rand_int__ f1 f3 f5
 HMSET|100|HMSET KEYTAGhash:__rand_int__ f3 v f4 v
 HSETNX|100|HSETNX KEYTAGhash:__rand_int__ f3 v
 HINCRBY|100|HINCRBY KEYTAGhash:__rand_int__ ctr 1
+HSCAN|100|HSCAN KEYTAGhash:__rand_int__ 0
 LPUSH|100|LPUSH pushKEYTAGlist:__rand_int__ e
 RPUSH|100|RPUSH pushKEYTAGlist:__rand_int__ e
 LLEN|100|LLEN KEYTAGlist:__rand_int__
@@ -163,6 +173,7 @@ SISMEMBER|100|SISMEMBER KEYTAGset:__rand_int__ m42
 SMEMBERS|100|SMEMBERS KEYTAGset:__rand_int__
 SMISMEMBER|100|SMISMEMBER KEYTAGset:__rand_int__ m42 m43 nope
 SRANDMEMBER|100|SRANDMEMBER KEYTAGset:__rand_int__
+SSCAN|100|SSCAN KEYTAGset:__rand_int__ 0
 ZADD|100|ZADD zKEYTAGset:__rand_int__ 42 m42
 ZCARD|100|ZCARD zKEYTAGset:__rand_int__
 ZSCORE|100|ZSCORE zKEYTAGset:__rand_int__ m42
@@ -174,6 +185,7 @@ ZREVRANGE|100|ZREVRANGE zKEYTAGset:__rand_int__ 0 9
 ZRANGEBYSCORE|100|ZRANGEBYSCORE zKEYTAGset:__rand_int__ 0 9
 ZREVRANGEBYSCORE|100|ZREVRANGEBYSCORE zKEYTAGset:__rand_int__ 9 0
 ZCOUNT|100|ZCOUNT zKEYTAGset:__rand_int__ 0 9
+ZSCAN|100|ZSCAN zKEYTAGset:__rand_int__ 0
 PUBLISH|1000|PUBLISH KEYTAGchan:__rand_int__ hello|60000
 PING|1|PING
 DBSIZE|1|DBSIZE

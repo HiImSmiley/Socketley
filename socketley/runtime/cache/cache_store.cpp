@@ -1313,6 +1313,65 @@ int cache_store::linsert(std::string_view key, bool before, std::string_view piv
     return static_cast<int>(dq.size());
 }
 
+bool cache_store::lmove(std::string_view src, std::string_view dst,
+                        bool from_head, bool to_head, std::string& out)
+{
+    check_expiry(src);
+    if (src != dst) check_expiry(dst);
+
+    auto sit = m_lists.find(src);
+    if (sit == m_lists.end() || sit->second.empty())
+        return false;
+
+    // The destination must be a list or absent; a string there is a refusal
+    // and NOT a pop, or the element would be gone with nowhere to be.
+    if (m_lists.find(dst) == m_lists.end() && has_type_conflict_for_list(dst))
+        return false;
+
+    // Charged before the pop, for the same reason: a refusal after it would
+    // have taken the element out of the queue and dropped it.
+    const std::string& head = from_head ? sit->second.front() : sit->second.back();
+    if (src != dst && !check_memory(stored_string(head.size())
+                                    + new_key_cost(dst.size()) + list_elem_overhead, dst))
+        return false;
+    sit = m_lists.find(src);
+    if (sit == m_lists.end() || sit->second.empty())
+        return false;
+
+    if (from_head) { out = std::move(sit->second.front()); sit->second.pop_front(); }
+    else           { out = std::move(sit->second.back());  sit->second.pop_back();  }
+    track_sub(stored_string(out));
+    --m_list_elems;
+
+    // src == dst is a rotation, and the deque above is the one below: taken
+    // before the source can be erased for being empty, which it is not.
+    if (src == dst)
+    {
+        if (to_head) sit->second.push_front(out); else sit->second.push_back(out);
+        ++m_list_elems;
+        track_add(stored_string(out));
+        touch_lru(src);
+        return true;
+    }
+
+    if (sit->second.empty())
+    {
+        track_sub(entry_cost(sit->first, sit->second));
+        m_lists.erase(sit);
+        m_expiry.erase(std::string(src));
+        drop_lru(src);
+    }
+
+    auto dit = m_lists.find(dst);
+    if (dit == m_lists.end())
+        dit = m_lists.emplace(std::string(dst), std::deque<std::string>{}).first;
+    if (to_head) dit->second.push_front(out); else dit->second.push_back(out);
+    ++m_list_elems;
+    track_add(stored_string(out));
+    touch_lru(dst);
+    return true;
+}
+
 // ─── Sets, the sampling spellings ───
 
 bool cache_store::spop(std::string_view key, std::string& out)
@@ -1347,6 +1406,85 @@ bool cache_store::srandmember(std::string_view key, std::string& out) const
         return false;
     out = *it->second.begin();
     return true;
+}
+
+// What a pattern is matched against, which is the element itself in a set and
+// the field or member name in the other two.
+static inline std::string_view scan_key_of(const std::string& s) { return s; }
+template <typename A, typename B>
+static inline std::string_view scan_key_of(const std::pair<A, B>& p) { return p.first; }
+
+// ─── One collection, scanned ───
+//
+// The keyspace SCAN packs a map index beside the bucket count because it walks
+// five maps; over one key there is no index, so the whole 24 bits of bucket
+// count and 32 of bucket index are this collection's.  The count rides along
+// for the same reason it does there: a resume can tell whether the table it is
+// going back into is the one it left, and a rehash restarts rather than
+// silently skipping half the elements.
+template <typename Map, typename Emit>
+static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
+                                    std::string_view pattern, size_t count, Emit emit)
+{
+    const bool match_all = (pattern.empty() || pattern == "*");
+    const auto match = [&](std::string_view k) {
+        return match_all
+            || fnmatch(std::string(pattern).c_str(), std::string(k).c_str(), 0) == 0;
+    };
+
+    const uint32_t was_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFFu);
+    size_t         bucket      = static_cast<size_t>(cursor & 0xFFFFFFFFu);
+    const size_t   nbuckets    = map.bucket_count();
+
+    // A table that has been rehashed under the caller is one this cursor
+    // cannot resume into, so it starts again rather than reporting a slice.
+    if (was_buckets != 0 && was_buckets != (nbuckets & 0xFFFFFFu))
+        bucket = 0;
+
+    size_t emitted = 0;
+    for (size_t b = bucket; b < nbuckets; ++b)
+    {
+        for (auto it = map.begin(b); it != map.end(b); ++it)
+            if (match(scan_key_of(*it))) { emit(*it); ++emitted; }
+
+        // Whole buckets only: half of one would need an element index the
+        // cursor has no room for.
+        if (emitted >= count && b + 1 < nbuckets)
+            return ((static_cast<uint64_t>(nbuckets) & 0xFFFFFFu) << 32)
+                 | (static_cast<uint64_t>(b + 1) & 0xFFFFFFFFu);
+    }
+    return 0;
+}
+
+uint64_t cache_store::hscan(std::string_view key, uint64_t cursor,
+                            std::string_view pattern, size_t count,
+                            std::vector<std::pair<std::string_view, std::string_view>>& out) const
+{
+    auto it = m_hashes.find(key);
+    if (it == m_hashes.end()) return 0;
+    return scan_one_collection(it->second, cursor, pattern, count,
+        [&out](const auto& e) { out.emplace_back(std::string_view(e.first),
+                                                 std::string_view(e.second)); });
+}
+
+uint64_t cache_store::sscan(std::string_view key, uint64_t cursor,
+                            std::string_view pattern, size_t count,
+                            std::vector<std::string_view>& out) const
+{
+    auto it = m_sets.find(key);
+    if (it == m_sets.end()) return 0;
+    return scan_one_collection(it->second, cursor, pattern, count,
+        [&out](const auto& e) { out.emplace_back(std::string_view(e)); });
+}
+
+uint64_t cache_store::zscan(std::string_view key, uint64_t cursor,
+                            std::string_view pattern, size_t count,
+                            std::vector<std::pair<std::string_view, double>>& out) const
+{
+    auto it = m_zsets.find(key);
+    if (it == m_zsets.end()) return 0;
+    return scan_one_collection(it->second.score, cursor, pattern, count,
+        [&out](const auto& e) { out.emplace_back(std::string_view(e.first), e.second); });
 }
 
 // ─── Hashes, the field spellings ───
