@@ -45,11 +45,34 @@ source "$(dirname "$0")/utils.sh"
 source "$(dirname "$0")/lib_paired.sh"
 
 MODE=${BENCH_MATRIX_MODE:-unsharded}     # unsharded | sharded
-PASSES=${BENCH_MATRIX_PASSES:-3}
-OPS=${BENCH_MATRIX_OPS:-100000}
+PASSES=${BENCH_MATRIX_PASSES:-5}
+OPS=${BENCH_MATRIX_OPS:-2000000}
 CLIENTS=${BENCH_MATRIX_CLIENTS:-50}
 PIPE=${BENCH_MATRIX_PIPE:-16}
-PROCS=${BENCH_MATRIX_PROCS:-4}           # client processes per cell
+# Twice as many client processes as there are server shards, because one
+# redis-benchmark does not saturate a core here and four of them left both arms
+# short of what they could serve -- which compresses the ratio, since a ceiling
+# holds the faster arm back harder.  Measured against a four-shard cluster
+# cache, 600k operations per process, pipeline 16:
+#
+#   GET    4 procs            2,727,273/s
+#          8 procs            4,060,925/s   <- +49%
+#         12 procs            2,878,466/s   (16 cores, 4 of them shards)
+#          8 procs, 100 conn  4,013,423/s   (connections are not the lever)
+#          4 procs x 4 thr    2,390,438/s   (--threads is worse in every shape)
+#   PING   4 procs            7,784,675/s
+#          8 procs           10,929,834/s
+#          4 procs x 4 thr    5,966,619/s
+#
+# PING is in that list on purpose: it touches no data, so a PING cell that
+# reads 1.23x is measuring the load generator and nothing else.  It is the
+# control for whether this number is set high enough.
+PROCS=${BENCH_MATRIX_PROCS:-8}           # client processes per cell
+# The longest a single client process may take before it is taken to be stuck.
+# Generous against the slowest legitimate cell measured here -- SMEMBERS over
+# hundred-element sets is about twenty seconds -- and far under the ninety-odd
+# minutes a wedged one ran for.
+CELL_TIMEOUT=${BENCH_MATRIX_CELL_TIMEOUT:-120}
 SKL_PORT=19811
 REDIS_PORT=7301
 CLUSTER_PORTS="7311 7312 7313 7314"
@@ -151,7 +174,7 @@ ZREVRANGE|100|ZREVRANGE zKEYTAGset:__rand_int__ 0 9
 ZRANGEBYSCORE|100|ZRANGEBYSCORE zKEYTAGset:__rand_int__ 0 9
 ZREVRANGEBYSCORE|100|ZREVRANGEBYSCORE zKEYTAGset:__rand_int__ 9 0
 ZCOUNT|100|ZCOUNT zKEYTAGset:__rand_int__ 0 9
-PUBLISH|1000|PUBLISH KEYTAGchan:__rand_int__ hello
+PUBLISH|1000|PUBLISH KEYTAGchan:__rand_int__ hello|60000
 PING|1|PING
 DBSIZE|1|DBSIZE
 '
@@ -235,6 +258,34 @@ load_arm() {    # load_arm PORT FILE
     redis-cli -p "$1" --pipe < "$2" >/dev/null 2>&1
 }
 
+# The ratio of each pass, sorted, with its median and its two ends.  A cell
+# whose ends straddle the decision threshold has not measured anything, and
+# saying so is the point of carrying them.
+paired_ratio() {   # paired_ratio "s1 s2 .." "r1 r2 .." -> "median lo hi"
+    awk -v A="$1" -v B="$2" 'BEGIN{
+        na = split(A, a, " "); nb = split(B, b, " ")
+        n  = (na < nb ? na : nb); m = 0
+        for (i = 1; i <= n; i++) if (b[i] > 0) r[++m] = a[i] / b[i]
+        if (m == 0) { print "0 0 0"; exit }
+        for (i = 2; i <= m; i++) { v = r[i]; j = i - 1
+            while (j > 0 && r[j] > v) { r[j+1] = r[j]; j-- }
+            r[j+1] = v }
+        med = (m % 2) ? r[int(m/2)+1] : (r[m/2] + r[m/2+1]) / 2
+        printf "%.2f %.2f %.2f", med, r[1], r[m]
+    }'
+}
+
+# Every node of a topology still answering.  A dead one is not a slow cell, it
+# is a different cluster, and the difference is invisible in the numbers.
+topo_alive() {   # topo_alive "port:tag port:tag .."
+    local ent p
+    for ent in $1; do
+        p=${ent%%:*}
+        [ "$(timeout 3 redis-cli -p "$p" ping 2>/dev/null)" = "PONG" ] || return 1
+    done
+    return 0
+}
+
 # ─── One cell ───────────────────────────────────────────────────────────────
 #
 # Echoes: ops_per_sec client_cores
@@ -251,10 +302,32 @@ run_cell() {    # run_cell TOPO KEYSPACE COMMAND...
     # whose slot that node owns, so no request is ever redirected.
     local topo=$1 range=$2; shift 2
     local tmpl=("$@")
-    # A floor on the per-process count, because a short run reports the clock:
-    # 2000 operations came back as 1,999,999 requests per second, which is one
-    # tick of resolution wearing a rate's clothes.
-    local per=$(( OPS / PROCS )); [ "$per" -lt 50000 ] && per=50000
+    # A floor on the per-process count, because a short run reports the clock
+    # and then the connections: 2000 operations came back as 1,999,999 requests
+    # per second, and 50,000 made the whole cell 70 ms with fifty connections
+    # being opened inside it.  Measured on one command, four processes:
+    #
+    #     50,000 ops/proc   70 ms cell   3,419,054/s
+    #    200,000 ops/proc  320 ms cell   2,597,444/s
+    #    500,000 ops/proc  660 ms cell   3,085,234/s
+    #  1,500,000 ops/proc  1.91 s cell   3,151,676/s
+    #
+    # The rate does not settle until the cell is most of a second long, and at
+    # 50,000 it reads eleven per cent high.  Paired against Redis over five
+    # passes that showed up as 58 of 66 cells whose passes disagreed by more
+    # than a quarter -- two commands sharing one code path came out at 0.91x
+    # and 1.53x.
+    local per=$(( OPS / PROCS )); [ "$per" -lt 500000 ] && per=500000
+    # A command may ask for fewer, and one does.  PUBLISH on a Redis cluster is
+    # broadcast to every node over the cluster bus, the bus link has no
+    # client-output-buffer-limit, and at this pipeline depth the buffer grows
+    # until the kernel steps in: measured twice, one node at 5.77 GB and then
+    # 3.44 GB, both "Out of memory: Killed process (redis-server)".  The node
+    # dies, redis-benchmark spins on a refused connection, and every later cell
+    # measures a three-node cluster in state fail.  The command is kept -- it
+    # is a real difference between the two -- at a load both survive.
+    [ -n "${CELL_OPS:-}" ] && per=$(( CELL_OPS / PROCS ))
+    [ "$per" -lt 1000 ] && per=1000
     local pids=() outs=() i
     local t0 t1 cpu=0
     t0=$(date +%s%N)
@@ -276,7 +349,16 @@ run_cell() {    # run_cell TOPO KEYSPACE COMMAND...
         # client-bound check can never fire where it matters most.  Measured:
         # redis showed 0.2 cores and socketley 0 in the same table, which was
         # the instrument and not the client.
+        # Under `timeout`, because a cell must not be able to hang the table.
+        # Measured: PUBLISH against a four-master Redis Cluster wedged two of
+        # eight client processes at 100% CPU for ninety-three minutes on a cell
+        # that takes five seconds -- Redis broadcasts every publish over the
+        # cluster bus, and at eight clients x fifty connections x pipeline 16
+        # the node stops making progress rather than slowing down.  A killed
+        # process writes no rate, the cell reports what it has, and the run
+        # goes on; an unreadable row is a row, an unfinished table is nothing.
         /usr/bin/time -f '%U %S' -o "$TMPD/t$i" \
+            timeout -k 5 "$CELL_TIMEOUT" \
             redis-benchmark -h 127.0.0.1 -p "$p_i" -n "$per" -c "$CLIENTS" \
                 -P "$PIPE" -r "$range" -q "${args[@]}" > "$TMPD/c$i.out" 2>/dev/null &
         pids+=($!)
@@ -447,7 +529,8 @@ if [ "${S_N:-0}" != "${R_N:-1}" ]; then
     log_warn "the two arms hold different key counts — every read below compares a hit against a miss"
 fi
 
-printf '%s\n' "$CMDS" | grep -v '^\s*$' | while IFS='|' read -r name range tmpl; do
+printf '%s\n' "$CMDS" | grep -v '^\s*$' | while IFS='|' read -r name range tmpl cell_ops; do
+    export CELL_OPS="${cell_ops:-}"
     sv=""; rv=""; sc=""; rc=""
     for ((pass = 1; pass <= PASSES; pass++)); do
         if (( pass % 2 )); then
@@ -458,9 +541,31 @@ printf '%s\n' "$CMDS" | grep -v '^\s*$' | while IFS='|' read -r name range tmpl;
             read -r a b <<<"$(run_cell "$S_TOPO" "$range" $tmpl)"; sv="$sv $a"; sc="$sc $b"
         fi
     done
+    # Both arms still whole?  The startup check cannot see a node that dies
+    # halfway, and the run went on for another forty minutes against a
+    # three-node cluster in state fail before anybody looked.  Loud and at
+    # once, because a table built on that is worse than no table.
+    if ! topo_alive "$S_TOPO"; then
+        log_error "a socketley shard stopped answering during $name -- discarding the run"
+        exit 2
+    fi
+    if ! topo_alive "$R_TOPO"; then
+        log_error "a Redis node stopped answering during $name -- discarding the run"
+        log_error "check dmesg for the OOM killer: a cluster PUBLISH has no bus buffer limit"
+        exit 2
+    fi
+
     s=$(median_of "$sv"); r=$(median_of "$rv")
     scm=$(median_of "$sc"); rcm=$(median_of "$rc")
-    ratio=$(awk -v a="$s" -v b="$r" 'BEGIN{printf "%.2f", (b > 0 ? a / b : 0)}')
+    # The ratio PER PASS, then the median of those -- not the ratio of two
+    # medians.  The two arms of a pass ran seconds apart on the same box, so a
+    # pass that was disturbed moves both and cancels; the ratio of two medians
+    # does not cancel anything.  Measured: a cell whose two commands share one
+    # code path and benchmark identically when asked directly came out of this
+    # table at 0.91x against the other's 1.53x, three passes each.
+    read -r ratio rlo rhi <<<"$(paired_ratio "$sv" "$rv")"
+    spread=$(awk -v m="$ratio" -v lo="$rlo" -v hi="$rhi" \
+        'BEGIN{ printf "%.2f", (m > 0 ? (hi - lo) / m : 9) }')
     # The ceiling first, because a ratio taken at it is a statement about
     # redis-benchmark.  PROCS processes can hold PROCS cores between them.
     # The ceiling is decided per cell and carried, not judged here: PROCS
@@ -468,8 +573,8 @@ printf '%s\n' "$CMDS" | grep -v '^\s*$' | while IFS='|' read -r name range tmpl;
     # is a statement about redis-benchmark.
     capped=$(awk -v sc="$scm" -v rc="$rcm" -v p="$PROCS" \
         'BEGIN{ print (sc >= p * 0.95 || rc >= p * 0.95) ? "yes" : "no" }')
-    printf '%s|%.0f|%.0f|%s|%s|%s|%s\n' "$name" "$s" "$r" "$ratio" "$scm" "$rcm" "$capped" \
-        >> "$TMPD/rows.txt"
+    printf '%s|%.0f|%.0f|%s|%s|%s|%s|%s\n' "$name" "$s" "$r" "$ratio" "$scm" "$rcm" "$capped" \
+        "$spread" >> "$TMPD/rows.txt"
 done
 
 # ─── The band, and why it is relative ───────────────────────────────────────
@@ -479,22 +584,27 @@ done
 # one command is 1.1x, that command is carrying something the others are not --
 # and against 1.0 it reads as a pass.  So the band is drawn around our own
 # median ratio, and a cell that was client-bound is never given one at all.
-MED=$(awk -F'|' '$7 == "no" {print $4}' "$TMPD/rows.txt" | sort -g | \
+MED=$(awk -F'|' '$7 == "no" && $8 <= 0.25 {print $4}' "$TMPD/rows.txt" | sort -g | \
       awk '{v[n++]=$1} END{if(n) printf "%.3f", (n%2)?v[int(n/2)]:(v[n/2-1]+v[n/2])/2}')
 
-printf '\n  %-11s %14s %14s %8s %9s %9s  %s\n' \
-    command "$S_LABEL" "$R_LABEL" ratio skl_cli redis_cli verdict
-printf '  %s\n' "$(printf '%.0s─' {1..90})"
-sort -t'|' -k4 -g "$TMPD/rows.txt" | while IFS='|' read -r name s r ratio scm rcm capped; do
-    verdict=$(awk -v x="$ratio" -v m="$MED" -v c="$capped" \
-        'BEGIN{ if (c == "yes") { print "client-bound — not readable"; exit }
+printf '\n  %-11s %14s %14s %8s %7s %9s %9s  %s\n' \
+    command "$S_LABEL" "$R_LABEL" ratio spread skl_cli redis_cli verdict
+printf '  %s\n' "$(printf '%.0s─' {1..100})"
+sort -t'|' -k4 -g "$TMPD/rows.txt" | while IFS='|' read -r name s r ratio scm rcm capped spread; do
+    # The spread is read before the level.  A cell whose passes disagree by
+    # more than a quarter of their own median has not measured this command,
+    # and a verdict drawn from it is a verdict about the box.
+    verdict=$(awk -v x="$ratio" -v m="$MED" -v c="$capped" -v sp="$spread" \
+        'BEGIN{ if (c == "yes")  { print "client-bound — not readable"; exit }
+                if (sp > 0.25)   { printf "spread %.0f%% — not readable", sp * 100; exit }
                 if (m <= 0)      { print "-"; exit }
                 rel = x / m
                 if      (rel < 0.55) printf "WELL BELOW our %.2fx norm — look here", m
                 else if (rel < 0.75) printf "below our %.2fx norm", m
                 else if (rel > 1.4)  print "above the norm"
                 else                 print "as usual" }')
-    printf '  %-11s %14s %14s %8s %9s %9s  %s\n' "$name" "$s" "$r" "${ratio}x" "$scm" "$rcm" "$verdict"
+    printf '  %-11s %14s %14s %8s %7s %9s %9s  %s\n' \
+        "$name" "$s" "$r" "${ratio}x" "$spread" "$scm" "$rcm" "$verdict"
 done
 
 echo
