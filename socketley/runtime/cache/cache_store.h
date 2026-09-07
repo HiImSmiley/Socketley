@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <chrono>
+#include "zskiplist.h"
 
 // Transparent hash for heterogeneous lookup (avoids string copies on find/erase)
 struct string_hash
@@ -45,13 +46,13 @@ using hash_inner = std::unordered_map<std::string, std::string, string_hash, str
 using hash_map = std::unordered_map<std::string, hash_inner, string_hash, string_equal>;
 
 // A sorted set is two views of one thing: scores by member, and members in
-// score order.  Redis uses a skiplist; a std::set of (score, member) gives the
-// same O(log n) insert and ordered walk, and the pair's second element is what
-// keeps two members with equal scores apart and ordered.
+// score order.  The ordered half is a skiplist carrying spans, because the
+// std::set it used to be had the right order and no way to ask WHERE a member
+// sits -- see zskiplist.h for the sweep that settled it.
 struct zset_inner
 {
     std::unordered_map<std::string, double, string_hash, string_equal> score;
-    std::set<std::pair<double, std::string>>                           order;
+    zskiplist                                                          order;
 
     size_t size() const { return score.size(); }
     bool   empty() const { return score.empty(); }

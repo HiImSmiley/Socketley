@@ -149,15 +149,12 @@ bool cache_store::zrank(std::string_view key, std::string_view member, size_t& o
     if (sit == it->second.score.end())
         return false;
 
-    // Walked rather than indexed, because std::set has no order statistic and
-    // a second structure to carry one would be a second thing to keep true.
-    size_t rank = 0;
-    for (const auto& e : it->second.order)
-    {
-        if (e.first == sit->second && e.second == sit->first)
-            break;
-        ++rank;
-    }
+    // The spans crossed on the way down are the rank, so this is O(log n) and
+    // not a walk.  It was a walk, and at fifty thousand members that was
+    // thirty-three times slower than Redis.
+    const size_t rank = it->second.order.rank(sit->second, sit->first);
+    if (rank == zskiplist::npos)
+        return false;
     out = reverse ? it->second.size() - 1 - rank : rank;
     return true;
 }
@@ -179,23 +176,25 @@ void cache_store::zrange(std::string_view key, int64_t start, int64_t stop,
         return;
 
     out.reserve(out.size() + static_cast<size_t>(stop - start + 1));
-    int64_t i = 0;
+    const auto& ord = it->second.order;
+    // Sought rather than counted to.  ZRANGE z 9000 9010 used to walk nine
+    // thousand nodes before emitting anything; at() lands on the first one.
     if (!reverse)
     {
-        for (const auto& e : it->second.order)
-        {
-            if (i > stop) break;
-            if (i >= start) out.emplace_back(std::string_view(e.second), e.first);
-            ++i;
-        }
+        auto e = ord.at(static_cast<size_t>(start));
+        for (int64_t i = start; i <= stop && e != ord.end(); ++i, ++e)
+            out.emplace_back(std::string_view(e->second), e->first);
     }
     else
     {
-        for (auto rit = it->second.order.rbegin(); rit != it->second.order.rend(); ++rit)
+        // Index i from the back is index n-1-i from the front.
+        auto e = ord.at(static_cast<size_t>(n - 1 - start));
+        for (int64_t i = start; i <= stop; ++i)
         {
-            if (i > stop) break;
-            if (i >= start) out.emplace_back(std::string_view(rit->second), rit->first);
-            ++i;
+            if (e == ord.end()) break;
+            out.emplace_back(std::string_view(e->second), e->first);
+            if (e == ord.begin()) { ++i; break; }
+            --e;
         }
     }
 }
@@ -1537,11 +1536,13 @@ int cache_store::hsetnx(std::string_view key, std::string_view field, std::strin
 // Where a score range starts in the ordered view: the pair's second element
 // orders equal scores, so an inclusive low end must sit before every member
 // holding it and an exclusive one after all of them.
-static std::set<std::pair<double, std::string>>::const_iterator
-score_lower(const std::set<std::pair<double, std::string>>& ord, double min, bool incl)
+static zskiplist::const_iterator
+score_lower(const zskiplist& ord, double min, bool incl)
 {
-    return incl ? ord.lower_bound({min, std::string{}})
-                : ord.upper_bound({min, std::string(1, '\xff')});
+    // The exclusive case used to be upper_bound({min, "\xff"}), which is only
+    // right while no member begins with that byte.  Asking the list to skip a
+    // SCORE cannot be fooled by a member's spelling.
+    return ord.lower_bound_score(min, incl);
 }
 
 void cache_store::zrangebyscore(std::string_view key, double min, double max,
