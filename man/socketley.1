@@ -1514,23 +1514,42 @@ with
 this), with
 .B \-\-tls
 (a unix socket is not on a network; the permissions on the node are what
-restrict it), with
-.B \-\-shards
-(see
+restrict it), and on a cache with
+.B \-\-cluster
+(cluster members advertise ports out of a formula, and RESP has no way to write
+a filesystem path as a node address). Each combination is refused at start with
+the reason in the daemon
+log, rather than one of the two winning quietly.
+.PP
+.B \-\-shards is no longer among them.
+A sharded runtime binds one node per shard,
+.IR name #i.sock,
+which is the rule the daemon's companion nodes already followed. The pair was
+refused for years on a reason that was true of the design nobody proposed: N
+processes binding
+.I one
+path unlink each other's node, and only the last to bind stays reachable. N
+paths are N listeners. See
 .B Sharding
 under
-.BR "SERVER FLAGS" ),
-and on a cache with
-.B \-\-cluster
-(cluster members advertise ports out of a formula, and a path has no
-successor). Each combination is refused at start with the reason in the daemon
-log, rather than one of the two winning quietly.
+.B SERVER FLAGS
+for which node a caller should pick, which is a real question on a cache and
+not one on a server.
 .PP
 The path must be absolute and shorter than 108 bytes, which is what the kernel's
 .I sun_path
 holds. Both are refused when the flag is read \(em the kernel truncates a long
 path silently, and a trimmed path names a different socket, very possibly a real
 one belonging to something else.
+.PP
+.B Under \-\-shards the rule is applied to the longest node, not to the path as typed.
+.RI name #15.sock
+is three bytes longer than
+.IR name .sock,
+so a path that fits can still be a set that does not \(em and the shard that
+did not fit would fail at its bind with the earlier shards already serving. It
+is refused at configuration instead, naming the longest node rather than the
+one that was typed.
 .PP
 .B The socket node is created 0600.
 Connecting to a unix socket needs write permission on the node, so leaving that
@@ -3022,10 +3041,66 @@ port. The full treatment is
 under
 .BR "COMMON FLAGS" ;
 refused with
+.BR \-\-cluster ,
+because members advertise ports out of a formula and RESP has no way to write a
+filesystem path as a node address.
+.IP
+.B It is worth measuring before it is worth arguing about.
+On this box, one cache and one redis\-server both loaded with the same keys,
+eight client processes, GET:
+.IP
+.nf
+socketley over TCP      2,969,848/s        redis over TCP    1,411,960/s
+socketley over AF_UNIX  4,517,387/s        redis over AF_UNIX 2,319,573/s
+.fi
+.IP
+Both sides gain about half again, which is the TCP and netfilter path coming
+out of the measurement rather than anything either program does differently.
+On a box with conntrack loaded and nftables rules on the OUTPUT hook \(em any
+box running Docker \(em that path is not free, and a peer on the same machine
+does not need it.
+.TP
+.B \-\-listen with \-\-shards binds one node per shard.
+Shard
+.I i
+gets
+.IR name #i.sock ,
+inserted before the suffix, by the rule the daemon's own companion nodes
+already follow. The pair used to be refused, and the refusal's reason was
+sound for a design nobody was proposing: N processes binding
+.I one
+path unlink each other's node and only the last stays reachable. N paths are N
+listeners.
+.IP
+.B The formula is the interface.
+On a server every shard answers every request, so a caller takes any node. On a
+.I cache
+they are not interchangeable, and that is where choosing pays: a caller that
+hashes the key the way
+.B CLUSTER KEYSLOT
+does and connects to that shard's node crosses nothing, which is the same
+saving
 .B \-\-cluster
-(members advertise ports out of a formula, and a path has no successor) and
-with
-.BR \-\-shards .
+buys between ports. A caller that picks a node at random still gets correct
+answers \(em the shard crosses to the owner \(em at the crossing's cost.
+.IP
+Measured against the same cache on TCP with
+.BR \-\-cluster ,
+both clients routing by key, four shards: at least
+.B 1.22x
+in AF_UNIX's favour. Two later passes read higher and are not quoted, because
+the TCP arm fell across them for a reason that was not the port pool
+(TIME\-WAIT peaked at 1,235 of 28,231) and is not understood.
+.IP
+.B A remote client gets none of this.
+AF_UNIX is local, so the benefit lands on hops between processes on one
+machine. The hop that cannot take it today is a proxy in front of a
+.I sharded
+cache: a proxy does not read keys, so it would land on the wrong shard
+.RI ( N \-1)/ N
+of the time. Teaching it
+.B cache_shard_of
+would close that, and is not done.
 .TP
 .BI "\-\-persistent " "file"
 Persistent storage file. Cache is saved on stop and loaded on start.

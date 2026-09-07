@@ -510,6 +510,15 @@ bool cache_instance::setup(event_loop& loop)
             LOG_ERROR(("cache: " + msg).c_str());
             return false;
         }
+        // The set is judged by its longest member, because a shard whose node
+        // does not fit is a shard nothing can reach -- and it would fail at
+        // the bind, one shard in, with the others already serving.
+        if (const std::string msg = socketley::unix_sock::shard_listen_path_refusal(
+                listen_path, m_shard_n); !msg.empty())
+        {
+            LOG_ERROR(("cache: " + msg).c_str());
+            return false;
+        }
         // And the member only this runtime carries, because --cluster
         // advertises a port formula and a path has no successor to compute.
         if (m_cluster_forced)
@@ -560,7 +569,12 @@ bool cache_instance::setup(event_loop& loop)
         // The mechanism is shared/unix_listener.h's, one implementation for
         // every runtime that listens, with everything below the branch the
         // same for both families.
-        auto r = socketley::unix_sock::bind_listener(listen_path);
+        // One node per shard, because a path is one listener: the second
+        // process to bind the same one unlinks the first and only it stays
+        // reachable.  At a single shard this is the path as typed.
+        const std::string mine = socketley::unix_sock::shard_listen_path(
+            listen_path, m_shard_i, m_shard_n);
+        auto r = socketley::unix_sock::bind_listener(mine);
         if (r.fd < 0)
         {
             LOG_ERROR(("cache: " + r.error).c_str());
@@ -569,7 +583,7 @@ bool cache_instance::setup(event_loop& loop)
         m_listen_fd = r.fd;
         // Remembered so teardown() removes exactly the node this bind
         // created, and not whatever the configuration says by then.
-        m_bound_listen_path = listen_path;
+        m_bound_listen_path = mine;
     }
     else if (!open_listener(port, /*reuseport=*/true, m_listen_fd))
         return false;
@@ -2256,6 +2270,13 @@ static void append_score_bare(std::string& rb, double sc)
     if (n > 0)
         rb.append(buf, static_cast<size_t>(n));
 }
+
+// Redis's own wording, because a client matches the first word of an error
+// reply: through encode_error_into this went out as "-ERR WRONGTYPE ...", so a
+// library switching on the code saw ERR and a type conflict was indistinguish-
+// able from a syntax error.  The same reason emit_moved has its own encoder.
+static constexpr std::string_view wrongtype_msg =
+    "WRONGTYPE Operation against a key holding the wrong kind of value";
 
 // A score bound as ZRANGEBYSCORE spells it: a bare number is inclusive, a
 // leading "(" makes it exclusive, and -inf/+inf are the open ends.
@@ -5197,9 +5218,11 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             double score = 0.0;
             if (!parse_double_sv(score_str, score))
             { rb.append("error: invalid score\n", 21); return; }
-            m_store.check_expiry(key);
-            const bool added = m_store.zadd(key, score, member);
-            if (!added && m_store.type(key) != "zset")
+            // zadd checks expiry itself, and its answer distinguishes the two
+            // meanings a bare false used to carry -- so neither the second
+            // probe nor type()'s five are owed here.
+            const int added = m_store.zadd(key, score, member);
+            if (added < 0)
             { rb.append("error: type conflict\n", 21); return; }
             rb.append(added ? "1\n" : "0\n", 2);
             replicate_command(line);
@@ -7175,7 +7198,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                             resp::encode_error_into(rb,
                                 "OOM command not allowed when used memory > 'maxmemory'");
                         else
-                            resp::encode_error_into(rb, "type conflict");
+                            resp::encode_error_code_into(rb, wrongtype_msg);
                         break;
                     }
                 }
@@ -7234,7 +7257,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (xx && !key_exists) { resp::encode_null_into(rb); break; }
             if (!m_store.set(args[1], args[2]))
             {
-                resp::encode_error_into(rb, "type conflict");
+                resp::encode_error_code_into(rb, wrongtype_msg);
                 break;
             }
             if (ex_sec > 0) { m_store.set_expiry(args[1], ex_sec); mark_ttl_keys(); }
@@ -7372,7 +7395,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], 1, result))
-                resp::encode_error_into(rb, "ERR value is not an integer or out of range");
+                resp::encode_error_into(rb, "value is not an integer or out of range");
             else
             { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
@@ -7383,7 +7406,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], -1, result))
-                resp::encode_error_into(rb, "ERR value is not an integer or out of range");
+                resp::encode_error_into(rb, "value is not an integer or out of range");
             else
             { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
@@ -7393,10 +7416,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t delta = 0;
-            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], delta, result))
-                resp::encode_error_into(rb, "ERR value is not an integer or out of range");
+                resp::encode_error_into(rb, "value is not an integer or out of range");
             else
             { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
@@ -7406,10 +7429,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t delta = 0;
-            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             int64_t result = 0;
             if (!m_store.incr(args[1], -delta, result))
-                resp::encode_error_into(rb, "ERR value is not an integer or out of range");
+                resp::encode_error_into(rb, "value is not an integer or out of range");
             else
             { resp::encode_integer_into(rb, result); repl(args, argc); }
             break;
@@ -7420,7 +7443,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             size_t newlen = m_store.append(args[1], args[2]);
             if (newlen == cache_store::append_wrong_type)
-                resp::encode_error_into(rb, "WRONGTYPE");
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else if (newlen == cache_store::append_denied)
                 resp::encode_error_into(rb, "OOM command not allowed when used memory > 'maxmemory'");
             else
@@ -7443,7 +7466,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             bool had_key = m_store.exists(args[1]);
             std::string oldval;
             if (!m_store.getset(args[1], args[2], oldval))
-                resp::encode_error_into(rb, "WRONGTYPE");
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else
             {
                 if (!had_key) resp::encode_null_into(rb);
@@ -7545,7 +7568,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     m_store.check_expiry(args[1]);
                     if (!m_store.lpush(args[1], args[i]))
                     {
-                        resp::encode_error_into(rb, "type conflict");
+                        resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
@@ -7565,7 +7588,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     m_store.check_expiry(args[1]);
                     if (!m_store.rpush(args[1], args[i]))
                     {
-                        resp::encode_error_into(rb, "type conflict");
+                        resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
@@ -7606,7 +7629,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int start = 0, stop = 0;
-            if (!parse_int_sv(args[2], start) || !parse_int_sv(args[3], stop)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], start) || !parse_int_sv(args[3], stop)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             const auto* deq = m_store.list_ptr(args[1]);
             if (!deq || deq->empty()) { resp::encode_array_header_into(rb, 0); break; }
             int len = static_cast<int>(deq->size());
@@ -7625,7 +7648,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int idx = 0;
-            if (!parse_int_sv(args[2], idx)) { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            if (!parse_int_sv(args[2], idx)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             const std::string* val = m_store.lindex(args[1], idx);
             if (val) resp::encode_bulk_into(rb, *val);
             else resp::encode_null_into(rb);
@@ -7640,17 +7663,16 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly)
             { resp::encode_error_into(rb, "readonly mode"); return; }
-            m_store.check_expiry(args[1]);
             int zadded = 0;
             for (int i = 2; i + 1 < argc; i += 2)
             {
                 double zsc = 0.0;
                 if (!parse_double_sv(args[i], zsc))
-                { resp::encode_error_into(rb, "ERR value is not a valid float"); return; }
-                const bool zn = m_store.zadd(args[1], zsc, args[i + 1]);
-                if (!zn && m_store.type(args[1]) != "zset")
-                { resp::encode_error_into(rb, "WRONGTYPE"); return; }
-                zadded += zn ? 1 : 0;
+                { resp::encode_error_into(rb, "value is not a valid float"); return; }
+                const int zn = m_store.zadd(args[1], zsc, args[i + 1]);
+                if (zn < 0)
+                { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+                zadded += zn;
             }
             repl(args, argc);
             resp::encode_integer_into(rb, zadded);
@@ -7704,7 +7726,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             int64_t zstart = 0, zstop = 0;
             if (!parse_int_sv(args[2], zstart) || !parse_int_sv(args[3], zstop))
-            { resp::encode_error_into(rb, "ERR value is not an integer or out of range"); return; }
+            { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             const bool zwith = argc > 4 && fnv1a_lower(args[4]) == fnv1a("withscores");
             m_store.check_expiry(args[1]);
             std::vector<std::pair<std::string_view, double>> zitems;
@@ -7730,11 +7752,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_into(rb, "readonly mode"); return; }
             double zd = 0.0;
             if (!parse_double_sv(args[2], zd))
-            { resp::encode_error_into(rb, "ERR value is not a valid float"); return; }
+            { resp::encode_error_into(rb, "value is not a valid float"); return; }
             m_store.check_expiry(args[1]);
             double zout = 0.0;
             if (!m_store.zincrby(args[1], zd, args[3], zout))
-            { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+            { resp::encode_error_code_into(rb, wrongtype_msg); return; }
             repl(args, argc);
             std::string zs;
             append_score_bare(zs, zout);
@@ -7753,7 +7775,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 {
                     m_store.check_expiry(args[1]);
                     r = m_store.sadd(args[1], args[i]);
-                    if (r < 0) { resp::encode_error_into(rb, "type conflict"); return; }
+                    if (r < 0) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
                 }
                 added += r;
             }
@@ -7821,7 +7843,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                             resp::encode_error_into(rb,
                                 "OOM command not allowed when used memory > 'maxmemory'");
                         else
-                            resp::encode_error_into(rb, "type conflict");
+                            resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
@@ -7933,11 +7955,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int sec = 0;
-            if (!parse_int_sv(args[2], sec) || sec <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in SETEX"); return; }
+            if (!parse_int_sv(args[2], sec) || sec <= 0) { resp::encode_error_into(rb, "invalid expire time in SETEX"); return; }
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
-                if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+                if (!m_store.set(args[1], args[3])) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
             }
             m_store.set_expiry(args[1], sec);
             mark_ttl_keys();
@@ -7963,11 +7985,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
-            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time in PSETEX"); return; }
+            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "invalid expire time in PSETEX"); return; }
             if (!m_store.set(args[1], args[3]))
             {
                 m_store.check_expiry(args[1]);
-                if (!m_store.set(args[1], args[3])) { resp::encode_error_into(rb, "WRONGTYPE"); return; }
+                if (!m_store.set(args[1], args[3])) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
             }
             m_store.set_expiry_ms(args[1], ms);
             mark_ttl_keys();
@@ -7993,7 +8015,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
-            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "ERR invalid expire time"); return; }
+            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "invalid expire time"); return; }
             if (m_store.set_expiry_ms(args[1], ms))
             {
                 mark_ttl_keys();
@@ -8016,7 +8038,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t unix_s = 0;
-            if (!parse_int_sv(args[2], unix_s)) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
+            if (!parse_int_sv(args[2], unix_s)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
                 int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -8033,7 +8055,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t unix_ms = 0;
-            if (!parse_int_sv(args[2], unix_ms)) { resp::encode_error_into(rb, "ERR invalid timestamp"); return; }
+            if (!parse_int_sv(args[2], unix_ms)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
                 int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -8050,7 +8072,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             uint64_t scan_cursor = 0;
             {
-                if (!parse_int_sv(args[1], scan_cursor)) { resp::encode_error_into(rb, "ERR invalid cursor"); return; }
+                if (!parse_int_sv(args[1], scan_cursor)) { resp::encode_error_into(rb, "invalid cursor"); return; }
             }
             std::string_view scan_pattern = "*";
             size_t scan_count = 10;
@@ -8070,7 +8092,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
                             conn->cluster_port))
             {
-                resp::encode_error_into(rb, "ERR invalid cursor");
+                resp::encode_error_into(rb, "invalid cursor");
                 return;
             }
             // RESP: *2\r\n + bulk(next_cursor_str) + array(keys)

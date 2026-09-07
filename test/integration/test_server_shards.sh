@@ -141,23 +141,41 @@ n=$("$BIN" show ss_lua 2>/dev/null | grep -c '"shards": 4')
 check "and the import applied the count" "$n" "1"
 "$BIN" remove ss_lua >/dev/null 2>&1
 
-echo "== --shards and --listen unix: are two different listeners =="
-out=$("$BIN" create server ss_unix --shards 4 --listen "unix:$SOCKNODE" 2>&1); rc=$?
-check "--shards before --listen refused" "$rc" "1"
-[[ "$out" == *"--listen"* ]] && ok "and names --listen" || bad "reason: $out"
-out=$("$BIN" create server ss_unix --listen "unix:$SOCKNODE" --shards 4 2>&1); rc=$?
-check "--listen before --shards refused" "$rc" "1"
-n=$("$BIN" ls 2>/dev/null | grep -c ' ss_unix ')
-check "neither order left a runtime behind" "$n" "0"
+echo "== --shards and --listen unix: are N listeners, not a contradiction =="
+# The pair was refused for years because N processes binding ONE path unlink
+# each other's node.  Each shard now binds its own, name#i.sock, so both flag
+# orders are accepted and the check is that the nodes are really there -- the
+# old failure mode was one listener behind several paths, which a create's exit
+# code cannot see.
+out=$("$BIN" create server ss_unix --shards 4 --listen "unix:$SOCKNODE" -s 2>&1); rc=$?
+check "--shards before --listen accepted" "$rc" "0"
+for _ in $(seq 1 60); do
+    [ "$(ls "${SOCKNODE%.sock}"#*.sock 2>/dev/null | wc -l)" -ge 4 ] && break
+    sleep 0.2
+done
+n=$(ls "${SOCKNODE%.sock}"#*.sock 2>/dev/null | wc -l)
+check "four nodes bound, one per shard" "$n" "4"
+[ ! -e "$SOCKNODE" ] && ok "and the path as typed is not bound" \
+                     || bad "the bare path was bound as well as the four nodes"
+"$BIN" remove ss_unix >/dev/null 2>&1
+rm -f "${SOCKNODE%.sock}"#*.sock
 
-# ...and the other direction, which no case label can catch on its own: the
-# runtime already shards and --listen is the flag that completes the pair.
-out=$("$BIN" edit ss_ok --listen "unix:$SOCKNODE" 2>&1); rc=$?
-check "edit --listen onto a sharded server refused" "$rc" "1"
-n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"listen"')
-check "the refused edit rolled the listen path back" "$n" "0"
+out=$("$BIN" create server ss_unix2 --listen "unix:$SOCKNODE" --shards 4 2>&1); rc=$?
+check "--listen before --shards accepted too" "$rc" "0"
+"$BIN" remove ss_unix2 >/dev/null 2>&1
+
+# ...and the other direction: the runtime already shards and --listen is the
+# flag that completes the pair.  On a runtime of its own, because an edit that
+# now SUCCEEDS would otherwise leave ss_ok listening on a path and every
+# assertion below it is about ss_ok on a port.
+"$BIN" create server ss_edl -p $P_H --shards 4 >/dev/null 2>&1
+out=$("$BIN" edit ss_edl --listen "unix:$SOCKNODE" 2>&1); rc=$?
+check "edit --listen onto a sharded server accepted" "$rc" "0"
+n=$("$BIN" show ss_edl 2>/dev/null | grep -c '"listen"')
+check "and the edit stored the path" "$n" "1"
+"$BIN" remove ss_edl >/dev/null 2>&1
 n=$("$BIN" show ss_ok 2>/dev/null | grep -c '"shards": 4')
-check "and left the shard count alone" "$n" "1"
+check "ss_ok was left alone" "$n" "1"
 
 # Five assertions about `--shards N --daemon-process` are gone with that flag,
 # because a contradiction between two flags cannot be tested when one does not

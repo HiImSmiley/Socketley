@@ -110,7 +110,7 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             // the command line, because a --listen path may be typed after
             // this flag and the whole question is asked again in cmd_create.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n, {}); !msg.empty())
+                    instance->get_type(), n); !msg.empty())
             {
                 std::cout << msg;
                 return 1;
@@ -1026,7 +1026,7 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             // --listen can be typed further along this same command line, so
             // this asks only the half of the question whose inputs are final.
             if (const std::string msg = shards_config_refusal(
-                    instance->get_type(), n, {}); !msg.empty())
+                    instance->get_type(), n); !msg.empty())
             {
                 std::cout << msg;
                 return 1;

@@ -206,12 +206,26 @@ setup_refusal() {   # setup_refusal <label> <needle> <create-args...>
     else fail "$label" "exit $rc; the log said: ${after:0:200}"; fi
 }
 
-# A sharded proxy on a unix path would have N workers unlink each other's node,
-# so a build that let the pair through would serve on whichever shard bound
-# last.
-refuse_cli "a sharded proxy is refused a unix listener" \
-    "--shards and --listen are not compatible" \
-    proxy ur_shpx --shards 2 --listen "unix:$D/shpx.sock" --backend "127.0.0.1:9"
+# A sharded runtime on a unix path used to be refused, on the grounds that N
+# workers would unlink each other's node and only the last to bind would be
+# reachable.  That is true of ONE path.  Each shard now binds its own,
+# name#i.sock, so the thing to check is the refusal's own scenario not coming
+# true anyway: both nodes present, and both of them actually served rather than
+# one listener behind two paths.
+"$BIN" create proxy ur_shpx --shards 2 --listen "unix:$D/shpx.sock" \
+    --backend "127.0.0.1:9" -s >/dev/null 2>&1
+for _ in $(seq 1 60); do
+    [ "$(ls "$D"/shpx#*.sock 2>/dev/null | wc -l)" -ge 2 ] && break
+    sleep 0.2
+done
+if [ "$(ls "$D"/shpx#*.sock 2>/dev/null | wc -l)" -eq 2 ]; then pass
+else fail "a sharded proxy binds one node per shard" \
+          "found: $(ls "$D"/shpx* 2>/dev/null | tr '\n' ' ')"; fi
+
+# And the path as typed is NOT bound, or a caller would reach a node nothing
+# listens on.
+if [ ! -e "$D/shpx.sock" ]; then pass
+else fail "the bare path is not bound under --shards" "$D/shpx.sock exists"; fi
 
 # A client listens on nothing, so the flag is refused with a pointer to the
 # side it does have.

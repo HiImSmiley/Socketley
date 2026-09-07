@@ -90,6 +90,55 @@ inline std::string companion_path(std::string_view daemon_socket,
     return path_refusal(p).empty() ? p : std::string{};
 }
 
+// A sharded listener's path for shard `i`, by the same rule companion_path
+// uses for its own nodes: the shard number goes before the .sock suffix, or on
+// the end when there is none.  N processes cannot share one path -- the second
+// bind unlinks the first -- but N paths are N listeners, and which one a client
+// picks is the same choice --cluster gives it between ports.
+//
+// The formula is the interface: a client that hashes a key the way
+// CLUSTER KEYSLOT does and connects to that shard's node skips the crossing,
+// exactly as a cluster client skips it by choosing the port.  CLUSTER SLOTS
+// cannot say this, because RESP has no way to write a filesystem path as a
+// node address -- so the rule is documented rather than advertised.
+inline std::string shard_listen_path(std::string_view base, uint32_t shard,
+                                     uint32_t shards)
+{
+    if (shards <= 1)
+        return std::string(base);
+
+    const std::string_view suffix = ".sock";
+    std::string p;
+    if (base.size() > suffix.size() && base.substr(base.size() - suffix.size()) == suffix)
+    {
+        p.assign(base.substr(0, base.size() - suffix.size()));
+        p += '#';
+        p += std::to_string(shard);
+        p += suffix;
+    }
+    else
+    {
+        p.assign(base);
+        p += '#';
+        p += std::to_string(shard);
+    }
+    return p;
+}
+
+// The longest of them, which is the one a length rule has to be asked about:
+// a set whose last node does not fit is a cache with a shard nothing can
+// reach, and the refusal belongs at configuration rather than at the bind.
+inline std::string shard_listen_path_refusal(std::string_view base, uint32_t shards)
+{
+    if (base.empty() || shards <= 1)
+        return {};
+    const std::string longest = shard_listen_path(base, shards - 1, shards);
+    if (std::string why = path_refusal(longest); !why.empty())
+        return "--listen with --shards binds one node per shard, and \""
+               + longest + "\" is the longest of them: " + why;
+    return {};
+}
+
 // Every node of one runtime, one per shard and all or none: a set missing its
 // longest path would have a proxy spread over N-1 shards with nothing to say
 // the last one is only on the port.

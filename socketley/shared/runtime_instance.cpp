@@ -132,7 +132,7 @@ bool runtime_instance::start(event_loop& loop)
     // because the daemon forks this many children and a state file carrying
     // `"shards": 4` on a cache passes no parser on the restore path.
     if (const std::string msg = shards_config_refusal(
-            get_type(), m_shards, get_listen_path());
+            get_type(), m_shards);
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());

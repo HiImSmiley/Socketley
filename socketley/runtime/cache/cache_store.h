@@ -146,9 +146,13 @@ public:
     bool getset(std::string_view key, std::string_view newval, std::string& oldval);
 
     // --- Sorted sets ---
-    // zadd answers whether the member was new, which is what the protocols
-    // count; a score that changes is an update and not an addition.
-    bool   zadd(std::string_view key, double score, std::string_view member);
+    // 1 added, 0 already there, -1 type conflict -- sadd's answers, and for
+    // sadd's reason: a bare false meant either "already there" or "not a
+    // sorted set", and every caller had to ask type() to tell them apart.
+    // type() walks all five containers, so the ambiguity cost five hash
+    // lookups on every update, which is the whole of what ZADD does when a
+    // member's score has not moved.
+    int    zadd(std::string_view key, double score, std::string_view member);
     bool   zrem(std::string_view key, std::string_view member);
     bool   zscore(std::string_view key, std::string_view member, double& out) const;
     size_t zcard(std::string_view key) const;

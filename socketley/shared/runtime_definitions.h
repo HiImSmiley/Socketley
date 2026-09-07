@@ -32,8 +32,7 @@ inline bool in_worker_process()         { return g_worker_process; }
 // The whole --shards rule; every route asks, because a command line is not the
 // only way a shard count arrives.
 inline std::string shards_config_refusal(runtime_type type,
-                                         uint32_t    shards,
-                                         std::string_view listen_path)
+                                         uint32_t    shards)
 {
     // The unsharded case, which every runtime that never typed the flag is, so
     // nothing below may fire for it.
@@ -49,11 +48,22 @@ inline std::string shards_config_refusal(runtime_type type,
                "connections to the peer -- a different feature wearing this "
                "flag's name\n";
 
-    if (!listen_path.empty())
-        return "--shards and --listen are not compatible: shards share a port "
-               "through SO_REUSEPORT, and a unix socket is a path -- N "
-               "processes would unlink each other's node and only the last to "
-               "bind would be reachable.  Use -p for a sharded listener\n";
+    // --listen used to be refused here, on the grounds that N processes
+    // binding one path unlink each other's node.  That is true of one path and
+    // not of N: each shard binds its own, name#0.sock .. name#N-1.sock, the
+    // same rule companion_path already uses.  Over AF_UNIX the transport is
+    // worth at least 1.22x of TCP on a four-shard cache here.
+    //
+    // Every listening type, and the reason is the same for all three read the
+    // right way round.  On a server and a proxy the nodes are INTERCHANGEABLE
+    // -- every shard answers every request -- so a caller takes any one and
+    // there is nothing to get wrong.  On a cache they are not, and that is
+    // exactly where choosing pays: a caller that hashes the key the way
+    // CLUSTER KEYSLOT does and picks that shard's node crosses nothing.  Both
+    // are reasons to allow it, not to refuse it.
+    //
+    // A client is already refused above, and for a different reason: it has no
+    // listening socket at all.
 
     return {};
 }

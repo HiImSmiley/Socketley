@@ -1331,6 +1331,15 @@ bool proxy_instance::setup(event_loop& loop)
         LOG_ERROR(("proxy: " + msg).c_str());
         return false;
     }
+    // The set is judged by its longest member: a shard whose node does not fit
+    // in the kernel's 108 bytes is a shard nothing can reach, and it would
+    // fail at the bind with the earlier shards already serving.
+    if (const std::string msg = socketley::unix_sock::shard_listen_path_refusal(
+            listen_path, get_shards()); !msg.empty())
+    {
+        LOG_ERROR(("proxy: " + msg).c_str());
+        return false;
+    }
 
     // ── TLS ─────────────────────────────────────────────────────────────────
     // Certificates are read here at setup because that is blocking file I/O
@@ -1426,7 +1435,13 @@ bool proxy_instance::setup(event_loop& loop)
         // The mechanism is shared/unix_listener.h's, one implementation for
         // every runtime that listens, with everything below the branch the
         // same for both families.
-        auto r = socketley::unix_sock::bind_listener(listen_path);
+        // One node per shard, by the rule shared/unix_listener.h owns: a path
+        // is one listener, and the second process to bind it unlinks the
+        // first.  Every shard of a proxy answers every request, so which node
+        // a caller takes does not matter here.
+        const std::string mine = socketley::unix_sock::shard_listen_path(
+            listen_path, get_shard_index(), get_shards());
+        auto r = socketley::unix_sock::bind_listener(mine);
         if (r.fd < 0)
         {
             LOG_ERROR(("proxy: " + r.error).c_str());
@@ -1435,7 +1450,7 @@ bool proxy_instance::setup(event_loop& loop)
         m_listen_fd = r.fd;
         // Remembered so teardown() removes exactly the node this bind created,
         // and not whatever the configuration says by then.
-        m_bound_listen_path = listen_path;
+        m_bound_listen_path = mine;
     }
     else
     {

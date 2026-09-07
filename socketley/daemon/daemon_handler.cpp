@@ -152,8 +152,7 @@ static std::string instance_shards_refusal(const runtime_instance* inst)
         return {};
 
     return shards_config_refusal(inst->get_type(),
-                                 inst->get_shards(),
-                                 inst->get_listen_path());
+                                 inst->get_shards());
 }
 
 // Why a cache's persistence pair cannot be honoured, judged as a set because
@@ -3251,8 +3250,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     const std::string eff_listen = merged("listen", cfg.listen_path,
                                           std::string(instance->get_listen_path()));
 
-    if (const std::string msg = shards_config_refusal(type, eff_shards,
-                                                      eff_listen);
+    if (const std::string msg = shards_config_refusal(type, eff_shards);
         !msg.empty())
     {
         conn->write_buf = msg;

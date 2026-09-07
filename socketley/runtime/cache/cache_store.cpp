@@ -48,12 +48,13 @@ size_t cache_store::entry_cost(const std::string& key, const zset_inner& members
     return bytes;
 }
 
-bool cache_store::zadd(std::string_view key, double score, std::string_view member)
+int cache_store::zadd(std::string_view key, double score, std::string_view member)
 {
     check_expiry(key);
-    if (has_type_conflict_for_zset(key))
-        return false;
 
+    // A key found here is a sorted set, so the four cross-map probes are owed
+    // only when it is not -- the shortcut lpush, rpush, sadd and hset already
+    // take, and the one this function was the last to be without.
     auto it = m_zsets.find(key);
     if (it != m_zsets.end())
     {
@@ -70,13 +71,16 @@ bool cache_store::zadd(std::string_view key, double score, std::string_view memb
                 sit->second = score;
             }
             touch_lru(key);
-            return false;
+            return 0;
         }
     }
 
+    if (it == m_zsets.end() && has_type_conflict_for_zset(key))
+        return -1;
+
     if (!check_memory(2 * stored_string(member.size()) + new_key_cost(key.size())
                       + zset_member_overhead, key))
-        return false;
+        return -1;
 
     if (it == m_zsets.end())
         it = m_zsets.emplace(std::string(key), zset_inner{}).first;
@@ -87,7 +91,7 @@ bool cache_store::zadd(std::string_view key, double score, std::string_view memb
     ++m_zset_members;
     track_add(entry_cost(it->first, it->second) - before);
     touch_lru(key);
-    return true;
+    return 1;
 }
 
 bool cache_store::zrem(std::string_view key, std::string_view member)

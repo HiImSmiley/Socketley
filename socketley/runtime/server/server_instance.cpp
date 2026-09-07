@@ -1508,7 +1508,14 @@ bool server_instance::setup_tcp_listener(uint16_t port)
 // bound.
 bool server_instance::setup_unix_listener(const std::string& path)
 {
-    auto r = socketley::unix_sock::bind_listener(path);
+    // One node per shard, for the reason the cache gives: a path is one
+    // listener, and the second process to bind it unlinks the first.  Every
+    // shard of a server answers every request, so which node a caller picks
+    // does not matter here -- it matters on the cache, and the rule is the
+    // same so the two cannot drift.
+    const std::string mine = socketley::unix_sock::shard_listen_path(
+        path, get_shard_index(), get_shards());
+    auto r = socketley::unix_sock::bind_listener(mine);
     if (r.fd < 0)
     {
         LOG_ERROR(("server: " + r.error).c_str());
@@ -1519,7 +1526,7 @@ bool server_instance::setup_unix_listener(const std::string& path)
     // Remembered so teardown() removes exactly the node this bind created,
     // because a runtime edited between start and stop would unlink a path it
     // never bound.
-    m_bound_listen_path = path;
+    m_bound_listen_path = mine;
     return true;
 }
 
@@ -1607,6 +1614,15 @@ bool server_instance::setup(event_loop& loop)
         // re-checked because the flag parser is not on the restore path.
         if (const std::string msg = socketley::unix_sock::listen_config_refusal(
                 listen_path, get_port(), get_tls()); !msg.empty())
+        {
+            LOG_ERROR(("server: " + msg).c_str());
+            return false;
+        }
+        // The set is judged by its longest member: a shard whose node does not
+        // fit in the kernel's 108 bytes is a shard nothing can reach, and it
+        // would fail at the bind with the earlier shards already serving.
+        if (const std::string msg = socketley::unix_sock::shard_listen_path_refusal(
+                listen_path, get_shards()); !msg.empty())
         {
             LOG_ERROR(("server: " + msg).c_str());
             return false;
