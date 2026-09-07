@@ -3793,6 +3793,107 @@ gives above.
 Remove a range by position or by score and return how many went. Emptying the
 set removes the key.
 .PP
+.B Scripting:
+.PP
+Lua, over RESP, with the script coming from the client.
+.TP
+.BI "eval " "script numkeys key... arg..."
+.TQ
+.BI "evalsha " "sha1 numkeys key... arg..."
+Run
+.IR script ,
+with the declared keys in
+.B KEYS
+and the rest in
+.BR ARGV ,
+both 1-based.
+.B redis.call
+runs a command and raises what it answers if that is an error;
+.B redis.pcall
+hands the error back as a table with
+.BR err .
+.BR redis.status_reply ", " redis.error_reply " and " redis.sha1hex
+are there;
+.B redis.log
+is accepted and writes nothing.
+.IP
+The return value is converted as Redis converts it: a number becomes an
+integer truncated towards zero, a string a bulk, a table an array
+.I up to its first hole
+\(em Lua's own rule for where an array ends \(em
+.B false
+a nil and
+.B true
+the integer 1. A table carrying
+.B err
+or
+.B ok
+is an error or a status rather than a list.
+.IP
+.B The interpreter is not the one \-\-lua uses, and that is the point.
+.B COMMON FLAGS
+says of that one that it is not a sandbox: it has
+.BR io ", " os ", " package
+and the whole of
+.B base
+open, which is the right trade for a script the operator wrote and the wrong
+one for a script that arrived over the network. This state is opened the other
+way round \(em
+.BR base ", " string ", " table " and " math ,
+with every loader removed by name. Under LuaJIT the one that decides it is
+.BR ffi :
+.B require("ffi")
+is arbitrary memory access, which is a shell on the machine, so
+.B require
+is not there to reach it with. A client's script also cannot see the
+operator's globals, because the two states never meet.
+.IP
+.B A script holds the event loop of its shard while it runs.
+So it runs under the same count hook a Lua callback does, and a runaway one is
+stopped with
+.B "a script exceeded the 10000ms deadline"
+rather than holding every other client on that shard for ever. The bound is
+.B callback_timeout_ms
+or
+.BR SOCKETLEY_LUA_TIMEOUT_MS ,
+as it is for callbacks.
+.IP
+.B On a sharded cache a script is routed by the keys it declares.
+Not a convention here but the routing itself: the shard that owns
+.B KEYS[1]
+runs it, keys belonging to two shards answer
+.BR \-CROSSSLOT ,
+and a script declaring no keys runs wherever it was asked. A script that
+reaches a key it did not declare is reaching into whatever store the shard it
+landed on happens to have.
+.TP
+.BI "script load " "script"
+.TQ
+.BI "script exists " "sha1 [sha1 ...]"
+.TQ
+.B "script flush"
+The script cache.
+.B eval
+loads as well as runs, so a client may try
+.B evalsha
+first and fall back to
+.B eval
+on
+.BR \-NOSCRIPT ,
+which is the usual shape.
+.IP
+.B The cache is per shard, as it is per node on Redis Cluster.
+A sharded cache's shared port hands each connection to whichever shard the
+kernel picks, so a
+.B script load
+sticks to one of them.
+.B eval
+is what makes this self-healing; a client that wants
+.B evalsha
+to work everywhere sends
+.B script load
+to each per-shard port, which is what a cluster client does with each master.
+.PP
 .B Connection and introspection:
 .PP
 The set a client library sends before it sends anything of its own. Answering

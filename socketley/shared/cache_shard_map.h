@@ -244,6 +244,10 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("select"):     case fnv1a("auth"):
         case fnv1a("client"):     case fnv1a("command"):
         case fnv1a("config"):     case fnv1a("info"):
+        // SCRIPT keeps its table in the process that was asked, and EVAL is
+        // routed ahead of this switch by the keys it declares -- neither is a
+        // single-key command, and args[1] of an EVAL is the script.
+        case fnv1a("script"):
         // Every field is derived from the shard count and base port, which
         // each shard holds, so whoever has the socket answers for the map.
         case fnv1a("cluster"):

@@ -6980,6 +6980,55 @@ void cache_instance::process_resp_command(client_connection* conn,
         }
     }
 
+#ifndef SOCKETLEY_NO_LUA
+    // EVAL is routed by the keys it DECLARES, because args[1] is the script.
+    // Redis says a script may only touch keys it declared; here that is not a
+    // convention but the routing itself, and a script reaching past its own
+    // KEYS on a sharded cache would be reaching into another process's store.
+    if (SOCKETLEY_UNLIKELY(h == fnv1a("eval") || h == fnv1a("evalsha")))
+    {
+        int64_t nkeys = 0;
+        if (argc >= 3 && parse_int_sv(args[2], nkeys) && nkeys > 0 && nkeys <= argc - 3)
+        {
+            const uint32_t owner = cache_shard_of(args[3], m_shard_n);
+            for (int i = 1; i < nkeys; ++i)
+                if (cache_shard_of(args[3 + i], m_shard_n) != owner)
+                {
+                    run_in_reply_order(conn, [&] {
+                        resp::encode_error_code_into(conn->response_buf,
+                            "CROSSSLOT Keys in request don't hash to the same slot");
+                    });
+                    return;
+                }
+            if (owner != m_shard_i)
+            {
+                // The per-shard port corrects the client's map rather than
+                // crossing, exactly as a single-key command does there.
+                if (conn->cluster_port)
+                {
+                    run_in_reply_order(conn, [&] { emit_moved(conn, args[3], owner, true); });
+                    return;
+                }
+                if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
+                {
+                    run_in_reply_order(conn, [&] {
+                        emit_unrouted(conn, args[0], true,
+                                      "runs against keys another shard owns, and "
+                                      "this path cannot wait for it");
+                    });
+                    return;
+                }
+                const uint32_t slot = slot_open(conn, true, cache_merge::single, 1);
+                std::string raw;
+                resp::encode_array_header_into(raw, argc);
+                for (int i = 0; i < argc; ++i) resp::encode_bulk_into(raw, args[i]);
+                route_part(conn, owner, slot, 0, raw, true);
+                return;
+            }
+        }
+    }
+#endif
+
     switch (cache_classify_resp(h, argc))
     {
         case cache_cmd_class::single_key:
@@ -8661,6 +8710,90 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_integer_into(rb, v ? static_cast<int64_t>(v->size()) : 0);
             break;
         }
+#ifndef SOCKETLEY_NO_LUA
+        // ─── Scripting ──────────────────────────────────────────────────────
+        case fnv1a("eval"):
+        case fnv1a("evalsha"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            int64_t nkeys = 0;
+            if (!parse_int_sv(args[2], nkeys) || nkeys < 0 || nkeys > argc - 3)
+            { resp::encode_error_code_into(rb,
+                "ERR Number of keys can't be greater than number of args"); break; }
+
+            std::string_view body;
+            if (cmd_hash == fnv1a("evalsha"))
+            {
+                const std::string* found = m_scripts.body_of(args[1]);
+                if (!found)
+                { resp::encode_error_code_into(rb,
+                    "NOSCRIPT No matching script. Please use EVAL."); break; }
+                body = *found;
+            }
+            else
+            {
+                body = args[1];
+                // EVAL loads as well as runs, so the SHA it would have under
+                // SCRIPT LOAD works afterwards -- which is what lets a client
+                // try EVALSHA first and fall back once.
+                m_scripts.load(body);
+            }
+
+            std::vector<std::string_view> keys, argv;
+            keys.reserve(static_cast<size_t>(nkeys));
+            for (int i = 0; i < nkeys; ++i) keys.push_back(args[3 + i]);
+            for (int i = 3 + static_cast<int>(nkeys); i < argc; ++i) argv.push_back(args[i]);
+
+            std::string out, err;
+            const bool okrun = m_scripts.eval(
+                body, keys, argv,
+                [this, conn](std::string_view raw, std::string& reply)
+                { script_command(conn, raw, reply); },
+                out, err);
+            if (!okrun)
+            {
+                // A redis.call that failed carries the cache's own error out
+                // of the script, and its code is what a client switches on --
+                // so WRONGTYPE stays WRONGTYPE rather than becoming the ERR
+                // that wraps it.  Anything without a code gets one.
+                static constexpr std::string_view codes[] = {
+                    "ERR ", "WRONGTYPE ", "NOSCRIPT ", "CROSSSLOT ", "MOVED ",
+                    "NOPROTO ", "OOM ", "BUSYGROUP ", "NOTBUSY "
+                };
+                bool coded = false;
+                for (const auto& c : codes)
+                    if (err.compare(0, c.size(), c) == 0) { coded = true; break; }
+                resp::encode_error_code_into(rb, coded ? err : "ERR " + err);
+                break;
+            }
+            rb.append(out);
+            break;
+        }
+        case fnv1a("script"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            switch (fnv1a_lower(args[1]))
+            {
+                case fnv1a("load"):
+                    if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+                    resp::encode_bulk_into(rb, m_scripts.load(args[2]));
+                    break;
+                case fnv1a("exists"):
+                    resp::encode_array_header_into(rb, argc - 2);
+                    for (int i = 2; i < argc; ++i)
+                        resp::encode_integer_into(rb, m_scripts.known(args[i]) ? 1 : 0);
+                    break;
+                case fnv1a("flush"):
+                    m_scripts.flush();
+                    resp::encode_ok_into(rb);
+                    break;
+                default:
+                    resp::encode_error_into(rb, "unknown SCRIPT subcommand");
+                    break;
+            }
+            break;
+        }
+#endif
         // ─── One collection, scanned ───
         case fnv1a("hscan"):
         case fnv1a("sscan"):
@@ -8814,6 +8947,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         }
     }
 }
+
+#ifndef SOCKETLEY_NO_LUA
+// ─── EVAL's way into the cache ──────────────────────────────────────────────
+//
+// One command, run through the same local dispatch every other command takes,
+// with the reply captured instead of queued.  A script therefore sees exactly
+// what a client would -- including the refusals -- and cannot reach past the
+// dispatch into the store.
+void cache_instance::script_command(client_connection* conn, std::string_view raw,
+                                    std::string& reply)
+{
+    run_local_raw(conn, raw, /*resp=*/true, reply);
+}
+#endif
 
 // ─── INFO ───
 

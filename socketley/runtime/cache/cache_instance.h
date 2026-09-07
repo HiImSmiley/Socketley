@@ -18,6 +18,7 @@
 #include <deque>
 #include "../../shared/cache_shard_map.h"
 #include "cache_store.h"
+#include "cache_script.h"
 #include "../../shared/mutation_journal.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
@@ -612,6 +613,16 @@ private:
 
     // Whether a mutation needs writing down at all, asked before the text of
     // the command is built, because most caches neither lead nor journal.
+#ifndef SOCKETLEY_NO_LUA
+    // EVAL's own Lua, built on first use and never the runtime's --lua state:
+    // one is the operator's code and the other arrived over the network.
+    socketley::cache_script_engine m_scripts;
+
+    // Runs one RESP-encoded command for a script and hands back its reply,
+    // which is redis.call's only way into the cache.
+    void script_command(client_connection* conn, std::string_view raw, std::string& reply);
+#endif
+
     // The handful of INFO fields a client or a monitor actually reads back,
     // and nothing invented to fill a section out.
     void build_info_reply(std::string& out) const;
