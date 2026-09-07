@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
+#include <fnmatch.h>
 #include <cstdlib>
 #include <cstdio>
 #include <charconv>
@@ -329,6 +330,11 @@ void cache_instance::close_client([[maybe_unused]] client_connection* conn, int 
         batch_drop(conn);
 
     m_store.unsubscribe_all(fd);
+    m_store.punsubscribe_all(fd);
+    // And a blocked pop on this descriptor, for the same reason and in the
+    // same place: it holds the number, not the connection.
+    drop_blocked(fd);
+    drop_watches(fd);
     // A follower registered on this descriptor goes with it, because it holds
     // no reference of its own and would otherwise point replication at a
     // number the kernel reissued.
@@ -1162,6 +1168,12 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                                                                &m_idle_sweep_timer->req)))
                     LOG_ERROR("cache: idle sweep timer refused — no further sweeps will run");
             }
+            // The blocked-pop tick, which answers whoever has waited out their
+            // timeout and re-arms only while somebody is still waiting.
+            else if (m_block_timer && req == &m_block_timer->req)
+            {
+                sweep_blocked();
+            }
             // Accept backoff expired, so the timer owes nothing more and the
             // next shortage may arm a new one.
             else if (m_accept_backoff_timer && req == &m_accept_backoff_timer->req)
@@ -1771,6 +1783,10 @@ bool cache_instance::parse_text_lines(client_connection* conn)
             break;
         }
 
+        // The same stop the RESP loop makes, for the same reason.
+        if (SOCKETLEY_UNLIKELY(conn->blocked))
+            break;
+
         std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
 
         if (!line.empty() && line.back() == '\r')
@@ -2277,6 +2293,19 @@ static void append_score_bare(std::string& rb, double sc)
 // able from a syntax error.  The same reason emit_moved has its own encoder.
 static constexpr std::string_view wrongtype_msg =
     "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+// The three-element confirmation every subscribe verb answers on Redis: the
+// verb, the channel or pattern, and how many this connection now holds.  A
+// client counts down from that number to know when its own batch is done, and
+// +OK -- which is what this used to send -- gives it nothing to count.
+static void sub_confirm(std::string& rb, std::string_view verb,
+                        std::string_view name, uint32_t count)
+{
+    resp::encode_array_header_into(rb, 3);
+    resp::encode_bulk_into(rb, verb);
+    resp::encode_bulk_into(rb, name);
+    resp::encode_integer_into(rb, static_cast<int64_t>(count));
+}
 
 // A score bound as ZRANGEBYSCORE spells it: a bare number is inclusive, a
 // leading "(" makes it exclusive, and -inf/+inf are the open ends.
@@ -4379,7 +4408,12 @@ void cache_instance::fan_publish(client_connection* conn, uint32_t h,
     uint32_t targets[max_shards];
     uint32_t n = 0;
     for (uint32_t sh = 0; sh < m_shard_n; ++sh)
-        if (sh == m_shard_i || tbl.channel_may_have(sh, bit))
+        // A shard holding a pattern subscriber cannot be filtered out: the
+        // pattern matches channels that do not exist yet, so it has no bit of
+        // its own to look up.  This is the whole cost of the feature, and it
+        // is paid only by a cache that actually has one.
+        if (sh == m_shard_i || tbl.channel_may_have(sh, bit)
+            || tbl.channel_may_have(sh, shard_stats::pattern_bit))
             targets[n++] = sh;
 
     const uint32_t slot = slot_open(conn, resp, cache_merge_for(h), n);
@@ -4390,6 +4424,23 @@ void cache_instance::fan_publish(client_connection* conn, uint32_t h,
 void cache_instance::on_channel_presence(void* ctx, std::string_view channel, bool present)
 {
     static_cast<cache_instance*>(ctx)->channel_presence(channel, present);
+}
+
+// The same set/clear by BIT rather than by channel name, for the one bit that
+// does not belong to a channel: patterns.  It goes through the same reference
+// count so a shard with two pattern subscribers does not clear the bit when
+// the first of them leaves.
+void cache_instance::channel_presence_bit(uint32_t bit, bool present)
+{
+    auto& tbl = shard_stats_table();
+    if (!tbl.writable())
+        return;
+    if (m_chan_buckets.empty())
+        m_chan_buckets.assign(shard_stats::channel_bits, 0);
+
+    uint32_t& n = m_chan_buckets[bit];
+    if (present) { if (n++ == 0) tbl.channel_set(bit); }
+    else if (n > 0 && --n == 0) tbl.channel_clear(bit);
 }
 
 void cache_instance::channel_presence(std::string_view channel, bool present)
@@ -4639,6 +4690,34 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             rb.append("ok\n", 3);
             return;
         }
+        if (mh == fnv1a("watch"))
+        {
+            if (conn->in_multi) { rb.append("error: WATCH inside MULTI\n", 26); return; }
+            // Split here rather than through extract_key(), which is defined
+            // further down this file than the transaction verbs are handled.
+            std::vector<std::string_view> ws;
+            ws.push_back(cmd);
+            std::string_view walk = args;
+            while (!walk.empty())
+            {
+                const size_t sp = walk.find(' ');
+                const std::string_view w = (sp == std::string_view::npos)
+                                         ? walk : walk.substr(0, sp);
+                if (!w.empty()) ws.push_back(w);
+                if (sp == std::string_view::npos) break;
+                walk = walk.substr(sp + 1);
+            }
+            if (ws.size() < 2) { rb.append("usage: watch key [key ...]\n", 27); return; }
+            watch_keys(conn, ws.data(), static_cast<int>(ws.size()));
+            rb.append("ok\n", 3);
+            return;
+        }
+        if (mh == fnv1a("unwatch"))
+        {
+            unwatch_all(conn);
+            rb.append("ok\n", 3);
+            return;
+        }
         if (mh == fnv1a("discard"))
         {
             if (!conn->in_multi) { rb.append("error: DISCARD without MULTI\n", 29); return; }
@@ -4646,6 +4725,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             conn->multi_broken = false;
             conn->multi_queue.clear();
             conn->multi_bytes  = 0;
+            unwatch_all(conn);
             rb.append("ok\n", 3);
             return;
         }
@@ -4671,9 +4751,19 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             std::vector<std::string> queued;
             queued.swap(conn->multi_queue);
             const bool broken = conn->multi_broken;
+            const bool wdirty = conn->watch_dirty;
             conn->in_multi     = false;
             conn->multi_broken = false;
             conn->multi_bytes  = 0;
+            unwatch_all(conn);
+            if (wdirty)
+            {
+                // Its own word rather than RESP's nil array, because this
+                // protocol has no types to tell "did not run" from "ran and
+                // returned nothing".
+                rb.append("aborted\n", 8);
+                return;
+            }
             if (broken)
             {
                 // Nothing ran, because running part of what was asked is worse
@@ -6049,6 +6139,60 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (n > 0) replicate_command(line);
             break;
         }
+        // ─── Lists, the blocking pops ───
+        // Here as well as in RESP because deliver_pop() formats for both, and
+        // a delivery path with no command behind it is dead code.
+        case fnv1a("blpop"):
+        case fnv1a("brpop"):
+        {
+            if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
+            if (SOCKETLEY_UNLIKELY(m_shard_n > 1))
+            { rb.append("error: blpop is not available on a sharded cache\n", 48); return; }
+            // Collected first, because the last word is the timeout and the
+            // ones before it are the keys.
+            std::vector<std::string_view> parts;
+            std::string_view walk = args;
+            while (!walk.empty())
+            {
+                auto [w, rest] = extract_key(walk);
+                if (w.empty()) break;
+                parts.push_back(w); walk = rest;
+            }
+            if (parts.size() < 2)
+            { rb.append("usage: blpop key [key ...] timeout\n", 35); return; }
+            double secs = 0;
+            if (!parse_double_sv(parts.back(), secs) || secs < 0)
+            { rb.append("error: invalid timeout\n", 23); return; }
+            const bool from_head = (fnv1a_lower(cmd) == fnv1a("blpop"));
+            for (size_t i = 0; i + 1 < parts.size(); ++i)
+            {
+                if (m_has_ttl_keys) m_store.check_expiry(parts[i]);
+                std::string val;
+                const bool got = from_head ? m_store.lpop(parts[i], val)
+                                           : m_store.rpop(parts[i], val);
+                if (got)
+                {
+                    rb.append(parts[i].data(), parts[i].size());
+                    rb.push_back(' '); rb.append(val); rb.push_back('\n');
+                    if (mutation_log_wanted())
+                    {
+                        std::string c = from_head ? "lpop " : "rpop ";
+                        c.append(parts[i].data(), parts[i].size());
+                        replicate_command(c);
+                    }
+                    return;
+                }
+            }
+            {
+                // block_pop() reads args[1..argc-2] as keys, so the same shape
+                // is handed to it rather than a second parking path.
+                std::vector<std::string_view> as;
+                as.push_back(cmd);
+                for (const auto& pp : parts) as.push_back(pp);
+                block_pop(conn, as.data(), static_cast<int>(as.size()), from_head);
+            }
+            break;
+        }
 
         // ─── Lists, the reliable-queue move ───
         // Present in the text protocol because replication goes through it:
@@ -6895,6 +7039,13 @@ bool cache_instance::process_resp(client_connection* conn)
             break;
         }
 
+        // A blocked BLPOP answers on a later turn, so everything behind it
+        // waits in `partial` rather than being answered out of order.  Not
+        // through `cut`: that path's caller loops straight back in, which for
+        // a connection that is still blocked never ends.
+        if (SOCKETLEY_UNLIKELY(conn->blocked))
+            break;
+
         std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
         auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
 
@@ -7255,9 +7406,27 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_simple_into(rb, "OK");
             return;
         }
+        if (mh == fnv1a("watch"))
+        {
+            // Redis refuses it inside MULTI, because a watch taken after the
+            // queue started could not be checked against the reads that
+            // decided what to queue.
+            if (conn->in_multi) { resp::encode_error_into(rb, "WATCH inside MULTI is not allowed"); return; }
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            watch_keys(conn, args, argc);
+            resp::encode_ok_into(rb);
+            return;
+        }
+        if (mh == fnv1a("unwatch"))
+        {
+            unwatch_all(conn);
+            resp::encode_ok_into(rb);
+            return;
+        }
         if (mh == fnv1a("discard"))
         {
             if (!conn->in_multi) { resp::encode_error_into(rb, "DISCARD without MULTI"); return; }
+            unwatch_all(conn);
             conn->in_multi = false; conn->multi_broken = false;
             conn->multi_queue.clear(); conn->multi_bytes = 0;
             resp::encode_simple_into(rb, "OK");
@@ -7285,7 +7454,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             std::vector<std::string> queued;
             queued.swap(conn->multi_queue);
             const bool broken = conn->multi_broken;
+            const bool dirty  = conn->watch_dirty;
             conn->in_multi = false; conn->multi_broken = false; conn->multi_bytes = 0;
+            // Either way the watch is over: EXEC ends it whether it ran or
+            // not, so a retry loop starts from a fresh WATCH rather than an
+            // old one that is already dirty.
+            unwatch_all(conn);
+            if (dirty)
+            {
+                // A nil ARRAY and not a nil string: a client tells "the
+                // transaction did not run" from "it ran and returned nothing"
+                // by the type.
+                rb.append("*-1\r\n", 5);
+                return;
+            }
             if (broken)
             {
                 resp::encode_error_into(rb, "EXECABORT Transaction discarded because of previous errors.");
@@ -7324,6 +7506,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // unnamed hash reads `unknown` and is served where it was asked -- right
     // for a command that does not exist and wrong for a real one.
     const uint32_t cmd_hash = fnv1a_lower(args[0]);
+
+    // Whoever is watching what this may touch cannot commit any more.  Before
+    // the switch and not inside forty cases, because a write that forgot to
+    // say so is a transaction committing over a change it never saw -- and
+    // silent.  Costs one empty() test when nobody is watching, which is the
+    // usual state.
+    note_write_for_watch(cmd_hash, args, argc);
+
     switch (cmd_hash)
     {
         case fnv1a("set"):
@@ -7780,8 +7970,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     }
                 }
             }
+            // The length INCLUDING what was just pushed, and only then the
+            // waiters: a client blocked on this key takes an element, and a
+            // reply counted after that would report a queue shorter than the
+            // one the caller filled.
             resp::encode_integer_into(rb, m_store.llen(args[1]));
             repl(args, argc);
+            // N elements can free N waiters, so this runs until nobody is left
+            // for this key or the list is empty again.
+            while (wake_one_waiter(args[1])) {}
             break;
         }
         case fnv1a("rpush"):
@@ -7800,8 +7997,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     }
                 }
             }
+            // The length INCLUDING what was just pushed, and only then the
+            // waiters: a client blocked on this key takes an element, and a
+            // reply counted after that would report a queue shorter than the
+            // one the caller filled.
             resp::encode_integer_into(rb, m_store.llen(args[1]));
             repl(args, argc);
+            // N elements can free N waiters, so this runs until nobody is left
+            // for this key or the list is empty again.
+            while (wake_one_waiter(args[1])) {}
             break;
         }
         case fnv1a("lpop"):
@@ -8363,16 +8567,52 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             for (int i = 1; i < argc; i++)
+            {
                 m_store.subscribe(conn->fd, args[i]);
-            resp::encode_ok_into(rb);
+                // The confirmation Redis sends and a client library waits for:
+                // it counts down from this number to know its own subscribe
+                // batch is complete, and +OK gives it nothing to count.
+                sub_confirm(rb, "subscribe", args[i], ++conn->sub_count);
+            }
+            break;
+        }
+        case fnv1a("psubscribe"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            const bool first = !m_store.has_patterns();
+            for (int i = 1; i < argc; i++)
+            {
+                m_store.psubscribe(conn->fd, args[i]);
+                sub_confirm(rb, "psubscribe", args[i], ++conn->sub_count);
+            }
+            // A shard that has gained its first pattern can no longer be
+            // skipped by the channel filter, and this is how the publishing
+            // shard finds that out.
+            if (first && m_shard_n > 1) channel_presence_bit(shard_stats::pattern_bit, true);
+            break;
+        }
+        case fnv1a("punsubscribe"):
+        {
+            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            for (int i = 1; i < argc; i++)
+            {
+                m_store.punsubscribe(conn->fd, args[i]);
+                if (conn->sub_count) --conn->sub_count;
+                sub_confirm(rb, "punsubscribe", args[i], conn->sub_count);
+            }
+            if (!m_store.has_patterns() && m_shard_n > 1)
+                channel_presence_bit(shard_stats::pattern_bit, false);
             break;
         }
         case fnv1a("unsubscribe"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             for (int i = 1; i < argc; i++)
+            {
                 m_store.unsubscribe(conn->fd, args[i]);
-            resp::encode_ok_into(rb);
+                if (conn->sub_count) --conn->sub_count;
+                sub_confirm(rb, "unsubscribe", args[i], conn->sub_count);
+            }
             break;
         }
         case fnv1a("publish"):
@@ -8609,6 +8849,62 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             break;
         }
 
+#ifndef SOCKETLEY_NO_LUA_UNUSED
+#endif
+        // ─── Lists, the blocking pops ───
+        case fnv1a("blpop"):
+        case fnv1a("brpop"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            // Every shard is a process of its own, so a key another shard owns
+            // would have to wake this one across a boundary the crossing
+            // protocol only carries answers over.  Refused by name, the way
+            // `replicate` is on a sharded cache.
+            if (SOCKETLEY_UNLIKELY(m_shard_n > 1))
+            {
+                resp::encode_error_code_into(rb,
+                    "ERR BLPOP is not available on a sharded cache -- a waiting "
+                    "client and the key it waits on can be in two processes");
+                break;
+            }
+            const bool from_head = (cmd_hash == fnv1a("blpop"));
+            double secs = 0;
+            if (!parse_double_sv(args[argc - 1], secs) || secs < 0)
+            { resp::encode_error_code_into(rb, "ERR timeout is not a float or out of range"); break; }
+
+            // Tried in the order given, and answered at once if any of them
+            // has something -- a BLPOP on a queue that is not empty must not
+            // pay for the machinery below.
+            for (int i = 1; i < argc - 1; ++i)
+            {
+                if (m_has_ttl_keys) m_store.check_expiry(args[i]);
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[i], 'l')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); goto blpop_done; }
+                std::string val;
+                const bool got = from_head ? m_store.lpop(args[i], val)
+                                           : m_store.rpop(args[i], val);
+                if (got)
+                {
+                    resp::encode_array_header_into(rb, 2);
+                    resp::encode_bulk_into(rb, args[i]);
+                    resp::encode_bulk_into(rb, val);
+                    if (mutation_log_wanted())
+                    {
+                        std::string c = from_head ? "lpop " : "rpop ";
+                        c.append(args[i].data(), args[i].size());
+                        replicate_command(c);
+                    }
+                    goto blpop_done;
+                }
+            }
+            // Nothing to take, so the caller waits and this command answers on
+            // a later turn -- the only one in this file that does.
+            block_pop(conn, args, argc, from_head);
+        blpop_done:
+            break;
+        }
+
         // ─── Lists, the reliable-queue move ───
         case fnv1a("rpoplpush"):
         case fnv1a("lmove"):
@@ -8656,6 +8952,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             resp::encode_bulk_into(rb, moved);
             repl(args, argc);
+            // The destination gained an element, and a worker may be waiting
+            // on it -- the reliable-queue shape is exactly this pair.
+            while (wake_one_waiter(args[2])) {}
             break;
         }
 
@@ -9023,6 +9322,268 @@ void cache_instance::script_command(client_connection* conn, std::string_view ra
 }
 #endif
 
+// ─── WATCH ──────────────────────────────────────────────────────────────────
+//
+// The guarantee is one sentence: EXEC does nothing if a watched key was
+// written between the WATCH and the EXEC.  That is what makes a
+// compare-and-set loop possible, and it is the usual reason to reach for MULTI
+// at all -- without it a transaction here is a batch.
+
+void cache_instance::watch_keys(client_connection* conn, std::string_view* args, int argc)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        conn->watched.emplace_back(args[i]);
+        m_watchers[std::string(args[i])].insert(conn->fd);
+    }
+}
+
+void cache_instance::unwatch_all(client_connection* conn)
+{
+    if (conn->watched.empty()) { conn->watch_dirty = false; return; }
+    for (const auto& k : conn->watched)
+    {
+        auto it = m_watchers.find(k);
+        if (it == m_watchers.end()) continue;
+        it->second.erase(conn->fd);
+        if (it->second.empty()) m_watchers.erase(it);
+    }
+    conn->watched.clear();
+    conn->watch_dirty = false;
+}
+
+void cache_instance::drop_watches(int fd)
+{
+    if (SOCKETLEY_LIKELY(m_watchers.empty()))
+        return;
+    for (auto it = m_watchers.begin(); it != m_watchers.end(); )
+    {
+        it->second.erase(fd);
+        if (it->second.empty()) it = m_watchers.erase(it); else ++it;
+    }
+}
+
+void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, int argc)
+{
+    // Nobody is watching, which is nearly always, and this is the whole cost
+    // of carrying the feature for everybody who does not use it.
+    if (SOCKETLEY_LIKELY(m_watchers.empty()))
+        return;
+    if (cache_is_read_only(h))
+        return;
+
+    const auto dirty = [this](const std::unordered_set<int>& fds) {
+        for (int fd : fds)
+        {
+            // A descriptor and not a pointer, so it is looked up rather than
+            // trusted -- the same rule the subscriber set follows.
+            if (fd < 0 || fd >= MAX_FDS) continue;
+            if (auto* c = m_conn_idx[fd]) c->watch_dirty = true;
+        }
+    };
+
+    // A single-key write names its key, which is the case worth being exact
+    // about: two clients on two different keys must not abort each other.
+    if (argc >= 2 && cache_classify(h) == cache_cmd_class::single_key)
+    {
+        auto it = m_watchers.find(std::string(args[1]));
+        if (it != m_watchers.end()) dirty(it->second);
+        return;
+    }
+
+    // Anything else -- MSET, DEL with several keys, FLUSH, EVAL -- may have
+    // touched anything, so everyone watching is told.  Pessimistic, and for a
+    // compare-and-set loop that is a retry rather than a wrong answer; the
+    // other direction would be a transaction committing over a change it never
+    // saw.
+    for (const auto& [key, fds] : m_watchers) { (void)key; dirty(fds); }
+}
+
+// ─── BLPOP / BRPOP ──────────────────────────────────────────────────────────
+//
+// The half that looks hard is already here: publish() writes into another
+// connection's buffer and flushes it, and the subscriber set has solved the
+// lifetime question by holding descriptors rather than pointers.  What is new
+// is only that the caller gets NO reply now -- every other command in this
+// file answers on the turn it arrived on.
+
+void cache_instance::arm_block_timer()
+{
+    if (m_block_timer_armed || m_blocked.empty() || !m_loop)
+        return;
+    if (!m_block_timer)
+        m_block_timer = std::make_unique<timer_op>();
+    // A tick and not a per-client deadline: one timer for the whole list, at a
+    // resolution a human waiting on a job queue cannot tell from exact.
+    m_block_timer->ts.tv_sec  = 0;
+    m_block_timer->ts.tv_nsec = 100 * 1000 * 1000;
+    m_block_timer->req = { this, nullptr, -1, 0, op_timeout };
+    if (m_loop->submit_timeout(&m_block_timer->ts, &m_block_timer->req))
+        m_block_timer_armed = true;
+}
+
+// The reply a blocked pop gets when it finally has one, written into the
+// waiting connection rather than the caller's -- publish()'s path, with
+// publish()'s guards.
+static void deliver_pop(client_connection* c, std::string_view key,
+                        const std::string* value)
+{
+    std::string out;
+    if (c->resp_mode)
+    {
+        if (!value) { out.append("*-1\r\n", 5); }
+        else
+        {
+            resp::encode_array_header_into(out, 2);
+            resp::encode_bulk_into(out, key);
+            resp::encode_bulk_into(out, *value);
+        }
+    }
+    else
+    {
+        if (!value) out.append("nil\n", 4);
+        else { out.append(key.data(), key.size()); out.push_back(' ');
+               out.append(*value); out.push_back('\n'); }
+    }
+    c->write_queue.push_coalesced(out, client_connection::WRITE_COALESCE_LIMIT);
+}
+
+bool cache_instance::wake_one_waiter(std::string_view key)
+{
+    if (SOCKETLEY_LIKELY(m_blocked.empty()))
+        return false;
+
+    // Longest-waiting first: a worker pool that served its newest member would
+    // starve the one that has been idle longest.
+    size_t pick = m_blocked.size();
+    uint64_t best = UINT64_MAX;
+    for (size_t i = 0; i < m_blocked.size(); ++i)
+    {
+        if (m_blocked[i].seq >= best) continue;
+        for (const auto& k : m_blocked[i].keys)
+            if (k == key) { pick = i; best = m_blocked[i].seq; break; }
+    }
+    if (pick == m_blocked.size())
+        return false;
+
+    const blocked_pop w = m_blocked[pick];
+
+    // Revalidated rather than trusted: between the park and this push the
+    // descriptor may have closed and been reissued to somebody else.
+    client_connection* c = (w.fd >= 0 && w.fd < MAX_FDS) ? m_conn_idx[w.fd] : nullptr;
+    if (!c || c->closing || c->is_follower)
+    {
+        // Its socket is gone, so it is dropped -- but the element stays, for
+        // whoever is behind it.
+        m_blocked.erase(m_blocked.begin() + static_cast<long>(pick));
+        return true;
+    }
+
+    // Taken BEFORE the waiter is removed from the list.  The other order lost
+    // a waiter every time: the caller loops while this returns true, the
+    // second call picked the next waiter, erased it, found the list empty and
+    // answered false -- and that waiter had already gone from the list without
+    // ever being answered.  Measured as two of three clients served.
+    std::string val;
+    const bool got = w.from_head ? m_store.lpop(key, val) : m_store.rpop(key, val);
+    if (!got)
+        return false;
+    m_blocked.erase(m_blocked.begin() + static_cast<long>(pick));
+
+    deliver_pop(c, key, &val);
+    c->blocked = false;
+    if (!c->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(c)))
+    {
+        c->closing = true;
+        return true;                        // taken from the list either way
+    }
+
+    // The pop is what replicates, not the blocking: a follower running BLPOP
+    // would wait for its own push and never see the leader's.
+    if (mutation_log_wanted())
+    {
+        std::string cmd = w.from_head ? "lpop " : "rpop ";
+        cmd.append(key.data(), key.size());
+        replicate_command(cmd);
+    }
+
+    // Whatever the client pipelined behind its BLPOP has been sitting in
+    // `partial` since, and nothing else will come to drive it.  pump() parses
+    // and routes; putting the replies on the wire is flush_responses()'s job,
+    // which the read path does immediately after it for the same reason.
+    pump(c);
+    if (SOCKETLEY_UNLIKELY(!flush_responses(c)))
+        c->closing = true;
+    return true;
+}
+
+void cache_instance::sweep_blocked()
+{
+    m_block_timer_armed = false;
+    if (m_blocked.empty())
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < m_blocked.size(); )
+    {
+        const auto& w = m_blocked[i];
+        if (w.deadline.time_since_epoch().count() == 0 || now < w.deadline)
+        { ++i; continue; }
+
+        const blocked_pop done = w;
+        m_blocked.erase(m_blocked.begin() + static_cast<long>(i));
+
+        client_connection* c =
+            (done.fd >= 0 && done.fd < MAX_FDS) ? m_conn_idx[done.fd] : nullptr;
+        if (!c || c->closing) continue;
+        deliver_pop(c, {}, nullptr);
+        c->blocked = false;
+        if (!c->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(c)))
+        { c->closing = true; continue; }
+        pump(c);
+        if (SOCKETLEY_UNLIKELY(!flush_responses(c)))
+        { c->closing = true; continue; }
+    }
+    arm_block_timer();
+}
+
+void cache_instance::drop_blocked(int fd)
+{
+    if (SOCKETLEY_LIKELY(m_blocked.empty()))
+        return;
+    for (size_t i = 0; i < m_blocked.size(); )
+    {
+        if (m_blocked[i].fd == fd)
+            m_blocked.erase(m_blocked.begin() + static_cast<long>(i));
+        else
+            ++i;
+    }
+}
+
+bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
+                               int argc, bool from_head)
+{
+    // The last argument is the timeout, so there is at least one key before it.
+    double secs = 0;
+    if (!parse_double_sv(args[argc - 1], secs) || secs < 0)
+        return false;
+
+    blocked_pop w;
+    w.fd        = conn->fd;
+    w.from_head = from_head;
+    w.resp      = conn->resp_mode;
+    w.seq       = ++m_block_seq;
+    for (int i = 1; i < argc - 1; ++i) w.keys.emplace_back(args[i]);
+    if (secs > 0)
+        w.deadline = std::chrono::steady_clock::now()
+                   + std::chrono::milliseconds(static_cast<int64_t>(secs * 1000.0));
+
+    m_blocked.push_back(std::move(w));
+    conn->blocked = true;
+    arm_block_timer();
+    return true;
+}
+
 // ─── INFO ───
 
 void cache_instance::build_info_reply(std::string& out) const
@@ -9134,6 +9695,53 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 continue;
             }
             count++;
+        }
+    }
+
+    // And the pattern subscribers, which are matched rather than looked up --
+    // the reason they are a second map and the reason a shard holding one has
+    // to be woken by every publish.  Walked only when there are any, so a
+    // cache nobody psubscribes to pays one empty() test.
+    if (SOCKETLEY_UNLIKELY(m_store.has_patterns()))
+    {
+        const std::string chan(channel);
+        for (const auto& [pat, fds] : m_store.patterns())
+        {
+            if (fnmatch(pat.c_str(), chan.c_str(), 0) != 0)
+                continue;
+            for (int fd : fds)
+            {
+                if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) continue;
+                auto* pc = m_conn_idx[fd];
+                if (pc->closing || pc->is_follower) continue;
+                if (pc->write_queue.bytes() >= socketley::write_queue_max_bytes)
+                { pc->closing = true; continue; }
+
+                // pmessage and not message: the pattern is part of the reply,
+                // because a client subscribed to two patterns cannot otherwise
+                // tell which one matched.
+                std::string out;
+                if (pc->resp_mode)
+                {
+                    resp::encode_array_header_into(out, 4);
+                    resp::encode_bulk_into(out, "pmessage");
+                    resp::encode_bulk_into(out, pat);
+                    resp::encode_bulk_into(out, channel);
+                    resp::encode_bulk_into(out, message);
+                }
+                else
+                {
+                    out.append("pmessage ");
+                    out.append(pat); out.push_back(' ');
+                    out.append(channel.data(), channel.size()); out.push_back(' ');
+                    out.append(message.data(), message.size()); out.push_back('\n');
+                }
+                pc->write_queue.push_coalesced(
+                    out, client_connection::WRITE_COALESCE_LIMIT);
+                if (!pc->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(pc)))
+                { pc->closing = true; continue; }
+                count++;
+            }
         }
     }
 

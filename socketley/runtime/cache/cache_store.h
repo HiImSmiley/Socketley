@@ -304,6 +304,15 @@ public:
     void unsubscribe(int fd, std::string_view channel);
     void unsubscribe_all(int fd);
 
+    // Pattern subscriptions, kept apart from the exact ones because they are
+    // matched and not looked up: every publish walks this map, and nothing
+    // walks the other.
+    void psubscribe(int fd, std::string_view pattern);
+    void punsubscribe(int fd, std::string_view pattern);
+    void punsubscribe_all(int fd);
+    bool has_patterns() const { return !m_patterns.empty(); }
+    const channel_map& patterns() const { return m_patterns; }
+
     // Told when a channel gains its first subscriber here or loses its last,
     // which is what a shard's channel filter is kept from.
     using channel_observer = void (*)(void* ctx, std::string_view channel, bool present);
@@ -491,6 +500,7 @@ private:
 
     // Pub/Sub
     channel_map m_channels;
+    channel_map m_patterns;
     channel_observer m_chan_observer{nullptr};
     void*            m_chan_observer_ctx{nullptr};
 };

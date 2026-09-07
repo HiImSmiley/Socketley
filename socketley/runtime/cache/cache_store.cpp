@@ -2775,6 +2775,31 @@ void cache_store::unsubscribe(int fd, std::string_view channel)
     }
 }
 
+// A pattern has no bit to look up, so these are walked and matched on every
+// publish -- which is why they are a separate map: the exact channels stay a
+// hash lookup and pay nothing for a feature they are not using.
+void cache_store::psubscribe(int fd, std::string_view pattern)
+{
+    m_patterns[std::string(pattern)].insert(fd);
+}
+
+void cache_store::punsubscribe(int fd, std::string_view pattern)
+{
+    auto it = m_patterns.find(pattern);
+    if (it == m_patterns.end()) return;
+    it->second.erase(fd);
+    if (it->second.empty()) m_patterns.erase(it);
+}
+
+void cache_store::punsubscribe_all(int fd)
+{
+    for (auto it = m_patterns.begin(); it != m_patterns.end(); )
+    {
+        it->second.erase(fd);
+        if (it->second.empty()) it = m_patterns.erase(it); else ++it;
+    }
+}
+
 void cache_store::unsubscribe_all(int fd)
 {
     for (auto it = m_channels.begin(); it != m_channels.end(); )

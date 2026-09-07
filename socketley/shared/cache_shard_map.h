@@ -184,6 +184,9 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         // for a pair that does not hash together -- moving it would be a
         // crossing that has to be undone if the far side refuses.
         case fnv1a("rpoplpush"):  case fnv1a("lmove"):
+        // Refused on a sharded cache by the handler, and single-key here so an
+        // unsharded one routes it like every other list command.
+        case fnv1a("blpop"):      case fnv1a("brpop"):
         // ── sets ──
         case fnv1a("sadd"):       case fnv1a("srem"):
         case fnv1a("sismember"):  case fnv1a("scard"):
@@ -258,6 +261,60 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
 
         default:
             return cache_cmd_class::unknown;
+    }
+}
+
+// Whether a command can be trusted not to change anything, asked by WATCH and
+// by nothing else.
+//
+// The list is of READS and not of writes, deliberately.  A write missing from
+// a list of writes is a transaction that commits over somebody else's change
+// and never notices -- silent, and the exact failure WATCH exists to prevent.
+// A read missing from this list is a transaction that retries once for no
+// reason.  So anything not named here counts as a write.
+constexpr bool cache_is_read_only(uint32_t h)
+{
+    switch (h)
+    {
+        case fnv1a("get"):        case fnv1a("mget"):
+        case fnv1a("strlen"):     case fnv1a("getrange"):
+        case fnv1a("substr"):     case fnv1a("exists"):
+        case fnv1a("touch"):      case fnv1a("type"):
+        case fnv1a("ttl"):        case fnv1a("pttl"):
+        case fnv1a("llen"):       case fnv1a("lrange"):
+        case fnv1a("lindex"):
+        case fnv1a("scard"):      case fnv1a("smembers"):
+        case fnv1a("sismember"):  case fnv1a("smismember"):
+        case fnv1a("srandmember"):
+        case fnv1a("hget"):       case fnv1a("hgetall"):
+        case fnv1a("hlen"):       case fnv1a("hkeys"):
+        case fnv1a("hvals"):      case fnv1a("hmget"):
+        case fnv1a("hexists"):    case fnv1a("hstrlen"):
+        case fnv1a("zscore"):     case fnv1a("zcard"):
+        case fnv1a("zrank"):      case fnv1a("zrevrank"):
+        case fnv1a("zrange"):     case fnv1a("zrevrange"):
+        case fnv1a("zrangebyscore"): case fnv1a("zrevrangebyscore"):
+        case fnv1a("zcount"):
+        case fnv1a("scan"):       case fnv1a("hscan"):
+        case fnv1a("sscan"):      case fnv1a("zscan"):
+        case fnv1a("keys"):       case fnv1a("dbsize"):
+        case fnv1a("size"):       case fnv1a("memory"):
+        case fnv1a("ping"):       case fnv1a("echo"):
+        case fnv1a("info"):       case fnv1a("config"):
+        case fnv1a("command"):    case fnv1a("cluster"):
+        case fnv1a("select"):     case fnv1a("hello"):
+        case fnv1a("client"):     case fnv1a("auth"):
+        // publish changes no key; subscribe records a descriptor.
+        case fnv1a("publish"):    case fnv1a("subscribe"):
+        case fnv1a("unsubscribe"):
+        // The transaction verbs themselves, and SCRIPT, which only touches
+        // the script table -- EVAL is a write, because it can be.
+        case fnv1a("multi"):      case fnv1a("exec"):
+        case fnv1a("discard"):    case fnv1a("watch"):
+        case fnv1a("unwatch"):    case fnv1a("script"):
+            return true;
+        default:
+            return false;
     }
 }
 

@@ -3616,6 +3616,41 @@ Insert beside the first occurrence of
 .IR pivot ,
 returning the new length, 0 when the key is absent and \-1 when the pivot is.
 .TP
+.BI "blpop " "key [key ...] timeout"
+.TQ
+.BI "brpop " "key [key ...] timeout"
+.B lpop
+and
+.B rpop
+that wait. The keys are tried in the order given and the first with anything in
+it answers at once; when none has, the caller waits until something is pushed
+or
+.I timeout
+seconds pass.
+.B 0
+waits for ever. The reply names the key as well as the element, because with
+several keys the caller cannot otherwise tell which one it came from.
+.IP
+.B The longest-waiting client is served first.
+A worker pool that served its newest member would starve the one that has been
+idle longest, which is the member most likely to be healthy.
+.IP
+.B Everything pipelined behind a blocking pop waits for it.
+This is the only command here that answers on a later turn than the one it
+arrived on, so the rest of that connection's input stays unparsed until the
+wait ends \(em otherwise the second reply would overtake the first.
+.IP
+.B Not available on a sharded cache, and refused by name.
+Every shard is a process of its own: the client waits in one and the key it
+waits on can be owned by another, and the crossing protocol carries answers to
+questions rather than a push arriving somewhere nobody asked. Refused the way
+.B replicate
+is, rather than blocking on a key this process will never see written.
+.IP
+What replicates is the pop and not the wait \(em a follower running
+.B blpop
+would be waiting for its own push and would never see the leader's.
+.TP
 .BI "rpoplpush " "source destination"
 .TQ
 .BI "lmove " "source destination left|right left|right"
@@ -3812,6 +3847,72 @@ gives above.
 .BI "zremrangebyscore " "key min max"
 Remove a range by position or by score and return how many went. Emptying the
 set removes the key.
+.PP
+.B Pattern subscriptions:
+.TP
+.BI "psubscribe " "pattern [pattern ...]"
+.TQ
+.BI "punsubscribe " "pattern [pattern ...]"
+Receive from every channel a glob pattern matches \(em
+.BR * ,
+.B ?
+and character classes, the same matching
+.B keys
+uses. The delivery is
+.B pmessage
+and carries the pattern as well as the channel, because a client subscribed to
+two patterns cannot otherwise tell which one matched.
+.IP
+.B Every subscribe verb confirms with a count.
+.BR subscribe ", " unsubscribe ", " psubscribe " and " punsubscribe
+each answer a three\-element reply naming the verb, the channel or pattern, and
+how many subscriptions the connection now holds. A client library counts down
+from that number to know its own batch is complete \(em these used to answer
+"+OK", which gives it nothing to count.
+.IP
+.B A pattern costs a sharded cache its publish filter, and only then.
+A publish normally wakes just the shards whose filter says they may hold a
+subscriber of that channel. A pattern matches channels that do not exist yet,
+so it has no bit to set; a shard holding one is woken by every publish instead.
+Nothing changes for a cache that has no pattern subscriber.
+.PP
+.B Transactions with a check:
+.TP
+.BI "watch " "key [key ...]"
+.TQ
+.B unwatch
+.B exec
+does nothing if a watched key was written between the
+.B watch
+and it \(em over RESP the reply is a nil
+.IR array ,
+whose type is how a client tells "did not run" from "ran and returned nothing",
+and over the text protocol the word
+.BR aborted .
+Either way the watch ends, so a retry starts from a fresh one.
+.IP
+Without this,
+.B multi
+is a batch: the commands run together and nothing checks that the world still
+looks the way the client read it. With it, the compare\-and\-set loop that a
+distributed lock or a counter needs becomes possible.
+.IP
+.B A write to a different key does not abort.
+The mark is set in one place, before the switch that runs the command, and it
+is driven by a list of read\-only commands rather than a list of writes: a
+write missing from a list of writes would be a transaction committing over a
+change it never saw, silently, while a read missing from the read list is one
+retry too many. Commands that can touch anything \(em
+.BR mset ", " del
+over several keys,
+.BR flush ", " eval
+\(em mark every watcher rather than a list.
+.IP
+.B watch
+inside
+.B multi
+is refused, as it is on Redis: a watch taken after the queue started could not
+be checked against the reads that decided what to queue.
 .PP
 .B Scripting:
 .PP

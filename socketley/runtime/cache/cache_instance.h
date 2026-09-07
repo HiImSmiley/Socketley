@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_set>
+#include <chrono>
 #include <unordered_map>
 #include <memory>
 #include <queue>
@@ -107,6 +109,23 @@ struct client_connection
     bool is_follower{false};
     bool follower_refused{false};
 
+    // The keys this connection asked WATCH about, and whether any of them has
+    // been written since.  Kept on the connection so a disconnect takes them
+    // with it, and named in m_watchers so a write can find the watcher.
+    std::vector<std::string> watched;
+    bool watch_dirty{false};
+
+    // Channels plus patterns this connection holds, which is the number Redis
+    // puts in every subscribe confirmation -- a client counts down from it to
+    // know when its own subscribe batch is complete.
+    uint32_t sub_count{0};
+
+    // Waiting on BLPOP or BRPOP, which is the one command here that answers on
+    // a later turn than the one it arrived on.  Everything already pipelined
+    // behind it stays in `partial` until the wait ends, or the second reply
+    // would overtake the first.
+    bool blocked{false};
+
     // Non-null only with --tls, on the server runtime's design deliberately
     // unchanged, and freed only by this struct -- which is what makes freeing
     // it never have to wait on the ring.
@@ -165,6 +184,10 @@ struct client_connection
         resp_detected = false;
         is_follower = false;
         follower_refused = false;
+        blocked = false;
+        watched.clear();
+        watch_dirty = false;
+        sub_count = 0;
         // pool_release() already did this, repeated because a struct leaving
         // the pool must not carry the previous connection's session.
         tls_context::free_ssl(ssl);
@@ -501,6 +524,8 @@ private:
                      bool resp, std::string_view channel);
     static void on_channel_presence(void* ctx, std::string_view channel, bool present);
     void        channel_presence(std::string_view channel, bool present);
+    // The one bit with no channel name behind it: patterns.
+    void        channel_presence_bit(uint32_t bit, bool present);
     // Channels of this shard per filter bucket, so the bit clears with the
     // bucket's last channel and not its first.
     std::vector<uint32_t> m_chan_buckets;
@@ -622,6 +647,54 @@ private:
     // which is redis.call's only way into the cache.
     void script_command(client_connection* conn, std::string_view raw, std::string& reply);
 #endif
+
+    // ─── BLPOP / BRPOP ──────────────────────────────────────────────────────
+    //
+    // A descriptor and not a pointer, which is how the subscriber set holds
+    // its readers and for the same reason: a descriptor can be revalidated
+    // through m_conn_idx and a stale pointer cannot be noticed at all.  The
+    // entry is dropped in close_client(), beside unsubscribe_all(), which is
+    // the one function every close goes through.
+    struct blocked_pop
+    {
+        int                      fd{-1};
+        std::vector<std::string> keys;
+        bool                     from_head{true};   // BLPOP head, BRPOP tail
+        bool                     resp{true};
+        // Zero means "no timeout": BLPOP key 0 waits for ever, as Redis does.
+        std::chrono::steady_clock::time_point deadline{};
+        uint64_t                 seq{0};
+    };
+
+    // Arrival order, because Redis serves the longest-waiting client first and
+    // a worker pool that served the newest would starve its own oldest member.
+    // A linear walk, because the list is one entry per idle worker -- an index
+    // per key would be the optimisation to make when that stops being true.
+    std::vector<blocked_pop> m_blocked;
+    uint64_t                 m_block_seq{0};
+
+    // ─── WATCH ──────────────────────────────────────────────────────────────
+    // key -> the descriptors watching it, the shape the subscriber set has and
+    // for the same reason.  Empty is the usual state and the fast path.
+    std::unordered_map<std::string, std::unordered_set<int>> m_watchers;
+
+    void watch_keys(client_connection* conn, std::string_view* args, int argc);
+    void unwatch_all(client_connection* conn);
+    void drop_watches(int fd);
+    // A command that is not a read has run: whoever is watching what it may
+    // have touched cannot commit any more.
+    void note_write_for_watch(uint32_t h, std::string_view* args, int argc);
+
+    // Park the caller; false when it could be answered at once after all.
+    bool block_pop(client_connection* conn, std::string_view* args, int argc,
+                   bool from_head);
+    // A push landed on `key`: hand it to the longest-waiting client that asked
+    // for it, if there is one.  True means the element is gone to a waiter.
+    bool wake_one_waiter(std::string_view key);
+    // Answer everyone whose deadline has passed, and re-arm while any remain.
+    void sweep_blocked();
+    void arm_block_timer();
+    void drop_blocked(int fd);
 
     // The handful of INFO fields a client or a monitor actually reads back,
     // and nothing invented to fill a section out.
@@ -818,6 +891,11 @@ private:
 
     // EMFILE/ENFILE accept backoff
     std::unique_ptr<timer_op> m_accept_backoff_timer;
+
+    // The tick that answers a BLPOP whose timeout has passed, armed only while
+    // somebody is waiting -- a cache nobody blocks on has no timer at all.
+    std::unique_ptr<timer_op> m_block_timer;
+    bool                      m_block_timer_armed{false};
 
     // Idle connection sweep timer
     std::unique_ptr<timer_op> m_idle_sweep_timer;

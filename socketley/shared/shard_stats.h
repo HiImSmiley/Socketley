@@ -61,6 +61,13 @@ struct alignas(line_size) channel_filter
 };
 static_assert(sizeof(channel_filter) == channel_words * sizeof(uint64_t));
 
+// One bit reserved to mean "this shard has pattern subscribers".  A pattern
+// cannot be hashed to a channel's bit -- it matches channels that do not exist
+// yet -- so a shard holding one has to be woken by every publish, and this is
+// how the publisher finds out without a second table.  A real channel hashing
+// here costs one extra wake, which is what a filter collision already costs.
+inline constexpr uint32_t pattern_bit = 0;
+
 inline uint32_t channel_bit(std::string_view channel)
 {
     return fnv1a(channel) & (channel_bits - 1);
