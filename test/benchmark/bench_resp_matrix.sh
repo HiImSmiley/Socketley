@@ -296,6 +296,14 @@ load_arm() {    # load_arm PORT FILE
     redis-cli -p "$1" --pipe < "$2" >/dev/null 2>&1
 }
 
+# Everything above is the command table, the key space and how to load it, and
+# the profiler wants exactly that and none of the measuring below.  Sourcing
+# with this set stops here, so the two never drift: a command added to the
+# table is profiled without anybody remembering to add it twice.
+if [ -n "${BENCH_MATRIX_TABLE_ONLY:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # The ratio of each pass, sorted, with its median and its two ends.  A cell
 # whose ends straddle the decision threshold has not measured anything, and
 # saying so is the point of carrying them.

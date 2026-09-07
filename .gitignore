@@ -46,6 +46,7 @@ bin/Dev/
 bin/Release/
 bin/Sanitize/
 bin/Coverage/
+bin/Profile/
 bin/TSan/
 make/
 
