@@ -72,6 +72,18 @@ private:
     bool                m_ready{false};
     sol::state          m_lua;
     std::unordered_map<std::string, std::string> m_scripts;
+
+    // The compiled chunk, kept under the same SHA as the source.  Compiling on
+    // every call is what made EVAL five times slower than Redis at it: Redis
+    // compiles once and calls thereafter, and measured here `EVAL return(1) 0`
+    // ran at 160,452/s against 787,482.
+    std::unordered_map<std::string, sol::protected_function> m_compiled;
+
+    // What redis.call reaches, set for the duration of one eval.  A member
+    // rather than a capture, so the `redis` table is built once at start-up
+    // instead of once per call -- three tables and a dozen closures per EVAL
+    // was the other half of the same cost.
+    const command_fn*   m_call{nullptr};
 };
 
 }  // namespace socketley

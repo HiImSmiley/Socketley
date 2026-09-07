@@ -105,6 +105,17 @@ V_SIZE=100       # bytes per string value
 # need their own key family reloaded between passes, which is a separate piece
 # of work; a number for them here would be a number for an empty list.
 #
+# BLPOP and BRPOP are absent for a third reason, which is worse than not being
+# idempotent: on an empty list they measure their own timeout -- the rate would
+# be exactly clients divided by the timeout, a constant wearing a rate's
+# clothes -- and on a full one they are LPOP with a different name and the
+# blocking path is never entered.  What can be asked of them is a latency
+# (LPUSH to woken) and not a throughput, and that needs a different instrument.
+#
+# PSUBSCRIBE is absent because it accumulates: the tenth call on one connection
+# is not the first.  What it costs is measured separately, as a publish rate
+# with and without a pattern subscriber attached.
+#
 # RPOPLPUSH and LMOVE could be made idempotent by moving a list onto itself,
 # which rotates -- but only with the SAME key on both sides, and
 # __rand_int__ is substituted per occurrence, so the two would be different
@@ -131,6 +142,13 @@ GETRANGE|1000|GETRANGE KEYTAGstr:__rand_int__ 0 9
 SETRANGE|1000|SETRANGE KEYTAGstr:__rand_int__ 0 zzzz
 SETKEEPTTL|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx KEEPTTL
 SETGET|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx GET
+# No spaces in either script: run_cell splits the template on whitespace, so a
+# script written the readable way arrives as several arguments and the cell
+# measures a syntax error on both arms -- which reads as two zeroes and no
+# warning at all.
+EVAL|1000|EVAL return(1) 0
+EVALKEY|1000|EVAL return(redis.call('get',KEYS[1])) 1 KEYTAGstr:__rand_int__
+WATCH|1000|WATCH KEYTAGstr:__rand_int__
 INCR|1000|INCR KEYTAGnum:__rand_int__
 DECR|1000|DECR KEYTAGnum:__rand_int__
 INCRBY|1000|INCRBY KEYTAGnum:__rand_int__ 3
