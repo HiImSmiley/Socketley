@@ -3417,6 +3417,26 @@ one whose keys span shards is answered with
 The second is not pedantry: redirecting it would send the client to a shard
 that would redirect it back.
 .SS Cache Protocol
+.PP
+.B A read of a key held as another type answers \-WRONGTYPE over RESP.
+.B get
+on a list, 
+.B llen
+on a string,
+.B hgetall
+on a sorted set: all of them used to answer as though the key were absent \(em
+nil, 0, an empty array \(em which is worse than an error because a caller
+believes it and goes to its database for something the cache already holds.
+The probe runs only where a read has already missed its own container, so a hit
+costs nothing and a store holding one type costs four
+.B empty()
+tests.
+.B mget
+is the exception, and Redis's: it answers nil per wrong\-typed key.
+.PP
+The text protocol keeps its own answers \(em "nil", "end", 0 \(em because
+they are its documented contract and a text client is not a Redis client.
+
 Connect via TCP and send commands (newline-terminated, all lowercase).
 .PP
 .B Strings:

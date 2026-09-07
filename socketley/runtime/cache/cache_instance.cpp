@@ -7517,7 +7517,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 }
 #endif
                 m_stat_get_misses++;
-                rb.append(resp::RESP_NULL, 5);
+                // A miss and a key of another type are two different answers,
+                // and until this was here every read gave the first for both:
+                // GET on a list replied nil, which a caller reads as "not
+                // cached" and acts on.
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 's')))
+                    resp::encode_error_code_into(rb, wrongtype_msg);
+                else
+                    rb.append(resp::RESP_NULL, 5);
             }
             break;
         }
@@ -7649,7 +7656,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, static_cast<int64_t>(m_store.strlen_key(args[1])));
+            {
+                const size_t n = m_store.strlen_key(args[1]);
+                if (SOCKETLEY_UNLIKELY(n == 0 && m_store.holds_other_type(args[1], 's')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_integer_into(rb, static_cast<int64_t>(n));
+            }
             break;
         }
         case fnv1a("getset"):
@@ -7816,7 +7828,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.llen(args[1]));
+            {
+                const int n = m_store.llen(args[1]);
+                if (SOCKETLEY_UNLIKELY(n == 0 && m_store.holds_other_type(args[1], 'l')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_integer_into(rb, n);
+            }
             break;
         }
         case fnv1a("lrange"):
@@ -7826,7 +7843,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int start = 0, stop = 0;
             if (!parse_int_sv(args[2], start) || !parse_int_sv(args[3], stop)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             const auto* deq = m_store.list_ptr(args[1]);
-            if (!deq || deq->empty()) { resp::encode_array_header_into(rb, 0); break; }
+            if (!deq || deq->empty())
+            {
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_array_header_into(rb, 0); break;
+            }
             int len = static_cast<int>(deq->size());
             if (start < 0) start += len;
             if (stop < 0) stop += len;
@@ -7846,6 +7868,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!parse_int_sv(args[2], idx)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             const std::string* val = m_store.lindex(args[1], idx);
             if (val) resp::encode_bulk_into(rb, *val);
+            else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else resp::encode_null_into(rb);
             break;
         }
@@ -7891,7 +7915,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
             double zsc = 0.0;
-            if (!m_store.zscore(args[1], args[2], zsc)) { resp::encode_null_into(rb); break; }
+            if (!m_store.zscore(args[1], args[2], zsc))
+            {
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'z')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_null_into(rb); break;
+            }
             std::string zs;
             append_score_bare(zs, zsc);
             resp::encode_bulk_into(rb, zs);
@@ -7901,7 +7930,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, static_cast<int64_t>(m_store.zcard(args[1])));
+            {
+                const size_t n = m_store.zcard(args[1]);
+                if (SOCKETLEY_UNLIKELY(n == 0 && m_store.holds_other_type(args[1], 'z')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_integer_into(rb, static_cast<int64_t>(n));
+            }
             break;
         }
         case fnv1a("zrank"):
@@ -7994,6 +8028,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            if (SOCKETLEY_UNLIKELY(!m_store.sismember(args[1], args[2])
+                                   && m_store.holds_other_type(args[1], 't')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             resp::encode_integer_into(rb, m_store.sismember(args[1], args[2]) ? 1 : 0);
             break;
         }
@@ -8001,7 +8038,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.scard(args[1]));
+            {
+                const int n = m_store.scard(args[1]);
+                if (SOCKETLEY_UNLIKELY(n == 0 && m_store.holds_other_type(args[1], 't')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_integer_into(rb, n);
+            }
             break;
         }
         case fnv1a("smembers"):
@@ -8009,7 +8051,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const auto* s = m_store.set_ptr(args[1]);
-            if (!s) { resp::encode_array_header_into(rb, 0); break; }
+            if (!s)
+            {
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 't')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_array_header_into(rb, 0); break;
+            }
             resp::encode_array_header_into(rb, static_cast<int>(s->size()));
             for (const auto& member : *s)
                 resp::encode_bulk_into(rb, member);
@@ -8054,6 +8101,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const std::string* val = m_store.hget(args[1], args[2]);
             if (val) resp::encode_bulk_into(rb, *val);
+            else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'h')))
+                resp::encode_error_code_into(rb, wrongtype_msg);
             else resp::encode_null_into(rb);
             break;
         }
@@ -8073,7 +8122,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.hlen(args[1]));
+            {
+                const int n = m_store.hlen(args[1]);
+                if (SOCKETLEY_UNLIKELY(n == 0 && m_store.holds_other_type(args[1], 'h')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_integer_into(rb, n);
+            }
             break;
         }
         case fnv1a("hgetall"):
@@ -8081,7 +8135,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             const auto* h = m_store.hash_ptr(args[1]);
-            if (!h) { resp::encode_array_header_into(rb, 0); break; }
+            if (!h)
+            {
+                if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'h')))
+                { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+                resp::encode_array_header_into(rb, 0); break;
+            }
             resp::encode_array_header_into(rb, static_cast<int>(h->size() * 2));
             for (const auto& [field, val] : *h)
             {
@@ -8448,7 +8507,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             std::string out;
-            m_store.getrange(args[1], s, e, out);
+            if (!m_store.getrange(args[1], s, e, out)
+                && SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 's')))
+            { resp::encode_error_code_into(rb, wrongtype_msg); break; }
             resp::encode_bulk_into(rb, out);
             break;
         }

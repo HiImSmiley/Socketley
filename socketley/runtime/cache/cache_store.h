@@ -231,6 +231,14 @@ public:
     size_t zremrangebyscore(std::string_view key, double min, double max,
                             bool min_incl, bool max_incl);
 
+    // The difference between "not there" and "there as something else", asked
+    // only when a read has already MISSED its own container -- so a hit pays
+    // nothing and a pure single-type store pays four empty() tests.
+    //
+    // `expect` is the container the caller looked in: 's' string, 'l' list,
+    // 't' set, 'h' hash, 'z' sorted set.
+    bool holds_other_type(std::string_view key, char expect) const;
+
     // --- Type / Keys ---
     std::string_view type(std::string_view key) const;
     // returns "string", "list", "set", "hash", or "none"

@@ -1639,6 +1639,22 @@ size_t cache_store::zremrangebyscore(std::string_view key, double min, double ma
     return doomed.size();
 }
 
+// A read that missed its own container has two possible answers, and until
+// this existed every one of them gave the wrong one: GET on a list replied nil,
+// which a caller reads as "not cached" and acts on.  Redis answers WRONGTYPE.
+//
+// The order is the cheap tests first, and every one is guarded by empty() --
+// a cache holding only strings never touches the other four maps.
+bool cache_store::holds_other_type(std::string_view key, char expect) const
+{
+    if (expect != 's' && !m_data.empty()   && m_data.count(key))   return true;
+    if (expect != 'l' && !m_lists.empty()  && m_lists.count(key))  return true;
+    if (expect != 't' && !m_sets.empty()   && m_sets.count(key))   return true;
+    if (expect != 'h' && !m_hashes.empty() && m_hashes.count(key)) return true;
+    if (expect != 'z' && !m_zsets.empty()  && m_zsets.count(key))  return true;
+    return false;
+}
+
 std::string_view cache_store::type(std::string_view key) const
 {
     if (m_data.count(key)) return "string";
