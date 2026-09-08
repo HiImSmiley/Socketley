@@ -1099,64 +1099,101 @@ inline unsigned event_loop::dispatch_ready(bool& got_signal)
     return count;
 }
 
+// ─── one ring entry ─────────────────────────────────────────────────────────
+// The counter is zeroed here and in the sibling below, on the entry that handed
+// the SQEs to the kernel and on no path that only peeked.
+inline int event_loop::enter_get_events()
+{
+    if (m_pending_submissions == 0)
+        return io_uring_get_events(&m_ring);
+    const int rc = io_uring_submit_and_get_events(&m_ring);
+    m_pending_submissions = 0;
+    return rc;
+}
+
+// Like io_uring_wait_cqe_timeout this can come back non-negative with no
+// completion, so the caller tests the pointer and not the return.
+inline int event_loop::enter_wait_timeout(struct io_uring_cqe** cqe,
+                                          struct __kernel_timespec* ts)
+{
+    if (m_pending_submissions == 0)
+        return io_uring_wait_cqe_timeout(&m_ring, cqe, ts);
+    const int rc = io_uring_submit_and_wait_timeout(&m_ring, cqe, 1, ts, nullptr);
+    m_pending_submissions = 0;
+    return rc;
+}
+
 uint32_t event_loop::poll_completions(int timeout_ms)
 {
     if (!m_ring_open)
         return 0;
 
-    if (m_pending_submissions > 0)
+    struct io_uring_cqe* cqe = nullptr;
+    if (io_uring_peek_cqe(&m_ring, &cqe) != 0)
+        cqe = nullptr;
+
+    // A turn that will spin makes its first entry before the credit is
+    // settled, because that entry also carries the queued submissions and one
+    // of them completing inline is a hit the credit is not charged for.
+    uint32_t spun = 0;
+    if (!cqe && m_pending_submissions > 0 && timeout_ms > 0
+        && credit_after_turn(m_last_batch, m_busy_credit) > 0)
     {
-        io_uring_submit(&m_ring);
-        m_pending_submissions = 0;
+        if (enter_get_events() < 0 || io_uring_peek_cqe(&m_ring, &cqe) != 0)
+            cqe = nullptr;
+        spun = 1;
     }
 
-    struct io_uring_cqe* cqe = nullptr;
-    if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
+    if (cqe)
     {
-        if (timeout_ms <= 0)
+        // A completion already posted is dispatched only after the queued
+        // submissions have gone out, or a reply queued by the last dispatch
+        // sits in the ring for as long as completions keep arriving without it.
+        if (m_pending_submissions > 0)
+            enter_get_events();
+    }
+    else if (timeout_ms <= 0)
+    {
+        // Peeking is not enough on its own, because with DEFER_TASKRUN the
+        // kernel only runs the task work that posts completions when the
+        // ring is entered.
+        if (enter_get_events() < 0)
+        { m_last_batch = 0; return 0; }
+        if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
+        { m_last_batch = 0; return 0; }
+    }
+    else
+    {
+        // A turn that drained more than one completion is mid-batch and
+        // its next one is due in well under the sleep it would otherwise
+        // take, so it enters the ring again instead; one completion per
+        // turn is an idle loop and must sleep at once, or a runtime with
+        // no traffic burns a core.
+        // A turn is asked whether the loop is busy exactly when it is
+        // about to sleep, which is the one moment the previous turn is a
+        // poor witness; a credit that a batch refills and every quiet turn
+        // spends answers for the phase instead of the instant.
+        m_busy_credit = credit_after_turn(m_last_batch, m_busy_credit);
+
+        for (uint32_t s = m_busy_credit ? SPIN_BUDGET - spun : 0; s > 0; --s)
         {
-            // Peeking is not enough on its own, because with DEFER_TASKRUN the
-            // kernel only runs the task work that posts completions when the
-            // ring is entered.
-            if (io_uring_get_events(&m_ring) < 0)
-            { m_last_batch = 0; return 0; }
-            if (io_uring_peek_cqe(&m_ring, &cqe) != 0 || !cqe)
-            { m_last_batch = 0; return 0; }
+            // Entering the ring is what runs the task work that posts
+            // completions under DEFER_TASKRUN, so this is a syscall and
+            // not a userspace read of the completion queue.
+            if (enter_get_events() < 0)
+                break;
+            if (io_uring_peek_cqe(&m_ring, &cqe) == 0 && cqe)
+                break;
+            cqe = nullptr;
         }
-        else
+
+        if (!cqe)
         {
-            // A turn that drained more than one completion is mid-batch and
-            // its next one is due in well under the sleep it would otherwise
-            // take, so it enters the ring again instead; one completion per
-            // turn is an idle loop and must sleep at once, or a runtime with
-            // no traffic burns a core.
-            // A turn is asked whether the loop is busy exactly when it is
-            // about to sleep, which is the one moment the previous turn is a
-            // poor witness; a credit that a batch refills and every quiet turn
-            // spends answers for the phase instead of the instant.
-            if (m_last_batch > 1) m_busy_credit = BUSY_CREDIT;
-            else if (m_busy_credit) --m_busy_credit;
-
-            for (uint32_t s = m_busy_credit ? SPIN_BUDGET : 0; s > 0; --s)
-            {
-                // Entering the ring is what runs the task work that posts
-                // completions under DEFER_TASKRUN, so this is a syscall and
-                // not a userspace read of the completion queue.
-                if (io_uring_get_events(&m_ring) < 0)
-                    break;
-                if (io_uring_peek_cqe(&m_ring, &cqe) == 0 && cqe)
-                    break;
-                cqe = nullptr;
-            }
-
-            if (!cqe)
-            {
-                struct __kernel_timespec ts{
-                    timeout_ms / 1000,
-                    static_cast<long long>(timeout_ms % 1000) * 1000000LL };
-                if (io_uring_wait_cqe_timeout(&m_ring, &cqe, &ts) < 0 || !cqe)
-                { m_last_batch = 0; return 0; }
-            }
+            struct __kernel_timespec ts{
+                timeout_ms / 1000,
+                static_cast<long long>(timeout_ms % 1000) * 1000000LL };
+            if (enter_wait_timeout(&cqe, &ts) < 0 || !cqe)
+            { m_last_batch = 0; return 0; }
         }
     }
 

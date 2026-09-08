@@ -347,6 +347,12 @@ private:
     // consumed and leaving the ones behind the stop eventfd for the next pass.
     unsigned dispatch_ready(bool& got_signal);
 
+    // One ring entry each, carrying whatever is queued so a turn with
+    // submissions costs one syscall and not a submit plus the entry it was
+    // about to make anyway.
+    int enter_get_events();
+    int enter_wait_timeout(struct io_uring_cqe** cqe, struct __kernel_timespec* ts);
+
     // Stamp the owner identity and the descriptors named onto a submission and
     // count it, taking the number written into the SQE rather than req->fd,
     // which several helpers set to something else.
@@ -381,6 +387,11 @@ private:
     // leaves at most this many extra ring entries behind it.
     static constexpr uint32_t BUSY_CREDIT = 64;
     uint32_t m_busy_credit{0};
+    // The credit after a turn that found nothing: a batch refills it and a
+    // quiet turn spends one, written once so a turn can read what the
+    // settlement will say before it makes the entry the answer depends on.
+    static constexpr uint32_t credit_after_turn(uint32_t last_batch, uint32_t credit)
+    { return last_batch > 1 ? BUSY_CREDIT : credit > 0 ? credit - 1 : 0; }
     uint64_t m_stat_ownerless{0};
     bool     m_warned_ownerless{false};
     int m_eventfd{-1};
