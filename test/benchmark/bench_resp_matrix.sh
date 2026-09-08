@@ -410,6 +410,17 @@ run_cell() {    # run_cell TOPO KEYSPACE COMMAND...
         pids+=($!)
     done
     for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    # A cell that measures nothing leaves no trace otherwise: the rate is
+    # parsed out of these files and they are overwritten by the next cell.
+    # BENCH_MATRIX_KEEP=<NAME> keeps one row's raw client output, which is the
+    # only place a client that died on a server error says so.
+    if [ -n "${BENCH_MATRIX_KEEP:-}" ] && [ "${CELL_NAME:-}" = "$BENCH_MATRIX_KEEP" ]; then
+        local kd=${BENCH_MATRIX_KEEP_DIR:-/tmp/skl-cell-keep}
+        mkdir -p "$kd"
+        for ((i = 0; i < PROCS; i++)); do
+            cp -f "$TMPD/c$i.out" "$kd/${CELL_NAME}-p${p_i:-x}-c$i.out" 2>/dev/null
+        done
+    fi
     t1=$(date +%s%N)
 
     for ((i = 0; i < PROCS; i++)); do
@@ -575,8 +586,17 @@ if [ "${S_N:-0}" != "${R_N:-1}" ]; then
     log_warn "the two arms hold different key counts — every read below compares a hit against a miss"
 fi
 
-printf '%s\n' "$CMDS" | grep -v '^\s*$' | while IFS='|' read -r name range tmpl cell_ops; do
+# Comments as well as blank lines.  They were not dropped, so every `#` line in
+# the table was read as a command row with an empty template -- and
+# redis-benchmark with no command runs its ENTIRE default suite.  Four comment
+# lines therefore became four cells that hammered both arms with twenty-odd
+# unrelated benchmarks until the 120s cell timeout killed them, five passes,
+# both arms, writing redis-benchmark's own keys into both caches on the way.
+# They printed as rows: "# No spaces in either script..." with redis at
+# 2,124,210 and socketley at 0.
+printf '%s\n' "$CMDS" | grep -vE '^[[:space:]]*(#|$)' | while IFS='|' read -r name range tmpl cell_ops; do
     export CELL_OPS="${cell_ops:-}"
+    export CELL_NAME="$name"
     sv=""; rv=""; sc=""; rc=""
     for ((pass = 1; pass <= PASSES; pass++)); do
         if (( pass % 2 )); then

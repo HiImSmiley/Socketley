@@ -35,7 +35,8 @@ if not un or not sh:
     sys.exit(f"leer: unsharded={len(un)} sharded={len(sh)}")
 
 READ = lambda d: [v for v in d.values() if 'not readable' not in v['verdict']
-                                       and 'client-bound' not in v['verdict']]
+                                       and 'client-bound' not in v['verdict']
+                                       and not (v['skl'] == 0 and v['redis'] == 0)]
 med  = lambda d: statistics.median(v['ratio'] for v in READ(d)) if READ(d) else 0
 worst= lambda d: min((v['ratio'] for v in READ(d)), default=0)
 
@@ -50,6 +51,15 @@ def cls(v):
 num = lambda v: f'{v:,}'.replace(',', ' ') if v is not None else '—'
 def cell(d, key):
     if not d: return '<td class="n">—</td><td class="n">—</td><td class="r">—</td><td class="sp">—</td>'
+    # A cell where BOTH arms measured nothing is not a result and must not be
+    # drawn like one: "0.00x" beside a 900% spread reads as "infinitely slower"
+    # when it means "the client never ran".  Redis is not affected by our code,
+    # so two zeroes together are always the instrument.
+    if d['skl'] == 0 and d['redis'] == 0:
+        return ('<td class="n dim">—</td><td class="n dim">—</td>'
+                '<td class="r dim" title="no measurement: both arms returned '
+                'nothing, so this is the harness and not the servers">not measured</td>'
+                '<td class="sp dim">—</td>')
     unread = 'not readable' in d['verdict'] or 'client-bound' in d['verdict']
     rcls = 'dim' if unread else cls(d['ratio'])
     sp = f"{d['spread']*100:.0f}%"
@@ -68,9 +78,11 @@ stamp = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
 un_unread = sum(1 for v in un.values() if 'not readable' in v['verdict'])
 sh_unread = sum(1 for v in sh.values() if 'not readable' in v['verdict'])
 sh_low = sorted([(v['ratio'], c) for c, v in sh.items()
-                 if v['ratio'] < 1.30 and 'not readable' not in v['verdict']])
+                 if v['ratio'] < 1.30 and 'not readable' not in v['verdict']
+                 and not (v['skl'] == 0 and v['redis'] == 0)])
 un_low = sorted([(v['ratio'], c) for c, v in un.items()
-                 if v['ratio'] < 1.30 and 'not readable' not in v['verdict']])
+                 if v['ratio'] < 1.30 and 'not readable' not in v['verdict']
+                 and not (v['skl'] == 0 and v['redis'] == 0)])
 
 doc = f"""<!doctype html><html lang="de"><meta charset="utf-8">
 <title>socketley vs Redis — jedes RESP-Kommando</title>

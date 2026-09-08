@@ -2020,6 +2020,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
         conn->closing = true;
 
+    // QUIT is honoured HERE, after the flush and not inside the command, for
+    // the reason the protocol-error path had to learn: flush_responses drops a
+    // closing connection's buffer, so a command that set the flag itself would
+    // be answered into a buffer nobody sends.  The write-drain path closes it.
+    if (SOCKETLEY_UNLIKELY(conn->quit_after_flush))
+        conn->closing = true;
+
     // close_notify is applied here because the read that carried it can carry
     // the last command ahead of it, and then one flush covers everything the
     // record layer owes -- outside flush_responses(), which returns early on a
@@ -4733,7 +4740,15 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             rb.append("ok\n", 3);
             return;
         }
-        if (conn->in_multi && mh != fnv1a("exec"))
+        // RESET and QUIT run even inside MULTI, where everything else is
+        // queued.  RESET queued is RESET not happening: a pooling client sends
+        // it precisely because it does not know what state a connection is in,
+        // and if a stray MULTI is that state then the one command meant to
+        // clear it would be filed behind the mess.  redis-server answers
+        // +RESET at once and then "EXEC without MULTI" -- the transaction is
+        // gone, not queued.  Both protocols, because both have the queue.
+        if (conn->in_multi && mh != fnv1a("exec")
+                           && mh != fnv1a("reset") && mh != fnv1a("quit"))
         {
             // A cap, because a client that never sends EXEC would otherwise
             // park as much memory on this connection as it can type.
@@ -5942,6 +5957,21 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("size"):
         {
             append_int_nl(rb, m_store.size());
+            break;
+        }
+
+        // Here as well as in RESP, because the text protocol is a session a
+        // person types into and leaving it should not need a signal.
+        case fnv1a("quit"):
+        {
+            rb.append("ok\n", 3);
+            conn->quit_after_flush = true;
+            break;
+        }
+        case fnv1a("reset"):
+        {
+            reset_connection_state(conn);
+            rb.append("ok\n", 3);
             break;
         }
 
@@ -7477,7 +7507,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_simple_into(rb, "OK");
             return;
         }
-        if (conn->in_multi && mh != fnv1a("exec"))
+        // RESET and QUIT run even inside MULTI, where everything else is
+        // queued.  RESET queued is RESET not happening: a pooling client sends
+        // it precisely because it does not know what state a connection is in,
+        // and if a stray MULTI is that state then the one command meant to
+        // clear it would be filed behind the mess.  redis-server answers
+        // +RESET at once and then "EXEC without MULTI" -- the transaction is
+        // gone, not queued.  Both protocols, because both have the queue.
+        if (conn->in_multi && mh != fnv1a("exec")
+                           && mh != fnv1a("reset") && mh != fnv1a("quit"))
         {
             std::string framed;
             rebuild_resp(framed, args, argc);
@@ -8608,6 +8646,25 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_bulk_into(rb, k);
             break;
         }
+        // Every client library sends QUIT before it drops a connection, and
+        // was answered "unknown command" for it -- harmless in effect and a
+        // line in somebody's error log every time a pool recycled a socket.
+        case fnv1a("quit"):
+        {
+            rb.append("+OK\r\n", 5);
+            conn->quit_after_flush = true;
+            break;
+        }
+        // RESET returns a connection to the state it had on accept, which is
+        // what a pooling client needs before handing it to the next caller: a
+        // socket that is still inside a MULTI, still watching a key or still
+        // subscribed is not a fresh one, and the caller cannot tell.
+        case fnv1a("reset"):
+        {
+            reset_connection_state(conn);
+            rb.append("+RESET\r\n", 8);
+            break;
+        }
         case fnv1a("subscribe"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
@@ -9373,6 +9430,23 @@ void cache_instance::script_command(client_connection* conn, std::string_view ra
 // written between the WATCH and the EXEC.  That is what makes a
 // compare-and-set loop possible, and it is the usual reason to reach for MULTI
 // at all -- without it a transaction here is a batch.
+
+// Everything a connection accumulated for its own session, dropped in one
+// place.  Two protocols reach RESET, and a piece of state cleared in one of
+// them and not the other is a connection that looks fresh and is not.
+void cache_instance::reset_connection_state(client_connection* conn)
+{
+    unwatch_all(conn);
+    drop_blocked(conn->fd);
+    conn->blocked = false;
+    m_store.unsubscribe_all(conn->fd);
+    m_store.punsubscribe_all(conn->fd);
+    conn->sub_count    = 0;
+    conn->in_multi     = false;
+    conn->multi_broken = false;
+    conn->multi_queue.clear();
+    conn->multi_bytes  = 0;
+}
 
 void cache_instance::watch_keys(client_connection* conn, std::string_view* args, int argc)
 {

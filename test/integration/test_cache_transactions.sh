@@ -92,6 +92,37 @@ if command -v redis-cli >/dev/null 2>&1; then
 
     OUT=$(printf 'MULTI\nDISCARD\nEXEC\n' | redis-cli -p "$PORT" 2>&1 | tr '\n' '|')
     case "$OUT" in "OK|OK|"*"without MULTI"*) ok ;; *) bad "RESP: DISCARD then EXEC" "got '$OUT'" ;; esac
+
+    # ── RESET, which is why a pooling client can reuse a socket ──────────────
+    #
+    # RESET has to run INSIDE a transaction, where every other command is
+    # queued.  That is the whole point of it: a client returning a connection
+    # to its pool sends RESET precisely because it does not know what state the
+    # connection is in, and if a stray MULTI is that state then queueing the
+    # one command meant to clear it files it behind the mess.  Checked on the
+    # wire because the ORDER of the replies is the assertion -- +RESET has to
+    # arrive before EXEC is refused, not after it.
+    RAW=$(printf '*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$2\r\nrq\r\n$1\r\n1\r\n*1\r\n$5\r\nRESET\r\n*1\r\n$4\r\nEXEC\r\n' \
+          | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
+    case "$RAW" in "+OK|+QUEUED|+RESET|-ERR"*) ok ;;
+        *) bad "RESP: RESET runs inside MULTI and discards it" "got '$RAW'" ;; esac
+    eq "RESP: and the queued write never happened" \
+       "$(redis-cli -p "$PORT" GET rq 2>&1 | tr '\n' '|')" "|"
+
+    # A subscription is session state too, and a connection still holding one
+    # is not a fresh one.
+    RAW=$(printf '*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n*1\r\n$5\r\nRESET\r\n*2\r\n$3\r\nGET\r\n$2\r\nrq\r\n' \
+          | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
+    case "$RAW" in *"+RESET|"*'$-1'*) ok ;;
+        *) bad "RESP: RESET leaves subscribe mode" "got '$RAW'" ;; esac
+
+    # QUIT is what every client library sends when it drops a connection, and
+    # it was answered "unknown command".  The +OK has to reach the wire BEFORE
+    # the close -- a connection marked closing has its buffer dropped, which is
+    # the shape that silenced every protocol error.
+    RAW=$(printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n' \
+          | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
+    eq "RESP: QUIT is answered and then closes" "$RAW" "+PONG|+OK|"
 else
     echo "  (redis-cli absent — the RESP arm did not run)"
 fi

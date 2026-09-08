@@ -113,6 +113,10 @@ struct client_connection
     // The keys this connection asked WATCH about, and whether any of them has
     // been written since.  Kept on the connection so a disconnect takes them
     // with it, and named in m_watchers so a write can find the watcher.
+    // QUIT is answered and THEN closed, in that order: a connection marked
+    // closing has its response buffer dropped, so setting it here would throw
+    // the +OK away -- the same shape that silenced every protocol error.
+    bool                     quit_after_flush{false};
     std::vector<std::string> watched;
     bool watch_dirty{false};
 
@@ -186,6 +190,7 @@ struct client_connection
         is_follower = false;
         follower_refused = false;
         blocked = false;
+        quit_after_flush = false;
         watched.clear();
         watch_dirty = false;
         sub_count = 0;
@@ -705,6 +710,7 @@ private:
     // CLIENTS instead, where that client is one entry.
     std::unordered_set<int> m_watching;
 
+    void reset_connection_state(client_connection* conn);
     void watch_keys(client_connection* conn, std::string_view* args, int argc);
     void unwatch_all(client_connection* conn);
     void drop_watches(int fd);

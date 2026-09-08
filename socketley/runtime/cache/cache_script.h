@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <sol/sol.hpp>
+#include "../../shared/transparent_string.h"
 
 namespace socketley {
 
@@ -71,13 +72,36 @@ private:
 
     bool                m_ready{false};
     sol::state          m_lua;
-    std::unordered_map<std::string, std::string> m_scripts;
+    // Transparent too: known() and body_of() take a view and used to build a
+    // std::string for every EVALSHA just to look it up.
+    std::unordered_map<std::string, std::string,
+                       string_hash, string_equal> m_scripts;
+
+    // The same pair the other way round, so load() can answer without
+    // digesting.  Kept in step with m_scripts: both are filled in load() and
+    // both are cleared in flush().
+    std::unordered_map<std::string, std::string,
+                       string_hash, string_equal> m_sha_of;
 
     // The compiled chunk, kept under the same SHA as the source.  Compiling on
     // every call is what made EVAL five times slower than Redis at it: Redis
     // compiles once and calls thereafter, and measured here `EVAL return(1) 0`
     // ran at 160,452/s against 787,482.
-    std::unordered_map<std::string, sol::protected_function> m_compiled;
+    // Keyed by the BODY and not by its SHA.  Keying by SHA meant hashing the
+    // script on every single EVAL -- EVP_MD_CTX_new allocates an OpenSSL
+    // context, then forty characters go into a std::string one at a time,
+    // which is why std::string::push_back was the top symbol in the profile.
+    // The body is already in hand and a string_view hash of it costs nothing.
+    // The SHA is still computed where it is actually wanted: SCRIPT LOAD, and
+    // EVALSHA's lookup.
+    std::unordered_map<std::string, sol::protected_function,
+                       string_hash, string_equal> m_compiled;
+
+    // Built once and refilled per call.  Two fresh Lua tables per EVAL is two
+    // allocations and two global-table writes for something whose shape almost
+    // never changes; `EVAL return(1) 0` created two empty ones every time.
+    sol::table m_keys_tbl;
+    sol::table m_argv_tbl;
 
     // What redis.call reaches, set for the duration of one eval.  A member
     // rather than a capture, so the `redis` table is built once at start-up

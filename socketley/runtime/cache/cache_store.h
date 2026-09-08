@@ -12,31 +12,7 @@
 #include <chrono>
 #include "zskiplist.h"
 
-// Transparent hash for heterogeneous lookup (avoids string copies on find/erase)
-struct string_hash
-{
-    using is_transparent = void;
-
-    size_t operator()(std::string_view sv) const noexcept
-    {
-        return std::hash<std::string_view>{}(sv);
-    }
-
-    size_t operator()(const std::string& s) const noexcept
-    {
-        return std::hash<std::string_view>{}(s);
-    }
-};
-
-struct string_equal
-{
-    using is_transparent = void;
-
-    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept
-    {
-        return lhs == rhs;
-    }
-};
+#include "../../shared/transparent_string.h"
 
 using string_map = std::unordered_map<std::string, std::string, string_hash, string_equal>;
 using list_map = std::unordered_map<std::string, std::deque<std::string>, string_hash, string_equal>;

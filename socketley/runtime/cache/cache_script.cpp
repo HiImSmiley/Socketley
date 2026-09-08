@@ -35,25 +35,44 @@ std::string cache_script_engine::sha1_hex(std::string_view in)
 
 std::string cache_script_engine::load(std::string_view body)
 {
+    // EVAL registers its body on every call, so a client that never uses
+    // EVALSHA still paid for one SHA1 per command: an OpenSSL context
+    // allocated and freed, then forty characters appended one at a time.  That
+    // was 5% of the worker in the profile, under a name -- push_back -- that
+    // says nothing about scripting at all.
+    //
+    // The body is the thing we have; the digest is a name for it.  Naming it
+    // twice gives the same answer, so the second time is a lookup.
+    auto seen = m_sha_of.find(body);
+    if (seen != m_sha_of.end())
+        return seen->second;
+
     std::string sha = sha1_hex(body);
-    if (!sha.empty()) m_scripts.emplace(sha, std::string(body));
+    if (!sha.empty())
+    {
+        m_scripts.emplace(sha, std::string(body));
+        m_sha_of.emplace(std::string(body), sha);
+    }
     return sha;
 }
 
 bool cache_script_engine::known(std::string_view sha) const
 {
-    return m_scripts.find(std::string(sha)) != m_scripts.end();
+    return m_scripts.find(sha) != m_scripts.end();
 }
 
 const std::string* cache_script_engine::body_of(std::string_view sha) const
 {
-    auto it = m_scripts.find(std::string(sha));
+    auto it = m_scripts.find(sha);
     return it == m_scripts.end() ? nullptr : &it->second;
 }
 
 void cache_script_engine::flush()
 {
     m_scripts.clear();
+    // The reverse index goes with it, or SCRIPT FLUSH would leave load()
+    // answering with the digest of a script the engine no longer holds.
+    m_sha_of.clear();
     // And the compiled forms, or SCRIPT FLUSH would leave the memory it was
     // asked to release.
     m_compiled.clear();
@@ -339,12 +358,29 @@ bool cache_script_engine::eval(std::string_view body,
 {
     ensure_state();
 
-    sol::table KEYS = m_lua.create_table(static_cast<int>(keys.size()), 0);
-    for (size_t i = 0; i < keys.size(); ++i) KEYS[i + 1] = std::string(keys[i]);
-    sol::table ARGV = m_lua.create_table(static_cast<int>(argv.size()), 0);
-    for (size_t i = 0; i < argv.size(); ++i) ARGV[i + 1] = std::string(argv[i]);
-    m_lua["KEYS"] = KEYS;
-    m_lua["ARGV"] = ARGV;
+    // Refilled, not rebuilt.  The tables and their two global bindings are made
+    // once; a call only writes the elements it needs and clears whatever the
+    // previous script left past its own end.  Views go in directly -- sol
+    // pushes a Lua string of that length, so the std::string copy per key was
+    // an allocation for nothing.
+    if (!m_keys_tbl.valid())
+    {
+        m_keys_tbl = m_lua.create_table();
+        m_argv_tbl = m_lua.create_table();
+        m_lua["KEYS"] = m_keys_tbl;
+        m_lua["ARGV"] = m_argv_tbl;
+    }
+    // The tail is measured on the table and not remembered from last time: a
+    // script may write KEYS[5] itself, and trusting our own count would leave
+    // that entry visible to the next script.  Scripts already share globals
+    // here -- there is no metatable guarding them, which Redis does have -- so
+    // this does not close that door, it just does not open it wider.
+    const size_t prev_k = m_keys_tbl.size();
+    const size_t prev_a = m_argv_tbl.size();
+    for (size_t i = 0; i < keys.size(); ++i) m_keys_tbl[i + 1] = keys[i];
+    for (size_t i = keys.size(); i < prev_k; ++i) m_keys_tbl[i + 1] = sol::lua_nil;
+    for (size_t i = 0; i < argv.size(); ++i) m_argv_tbl[i + 1] = argv[i];
+    for (size_t i = argv.size(); i < prev_a; ++i) m_argv_tbl[i + 1] = sol::lua_nil;
 
     // For the duration of this call only: the closures in the `redis` table
     // read it, and it is cleared on the way out so a stale one cannot be used
@@ -353,9 +389,10 @@ bool cache_script_engine::eval(std::string_view body,
     struct call_guard { const command_fn** slot; ~call_guard() { *slot = nullptr; } }
         cg{ &m_call };
 
-    // Compiled once and kept under its SHA, which is what Redis does too.
-    const std::string sha = sha1_hex(body);
-    auto cached = m_compiled.find(sha);
+    // Looked up by the body itself.  The SHA it used to be keyed by cost an
+    // OpenSSL context allocation and a forty-character string build on every
+    // call, to arrive at a name for something we were already holding.
+    auto cached = m_compiled.find(body);
     if (cached == m_compiled.end())
     {
         // Named so a compile error points at "user_script" the way Redis's
@@ -367,7 +404,8 @@ bool cache_script_engine::eval(std::string_view body,
             err = shape_lua_error(e.what());
             return false;
         }
-        cached = m_compiled.emplace(sha, lr.get<sol::protected_function>()).first;
+        cached = m_compiled.emplace(std::string(body),
+                                    lr.get<sol::protected_function>()).first;
     }
 
     // Armed for this call, and NOT hoisted out of it: this is what stops a
