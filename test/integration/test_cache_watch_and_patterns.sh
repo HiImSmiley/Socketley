@@ -142,32 +142,62 @@ elif mode == 'patterns':
     print(json.dumps(got[0].decode('latin1')))
 
 elif mode == 'repeat':
-    # 200,000 WATCHes of ONE key on one connection.  Both readings are taken
-    # here, with the connection still OPEN: the vector is freed on close, so a
-    # reading taken afterwards would measure nothing and pass either way.
+    # 200,000 WATCHes of ONE key, and then 200,000 of DISTINCT keys, and the
+    # answer is the RATIO of what each cost.
+    #
+    # An absolute threshold on the one-key figure is what this was, and it does
+    # not survive a second allocator: it read +0 kB alone and +3944 kB inside
+    # the full suite under the sanitizer, on the same binary, because RSS counts
+    # RESIDENT PAGES and the 200k commands still allocate for parsing and
+    # replies whether or not a watch is retained.  Under memory pressure those
+    # pages are reclaimed and faulted back and the number grows with nothing
+    # retained at all.
+    #
+    # The distinct-key burst is the control: it is the same command, the same
+    # count and the same churn, with 200,000 entries actually kept.  Whatever
+    # the allocator charges for the churn it charges to both, so the difference
+    # is the retention -- which is the thing this test is about.
+    #
+    # ONE KEY FIRST, and not the other way round: the distinct burst leaves the
+    # allocator holding blocks it has freed, and a one-key burst run afterwards
+    # would be served out of that pool without growing RSS -- passing whether or
+    # not the dedupe works.
     def rss(pid):
         with open('/proc/%s/status' % pid) as f:
             for ln in f:
                 if ln.startswith('VmRSS'): return int(ln.split()[1])
         return -1
+
+    def burst(keyfn, n):
+        # The reading is taken with the connection still OPEN, because the
+        # watch set is freed on close and a reading taken afterwards would
+        # measure nothing and pass either way.
+        s = conn(port)
+        seen = 0; sent = 0
+        while sent < n:
+            s.sendall(b''.join(enc(['WATCH', keyfn(sent + i)]) for i in range(1000)))
+            sent += 1000
+            s.settimeout(4)
+            try:
+                while True:
+                    x = s.recv(1 << 20)
+                    if not x: break
+                    seen += x.count(b'+OK')
+                    if seen >= sent: break
+            except socket.timeout: break
+        return s, seen
+
     wpid = sys.argv[3]
     r0 = rss(wpid)
-    s = conn(port)
-    buf = enc(['WATCH','einer']) * 1000
-    seen = 0
-    for _ in range(200):
-        s.sendall(buf)
-        s.settimeout(4)
-        try:
-            while True:
-                x = s.recv(1 << 20)
-                if not x: break
-                seen += x.count(b'+OK')
-                if seen % 1000 == 0: break
-        except socket.timeout: break
-    r1 = rss(wpid)
-    s.close()
-    print(json.dumps({'acked': seen, 'grew': r1 - r0}))
+    sa, acked = burst(lambda i: 'einer', 200000)
+    ra = rss(wpid)
+    sa.close(); time.sleep(0.3)
+    rb0 = rss(wpid)
+    sb, acked_many = burst(lambda i: 'viele:%d' % i, 200000)
+    rb = rss(wpid)
+    sb.close()
+    print(json.dumps({'acked': acked, 'acked_many': acked_many,
+                      'grew_one': ra - r0, 'grew_many': rb - rb0}))
 
 elif mode == 'punsub':
     s=conn(port)
@@ -246,11 +276,23 @@ else
     REP=$(python3 "$PY" repeat "$P" "$WPID" 2>/dev/null)
     case "$REP" in *'"acked": 200000'*|*'"acked":200000'*) ok "200k repeated WATCHes all answered" ;;
         *) bad "repeat" "not every WATCH was answered" "got: ${REP:0:80}" ;; esac
-    GROWTH=$(printf '%s' "$REP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("grew",99999))' 2>/dev/null || echo 99999)
-    # Undeduped this was ~5000 kB for this many; 2048 is far outside the noise
-    # of an idle worker and far under what the defect produced.
-    if [ "$GROWTH" -lt 2048 ]; then ok "and held one entry, not 200000 (RSS +${GROWTH} kB)"
-    else bad "repeat" "watched keys accumulate" "RSS grew ${GROWTH} kB over 200k WATCHes of one key"; fi
+    ONE=$(printf '%s' "$REP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("grew_one",99999))' 2>/dev/null || echo 99999)
+    MANY=$(printf '%s' "$REP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("grew_many",0))' 2>/dev/null || echo 0)
+    # The ratio and not either number on its own.  200,000 distinct keys are
+    # what 200,000 retained watches cost in whatever allocator is running, and
+    # one key deduped should cost a small fraction of it; both bursts pay the
+    # same parsing and reply churn, so it cancels.  Four is a wide margin --
+    # measured, the two differ by more than an order of magnitude -- and a
+    # margin this wide is what makes the check mean the same thing in Release
+    # and under the sanitizer, which an absolute threshold did not.
+    if [ "$MANY" -lt 1024 ]; then
+        ok "SKIP growth check: the control burst grew only ${MANY} kB, so there is no scale to read against"
+    elif [ "$((ONE * 4))" -lt "$MANY" ]; then
+        ok "and held one entry, not 200000 (one key +${ONE} kB against +${MANY} kB for distinct keys)"
+    else
+        bad "repeat" "watched keys accumulate" \
+            "one key grew ${ONE} kB and 200k distinct keys grew ${MANY} kB -- deduped they should differ by much more"
+    fi
 fi
 # The guarantee must survive all that repetition.
 W2=$(py watch)
