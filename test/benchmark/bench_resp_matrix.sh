@@ -630,6 +630,12 @@ printf '%s\n' "$CMDS" | grep -vE '^[[:space:]]*(#|$)' | while IFS='|' read -r na
     # code path and benchmark identically when asked directly came out of this
     # table at 0.91x against the other's 1.53x, three passes each.
     read -r ratio rlo rhi <<<"$(paired_ratio "$sv" "$rv")"
+    # Said out loud as it happens.  The table is sorted and therefore printed
+    # only at the end, so for most of an hour the run looks identical to a
+    # hung one -- and twice now that had to be settled with ps instead of by
+    # reading the output.  Progress goes to stderr so it cannot land in a log
+    # somebody later parses as a result row.
+    printf '  [%2d] %-16s %8s\n' "$((++ROW_N))" "$name" "${ratio}x" >&2
     spread=$(awk -v m="$ratio" -v lo="$rlo" -v hi="$rhi" \
         'BEGIN{ printf "%.2f", (m > 0 ? (hi - lo) / m : 9) }')
     # The ceiling first, because a ratio taken at it is a statement about

@@ -815,6 +815,17 @@ private:
                     uint32_t owner, bool resp);
     // The verdict on a multi-key command that arrived on the per-shard port,
     // where true means it has been answered here and the caller must stop.
+    // Pointer and count, because the RESP spelling already HAS the keys in a
+    // row: EXISTS, DEL, MGET and TOUCH name them in args[1..n], so building a
+    // vector to look at them was one heap allocation per command on the
+    // cluster port -- which is the port every sharded client connects to.
+    bool cluster_multi_verdict(client_connection* conn,
+                               const std::string_view* keys, size_t n,
+                               bool resp);
+    // MSET's keys are every other argument, so that one still needs a buffer;
+    // it is reused rather than rebuilt.
+    std::vector<std::string_view> m_multi_keys;
+
     bool cluster_multi_verdict(client_connection* conn,
                                const std::vector<std::string_view>& keys,
                                bool resp);

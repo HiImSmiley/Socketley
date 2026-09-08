@@ -4188,12 +4188,20 @@ bool cache_instance::cluster_multi_verdict(client_connection* conn,
                                            const std::vector<std::string_view>& keys,
                                            bool resp)
 {
+    return cluster_multi_verdict(conn, keys.data(), keys.size(), resp);
+}
+
+bool cache_instance::cluster_multi_verdict(client_connection* conn,
+                                           const std::string_view* keys, size_t nkeys,
+                                           bool resp)
+{
     bool any_local = false, any_foreign = false, mixed_foreign = false;
     uint32_t       foreign_owner = 0;
     std::string_view foreign_key;
 
-    for (const std::string_view k : keys)
+    for (size_t ki = 0; ki < nkeys; ++ki)
     {
+        const std::string_view k = keys[ki];
         const uint32_t o = cache_shard_of(k, m_shard_n);
         if (o == m_shard_i)
         {
@@ -4335,12 +4343,19 @@ bool cache_instance::explode_resp_multi(client_connection* conn, uint32_t h,
     // with the vector built only on this port.
     if (SOCKETLEY_UNLIKELY(conn->cluster_port))
     {
-        std::vector<std::string_view> ks;
-        ks.reserve(n);
-        for (size_t i = 0; i < n; ++i)
-            ks.push_back(is_mset ? args[1 + i * 2] : args[1 + i]);
-        if (cluster_multi_verdict(conn, ks, true))
-            return true;
+        if (!is_mset)
+        {
+            // Straight at the arguments: no copy, no allocation.
+            if (cluster_multi_verdict(conn, args + 1, n, true))
+                return true;
+        }
+        else
+        {
+            m_multi_keys.clear();
+            for (size_t i = 0; i < n; ++i) m_multi_keys.push_back(args[1 + i * 2]);
+            if (cluster_multi_verdict(conn, m_multi_keys.data(), n, true))
+                return true;
+        }
     }
 
     // Same shortcut as the text spelling, walking the arguments in place
