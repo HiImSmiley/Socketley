@@ -347,6 +347,50 @@ void cache_script_engine::ensure_state()
     redis["LOG_NOTICE"] = 2; redis["LOG_WARNING"] = 3;
     m_lua["redis"]  = redis;
     m_lua["server"] = redis;      // Redis 7's second name for the same table
+
+    // KEYS and ARGV are bound HERE, before the globals are sealed below, and
+    // refilled per call thereafter.  Binding them lazily would mean the first
+    // eval writing a global into a table that no longer accepts one.
+    m_keys_tbl = m_lua.create_table();
+    m_argv_tbl = m_lua.create_table();
+    m_lua["KEYS"] = m_keys_tbl;
+    m_lua["ARGV"] = m_argv_tbl;
+
+    // ─── AND THEN THE GLOBALS ARE SEALED ────────────────────────────────────
+    //
+    // One interpreter serves every script on this cache, so its global table
+    // is shared: `x = 1` in one script was readable by the next one, and by
+    // every script after it for the life of the process.  That is a channel
+    // between two clients that neither asked for -- a script can leave a value
+    // behind and another can find it -- and it is state that no FLUSH clears.
+    //
+    // Redis guards this with a metatable and so does this now: writing a
+    // global raises, naming the variable.  Reads are left alone, because an
+    // undefined global reading as nil is ordinary Lua and blocking the write
+    // is what closes the channel.
+    //
+    // The cost is that `function f() end` at the top level of a script is a
+    // global and now fails; `local function f() end` is the spelling, and it
+    // is the spelling Redis requires too.
+    // Two locks, because the metatable alone is not one.  rawset goes straight
+    // past __newindex -- measured: `rawset(_G, "sneak", 1)` stored, and the
+    // next script read it back -- and table.insert would reach the same table
+    // by number.  Every one of those routes needs a REFERENCE to the globals
+    // table, so the name is taken away first and the metatable then covers the
+    // ordinary assignment that needs no name at all.
+    //
+    // getfenv and setfenv are already nil in this sandbox, and load, loadstring
+    // and require with them, so there is no second way to name it.
+    m_lua.script(
+        "local g = _G\n"
+        "rawset(g, \"_G\", nil)\n"          // no name for the table any more
+        "local mt = {}\n"
+        "mt.__newindex = function(_, n, _)\n"
+        "  error(\"Script attempted to create global variable '\" ..\n"
+        "        tostring(n) .. \"'\", 2)\n"
+        "end\n"
+        "mt.__metatable = false\n"           // and the lid cannot be lifted
+        "setmetatable(g, mt)\n");
 }
 
 bool cache_script_engine::eval(std::string_view body,
@@ -363,13 +407,6 @@ bool cache_script_engine::eval(std::string_view body,
     // previous script left past its own end.  Views go in directly -- sol
     // pushes a Lua string of that length, so the std::string copy per key was
     // an allocation for nothing.
-    if (!m_keys_tbl.valid())
-    {
-        m_keys_tbl = m_lua.create_table();
-        m_argv_tbl = m_lua.create_table();
-        m_lua["KEYS"] = m_keys_tbl;
-        m_lua["ARGV"] = m_argv_tbl;
-    }
     // The tail is measured on the table and not remembered from last time: a
     // script may write KEYS[5] itself, and trusting our own count would leave
     // that entry visible to the next script.  Scripts already share globals

@@ -171,7 +171,39 @@ want "eval loads as well as runs" "wert" \
 want "so evalsha finds it afterwards" ":1" \
   '[["SCRIPT","EXISTS","a5260dd66ce02462c5b5231c727b3f7772c0bcc5"]]'
 
-echo "--- 7. sharded: a script is routed by the keys it declares ---"
+echo "--- 7. the globals are sealed, so one script cannot leave state for the next ---"
+# One interpreter serves every script on a cache, so its global table is
+# shared.  Before this, `leaked = 42` in one client's script was readable by
+# every later script on that cache, for the life of the process, and no FLUSH
+# cleared it -- a channel between two clients that neither opened.
+want "writing a global is refused, and names the variable" "leaked" \
+  '[["EVAL","leaked = 42","0"]]'
+want "and nothing was left behind" "nil" \
+  '[["EVAL","return tostring(leaked)","0"]]'
+# The seal must not reach the things a script legitimately uses.
+want "locals still work" ":8" \
+  '[["EVAL","local a = 7 return a + 1","0"]]'
+want "KEYS is still bound" "hello" \
+  '[["EVAL","return KEYS[1]","1","hello"]]'
+want "ARGV is still bound" "world" \
+  '[["EVAL","return ARGV[1]","0","world"]]'
+want "and redis.call still reaches the store" "+OK" \
+  '[["EVAL","return redis.call(\"set\",KEYS[1],\"v\")","1","sealed:k"]]'
+# The metatable alone is NOT the guard: rawset walks straight past __newindex,
+# and it did -- rawset(_G,"sneak",1) stored and the next script read it back.
+# table.insert(_G, x) is the same hole by number.  Every route needs a
+# REFERENCE to the globals table, so the name is taken away as well, and these
+# three now fail on the argument rather than on the permission.
+want "rawset cannot reach the globals" "table expected" \
+  '[["EVAL","rawset(_G, \"sneak\", 1) return 1","0"]]'
+want "nor can table.insert" "table expected" \
+  '[["EVAL","table.insert(_G, \"x\") return 1","0"]]'
+want "nor setmetatable" "table expected" \
+  '[["EVAL","setmetatable(_G, {}) return 1","0"]]'
+want "and no value survived any of them" "nil" \
+  '[["EVAL","return tostring(sneak)","0"]]'
+
+echo "--- 8. sharded: a script is routed by the keys it declares ---"
 "$BIN" create cache sc_s -p "$PS" --shards 4 --cluster -s >/dev/null 2>&1
 for _ in $(seq 1 80); do
     [ "$(ss -ltn 2>/dev/null | awk -v a=$((PS+1)) -v d=$((PS+4)) -F: '{n=$NF+0; if(n>=a&&n<=d) c++} END{print c+0}')" -ge 4 ] && break

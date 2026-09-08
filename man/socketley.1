@@ -4232,9 +4232,21 @@ is refused with an error that names the limit, and the connection is closed --
 the stream is framed, but the arguments were never stored, so it cannot
 continue from a message it did not take.
 .PP
-Lua scripts share one interpreter state and therefore share globals, which
-Redis guards with a metatable and this does not. A script that sets a global
-can be read by the next script on the same cache.
+Lua scripts share one interpreter state, so its globals are sealed: writing a
+global raises an error naming the variable, and the globals table itself is
+unnamed, so rawset and table.insert cannot reach it either. Use
+.B local
+for everything, including functions \(em
+.B "local function f() end"
+rather than
+.BR "function f() end" ,
+which is what Redis requires too.
+.PP
+One difference from Redis remains, deliberately: reading an undefined global
+returns nil here, as ordinary Lua does, where Redis raises. Blocking the WRITE
+is what closes the channel between two clients; erroring on the read only
+catches typos, and it would break a script that tests a global to see whether
+it is there.
 .RE
 .PP
 Example with redis-cli:
