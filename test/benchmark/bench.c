@@ -1864,6 +1864,15 @@ struct http_args {
     int                  keepalive;
     int                  thread_success;
     int                  thread_failed;
+    /* Per-thread samples, merged by the parent.  These were `lat_init(&r, 1)`
+     * -- a log of capacity one, so every HTTP number this program has ever
+     * printed came with an empty percentile block.  A throughput that is 24%
+     * apart between two proxies says nothing about WHERE the difference is,
+     * and a p50 next to a p99 separates a per-request cost from a timer:
+     * measured here, socketley's http-close arm delivered 10,914 and 15,406
+     * req/s in two runs at an identical 0.53 proxy cores, which is waiting and
+     * not working -- and nothing in the output could say what it waited on. */
+    struct latency_log   lat;
 };
 
 static void *http_worker(void *arg)
@@ -1881,9 +1890,26 @@ static void *http_worker(void *arg)
     pthread_barrier_wait(a->barrier);
     if (a->keepalive && fd < 0) return NULL;
 
+    /* The warm-up is measured in whatever unit ends the run: a timed run is
+     * given an operation cap and not an estimate, so "the first 10% of
+     * num_ops" would be ten million requests that never happen and the
+     * percentiles would come out of an empty log.  Same reasoning as the
+     * server round-trip loop. */
+    int64_t wstart = time_ns();
+    int64_t warm_until = (cfg->duration_ms > 0)
+        ? wstart + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL
+        : 0;
+    int warm_ops = (cfg->duration_ms > 0) ? 0 : cfg->num_ops * cfg->warmup_pct / 100;
+
     int local = 0;
     for (int i = 0; i < cfg->num_ops; i++) {
         if (deadline_passed()) break;
+
+        /* The whole cycle, connect included, because that is the operation the
+         * rate counts: in http-close every request pays a connect and two
+         * teardowns, and a latency that started after the connect would
+         * describe a shape nobody ran. */
+        int64_t t0 = time_ns();
 
         if (!a->keepalive) {
             fd = tcp_connect(cfg->host, cfg->port);
@@ -1895,6 +1921,9 @@ static void *http_worker(void *arg)
         int keep = 1;
         if (send_all(fd, a->request, a->req_len) != a->req_len) { a->thread_failed++; break; }
         if (!http_read_response(&r, fd, &keep))                 { a->thread_failed++; break; }
+        int64_t t1 = time_ns();
+        if ((warm_until && t1 >= warm_until) || (!warm_until && i >= warm_ops))
+            lat_record(&a->lat, t1 - t0);
         local++;
 
         if (!a->keepalive) {
@@ -1917,9 +1946,20 @@ static void *http_worker(void *arg)
 static struct run_result bench_http(struct bench_config *cfg, int keepalive)
 {
     struct run_result r = {0};
-    lat_init(&r.latencies, 1);
 
     int nc = cfg->num_clients > 0 ? cfg->num_clients : 1;
+    /* Bounded ACROSS the threads and not per thread.  A time-boxed run is
+     * given an operation cap of a hundred million, so "num_ops minus the
+     * warm-up" per thread is MAX_LATENCIES apiece -- 16 MB times thirty-two
+     * threads for a run that will produce a few thousand samples each.  The
+     * whole set is capped at MAX_LATENCIES instead, which is already the
+     * number of samples the percentiles are willing to look at. */
+    int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
+    if (per_thread < 1) per_thread = 1;
+    if (per_thread > MAX_LATENCIES / nc) per_thread = MAX_LATENCIES / nc;
+    if (per_thread < 1) per_thread = 1;
+    lat_init(&r.latencies, nc * per_thread);
+
     char request[512];
     int req_len = snprintf(request, sizeof request,
         "GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n",
@@ -1939,6 +1979,7 @@ static struct run_result bench_http(struct bench_config *cfg, int keepalive)
         args[i].keepalive = keepalive;
         args[i].thread_success = 0;
         args[i].thread_failed = 0;
+        lat_init(&args[i].lat, per_thread);
         pthread_create(&threads[i], NULL, http_worker, &args[i]);
     }
 
@@ -1948,7 +1989,12 @@ static struct run_result bench_http(struct bench_config *cfg, int keepalive)
     int64_t end = time_ns();
 
     int total = 0, failed = 0;
-    for (int i = 0; i < nc; i++) { total += args[i].thread_success; failed += args[i].thread_failed; }
+    for (int i = 0; i < nc; i++) {
+        total += args[i].thread_success;
+        failed += args[i].thread_failed;
+        lat_merge(&r.latencies, &args[i].lat);
+    }
+    for (int i = 0; i < nc; i++) lat_free(&args[i].lat);
 
     pthread_barrier_destroy(&barrier);
     free(threads);
