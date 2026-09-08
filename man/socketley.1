@@ -4163,19 +4163,85 @@ The cache supports the RESP2 wire protocol for compatibility with Redis clients
 connection's first byte is '*', or can be forced with
 .BR \-\-resp .
 .PP
-Supported Redis commands (case-insensitive): SET (with EX, PX, NX, XX options),
-GET, DEL, EXISTS, PING, DBSIZE, INCR, DECR, INCRBY, DECRBY, APPEND, STRLEN,
-GETSET, MGET, MSET, TYPE, KEYS, SETNX, SETEX, PSETEX, SCAN,
-LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX,
-SADD, SREM, SISMEMBER, SCARD, SMEMBERS,
-HSET, HGET, HDEL, HLEN, HGETALL,
-EXPIRE, TTL, PERSIST, PEXPIRE, PTTL, EXPIREAT, PEXPIREAT,
-SUBSCRIBE, UNSUBSCRIBE, PUBLISH.
+Supported Redis commands, case-insensitive. A command not listed here is
+answered with an error naming it, never silently ignored.
+.PP
+.B Strings
+.RS 2
+SET (EX, PX, NX, XX, KEEPTTL, GET), GET, GETSET, GETDEL, GETRANGE, SUBSTR,
+SETRANGE, SETNX, SETEX, PSETEX, MGET, MSET, APPEND, STRLEN, INCR, DECR,
+INCRBY, DECRBY, INCRBYFLOAT
+.RE
+.PP
+.B Keys
+.RS 2
+DEL, UNLINK, EXISTS, TOUCH, TYPE, KEYS, SCAN, DBSIZE, EXPIRE, PEXPIRE,
+EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST
+.RE
+.PP
+.B Lists
+.RS 2
+LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LREM, LTRIM, LINSERT,
+LMOVE, RPOPLPUSH, BLPOP, BRPOP
+.RE
+.PP
+.B Sets
+.RS 2
+SADD, SREM, SISMEMBER, SMISMEMBER, SCARD, SMEMBERS, SPOP, SRANDMEMBER, SSCAN
+.RE
+.PP
+.B Hashes
+.RS 2
+HSET, HSETNX, HGET, HMSET, HMGET, HDEL, HLEN, HEXISTS, HKEYS, HVALS, HGETALL,
+HSTRLEN, HINCRBY, HSCAN
+.RE
+.PP
+.B Sorted sets
+.RS 2
+ZADD, ZREM, ZSCORE, ZCARD, ZCOUNT, ZINCRBY, ZRANK, ZREVRANK, ZRANGE,
+ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZPOPMIN, ZPOPMAX,
+ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZSCAN
+.RE
+.PP
+.B Pub/Sub
+.RS 2
+SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
+.RE
+.PP
+.B Transactions
+.RS 2
+MULTI, EXEC, DISCARD, WATCH, UNWATCH
+.RE
+.PP
+.B Scripting
+.RS 2
+EVAL, EVALSHA, SCRIPT LOAD, SCRIPT EXISTS, SCRIPT FLUSH
+.RE
+.PP
+.B Connection and server
+.RS 2
+PING, ECHO, AUTH, HELLO, SELECT, QUIT, RESET, CLIENT (GETNAME, SETNAME, ID,
+REPLY, SETINFO), CONFIG GET/SET, COMMAND, INFO, CLUSTER
+.RE
+.PP
+.B Where the answers differ from Redis on purpose
+.RS 2
+The RESP array limit is 1024 arguments, not 1024*1024: args[] is a stack array
+and a million views would be sixteen megabytes of it. A command over the limit
+is refused with an error that names the limit, and the connection is closed --
+the stream is framed, but the arguments were never stored, so it cannot
+continue from a message it did not take.
+.PP
+Lua scripts share one interpreter state and therefore share globals, which
+Redis guards with a metatable and this does not. A script that sets a global
+can be read by the next script on the same cache.
+.RE
 .PP
 Example with redis-cli:
 .nf
 redis-cli -p 9000 SET mykey myval
 redis-cli -p 9000 GET mykey
+redis-cli -p 9000 EVAL "return redis.call('GET', KEYS[1])" 1 mykey
 redis-cli -p 9000 SUBSCRIBE news
 .fi
 .SS Database Backend
