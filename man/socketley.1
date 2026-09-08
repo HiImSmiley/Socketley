@@ -4175,8 +4175,18 @@ INCRBY, DECRBY, INCRBYFLOAT
 .PP
 .B Keys
 .RS 2
-DEL, UNLINK, EXISTS, TOUCH, TYPE, KEYS, SCAN, DBSIZE, EXPIRE, PEXPIRE,
-EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST
+DEL, UNLINK, EXISTS, TOUCH, TYPE, KEYS, SCAN, DBSIZE, RANDOMKEY, RENAME,
+RENAMENX, COPY, FLUSHALL, FLUSHDB, EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL,
+PTTL, EXPIRETIME, PEXPIRETIME, PERSIST
+.PP
+RENAME carries the key's expiry with it, and so does COPY \(em renaming or
+copying is not a way to make an expiring key permanent. RENAME and COPY name
+two keys, so on a sharded cache both must belong to one shard and keys that do
+not are refused with
+.BR \-CROSSSLOT ;
+a key cannot be half-moved. FLUSHALL and FLUSHDB are the same command here,
+because this cache has one keyspace and no SELECT-able databases to leave
+behind.
 .RE
 .PP
 .B Lists

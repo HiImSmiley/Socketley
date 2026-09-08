@@ -116,16 +116,22 @@ enum class cache_cmd_class : uint8_t
 
 // A multi-key command is EXPLODED into one per key, so reassembly is
 // concatenation; splitting per shard would need a reply-shape table.
-// Commands that read several whole collections and answer one thing.  They
-// cannot be split per key -- an intersection computed on two shards separately
-// is not an intersection -- so every key must belong to one shard.
-constexpr bool cache_is_set_algebra(uint32_t h)
+// Commands that name several keys and cannot be split between shards.  Set
+// algebra because an intersection computed on two shards separately is not an
+// intersection; RENAME and COPY because a key cannot be half-moved.  Every key
+// must belong to one shard, and keys that do not are refused with -CROSSSLOT.
+//
+// Named for the ROUTING RULE and not for sets: the first version of this was
+// called cache_is_set_algebra and RENAME wanted the same decision two hours
+// later.
+constexpr bool cache_needs_one_shard(uint32_t h)
 {
     switch (h)
     {
         case fnv1a("sinter"):      case fnv1a("sunion"):      case fnv1a("sdiff"):
         case fnv1a("sinterstore"): case fnv1a("sunionstore"): case fnv1a("sdiffstore"):
         case fnv1a("smove"):
+        case fnv1a("rename"):      case fnv1a("renamenx"):    case fnv1a("copy"):
             return true;
         default:
             return false;
@@ -293,6 +299,7 @@ constexpr bool cache_is_read_only(uint32_t h)
     switch (h)
     {
         case fnv1a("get"):        case fnv1a("mget"):
+        case fnv1a("expiretime"): case fnv1a("pexpiretime"):
         case fnv1a("strlen"):     case fnv1a("getrange"):
         case fnv1a("substr"):     case fnv1a("exists"):
         case fnv1a("touch"):      case fnv1a("type"):

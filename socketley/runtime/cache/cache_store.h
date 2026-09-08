@@ -101,6 +101,33 @@ public:
     // 1 moved, 0 not a member, -1 type conflict.
     int smove(std::string_view src, std::string_view dst, std::string_view member);
 
+    // ─── Whole-key operations ───────────────────────────────────────────────
+    //
+    // A key lives in exactly one of the five containers and may carry an entry
+    // in the expiry map, so moving or copying one has to find it first and
+    // take its deadline with it -- Redis carries the TTL through RENAME and,
+    // for COPY, does not.
+    //
+    // 1 done, 0 refused because the destination exists (the NX forms), -2 the
+    // source is not there.
+    int rename_key(std::string_view src, std::string_view dst, bool nx);
+    int copy_key(std::string_view src, std::string_view dst, bool replace);
+
+    // Any key at all, empty when the store is.  One container is picked and
+    // then one entry inside it, which is not uniform across containers -- and
+    // neither is Redis, which samples its own table.
+    std::string_view random_key() const;
+
+    // The absolute deadline in seconds or milliseconds since the epoch: -1 for
+    // a key with no expiry, -2 for a key that is not there, which is TTL's own
+    // pair of answers and what a client already switches on.
+    int64_t expire_time(std::string_view key, bool millis) const;
+
+    // Empties the store and its counters.  FLUSHALL and FLUSHDB are the same
+    // thing here because there is one keyspace: this cache has no SELECT-able
+    // databases, so there is no second one to leave behind.
+    void flush_all();
+
     // --- Hashes ---
     bool hset(std::string_view key, std::string_view field, std::string_view val);
     const std::string* hget(std::string_view key, std::string_view field) const;

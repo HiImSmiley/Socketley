@@ -5497,6 +5497,71 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             replicate_command(line);
             break;
         }
+        // Here as well as in RESP for the same reason as the set forms below:
+        // replication ships a TEXT line, and a follower that cannot rename
+        // keeps a key its leader no longer has.
+        case fnv1a("rename"):
+        case fnv1a("renamenx"):
+        case fnv1a("copy"):
+        {
+            if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
+            std::vector<std::string_view> ks;
+            std::string_view walk = args;
+            while (!walk.empty())
+            {
+                const size_t sp = walk.find(' ');
+                const std::string_view w = (sp == std::string_view::npos) ? walk : walk.substr(0, sp);
+                if (!w.empty()) ks.push_back(w);
+                if (sp == std::string_view::npos) break;
+                walk = walk.substr(sp + 1);
+            }
+            if (ks.size() < 2) { rb.append("usage: rename src dst\n", 22); return; }
+            const uint32_t th = fnv1a_lower(cmd);
+            int r;
+            if (th == fnv1a("copy"))
+            {
+                bool replace = false;
+                for (size_t i = 2; i < ks.size(); ++i)
+                    if (fnv1a_lower(ks[i]) == fnv1a("replace")) replace = true;
+                r = m_store.copy_key(ks[0], ks[1], replace);
+            }
+            else
+                r = m_store.rename_key(ks[0], ks[1], th == fnv1a("renamenx"));
+            if (r == -2)      rb.append("error: no such key\n", 19);
+            else if (r == 0)  rb.append("no\n", 3);
+            else            { rb.append("ok\n", 3); replicate_command(line); }
+            break;
+        }
+        case fnv1a("flushall"):
+        case fnv1a("flushdb"):
+        {
+            if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
+            m_store.flush_all();
+            m_has_ttl_keys = false;
+            rb.append("ok\n", 3);
+            replicate_command(line);
+            break;
+        }
+        case fnv1a("randomkey"):
+        {
+            const std::string_view k = m_store.random_key();
+            if (k.empty()) rb.append("nil\n", 4);
+            else { rb.append(k.data(), k.size()); rb.push_back('\n'); }
+            break;
+        }
+        case fnv1a("expiretime"):
+        case fnv1a("pexpiretime"):
+        {
+            auto [key, rest] = extract_key(args);
+            (void)rest;
+            if (key.empty()) key = args;
+            if (key.empty()) { rb.append("usage: expiretime key\n", 22); return; }
+            rb.append(std::to_string(
+                m_store.expire_time(key, fnv1a_lower(cmd) == fnv1a("pexpiretime"))));
+            rb.push_back('\n');
+            break;
+        }
+
         // Here as well as in RESP, because replication ships the command as a
         // TEXT line: a follower that cannot read `sinterstore d a b` holds a
         // destination the leader has and it does not.
@@ -7349,11 +7414,14 @@ void cache_instance::process_resp_command(client_connection* conn,
     // computed on two shards separately is not an intersection.  Same rule as
     // EVAL therefore -- one shard owns all of it or the command is refused --
     // and Redis Cluster answers CROSSSLOT for exactly this reason.
-    if (SOCKETLEY_UNLIKELY(cache_is_set_algebra(h)) && argc >= 2)
+    if (SOCKETLEY_UNLIKELY(cache_needs_one_shard(h)) && argc >= 2)
     {
-        // SMOVE names two keys and then a member; the others are all keys, and
-        // for the STORE forms that includes the destination.
-        const int nk = (h == fnv1a("smove")) ? 2 : argc - 1;
+        // SMOVE names two keys and then a member; RENAME and COPY name exactly
+        // two and COPY may carry REPLACE after them; the set forms are all
+        // keys, and for the STORE forms that includes the destination.
+        const int nk = (h == fnv1a("smove") || h == fnv1a("rename")
+                     || h == fnv1a("renamenx") || h == fnv1a("copy"))
+                     ? 2 : argc - 1;
         if (route_all_keys_one_shard(conn, args, argc, 1, nk))
             return;
     }
@@ -8453,6 +8521,73 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_bulk_into(rb, member);
             break;
         }
+        case fnv1a("flushall"):
+        case fnv1a("flushdb"):
+        {
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            // ASYNC and SYNC are accepted and both mean the same here: the
+            // store is freed inline, and a client that asks for ASYNC gets the
+            // answer it expects rather than an argument error.
+            m_store.flush_all();
+            m_has_ttl_keys = false;
+            repl(args, argc);
+            resp::encode_ok_into(rb);
+            break;
+        }
+
+        // ─── Whole-key operations ───────────────────────────────────────
+        case fnv1a("rename"):
+        case fnv1a("renamenx"):
+        {
+            if (argc != 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (m_has_ttl_keys) { m_store.check_expiry(args[1]); m_store.check_expiry(args[2]); }
+            const bool nx = (cmd_hash == fnv1a("renamenx"));
+            const int r = m_store.rename_key(args[1], args[2], nx);
+            // Redis answers an error and not a zero for a missing source, and a
+            // client distinguishes the two: "there was nothing to rename" is
+            // not "the destination was in the way".
+            if (r == -2) { resp::encode_error_into(rb, "no such key"); break; }
+            repl(args, argc);
+            if (nx) resp::encode_integer_into(rb, r);
+            else    resp::encode_ok_into(rb);
+            break;
+        }
+        case fnv1a("copy"):
+        {
+            if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            bool replace = false;
+            for (int i = 3; i < argc; ++i)
+                if (fnv1a_lower(args[i]) == fnv1a("replace")) replace = true;
+            if (m_has_ttl_keys) { m_store.check_expiry(args[1]); m_store.check_expiry(args[2]); }
+            const int r = m_store.copy_key(args[1], args[2], replace);
+            // A missing source is 0 here and not an error: COPY answers whether
+            // it copied, which is the shape a client tests.
+            if (r > 0) repl(args, argc);
+            resp::encode_integer_into(rb, r > 0 ? 1 : 0);
+            break;
+        }
+        case fnv1a("randomkey"):
+        {
+            // Answered by whichever shard was asked, as Redis Cluster does: a
+            // key drawn from the whole ring would need every shard to be asked
+            // and one of them to be picked, and no client expects that.
+            const std::string_view k = m_store.random_key();
+            if (k.empty()) resp::encode_null_into(rb);
+            else           resp::encode_bulk_into(rb, k);
+            break;
+        }
+        case fnv1a("expiretime"):
+        case fnv1a("pexpiretime"):
+        {
+            if (argc != 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            resp::encode_integer_into(rb,
+                m_store.expire_time(args[1], cmd_hash == fnv1a("pexpiretime")));
+            break;
+        }
+
         // ─── Set algebra ────────────────────────────────────────────────
         //
         // The reading forms and the STORE forms share their body, because the

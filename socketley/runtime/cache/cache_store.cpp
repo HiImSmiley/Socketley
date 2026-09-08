@@ -726,6 +726,129 @@ int cache_store::smove(std::string_view src, std::string_view dst,
     return 1;
 }
 
+// ─── Whole-key operations ───
+
+namespace
+{
+// Moves or copies one key between two maps of the same kind, leaving the
+// source alone when `keep` is set.  Written once as a template because doing
+// it five times by hand is five chances to forget one container -- which has
+// already happened twice in this file, to dump_commands and to holds_other_type.
+template <typename Map>
+bool move_one(Map& m, std::string_view src, std::string_view dst, bool keep)
+{
+    auto it = m.find(src);
+    if (it == m.end())
+        return false;
+    if (keep)
+    {
+        auto copy = it->second;                 // before the insert can rehash
+        m.insert_or_assign(std::string(dst), std::move(copy));
+    }
+    else
+    {
+        auto held = std::move(it->second);
+        m.erase(it);
+        m.insert_or_assign(std::string(dst), std::move(held));
+    }
+    return true;
+}
+}  // namespace
+
+int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
+{
+    if (!exists(src))
+        return -2;
+    if (src == dst)
+        return nx ? 0 : 1;      // Redis answers OK and changes nothing
+    if (nx && exists(dst))
+        return 0;
+
+    // The destination goes first whatever it held: RENAME replaces it outright
+    // and does not answer WRONGTYPE for a destination of another type.
+    del(dst);
+
+    int64_t deadline_ms = -1;
+    if (auto e = m_expiry.find(src); e != m_expiry.end())
+    {
+        deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          e->second.time_since_epoch()).count();
+        m_expiry.erase(e);
+    }
+    drop_lru(src);
+
+    if (!move_one(m_data,   src, dst, false)
+     && !move_one(m_lists,  src, dst, false)
+     && !move_one(m_sets,   src, dst, false)
+     && !move_one(m_hashes, src, dst, false)
+     && !move_one(m_zsets,  src, dst, false))
+        return -2;
+
+    // The deadline travels with the key, which is what Redis does: renaming is
+    // not a way to make an expiring key permanent.
+    if (deadline_ms >= 0)
+        m_expiry.insert_or_assign(std::string(dst),
+            std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)));
+    return 1;
+}
+
+int cache_store::copy_key(std::string_view src, std::string_view dst, bool replace)
+{
+    if (!exists(src))
+        return -2;
+    if (src == dst)
+        return 0;
+    if (exists(dst))
+    {
+        if (!replace)
+            return 0;
+        del(dst);
+    }
+    if (!move_one(m_data,   src, dst, true)
+     && !move_one(m_lists,  src, dst, true)
+     && !move_one(m_sets,   src, dst, true)
+     && !move_one(m_hashes, src, dst, true)
+     && !move_one(m_zsets,  src, dst, true))
+        return -2;
+    // The deadline is copied too.  This first read "COPY copies the value, not
+    // the deadline", which sounded right and is not what redis-server does --
+    // the comparison in the test caught it: the copy came back with TTL -1
+    // there and 500 in Redis.  A copy that outlives its original is a key that
+    // never goes away.
+    if (auto e = m_expiry.find(src); e != m_expiry.end())
+        m_expiry.insert_or_assign(std::string(dst), e->second);
+    return 1;
+}
+
+std::string_view cache_store::random_key() const
+{
+    if (!m_data.empty())   return m_data.begin()->first;
+    if (!m_lists.empty())  return m_lists.begin()->first;
+    if (!m_sets.empty())   return m_sets.begin()->first;
+    if (!m_hashes.empty()) return m_hashes.begin()->first;
+    if (!m_zsets.empty())  return m_zsets.begin()->first;
+    return {};
+}
+
+int64_t cache_store::expire_time(std::string_view key, bool millis) const
+{
+    if (!exists(key))
+        return -2;
+    auto e = m_expiry.find(key);
+    if (e == m_expiry.end())
+        return -1;
+    // m_expiry holds a steady_clock point, which has no epoch a client could
+    // use, so it is turned back into wall time through the offset between the
+    // two clocks measured now.
+    const auto now_steady = std::chrono::steady_clock::now();
+    const auto now_wall   = std::chrono::system_clock::now();
+    const auto delta      = e->second - now_steady;
+    const auto when       = now_wall + delta;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        when.time_since_epoch()).count();
+    return millis ? ms : ms / 1000;
+}
+
 // ─── Hashes ───
 
 bool cache_store::hset(std::string_view key, std::string_view field, std::string_view val)
@@ -2282,20 +2405,30 @@ bool cache_store::load(std::string_view path, size_t offset)
     return load_v1(file, first_key_len);
 }
 
-bool cache_store::load_v2(const char* data, size_t size)
+// Everything, including the counters.  Extracted from load_v2, which had the
+// only copy: a second hand-written clear is a second chance to leave
+// m_list_elems standing while the lists it counts are gone, and the memory
+// figure would then never come back to zero.
+void cache_store::flush_all()
 {
     m_data.clear();
     m_lists.clear();
     m_sets.clear();
     m_hashes.clear();
     m_zsets.clear();
-    m_list_elems = 0;
-    m_set_elems = 0;
-    m_hash_fields = 0;
+    m_list_elems   = 0;
+    m_set_elems    = 0;
+    m_hash_fields  = 0;
+    m_zset_members = 0;
     m_expiry.clear();
     m_current_memory = 0;
     m_lru_order.clear();
     m_lru_map.clear();
+}
+
+bool cache_store::load_v2(const char* data, size_t size)
+{
+    flush_all();
 
     auto now = std::chrono::steady_clock::now();
     const char* p = data;
