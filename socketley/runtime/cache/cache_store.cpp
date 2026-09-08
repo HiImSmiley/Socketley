@@ -626,6 +626,106 @@ const set_inner* cache_store::set_ptr(std::string_view key) const
     return &it->second;
 }
 
+// ─── Set algebra ───
+
+// Shared shape: every key must be a set or absent, and a key that is neither
+// stops the whole command.  Checked BEFORE any work, so a WRONGTYPE never
+// arrives after a partial answer.
+int cache_store::sinter(const std::string_view* keys, size_t n,
+                        std::vector<std::string>& out) const
+{
+    if (n == 0) return 0;
+    std::vector<const set_inner*> sets;
+    sets.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (holds_other_type(keys[i], 't')) return -1;
+        const set_inner* sp = set_ptr(keys[i]);
+        if (!sp || sp->empty()) return 0;      // one empty set empties the lot
+        sets.push_back(sp);
+    }
+    // Walk the smallest, probe the rest: the cost is then the smallest set
+    // times the number of sets, not the first one named.
+    size_t smallest = 0;
+    for (size_t i = 1; i < sets.size(); ++i)
+        if (sets[i]->size() < sets[smallest]->size()) smallest = i;
+    for (const auto& m : *sets[smallest])
+    {
+        bool in_all = true;
+        for (size_t i = 0; i < sets.size() && in_all; ++i)
+            if (i != smallest && sets[i]->find(m) == sets[i]->end()) in_all = false;
+        if (in_all) out.push_back(m);
+    }
+    return 0;
+}
+
+int cache_store::sunion(const std::string_view* keys, size_t n,
+                        std::vector<std::string>& out) const
+{
+    set_inner seen;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (holds_other_type(keys[i], 't')) return -1;
+        const set_inner* sp = set_ptr(keys[i]);
+        if (!sp) continue;
+        for (const auto& m : *sp)
+            if (seen.insert(m).second) out.push_back(m);
+    }
+    return 0;
+}
+
+int cache_store::sdiff(const std::string_view* keys, size_t n,
+                       std::vector<std::string>& out) const
+{
+    if (n == 0) return 0;
+    for (size_t i = 0; i < n; ++i)
+        if (holds_other_type(keys[i], 't')) return -1;
+    const set_inner* first = set_ptr(keys[0]);
+    if (!first) return 0;
+    for (const auto& m : *first)
+    {
+        bool elsewhere = false;
+        for (size_t i = 1; i < n && !elsewhere; ++i)
+        {
+            const set_inner* sp = set_ptr(keys[i]);
+            if (sp && sp->find(m) != sp->end()) elsewhere = true;
+        }
+        if (!elsewhere) out.push_back(m);
+    }
+    return 0;
+}
+
+size_t cache_store::sreplace(std::string_view dest, std::vector<std::string>&& members)
+{
+    // Gone first, so a destination that was a string or a list stops being one
+    // -- Redis replaces the key outright and does not answer WRONGTYPE here.
+    del(dest);
+    if (members.empty())
+        return 0;                       // an empty result leaves no key behind
+    set_inner s;
+    s.reserve(members.size());
+    for (auto& m : members) s.insert(std::move(m));
+    const size_t n = s.size();
+    m_sets.emplace(std::string(dest), std::move(s));
+    return n;
+}
+
+int cache_store::smove(std::string_view src, std::string_view dst,
+                       std::string_view member)
+{
+    if (holds_other_type(src, 't') || holds_other_type(dst, 't')) return -1;
+    auto it = m_sets.find(src);
+    if (it == m_sets.end()) return 0;
+    auto m = it->second.find(member);
+    if (m == it->second.end()) return 0;
+    // Taken from the source only once the destination has it, so a failure
+    // between the two cannot lose the member.
+    sadd(dst, member);
+    it->second.erase(m);
+    if (it->second.empty()) m_sets.erase(it);
+    return 1;
+}
+
 // ─── Hashes ───
 
 bool cache_store::hset(std::string_view key, std::string_view field, std::string_view val)

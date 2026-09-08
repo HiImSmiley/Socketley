@@ -819,6 +819,9 @@ private:
     // row: EXISTS, DEL, MGET and TOUCH name them in args[1..n], so building a
     // vector to look at them was one heap allocation per command on the
     // cluster port -- which is the port every sharded client connects to.
+    bool route_all_keys_one_shard(client_connection* conn,
+                                  std::string_view* args, int argc,
+                                  int key_first, int key_count);
     bool cluster_multi_verdict(client_connection* conn,
                                const std::string_view* keys, size_t n,
                                bool resp);

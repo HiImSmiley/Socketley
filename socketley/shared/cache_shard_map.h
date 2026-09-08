@@ -116,6 +116,22 @@ enum class cache_cmd_class : uint8_t
 
 // A multi-key command is EXPLODED into one per key, so reassembly is
 // concatenation; splitting per shard would need a reply-shape table.
+// Commands that read several whole collections and answer one thing.  They
+// cannot be split per key -- an intersection computed on two shards separately
+// is not an intersection -- so every key must belong to one shard.
+constexpr bool cache_is_set_algebra(uint32_t h)
+{
+    switch (h)
+    {
+        case fnv1a("sinter"):      case fnv1a("sunion"):      case fnv1a("sdiff"):
+        case fnv1a("sinterstore"): case fnv1a("sunionstore"): case fnv1a("sdiffstore"):
+        case fnv1a("smove"):
+            return true;
+        default:
+            return false;
+    }
+}
+
 enum class cache_merge : uint8_t
 {
     single,     // one part, verbatim.  Every command routed by step one.

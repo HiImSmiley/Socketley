@@ -4184,6 +4184,58 @@ static constexpr size_t MAX_PARTS_PER_COMMAND = 65536;
 // -MOVED, or refused with -CROSSSLOT -- because -MOVED for a command with keys
 // on both sides would bounce the client between two shards until it ran out of
 // redirects.
+// One shard owns every key, or the command does not run.  Extracted from EVAL,
+// which had it first, because set algebra needs exactly the same decision and
+// a second copy of it is a second place for the two to drift apart.
+//
+// Returns true when the command has been dealt with -- refused, corrected with
+// -MOVED, or sent whole to the shard that owns it -- and false when the caller
+// should carry on and serve it locally.
+bool cache_instance::route_all_keys_one_shard(client_connection* conn,
+                                              std::string_view* args, int argc,
+                                              int key_first, int key_count)
+{
+    if (key_count <= 0 || key_first + key_count > argc)
+        return false;
+
+    const uint32_t owner = cache_shard_of(args[key_first], m_shard_n);
+    for (int i = 1; i < key_count; ++i)
+        if (cache_shard_of(args[key_first + i], m_shard_n) != owner)
+        {
+            run_in_reply_order(conn, [&] {
+                resp::encode_error_code_into(conn->response_buf,
+                    "CROSSSLOT Keys in request don't hash to the same slot");
+            });
+            return true;
+        }
+
+    if (owner == m_shard_i)
+        return false;
+
+    // The per-shard port corrects the client's map rather than crossing,
+    // exactly as a single-key command does there.
+    if (conn->cluster_port)
+    {
+        run_in_reply_order(conn, [&] { emit_moved(conn, args[key_first], owner, true); });
+        return true;
+    }
+    if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
+    {
+        run_in_reply_order(conn, [&] {
+            emit_unrouted(conn, args[0], true,
+                          "runs against keys another shard owns, and "
+                          "this path cannot wait for it");
+        });
+        return true;
+    }
+    const uint32_t slot = slot_open(conn, true, cache_merge::single, 1);
+    std::string raw;
+    resp::encode_array_header_into(raw, argc);
+    for (int i = 0; i < argc; ++i) resp::encode_bulk_into(raw, args[i]);
+    route_part(conn, owner, slot, 0, raw, true);
+    return true;
+}
+
 bool cache_instance::cluster_multi_verdict(client_connection* conn,
                                            const std::vector<std::string_view>& keys,
                                            bool resp)
@@ -5443,6 +5495,64 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             { rb.append("error: type conflict\n", 21); return; }
             append_score(rb, zout);
             replicate_command(line);
+            break;
+        }
+        // Here as well as in RESP, because replication ships the command as a
+        // TEXT line: a follower that cannot read `sinterstore d a b` holds a
+        // destination the leader has and it does not.
+        case fnv1a("sinter"):      case fnv1a("sunion"):      case fnv1a("sdiff"):
+        case fnv1a("sinterstore"): case fnv1a("sunionstore"): case fnv1a("sdiffstore"):
+        case fnv1a("smove"):
+        {
+            std::vector<std::string_view> ps;
+            std::string_view walk = args;
+            while (!walk.empty())
+            {
+                const size_t sp = walk.find(' ');
+                const std::string_view w = (sp == std::string_view::npos) ? walk : walk.substr(0, sp);
+                if (!w.empty()) ps.push_back(w);
+                if (sp == std::string_view::npos) break;
+                walk = walk.substr(sp + 1);
+            }
+            const uint32_t th = fnv1a_lower(cmd);
+            if (th == fnv1a("smove"))
+            {
+                if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
+                if (ps.size() != 3) { rb.append("usage: smove src dst member\n", 28); return; }
+                const int r = m_store.smove(ps[0], ps[1], ps[2]);
+                if (r < 0)      rb.append("error: type conflict\n", 21);
+                else if (r == 0) rb.append("no\n", 3);
+                else            { rb.append("ok\n", 3); replicate_command(line); }
+                break;
+            }
+            const bool store = (th == fnv1a("sinterstore") || th == fnv1a("sunionstore")
+                                                           || th == fnv1a("sdiffstore"));
+            if (store && m_mode == cache_mode_readonly)
+            { rb.append("denied: readonly mode\n", 22); return; }
+            const size_t first = store ? 1u : 0u;
+            if (ps.size() < first + 1)
+            { rb.append("usage: sinter key [key ...]\n", 28); return; }
+
+            std::vector<std::string> out;
+            const size_t n = ps.size() - first;
+            int rc;
+            if (th == fnv1a("sinter") || th == fnv1a("sinterstore"))
+                rc = m_store.sinter(ps.data() + first, n, out);
+            else if (th == fnv1a("sunion") || th == fnv1a("sunionstore"))
+                rc = m_store.sunion(ps.data() + first, n, out);
+            else
+                rc = m_store.sdiff(ps.data() + first, n, out);
+            if (rc < 0) { rb.append("error: type conflict\n", 21); break; }
+
+            if (!store)
+            {
+                for (const auto& m : out) { rb.append(m); rb.push_back('\n'); }
+                rb.append("end\n", 4);
+                break;
+            }
+            const size_t card = m_store.sreplace(ps[0], std::move(out));
+            replicate_command(line);
+            rb.append(std::to_string(card)); rb.push_back('\n');
             break;
         }
         case fnv1a("sadd"):
@@ -7230,43 +7340,22 @@ void cache_instance::process_resp_command(client_connection* conn,
     {
         int64_t nkeys = 0;
         if (argc >= 3 && parse_int_sv(args[2], nkeys) && nkeys > 0 && nkeys <= argc - 3)
-        {
-            const uint32_t owner = cache_shard_of(args[3], m_shard_n);
-            for (int i = 1; i < nkeys; ++i)
-                if (cache_shard_of(args[3 + i], m_shard_n) != owner)
-                {
-                    run_in_reply_order(conn, [&] {
-                        resp::encode_error_code_into(conn->response_buf,
-                            "CROSSSLOT Keys in request don't hash to the same slot");
-                    });
-                    return;
-                }
-            if (owner != m_shard_i)
-            {
-                // The per-shard port corrects the client's map rather than
-                // crossing, exactly as a single-key command does there.
-                if (conn->cluster_port)
-                {
-                    run_in_reply_order(conn, [&] { emit_moved(conn, args[3], owner, true); });
-                    return;
-                }
-                if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
-                {
-                    run_in_reply_order(conn, [&] {
-                        emit_unrouted(conn, args[0], true,
-                                      "runs against keys another shard owns, and "
-                                      "this path cannot wait for it");
-                    });
-                    return;
-                }
-                const uint32_t slot = slot_open(conn, true, cache_merge::single, 1);
-                std::string raw;
-                resp::encode_array_header_into(raw, argc);
-                for (int i = 0; i < argc; ++i) resp::encode_bulk_into(raw, args[i]);
-                route_part(conn, owner, slot, 0, raw, true);
+            if (route_all_keys_one_shard(conn, args, argc, 3, static_cast<int>(nkeys)))
                 return;
-            }
-        }
+    }
+
+    // Set algebra reads several whole sets and answers one thing, so it cannot
+    // be split into per-key parts the way MGET or DEL can: an intersection
+    // computed on two shards separately is not an intersection.  Same rule as
+    // EVAL therefore -- one shard owns all of it or the command is refused --
+    // and Redis Cluster answers CROSSSLOT for exactly this reason.
+    if (SOCKETLEY_UNLIKELY(cache_is_set_algebra(h)) && argc >= 2)
+    {
+        // SMOVE names two keys and then a member; the others are all keys, and
+        // for the STORE forms that includes the destination.
+        const int nk = (h == fnv1a("smove")) ? 2 : argc - 1;
+        if (route_all_keys_one_shard(conn, args, argc, 1, nk))
+            return;
     }
 #endif
 
@@ -8362,6 +8451,60 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_array_header_into(rb, static_cast<int>(s->size()));
             for (const auto& member : *s)
                 resp::encode_bulk_into(rb, member);
+            break;
+        }
+        // ─── Set algebra ────────────────────────────────────────────────
+        //
+        // The reading forms and the STORE forms share their body, because the
+        // only difference is where the answer goes -- and a second copy of the
+        // union rules is a second place for them to disagree.
+        case fnv1a("sinter"):      case fnv1a("sunion"):      case fnv1a("sdiff"):
+        case fnv1a("sinterstore"): case fnv1a("sunionstore"): case fnv1a("sdiffstore"):
+        {
+            const bool store = (cmd_hash == fnv1a("sinterstore")
+                             || cmd_hash == fnv1a("sunionstore")
+                             || cmd_hash == fnv1a("sdiffstore"));
+            const int first = store ? 2 : 1;
+            if (argc < first + 1) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (store && m_mode == cache_mode_readonly)
+            { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (m_has_ttl_keys)
+                for (int i = first; i < argc; ++i) m_store.check_expiry(args[i]);
+
+            std::vector<std::string> out;
+            const size_t n = static_cast<size_t>(argc - first);
+            int rc;
+            if (cmd_hash == fnv1a("sinter") || cmd_hash == fnv1a("sinterstore"))
+                rc = m_store.sinter(args + first, n, out);
+            else if (cmd_hash == fnv1a("sunion") || cmd_hash == fnv1a("sunionstore"))
+                rc = m_store.sunion(args + first, n, out);
+            else
+                rc = m_store.sdiff(args + first, n, out);
+            if (rc < 0) { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+
+            if (!store)
+            {
+                resp::encode_array_header_into(rb, static_cast<int>(out.size()));
+                for (const auto& m : out) resp::encode_bulk_into(rb, m);
+                break;
+            }
+            const size_t card = m_store.sreplace(args[1], std::move(out));
+            // Replicated as the command, not as the result: the follower holds
+            // the same sets, so it computes the same answer -- and shipping the
+            // members would be the whole result on the wire for every call.
+            repl(args, argc);
+            resp::encode_integer_into(rb, static_cast<int64_t>(card));
+            break;
+        }
+        case fnv1a("smove"):
+        {
+            if (argc != 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (m_has_ttl_keys) { m_store.check_expiry(args[1]); m_store.check_expiry(args[2]); }
+            const int r = m_store.smove(args[1], args[2], args[3]);
+            if (r < 0) { resp::encode_error_code_into(rb, wrongtype_msg); break; }
+            if (r > 0) repl(args, argc);
+            resp::encode_integer_into(rb, r);
             break;
         }
         case fnv1a("hset"):

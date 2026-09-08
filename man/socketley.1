@@ -4187,7 +4187,17 @@ LMOVE, RPOPLPUSH, BLPOP, BRPOP
 .PP
 .B Sets
 .RS 2
-SADD, SREM, SISMEMBER, SMISMEMBER, SCARD, SMEMBERS, SPOP, SRANDMEMBER, SSCAN
+SADD, SREM, SISMEMBER, SMISMEMBER, SCARD, SMEMBERS, SPOP, SRANDMEMBER, SSCAN,
+SINTER, SUNION, SDIFF, SINTERSTORE, SUNIONSTORE, SDIFFSTORE, SMOVE
+.PP
+Set algebra reads whole sets and answers one thing, so on a sharded cache it
+cannot be split across shards the way MGET or DEL can \(em an intersection
+computed on two shards separately is not an intersection. Every key must
+therefore belong to one shard, and keys that do not are refused with
+.BR \-CROSSSLOT ,
+which is what Redis Cluster answers and for the same reason. Use a hash tag
+.RB ( "{user}:seen" )
+to place them together.
 .RE
 .PP
 .B Hashes

@@ -80,6 +80,27 @@ public:
     int scard(std::string_view key) const;
     const set_inner* set_ptr(std::string_view key) const;
 
+    // ─── Set algebra ────────────────────────────────────────────────────────
+    //
+    // The result is materialised as owned strings and not as views into the
+    // sets, because the STORE forms write their answer back and the
+    // destination is allowed to BE one of the sources: SINTERSTORE s s t is
+    // legal, and a view into `s` would dangle the moment `s` is replaced.
+    //
+    // -1 back means a key held something that is not a set; the caller turns
+    // that into WRONGTYPE, which is what a client switches on.
+    int sinter(const std::string_view* keys, size_t n, std::vector<std::string>& out) const;
+    int sunion(const std::string_view* keys, size_t n, std::vector<std::string>& out) const;
+    int sdiff (const std::string_view* keys, size_t n, std::vector<std::string>& out) const;
+
+    // Replaces dest outright, as Redis does: an empty result DELETES it rather
+    // than leaving an empty set behind, because an empty set is not a thing
+    // Redis keeps and EXISTS would disagree with the store otherwise.
+    size_t sreplace(std::string_view dest, std::vector<std::string>&& members);
+
+    // 1 moved, 0 not a member, -1 type conflict.
+    int smove(std::string_view src, std::string_view dst, std::string_view member);
+
     // --- Hashes ---
     bool hset(std::string_view key, std::string_view field, std::string_view val);
     const std::string* hget(std::string_view key, std::string_view field) const;
