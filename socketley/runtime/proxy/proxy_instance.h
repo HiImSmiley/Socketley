@@ -120,8 +120,10 @@ struct alignas(64) proxy_client_connection
     io_request splice_in_req;
     io_request splice_out_req;
     std::string partial;
-    socketley::byte_counted_queue<std::string> write_queue;
-    std::string write_batch[MAX_WRITE_BATCH];
+    // write_chunk rather than std::string, because a TCP relay lends the ring
+    // buffer a read arrived in to the write instead of copying it.
+    socketley::byte_counted_queue<socketley::write_chunk> write_queue;
+    socketley::write_chunk write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
 
     // === COLD fields ===
@@ -270,8 +272,9 @@ struct alignas(64) proxy_backend_connection
     // client, unused on a cleartext backend, which forwards straight out of
     // the read buffer.
     std::string partial;
-    socketley::byte_counted_queue<std::string> write_queue;
-    std::string write_batch[MAX_WRITE_BATCH];
+    // See proxy_client_connection::write_queue.
+    socketley::byte_counted_queue<socketley::write_chunk> write_queue;
+    socketley::write_chunk write_batch[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
 
     // === COLD fields ===
@@ -686,8 +689,13 @@ private:
     // header is left alone.
     bool append_backend_host_header(std::string& out, const proxy_client_connection* conn) const;
 
-    void forward_to_backend(proxy_client_connection* conn, std::string_view data);
-    void forward_to_client(proxy_backend_connection* conn, std::string_view data);
+    // True when the ring buffer `lent_buf` names (-1 for none) was queued in
+    // place, after which the queue entry gives it back and the caller must
+    // not.
+    bool forward_to_backend(proxy_client_connection* conn, std::string_view data,
+                            int lent_buf = -1);
+    bool forward_to_client(proxy_backend_connection* conn, std::string_view data,
+                           int lent_buf = -1);
 
     // Mark both sides of a pair whose response an on_proxy_response hook
     // refused, because handle_backend_read is gated on the backend's flag and
@@ -895,6 +903,27 @@ private:
     // a per-connection buffer and tying the ring to it makes any buffer-size
     // experiment two experiments at once.
     static constexpr uint32_t BUF_SIZE = 65536;
+    // At most this many ring buffers on loan to write queues at once, counted
+    // per process rather than per instance because the group is one ring per
+    // loop and there is one loop per process, so an instance's own count
+    // bounds nothing the ring can run out of.
+    static constexpr uint32_t RING_BORROW_LIMIT = BUF_COUNT / 4;
+    // Below this the copy is not measurable and the 64 KiB a loan pins is.
+    static constexpr size_t RING_BORROW_MIN_BYTES = 4096;
+    inline static uint32_t s_ring_bufs_lent{0};
+    static void give_back_ring_buf(void* loop, uint16_t id);
+    // Queue `data` on loan from ring buffer `lent_buf` while the bound allows
+    // and as a copy otherwise, true when it was lent.
+    bool lend_or_copy(socketley::byte_counted_queue<socketley::write_chunk>& q,
+                      std::string_view data, int lent_buf);
+    // The buffer id when this read's bytes may be lent to the write queue, and
+    // -1 when they must be copied: not the ring's, not a TCP relay, or too few
+    // to be worth a whole buffer.
+    int lendable_buf(bool is_provided, uint16_t buf_id, size_t len) const
+    {
+        return (is_provided && m_protocol == protocol_tcp && len >= RING_BORROW_MIN_BYTES)
+                   ? static_cast<int>(buf_id) : -1;
+    }
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_send_zc{false};

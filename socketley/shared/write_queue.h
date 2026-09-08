@@ -4,6 +4,7 @@
 // overhead so empty messages are bounded too.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <queue>
 #include <string>
@@ -34,40 +35,118 @@ inline size_t write_queue_size_of(const std::shared_ptr<const std::string>& p)
     return (p ? p->size() : 0) + write_queue_entry_overhead;
 }
 
-// One queued write: either bytes this connection owns, or a reference to bytes
-// several connections are sending.
+// Bytes on loan from a pool that wants them back by number once the write that
+// used them has completed, which is what a provided-buffer ring is.
+struct borrowed_bytes
+{
+    const char* data{nullptr};
+    size_t      size{0};
+    void      (*give_back)(void* pool, uint16_t id){nullptr};
+    void*       pool{nullptr};
+    uint16_t    id{0};
+};
+
+// One queued write: bytes this connection owns, a reference to bytes several
+// connections are sending, or bytes on loan from the buffer a read delivered
+// them in.
 //
-// The two halves are the two things a write queue can be good at and neither
-// is free.  Sharing is what makes a broadcast to N connections cost one copy
-// instead of N -- the server's queue held shared_ptr for that reason and could
-// not coalesce, because appending to a payload would change it for everybody
-// else holding it.  Owning is what lets a backlog become fewer, larger writes
-// -- the cache's queue held strings for that reason and pays N copies on a
-// fan-out.  Holding both is not a compromise between them: a connection that
-// is keeping up has nothing to coalesce into, and one that is behind has
-// already been copied to once, so the two cases never want the same entry.
+// The first two halves are the two things a write queue can be good at and
+// neither is free.  Sharing is what makes a broadcast to N connections cost
+// one copy instead of N -- the server's queue held shared_ptr for that reason
+// and could not coalesce, because appending to a payload would change it for
+// everybody else holding it.  Owning is what lets a backlog become fewer,
+// larger writes -- the cache's queue held strings for that reason and pays N
+// copies on a fan-out.  Holding both is not a compromise between them: a
+// connection that is keeping up has nothing to coalesce into, and one that is
+// behind has already been copied to once, so the two cases never want the same
+// entry.
+//
+// Borrowing is the third: a relay that forwards what it read has nothing to
+// add and nobody to share with, so the copy into an owned string bought only
+// the right to return the read's buffer early.  A borrowed entry gives that
+// buffer back itself, when it is dropped, moved over or cleared, which is the
+// one place a queue entry's life ends -- so no path that drops an entry has
+// to remember the buffer.
 class write_chunk
 {
 public:
     write_chunk() = default;
     write_chunk(std::string s) : m_owned(std::move(s)) {}
     write_chunk(std::shared_ptr<const std::string> p) : m_shared(std::move(p)) {}
+    write_chunk(borrowed_bytes b) : m_borrowed(b) {}
+    ~write_chunk() { give_back(); }
 
-    const char* data() const { return m_shared ? m_shared->data() : m_owned.data(); }
-    size_t      size() const { return m_shared ? m_shared->size() : m_owned.size(); }
+    // A copy of a loan is bytes this copy owns, so one buffer is never given
+    // back twice.
+    write_chunk(const write_chunk& o)
+        : m_owned(o.m_borrowed.data ? std::string(o.m_borrowed.data, o.m_borrowed.size)
+                                    : o.m_owned),
+          m_shared(o.m_shared)
+    {
+    }
+    write_chunk& operator=(const write_chunk& o)
+    {
+        if (this != &o)
+        {
+            give_back();
+            m_owned  = o.m_borrowed.data ? std::string(o.m_borrowed.data, o.m_borrowed.size)
+                                         : o.m_owned;
+            m_shared = o.m_shared;
+        }
+        return *this;
+    }
+    write_chunk(write_chunk&& o) noexcept
+        : m_owned(std::move(o.m_owned)), m_shared(std::move(o.m_shared)),
+          m_borrowed(o.m_borrowed)
+    {
+        o.m_borrowed = {};
+    }
+    write_chunk& operator=(write_chunk&& o) noexcept
+    {
+        if (this != &o)
+        {
+            give_back();
+            m_owned    = std::move(o.m_owned);
+            m_shared   = std::move(o.m_shared);
+            m_borrowed = o.m_borrowed;
+            o.m_borrowed = {};
+        }
+        return *this;
+    }
+
+    const char* data() const
+    {
+        return m_borrowed.data ? m_borrowed.data
+             : m_shared        ? m_shared->data()
+                               : m_owned.data();
+    }
+    size_t size() const
+    {
+        return m_borrowed.data ? m_borrowed.size
+             : m_shared        ? m_shared->size()
+                               : m_owned.size();
+    }
     bool        empty() const { return size() == 0; }
     std::string_view view() const { return { data(), size() }; }
 
-    // Whether this entry may still grow, which a shared one may not: those
-    // bytes are in somebody else's queue as well.
-    bool owns() const { return !m_shared; }
+    // Whether this entry may still grow, which a shared or a borrowed one may
+    // not: those bytes are in somebody else's queue, or somebody else's pool.
+    bool owns() const { return !m_shared && !m_borrowed.data; }
     void append(std::string_view extra) { m_owned.append(extra); }
 
-    void clear() { m_owned.clear(); m_shared.reset(); }
+    void clear() { m_owned.clear(); m_shared.reset(); give_back(); }
 
 private:
+    void give_back()
+    {
+        if (m_borrowed.give_back)
+            m_borrowed.give_back(m_borrowed.pool, m_borrowed.id);
+        m_borrowed = {};
+    }
+
     std::string                        m_owned;
     std::shared_ptr<const std::string> m_shared;
+    borrowed_bytes                     m_borrowed;
 };
 
 inline size_t write_queue_size_of(const write_chunk& c)

@@ -424,6 +424,10 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
             owed[n++] = &conn->abort_req;
         if (n > 0)
         {
+            // Nothing queued has reached the ring and nothing will flush it
+            // now, so a borrowed entry's buffer goes back here rather than
+            // when the last completion lands.
+            conn->write_queue.clear();
             retire(std::shared_ptr<void>(std::move(conn)), owed, n);
             return;
         }
@@ -504,6 +508,10 @@ void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connecti
             owed[n++] = &conn->splice_out_req;
         if (n > 0)
         {
+            // Nothing queued has reached the ring and nothing will flush it
+            // now, so a borrowed entry's buffer goes back here rather than
+            // when the last completion lands.
+            conn->write_queue.clear();
             retire(std::shared_ptr<void>(std::move(conn)), owed, n);
             return;
         }
@@ -2839,8 +2847,9 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         }
 
         std::string_view data(read_data, data_len);
-        forward_to_backend(conn, data);
-        if (is_provided)
+        const bool lent = forward_to_backend(conn, data,
+                                             lendable_buf(is_provided, buf_id, data_len));
+        if (is_provided && !lent)
             m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
         if (SOCKETLEY_LIKELY(!conn->closing) && conn->splice_active &&
@@ -3443,7 +3452,8 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     }
 
     // Forward to client
-    forward_to_client(conn, {data_ptr, forward_len});
+    const bool lent = forward_to_client(conn, {data_ptr, forward_len},
+                                        lendable_buf(is_provided, buf_id, forward_len));
 
     // The response framing decides both whether the socket may be pooled and
     // how much of this chunk the client may see, which were one question all
@@ -3461,8 +3471,9 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             note_backend_success(ce.client);
     }
 
-    // Return provided buffer after scanning
-    if (is_provided)
+    // Return provided buffer after scanning, unless the write queue holds it
+    // and will.
+    if (is_provided && !lent)
         m_loop->return_buf(BUF_GROUP_ID, buf_id);
 
     // ── the switch ──────────────────────────────────────────────────────────
@@ -8004,7 +8015,28 @@ std::vector<int> proxy_instance::clients() const
 void proxy_instance::set_on_proxy_request(proxy_hook cb) { m_cb_on_proxy_request = std::move(cb); }
 void proxy_instance::set_on_proxy_response(proxy_hook cb) { m_cb_on_proxy_response = std::move(cb); }
 
-void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::string_view data)
+void proxy_instance::give_back_ring_buf(void* loop, uint16_t id)
+{
+    --s_ring_bufs_lent;
+    static_cast<event_loop*>(loop)->return_buf(BUF_GROUP_ID, id);
+}
+
+bool proxy_instance::lend_or_copy(socketley::byte_counted_queue<socketley::write_chunk>& q,
+                                  std::string_view data, int lent_buf)
+{
+    if (lent_buf < 0 || s_ring_bufs_lent >= RING_BORROW_LIMIT)
+    {
+        q.emplace(std::string(data));
+        return false;
+    }
+    ++s_ring_bufs_lent;
+    q.emplace(socketley::borrowed_bytes{ data.data(), data.size(), &give_back_ring_buf,
+                                         m_loop, static_cast<uint16_t>(lent_buf) });
+    return true;
+}
+
+bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::string_view data,
+                                        int lent_buf)
 {
     // Every path out that does not deliver takes the client down with it,
     // because a connection that silently swallows data is worse than one that
@@ -8012,20 +8044,20 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     if (SOCKETLEY_UNLIKELY(conn->backend_fd < 0 || !m_loop))
     {
         conn->closing = true;
-        return;
+        return false;
     }
 
     if (SOCKETLEY_UNLIKELY(conn->backend_fd >= MAX_FDS))
     {
         conn->closing = true;
-        return;
+        return false;
     }
 
     auto& be = m_conn_idx[conn->backend_fd];
     if (SOCKETLEY_UNLIKELY(be.side != conn_backend))
     {
         conn->closing = true;
-        return;
+        return false;
     }
 
     auto* bconn = be.backend;
@@ -8035,13 +8067,13 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     if (SOCKETLEY_UNLIKELY(bconn->client_fd != conn->fd))
     {
         conn->closing = true;
-        return;
+        return false;
     }
 
     if (SOCKETLEY_UNLIKELY(bconn->closing))
     {
         conn->closing = true;
-        return;
+        return false;
     }
 
     std::string hook_storage;
@@ -8050,7 +8082,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     if (m_cb_on_proxy_request)
     {
         auto result = m_cb_on_proxy_request(conn->fd, data);
-        if (!result) return;  // nullopt = drop
+        if (!result) return false;  // nullopt = drop
         if (!result->empty()) { hook_storage = std::move(*result); hook_modified = true; }
     }
 #ifndef SOCKETLEY_NO_LUA
@@ -8070,7 +8102,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
                     lua_diag::tag(get_name()).c_str(), err.what());
             bconn->closing = true;
             conn->closing = true;
-            return;
+            return false;
         }
 
         // Saying nothing is not saying nil, because a hook that only logs ends
@@ -8079,7 +8111,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         if (r.return_count() > 0)
         {
             sol::object obj = r;
-            if (obj.get_type() == sol::type::nil) return;   // drop
+            if (obj.get_type() == sol::type::nil) return false;   // drop
 
             if (SOCKETLEY_LIKELY(obj.is<std::string>()))
             {
@@ -8098,7 +8130,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
                                      static_cast<int>(obj.get_type())));
                 bconn->closing = true;
                 conn->closing = true;
-                return;
+                return false;
             }
         }
     }
@@ -8111,9 +8143,10 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         // marking only the backend left the client writing into a void.
         bconn->closing = true;
         conn->closing = true;
-        return;
+        return false;
     }
 
+    bool lent = false;
     if (hook_modified)
     {
         m_stat_bytes_out.fetch_add(hook_storage.size(), std::memory_order_relaxed);
@@ -8122,7 +8155,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     else
     {
         m_stat_bytes_out.fetch_add(data.size(), std::memory_order_relaxed);
-        bconn->write_queue.emplace(data);
+        lent = lend_or_copy(bconn->write_queue, data, lent_buf);
     }
 
     // Undeliverable, and marking is all this may do, because the callers go on
@@ -8130,6 +8163,7 @@ void proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     // closing.
     if (!bconn->write_pending && !flush_backend_write_queue(bconn))
         conn->closing = true;
+    return lent;
 }
 
 // A refused response marks both sides, because only the running handler's own
@@ -8143,24 +8177,25 @@ void proxy_instance::refuse_response(proxy_backend_connection* bconn,
     bconn->closing = true;
 }
 
-void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::string_view data)
+bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::string_view data,
+                                       int lent_buf)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
-        return;
+        return false;
 
     if (SOCKETLEY_UNLIKELY(conn->client_fd < 0 || conn->client_fd >= MAX_FDS))
-        return;
+        return false;
 
     auto& ce = m_conn_idx[conn->client_fd];
     if (SOCKETLEY_UNLIKELY(ce.side != conn_client))
-        return;
+        return false;
 
     auto* cconn = ce.client;
     if (SOCKETLEY_UNLIKELY(cconn->backend_fd != conn->fd))
-        return;   // not our client any more; see forward_to_backend
+        return false;   // not our client any more; see forward_to_backend
 
     if (SOCKETLEY_UNLIKELY(cconn->closing))
-        return;
+        return false;
 
     // --idle-timeout is measured by the client's own reads, which is right for
     // a request/response exchange and wrong for a tunnel, where a
@@ -8175,7 +8210,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (m_cb_on_proxy_response)
     {
         auto result = m_cb_on_proxy_response(conn->client_fd, data);
-        if (!result) return;  // nullopt = drop
+        if (!result) return false;  // nullopt = drop
         if (!result->empty()) { hook_storage = std::move(*result); hook_modified = true; }
     }
 #ifndef SOCKETLEY_NO_LUA
@@ -8194,7 +8229,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
                             "response\n",
                     lua_diag::tag(get_name()).c_str(), err.what());
             refuse_response(conn, cconn);
-            return;
+            return false;
         }
 
         // The request hook's reasoning unchanged: an empty return is an
@@ -8202,7 +8237,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         if (r.return_count() > 0)
         {
             sol::object obj = r;
-            if (obj.get_type() == sol::type::nil) return;   // drop
+            if (obj.get_type() == sol::type::nil) return false;   // drop
 
             if (SOCKETLEY_LIKELY(obj.is<std::string>()))
             {
@@ -8217,7 +8252,7 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
                         lua_typename(lctx->state().lua_state(),
                                      static_cast<int>(obj.get_type())));
                 refuse_response(conn, cconn);
-                return;
+                return false;
             }
         }
     }
@@ -8226,9 +8261,10 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
         cconn->closing = true;
-        return;
+        return false;
     }
 
+    bool lent = false;
     if (hook_modified)
     {
         m_stat_bytes_out.fetch_add(hook_storage.size(), std::memory_order_relaxed);
@@ -8237,11 +8273,12 @@ void proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     else
     {
         m_stat_bytes_out.fetch_add(data.size(), std::memory_order_relaxed);
-        cconn->write_queue.emplace(data);
+        lent = lend_or_copy(cconn->write_queue, data, lent_buf);
     }
 
     if (!cconn->write_pending && !flush_client_write_queue(cconn))
         cconn->closing = true;
+    return lent;
 }
 
 void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body)
@@ -8455,7 +8492,7 @@ bool proxy_instance::tls_flush(Conn* conn)
     {
         while (!conn->write_queue.empty())
         {
-            const std::string& msg = conn->write_queue.front();
+            const auto& msg = conn->write_queue.front();
             const int n = tls_context::ssl_write(conn->ssl, msg.data(),
                                                  static_cast<int>(msg.size()));
             if (n <= 0)
@@ -8503,7 +8540,7 @@ bool proxy_instance::tls_flush(Conn* conn)
         conn->write_batch[i].clear();
 
     conn->write_batch[0] = std::move(cipher);
-    conn->write_iovs[0].iov_base = conn->write_batch[0].data();
+    conn->write_iovs[0].iov_base = const_cast<char*>(conn->write_batch[0].data());
     conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
     conn->write_batch_count = 1;
     conn->write_pending = true;
@@ -8542,7 +8579,7 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     {
         conn->write_batch[count] = conn->write_queue.take_front();
 
-        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count].data());
         conn->write_iovs[count].iov_len = conn->write_batch[count].size();
         count++;
     }
@@ -8577,6 +8614,10 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     {
         conn->write_pending = false;
         conn->zc_notif_pending = false;
+        // Dropped now rather than at the next overwrite, because a borrowed
+        // entry holds a ring buffer until it is.
+        for (uint32_t i = 0; i < count; i++)
+            conn->write_batch[i].clear();
         conn->write_batch_count = 0;
         return false;
     }
@@ -8602,7 +8643,7 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     {
         conn->write_batch[count] = conn->write_queue.take_front();
 
-        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+        conn->write_iovs[count].iov_base = const_cast<char*>(conn->write_batch[count].data());
         conn->write_iovs[count].iov_len = conn->write_batch[count].size();
         count++;
     }
@@ -8637,6 +8678,10 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     {
         conn->write_pending = false;
         conn->zc_notif_pending = false;
+        // Dropped now rather than at the next overwrite, because a borrowed
+        // entry holds a ring buffer until it is.
+        for (uint32_t i = 0; i < count; i++)
+            conn->write_batch[i].clear();
         conn->write_batch_count = 0;
         return false;
     }
