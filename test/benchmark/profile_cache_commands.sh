@@ -55,6 +55,10 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 cd "$ROOT" || exit 2
+# The perf wrapper, perf_event_paranoid, the symbol build and the report parser.
+# profile_proxy_scenarios.sh needs the identical four; see lib_profile.sh for
+# what each of them has already made blind.
+source "$HERE/lib_profile.sh"
 
 PROF_SECS=${PROF_SECS:-3}          # sampling window per cell
 PROF_FREQ=${PROF_FREQ:-997}        # Hz, prime so it does not beat with a timer
@@ -117,51 +121,18 @@ cleanup() {
 ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PROF_PORT\$" \
     && die "port $PROF_PORT is held"
 
-PERF=${PERF:-}
-if [ -z "$PERF" ]; then
-    # The wrapper refuses when the running kernel has no matching package, which
-    # is the normal state on this box after a kernel bump; the binary itself is
-    # fine, so it is found directly.
-    PERF=$(ls -d /usr/lib/linux-tools/*/perf 2>/dev/null | tail -1)
-    [ -z "$PERF" ] && PERF=$(command -v perf)
-fi
-[ -x "${PERF:-}" ] || die "no perf binary found (looked in /usr/lib/linux-tools/*/perf and \$PATH)"
-
-PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 4)
-if [ "$PARANOID" -gt 1 ]; then
-    sudo -n sysctl -q -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0 2>/dev/null
-    PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 4)
-fi
-[ "$PARANOID" -le 1 ] \
-    || die "perf_event_paranoid=$PARANOID denies profiling; run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0"
+PERF=$(profile_find_perf) \
+    || die "no perf binary found (looked in /usr/lib/linux-tools/*/perf and \$PATH)"
+profile_require_perf \
+    || die "perf_event_paranoid denies profiling; run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0"
 
 command -v redis-benchmark >/dev/null || die "redis-benchmark not found"
 
 # ─── 2. a binary perf can read ──────────────────────────────────────────────
 
-BIN=$ROOT/bin/Profile/socketley
-if [ ! -x "$BIN" ] || [ "$ROOT/bin/Release/socketley" -nt "$BIN" ]; then
-    say "linking a symbol-bearing build (Release strips, so perf would see only offsets)"
-    ./bin/premake5 gmake2 >/dev/null 2>&1 || die "premake failed"
-    # Same objects, same optimisation, same LTO -- only the strip flag differs,
-    # so what is measured is the shipped code and not a debug build.
-    sed -i 's/-m64 -s -flto=auto/-m64 -flto=auto/' make/socketley.make
-    rm -f "$ROOT/bin/Release/socketley"
-    if ! make -C make config=release_x64 -j"$(nproc)" >"$TMPD/build.log" 2>&1; then
-        ./bin/premake5 gmake2 >/dev/null 2>&1
-        die "build failed, see $TMPD/build.log"
-    fi
-    mkdir -p "$ROOT/bin/Profile"
-    cp "$ROOT/bin/Release/socketley" "$BIN"
-    # Put the tree back the way it is packaged, and rebuild the stripped one so
-    # nobody inherits an unstripped Release from having profiled once.
-    ./bin/premake5 gmake2 >/dev/null 2>&1
-    rm -f "$ROOT/bin/Release/socketley"
-    make -C make config=release_x64 -j"$(nproc)" >>"$TMPD/build.log" 2>&1 \
-        || die "restoring the stripped Release failed, see $TMPD/build.log"
-fi
-file "$BIN" | grep -q 'not stripped' \
-    || die "$BIN is stripped; perf would report offsets and the ranking would be empty"
+say "linking a symbol-bearing build if the Release is newer (Release strips)"
+BIN=$(profile_symbol_build "$ROOT" "$TMPD/build.log") \
+    || die "the symbol-bearing build failed, see $TMPD/build.log"
 
 # ─── 3. the command table, from the matrix and not a copy of it ─────────────
 
@@ -210,39 +181,9 @@ say "worker pid $WPID, sampling ${PROF_SECS}s per cell at ${PROF_FREQ}Hz"
 
 # ─── 5. one cell ────────────────────────────────────────────────────────────
 
-# Sums the report by where the sample landed: kernel, our binary, or a library.
-# --percent-limit 0 because a ranking built from a truncated report would put a
-# command with one fat symbol above a command with fifty thin ones.
-# perf record runs under sudo, so perf.data lands root-owned and 0600.  Read as
-# the invoking user it fails with "Permission denied", awk sums an empty stream,
-# and every cell reports 0.0% -- a complete, plausible, entirely blind table.
-# That happened on the first run of this script; hence both the sudo here and
-# the sample check in profile_cell.
-parse_report() {   # parse_report FILE -> "kernel ours libs top1 pct1 top2 pct2"
-    sudo -n "$PERF" report -i "$1" --stdio --no-children -g none --percent-limit 0 2>/dev/null \
-    | awk '
-        /^[[:space:]]*[0-9.]+%/ {
-            pct = $1; sub(/%/, "", pct)
-            dso = $3; sym = ""
-            for (i = 5; i <= NF; i++) sym = sym (i > 5 ? " " : "") $i
-            # Cut at the argument list and squeeze what is left: a demangled
-            # C++ name carries spaces, and a space in a field shifts every
-            # column behind it in the tables built from this line.
-            sub(/\(.*/, "", sym); gsub(/[ \t]+/, "_", sym)
-            # And a demangled template instantiation runs to eight hundred
-            # characters, which is one table cell nobody can read.  The tail is
-            # the interesting half of a C++ name, so the middle goes.
-            if (length(sym) > 64)
-                sym = substr(sym, 1, 24) "..." substr(sym, length(sym) - 33)
-            if (dso ~ /kallsyms/)            { k += pct }
-            else if (dso == "socketley")     { o += pct; if (pct > b1p) { b2 = b1; b2p = b1p; b1 = sym; b1p = pct }
-                                               else if (pct > b2p)     { b2 = sym; b2p = pct } }
-            else                             { l += pct; if (pct > b1p) { b2 = b1; b2p = b1p; b1 = sym "@" dso; b1p = pct }
-                                               else if (pct > b2p)     { b2 = sym "@" dso; b2p = pct } }
-        }
-        END { printf "%.1f %.1f %.1f %s %.1f %s %.1f",
-                     k, o, l, (b1 == "" ? "-" : b1), b1p, (b2 == "" ? "-" : b2), b2p }'
-}
+# Kernel / ours / libraries, and the two fattest symbols.  In lib_profile.sh
+# because the proxy profiler wants the identical breakdown.
+parse_report() { profile_parse_report "$PERF" "$1" socketley; }
 
 # The keyspace substitution redis-benchmark does not do for us: the matrix's
 # templates carry KEYTAG, which is only meaningful when sharded.

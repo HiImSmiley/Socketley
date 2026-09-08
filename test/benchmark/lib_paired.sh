@@ -34,11 +34,20 @@
 #   BE_PID        pid of the shared backend, for the backend-bound check
 #
 #   arm_measure ARM MODE A B
-#       ARM is "a" or "b".  Echoes three fields: rate, proxy cores, backend
-#       cores.  Resolving ARM to a port, a pid and whatever else differs between
-#       the two sides is the caller's job, because that is the part that is not
-#       shared: the HTTP arms need different request paths to reach the same
-#       resource, and pretending otherwise measures a 404 against a file.
+#       ARM is "a" or "b".  Echoes three fields -- rate, proxy cores, backend
+#       cores -- or FOUR, the fourth being the load generator's own cores.
+#       Resolving ARM to a port, a pid and whatever else differs between the two
+#       sides is the caller's job, because that is the part that is not shared:
+#       the HTTP arms need different request paths to reach the same resource,
+#       and pretending otherwise measures a 404 against a file.
+#
+#       The fourth field is optional so that the two callers written before it
+#       keep working, and it reads as zero for them.  It is worth supplying: a
+#       cell whose client is at its ceiling reports the load generator, and that
+#       has been mistaken for parity in this directory more than once -- two
+#       builds within a few percent of each other is the tell, and a cache once
+#       measured 106,213 against Redis's 108,342 because one redis-benchmark
+#       caps this box near 90k.
 
 HZ=$(getconf CLK_TCK)
 
@@ -105,8 +114,8 @@ ci_pct_of() {
 # before when this one fails.
 paired_run_case() {
     local mode=$1 a=$2 b=$3
-    local av=() bv=() rv=() apx=() bpx=() abe=() bbe=()
-    local a_rate a_px a_be b_rate b_px b_be
+    local av=() bv=() rv=() apx=() bpx=() abe=() bbe=() acl=() bcl=()
+    local a_rate a_px a_be a_cl b_rate b_px b_be b_cl
     local kept=0 dropped=0 badrun=0 attempt=0 max_attempts=$((PAIRS * 2 + 2))
 
     # A discarded warm-up pair.  The first run against a proxy that has just
@@ -130,8 +139,11 @@ paired_run_case() {
         fi
         after=$(box_load_cores)
 
-        read -r a_rate a_px a_be <<<"$ra"
-        read -r b_rate b_px b_be <<<"$rb"
+        # Four fields where the caller supplies them, three where it does not:
+        # a_cl then reads empty, and the client check below is skipped rather
+        # than being fed a zero it would treat as an idle client.
+        read -r a_rate a_px a_be a_cl <<<"$ra"
+        read -r b_rate b_px b_be b_cl <<<"$rb"
 
         if awk -v x="$before" -v y="$after" -v lim="$QUIET_CORES" \
                'BEGIN { exit !(x > lim || y > lim) }'; then
@@ -149,6 +161,7 @@ paired_run_case() {
         av+=("$a_rate"); bv+=("$b_rate")
         apx+=("$a_px");  bpx+=("$b_px")
         abe+=("$a_be");  bbe+=("$b_be")
+        acl+=("${a_cl:-0}"); bcl+=("${b_cl:-0}")
         rv+=("$(awk -v x="$a_rate" -v y="$b_rate" 'BEGIN { printf "%.6f", x / y }')")
         kept=$((kept + 1))
     done
@@ -157,7 +170,7 @@ paired_run_case() {
     C_DROPPED=$dropped
     C_BADRUN=$badrun
     C_A=0; C_B=0; C_RATIO=0; C_CI=0; C_A_CI=0; C_APX=0; C_BPX=0
-    C_ABE=0; C_BBE=0; C_BE=0
+    C_ABE=0; C_BBE=0; C_BE=0; C_ACLI=0; C_BCLI=0; C_CLI=0
     if (( kept == 0 )); then return 0; fi
 
     C_A=$(median_of "${av[*]}")
@@ -173,6 +186,13 @@ paired_run_case() {
     C_ABE=$(median_of "${abe[*]}")
     C_BBE=$(median_of "${bbe[*]}")
     C_BE=$(awk -v x="$C_ABE" -v y="$C_BBE" 'BEGIN { print (x > y) ? x : y }')
+    # The load generator, on the same argument as the backend above: either arm
+    # hitting the ceiling is enough to spoil the ratio, and it is the FASTER arm
+    # that reaches it first -- so a client cap does not read as noise, it reads
+    # as the two proxies being level.
+    C_ACLI=$(median_of "${acl[*]}")
+    C_BCLI=$(median_of "${bcl[*]}")
+    C_CLI=$(awk -v x="$C_ACLI" -v y="$C_BCLI" 'BEGIN { print (x > y) ? x : y }')
     C_RATIO=$(median_of "${rv[*]}")
     C_CI=$(ci_pct_of "${rv[*]}")
     C_A_CI=$(ci_pct_of "${av[*]}")
@@ -181,8 +201,12 @@ paired_run_case() {
 # The verdict column, not the ratio, is the thing to read first.  A ratio whose
 # interval is wider than the difference it claims is not a weaker result, it is
 # not a result.
-paired_verdict() {   # ci kept backend_cores -> text
-    local ci=$1 kept=$2 be=$3
+# The client cap and its ceiling are optional, for the two callers that predate
+# them.  CEIL is what this shape's load generator could hold at most -- one core
+# per connection it drives, up to the machine's -- so the check scales with the
+# case instead of asking whether one core was busy.
+paired_verdict() {   # ci kept backend_cores [client_cores] [client_ceiling] -> text
+    local ci=$1 kept=$2 be=$3 cli=${4:-} ceil=${5:-}
     if (( kept == 0 )); then
         if (( ${C_BADRUN:-0} > 0 )); then
             echo "no pair survived — ${C_BADRUN} had a leg that returned nothing"
@@ -194,6 +218,11 @@ paired_verdict() {   # ci kept backend_cores -> text
     if (( kept < 3 )); then echo "only $kept pair(s) survived — no interval"; return; fi
     if awk -v b="$be" 'BEGIN { exit !(b > 0.85) }'; then
         echo "backend-bound (${be} cores) — measures the backend"
+        return
+    fi
+    if [[ -n "$cli" && -n "$ceil" ]] && \
+       awk -v c="$cli" -v k="$ceil" 'BEGIN { exit !(k > 0 && c >= k * 0.95) }'; then
+        echo "client-bound (${cli} of ${ceil} cores) — measures the load generator"
         return
     fi
     if awk -v c="$ci" -v t="$TARGET_PCT" 'BEGIN { exit !(c > t) }'; then
