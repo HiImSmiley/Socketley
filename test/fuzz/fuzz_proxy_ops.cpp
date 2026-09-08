@@ -2475,7 +2475,7 @@ void check_struct_pools(proxy_instance* rt, bool deep)
                        "requests, so a completion that arrives for it is dispatched into "
                        "whichever connection takes the struct over");
             RT_FINDING("pool-armed",
-                       !c->read_pending && !c->write_pending && !c->zc_notif_pending &&
+                       !c->read_pending && !c->write_pending &&
                        !c->splice_in_pending && !c->splice_out_pending &&
                        !c->connect_pending && !c->abort_watch_pending,
                        "a client struct is in the pool with an operation still armed on it "
@@ -2500,7 +2500,7 @@ void check_struct_pools(proxy_instance* rt, bool deep)
                        "a pooled backend struct still carries a live owner on one of its "
                        "requests");
             RT_FINDING("pool-armed",
-                       !c->read_pending && !c->write_pending && !c->zc_notif_pending &&
+                       !c->read_pending && !c->write_pending &&
                        !c->splice_in_pending && !c->splice_out_pending && !c->pool_draining,
                        "a backend struct is in the pool with an operation still armed on it");
             RT_FINDING("pool-fd-held",

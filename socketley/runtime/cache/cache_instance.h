@@ -56,7 +56,6 @@ struct client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    bool zc_notif_pending{false};
 
     // Which listener this connection came in on, recorded at accept, because a
     // client that chose this shard's own port has read CLUSTER SLOTS and a key
@@ -175,7 +174,6 @@ struct client_connection
         read_pending = false;
         write_pending = false;
         closing = false;
-        zc_notif_pending = false;
         cluster_port = false;
         in_multi = false;
         multi_broken = false;
@@ -1056,7 +1054,6 @@ private:
     // buffer, and only a preference: a refused submit falls back to the plain
     // arm, which handle_read consumes identically.
     bool m_recv_bundle{false};
-    bool m_send_zc{false};
 
     // Periodic TTL sweep timer
     std::unique_ptr<timer_op> m_ttl_timer;

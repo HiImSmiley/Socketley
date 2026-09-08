@@ -150,7 +150,6 @@ public:
     bool submit_sendmsg_fixed_file(int fixed_idx, struct msghdr* msg, io_request* req);
     bool submit_recv_multishot_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
     bool submit_read_provided_fixed_file(int fixed_idx, uint16_t group_id, io_request* req);
-    bool submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req);
 
     // Registered buffers: eliminate copy_from_user/copy_to_user per I/O op.
     bool register_buffers(const struct iovec* iovs, uint32_t count);
@@ -241,20 +240,6 @@ public:
             remaining -= take;
         }
     }
-
-    // Zero-copy send, which produces a completion and a separate notification,
-    // and whose buffer must stay alive until the notification arrives.
-    bool submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req);
-
-    // Whether the kernel has the opcode, which says nothing about whether
-    // using it is a good idea here.
-    bool send_zc_supported() const;
-
-    // Off unless SOCKETLEY_SEND_ZC=1, because the notification is released
-    // only by the peer reading or an abortive close, cannot be cancelled, and
-    // one client that stops reading a large response therefore pins a stopped
-    // runtime's whole instance for as long as it likes.
-    bool send_zc_enabled() const;
 
     // Registered files: pre-register fds to avoid fget/fput per op
     bool register_files(const int* fds, uint32_t count);
@@ -407,7 +392,6 @@ private:
     bool m_cpus_explicit{false};
     bool m_affinity_applied{false};
     cpu_set_spec m_cpus{};
-    bool m_send_zc_supported{false};
     bool m_recv_multishot_supported{false};
     bool m_files_registered{false};
     bool m_bufs_registered{false};

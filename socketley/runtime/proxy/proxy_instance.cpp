@@ -108,7 +108,7 @@ static bool backend_connect_addr(const backend_info& b,
 // deferrals on an armed read alone with zero stranded.
 static inline bool client_op_in_flight(const proxy_client_connection* c)
 {
-    return c->read_pending || c->write_pending || c->zc_notif_pending ||
+    return c->read_pending || c->write_pending ||
            c->splice_in_pending || c->splice_out_pending || c->connect_pending ||
            c->abort_watch_pending;
 }
@@ -118,7 +118,7 @@ static inline bool client_op_in_flight(const proxy_client_connection* c)
 // alone and none stranded.
 static inline bool backend_op_in_flight(const proxy_backend_connection* b)
 {
-    return b->read_pending || b->write_pending || b->zc_notif_pending ||
+    return b->read_pending || b->write_pending ||
            b->splice_in_pending || b->splice_out_pending;
 }
 
@@ -191,9 +191,8 @@ bool proxy_instance::absorb_retired(io_request* req, struct io_uring_cqe* cqe)
                 m_retired_loop->return_buf(BUF_GROUP_ID,
                                            static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT));
 
-            // More to come, because a multishot read keeps delivering and a
-            // zero-copy send answers twice, so the memory stays until that
-            // last word.
+            // More to come, because a multishot read keeps delivering, so the
+            // memory stays until that last word.
             if (cqe->flags & IORING_CQE_F_MORE)
                 return true;
 
@@ -255,7 +254,6 @@ void proxy_client_connection::reset(int new_fd)
     read_pending = false;
     write_pending = false;
     closing = false;
-    zc_notif_pending = false;
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
@@ -331,7 +329,6 @@ void proxy_backend_connection::reset(int new_fd)
     read_pending = false;
     write_pending = false;
     closing = false;
-    zc_notif_pending = false;
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
@@ -407,10 +404,7 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
         size_t n = 0;
         if (conn->read_pending)
             owed[n++] = &conn->read_req;
-        // A zero-copy send clears write_pending on its first completion and
-        // still owes the notification that says the kernel has stopped reading
-        // the buffer, so the two flags together are the condition.
-        if (conn->write_pending || conn->zc_notif_pending)
+        if (conn->write_pending)
             owed[n++] = &conn->write_req;
         if (conn->splice_in_pending)
             owed[n++] = &conn->splice_in_req;
@@ -452,7 +446,7 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     conn->saved_request.clear();
 
     SKL_INV_POOLABLE("proxy::client_pool_release", conn->fd,
-        conn->read_pending || conn->write_pending || conn->zc_notif_pending ||
+        conn->read_pending || conn->write_pending ||
         conn->splice_in_pending || conn->splice_out_pending || conn->connect_pending ||
         conn->abort_watch_pending,
         conn->read_req.owner || conn->write_req.owner || conn->splice_in_req.owner ||
@@ -500,7 +494,7 @@ void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connecti
         size_t n = 0;
         if (conn->read_pending)
             owed[n++] = &conn->read_req;
-        if (conn->write_pending || conn->zc_notif_pending)
+        if (conn->write_pending)
             owed[n++] = &conn->write_req;
         if (conn->splice_in_pending)
             owed[n++] = &conn->splice_in_req;
@@ -527,7 +521,7 @@ void proxy_instance::backend_pool_release(std::unique_ptr<proxy_backend_connecti
     conn->write_batch_count = 0;
 
     SKL_INV_POOLABLE("proxy::backend_pool_release", conn->fd,
-        conn->read_pending || conn->write_pending || conn->zc_notif_pending ||
+        conn->read_pending || conn->write_pending ||
         conn->splice_in_pending || conn->splice_out_pending,
         conn->read_req.owner || conn->write_req.owner || conn->splice_in_req.owner ||
         conn->splice_out_req.owner);
@@ -1418,9 +1412,7 @@ bool proxy_instance::setup(event_loop& loop)
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
     // This proxy deliberately does not bundle, because handle_read takes one
     // contiguous buffer out of the completion and a bundle would hand it k
-    // discontiguous ones -- and it does not send zero-copy either, because a
-    // pending notification would hold the instance in the graveyard.
-    m_send_zc = loop.send_zc_enabled();
+    // discontiguous ones.
 
     // Probe for splice support even when the opt-in is off, so `stats` can say
     // whether this kernel could do it and the probe is exercised on every
@@ -1833,8 +1825,6 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
         }
         case op_write:
         case op_writev:
-        case op_send_zc:
-        case op_send_zc_notif:
         {
             if (SOCKETLEY_UNLIKELY(req->fd < 0 || req->fd >= MAX_FDS)) break;
             auto& we = m_conn_idx[req->fd];
@@ -2098,7 +2088,7 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     {
         c.present   = true;
         c.in_flight = cconn->read_pending || cconn->write_pending ||
-                      cconn->zc_notif_pending || cconn->splice_in_pending ||
+                      cconn->splice_in_pending ||
                       cconn->splice_out_pending || cconn->connect_pending ||
                       cconn->abort_watch_pending;
         c.queued    = !cconn->write_queue.empty();
@@ -2109,7 +2099,7 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
     {
         b.present   = true;
         b.in_flight = bconn->read_pending || bconn->write_pending ||
-                      bconn->zc_notif_pending || bconn->splice_in_pending ||
+                      bconn->splice_in_pending ||
                       bconn->splice_out_pending;
         b.queued    = !bconn->write_queue.empty();
         b.closing   = bconn->closing;
@@ -2171,7 +2161,6 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     f |= uint64_t(c->read_pending)          << 0;
     f |= uint64_t(c->write_pending)         << 1;
     f |= uint64_t(c->closing)               << 2;
-    f |= uint64_t(c->zc_notif_pending)      << 3;
     f |= uint64_t(c->splice_active)         << 4;
     f |= uint64_t(c->splice_in_pending)     << 5;
     f |= uint64_t(c->splice_out_pending)    << 6;
@@ -2217,7 +2206,6 @@ uint64_t proxy_instance::inv_digest(const proxy_backend_connection* b)
     f |= uint64_t(b->read_pending)                   << 0;
     f |= uint64_t(b->write_pending)                  << 1;
     f |= uint64_t(b->closing)                        << 2;
-    f |= uint64_t(b->zc_notif_pending)               << 3;
     f |= uint64_t(b->splice_active)                  << 4;
     f |= uint64_t(b->splice_in_pending)              << 5;
     f |= uint64_t(b->splice_out_pending)             << 6;
@@ -2258,7 +2246,7 @@ void proxy_instance::inv_check_progress(int fd, int res, uint8_t type, const cha
         switch (type)
         {
             case op_read:  case op_read_provided: case op_recv_multishot:
-            case op_write: case op_writev:        case op_send_zc:
+            case op_write: case op_writev:
             case op_splice:
                 bytes = static_cast<uint64_t>(res);
                 break;
@@ -6066,11 +6054,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
         {
             auto* bconn = be.backend;
             // Deferring is only right while something is in flight, so a flush
-            // that cannot reach the ring falls through -- and zc_notif_pending
-            // belongs in the list, because a zero-copy send clears
-            // write_pending on the first of its two answers.
+            // that cannot reach the ring falls through.
             bool defer = bconn->read_pending || bconn->write_pending ||
-                         bconn->zc_notif_pending ||
                          bconn->splice_in_pending || bconn->splice_out_pending ||
                          !bconn->write_queue.empty() ||
                          // The record layer's own bytes: the alert that says
@@ -6143,9 +6128,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 if (be2.side == conn_backend)
                 {
                     auto* bconn2 = be2.backend;
-                    // Same list as above, zero-copy notification included.
+                    // Same list as above.
                     bool defer2 = bconn2->read_pending || bconn2->write_pending ||
-                                  bconn2->zc_notif_pending ||
                                   bconn2->splice_in_pending || bconn2->splice_out_pending ||
                                   !bconn2->write_queue.empty() || tls_owes_output(bconn2);
                     if (defer2)
@@ -6193,10 +6177,9 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
             if (conn->abort_watch_pending && m_loop)
                 m_loop->submit_poll_remove(&conn->abort_req);
 
-            // Zero-copy notification included, with peer_splicing_into_client
-            // the descriptor the backend is still writing into.
+            // With peer_splicing_into_client the descriptor the backend is
+            // still writing into.
             bool defer_c = conn->read_pending || conn->write_pending ||
-                           conn->zc_notif_pending ||
                            conn->splice_in_pending || conn->splice_out_pending ||
                            !conn->write_queue.empty() || tls_owes_output(conn) ||
                            peer_splicing_into_client;
@@ -6317,7 +6300,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
     // was almost never true and the connection was thrown away after every
     // response -- and a read is the one operation that can be taken back.
     const bool only_read_pending =
-        bconn->read_pending && !bconn->write_pending && !bconn->zc_notif_pending &&
+        bconn->read_pending && !bconn->write_pending &&
         !bconn->splice_in_pending && !bconn->splice_out_pending;
 
     // The cancel is the last condition, because a refused submission must
@@ -6368,7 +6351,7 @@ void proxy_instance::detach_and_pool_backend(proxy_client_connection* cconn, int
 
     // Cannot pool if there are pending io_uring ops — CQEs would arrive for a
     // pooled (unregistered) fd, causing UAF or misrouted completions.
-    if (bconn->read_pending || bconn->write_pending || bconn->zc_notif_pending ||
+    if (bconn->read_pending || bconn->write_pending ||
         bconn->splice_in_pending || bconn->splice_out_pending)
     {
         // A backend that cannot be pooled is no reason to take the client with
@@ -6592,10 +6575,8 @@ void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
         return;
     auto* bconn = m_conn_idx[bfd].backend;
 
-    // Anything the copy path still owes this socket, zc_notif_pending
-    // included, because a zero-copy send clears write_pending on its first
-    // completion.
-    if (bconn->write_pending || bconn->zc_notif_pending || !bconn->write_queue.empty())
+    // Anything the copy path still owes this socket.
+    if (bconn->write_pending || !bconn->write_queue.empty())
         return;
 
     // And anything the splice path still owes it, where the two pending flags
@@ -8482,7 +8463,7 @@ bool proxy_instance::tls_flush(Conn* conn)
 
     // One write in flight at a time, because a second submission would need a
     // second buffer and would interleave two record streams on one socket.
-    if (conn->write_pending || conn->zc_notif_pending)
+    if (conn->write_pending)
         return true;
 
     // Application data only once the handshake is done, so a request queued
@@ -8571,7 +8552,7 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
         return tls_flush(conn);
 
-    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
+    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty()))
         return true;
 
     uint32_t count = 0;
@@ -8592,17 +8573,8 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     {
         auto len = static_cast<uint32_t>(std::min(conn->write_batch[0].size(),
                                                    static_cast<size_t>(UINT32_MAX)));
-        if (m_send_zc && len >= (512u << 10))
-        {
-            conn->zc_notif_pending = true;
-            conn->write_req.type = op_send_zc;
-            queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
-        else
-        {
-            conn->write_req.type = op_write;
-            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
+        conn->write_req.type = op_write;
+        queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
     }
     else
     {
@@ -8613,7 +8585,6 @@ bool proxy_instance::flush_client_write_queue(proxy_client_connection* conn)
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
-        conn->zc_notif_pending = false;
         // Dropped now rather than at the next overwrite, because a borrowed
         // entry holds a ring buffer until it is.
         for (uint32_t i = 0; i < count; i++)
@@ -8635,7 +8606,7 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
         return tls_flush(conn);
 
-    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
+    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty()))
         return true;
 
     uint32_t count = 0;
@@ -8656,17 +8627,8 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     {
         auto len = static_cast<uint32_t>(std::min(conn->write_batch[0].size(),
                                                    static_cast<size_t>(UINT32_MAX)));
-        if (m_send_zc && len >= (512u << 10))
-        {
-            conn->zc_notif_pending = true;
-            conn->write_req.type = op_send_zc;
-            queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
-        else
-        {
-            conn->write_req.type = op_write;
-            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
+        conn->write_req.type = op_write;
+        queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
     }
     else
     {
@@ -8677,7 +8639,6 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
-        conn->zc_notif_pending = false;
         // Dropped now rather than at the next overwrite, because a borrowed
         // entry holds a ring buffer until it is.
         for (uint32_t i = 0; i < count; i++)
@@ -8686,26 +8647,6 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
         return false;
     }
     return true;
-}
-
-// Whether the kernel zero-copied this send or quietly fell back to copying it,
-// said once per instance because a path that falls back falls back for every
-// send on it.
-//
-// A fallback is the worst of the three outcomes and the only one nothing
-// reported: a copy AND a second completion AND a buffer held until the
-// notification, which is strictly more than a plain send costs.  Zero-copy is
-// opt-in through SOCKETLEY_SEND_ZC and no test sets it, so this had never run.
-void proxy_instance::note_zc_outcome(const struct io_uring_cqe* cqe)
-{
-    if (!(cqe->res & IORING_NOTIF_USAGE_ZC_COPIED))
-        return;
-    if (m_zc_copied_warned)
-        return;
-    m_zc_copied_warned = true;
-    LOG_WARN("proxy: the kernel COPIED a zero-copy send rather than referencing the "
-             "buffer -- on this path SOCKETLEY_SEND_ZC costs a copy, an extra "
-             "completion and a pinned buffer, which is worse than a plain send");
 }
 
 void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* req)
@@ -8717,46 +8658,19 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
 
     auto* conn = entry.client;
 
-    // Zero-copy send notification: buffer is now safe to release
-    if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
-    {
-        note_zc_outcome(cqe);
-        conn->zc_notif_pending = false;
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-
-        if (!conn->write_queue.empty() && !conn->write_pending)
-        {
-            if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
-            {
-                close_pair(conn->fd, conn->backend_fd);
-                return;
-            }
-        }
-        else if (conn->write_queue.empty() && !conn->write_pending &&
-                 conn->closing && !conn->read_pending &&
-                 !conn->splice_in_pending && !conn->splice_out_pending)
-            close_pair(fd, conn->backend_fd);
-        return;
-    }
-
     conn->write_pending = false;
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        if (SOCKETLEY_LIKELY(!conn->zc_notif_pending))
-        {
-            for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].clear();
-            conn->write_batch_count = 0;
-        }
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
         close_pair(fd, conn->backend_fd);
         return;
     }
 
     // Short write handling: resubmit remaining bytes
-    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    if (conn->write_batch_count > 0)
     {
         size_t total_submitted = 0;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
@@ -8822,16 +8736,13 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     }
 
     // Full write completed — release batch
-    if (SOCKETLEY_LIKELY(!conn->zc_notif_pending))
-    {
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-    }
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
 
     // A TLS connection can owe the wire bytes with an empty queue, and asking
     // only about the queue is how a handshake stalls one round short.
-    if ((!conn->write_queue.empty() || tls_owes_output(conn)) && !conn->zc_notif_pending)
+    if (!conn->write_queue.empty() || tls_owes_output(conn))
     {
         if (SOCKETLEY_UNLIKELY(!flush_client_write_queue(conn)))
         {
@@ -8839,7 +8750,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             return;
         }
     }
-    else if (conn->closing && !conn->read_pending && !conn->zc_notif_pending &&
+    else if (conn->closing && !conn->read_pending &&
              !conn->splice_in_pending && !conn->splice_out_pending)
     {
         close_pair(fd, conn->backend_fd);
@@ -8874,46 +8785,19 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
 
     auto* conn = entry.backend;
 
-    // Zero-copy send notification: buffer is now safe to release
-    if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
-    {
-        note_zc_outcome(cqe);
-        conn->zc_notif_pending = false;
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-
-        if (!conn->write_queue.empty() && !conn->write_pending)
-        {
-            if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
-            {
-                close_pair(conn->client_fd, conn->fd);
-                return;
-            }
-        }
-        else if (conn->write_queue.empty() && !conn->write_pending &&
-                 conn->closing && !conn->read_pending &&
-                 !conn->splice_in_pending && !conn->splice_out_pending)
-            close_pair(conn->client_fd, fd);
-        return;
-    }
-
     conn->write_pending = false;
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
-        if (SOCKETLEY_LIKELY(!conn->zc_notif_pending))
-        {
-            for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].clear();
-            conn->write_batch_count = 0;
-        }
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
         close_pair(conn->client_fd, fd);
         return;
     }
 
     // Short write handling: resubmit remaining bytes
-    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    if (conn->write_batch_count > 0)
     {
         size_t total_submitted = 0;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
@@ -8982,16 +8866,13 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     SKL_TRACE_ADD(conn, writes, 1);
 
     // Full write completed — release batch
-    if (SOCKETLEY_LIKELY(!conn->zc_notif_pending))
-    {
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-    }
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
 
     // See handle_client_write: the record layer owes bytes the queue cannot
     // account for.
-    if ((!conn->write_queue.empty() || tls_owes_output(conn)) && !conn->zc_notif_pending)
+    if (!conn->write_queue.empty() || tls_owes_output(conn))
     {
         if (SOCKETLEY_UNLIKELY(!flush_backend_write_queue(conn)))
         {
@@ -8999,7 +8880,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
             return;
         }
     }
-    else if (conn->closing && !conn->read_pending && !conn->zc_notif_pending &&
+    else if (conn->closing && !conn->read_pending &&
              !conn->splice_in_pending && !conn->splice_out_pending)
     {
         close_pair(conn->client_fd, fd);

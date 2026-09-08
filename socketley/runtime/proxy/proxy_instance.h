@@ -95,7 +95,6 @@ struct alignas(64) proxy_client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    bool zc_notif_pending{false};
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
@@ -238,7 +237,6 @@ struct alignas(64) proxy_backend_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    bool zc_notif_pending{false};
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
@@ -723,7 +721,6 @@ private:
 
     // Both report whether the submission reached the ring; see the
     // definitions for why a caller must not ignore that.
-    void note_zc_outcome(const struct io_uring_cqe* cqe);
     bool flush_client_write_queue(proxy_client_connection* conn);
     bool flush_backend_write_queue(proxy_backend_connection* conn);
 
@@ -927,7 +924,6 @@ private:
     }
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
-    bool m_send_zc{false};
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
     bool m_splice_supported{false};
@@ -942,8 +938,6 @@ private:
     // per instance because the condition is a property of the backend rather
     // than of one connection.
     bool m_pool_unbidden_warned{false};
-    // Said once: a path that falls back to copying does it for every send.
-    bool m_zc_copied_warned{false};
     // The same finding on an encrypted socket, as a separate flag because
     // there the bytes are routine and what OpenSSL made of them is the
     // evidence.

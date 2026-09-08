@@ -911,7 +911,6 @@ bool event_loop::init()
         struct io_uring_probe* probe = io_uring_get_probe_ring(&m_ring);
         if (probe)
         {
-            m_send_zc_supported = io_uring_opcode_supported(probe, IORING_OP_SEND_ZC);
             m_recv_multishot_supported = io_uring_opcode_supported(probe, IORING_OP_RECV);
             io_uring_free_probe(probe);
         }
@@ -1014,26 +1013,7 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         // completion that is the operation's last, since IORING_CQE_F_MORE
         // means the submission will resolve its descriptor again.
         const bool final_cqe = (cqe->flags & IORING_CQE_F_MORE) == 0;
-
-        // IORING_OP_SEND_ZC answers "may this number be reissued" and "may
-        // this storage be freed" at different times, so the target reference
-        // comes off at the send while the owner count waits for a notification
-        // the peer alone releases.
-        const bool zc_send_phase = !final_cqe && rtype == op_send_zc &&
-                                   (cqe->flags & IORING_CQE_F_NOTIF) == 0;
-        if (__builtin_expect(zc_send_phase, 0))
-        {
-            // So the notification's own disarm() does not release them a
-            // second time, safe before the dispatch because no caller re-arms
-            // a request whose notification is outstanding.
-            req->armed_target  = IO_TARGET_NONE;
-            req->armed_target2 = IO_TARGET_NONE;
-        }
-
-        // What close_fd() discounts while the handler runs, only where the
-        // submission will not resolve its descriptor again -- the zero-copy
-        // send being the exception, since its SQE is already spent.
-        if (__builtin_expect(final_cqe || zc_send_phase, 1))
+        if (__builtin_expect(final_cqe, 1))
         {
             m_cqe_target  = rt1;
             m_cqe_target2 = rt2;
@@ -1063,14 +1043,6 @@ event_loop::cqe_outcome event_loop::dispatch_cqe(struct io_uring_cqe* cqe)
         // point, since a slot that keeps looking armed is never reusable.
         if (__builtin_expect(final_cqe, 1))
             disarm(tok, rtype, rt1, rt2);
-        else if (__builtin_expect(zc_send_phase, 0))
-        {
-            // The owner keeps its count because the notification is still
-            // owed, while the file is released now, last and after the handler
-            // has run.
-            target_unref(rt1);
-            target_unref(rt2);
-        }
     }
 
     return cqe_outcome::next;
@@ -1562,19 +1534,6 @@ bool event_loop::submit_read_provided_fixed_file(int fixed_idx, uint16_t group_i
     return true;
 }
 
-bool event_loop::submit_send_zc_fixed_file(int fixed_idx, const char* buf, uint32_t len, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return false;
-
-    io_uring_prep_send_zc(sqe, fixed_idx, buf, len, MSG_NOSIGNAL, 0);
-    sqe->flags |= IOSQE_FIXED_FILE;
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_send_zc;
-    arm(req, fixed_target(fixed_idx));
-    return true;
-}
-
 // Registered buffers: the kernel pins these pages and skips
 // copy_from_user/copy_to_user on each I/O operation.
 bool event_loop::register_buffers(const struct iovec* iovs, uint32_t count)
@@ -1782,22 +1741,6 @@ bool event_loop::recv_multishot_supported() const
     return m_recv_multishot_supported;
 }
 
-bool event_loop::send_zc_supported() const
-{
-    return m_send_zc_supported;
-}
-
-bool event_loop::send_zc_enabled() const
-{
-    // Read once: the answer cannot change under a running process, and this is
-    // consulted from every runtime's setup().
-    static const bool opted_in = [] {
-        const char* e = getenv("SOCKETLEY_SEND_ZC");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
-    return m_send_zc_supported && opted_in;
-}
-
 bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
@@ -1926,18 +1869,6 @@ bool event_loop::submit_recv_multishot_bundle_fixed_file(int fixed_idx, uint16_t
     req->type = op_recv_multishot_bundle;
     req->buf_group = static_cast<uint8_t>(group_id);
     arm(req, fixed_target(fixed_idx));
-    return true;
-}
-
-bool event_loop::submit_send_zc(int fd, const char* buf, uint32_t len, io_request* req)
-{
-    struct io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return false;
-
-    io_uring_prep_send_zc(sqe, fd, buf, len, MSG_NOSIGNAL, 0);
-    io_uring_sqe_set_data(sqe, req);
-    req->type = op_send_zc;
-    arm(req, raw_target(fd));
     return true;
 }
 

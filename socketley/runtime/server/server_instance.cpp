@@ -148,7 +148,7 @@ conn_ref server_instance::ref_for_fd(int fd) const
 // one dispatch later.
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
-    return conn->read_pending || conn->write_pending || conn->zc_notif_pending
+    return conn->read_pending || conn->write_pending
         || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending;
 }
 
@@ -159,7 +159,6 @@ socketley::reach::owed server_instance::conn_owed(const server_connection* conn)
 {
     socketley::reach::owed o;
     o.write          = conn->write_pending;
-    o.zc_notif       = conn->zc_notif_pending;
     o.file_read      = conn->file_read_pending;
     o.splice_in      = conn->splice_in_pending;
     o.splice_out     = conn->splice_out_pending;
@@ -272,8 +271,8 @@ void server_instance::return_provided_buf(struct io_uring_cqe* cqe)
 }
 
 // One teardown for a client connection reached from every path that closes
-// one, because ten steps in each path's own order is how the zero-copy
-// notification came to be checked in three and forgotten in two.
+// one, because ten steps in each path's own order is how a pending flag came
+// to be checked in three and forgotten in two.
 void server_instance::close_conn(server_connection* conn, bool notify_disconnect)
 {
     // An answer from the cache is still owed, and closing now throws away what
@@ -358,15 +357,7 @@ bool server_instance::reap_retired(struct io_uring_cqe* cqe, io_request* req)
             if (!(cqe->flags & IORING_CQE_F_MORE))
                 c->read_pending = false;
         }
-        else if (req == &c->write_req)
-        {
-            // A zero-copy send completes twice: once when the kernel has taken
-            // the request, once when it has finished reading the pages.
-            if (cqe->flags & IORING_CQE_F_NOTIF)
-                c->zc_notif_pending = false;
-            else
-                c->write_pending = false;
-        }
+        else if (req == &c->write_req)       c->write_pending = false;
         else if (req == &c->file_read_req)   c->file_read_pending = false;
         else if (req == &c->splice_in_req)   c->splice_in_pending = false;
         else if (req == &c->splice_out_req)  c->splice_out_pending = false;
@@ -1736,10 +1727,6 @@ bool server_instance::setup(event_loop& loop)
     // Bundled recv, probed by a real submission and switchable by
     // SOCKETLEY_RECV_BUNDLE=0, which is also the A/B switch on one binary.
     m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();
-    // Not send_zc_supported(), because a pending zero-copy notification is not
-    // cancellable and only the peer can release it, which would hold this
-    // instance in the graveyard.
-    m_send_zc = loop.send_zc_enabled();
 
     // Multishot accept where supported, but not direct descriptors, because
     // cqe->res would be a fixed index and setsockopt and getpeername need a
@@ -1961,10 +1948,9 @@ void server_instance::teardown(event_loop& loop)
         conn->splice_pending = false;
 
         // The queue is ours to drop and the batch is not, because a write that
-        // reached the ring is reading out of write_batch[0] and a zero-copy
-        // send does so after write_pending went down.
+        // reached the ring is reading out of write_batch[0].
         conn->write_queue.clear();
-        if (!conn->write_pending && !conn->zc_notif_pending)
+        if (!conn->write_pending)
         {
             for (size_t i = 0; i < conn->write_batch_count; i++)
                 conn->write_batch[i].clear();
@@ -2144,8 +2130,6 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_recv_multishot_bundle:
         case op_write:
         case op_writev:
-        case op_send_zc:
-        case op_send_zc_notif:
         {
             const bool is_read = is_read_op(req->type);
 
@@ -2324,7 +2308,7 @@ void server_instance::inv_check_reachable(int fd, const char* where)
         // A cache request counts, because the channel's own wakeup is in the
         // ring and the reply comes back here, which is what the invariant is
         // about.
-        h.in_flight = c->read_pending || c->write_pending || c->zc_notif_pending ||
+        h.in_flight = c->read_pending || c->write_pending ||
                       c->file_read_pending || c->splice_in_pending || c->splice_out_pending ||
                       c->cache_pending > 0;
         h.queued    = !c->write_queue.empty();
@@ -3338,9 +3322,8 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             return;
         }
 
-        // Connection closed or error, asked through conn_ops_pending(),
-        // because the old guard ignored the zero-copy notification and
-        // released the struct while the kernel was still reading the pages.
+        // Connection closed or error, asked through conn_ops_pending(), so
+        // that every operation still owed on this struct is counted.
         conn->closing = true;
         if (!conn_ops_pending(conn))
             close_conn(conn);
@@ -4115,7 +4098,7 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
         return;
 
     // Still something to send, or something in the ring that is sending it.
-    if (conn_has_output(conn) || conn->write_pending || conn->zc_notif_pending)
+    if (conn_has_output(conn) || conn->write_pending)
         return;
     if (conn->splice_pending || conn->splice_in_pending || conn->splice_out_pending)
         return;
@@ -4144,7 +4127,7 @@ void server_instance::tls_flush(server_connection* conn)
 
     // One write in flight at a time, because a second submission would need a
     // second buffer and would interleave two record streams on one socket.
-    if (conn->write_pending || conn->zc_notif_pending)
+    if (conn->write_pending)
         return;
 
     // Application data only once the handshake is done, so a message queued by
@@ -4237,7 +4220,7 @@ void server_instance::flush_write_queue(server_connection* conn)
         return;
     }
 
-    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty() || conn->zc_notif_pending))
+    if (SOCKETLEY_UNLIKELY(!m_loop || conn->write_queue.empty()))
         return;
 
     // Coalesce up to MAX_WRITE_BATCH messages into a single writev
@@ -4259,26 +4242,12 @@ void server_instance::flush_write_queue(server_connection* conn)
     {
         auto len = static_cast<uint32_t>(conn->write_batch[0].size());
 
-        // Use zero-copy send only for very large buffers (>= 512KB);
-        // the NOTIF CQE round-trip kills throughput for smaller writes
-        if (m_send_zc && len >= (512u << 10))
-        {
-            conn->zc_notif_pending = true;
-            conn->write_req.type = op_send_zc;
-            if (conn->direct_fd)
-                queued = m_loop->submit_send_zc_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
-            else
-                queued = m_loop->submit_send_zc(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
+        // Single message — use plain write (lower overhead than writev)
+        conn->write_req.type = op_write;
+        if (conn->direct_fd)
+            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
         else
-        {
-            // Single message — use plain write (lower overhead than writev)
-            conn->write_req.type = op_write;
-            if (conn->direct_fd)
-                queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
-            else
-                queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
-        }
+            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
     }
     else
     {
@@ -4295,7 +4264,6 @@ void server_instance::flush_write_queue(server_connection* conn)
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         conn->write_pending = false;
-        conn->zc_notif_pending = false;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
@@ -4310,36 +4278,14 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!conn))
         return;
 
-    // Zero-copy send notification: buffer is now safe to release
-    if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
-    {
-        conn->zc_notif_pending = false;
-        // Release batch references now that kernel is done with buffers
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-
-        // Drain queue if we were waiting for NOTIF
-        if (!conn->write_queue.empty() && !conn->write_pending)
-            flush_write_queue(conn);
-        else if (conn->write_queue.empty() && conn->closing && !conn_ops_pending(conn))
-            close_conn(conn);
-        else
-            maybe_shutdown_write(conn);
-        return;
-    }
-
     conn->write_pending = false;
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
         // Release batch refs on error
-        if (!conn->zc_notif_pending)
-        {
-            for (uint32_t i = 0; i < conn->write_batch_count; i++)
-                conn->write_batch[i].clear();
-            conn->write_batch_count = 0;
-        }
+        for (uint32_t i = 0; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+        conn->write_batch_count = 0;
         conn->closing = true;
         // splice_cleanup() declines while a splice is armed, because closing
         // the file and handing the pipe on mixes one response's bytes into the
@@ -4354,7 +4300,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
     // Short write handling: resubmit remaining bytes
-    if (!conn->zc_notif_pending && conn->write_batch_count > 0)
+    if (conn->write_batch_count > 0)
     {
         size_t total_submitted = 0;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
@@ -4442,12 +4388,9 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     }
 
     // Full write completed — release batch
-    if (!conn->zc_notif_pending)
-    {
-        for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
-        conn->write_batch_count = 0;
-    }
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
 
     // The response is on the wire with an empty queue behind it, which is the
     // only moment sending the FIN cannot overtake anything; it declines by
@@ -4456,7 +4399,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 
     // conn_has_output and not the queue alone, because a TLS connection owes
     // handshake records with nothing queued at all.
-    if (SOCKETLEY_LIKELY(conn_has_output(conn) && !conn->zc_notif_pending))
+    if (SOCKETLEY_LIKELY(conn_has_output(conn)))
     {
         flush_write_queue(conn);
         // A flush can legitimately submit nothing, and without this the
@@ -4505,9 +4448,8 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         free(conn->file_buf);
         conn->file_buf = nullptr;
         conn->file_size = 0;
-        // The old guard here looked at the read and the write only, so a
-        // zero-copy send still reading out of write_batch[0] — write_pending
-        // long since down, notification not yet in — did not stop the release.
+        // Asked through conn_ops_pending(), so that every operation still owed
+        // on this struct stops the release.
         if (!conn_ops_pending(conn))
             close_conn(conn);
         return;

@@ -227,8 +227,6 @@ enum op_type : uint8_t
     op_recvmsg               = 7,
     op_timeout               = 8,
     op_recv_multishot        = 9,
-    op_send_zc               = 10,
-    op_send_zc_notif         = 11,
     op_multishot_accept_direct = 12,  // multishot accept with direct descriptors
     op_read_fixed_buf        = 13,    // read using registered buffer
     op_write_fixed_buf       = 14,    // write using registered buffer
@@ -264,8 +262,6 @@ inline const char* io_op_name(uint8_t t)
         case op_recvmsg:                 return "recvmsg";
         case op_timeout:                 return "timeout";
         case op_recv_multishot:          return "recv-multishot";
-        case op_send_zc:                 return "send-zc";
-        case op_send_zc_notif:           return "send-zc-notif";
         case op_multishot_accept_direct: return "multishot-accept-direct";
         case op_read_fixed_buf:          return "read-fixed-buf";
         case op_write_fixed_buf:         return "write-fixed-buf";

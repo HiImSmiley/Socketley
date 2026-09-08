@@ -181,9 +181,6 @@
 // because a build host's liburing headers may predate them, and a target that
 // stops compiling on an older box teaches nobody anything — the flag is a bit
 // in a word the loop reads either way.
-#ifndef IORING_CQE_F_NOTIF
-#define IORING_CQE_F_NOTIF (1U << 3)
-#endif
 #ifndef IORING_CQE_F_SOCK_NONEMPTY
 #define IORING_CQE_F_SOCK_NONEMPTY (1U << 2)
 #endif
@@ -385,8 +382,8 @@ enum arm_kind : uint8_t
     A_READ, A_WRITE, A_WRITEV, A_RECVMSG, A_SENDMSG,
     A_TIMEOUT,
     A_READ_PROVIDED, A_RECV_MULTISHOT,
-    A_READ_FIXED, A_WRITE_FIXED, A_MSHOT_FIXED, A_PROVIDED_FIXED, A_SENDZC_FIXED,
-    A_SENDZC, A_SPLICE, A_FILE_READ, A_CONNECT, A_POLL,
+    A_READ_FIXED, A_WRITE_FIXED, A_MSHOT_FIXED, A_PROVIDED_FIXED,
+    A_SPLICE, A_FILE_READ, A_CONNECT, A_POLL,
     A_READ_FIXED_BUF, A_WRITE_FIXED_BUF,
     A_KIND_COUNT
 };
@@ -1040,15 +1037,6 @@ bool do_arm(world& w, int ri, uint8_t kind, uint8_t a, uint8_t b, bool in_handle
             ty = op_read_provided; t1 = fixed_t(fx); group = grp;
             ok = w.loop->submit_read_provided_fixed_file(fx, grp, &r.req);
             break;
-        case A_SENDZC_FIXED:
-            if (fx < 0) return false;
-            ty = op_send_zc; t1 = fixed_t(fx);
-            ok = w.loop->submit_send_zc_fixed_file(fx, w.iobuf, 64, &r.req);
-            break;
-        case A_SENDZC:
-            ty = op_send_zc; t1 = raw_t(fd);
-            ok = w.loop->submit_send_zc(fd, w.iobuf, 64, &r.req);
-            break;
         case A_SPLICE:
             if (fd2 < 0) return false;
             ty = op_splice; t1 = raw_t(fd); t2 = raw_t(fd2);
@@ -1158,7 +1146,6 @@ bool do_cqe(world& w, int ri, uint8_t res_sel, uint8_t flag_sel, uint8_t aux)
     const bool more = (flag_sel & 1u) != 0;
     if (more)            flags |= IORING_CQE_F_MORE;
     if (flag_sel & 4u)   flags |= IORING_CQE_F_SOCK_NONEMPTY;
-    if (flag_sel & 8u)   flags |= IORING_CQE_F_NOTIF;
 
     // A provided buffer only ever rides on a completion for a submission that
     // selected one; anything else is a shape no kernel produces, and asserting
@@ -1187,16 +1174,6 @@ bool do_cqe(world& w, int ri, uint8_t res_sel, uint8_t flag_sel, uint8_t aux)
     // A zero-copy send answers the two questions this loop tracks at different
     // moments, and it is the only operation that does.  Its send completion
     // ends the descriptor's involvement — the SQE is spent, and the
-    // notification that follows resolves no file — while its owner stays
-    // counted until that notification, because the request storage has to
-    // survive to receive it.  So the target is released on the first of the two
-    // CQEs and the owner on the second.  Mirrors the zc_send_phase branch in
-    // dispatch_cqe(), and reads req->type, the same field the loop reads, so
-    // the model cannot drift from the implementation by disagreeing about which
-    // arm's type applies when one request is armed more than once.
-    const bool zc_send_phase = more && r.req.type == op_send_zc &&
-                               (flags & IORING_CQE_F_NOTIF) == 0;
-
     w.cqe_req    = ri;
     w.cqe_action = w.draining ? static_cast<uint8_t>(H_NONE)
                               : static_cast<uint8_t>(aux % H_ACTION_COUNT);
@@ -1205,8 +1182,8 @@ bool do_cqe(world& w, int ri, uint8_t res_sel, uint8_t flag_sel, uint8_t aux)
     w.cqe_dispatched      = false;
     // Exactly what the loop puts in m_cqe_target for the duration of the
     // dispatch, so a close_fd() from inside the handler can be predicted.
-    w.cqe_t1 = (more && !zc_send_phase) ? IO_TARGET_NONE : rec.t1;
-    w.cqe_t2 = (more && !zc_send_phase) ? IO_TARGET_NONE : rec.t2;
+    w.cqe_t1 = more ? IO_TARGET_NONE : rec.t1;
+    w.cqe_t2 = more ? IO_TARGET_NONE : rec.t2;
     w.cqe_final = !more;
 
     const auto outcome = w.loop->dispatch_cqe(&cqe);
@@ -1263,18 +1240,6 @@ bool do_cqe(world& w, int ri, uint8_t res_sel, uint8_t flag_sel, uint8_t aux)
         buf_sync(w, buf_group);
     }
 
-    if (zc_send_phase)
-    {
-        // The descriptor half of the arm is answered, the owner half is not.
-        // The arm stays at the head of the FIFO — its notification is still to
-        // come — but its targets are cleared, so the notification does not
-        // release them a second time.  The loop does exactly this by clearing
-        // req->armed_target before the dispatch.
-        ledger_unref(w, rec.t1);
-        ledger_unref(w, rec.t2);
-        r.arms[0].t1 = IO_TARGET_NONE;
-        r.arms[0].t2 = IO_TARGET_NONE;
-    }
 
     if (!more)
     {

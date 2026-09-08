@@ -63,7 +63,6 @@ struct alignas(64) server_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    bool zc_notif_pending{false};
     proto_state proto{proto_unknown};
     bool routed{false};
     bool file_read_pending{false};
@@ -237,7 +236,6 @@ struct alignas(64) server_connection
         read_pending = false;
         write_pending = false;
         closing = false;
-        zc_notif_pending = false;
         if (file_fd >= 0) { close(file_fd); file_fd = -1; }
         if (file_buf) { free(file_buf); file_buf = nullptr; }
         file_read_req = {};
@@ -879,7 +877,6 @@ private:
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     bool m_recv_bundle{false};
-    bool m_send_zc{false};
     bool m_direct_accept{false};
 
     // UDP mode

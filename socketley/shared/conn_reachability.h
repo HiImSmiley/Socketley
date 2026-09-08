@@ -10,8 +10,6 @@ namespace socketley::reach
 struct owed
 {
     bool write{false};        // an error is still an answer
-    bool zc_notif{false};     // not implied by write: the first completion
-                              // clears that while the kernel is still DMA-ing
     bool file_read{false};    // depends on neither socket nor peer
     bool splice_in{false};
     bool splice_out{false};
@@ -24,7 +22,7 @@ struct owed
 
 inline constexpr bool ring_will_report(const owed& o)
 {
-    return o.write || o.zc_notif || o.file_read || o.splice_in || o.splice_out ||
+    return o.write || o.file_read || o.splice_in || o.splice_out ||
            o.connect || o.promised_reply;
 }
 
