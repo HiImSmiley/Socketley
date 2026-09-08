@@ -25,6 +25,25 @@
 # left alone, so a difference between the arms cannot be a difference between
 # two fixtures.
 #
+# ─── THE BACKEND IS floor_server AND NOT A SOCKETLEY SERVER ─────────────────
+#
+# The first version of this fronted `server --mode in --lua echo.lua`, which is
+# what the two older proxy benchmarks use, and the concurrent TCP row came back
+# `backend-bound (0.863 cores)`: echo.lua runs a Lua interpreter per message, so
+# eight connections were enough to make the fixture the ceiling and both arms
+# report it instead of themselves.
+#
+# floor_server is C, single-threaded epoll, no io_uring, no framing, no counters
+# -- one read and one write per message, which is strictly less work than the
+# proxy in front of it does.  It is the same argument as `--http-cache` on the
+# HTTP backend: a fixture is not a thing under test, and the cheaper it is the
+# more of the number belongs to what is.
+#
+# `-n` in sharded mode, because one epoll thread is cheaper than one proxy and
+# not cheaper than four.  AF_UNIX has no SO_REUSEPORT, so the unix backend stays
+# a single process in both modes and the backend-bound check is what decides
+# whether that spoiled its rows.
+#
 # ─── THE CHECKS, EACH OF WHICH HAS ALREADY BOUGHT A WORTHLESS RUN ───────────
 #
 #   THE 404.  socketley's HTTP proxy routes on a leading `/<runtime-name>/` and
@@ -67,6 +86,9 @@
 
 declare -gA SKPORT HAPORT SKPIDS BEPIDS
 HA_PID=""
+# Not socketley processes, so the caller's environment-matched sweep cannot see
+# them: they are tracked by pid and taken down by proxy_fixtures_down.
+FLOOR_PIDS=""
 
 pids_on_port() {
     ss -ltnp 2>/dev/null | awk -v p=":$1\$" '$4 ~ p' \
@@ -131,7 +153,27 @@ proxy_fixtures_ports_free() {
     return 0
 }
 
+# Every floor_server this run started, children included: -n forks, and a
+# backend that outlives its benchmark holds the port against the next one.
+proxy_fixtures_down() {
+    local p c
+    for p in $FLOOR_PIDS; do
+        for c in $(pgrep -P "$p" 2>/dev/null); do kill -9 "$c" 2>/dev/null; done
+        kill -9 "$p" 2>/dev/null
+    done
+    FLOOR_PIDS=""
+    [ -n "${HA_PID:-}" ] && kill -9 "$HA_PID" 2>/dev/null
+    return 0
+}
+
 proxy_fixtures_up() {
+    FLOOR_BIN=${FLOOR_BIN:-$PROJECT_ROOT/bin/Release/floor_server}
+    if [ ! -x "$FLOOR_BIN" ]; then
+        log_error "floor_server is not built at $FLOOR_BIN"
+        log_error "the TCP backends need it: an echo.lua fixture runs an interpreter"
+        log_error "per message and made the eight-connection row backend-bound"
+        return 1
+    fi
     mkdir -p "$WORK/www"
     printf 'ok' > "$WORK/www/small.txt"
     # Not an .html file: `--http` injects a WebSocket script into every .html it
@@ -140,26 +182,36 @@ proxy_fixtures_up() {
     chmod -R a+rX "$WORK"
     BE_SOCK=$WORK/be.sock
 
-    # In sharded mode the backends are sharded too.  A single-process echo
-    # server saturates near one core, which four proxy shards reach long before
-    # they reach their own limit -- and then both arms report the backend.
-    local BE_SHARD="" PX_SHARD=""
+    # In sharded mode the backends are spread too.  One backend process is
+    # cheaper than one proxy process and not cheaper than four, and a saturated
+    # fixture makes both arms report it instead of themselves.
+    local BE_N=1 PX_SHARD=""
     if [ "$MODE" = "sharded" ]; then
-        BE_SHARD="--shards $SHARDS"; PX_SHARD="--shards $SHARDS"
+        BE_N=$SHARDS; PX_SHARD="--shards $SHARDS"
     fi
 
     up() { local n=$1; shift; socketley_cmd create "$@" -s >/dev/null 2>&1; return 0; }
+    floor() {   # floor ARGS... -- start one and remember it
+        "$FLOOR_BIN" "$@" >>"$WORK/floor.log" 2>&1 &
+        FLOOR_PIDS="$FLOOR_PIDS $!"
+    }
 
-    up be_tcp  server be_tcp  -p "$P_BE_TCP"  --mode in --lua "$BENCH_ECHO_LUA" $BE_SHARD
-    # --listen unix: refuses --shards, so the unix backend is one process in
-    # both modes.  Named here rather than worked around: the unix rows in
-    # sharded mode are four proxy shards in front of one backend process, and
-    # the backend-bound check is what decides whether that spoiled them.
-    up be_unix server be_unix --listen "unix:$BE_SOCK" --mode in --lua "$BENCH_ECHO_LUA"
+    floor "$P_BE_TCP" -m epoll -n "$BE_N"
+    # AF_UNIX has no SO_REUSEPORT, so this one is a single process in both
+    # modes.  Named rather than worked around: the unix rows in sharded mode are
+    # four proxy shards in front of one backend thread, and the backend-bound
+    # check is what decides whether that spoiled them.
+    floor -u "$BE_SOCK" -m epoll
+    # HTTP has no C floor in this tree, and this backend was measured with
+    # headroom to spare behind either proxy -- see bench_proxy_http_vs_haproxy.sh
+    # for the numbers.  --http-cache is not optional: without it every request is
+    # a disk read and the case measured is the page cache.
+    local BE_SHARD=""
+    [ "$MODE" = "sharded" ] && BE_SHARD="--shards $SHARDS"
     up be_http server be_http -p "$P_BE_HTTP" --http "$WORK/www" --http-cache $BE_SHARD
     local RR_LIST="" i
     for i in 0 1 2 3; do
-        up "be_rr$i" server "be_rr$i" -p $((P_BE_RR + i)) --mode in --lua "$BENCH_ECHO_LUA"
+        floor $((P_BE_RR + i)) -m epoll
         RR_LIST="$RR_LIST,127.0.0.1:$((P_BE_RR + i))"
     done
     RR_LIST=${RR_LIST#,}
@@ -231,10 +283,14 @@ EOF
     SKPORT[http]=$P_SK_HTTP; HAPORT[http]=$P_HA_HTTP
     local f
     for f in tcp unix rr4 http; do SKPIDS[$f]=$(pids_on_port "${SKPORT[$f]}"); done
+    # Read back from the listening sockets and not from the pids `floor` kept:
+    # -n forks, so the process that reports the job id is one of several and
+    # charging a four-way backend's CPU to one of them is the same quarter-truth
+    # the sharded proxy would have been.
     BEPIDS[tcp]=$(pids_on_port "$P_BE_TCP")
     BEPIDS[unix]=$(pids_on_unix "$BE_SOCK")
     BEPIDS[http]=$(pids_on_port "$P_BE_HTTP")
-    BEPIDS[rr4]="$(pids_on_port $((P_BE_RR)))$(pids_on_port $((P_BE_RR+1)))$(pids_on_port $((P_BE_RR+2)))$(pids_on_port $((P_BE_RR+3)))"
+    BEPIDS[rr4]="$(pids_on_port $((P_BE_RR))) $(pids_on_port $((P_BE_RR+1))) $(pids_on_port $((P_BE_RR+2))) $(pids_on_port $((P_BE_RR+3)))"
     HA_PIDS=$(pids_on_port "$P_HA_TCP")
 
     for f in tcp unix rr4 http; do

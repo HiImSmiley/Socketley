@@ -101,6 +101,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
@@ -151,6 +152,13 @@ static int listen_unix(const char *path)
     return fd;
 }
 
+/* SO_REUSEPORT is set only when -n asks for more than one process, and that is
+ * deliberate: this program's whole value is being the floor, and a floor that
+ * quietly changed its socket options would no longer be comparable with the
+ * numbers already taken against it.  With one process the socket is set up
+ * byte-for-byte as it always was. */
+static int g_procs = 1;
+
 static int listen_on(int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -158,6 +166,10 @@ static int listen_on(int port)
 
     int opt = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) { }
+    if (g_procs > 1 &&
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt(SO_REUSEPORT)"); close(fd); return -1;
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -302,11 +314,18 @@ int main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <port> [-m block|epoll]\n"
+            "Usage: %s <port> [-m block|epoll] [-n procs]\n"
             "\n"
             "  block   one connection at a time, blocking read/write, no\n"
             "          readiness syscall -- the floor for a single connection\n"
             "  epoll   one thread, many connections -- the floor at concurrency\n"
+            "\n"
+            "  -n N    N processes behind one port through SO_REUSEPORT, for\n"
+            "          use as a BACKEND rather than as a floor: a single epoll\n"
+            "          thread is cheaper than a proxy but not four of them, and\n"
+            "          a backend that saturates makes both arms of a comparison\n"
+            "          report it instead of themselves.  N=1 leaves the socket\n"
+            "          exactly as it was, so the floor numbers still compare.\n"
             "\n"
             "Drive it with socketley-bench so the client is the same one the\n"
             "socketley numbers came from:\n"
@@ -337,9 +356,38 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             mode = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            g_procs = atoi(argv[i + 1]);
+            if (g_procs < 1 || g_procs > 64) {
+                fprintf(stderr, "floor_server: -n must be 1..64\n");
+                return 1;
+            }
+            i++;
         } else {
             fprintf(stderr, "floor_server: unknown argument: %s\n", argv[i]);
             return 1;
+        }
+    }
+
+    /* An AF_UNIX listener cannot be spread this way -- SO_REUSEPORT is not a
+     * thing there -- so -n is refused rather than silently ignored, which would
+     * leave a caller believing it had four backends in front of one. */
+    if (unix_path && g_procs > 1) {
+        fprintf(stderr, "floor_server: -n is TCP only; AF_UNIX has no SO_REUSEPORT\n");
+        return 1;
+    }
+
+    /* Forked BEFORE the socket, so each child binds its own: SO_REUSEPORT
+     * spreads across separate sockets, and an inherited descriptor would put
+     * every child on one accept queue and defeat the point.  The children die
+     * with the parent, because a backend that outlives its benchmark holds the
+     * port against the next run. */
+    for (int i = 1; i < g_procs; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 2; }
+        if (pid == 0) {
+            if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) { }
+            break;
         }
     }
 

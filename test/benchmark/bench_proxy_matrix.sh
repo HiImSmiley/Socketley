@@ -184,6 +184,9 @@ sweep() {
     return 0
 }
 cleanup() {
+    # The backends are floor_server processes and not socketley ones, so the
+    # environment-matched sweep below cannot see them.
+    command -v proxy_fixtures_down >/dev/null 2>&1 && proxy_fixtures_down
     [ -n "$HA_PID" ] && kill -9 "$HA_PID" 2>/dev/null
     sweep; sleep 0.3; sweep
     [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
@@ -278,6 +281,15 @@ client_ceiling() {   # shape conns -> cores
     [ "$n" -gt "$CORES" ] && n=$CORES
     echo "$n"
 }
+# And what the backend behind this fixture could hold: one core per process it
+# runs in.  rr4 is four backends whatever the mode; the tcp one is `-n SHARDS`
+# when sharded; AF_UNIX has no SO_REUSEPORT so the unix backend is always one.
+backend_ceiling() {   # fixture -> cores
+    local n; n=$(wc -w <<<"${BEPIDS[$1]}")
+    [ "${n:-0}" -lt 1 ] && n=1
+    [ "$n" -gt "$CORES" ] && n=$CORES
+    echo "$n"
+}
 
 measure() {   # port shape conns payload pids bepids -> "rate px_cores be_cores client_cores"
     local port=$1 shape=$2 conns=$3 payload=$4 pids=$5 bepids=$6
@@ -352,7 +364,8 @@ while IFS='|' read -r name fix shape conns payload; do
     fi
     TW_AT=$(tw_now)
     paired_run_case "$shape" "$conns" "$payload"
-    v=$(paired_verdict "$C_CI" "$C_KEPT" "$C_BE" "$C_CLI" "$(client_ceiling "$shape" "$conns")")
+    v=$(paired_verdict "$C_CI" "$C_KEPT" "$C_BE" "$C_CLI" \
+                       "$(client_ceiling "$shape" "$conns")" "$(backend_ceiling "$fix")")
     ROW_N=$((ROW_N + 1))
     # Said out loud as it happens.  The table is sorted and therefore printed
     # only at the end, so for twenty minutes a healthy run looks exactly like a

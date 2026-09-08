@@ -111,6 +111,9 @@ sweep() {
 }
 cleanup() {
     [ -n "$BENCH_PID" ] && kill -9 "$BENCH_PID" 2>/dev/null
+    # The backends are floor_server processes and not socketley ones, so the
+    # environment-matched sweep below cannot see them.
+    command -v proxy_fixtures_down >/dev/null 2>&1 && proxy_fixtures_down
     [ -n "${HA_PID:-}" ] && kill -9 "$HA_PID" 2>/dev/null
     sweep; sleep 0.3; sweep
     [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null

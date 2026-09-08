@@ -201,12 +201,18 @@ paired_run_case() {
 # The verdict column, not the ratio, is the thing to read first.  A ratio whose
 # interval is wider than the difference it claims is not a weaker result, it is
 # not a result.
-# The client cap and its ceiling are optional, for the two callers that predate
-# them.  CEIL is what this shape's load generator could hold at most -- one core
-# per connection it drives, up to the machine's -- so the check scales with the
-# case instead of asking whether one core was busy.
-paired_verdict() {   # ci kept backend_cores [client_cores] [client_ceiling] -> text
-    local ci=$1 kept=$2 be=$3 cli=${4:-} ceil=${5:-}
+# The client cap, its ceiling and the backend's ceiling are all optional, for
+# the two callers that predate them.  A CEILING is what that side could hold at
+# most: one core per connection the load generator drives, one core per process
+# the backend runs in, each capped at the machine's.
+#
+# The backend ceiling is not cosmetic.  It defaulted to one core and a four-
+# process round-robin backend at 1.252 cores -- 31% of each -- was reported as
+# `backend-bound`, which is the opposite of what those numbers say.  A check
+# that fires on a fixture with two thirds of its capacity idle costs the rows it
+# fires on, and it fired on the two rows that fixture existed for.
+paired_verdict() {   # ci kept be_cores [cli_cores] [cli_ceiling] [be_ceiling] -> text
+    local ci=$1 kept=$2 be=$3 cli=${4:-} ceil=${5:-} be_ceil=${6:-1}
     if (( kept == 0 )); then
         if (( ${C_BADRUN:-0} > 0 )); then
             echo "no pair survived — ${C_BADRUN} had a leg that returned nothing"
@@ -216,8 +222,8 @@ paired_verdict() {   # ci kept backend_cores [client_cores] [client_ceiling] -> 
         return
     fi
     if (( kept < 3 )); then echo "only $kept pair(s) survived — no interval"; return; fi
-    if awk -v b="$be" 'BEGIN { exit !(b > 0.85) }'; then
-        echo "backend-bound (${be} cores) — measures the backend"
+    if awk -v b="$be" -v k="$be_ceil" 'BEGIN { exit !(k > 0 && b > 0.85 * k) }'; then
+        echo "backend-bound (${be} of ${be_ceil} cores) — measures the backend"
         return
     fi
     if [[ -n "$cli" && -n "$ceil" ]] && \
