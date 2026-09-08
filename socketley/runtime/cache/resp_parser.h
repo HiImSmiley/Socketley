@@ -193,7 +193,12 @@ inline std::string encode_simple(std::string_view msg)
 
 // ─── Decoding ───
 
-enum class parse_result { ok, incomplete, error };
+// too_many_args is separated from error because the two need different words:
+// one says the stream is no longer framed, the other says this command had
+// more arguments than we accept and the next one would have been fine.  A
+// client told "protocol error" for an over-long DEL reconnects and sends it
+// again.
+enum class parse_result { ok, incomplete, error, too_many_args };
 
 // Parse a single RESP message from a partial buffer, filling `args` and
 // setting `consumed` to how many bytes were taken.
@@ -366,15 +371,20 @@ inline parse_result parse_message_views(std::string_view buf,
             return parse_result::incomplete;
 
         auto [ptr, ec] = std::from_chars(data + 1, crlf, count);
-        if (__builtin_expect(ec != std::errc{} || ptr != crlf
-                             || count < 0 || count > RESP_MAX_ARRAY_SIZE, 0))
+        if (__builtin_expect(ec != std::errc{} || ptr != crlf || count < 0, 0))
             return parse_result::error;
+        // A well-formed header asking for more elements than we hold room for
+        // is a REFUSAL and not a framing failure, and the two get different
+        // words further up.  Checked here as well as against max_args below,
+        // because this test comes first and reported the wrong one.
+        if (__builtin_expect(count > RESP_MAX_ARRAY_SIZE, 0))
+            return parse_result::too_many_args;
 
         offset = static_cast<size_t>(crlf - data) + 2;
     }
 
     if (__builtin_expect(count > max_args, 0))
-        return parse_result::error;
+        return parse_result::too_many_args;
 
     for (int i = 0; i < count; i++)
     {

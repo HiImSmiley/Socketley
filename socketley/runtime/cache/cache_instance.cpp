@@ -2586,10 +2586,12 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
         std::string_view args[MAX_RESP_ARGS];
         int    argc     = 0;
         size_t consumed = 0;
-        if (resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed)
-                == resp::parse_result::ok
-            && argc > 0)
+        const auto pr = resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed);
+        if (pr == resp::parse_result::ok && argc > 0)
             process_resp_command_local(conn, args, argc);
+        else if (pr == resp::parse_result::too_many_args)
+            resp::encode_error_into(conn->response_buf,
+                                    "too many arguments in one command");
         else
             resp::encode_error_into(conn->response_buf, "protocol error");
     }
@@ -7057,6 +7059,29 @@ bool cache_instance::process_resp(client_connection* conn)
         if (result == resp::parse_result::incomplete)
             break;
 
+        if (result == resp::parse_result::too_many_args)
+        {
+            // Named, with the limit in it.  Redis accepts up to 1024*1024
+            // elements; ours is 1024 because args[] is a stack array, and a
+            // client that hits it deserves to be told which wall it met rather
+            // than "protocol error".  The stream is still framed here -- the
+            // header was read and the message length is known -- but the
+            // arguments were never stored, so the connection cannot continue
+            // from a message it did not take.
+            conn->response_buf.append(
+                "-ERR too many arguments in one command (limit ");
+            conn->response_buf.append(std::to_string(MAX_RESP_ARGS));
+            conn->response_buf.append(")\r\n");
+            conn->partial.clear();
+            if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+            {
+                conn->closing = true;
+                return false;
+            }
+            conn->closing = true;
+            return false;
+        }
+
         if (result == resp::parse_result::error)
         {
             // Redis closes on a protocol error, and this path is the reason.
@@ -7068,6 +7093,21 @@ bool cache_instance::process_resp(client_connection* conn)
             // nothing after this point can be read as anything.
             conn->response_buf.append("-ERR protocol error\r\n");
             conn->partial.clear();
+            // Flushed BEFORE the flag and not after it.  flush_responses drops
+            // a closing connection's buffer -- deliberately, and there is a
+            // trace line for it -- so setting `closing` first threw away the
+            // very reply this path exists to send.  Every protocol error, not
+            // just this one, reached the client as a bare EOF, which a client
+            // library cannot tell from a crash: it reconnects, sends the same
+            // thing, and is cut off again with nothing to log.
+            //
+            // The write survives the flag: a closing connection with bytes in
+            // flight is closed by the write-drain path, not here.
+            if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+            {
+                conn->closing = true;
+                return false;
+            }
             conn->closing = true;
             return false;
         }

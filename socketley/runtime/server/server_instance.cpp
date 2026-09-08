@@ -3215,7 +3215,11 @@ reparse:
             auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
 
             if (result == resp::parse_result::incomplete) break;
-            if (result == resp::parse_result::error)
+            // Anything that is not ok, and not a test against the one failure
+            // that existed when this was written: a new parse_result would
+            // otherwise fall through to `offset += consumed` with a consumed
+            // the parser never set.
+            if (result != resp::parse_result::ok)
             {
                 conn->closing = true;
                 break;
