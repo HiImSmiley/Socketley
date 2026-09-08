@@ -67,12 +67,28 @@ def cell(d, key):
     return (f'<td class="n">{num(d["skl"])}</td><td class="n">{num(d["redis"])}</td>'
             f'<td class="r {rcls}">{d["ratio"]:.2f}x</td><td class="{spcls}">{sp}</td>')
 
+# PING does no work at all, so it is the ceiling of its arm: a row can only be
+# as fast relative to Redis as the empty command is.  Without this column the
+# table invites the wrong question -- three sharded rows sat "below 1.30x" all
+# night and every one of them was within 10% of a command that does nothing,
+# while the control itself moved between 1.23x and 1.46x from run to run.
+un_ping = un.get('PING', {}).get('ratio') or None
+sh_ping = sh.get('PING', {}).get('ratio') or None
+def vs_ping(d, base):
+    if not d or not base or d['skl'] == 0 or 'not readable' in d['verdict']:
+        return '<td class="sp dim">—</td>'
+    f = d['ratio'] / base
+    cls = 'sp' if f >= 0.85 else 'sp warn'
+    return f'<td class="{cls}" title="of the no-work control in this arm">{f:.2f}</td>'
+
 rows = []
 for c in cmds:
     u, s = un.get(c), sh.get(c)
-    rows.append(f'<tr><td class="cmd">{c}</td>{cell(u,c)}{cell(s,c)}'
+    rows.append(f'<tr><td class="cmd">{c}</td>{cell(u,c)}{vs_ping(u, un_ping)}'
+                f'{cell(s,c)}{vs_ping(s, sh_ping)}'
                 f'<td class="n s">{s["sc"]:.1f} / {s["rc"]:.1f}</td></tr>' if s else
-                f'<tr><td class="cmd">{c}</td>{cell(u,c)}{cell(None,c)}<td class="n s">—</td></tr>')
+                f'<tr><td class="cmd">{c}</td>{cell(u,c)}{vs_ping(u, un_ping)}'
+                f'{cell(None,c)}<td class="sp dim">—</td><td class="n s">—</td></tr>')
 
 stamp = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
 un_unread = sum(1 for v in un.values() if 'not readable' in v['verdict'])
@@ -137,11 +153,11 @@ Aufsteigend nach der sharded Ratio, schlechteste Zelle oben. Stand {stamp}.</p>
 <table id="t">
 <thead>
 <tr><th class="l" rowspan="2">Kommando</th>
-    <th class="grp" colspan="4">unsharded — socketley 1 Shard vs redis-server</th>
-    <th class="grp" colspan="4">sharded — socketley --shards 4 --cluster vs Redis Cluster 4</th>
+    <th class="grp" colspan="5">unsharded — socketley 1 Shard vs redis-server</th>
+    <th class="grp" colspan="5">sharded — socketley --shards 4 --cluster vs Redis Cluster 4</th>
     <th class="grp" rowspan="2">Client-Kerne<br>skl / redis</th></tr>
-<tr><th>socketley</th><th>Redis</th><th>Ratio</th><th>Streuung</th>
-    <th>socketley</th><th>Redis Cluster</th><th>Ratio</th><th>Streuung</th></tr>
+<tr><th>socketley</th><th>Redis</th><th>Ratio</th><th>Streuung</th><th>von PING</th>
+    <th>socketley</th><th>Redis Cluster</th><th>Ratio</th><th>Streuung</th><th>von PING</th></tr>
 </thead>
 <tbody>
 {chr(10).join(rows)}

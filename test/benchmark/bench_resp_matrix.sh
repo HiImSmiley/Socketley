@@ -635,7 +635,14 @@ printf '%s\n' "$CMDS" | grep -vE '^[[:space:]]*(#|$)' | while IFS='|' read -r na
     # hung one -- and twice now that had to be settled with ps instead of by
     # reading the output.  Progress goes to stderr so it cannot land in a log
     # somebody later parses as a result row.
-    printf '  [%2d] %-16s %8s\n' "$((++ROW_N))" "$name" "${ratio}x" >&2
+    # TIME-WAIT beside every row, because it is the one machine-wide resource a
+    # long table consumes and a short one does not: 73 rows x 5 passes x 2 arms
+    # is roughly 292,000 connections, against 8,000 for a handful of rows.  The
+    # same command measured 1.52x in a six-row run and 1.20x in the full table,
+    # with drift accounting for only 3.4% of it, so the number that separates
+    # those two runs belongs in the output rather than in a guess.
+    printf '  [%2d] %-16s %8s  tw=%s\n' "$((++ROW_N))" "$name" "${ratio}x" \
+        "$(ss -s 2>/dev/null | awk -F'timewait ' '/^TCP:/{split($2,a,")"); print a[1]+0}')" >&2
     spread=$(awk -v m="$ratio" -v lo="$rlo" -v hi="$rhi" \
         'BEGIN{ printf "%.2f", (m > 0 ? (hi - lo) / m : 9) }')
     # The ceiling first, because a ratio taken at it is a statement about
