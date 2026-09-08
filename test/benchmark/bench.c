@@ -778,6 +778,10 @@ static struct run_result bench_server_conn(struct bench_config *cfg)
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
+        /* The same gap as the ingest loop below.  Here the clock is a safety
+         * bound and not the shape: a connection rate is bounded by the
+         * ephemeral port pool, so a caller still passes a count. */
+        if (deadline_passed()) break;
         int64_t t0 = time_ns();
         int fd = tcp_connect(cfg->host, cfg->port);
         int64_t t1 = time_ns();
@@ -918,6 +922,10 @@ static struct run_result bench_server_ingest(struct bench_config *cfg)
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
+        /* `-d` promised a time box and this loop did not honour it, so an
+         * operation cap ran to the cap: at a hundred million that is a run with
+         * no end, which is how a server matrix row hung rather than measured. */
+        if (deadline_passed()) break;
         int64_t t0 = time_ns();
         ssize_t n = send_all(fd, msg, cfg->msg_size + 1);
         int64_t t1 = time_ns();

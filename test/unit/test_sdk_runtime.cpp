@@ -230,11 +230,15 @@ TEST_CASE("client wrapper dials a unix listener with the -t spelling")
 TEST_CASE("start() refuses instead of serving nothing when the port is taken")
 {
     // Hold the port WITHOUT SO_REUSEPORT, so the wrapper's bind must fail.
+    // Its own port and not one a later case reuses: the holder cannot set
+    // SO_REUSEADDR without letting the runtime bind over it too, so a port
+    // shared with another case fails this bind whenever that case's socket is
+    // still in TIME-WAIT -- seen once in a full suite run, green alone after.
     int holder = ::socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(holder >= 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(25894);
+    addr.sin_port = htons(25897);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     REQUIRE(::bind(holder, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     REQUIRE(::listen(holder, 1) == 0);
@@ -243,7 +247,7 @@ TEST_CASE("start() refuses instead of serving nothing when the port is taken")
     // and blocked forever, silently.  The contract now: return false, do not
     // enter the loop.  Run it in a thread so a regression fails the assert
     // below instead of hanging the suite.
-    socketley::server srv(static_cast<uint16_t>(25894));
+    socketley::server srv(static_cast<uint16_t>(25897));
     std::atomic<bool> returned{false};
     std::atomic<bool> result{true};
     std::thread t([&] { result = srv.start(); returned = true; });
