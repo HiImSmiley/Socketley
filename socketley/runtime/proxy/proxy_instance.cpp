@@ -8688,6 +8688,26 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     return true;
 }
 
+// Whether the kernel zero-copied this send or quietly fell back to copying it,
+// said once per instance because a path that falls back falls back for every
+// send on it.
+//
+// A fallback is the worst of the three outcomes and the only one nothing
+// reported: a copy AND a second completion AND a buffer held until the
+// notification, which is strictly more than a plain send costs.  Zero-copy is
+// opt-in through SOCKETLEY_SEND_ZC and no test sets it, so this had never run.
+void proxy_instance::note_zc_outcome(const struct io_uring_cqe* cqe)
+{
+    if (!(cqe->res & IORING_NOTIF_USAGE_ZC_COPIED))
+        return;
+    if (m_zc_copied_warned)
+        return;
+    m_zc_copied_warned = true;
+    LOG_WARN("proxy: the kernel COPIED a zero-copy send rather than referencing the "
+             "buffer -- on this path SOCKETLEY_SEND_ZC costs a copy, an extra "
+             "completion and a pinned buffer, which is worse than a plain send");
+}
+
 void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -8700,6 +8720,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     // Zero-copy send notification: buffer is now safe to release
     if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
     {
+        note_zc_outcome(cqe);
         conn->zc_notif_pending = false;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
@@ -8856,6 +8877,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     // Zero-copy send notification: buffer is now safe to release
     if (SOCKETLEY_UNLIKELY(cqe->flags & IORING_CQE_F_NOTIF))
     {
+        note_zc_outcome(cqe);
         conn->zc_notif_pending = false;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
