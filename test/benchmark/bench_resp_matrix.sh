@@ -155,8 +155,27 @@ SETGET|1000|SET KEYTAGstr:__rand_int__ xxxxxxxxxxxxxxxxxxxx GET
 # script written the readable way arrives as several arguments and the cell
 # measures a syntax error on both arms -- which reads as two zeroes and no
 # warning at all.
+#
+# And DOUBLE quotes inside the Lua, never single ones.  This whole table is a
+# single-quoted shell string, so an apostrophe inside it CLOSES the string and
+# bash reads `get` as unquoted text and concatenates, so the cell ran
+# redis.call(get, KEYS[1]) -- `get` an undefined global, so redis.call(nil,...)
+# errors and redis-benchmark exits on the server error.  Both arms got the same
+# broken script, so the row printed 0 and 0 with no complaint from anything.
+#
+# It survived four rounds of hunting because every attempt to reproduce it
+# passed the row through BENCH_MATRIX_CMDS with the quotes escaped, which
+# produces the quotes this table cannot hold -- so the isolated run measured
+# 1.40x and the table measured nothing, from what looked like the same line of
+# text.  Found by keeping the cell raw client output: the command it actually
+# sent was in it.
+#
+# The rule is the whole comment: NO apostrophe may appear anywhere between the
+# opening and closing quote of CMDS_DEFAULT, in a command OR in a comment.  The
+# first version of this note broke the table by quoting an apostrophe while
+# explaining apostrophes.
 EVAL|1000|EVAL return(1) 0
-EVALKEY|1000|EVAL return(redis.call('get',KEYS[1])) 1 KEYTAGstr:__rand_int__
+EVALKEY|1000|EVAL return(redis.call("get",KEYS[1])) 1 KEYTAGstr:__rand_int__
 INCR|1000|INCR KEYTAGnum:__rand_int__
 DECR|1000|DECR KEYTAGnum:__rand_int__
 INCRBY|1000|INCRBY KEYTAGnum:__rand_int__ 3
@@ -669,6 +688,18 @@ MED=$(awk -F'|' '$7 == "no" && $8 <= 0.25 {print $4}' "$TMPD/rows.txt" | sort -g
 printf '\n  %-11s %14s %14s %8s %7s %9s %9s  %s\n' \
     command "$S_LABEL" "$R_LABEL" ratio spread skl_cli redis_cli verdict
 printf '  %s\n' "$(printf '%.0s─' {1..100})"
+# Two zeroes together cannot be the servers: our code does not reach
+# redis-server, so a cell where BOTH arms measured nothing measured nothing at
+# all -- a template the shell mangled, a client that died on a server error, a
+# port nobody was listening on.  EVALKEY printed 0 and 0 for a week because the
+# row read as just another slow command in a sorted table.
+DEAD=$(awk -F'|' '$2 == 0 && $3 == 0 {printf "%s ", $1}' "$TMPD/rows.txt")
+if [ -n "$DEAD" ]; then
+    log_error "measured NOTHING on either arm: $DEAD"
+    log_error "  both arms zero is always the harness, never the servers --"
+    log_error "  check the command template reached the client intact"
+fi
+
 sort -t'|' -k4 -g "$TMPD/rows.txt" | while IFS='|' read -r name s r ratio scm rcm capped spread; do
     # The spread is read before the level.  A cell whose passes disagree by
     # more than a quarter of their own median has not measured this command,
