@@ -47,13 +47,50 @@ It's been an amazing journey so far, and I hope others see the same potential in
 
 ## Installation
 
-### Quick install
+### From a clone, on a machine that has nothing on it
+
+```bash
+git clone https://github.com/HiImSmiley/Socketley
+cd Socketley
+bash scripts/install-from-source.sh
+```
+
+That is the whole of it. The script checks the kernel, the architecture and the
+compiler; installs the build dependencies; builds the liburing this tree needs,
+because the one your distribution packages is probably too old (see
+[Requirements](#requirements)); builds Release; installs the binary, the man
+page, the help script and the systemd service; and then starts the daemon and
+asks it for its runtime list before it reports success.
+
+- `--dry-run` prints every command it would run and runs none of them.
+- `--uninstall` removes exactly what a previous run installed, from a manifest
+  that run wrote — and leaves `/var/lib/socketley`, `/etc/socketley` and the
+  `socketley` account alone, because those are not the installer's to delete.
+- `--prefix` moves the install. The default is `/usr` and not `/usr/local`
+  because the binary tests `/usr/bin/socketley` to decide whether it is
+  installed at all; under any other prefix it runs in user mode and no systemd
+  service is installed. `--help` says so too.
+- It names every step that needs root, and why, before it takes any.
+
+It refuses rather than guesses. A kernel below 5.19, GCC below 12, an
+architecture that is not x86\_64, a distribution whose package names are not
+written down anywhere in this repository, or a `socketley` `.deb` already
+owning `/usr/bin` — each one stops the run with the reason and the way forward,
+and changes nothing.
+
+### Prebuilt release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/HiImSmiley/Socketley/main/install.sh | sudo sh
 ```
 
-### From source
+Downloads the newest release `.deb` and installs it. Nothing is compiled, so it
+is minutes faster and gives you whatever the last tag was rather than what is on
+`main`.
+
+### From source, step by step
+
+Roughly what the script above does, if you would rather run it yourself:
 
 ```bash
 # Dependencies (Ubuntu/Debian)
@@ -82,6 +119,14 @@ cd make && make config=release_x64 -j$(nproc)
 sudo bash packaging/install.sh
 ```
 
+`./bin/build-thirdparty.sh` with no argument builds *both* archives, and
+`thirdparty/liburing/` is on the link path, so `-luring` then resolves to
+`liburing.a` and you get liburing statically linked. The Dockerfile, CI, the
+release job and `scripts/install-from-source.sh` all say `luajit` instead and
+take liburing from the system, which is what the `.deb`'s
+`Depends: liburing2 (>= 2.6)` describes. Both build; `ldd` on the result is
+what tells you which one you have.
+
 ### Debian package
 
 ```bash
@@ -102,7 +147,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 
 ## Features
 
-- **Server**:TCP/UDP listener with broadcast, WebSocket auto-detection, master mode
+- **Server**:TCP/UDP listener with broadcast, WebSocket auto-detection, master mode (TCP only), and `--send-to` to say who an incoming message reaches
 - **Client**:TCP/UDP connector with auto-reconnect
 - **Proxy**:HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
 - **Cache**:In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
@@ -112,7 +157,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Process isolation**:Every runtime is a supervised worker process, so one runtime cannot take the daemon down with it — there is no flag and no in-daemon mode; the whole cross-runtime Lua API works across the boundary
 - **Unix sockets**:`--listen unix:/path` on a listener and `--backend unix:/path` for a proxy's backends
 - **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run
-- **Master mode**:One client claims master, broadcasts to all; optional forwarding
+- **Master mode**:One client claims master and broadcasts to all; `--send-to` decides what happens to what everybody else says
 - **HTTP static serving**:`--http <dir>` with auto-injected WebSocket, optional in-memory caching
 - **TLS/SSL**:Server, cache and proxy listeners terminate TLS (incl. mutual TLS); client runtimes and proxy backend legs dial over it — see the note at the top
 - **WebSocket**:Auto-detected per connection, coexists with raw TCP on the same port
@@ -299,13 +344,14 @@ It shows again at depth 100, measured in the same four-arm shape — socketley �
 Redis goes from 3.94× over TCP to **4.63×** over AF_UNIX for SET, and 3.46× to
 **4.22×** for GET.
 
-**The trade-off is `--shards`.** It is refused with `--listen unix:`, and
-correctly: `SO_REUSEPORT` is not something a unix socket does, so N processes on
-one path would unlink each other's node and only the last to bind would answer.
-So the two levers exclude each other — `AF_UNIX` makes one connection ~2.2×
-cheaper on **one** core, and TCP with `--shards` pays the 4.10 µs to spread
-across cores. A local sidecar wants the first. Anything that needs more than a
-core wants the second.
+**`--shards` composes with it, and used not to.** It was refused with
+`--listen unix:` on the grounds that `SO_REUSEPORT` is not something a unix
+socket does, so N processes on one path would unlink each other's node. That is
+true of one path and not of N: each shard now binds its own,
+`name#0.sock` … `name#N-1.sock`, the same rule the companion socket already
+used. So the two levers combine rather than exclude — the cheap transport on
+each of N cores. No figure for that pair is quoted here, because this section's
+run did not measure it.
 
 You also give up reach: a unix socket is a filesystem path, not an address.
 Access control becomes file ownership and mode, which for a local service is
@@ -439,7 +485,8 @@ candidate, is written down in `test/benchmark/hotspots.md`.
 
 ## Quick Start
 
-After installing (via `dpkg -i` or `install.sh`), the daemon runs as a systemd service — no manual startup needed:
+After installing — via `scripts/install-from-source.sh`, `install.sh` or
+`dpkg -i` — the daemon runs as a systemd service, so there is no manual startup:
 
 ```bash
 # Create and start a server
@@ -487,6 +534,47 @@ socketley cluster ls|ps|group|show|stats|watch  # multi-daemon cluster inspectio
 Glob patterns supported: `socketley stop "api-*"` stops all runtimes matching `api-*`.
 
 See `socketley --help` or `man socketley` for full documentation.
+
+### Who a server answers: `--send-to`
+
+A server with no Lua `on_message` still has to decide who hears an incoming
+message, and `--mode` never said: it names a *direction*, not a set of
+recipients. `--send-to` names the recipients, as a comma-separated set of
+**disjoint** ones:
+
+| value | who |
+|---|---|
+| `sender` | the connection the message came from |
+| `others` | every other connection, the master excepted |
+| `master` | the master connection, which only `--mode master` has at all |
+
+Disjoint, so `sender,others` reaches everyone and there is deliberately no
+`all`: `others` meaning "everyone else" would make `others,master` mean exactly
+`others`, which is one behaviour under two spellings.
+
+Unset keeps what each mode has always done — `others` in `--mode inout`, which
+is the default mode, and in `--mode master` dropping what a non-master says.
+
+```bash
+socketley create server echo  -p 9000 --mode inout  --send-to sender        -s
+socketley create server chat  -p 9001 --mode inout  --send-to sender,others -s
+socketley create server relay -p 9002 --mode master --send-to master        -s
+```
+
+It is refused outside `--mode inout` and `--mode master` — `in` and `out` carry
+messages one way and answer nobody, so no recipient means anything there — and
+`master` is refused outside `--mode master`, where nothing ever claims that
+connection. Both are refusals rather than warnings: a flag accepted and then
+ignored is the shape this option exists to remove.
+
+**`--master-forward` is gone.** It was one recipient carrying its own flag, and
+it is now `--send-to master` — byte for byte the same behaviour, including the
+`[<fd>] ` prefix that puts the sender's descriptor in front of the forwarded
+line so the master can tell two clients apart. Typing the old flag prints the
+replacement rather than "unknown flag".
+
+**`--mode master` with `--udp` is refused.** Master mode claims a *connection*
+as the master, and a datagram is not one.
 
 ## Lua Scripting
 
@@ -607,6 +695,11 @@ still want it to themselves.
   is why the `.deb` depends on `liburing2 (>= 2.6)`.
 - libssl-dev (TLS on every role that has a handshake, and WebSocket handshake hashing)
 - GCC 12+ (C++23)
+- x86\_64. `premake5.lua` declares one platform and Release compiles
+  `-march=x86-64-v2`, so another architecture is a port and not a flag.
+
+`scripts/install-from-source.sh` checks every line of this list before it
+builds anything, and refuses with the reason rather than failing later.
 
 ### Toolchain
 
