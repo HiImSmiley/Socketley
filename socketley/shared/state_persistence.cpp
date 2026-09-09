@@ -149,6 +149,38 @@ uint8_t str_to_server_mode(std::string_view s)
     }
 }
 
+// The same comma spelling the flag takes, so a state file reads back as what
+// was typed rather than as a number nobody can check.
+std::string server_send_to_str(uint8_t mask)
+{
+    std::string out;
+    if (mask & 1) out += "sender";
+    if (mask & 2) { if (!out.empty()) out += ','; out += "others"; }
+    if (mask & 4) { if (!out.empty()) out += ','; out += "master"; }
+    return out;
+}
+
+uint8_t str_to_server_send_to(std::string_view s)
+{
+    uint8_t mask = 0;
+    size_t start = 0;
+    while (start <= s.size())
+    {
+        size_t comma = s.find(',', start);
+        if (comma == std::string_view::npos) comma = s.size();
+        switch (fnv1a(s.substr(start, comma - start)))
+        {
+            case fnv1a("sender"): mask |= 1; break;
+            case fnv1a("others"): mask |= 2; break;
+            case fnv1a("master"): mask |= 4; break;
+            default: break;
+        }
+        if (comma == s.size()) break;
+        start = comma + 1;
+    }
+    return mask;
+}
+
 const char* proxy_protocol_str(uint8_t p)
 {
     return p == 1 ? "tcp" : "http";
@@ -630,9 +662,9 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
         {
             auto* srv = static_cast<const server_instance*>(instance);
             cfg.mode = static_cast<uint8_t>(srv->get_mode());
+            cfg.send_to = srv->get_send_to();
             cfg.udp = srv->is_udp();
             cfg.master_pw = std::string(srv->get_master_pw());
-            cfg.master_forward = srv->get_master_forward();
             cfg.http_dir = srv->get_http_dir().string();
             cfg.http_cache = srv->get_http_cache();
             for (const auto& ut : srv->get_upstream_targets())
@@ -832,12 +864,12 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     {
         case runtime_server:
             append_str_field("mode", server_mode_str(cfg.mode));
+            if (cfg.send_to != 0)
+                append_str_field("send_to", server_send_to_str(cfg.send_to));
             if (cfg.udp)
                 append_bool_field("udp", true);
             if (!cfg.master_pw.empty())
                 append_str_field("master_pw", cfg.master_pw);
-            if (cfg.master_forward)
-                append_bool_field("master_forward", true);
             if (!cfg.http_dir.empty())
                 append_str_field("http_dir", cfg.http_dir);
             if (cfg.http_cache)
@@ -1015,9 +1047,15 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     {
         case runtime_server:
             cfg.mode = str_to_server_mode(json_get_string(json, "mode"));
+            cfg.send_to = str_to_server_send_to(json_get_string(json, "send_to"));
             cfg.udp = json_get_bool(json, "udp");
             cfg.master_pw = json_get_string(json, "master_pw");
-            cfg.master_forward = json_get_bool(json, "master_forward");
+            // A state file this daemon wrote before --send-to absorbed the flag
+            // still says master_forward, and that is exactly one recipient.
+            // Read and folded in, never written back, so an old configuration
+            // survives the upgrade without anybody retyping it.
+            if (json_get_bool(json, "master_forward"))
+                cfg.send_to |= 4;
             cfg.http_dir = json_get_string(json, "http_dir");
             cfg.http_cache = json_get_bool(json, "http_cache");
             cfg.upstreams = json_get_array(json, "upstreams");

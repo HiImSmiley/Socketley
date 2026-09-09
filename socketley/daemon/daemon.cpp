@@ -398,13 +398,12 @@ static void restore_runtimes(state_persistence& persistence,
             {
                 auto* srv = static_cast<server_instance*>(instance);
                 srv->set_mode(static_cast<server_mode>(cfg.mode));
+                srv->set_send_to(cfg.send_to);
                 if (cfg.udp) srv->set_udp(true);
                 if (!cfg.cache_name.empty())
                     srv->set_runtime_manager(&manager);
                 if (!cfg.master_pw.empty())
                     srv->set_master_pw(cfg.master_pw);
-                if (cfg.master_forward)
-                    srv->set_master_forward(true);
                 if (!cfg.http_dir.empty())
                     srv->set_http_dir(cfg.http_dir);
                 if (cfg.http_cache)

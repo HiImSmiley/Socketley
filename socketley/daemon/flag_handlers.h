@@ -82,6 +82,7 @@ class proxy_instance;
 class cache_instance;
 
 enum server_mode : uint8_t;
+enum server_send_to : uint8_t;
 enum client_mode : uint8_t;
 enum cache_mode : uint8_t;
 
@@ -109,6 +110,7 @@ std::string validate_listen_value(std::string_view value, std::string& out);
 
 // Mode parsing helpers
 bool parse_server_mode(uint32_t hash, server_mode& mode);
+bool parse_server_send_to(std::string_view value, uint8_t& mask, std::string& bad);
 bool parse_client_mode(uint32_t hash, client_mode& mode);
 bool parse_cache_mode(uint32_t hash, cache_mode& mode);
 

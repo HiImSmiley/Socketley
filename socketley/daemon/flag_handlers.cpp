@@ -389,6 +389,41 @@ bool parse_server_mode(uint32_t hash, server_mode& mode)
     }
 }
 
+// A comma separated set, because the recipients are disjoint and a message can
+// reach more than one of them: `sender,master` is an answer to whoever spoke
+// and a copy to the master, which had no spelling at all before.
+bool parse_server_send_to(std::string_view value, uint8_t& mask, std::string& bad)
+{
+    mask = 0;
+    size_t start = 0;
+    while (start <= value.size())
+    {
+        size_t comma = value.find(',', start);
+        if (comma == std::string_view::npos)
+            comma = value.size();
+        std::string_view one = value.substr(start, comma - start);
+        // A trailing or doubled comma is a typo, not an empty recipient.
+        if (one.empty())
+        {
+            bad = "<empty>";
+            return false;
+        }
+        switch (fnv1a(one))
+        {
+            case fnv1a("sender"): mask |= send_to_sender; break;
+            case fnv1a("others"): mask |= send_to_others; break;
+            case fnv1a("master"): mask |= send_to_master; break;
+            default:
+                bad = std::string(one);
+                return false;
+        }
+        if (comma == value.size())
+            break;
+        start = comma + 1;
+    }
+    return mask != 0;
+}
+
 bool parse_client_mode(uint32_t hash, client_mode& mode)
 {
     switch (hash)
@@ -461,9 +496,31 @@ static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t
     return 0;
 }
 
+// Spellings that were removed, answered by name instead of as "unknown flag":
+// each one worked yesterday and what it named still exists under another name.
+//
+// Ahead of the switch and not a case in it, because a case IS the flag surface
+// -- test_edit_flag_surface reads the parsers' `case fnv1a("-...")` labels and
+// requires every one of them to be documented, which a removed flag cannot be.
+// One copy for both server parsers, for the reason the style file gives.
+static int refuse_removed_server_flag(uint32_t which)
+{
+    if (which == fnv1a("--master-forward"))
+    {
+        std::cout << "--master-forward is now --send-to master: it was one "
+                     "recipient carrying its own flag, and the recipients are "
+                     "a set\n";
+        return 1;
+    }
+    return -1;
+}
+
 int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                        runtime_manager* mgr, std::string_view /*name*/)
 {
+    if (const int removed = refuse_removed_server_flag(pa.hashes[i]); removed >= 0)
+        return removed;
+
     switch (pa.hashes[i])
     {
 
@@ -482,6 +539,26 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                 return 1;
             }
             srv->set_mode(mode);
+            return 0;
+        }
+        case fnv1a("--send-to"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--send-to requires sender, others or master, "
+                             "comma separated\n";
+                return 1;
+            }
+            ++i;
+            uint8_t mask = 0;
+            std::string bad;
+            if (!parse_server_send_to(pa.args[i], mask, bad))
+            {
+                std::cout << "unknown --send-to: " << (bad.empty() ? pa.args[i] : bad)
+                          << " (sender, others, master; comma separated)\n";
+                return 1;
+            }
+            srv->set_send_to(mask);
             return 0;
         }
         case fnv1a("--cache"):
@@ -508,9 +585,6 @@ int parse_server_flags(server_instance* srv, const parsed_args& pa, size_t& i,
             srv->set_master_pw(pa.args[++i]);
             return 0;
         }
-        case fnv1a("--master-forward"):
-            srv->set_master_forward(true);
-            return 0;
         case fnv1a("--http"):
         {
             if (i + 1 >= pa.count)
@@ -1240,6 +1314,9 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
 int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t& i,
                             bool is_running, runtime_manager* mgr)
 {
+    if (const int removed = refuse_removed_server_flag(pa.hashes[i]); removed >= 0)
+        return removed;
+
     switch (pa.hashes[i])
     {
         case fnv1a("--mode"):
@@ -1257,6 +1334,26 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
                 return 1;
             }
             srv->set_mode(mode);
+            return 0;
+        }
+        case fnv1a("--send-to"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--send-to requires sender, others or master, "
+                             "comma separated\n";
+                return 1;
+            }
+            ++i;
+            uint8_t mask = 0;
+            std::string bad;
+            if (!parse_server_send_to(pa.args[i], mask, bad))
+            {
+                std::cout << "unknown --send-to: " << (bad.empty() ? pa.args[i] : bad)
+                          << " (sender, others, master; comma separated)\n";
+                return 1;
+            }
+            srv->set_send_to(mask);
             return 0;
         }
         case fnv1a("--cache"):
@@ -1290,9 +1387,6 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
             srv->set_master_pw(pa.args[++i]);
             return 0;
         }
-        case fnv1a("--master-forward"):
-            srv->set_master_forward(true);
-            return 0;
         case fnv1a("--http"):
         {
             if (i + 1 >= pa.count)

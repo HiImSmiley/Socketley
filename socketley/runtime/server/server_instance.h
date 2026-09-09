@@ -293,6 +293,24 @@ enum server_mode : uint8_t
     mode_master = 3
 };
 
+// Who a message reaches when no script answers it, which --mode never said: it
+// names a direction, and every one of these is bidirectional.  Until this was a
+// choice the answer was `others` over TCP and `all` over UDP, from two code
+// paths that were meant to agree.
+//
+// A SET, and a set of DISJOINT recipients.  Disjoint because `others` meaning
+// "everyone else" would make `others,master` mean exactly `others`, and one
+// behaviour under two spellings is what this file already refused once: the
+// master is named separately, so `others` is everyone else who is not it.
+// `all` is not a value for the same reason -- `sender,others` says it.
+enum server_send_to : uint8_t
+{
+    send_to_unset  = 0,        // whatever this mode has always done, see below
+    send_to_sender = 1u << 0,  // the connection the message came from
+    send_to_others = 1u << 1,  // every other connection, the master excepted
+    send_to_master = 1u << 2   // the master, which only mode_master has at all
+};
+
 struct upstream_target
 {
     std::string address;        // "host:port" as specified by user
@@ -356,6 +374,12 @@ public:
 
     void set_mode(server_mode mode);
     server_mode get_mode() const;
+
+    // A mask of server_send_to bits, or send_to_unset to let the mode decide:
+    // inout has always answered `others` and master has always dropped what a
+    // non-master said, and an unset flag keeps both.
+    void set_send_to(uint8_t mask);
+    uint8_t get_send_to() const;
 
     void set_udp(bool udp);
     bool is_udp() const override;
@@ -472,8 +496,6 @@ public:
     // Master mode
     void set_master_pw(std::string_view pw);
     std::string_view get_master_pw() const;
-    void set_master_forward(bool fwd);
-    bool get_master_forward() const;
     int get_master_fd() const;
 
     // HTTP static file serving
@@ -673,7 +695,11 @@ private:
     void invoke_on_upstream_disconnect(int conn_id);
 
     void process_message(server_connection* sender, std::string_view msg);
-    void queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd);
+    // Two exclusions, because `others` in master mode means everyone who is
+    // neither the sender nor the master, and one of those is the only thing
+    // this ever needed before.
+    void queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
+                         int exclude_fd2 = -1);
     void remove_active_fd(int fd);
     // `even_when_closing` is for an answer that was already promised, which
     // nothing else may set: the socket is still open precisely because that
@@ -739,6 +765,7 @@ private:
     void drop_udp_peer(int idx);
 
     server_mode m_mode;
+    uint8_t m_send_to{send_to_unset};
     bool m_udp{false};
 public:
     void refresh_cached_limits() override
@@ -755,7 +782,6 @@ private:
 
     // Master mode
     int m_master_fd{-1};
-    bool m_master_forward{false};
     std::string m_master_pw;
     int m_listen_fd;
     // The socket node this run's listener actually bound, deliberately not

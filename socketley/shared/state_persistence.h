@@ -95,11 +95,11 @@ struct runtime_config
 
     // Server/Client
     uint8_t mode = 0;       // server_mode or client_mode
+    uint8_t send_to = 0;    // server_send_to, server only
     bool udp = false;
 
     // Server master mode
     std::string master_pw;
-    bool master_forward = false;
 
     // Server HTTP static file serving
     std::string http_dir;

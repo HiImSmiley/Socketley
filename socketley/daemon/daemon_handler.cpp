@@ -170,6 +170,38 @@ static std::string instance_cache_persist_refusal(const runtime_instance* inst)
     return {};
 }
 
+// Why --send-to cannot be honoured, judged as a set because --mode may be typed
+// on either side of it.  The rule is per recipient and not per flag:
+//
+//   `in` and `out` answer nobody at all, so no recipient means anything there.
+//   `master` names a connection only mode_master ever has -- m_master_fd is set
+//   by that mode's password exchange and by nothing else -- so asking for it
+//   anywhere else is asking for a fd that stays -1.
+//
+// A flag accepted and then ignored is the shape this whole option exists to
+// remove, so both are refusals rather than warnings.
+static std::string instance_send_to_refusal(const runtime_instance* inst)
+{
+    if (!inst || inst->get_type() != runtime_server)
+        return {};
+
+    const auto* srv = static_cast<const server_instance*>(inst);
+    const uint8_t to = srv->get_send_to();
+    if (to == send_to_unset)
+        return {};
+
+    const server_mode mode = srv->get_mode();
+    if (mode == mode_in || mode == mode_out)
+        return "--send-to needs --mode inout or master: this mode carries "
+               "messages one way and never answers one\n";
+
+    if ((to & send_to_master) && mode != mode_master)
+        return "--send-to master needs --mode master: nothing claims the master "
+               "connection in any other mode, so there is nobody to send to\n";
+
+    return {};
+}
+
 // Who is on the other end of this connection, or 0 when the socket cannot say.
 static pid_t peer_pid(int conn_fd)
 {
@@ -1301,6 +1333,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    // And --send-to against --mode, which is the same question of order.
+    if (const std::string msg = instance_send_to_refusal(instance); !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
     // A registered type's required keys, at the point the TLS set is checked
     // and for the same reason, with declared defaults filled in on the way.
     if (const std::string msg = type_manifest::registered_create_refusal(instance);
@@ -1477,6 +1517,16 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // The persistence pair on the same reasoning: only a hand-written
             // state file can hold an interval without a path.
             if (const std::string msg = instance_cache_persist_refusal(inst);
+                !msg.empty())
+            {
+                conn->write_buf += std::string(n) + ": " + msg;
+                ++failed;
+                continue;
+            }
+
+            // And --send-to against --mode, for the same reason: an edit can
+            // move either half after the create checked them together.
+            if (const std::string msg = instance_send_to_refusal(inst);
                 !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
@@ -3475,13 +3525,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         {
             auto* srv = static_cast<server_instance*>(instance);
             if (has("mode")) srv->set_mode(static_cast<server_mode>(cfg.mode));
+            if (has("send_to") || has("master_forward"))
+                srv->set_send_to(cfg.send_to);
             if (has("udp"))  srv->set_udp(cfg.udp);
             if (!cfg.cache_name.empty())
                 srv->set_runtime_manager(&m_manager);
             if (!cfg.master_pw.empty())
                 srv->set_master_pw(cfg.master_pw);
-            if (cfg.master_forward)
-                srv->set_master_forward(true);
 
             // The list is replaced only when the document names it, because
             // clearing it on a document that never mentioned upstreams is a

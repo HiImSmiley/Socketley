@@ -109,7 +109,7 @@ Every flag `create` accepts is reachable from a configuration file.
 `test`, `tls`, `cert`, `key`, `ca`, `reconnect`, `config`/`lua`,
 `bash`, `start`.
 
-**server:** `mode`, `udp`, `http`, `http_cache`, `master_pw`, `master_forward`,
+**server:** `mode`, `send_to`, `udp`, `http`, `http_cache`, `master_pw`,
 `cache`, `upstreams`.
 
 **client:** `target`, `mode`, `udp`.

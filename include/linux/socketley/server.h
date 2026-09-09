@@ -87,7 +87,11 @@ public:
     }
     server& clear_upstreams()              { srv()->clear_upstream_targets(); return *this; }
     server& master_pw(std::string_view pw) { srv()->set_master_pw(pw); return *this; }
-    server& master_forward(bool fwd)       { srv()->set_master_forward(fwd); return *this; }
+    // The recipients of a message no script answers, as server_send_to bits:
+    // send_to_sender | send_to_others | send_to_master, or 0 to keep whatever
+    // the mode has always done.  master_forward(true) was send_to_master
+    // before the recipients were a set.
+    server& send_to(uint8_t mask)          { srv()->set_send_to(mask); return *this; }
     server& drain()                        { raw()->set_drain(true); return *this; }
     server& group(std::string_view g)      { raw()->set_group(g); return *this; }
     server& tick_interval(uint32_t ms)     { raw()->set_tick_interval(ms); return *this; }
@@ -161,7 +165,7 @@ public:
     bool             reload_lua()        { return raw()->reload_lua_script(); }
     std::string_view lua_script()        { return raw()->get_lua_script_path(); }
     server_mode      get_mode()          { return srv()->get_mode(); }
-    bool             get_master_forward() { return srv()->get_master_forward(); }
+    uint8_t          get_send_to()       { return srv()->get_send_to(); }
     std::string_view get_master_pw()     { return srv()->get_master_pw(); }
     bool             get_http_cache()    { return srv()->get_http_cache(); }
     const std::filesystem::path& get_http_dir() { return srv()->get_http_dir(); }

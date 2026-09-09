@@ -107,9 +107,9 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
         {
             auto& srv = static_cast<server_instance&>(rt);
             srv.set_mode(static_cast<server_mode>(cfg.mode));
+            srv.set_send_to(cfg.send_to);
             srv.set_udp(cfg.udp);
             if (!cfg.master_pw.empty())  srv.set_master_pw(cfg.master_pw);
-            if (cfg.master_forward)      srv.set_master_forward(true);
             if (!cfg.http_dir.empty())   srv.set_http_dir(cfg.http_dir);
             if (cfg.http_cache)          srv.set_http_cache(true);
             srv.clear_upstream_targets();

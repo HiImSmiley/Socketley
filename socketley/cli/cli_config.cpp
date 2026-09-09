@@ -63,11 +63,11 @@ constexpr config_key config_keys[] = {
 
     // ── Server ──────────────────────────────────────────────────────────────
     { "mode",               "--mode",               key_kind::text    },
+    { "send_to",            "--send-to",            key_kind::text    },
     { "udp",                "--udp",                key_kind::boolean },
     { "http",               "--http",               key_kind::text    },
     { "http_cache",         "--http-cache",         key_kind::boolean },
     { "master_pw",          "--master-pw",          key_kind::text    },
-    { "master_forward",     "--master-forward",     key_kind::boolean },
     { "cache",              "--cache",              key_kind::text    },
     { "upstreams",          "--upstream",           key_kind::list_semi },
 

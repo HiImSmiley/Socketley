@@ -83,7 +83,7 @@ runtimes = {
   { type = "server", name = "lp_api", port = $((P + 3)),
     upstreams = {"127.0.0.1:$((P + 42))", "127.0.0.1:$((P + 43))"},
     http = "$WORK", http_cache = true,
-    master_pw = "hunter2", master_forward = true, mode = "master",
+    master_pw = "hunter2", send_to = "master", mode = "master",
     cache = "lp_store", write = "$WORK/api.out", bash = "pt",
     max_connections = 77, rate_limit = 2.5, idle_timeout = 30,
     tls = true, cert = "$WORK/c.pem", key = "$WORK/k.pem", ca = "$WORK/ca.pem" },
@@ -100,7 +100,7 @@ shows "key reaches the runtime"            lp_api "k.pem"
 shows "ca reaches the runtime"             lp_api "ca.pem"
 shows "upstreams reach the runtime"        lp_api '"upstreams"'
 shows "master_pw reaches the runtime"      lp_api '"master_pw": "hunter2"'
-shows "master_forward reaches the runtime" lp_api '"master_forward": true'
+shows "send_to reaches the runtime"        lp_api '"send_to": "master"'
 shows "http_cache reaches the runtime"     lp_api '"http_cache": true'
 shows "cache reaches the runtime"          lp_api '"cache_name": "lp_store"'
 shows "bash=pt reaches all three bits"     lp_api '"bash_timestamp": true'

@@ -414,6 +414,16 @@ server_mode server_instance::get_mode() const
     return m_mode;
 }
 
+void server_instance::set_send_to(uint8_t mask)
+{
+    m_send_to = mask;
+}
+
+uint8_t server_instance::get_send_to() const
+{
+    return m_send_to;
+}
+
 void server_instance::set_udp(bool udp)
 {
     m_udp = udp;
@@ -436,15 +446,6 @@ std::string_view server_instance::get_master_pw() const
     return m_master_pw;
 }
 
-void server_instance::set_master_forward(bool fwd)
-{
-    m_master_forward = fwd;
-}
-
-bool server_instance::get_master_forward() const
-{
-    return m_master_forward;
-}
 
 int server_instance::get_master_fd() const
 {
@@ -3672,10 +3673,29 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             if (lua() && lua()->has_on_message())
                 break;
 
+            // Unset keeps what inout has always answered.  There is no master
+            // in this mode, so the mask is sender and others.
+            const uint8_t to = m_send_to ? m_send_to
+                                         : static_cast<uint8_t>(send_to_others);
+
             if (m_udp)
             {
-                // UDP: broadcast to all peers (exclude handled by caller via addr)
-                udp_broadcast(msg, nullptr);
+                // process_message() is reached with a null sender from exactly
+                // one place, handle_udp_read(), so for a datagram the receive
+                // buffer's address is this datagram's own source.
+                const struct sockaddr_in* from =
+                    (!sender && m_udp_recv) ? &m_udp_recv->addr : nullptr;
+
+                // The comment this replaced said the exclusion was handled by
+                // the caller through an address; no caller ever passed one, so
+                // a UDP sender had been receiving its own datagram back since
+                // the mode existed while a TCP one did not.
+                if ((to & send_to_sender) && from && m_udp_fd >= 0)
+                    sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
+                           reinterpret_cast<const struct sockaddr*>(from),
+                           sizeof(*from));
+                if (to & send_to_others)
+                    udp_broadcast(msg, from);
             }
             else
             {
@@ -3684,7 +3704,15 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 buf.append(msg);
                 buf.push_back('\n');
                 auto relay_msg = std::make_shared<const std::string>(std::move(buf));
-                queue_broadcast(relay_msg, sender ? sender->fd : -1);
+
+                // A message routed here from another runtime has no sender on
+                // this side, so `sender` names nobody and the set is empty:
+                // dropped rather than sent to everyone, because an echo server
+                // handed a message with nobody to echo to has no answer.
+                if ((to & send_to_sender) && sender)
+                    queue_send(sender, relay_msg);
+                if (to & send_to_others)
+                    queue_broadcast(relay_msg, sender ? sender->fd : -1);
             }
             break;
         }
@@ -3776,7 +3804,8 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 break;
             }
 
-            // If sender is master: broadcast to all except sender
+            // The master's own message reaches everyone else, which is what
+            // this mode IS and not something --send-to chooses.
             if (sender && sender->fd == m_master_fd)
             {
                 invoke_on_message(msg);
@@ -3793,10 +3822,20 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 break;
             }
 
-            // Non-master: forward to master if master_forward is set
-            if (sender && m_master_forward && m_master_fd >= 0 &&
-                m_master_fd < MAX_FDS && m_conn_idx[m_master_fd])
+            // What a NON-master said is what --send-to decides here.  Unset is
+            // the empty set and drops it, which is what this mode did before
+            // --master-forward and still does without a flag.
+            if (!sender || m_send_to == send_to_unset)
+                break;
+
+            const bool master_live = m_master_fd >= 0 && m_master_fd < MAX_FDS &&
+                                     m_conn_idx[m_master_fd];
+
+            if ((m_send_to & send_to_master) && master_live)
             {
+                // The sender's descriptor stays in front of it: it is how the
+                // master tells two clients apart, and --master-forward wrote
+                // it this way before this flag absorbed it.
                 char fd_buf[16];
                 auto [fd_end, fd_ec] = std::to_chars(fd_buf, fd_buf + sizeof(fd_buf), sender->fd);
                 std::string buf;
@@ -3809,7 +3848,21 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 auto fwd_msg = std::make_shared<const std::string>(std::move(buf));
                 queue_send(m_conn_idx[m_master_fd], fwd_msg);
             }
-            // Non-master messages are silently dropped (not broadcast)
+
+            if (m_send_to & (send_to_sender | send_to_others))
+            {
+                std::string buf;
+                buf.reserve(msg.size() + 1);
+                buf.append(msg);
+                buf.push_back('\n');
+                auto relay_msg = std::make_shared<const std::string>(std::move(buf));
+                if (m_send_to & send_to_sender)
+                    queue_send(sender, relay_msg);
+                // Two exclusions: the master has already had this message in
+                // its own form above, or was deliberately left out of the set.
+                if (m_send_to & send_to_others)
+                    queue_broadcast(relay_msg, sender->fd, m_master_fd);
+            }
             break;
         }
         default:
@@ -3856,7 +3909,8 @@ void server_instance::broadcast(std::string_view msg)
 // which is why a full submission queue reported as permanent left 952 of 3000
 // clients marked closing and never told -- fixed in event_loop.cpp, and
 // anything added here inherits that history.
-void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd)
+void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
+                                      int exclude_fd2)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return;
@@ -3868,7 +3922,7 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
     {
         int fd = m_active_fds[i];
         auto* conn = m_conn_idx[fd];
-        if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || conn->closing))
+        if (SOCKETLEY_UNLIKELY(!conn || fd == exclude_fd || fd == exclude_fd2 || conn->closing))
             continue;
 
         // An HTTP or RESP client is skipped rather than held, because no

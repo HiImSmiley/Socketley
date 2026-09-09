@@ -813,7 +813,7 @@ _
 mode	string	"inout", "in", "out", or "master"
 udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
 master_pw	string	Static password for master mode
-master_forward	bool	Forward non-master messages to master
+send_to	string	"sender", "others", "master", comma separated
 .TE
 .PP
 .B Client fields:
@@ -1708,6 +1708,13 @@ Message flow direction:
 .B master
 (one client claims master, only master's messages are broadcast).
 .IP
+A direction is not an answer. In
+.B inout
+with no script, every message is repeated to other connections and not to the
+one that sent it, so a single client talking to itself hears nothing and a
+second client hears everything. See
+.BR \-\-send\-to .
+.IP
 Relayed messages are held for a connection until the server knows what protocol
 it speaks, and delivered once it does \(em through that protocol's framing, so a
 WebSocket client receives them as frames rather than as raw text. A connection is
@@ -1757,6 +1764,85 @@ replies, anything a script addresses to it by client id, and the answers to
 .B "cache <command>"
 messages; what it no longer receives is other clients' traffic.
 .TP
+.BI "\-\-send\-to " "who[,who...]"
+Who the built\-in path answers when no script does, as a comma separated set of
+recipients:
+.B sender
+(the connection the message came from),
+.B others
+(every other connection, the master excepted),
+.B master
+(the master connection, which only
+.B "\-\-mode master"
+ever has).
+.IP
+The recipients are disjoint, so they compose:
+.B "\-\-send\-to sender,others"
+reaches everyone including the sender, and
+.B "\-\-send\-to sender,master"
+answers whoever spoke and sends the master a copy. There is no
+.B all
+for that reason \(em
+.B sender,others
+already says it, and one behaviour under two spellings is what
+.B \-\-master\-forward
+used to be.
+.IP
+Unset keeps what the mode has always done:
+.B inout
+answers
+.BR others ,
+and
+.B master
+drops what a non\-master says.
+.IP
+In
+.B "\-\-mode master"
+the flag decides what happens to a NON\-master's message; the master's own
+still reaches everyone else, which is what the mode is.
+.B "\-\-send\-to master"
+is what
+.B \-\-master\-forward
+was, prefix and all \(em the sender's descriptor stays in front of the line so
+the master can tell two clients apart.
+.B "\-\-send\-to others,master"
+is a moderated room the master reads along with.
+.IP
+Refused rather than accepted and ignored, per recipient:
+.B in
+and
+.B out
+answer nobody at all, and
+.B master
+names a connection no other mode has.
+.IP
+In
+.BR inout ,
+and for the master's own message in
+.BR master ,
+a script's
+.B on_message
+takes precedence over every recipient: when it is defined, nothing is sent
+automatically and
+.B self.send
+or
+.B self.broadcast
+decides. What a non\-master says in
+.B master
+mode has never reached
+.B on_message
+at all \(em only
+.BR on_client_message ,
+which does not suppress anything \(em so there the recipients apply whether or
+not a script is loaded.
+.IP
+Before this flag existed, UDP and TCP disagreed: a UDP sender received its own
+datagram back and a TCP sender did not.
+.B others
+is now what both do unset, and
+.B "\-\-send\-to sender,others"
+is the old UDP behaviour under a name.
+.TP
 .B \-\-udp
 Use UDP instead of TCP. The server binds a single SOCK_DGRAM socket.
 Peers are auto-registered on first datagram. Each datagram is one message
@@ -1775,10 +1861,6 @@ accept, before a byte is read, once that address has failed ten attempts within
 sixty seconds; the count decays after sixty seconds of quiet. This is a property
 of master mode and not of this flag \(em it applies whichever of the two
 authenticators is in use.
-.TP
-.B \-\-master\-forward
-When set in master mode, non-master client messages are forwarded to the master
-as "[<fd>] <message>\\n" instead of being silently dropped.
 .TP
 .BI "\-\-http " "directory"
 Serve static files from the given directory over HTTP. When a browser makes a
@@ -4613,7 +4695,7 @@ udp (bool)                 \-\-udp
 http                       \-\-http
 http_cache (bool)          \-\-http\-cache
 master_pw                  \-\-master\-pw
-master_forward (bool)      \-\-master\-forward
+send_to (string)           \-\-send\-to
 cache                      \-\-cache
 upstreams (array)          \-\-upstream a;b;c
 \(em\(em client \(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em\(em
@@ -7012,7 +7094,7 @@ Master mode with forwarding:
 .PP
 .nf
 socketley create server ctrl -p 9000 \\
-    --mode master --master-pw admin123 --master-forward -s
+    --mode master --master-pw admin123 --send-to master -s
 # Non-master messages forwarded to master as "[<fd>] msg"
 .fi
 .PP
