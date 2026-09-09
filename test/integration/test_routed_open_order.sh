@@ -186,13 +186,44 @@ for t in loaders: t.join(timeout=5)
 print("CONNECT_FAILED", len(failed))
 PY
 
-# Until the target has been quiet for a second, because what the loaders left
-# in its socket buffers is drained after they stop and the count must not be
-# taken while the log is still growing.
+# ─── WAITING FOR THE TARGET, WITHOUT MISTAKING A LONG TURN FOR THE END ──────
+#
+# What the loaders left in the target's socket buffers is drained after they
+# stop, so the count must not be taken while the log is still growing.  The
+# first version of this waited for ONE second with no change and then counted,
+# and that is not a test of "the stream ended" -- it is a test of "nothing was
+# observed for one second", and this file goes out of its way to make the
+# target's turns long.  Measured under Sanitize, sampling every second with no
+# early break:
+#
+#     t=1s   opens=271  msgs=260
+#     t=2s   opens=271  msgs=260   <- unchanged, so the old loop counted HERE
+#     t=3s   opens=300  msgs=300   <- and one second later everything is in
+#
+# It reported 271 of 300 opens and 260 of 300 messages as lost, for six months,
+# on a runtime that had dropped nothing.  Both halves of the fix matter:
+#
+#   * the fast path.  When both counts have reached what was asked for there is
+#     nothing left to wait for, so a healthy run stops at once and this file
+#     does not pay for the paranoia below.
+#   * QUIET_NEEDED consecutive unchanged samples, not one.  A single long turn
+#     cannot span five of them, and a run that genuinely lost frames still ends
+#     -- after five quiet seconds -- and still fails, which is the point.
+QUIET_NEEDED=5
+QUIET=0
 LAST=-1
-for _ in $(seq 1 30); do
-    NOW=$(grep -a -c 'RO_' "$SOCKETLEY_DLOG" 2>/dev/null)
-    [ "$NOW" = "$LAST" ] && break
+for _ in $(seq 1 90); do
+    NOW_G=$(( $(grep -a -c 'RO_GOT ' "$SOCKETLEY_DLOG" 2>/dev/null) - GOT_BEFORE ))
+    NOW_M=$(grep -a -c 'RO_MSG first-line-' "$SOCKETLEY_DLOG" 2>/dev/null)
+    # Everything asked for has arrived; nothing further can change the verdict.
+    [ "$NOW_G" -ge "$CLIENTS" ] && [ "$NOW_M" -ge "$CLIENTS" ] && break
+    NOW=$((NOW_G + NOW_M))
+    if [ "$NOW" = "$LAST" ]; then
+        QUIET=$((QUIET + 1))
+        [ "$QUIET" -ge "$QUIET_NEEDED" ] && break
+    else
+        QUIET=0
+    fi
     LAST=$NOW
     sleep 1
 done
@@ -218,8 +249,9 @@ if [ "$GOT" -eq "$CLIENTS" ]; then
 else
     fail "control: every open reached the target" \
          "the target's on_connect ran $GOT times for $CLIENTS routed clients" \
-         "the open travels the daemon's socket; a shortfall here is that path" \
-         "and not the order this file is about"
+         "the open takes the connection's own path once a link exists -- that" \
+         "is what stops the first data frame overtaking it -- so a shortfall" \
+         "here is delivery and not the order this file is about"
 fi
 if [ "${ORIGIN_LINKED:-0}" -ge 1 ]; then
     pass
