@@ -2882,14 +2882,26 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
 
     // Per-connection metadata: nil value deletes the key
     self["set_data"] = [owner, this](int id, std::string key,
-                                     sol::optional<std::string> val) -> api_result {
+                                     sol::optional<sol::object> val) -> api_result {
         // An empty key is a key nothing can read back, so storing under it is
         // a write that cannot be observed.
         if (key.empty())
             return api_why("the metadata key is empty");
+        // The type is judged here and not by a sol::optional<std::string>,
+        // whose failed check is indistinguishable from an absent argument, so
+        // storing a number deleted the key and answered true.
+        const bool has_val = val && val->valid()
+                             && val->get_type() != sol::type::lua_nil
+                             && val->get_type() != sol::type::none;
+        if (has_val && val->get_type() != sol::type::string)
+            return api_why("the metadata value is a "
+                           + std::string(lua_typename(
+                                 m_lua.lua_state(),
+                                 static_cast<int>(val->get_type())))
+                           + "; a string is stored and nil deletes the key");
         auto* srv = static_cast<server_instance*>(owner);
-        const bool ok = val ? srv->set_data(id, key, *val)
-                            : srv->del_data(id, key);
+        const bool ok = has_val ? srv->set_data(id, key, val->as<std::string>())
+                                : srv->del_data(id, key);
         if (ok) return api_yes();
         return api_why("there is no open connection " + std::to_string(id)
                        + " on " + q(m_owner_name) + " to carry metadata");

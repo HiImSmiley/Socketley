@@ -199,6 +199,23 @@ function on_client_message(id, msg)
     elseif cmd == "self_setdata_live" then
         reply(id, two(self.set_data(id, "k", "v")))
 
+    -- The value's TYPE, and what survives the attempt.  A number used to reach
+    -- a sol::optional<std::string> whose failed check is indistinguishable from
+    -- an absent argument, so the binding took the delete branch: the stored
+    -- value was destroyed and the call answered true.  The second reply is the
+    -- one that matters -- a refusal that still deleted would pass the first.
+    elseif cmd == "self_setdata_number" then
+        self.set_data(id, "typed", "ORIGINAL")
+        local ok, why = self.set_data(id, "typed", 100)
+        reply(id, tostring(ok) .. "|" .. tostring(why) ..
+                  "|kept=" .. tostring(self.get_data(id, "typed")))
+
+    -- nil deletes, and that is documented and must survive the type check.
+    elseif cmd == "self_setdata_nil" then
+        self.set_data(id, "gone", "ORIGINAL")
+        local ok = self.set_data(id, "gone", nil)
+        reply(id, tostring(ok) .. "|kept=" .. tostring(self.get_data(id, "gone")))
+
     elseif cmd == "self_group_empty" then
         reply(id, two(self.join_group(id, "")))
 
@@ -336,6 +353,18 @@ assert_has "self.set_data with an empty key is refused" "the metadata key is emp
     "that key cannot be observed by anything" "got: $R"
 assert_eq "self.set_data on a live connection answers true" \
           "true|nil" "$(ask "$RPC_PORT" self_setdata_live)"
+
+R=$(ask "$RPC_PORT" self_setdata_number)
+assert_has "self.set_data with a number is refused and names the type" \
+           "the metadata value is a number" "$R" "got: $R"
+assert_has "and the value already stored under that key survives the refusal" \
+           "kept=ORIGINAL" "$R" \
+    "this is the assertion the defect was about: the refusal alone is not the" \
+    "fix, because the old binding deleted the key on its way to answering" "got: $R"
+
+R=$(ask "$RPC_PORT" self_setdata_nil)
+assert_has "nil still deletes, which is the documented escape hatch" \
+           "kept=nil" "$R" "got: $R"
 
 R=$(ask "$RPC_PORT" self_group_empty)
 assert_has "join_group with an empty group name is refused" "the group name is empty" "$R" \
