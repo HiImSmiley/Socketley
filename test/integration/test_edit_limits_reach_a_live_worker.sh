@@ -30,6 +30,28 @@
 # an improvement and this file is where it gets written down; the third
 # assertion is what stops the second from also passing for an edit that was
 # never stored at all.
+#
+# ─── THE PROXY HALF, AND ONE WIDENING ──────────────────────────────────────
+#
+# The four above are limits every runtime type reads per use.  A proxy has nine
+# more of the same kind --- routing and mesh POLICY, read when a backend is
+# picked, a request is armed or a failure is counted, with nothing built from
+# them --- and they used to wait for a restart along with the port and the TLS
+# context, for no reason except that apply_live_config() did not mention them.
+# Measured against a backend that accepts and never answers:
+#
+#     created with --backend-timeout 1     client waited 1.02s
+#     edit --backend-timeout 6, rc 0       client waited 1.01s   <- show said 6
+#     after a restart                      client waited 6.02s
+#
+# So `show` reported six while the process holding the port cut the client off
+# at one, and the only way to find out was to time it.  They are live now, and
+# the assertions below time it rather than reading a rc or a `show`, because a
+# green rc is exactly what the defect produced.
+#
+# --health-check is deliberately NOT among the nine and the last assertion pins
+# that: it arms a sweep timer at setup, so turning it on has no timer to arm.
+# It is stored and applies at the next start, like the server's --http above.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -144,6 +166,85 @@ else
         "without this line the assertion above would also pass for an edit that" \
         "was never stored at all"
 fi
+
+# ── the proxy's nine, timed rather than reported ───────────────────────────
+#
+# A backend that accepts and never answers, so the only thing that ends the
+# request is the proxy's own response deadline -- which makes the wait the
+# measurement.  Held connections are kept in a list so the backend does not
+# close them and end the wait for the wrong reason.
+PX=$((SL_PORT_BASE+1494)); BE=$((SL_PORT_BASE+1495))
+python3 - "$BE" <<'PYEOF' &
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(64)
+held = []
+while True:
+    c, _ = s.accept(); held.append(c)
+PYEOF
+BE_PID=$!
+cleanup() {
+    # `wait` inside the redirect too, or the shell prints its own "Killed"
+    # job notice on stderr after the results line.
+    [ -n "${BE_PID:-}" ] && { kill -9 "$BE_PID"; wait "$BE_PID"; } 2>/dev/null
+    rm -rf "$WWW_A" "$WWW_B"
+    daemon_stop 2>/dev/null || true
+}
+sleep 0.5
+
+"$BIN" create proxy ep -p "$PX" --backend "127.0.0.1:$BE" --protocol http \
+    --backend-timeout 1 -s >/dev/null 2>&1
+for _ in $(seq 1 50); do nc -z 127.0.0.1 "$PX" 2>/dev/null && break; sleep 0.1; done
+sleep 0.6
+
+# Seconds the proxy made the client wait, to two decimals.
+waited() {
+    local t0 t1
+    t0=$(date +%s.%N)
+    curl -s -o /dev/null --max-time 20 "http://127.0.0.1:$PX/ep/" 2>/dev/null || true
+    t1=$(date +%s.%N)
+    awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}'
+}
+
+W_BEFORE=$(waited)
+if awk -v w="$W_BEFORE" 'BEGIN{exit !(w > 0.7 && w < 2.5)}'; then
+    ok "the proxy starts on the deadline its flag gave it (${W_BEFORE}s)"
+else
+    bad "the starting deadline has to be the flag's deadline" \
+        "the client waited ${W_BEFORE}s where --backend-timeout 1 was asked for;" \
+        "nothing below distinguishes anything if the deadline is already something else"
+fi
+
+"$BIN" edit ep --backend-timeout 6 >/dev/null 2>&1
+EDIT_BT_RC=$?
+sleep 0.3
+W_AFTER=$(waited)
+if [ "$EDIT_BT_RC" -eq 0 ] && awk -v w="$W_AFTER" 'BEGIN{exit !(w > 4.5 && w < 9.0)}'; then
+    ok "--backend-timeout reaches the running proxy (${W_BEFORE}s -> ${W_AFTER}s, no restart)"
+else
+    bad "mesh policy read per request reaches a proxy that is already serving" \
+        "edit rc $EDIT_BT_RC, the client waited ${W_AFTER}s where it waited ${W_BEFORE}s before;" \
+        "a wait unchanged near ${W_BEFORE}s means the config frame arrived and set a" \
+        "field the request path does not read, or apply_live_config() does not" \
+        "mention it --- \`show\` will report 6 either way, which is why this is timed"
+fi
+
+# And the one that is not live, pinned from the other side so the paragraph in
+# man/socketley.1 has an assertion behind it.
+"$BIN" edit ep --health-check tcp >/dev/null 2>&1
+EDIT_HC_RC=$?
+SHOWN_HC=$("$BIN" show ep 2>/dev/null | grep -o "\"health_check\": *[0-9]*" | head -1)
+if [ "$EDIT_HC_RC" -eq 0 ] && [ -n "$SHOWN_HC" ]; then
+    ok "--health-check is stored and waits for the next start ($SHOWN_HC)"
+else
+    bad "--health-check is stored rather than refused" \
+        "edit rc $EDIT_HC_RC, show: ${SHOWN_HC:-<none>};" \
+        "it arms a sweep timer at setup, so it cannot go live --- but it is" \
+        "stored like every other deferred flag, and man/socketley.1 says so"
+fi
+
+"$BIN" stop ep >/dev/null 2>&1; "$BIN" remove ep >/dev/null 2>&1
+{ kill -9 "$BE_PID"; wait "$BE_PID"; } 2>/dev/null; BE_PID=""
 
 "$BIN" stop et >/dev/null 2>&1; "$BIN" remove et >/dev/null 2>&1
 daemon_stop

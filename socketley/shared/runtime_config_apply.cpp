@@ -94,6 +94,34 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
 
+    // A proxy's routing and mesh POLICY, which is every mesh field this worker
+    // reads at the moment it uses it rather than at setup: a strategy is read
+    // when a backend is picked, a deadline when a request is armed, a circuit
+    // threshold when a failure is counted.  Those can move under a serving
+    // proxy because nothing is built from them.
+    //
+    // What is NOT here is the other four, and each for the same reason in a
+    // different place: --health-check arms a timer at setup and turning it on
+    // has none to arm, and --client-ca/--client-cert/--client-key are the mTLS
+    // context init_server() built before the first handshake.  `edit` refuses
+    // those while the runtime is running rather than storing them quietly.
+    if (rt.get_type() == runtime_proxy)
+    {
+        auto& prx = static_cast<proxy_instance&>(rt);
+        prx.set_strategy(static_cast<proxy_strategy>(cfg.strategy));
+        if (cfg.health_interval > 0)   prx.set_health_interval(cfg.health_interval);
+        if (!cfg.health_path.empty())  prx.set_health_path(cfg.health_path);
+        if (cfg.health_threshold > 0)  prx.set_health_threshold(cfg.health_threshold);
+        if (cfg.circuit_threshold >= 0) prx.set_circuit_threshold(cfg.circuit_threshold);
+        if (cfg.circuit_timeout > 0)   prx.set_circuit_timeout(cfg.circuit_timeout);
+        // Unconditional, unlike the rest: zero is "no deadline" and is a
+        // setting an operator can ask for, so the guarded form would make
+        // `--backend-timeout 0` the one value that could not be edited.
+        prx.set_backend_timeout(cfg.backend_timeout);
+        if (cfg.retry_count >= 0)      prx.set_retry_count(cfg.retry_count);
+        prx.set_retry_all(cfg.retry_all);
+    }
+
     // The setters above write fields the hot paths do not read; this is what
     // makes them true for a runtime that is already serving.
     rt.refresh_cached_limits();

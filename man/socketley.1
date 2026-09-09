@@ -595,7 +595,7 @@ which reach the full field set.
 .PP
 Four flags reach a
 .I running
-runtime at once:
+runtime of any type at once:
 .BR \-\-max\-connections ,
 .BR \-\-rate\-limit ,
 .B \-\-global\-rate\-limit
@@ -605,6 +605,31 @@ They are the limits a runtime reads at the moment it uses them \(em one per
 accept, one per message, one per idle sweep \(em so changing one changes the
 next decision and nothing already decided. The daemon sends the edited
 configuration to every shard.
+.PP
+On a
+.B proxy
+nine more do, for the same reason: they are routing and mesh
+.I policy,
+read when a backend is picked, a request is armed or a failure is counted, and
+nothing is built from them.
+.BR \-\-strategy ,
+.BR \-\-health\-interval ,
+.BR \-\-health\-path ,
+.BR \-\-health\-threshold ,
+.BR \-\-circuit\-threshold ,
+.BR \-\-circuit\-timeout ,
+.BR \-\-backend\-timeout ,
+.B \-\-retry
+and
+.BR \-\-retry\-all .
+.B \-\-health\-interval
+re-times the sweep already armed, so at most one period of the old value
+elapses before the new one applies.
+.PP
+.B \-\-health\-check
+is not among them, and is the one proxy flag whose reason differs from the
+others': it arms a sweep timer when the runtime starts, so turning it on has no
+timer to arm. It is stored and applies at the next start like everything below.
 .PP
 Every other flag
 .B edit

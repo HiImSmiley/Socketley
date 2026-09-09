@@ -892,7 +892,19 @@ const std::vector<backend_info>& proxy_instance::get_backends() const { return m
 const mesh_config& proxy_instance::get_mesh_config() const { return m_mesh; }
 
 void proxy_instance::set_health_check(mesh_config::health_type type) { m_mesh.health_check = type; }
-void proxy_instance::set_health_interval(int seconds) { m_mesh.health_interval = seconds; }
+void proxy_instance::set_health_interval(int seconds)
+{
+    m_mesh.health_interval = seconds;
+
+    // The armed timer carries its own copy: setup() writes the interval into a
+    // timespec and the completion re-submits THAT, not the field, so an `edit`
+    // on a running proxy changed the number `show` reports and left the sweep
+    // running at the old cadence.  The next re-submission picks this up; the
+    // one already in flight keeps the interval it was armed with, which is at
+    // most one period of the old value.
+    if (m_health_check_timer)
+        m_health_check_timer->ts.tv_sec = seconds;
+}
 void proxy_instance::set_health_path(std::string_view path) { m_mesh.health_path = std::string(path); }
 void proxy_instance::set_health_threshold(int threshold) { m_mesh.health_threshold = threshold; }
 void proxy_instance::set_circuit_threshold(int threshold) { m_mesh.circuit_threshold = threshold; }
