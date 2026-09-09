@@ -40,6 +40,29 @@
 #   * a handler that returns nothing still falls through to 404 — the documented
 #     meaning of nil is not collateral damage
 #   * the interpreter survives: the same runtime serves /ok again afterwards
+#
+# ─── AND THE OTHER WAY A HANDLER CAN BE UNREADABLE ──────────────────────────
+#
+# A raise is the loud failure.  The quiet one is a handler that returns a table
+# whose fields are the wrong type, which `get_or` cannot distinguish from a
+# field the script never set — so it substituted the documented default for
+# both and said nothing.  Measured on a private daemon before the fix:
+#
+#     body   = 12345          200, empty body       no log line
+#     body   = {1,2}          200, empty body       no log line
+#     status = "404"          200, carrying the     no log line
+#                             body meant for a 404
+#     headers = {X-Count=7}   header simply absent  no log line
+#
+# The first row is the one that reads as a broken server: a 200 with nothing in
+# it, from a handler that plainly meant to answer something.  A status or a body
+# this end cannot read now answers 500 and names the type it got; a header pair
+# that is not two strings is dropped and named, because one bad header costs the
+# client that header while a bad body costs the whole answer.
+#
+# `nil` and no-return-at-all stay completely silent.  That is the DECLINE, it is
+# documented, and Control 2 above is what stops this section from turning it
+# into a diagnostic.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -82,6 +105,27 @@ function on_http_request(req)
     end
     if req.path == "/ok" then
         return { status = 200, body = "served by lua" }
+    end
+    -- The four shapes this end cannot build a response from.  Each is a field
+    -- the script DID set, which is the whole distinction: an absent field takes
+    -- its documented default and must stay silent.
+    if req.path == "/badbody" then
+        return { status = 200, body = 12345 }
+    end
+    if req.path == "/tablebody" then
+        return { status = 200, body = { 1, 2 } }
+    end
+    if req.path == "/badstatus" then
+        return { status = "404", body = "meant for a 404" }
+    end
+    if req.path == "/badheader" then
+        return { status = 200, body = "hdr",
+                 headers = { ["X-Good"] = "yes", ["X-Count"] = 7 } }
+    end
+    -- Not a table at all: documented as falling through, so the CLIENT's answer
+    -- is unchanged and only the log gains a line.
+    if req.path == "/string" then
+        return "not a table"
     end
     -- /fall: no return at all.  Documented as "fall through to static/404".
 end
@@ -153,6 +197,85 @@ case "$OK_AFTER" in
             "GET /ok said '${OK_AFTER:-<nothing>}'" \
             "one raising request must not take the handler down with it" ;;
 esac
+
+# ── A table this end cannot build a response from ───────────────────────────
+#
+# Each row asserts the STATUS, because that is what the client sees and what
+# was wrong: a 200 with an empty body is what a handler returning body = 12345
+# used to produce, and it is indistinguishable from a working server answering
+# nothing.
+# path:status:what-was-wrong, so the failure line names the field rather than
+# the URL -- `${path#bad}` read "tablebody" for the second row.
+for probe in "badbody:500:body is a number" \
+             "tablebody:500:body is a table" \
+             "badstatus:500:status is a string"; do
+    path=${probe%%:*}; rest=${probe#*:}; want=${rest%%:*}; what=${rest#*:}
+    got=$(status "/$path")
+    if [ "$got" = "$want" ]; then pass; else
+        fail "a table whose $what answers $want" \
+             "GET /$path answered $got, wanted $want" \
+             "get_or() substitutes the default for a field of the wrong type as" \
+             "readily as for one that is absent, so this used to be a 200 with" \
+             "the unreadable part dropped and nothing in the log"
+    fi
+done
+
+# The body really is empty on the old path, so assert the new one carries the
+# 500's own body rather than the handler's.
+BB=$(body /badbody)
+case "$BB" in
+    *"500"*) pass ;;
+    *) fail "the 500 carries a body of its own" \
+            "GET /badbody said '${BB:-<nothing>}'" \
+            "an empty 200 was the defect; an empty 500 would be half a fix" ;;
+esac
+
+# A header pair that is not two strings costs that header and nothing else:
+# the good one on the same table must still arrive.
+HDRS=$(curl -s -D - -o /dev/null --max-time 3 "http://127.0.0.1:$PORT/badheader" 2>/dev/null || true)
+if grep -qi "^X-Good: yes" <<<"$HDRS" && ! grep -qi "^X-Count" <<<"$HDRS"; then pass; else
+    fail "a bad header pair is dropped and the rest are kept" \
+         "the response headers were: $(tr -d '\r' <<<"$HDRS" | tr '\n' '|')" \
+         "one unreadable header must not cost the client the whole answer," \
+         "which is why this one is dropped rather than answered 500"
+fi
+
+# And each is named in the log with the type it actually got, so the operator
+# is sent to the field rather than to the callback.
+for needle in "\`status\` is a string" "\`body\` is a number" "\`body\` is a table"; do
+    if grep -qa "$needle" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+        fail "the log names the type that arrived" \
+             "no '$needle' in $SOCKETLEY_DLOG" \
+             "naming only the field leaves the operator guessing what it was"
+    fi
+done
+
+# ── A non-table return: the client's answer is unchanged, the log gains a line ─
+STR=$(status /string)
+if [ "$STR" = "404" ]; then pass; else
+    fail "a non-table return still falls through" \
+         "GET /string answered $STR, wanted 404" \
+         "man/socketley.1 promises that anything which is not a table means the" \
+         "same as nil; the diagnostic was added without changing that"
+fi
+if grep -qa "expected a table or nil" "$SOCKETLEY_DLOG" 2>/dev/null; then pass; else
+    fail "but it is said out loud" \
+         "no 'expected a table or nil' in $SOCKETLEY_DLOG" \
+         "only nil declines — a script that returned a string meant to answer"
+fi
+
+# ── Control 4: the decline stays silent ─────────────────────────────────────
+#
+# The whole point of the distinction.  /fall returned nothing at all and must
+# not have produced any on_http_request diagnostic; the ones above were all
+# from paths that DID return something.
+if grep -qa "expected a table or nil" "$SOCKETLEY_DLOG" && \
+   [ "$(grep -ca "expected a table or nil" "$SOCKETLEY_DLOG")" = "1" ]; then pass; else
+    fail "control: returning nothing produces no diagnostic" \
+         "'expected a table or nil' appears $(grep -ca 'expected a table or nil' "$SOCKETLEY_DLOG" 2>/dev/null || echo 0) times, wanted exactly 1" \
+         "/fall and /string both reach the fall-through, and only /string" \
+         "returned something — a decline that logs is the defect inverted"
+fi
 
 TOTAL=$((TOTAL+1))
 if kill -0 "$SOCKETLEY_DPID" 2>/dev/null && daemon_alive "$SOCKETLEY_SOCKET"; then
