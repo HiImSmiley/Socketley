@@ -580,10 +580,6 @@ bool runtime_instance::reload_lua_script()
 
     m_lua = std::move(next);
 
-#ifndef SOCKETLEY_NO_LUA
-    m_lua->update_self_state("running");
-#endif
-
     bool should_tick = m_lua->has_on_tick();
     if (!m_tick && should_tick)
         start_tick_timer();
@@ -614,13 +610,22 @@ bool runtime_instance::invoke_on_start()
     // return early.
     m_on_start_error.clear();
 
+#ifndef SOCKETLEY_NO_LUA
+    // Ahead of every early return below, because `self.state` is the RUNTIME's
+    // state and not the callback's.  It stood after the has_on_start() test, so
+    // a script that defined no on_start never had it written: measured, a
+    // handler with only on_client_message answered a message and reported
+    // `self.state == "created"` while doing it.  The store to runtime_running
+    // happens in start() before this is called, so the literal is the truth.
+    if (m_lua)
+        m_lua->update_self_state("running");
+#endif
+
     if (m_cb_on_start) { m_cb_on_start(); return true; }
     if (!m_lua || !m_lua->has_on_start())
         return true;
 
 #ifndef SOCKETLEY_NO_LUA
-    m_lua->update_self_state("running");
-
     sol::protected_function_result r = m_lua->on_start()();
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {
@@ -640,13 +645,19 @@ bool runtime_instance::invoke_on_start()
 
 void runtime_instance::invoke_on_stop()
 {
+#ifndef SOCKETLEY_NO_LUA
+    // The same move for the same reason.  stop() stores runtime_stopped after
+    // this returns, so this says what the runtime is about to be -- which is
+    // what a script reading it from inside on_stop has always been told.
+    if (m_lua)
+        m_lua->update_self_state("stopped");
+#endif
+
     if (m_cb_on_stop) { m_cb_on_stop(); return; }
     if (!m_lua || !m_lua->has_on_stop())
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    m_lua->update_self_state("stopped");
-
     sol::protected_function_result r = m_lua->on_stop()();
     if (SOCKETLEY_UNLIKELY(!r.valid()))
     {

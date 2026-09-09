@@ -275,19 +275,17 @@ function on_miss(key)
     return nil
 end
 
--- Defined for one reason, written down because it is not obvious: self.state
--- is only ever updated from inside invoke_on_start / invoke_on_stop, and both
--- return early when the script has not defined the callback —
+-- This used to be defined for one reason: self.state was only written from
+-- inside invoke_on_start / invoke_on_stop, both of which returned early when
+-- the script had not defined the callback, so a script with no on_start read
+-- self.state as "created" for the whole life of a running runtime.  Defining
+-- an on_start here was the workaround, and this comment recorded the defect.
 --
---     if (!m_lua || !m_lua->has_on_start()) return;
---     m_lua->update_self_state("running");
---
--- so a script with no on_start reads self.state as "created" for the whole life
--- of a running runtime.  Measured, two identical servers, both Up in `ls`:
--- with on_start defined, self.state=running; without it, self.state=created.
--- Reported as a defect rather than worked around; this file asserts the field
--- on the path where it does work, and says so here so the assertion is not
--- mistaken for evidence that it works on the other one.
+-- Fixed since: the write moved ahead of those early returns, because
+-- self.state is the runtime's state and not the callback's.  The assertion
+-- below therefore now measures the ordinary path as well as this one, and
+-- test_self_state_without_on_start.sh is the pair that proves the difference.
+-- This on_start stays because the log line it writes is asserted further down.
 function on_start()
     socketley.log("CSTART " .. tostring(self.state))
 end
