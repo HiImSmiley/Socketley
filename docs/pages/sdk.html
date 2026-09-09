@@ -850,7 +850,6 @@ The sol2/LuaJIT include paths and <code>-lluajit</code> are not optional extras:
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
 <tr><td><code>cpus(spec)</code></td><td>Pin the wrapper's I/O thread: <code>"max"</code>, <code>"0-3"</code>, <code>"0,2,5"</code> &mdash; the <code>--cpus</code> spellings. A spec that does not parse is logged and ignored.</td></tr>
-<tr><td><code>sqpoll(bool)</code></td><td>Ask for (or decline) an SQPOLL submission poller on the wrapper's ring. A request &mdash; the kernel may refuse, and <code>start()</code> logs one line if it does. Must be called before <code>start()</code>.</td></tr>
 <tr><td><code>owner(name)</code> / <code>child_policy(p)</code></td><td>Ownership hierarchy, as in the daemon</td></tr>
 <tr><td><code>start()</code> &rarr; <code>bool</code></td><td>Run the loop; blocks. <code>false</code> = runtime never reached <code>running</code>, loop not entered</td></tr>
 <tr><td><code>stop()</code></td><td>Request the event loop to stop (callable from any thread or callback)</td></tr>
@@ -888,7 +887,7 @@ The sol2/LuaJIT include paths and <code>-lluajit</code> are not optional extras:
 <tr><td><code>udp()</code></td><td>Switch to UDP mode</td></tr>
 <tr><td><code>http_dir(path)</code> / <code>http_cache()</code></td><td>Serve static files over HTTP / with the in-memory response cache</td></tr>
 <tr><td><code>upstream(addr)</code> / <code>clear_upstreams()</code></td><td>Outbound upstream connections this server dials and holds. A malformed address is logged and ignored.</td></tr>
-<tr><td><code>master_pw(pw)</code> / <code>master_forward(bool)</code></td><td>Master-mode password / forwarding</td></tr>
+<tr><td><code>master_pw(pw)</code> / <code>send_to(mask)</code></td><td>Master-mode password / who a message no script answers goes to, as <code>send_to_sender | send_to_others | send_to_master</code> bits, or 0 to keep whatever the mode has always done. <code>master_forward(true)</code> was <code>send_to(send_to_master)</code></td></tr>
 <tr><td><code>drain()</code></td><td>Graceful shutdown: finish pending writes</td></tr>
 <tr><td><code>group(g)</code></td><td>Tag for dynamic proxy backend discovery</td></tr>
 <tr><td><code>tick_interval(ms)</code></td><td>Periodic tick interval</td></tr>
@@ -1093,16 +1092,16 @@ c.<span class="fn">set</span>(<span class="st">"boot"</span>, <span class="st">"
   <span class="badge badge-tier2">Tier 2</span>
 </div>
 <p class="method-sig">bool init()</p>
-<p class="method-desc">Initialize the io_uring ring. Must be called before any other event_loop method. Returns false if io_uring setup fails (missing kernel support). SQPOLL is <em>opt-in</em>: <code>set_sqpoll(true)</code> before <code>init()</code>, or <code>SOCKETLEY_SQPOLL=1</code> in the environment &mdash; and a request, not a guarantee: the kernel may refuse, in which case the loop runs without a poller (<code>sqpoll_enabled()</code> says what the ring actually got, <code>sqpoll_requested()</code> what was asked). A ring's polling mode is fixed at creation and cannot change afterwards.</p>
+<p class="method-desc">Initialize the io_uring ring. Must be called before any other event_loop method. Returns false if io_uring setup fails (missing kernel support). The ring is asked for <code>SINGLE_ISSUER | DEFER_TASKRUN | SUBMIT_ALL | COOP_TASKRUN</code> (and <code>NO_SQARRAY</code> where the kernel has it), falling back to a plain ring when the kernel refuses. There is no submission-queue poller in any of those, so every batch costs one <code>io_uring_enter(2)</code>.</p>
 </div>
 
 <div class="method-card" id="sdk-el-config">
 <div class="method-header">
-  <span class="method-name">event_loop::set_sqpoll / set_cpus</span>
+  <span class="method-name">event_loop::set_cpus</span>
   <span class="badge badge-tier2">Tier 2</span>
 </div>
-<p class="method-sig">void set_sqpoll(bool on) &nbsp;&middot;&nbsp; void set_cpus(const cpu_set_spec&amp; cpus)</p>
-<p class="method-desc">Ring configuration; both must be called <em>before</em> <code>init()</code>. <code>set_cpus</code> bounds the loop thread's CPU set (parse a spec string with <code>parse_cpu_set("0-3", online_cpu_count(), out, err)</code>); under SQPOLL the poller thread is pinned to the set's lowest member, because io_uring takes a CPU <em>number</em> for the poller, not a mask. The wrapper classes expose both as <code>cpus(spec)</code> and <code>sqpoll(bool)</code>.</p>
+<p class="method-sig">void set_cpus(const cpu_set_spec&amp; cpus)</p>
+<p class="method-desc">Ring configuration; must be called <em>before</em> <code>init()</code>. Bounds the loop thread's CPU set (parse a spec string with <code>parse_cpu_set("0-3", online_cpu_count(), out, err)</code>). The wrapper classes expose it as <code>cpus(spec)</code>.</p>
 </div>
 
 <div class="method-card" id="sdk-el-run">
@@ -1245,7 +1244,7 @@ c.<span class="fn">set</span>(<span class="st">"boot"</span>, <span class="st">"
 <tr><td><code>set_log_file(string_view)</code></td><td>Log output path</td></tr>
 <tr><td><code>set_listen_path(string_view)</code></td><td>AF_UNIX listener path instead of a port (<code>--listen unix:</code>); port and path are alternatives, never both</td></tr>
 <tr><td><code>set_tick_interval(uint32_t ms)</code></td><td>Periodic tick interval for <code>on_tick</code></td></tr>
-<tr><td><code>set_cpus(const cpu_set_spec&amp;)</code> / <code>set_sqpoll(bool)</code></td><td>A <em>request</em>, checked against the ring the runtime is started on &mdash; a shared ring that does not match refuses the start. On a ring you create yourself, configure the <code>event_loop</code> instead.</td></tr>
+<tr><td><code>set_cpus(const cpu_set_spec&amp;)</code></td><td>A <em>request</em>, checked against the ring the runtime is started on &mdash; a shared ring that does not match refuses the start. On a ring you create yourself, configure the <code>event_loop</code> instead.</td></tr>
 <tr><td><code>set_shards(uint32_t)</code></td><td>Worker-process shard count. Refused &gt;1 for any in-process runtime &mdash; a shard IS a worker process; meaningful only under the daemon.</td></tr>
 </tbody>
 </table>
@@ -1394,12 +1393,12 @@ srv-&gt;<span class="fn">set_on_tick</span>([](<span class="kw">double</span> dt
 <table>
 <thead><tr><th>Method</th><th>Description</th></tr></thead>
 <tbody>
-<tr><td><code>set_mode(server_mode)</code></td><td><code>mode_inout</code> (bidirectional), <code>mode_in</code> (receive only), <code>mode_out</code> (broadcast only), <code>mode_master</code> (first connection is admin)</td></tr>
-<tr><td><code>set_udp(bool)</code></td><td>Enable UDP datagram mode</td></tr>
+<tr><td><code>set_mode(server_mode)</code></td><td><code>mode_inout</code> (bidirectional), <code>mode_in</code> (receive only), <code>mode_out</code> (broadcast only), <code>mode_master</code> (one connection becomes the broadcaster by sending <code>master &lt;password&gt;</code>, checked against <code>set_master_pw</code> or the <code>on_master_auth</code> hook &mdash; not by connecting first)</td></tr>
+<tr><td><code>set_udp(bool)</code></td><td>Enable UDP datagram mode. Refused together with <code>mode_master</code>, which claims a connection and a datagram has none</td></tr>
 <tr><td><code>set_http_dir(string_view)</code></td><td>Serve static files from directory (enables HTTP mode)</td></tr>
 <tr><td><code>set_http_cache(bool)</code></td><td>Cache file contents in memory</td></tr>
-<tr><td><code>set_master_pw(string_view)</code></td><td>Set password for master/replica authentication</td></tr>
-<tr><td><code>set_master_forward(bool)</code></td><td>Enable forwarding writes to master in replica mode</td></tr>
+<tr><td><code>set_master_pw(string_view)</code></td><td>Password a client presents as <code>master &lt;password&gt;</code> to claim the master role</td></tr>
+<tr><td><code>set_send_to(uint8_t mask)</code></td><td>Recipients of a message no script answers: <code>send_to_sender</code>, <code>send_to_others</code>, <code>send_to_master</code>, OR-ed. 0 keeps whatever the mode has always done &mdash; <code>mode_inout</code> answers others, <code>mode_master</code> drops what a non-master says. <code>set_master_forward(true)</code> was <code>set_send_to(send_to_master)</code>; <code>get_send_to()</code> reads it back</td></tr>
 </tbody>
 </table>
 

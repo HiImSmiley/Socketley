@@ -2,6 +2,7 @@
       <li class="open"><a href="#lua-scripting">Lua Scripting</a><ul>
         <li><a href="#lua-attaching">Attaching Scripts</a></li>
         <li><a href="#lua-bindings">How Bindings Work</a></li>
+        <li><a href="#lua-deadline">Callback deadline</a></li>
         <li><a href="#lua-globals">Globals &amp; self</a></li>
       </ul></li>
       <li><a href="#callbacks">Callbacks</a><ul>
@@ -15,6 +16,8 @@
         <li><a href="#cb-on-master-auth">on_master_auth</a></li>
         <li><a href="#cb-on-auth">on_auth</a></li>
         <li><a href="#cb-on-websocket">on_websocket</a></li>
+        <li><a href="#cb-on-http-request">on_http_request</a></li>
+        <li><a href="#cb-on-upstream">on_upstream</a></li>
         <li><a href="#cb-on-proxy-hooks">on_proxy_request / on_proxy_response</a></li>
       </ul></li>
       <li><a href="#server-api">Server API</a><ul>
@@ -24,6 +27,9 @@
         <li><a href="#srv-clients">clients / multicast</a></li>
         <li><a href="#srv-set-data">set_data / get_data</a></li>
         <li><a href="#srv-ws-headers">ws_headers</a></li>
+        <li><a href="#srv-groups">Groups</a></li>
+        <li><a href="#srv-pipe">pipe / unpipe</a></li>
+        <li><a href="#srv-upstream">Upstreams</a></li>
         <li><a href="#srv-master">Master Mode</a></li>
       </ul></li>
       <li><a href="#client-api">Client API</a><ul>
@@ -40,6 +46,7 @@
       </ul></li>
       <li><a href="#proxy-api">Proxy API</a><ul>
         <li><a href="#proxy-connections">connections</a></li>
+        <li><a href="#proxy-backends">backends / health</a></li>
         <li><a href="#proxy-routing">Lua Routing</a></li>
       </ul></li>
       <li><a href="#runtime-mgmt">Runtime Management</a><ul>
@@ -82,12 +89,19 @@ socketley reload-lua myserver</code></pre>
 <h3 id="lua-bindings">How Bindings Work</h3>
 <div class="info-box"><strong>Binding order:</strong> <code>register_bindings()</code> runs <em>before</em> script execution. The <code>self</code>, <code>socketley</code>, and type-alias tables are already available at the top level of your script.</div>
 <ol>
-<li>Fresh LuaJIT state with <code>base</code>, <code>string</code>, <code>table</code>, <code>math</code>, <code>os</code> libs</li>
+<li>Fresh LuaJIT state with <code>base</code>, <code>string</code>, <code>table</code>, <code>math</code>, <code>os</code>, <code>io</code> and <code>package</code> libs</li>
 <li>Registers <code>socketley</code> namespace (log, create, start, stop, remove, send, list, get)</li>
 <li>Registers <code>self</code> table with runtime properties and type-specific action methods</li>
 <li>Registers a type alias (<code>server</code> / <code>client</code> / <code>cache</code> / <code>proxy</code>) pointing to the same <code>self</code> table</li>
 <li>Executes the script, then captures any defined callback functions</li>
 </ol>
+
+<div class="warn-box"><strong>This is not a sandbox.</strong> <code>io</code>, <code>package</code> and <code>base</code> are open, so a script runs with the daemon's full privileges. Two functions are removed, and only because one call can take the whole process down by accident: <code>os.exit</code>, which ends the daemon, and <code>os.setlocale</code>, which is process-wide and would change how every other script's JSON spells a number.</div>
+
+<h3 id="lua-deadline">The callback deadline</h3>
+<p>One Lua callback may hold the event-loop thread for <strong>10&nbsp;seconds</strong>. A count hook fires every N VM instructions and checks wall-clock time, so a callback blocked in <code>socketley.http</code> is caught too. Set a different bound with a top-level <code>callback_timeout_ms</code>, or process-wide with <code>SOCKETLEY_LUA_TIMEOUT_MS</code> (0&ndash;3600000). There is no CLI flag for it &mdash; that would let somebody who has not read the script overrule a bound its author set.</p>
+<div class="info-box"><strong>The JIT compiler follows the deadline.</strong> LuaJIT's compiler is off while a deadline is armed, because a compiled runaway callback can no longer be interrupted. Setting <code>callback_timeout_ms = 0</code> turns the deadline off and the compiler on &mdash; measured at 5.2&ndash;5.5x on compute-shaped scripts, and at the price that such a script can hold the loop for ever.</div>
+<pre><code>callback_timeout_ms = <span class="nb">0</span>   <span class="cm">-- no deadline, JIT on</span></code></pre>
 
 <h3 id="lua-globals">Globals &amp; self</h3>
 <h4>self Table (read-only properties)</h4>
@@ -106,6 +120,7 @@ socketley reload-lua myserver</code></pre>
 
 <h2 id="callbacks">Lua Callbacks</h2>
 <p>Define global functions to react to lifecycle events. All are optional. <code>self.state</code> is updated before each callback fires.</p>
+<div class="warn-box"><strong>A cache calls four of these and no others.</strong> <code>on_start</code>, <code>on_stop</code> and <code>on_tick</code> come from the lifecycle every runtime shares, and beyond those a cache dispatches only <code>on_write</code>, <code>on_miss</code>, <code>on_delete</code> and <code>on_expire</code> &mdash; see <a href="#db-backend">Addons: Database Backend Hooks</a>. A cache script that defines <code>on_message</code>, <code>on_connect</code>, <code>on_disconnect</code>, <code>on_send</code> or <code>on_auth</code> loads with no warning and those functions never fire.</div>
 
 <div class="callback-card" id="cb-on-start">
 <div class="method-header"><span class="method-name">on_start()</span><span class="badge badge-all">all types</span></div>
@@ -121,8 +136,8 @@ socketley reload-lua myserver</code></pre>
 </div>
 
 <div class="callback-card" id="cb-on-message">
-<div class="method-header"><span class="method-name">on_message(msg)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span><span class="badge badge-cache">cache</span></div>
-<div class="fires">Fires on each received message. Trailing newline is stripped.</div>
+<div class="method-header"><span class="method-name">on_message(msg)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span></div>
+<div class="fires">Fires on each received message. Trailing newline is stripped. Not a cache callback &mdash; a cache reacts to keys, not to lines, through <code>on_write</code> / <code>on_miss</code> / <code>on_delete</code> / <code>on_expire</code>.</div>
 <pre><code><span class="kw">function</span> <span class="fn">on_message</span>(msg)
     self.broadcast(<span class="st">"[echo] "</span> .. msg)
 <span class="kw">end</span></code></pre>
@@ -139,13 +154,13 @@ socketley reload-lua myserver</code></pre>
 </div>
 
 <div class="callback-card" id="cb-on-connect">
-<div class="method-header"><span class="method-name">on_connect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-cache">cache</span></div>
-<div class="fires">Fires when a client connects. <code>client_id</code> is the file descriptor.</div>
+<div class="method-header"><span class="method-name">on_connect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span><span class="badge badge-proxy">proxy</span></div>
+<div class="fires">Fires when a client connects. <code>client_id</code> is the file descriptor. On a server or a proxy that is the accepted connection; on a client runtime it is the runtime's own socket, so the callback fires once per successful dial and again on every reconnect. Not a cache callback.</div>
 </div>
 
 <div class="callback-card" id="cb-on-disconnect">
-<div class="method-header"><span class="method-name">on_disconnect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-cache">cache</span></div>
-<div class="fires">Fires when a client disconnects.</div>
+<div class="method-header"><span class="method-name">on_disconnect(client_id)</span><span class="badge badge-server">server</span><span class="badge badge-client">client</span><span class="badge badge-proxy">proxy</span></div>
+<div class="fires">Fires when a client disconnects. On a client runtime it fires when the runtime loses its own connection. Not a cache callback.</div>
 </div>
 
 <div class="callback-card" id="cb-on-send">
@@ -181,8 +196,8 @@ socketley reload-lua myserver</code></pre>
 </div>
 
 <div class="callback-card" id="cb-on-auth">
-<div class="method-header"><span class="method-name">on_auth(client_id) &rarr; boolean</span><span class="badge badge-server">server</span></div>
-<div class="fires">Fires after TCP accept, <strong>before</strong> <code>on_connect</code>. Return <code>false</code> to reject the connection (fail-closed: Lua errors also reject). The client fd is valid for <code>self.peer_ip()</code> inside this callback.</div>
+<div class="method-header"><span class="method-name">on_auth(client_id) &rarr; boolean</span><span class="badge badge-server">server</span><span class="badge badge-proxy">proxy</span></div>
+<div class="fires">Fires after TCP accept, <strong>before</strong> <code>on_connect</code>, on a server and on a proxy alike. Return <code>false</code> to reject the connection (fail-closed: Lua errors also reject). The client fd is valid for <code>self.peer_ip()</code> inside this callback.</div>
 <pre><code><span class="kw">function</span> <span class="fn">on_auth</span>(client_id)
     <span class="kw">local</span> ip = self.peer_ip(client_id)
     <span class="kw">if</span> ip == <span class="st">"10.0.0.1"</span> <span class="kw">then</span> <span class="kw">return</span> <span class="kw">false</span> <span class="kw">end</span>
@@ -210,7 +225,29 @@ socketley reload-lua myserver</code></pre>
 <div class="method-desc">See <a href="#addons-proxy-hooks">Addons: Proxy Data Hooks</a> for logging and filtering patterns.</div>
 </div>
 
+<div class="callback-card" id="cb-on-http-request">
+<div class="method-header"><span class="method-name">on_http_request(req) &rarr; table or nil</span><span class="badge badge-server">server</span></div>
+<div class="fires">Fires for each HTTP request before <code>--http</code> serves a file. <code>req</code> has <code>method</code>, <code>path</code>, <code>query</code>, <code>body</code>, <code>version</code>, <code>client_id</code> and a <code>headers</code> table. Return a table <code>{status, body, headers}</code> to answer it &mdash; <code>status</code> defaults to 200 and <code>body</code> to empty. Return nothing and the request falls through to the static directory, or to a 404 when there is none. A Lua error answers <code>500</code>.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_http_request</span>(req)
+    <span class="kw">if</span> req.path == <span class="st">"/api/time"</span> <span class="kw">then</span>
+        <span class="kw">return</span> { status = <span class="nb">200</span>, body = <span class="fn">tostring</span>(os.time()),
+                 headers = { [<span class="st">"Content-Type"</span>] = <span class="st">"text/plain"</span> } }
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+</div>
+
+<div class="callback-card" id="cb-on-upstream">
+<div class="method-header"><span class="method-name">on_upstream(conn_id, data)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">on_upstream_connect(conn_id)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">on_upstream_disconnect(conn_id)</span><span class="badge badge-server">server</span></div>
+<div class="fires">The outbound half of a server: the connections <code>--upstream</code> dials. <code>on_upstream</code> fires once per newline-terminated line received from an upstream. <code>conn_id</code> is a 1-based id that stays the same across reconnects, unlike a descriptor. Answer with <code>self.upstream_send(conn_id, msg)</code>.</div>
+<pre><code><span class="kw">function</span> <span class="fn">on_upstream</span>(id, line)
+    self.broadcast(<span class="st">"[upstream "</span> .. id .. <span class="st">"] "</span> .. line)
+<span class="kw">end</span></code></pre>
+</div>
+
 <h2 id="server-api">Lua Server API</h2>
+<div class="info-box"><strong>How a refusal is spelled.</strong> The calls below that can fail return <code>true</code>, or <code>false</code> and a reason: <code>local ok, why = self.pipe(a, b)</code>. Nothing is logged for a refusal &mdash; stopping something already stopped is how an idempotent teardown is written, so the reason is returned rather than printed.</div>
 
 <div class="method-card" id="srv-broadcast">
 <div class="method-header"><span class="method-name">self.broadcast</span><span class="method-sig">(msg)</span><span class="badge badge-server">server</span></div>
@@ -254,8 +291,27 @@ socketley reload-lua myserver</code></pre>
 <div class="method-desc">Returns WebSocket handshake headers for a WS-connected client, or <code>nil</code> if the client is plain TCP. Table keys: <code>cookie</code>, <code>origin</code>, <code>protocol</code>, <code>authorization</code>.</div>
 </div>
 
+<div class="method-card" id="srv-groups">
+<div class="method-header"><span class="method-name">self.join_group</span><span class="method-sig">(client_id, group)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">self.leave_group</span><span class="method-sig">(client_id, group)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">self.group_send</span><span class="method-sig">(group, msg) &rarr; number</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Name a subset of this server's connections and address it by that name. A connection may be in more than one group. <code>group_send</code> returns how many connections it reached rather than a boolean, because a group that exists and is empty is what a misspelled name looks like once its last member has left. An empty group name is refused at all three.</div>
+</div>
+<div class="method-card" id="srv-pipe">
+<div class="method-header"><span class="method-name">self.pipe</span><span class="method-sig">(fd_a, fd_b)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">self.unpipe</span><span class="method-sig">(fd)</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Join two of this server's own connections so bytes arriving on either go straight out of the other, and undo it. Joining a descriptor to itself is refused by name. The cross-runtime form is <a href="#util-pipe"><code>socketley.pipe</code></a>.</div>
+</div>
+<div class="method-card" id="srv-upstream">
+<div class="method-header"><span class="method-name">self.upstream_send</span><span class="method-sig">(conn_id, msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">self.upstream_broadcast</span><span class="method-sig">(msg)</span><span class="badge badge-server">server</span></div>
+<div class="method-header"><span class="method-name">self.upstreams</span><span class="method-sig">() &rarr; table</span><span class="badge badge-server">server</span></div>
+<div class="method-desc">Write to the connections <code>--upstream</code> dials. <code>self.upstreams()</code> is an array of their <code>conn_id</code>s, the same ids <a href="#cb-on-upstream"><code>on_upstream</code></a> is called with; an id survives a reconnect, a descriptor does not.</div>
+</div>
+
 <h3 id="srv-master">Master Mode</h3>
-<p>With <code>--mode master</code>, one authenticated client becomes the broadcaster. Others are silenced (or forwarded via <code>--master-forward</code>). Auth via <code>--master-pw</code> or the <code>on_master_auth</code> callback.</p>
+<p>With <code>--mode master</code>, one authenticated client becomes the broadcaster. What everyone else says is dropped unless <code>--send-to</code> names recipients for it &mdash; <code>--send-to master</code> forwards it to the master with a <code>[&lt;fd&gt;] </code> sender prefix, and <code>sender</code> and <code>others</code> compose with it. Auth via <code>--master-pw</code> or the <code>on_master_auth</code> callback.</p>
+<p>A non-master's message never reaches <code>on_message</code> in this mode &mdash; only <code>on_client_message</code> sees it &mdash; so <code>--send-to</code> applies there whether a script is attached or not. The master's own message reaches every other connection regardless of <code>--send-to</code>, unless <code>on_message</code> is defined, which takes precedence.</p>
 
 <h2 id="client-api">Lua Client API</h2>
 
@@ -311,6 +367,22 @@ socketley reload-lua myserver</code></pre>
 <div class="method-card" id="proxy-connections">
 <div class="method-header"><span class="method-name">self.connections</span><span class="method-sig">() &rarr; number</span><span class="badge badge-proxy">proxy</span></div>
 <div class="method-desc">Current active connection count through the proxy.</div>
+</div>
+
+<div class="method-card" id="proxy-clients">
+<div class="method-header"><span class="method-name">self.clients</span><span class="method-sig">() &rarr; table</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-header"><span class="method-name">self.peer_ip</span><span class="method-sig">(client_id) &rarr; string</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-header"><span class="method-name">self.close_client</span><span class="method-sig">(client_id)</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">The client side of the proxy: the open client connections, one's remote address, and closing one. <code>close_client</code> takes the <em>client</em> half of a proxied pair; handed the backend half it refuses and says so, rather than doing nothing.</div>
+</div>
+<div class="method-card" id="proxy-backends">
+<div class="method-header"><span class="method-name">self.backends</span><span class="method-sig">() &rarr; table</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-header"><span class="method-name">self.backend_health</span><span class="method-sig">() &rarr; table</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">The backend addresses in order, and each one's circuit-breaker state &mdash; <code>"closed"</code>, <code>"open"</code> or <code>"half_open"</code> &mdash; keyed by the same 1-based position, so <code>self.backend_health()[i]</code> describes <code>self.backends()[i]</code>. The index <code>on_route</code> returns is 0-based, one less than these.</div>
+</div>
+<div class="method-card" id="proxy-stats">
+<div class="method-header"><span class="method-name">self.stats</span><span class="method-sig">() &rarr; table</span><span class="badge badge-proxy">proxy</span></div>
+<div class="method-desc">Returns <code>{connections, bytes_in, bytes_out, total_connections, total_messages, backend_count}</code>. The counters are summed across worker shards, so they are the same figures <code>socketley stats</code> prints rather than one process's share.</div>
 </div>
 
 <h3 id="proxy-routing">Lua Routing</h3>
