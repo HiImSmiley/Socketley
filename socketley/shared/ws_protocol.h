@@ -268,17 +268,31 @@ inline int ws_write_header(char* hdr, uint8_t opcode_with_fin, size_t payload_le
     }
 }
 
-// Create text frame (server->client, unmasked)
-inline std::string ws_frame_text(std::string_view payload)
+// Build a data frame (server->client, unmasked) with the caller's opcode, so
+// text and binary share one encoder.
+inline std::string ws_frame_data(uint8_t opcode_with_fin, std::string_view payload)
 {
     char hdr[14]; // max WS header = 14 bytes (10 + 4 mask, but server doesn't mask)
-    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+    int hdr_len = ws_write_header(hdr, opcode_with_fin, payload.size());
 
     std::string frame;
     frame.reserve(static_cast<size_t>(hdr_len) + payload.size());
     frame.append(hdr, static_cast<size_t>(hdr_len));
     frame.append(payload);
     return frame;
+}
+
+// Create text frame (server->client, unmasked)
+inline std::string ws_frame_text(std::string_view payload)
+{
+    return ws_frame_data(static_cast<uint8_t>(0x80 | WS_OP_TEXT), payload);
+}
+
+// Create binary frame, for a payload RFC 6455 5.6 would require be valid UTF-8
+// in a text frame.
+inline std::string ws_frame_binary(std::string_view payload)
+{
+    return ws_frame_data(static_cast<uint8_t>(0x80 | WS_OP_BINARY), payload);
 }
 
 // Create pong frame
@@ -451,16 +465,30 @@ inline ws_parse ws_parse_frame_inplace(char* data, size_t len, ws_frame_view& ou
 
 // ─── Append-to-buffer variants (zero intermediate allocation) ───
 
-// Append text frame directly into buf (no intermediate allocation)
-inline void ws_frame_text_into(std::string& buf, std::string_view payload)
+// Append a data frame with the caller's opcode directly into buf (no
+// intermediate allocation)
+inline void ws_frame_data_into(std::string& buf, uint8_t opcode_with_fin,
+                               std::string_view payload)
 {
     char hdr[14];
-    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+    int hdr_len = ws_write_header(hdr, opcode_with_fin, payload.size());
 
     size_t off = buf.size();
     buf.resize(off + static_cast<size_t>(hdr_len) + payload.size());
     std::memcpy(&buf[off], hdr, static_cast<size_t>(hdr_len));
     std::memcpy(&buf[off + hdr_len], payload.data(), payload.size());
+}
+
+// Append text frame directly into buf (no intermediate allocation)
+inline void ws_frame_text_into(std::string& buf, std::string_view payload)
+{
+    ws_frame_data_into(buf, static_cast<uint8_t>(0x80 | WS_OP_TEXT), payload);
+}
+
+// Append binary frame directly into buf (no intermediate allocation)
+inline void ws_frame_binary_into(std::string& buf, std::string_view payload)
+{
+    ws_frame_data_into(buf, static_cast<uint8_t>(0x80 | WS_OP_BINARY), payload);
 }
 
 // Append pong frame directly into buf
@@ -528,18 +556,32 @@ inline void ws_handshake_response_into(std::string& buf, std::string_view client
 
 // ─── Broadcast helpers (encode once, share across all clients) ───
 
-// A pre-encoded WS text frame encoded once and shared by every recipient of a
+// A pre-encoded WS data frame encoded once and shared by every recipient of a
 // broadcast.
-inline std::shared_ptr<const std::string> ws_frame_text_shared(std::string_view payload)
+inline std::shared_ptr<const std::string> ws_frame_data_shared(uint8_t opcode_with_fin,
+                                                               std::string_view payload)
 {
     char hdr[14];
-    int hdr_len = ws_write_header(hdr, 0x81, payload.size());
+    int hdr_len = ws_write_header(hdr, opcode_with_fin, payload.size());
 
     auto frame = std::make_shared<std::string>();
     frame->resize(static_cast<size_t>(hdr_len) + payload.size());
     std::memcpy(frame->data(), hdr, static_cast<size_t>(hdr_len));
     std::memcpy(frame->data() + hdr_len, payload.data(), payload.size());
     return frame;
+}
+
+// The text opcode, which is what a broadcast of newline-delimited lines wants.
+inline std::shared_ptr<const std::string> ws_frame_text_shared(std::string_view payload)
+{
+    return ws_frame_data_shared(static_cast<uint8_t>(0x80 | WS_OP_TEXT), payload);
+}
+
+// The binary opcode, for a payload that is not valid UTF-8 and would make a
+// text frame non-conformant.
+inline std::shared_ptr<const std::string> ws_frame_binary_shared(std::string_view payload)
+{
+    return ws_frame_data_shared(static_cast<uint8_t>(0x80 | WS_OP_BINARY), payload);
 }
 
 // Create a pre-encoded WS pong frame as a shared_ptr
