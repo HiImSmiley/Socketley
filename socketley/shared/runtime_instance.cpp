@@ -140,6 +140,16 @@ bool runtime_instance::start(event_loop& loop)
         return false;
     }
 
+    // And whatever else this runtime type judges as a set, on the same terms
+    // and here rather than in the four callers that reach a live runtime,
+    // because a state file is not parsed by any of their parsers.
+    if (const std::string msg = config_refusal(); !msg.empty())
+    {
+        LOG_ERROR(msg.c_str());
+        m_state.store(runtime_failed, std::memory_order_release);
+        return false;
+    }
+
     // A placeholder arms nothing and binds nothing, and returning before
     // register_owner() keeps has_armed_io() false so removal can free it on
     // the spot.

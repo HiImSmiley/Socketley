@@ -1869,6 +1869,25 @@ accept, before a byte is read, once that address has failed ten attempts within
 sixty seconds; the count decays after sixty seconds of quiet. This is a property
 of master mode and not of this flag \(em it applies whichever of the two
 authenticators is in use.
+.IP
+Requires
+.BR "\-\-mode master" ,
+and is refused without it. The
+.B "master "
+prefix is read in exactly one place, so in any other mode the password is not a
+credential: it is an ordinary message, and a client that sends it has its
+password relayed to every other connection verbatim.
+.TP
+.B \-\-no\-master\-pw
+.RB ( edit
+only.) Remove the password from a server that has one, which is what makes
+leaving master mode possible \(em the pair above is refused as a set, so a mode
+change alone would be refused while the password remained. It has a flag of its
+own because passing an empty string to
+.B \-\-master\-pw
+cannot express it: the daemon receives one line and splits it on whitespace, so
+an empty argument does not survive the wire and arrives as the flag with
+nothing after it.
 .TP
 .BI "\-\-http " "directory"
 Serve static files from the given directory over HTTP. When a browser makes a

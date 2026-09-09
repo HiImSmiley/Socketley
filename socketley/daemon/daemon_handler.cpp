@@ -170,60 +170,14 @@ static std::string instance_cache_persist_refusal(const runtime_instance* inst)
     return {};
 }
 
-// Why --send-to cannot be honoured, judged as a set because --mode may be typed
-// on either side of it.  The rule is per recipient and not per flag:
-//
-//   `in` and `out` answer nobody at all, so no recipient means anything there.
-//   `master` names a connection only mode_master ever has -- m_master_fd is set
-//   by that mode's password exchange and by nothing else -- so asking for it
-//   anywhere else is asking for a fd that stays -1.
-//
-// A flag accepted and then ignored is the shape this whole option exists to
-// remove, so both are refusals rather than warnings.
-static std::string instance_send_to_refusal(const runtime_instance* inst)
+// Why this server's --mode and the three flags that only mean something in
+// some of its answers cannot be honoured together.  The rule itself lives in
+// server_instance.h beside the enums it is about, and start() asks the same
+// question through config_refusal(), so a state file reaches it too; this
+// wrapper exists only so a command can refuse BEFORE storing anything.
+static std::string instance_server_mode_refusal(const runtime_instance* inst)
 {
-    if (!inst || inst->get_type() != runtime_server)
-        return {};
-
-    const auto* srv = static_cast<const server_instance*>(inst);
-    const uint8_t to = srv->get_send_to();
-    if (to == send_to_unset)
-        return {};
-
-    const server_mode mode = srv->get_mode();
-    if (mode == mode_in || mode == mode_out)
-        return "--send-to needs --mode inout or master: this mode carries "
-               "messages one way and never answers one\n";
-
-    if ((to & send_to_master) && mode != mode_master)
-        return "--send-to master needs --mode master: nothing claims the master "
-               "connection in any other mode, so there is nobody to send to\n";
-
-    return {};
-}
-
-// Why --udp and --mode master cannot be honoured together.  The man page has
-// called them incompatible since the flag existed and nothing enforced it, and
-// the combination is not merely useless: master mode claims a CONNECTION as the
-// master, and a datagram has none, so process_message() reaches the mode_master
-// case with a null sender.  A datagram beginning "master " then dereferenced it
-// -- an unauthenticated packet, one per worker, SIGSEGV, and the daemon's own
-// log said `killed by signal 11` while the runtime came back and did it again.
-//
-// The dereference is guarded at the case as well.  This refusal is the one that
-// makes the documented promise true; that guard is the one that holds when a
-// state file written before this check carries the pair in anyway.
-static std::string instance_udp_master_refusal(const runtime_instance* inst)
-{
-    if (!inst || inst->get_type() != runtime_server)
-        return {};
-
-    const auto* srv = static_cast<const server_instance*>(inst);
-    if (!srv->is_udp() || srv->get_mode() != mode_master)
-        return {};
-
-    return "--udp cannot be combined with --mode master: master mode claims one "
-           "connection as the master and a datagram is not a connection\n";
+    return inst ? inst->config_refusal() : std::string{};
 }
 
 // Who is on the other end of this connection, or 0 when the socket cannot say.
@@ -1357,16 +1311,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
-    // And --send-to against --mode, which is the same question of order.
-    if (const std::string msg = instance_send_to_refusal(instance); !msg.empty())
-    {
-        std::cout << msg;
-        m_manager.remove(name);
-        return 1;
-    }
-
-    // And --udp against --mode master, which is the same question again.
-    if (const std::string msg = instance_udp_master_refusal(instance); !msg.empty())
+    // And --send-to, --udp and --master-pw against --mode, as one question
+    // because they are one answer and --mode may be typed on either side of
+    // any of them.
+    if (const std::string msg = instance_server_mode_refusal(instance); !msg.empty())
     {
         std::cout << msg;
         m_manager.remove(name);
@@ -1556,20 +1504,10 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
                 continue;
             }
 
-            // And --send-to against --mode, for the same reason: an edit can
-            // move either half after the create checked them together.
-            if (const std::string msg = instance_send_to_refusal(inst);
-                !msg.empty())
-            {
-                conn->write_buf += std::string(n) + ": " + msg;
-                ++failed;
-                continue;
-            }
-
-            // And --udp against --mode master.  This is the one that a state
-            // file predating the check reaches, so it refuses to START rather
-            // than only to be created.
-            if (const std::string msg = instance_udp_master_refusal(inst);
+            // And the server's --mode set, named here rather than left to
+            // start(): the runtime would refuse there anyway, but this reply
+            // carries the runtime's name and start()'s only goes to the log.
+            if (const std::string msg = instance_server_mode_refusal(inst);
                 !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;
@@ -3096,6 +3034,24 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     instance->get_mesh_tls_paths(mca_v, mcert_v, mkey_v);
     const std::string mesh_ca_before(mca_v), mesh_cert_before(mcert_v),
                       mesh_key_before(mkey_v);
+    // And the server's, which is four flags deciding one question: --mode says
+    // what this runtime is, and --send-to, --udp and --master-pw each mean
+    // something only in some of the answers.  `edit` accepts all four, so it
+    // can complete an incompatible set that `create` would have refused --
+    // measured: a legal master server edited to `--mode inout` kept its
+    // password and relayed it to the other connections again.
+    server_mode mode_before      = mode_inout;
+    uint8_t     send_to_before   = send_to_unset;
+    bool        udp_before       = false;
+    std::string master_pw_before;
+    if (type == runtime_server)
+    {
+        const auto* srv_b = static_cast<const server_instance*>(instance);
+        mode_before      = srv_b->get_mode();
+        send_to_before   = srv_b->get_send_to();
+        udp_before       = srv_b->is_udp();
+        master_pw_before = std::string(srv_b->get_master_pw());
+    }
 
     for (size_t i = 2; i < pa.count; ++i)
     {
@@ -3185,6 +3141,24 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         instance->set_listen_path(listen_before);
         std::cout << msg;
         return 1;
+    }
+
+    // The server set, rolled back as one because the four flags are one
+    // answer: restoring only the flag that was typed would leave the runtime
+    // in a state no `create` could have produced.
+    if (type == runtime_server)
+    {
+        const std::string msg = instance_server_mode_refusal(instance);
+        if (!msg.empty())
+        {
+            auto* srv_r = static_cast<server_instance*>(instance);
+            srv_r->set_mode(mode_before);
+            srv_r->set_send_to(send_to_before);
+            srv_r->set_udp(udp_before);
+            srv_r->set_master_pw(master_pw_before);
+            std::cout << msg;
+            return 1;
+        }
     }
 
     if (m_persistence)

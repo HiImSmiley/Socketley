@@ -325,6 +325,13 @@ public:
     // much smaller object.
     virtual server_instance* as_server() { return nullptr; }
 
+    // Why this runtime's own configuration cannot be honoured, asked by
+    // start() so that every route to a live runtime is covered by one answer
+    // -- a command line, a state file the boot restore reads, a script's
+    // `socketley.create` and an `import` all end here, and a check written in
+    // any one of them is a check the other three walk past.
+    virtual std::string config_refusal() const { return {}; }
+
     // Out of process -- a placeholder for a runtime in a worker this daemon
     // supervises -- distinct from external/managed, and it changes only that
     // start()/stop() must not touch the ring.

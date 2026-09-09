@@ -438,7 +438,21 @@ bool server_instance::is_udp() const
 
 void server_instance::set_master_pw(std::string_view pw)
 {
-    m_master_pw = std::string(pw);
+    // Copied before the old value is scrubbed, because `pw` may point into the
+    // string being replaced and zeroing it first would erase the source.
+    std::string next(pw);
+
+    // The same zeroize teardown() does, here as well because this setter is
+    // how a password is REMOVED -- `edit --no-master-pw` -- and a clear that
+    // leaves the bytes in the buffer has not cleared anything.
+    if (!m_master_pw.empty())
+    {
+        volatile char* p = m_master_pw.data();
+        for (size_t i = 0; i < m_master_pw.size(); i++)
+            p[i] = 0;
+    }
+
+    m_master_pw = std::move(next);
 }
 
 std::string_view server_instance::get_master_pw() const

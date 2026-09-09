@@ -311,6 +311,56 @@ enum server_send_to : uint8_t
     send_to_master = 1u << 2   // the master, which only mode_master has at all
 };
 
+// The whole rule binding --mode to the three flags that only mean something in
+// some of its answers, in one place because a command line is not the only way
+// this set arrives: a state file carries it too, and the boot restore that
+// reads one used to start a runtime no `create` would have accepted.
+//
+// Judged as a set and never per flag, since --mode may be typed on either side
+// of any of them, and returned as a message rather than a bool so the caller
+// can say which half is wrong.
+inline std::string server_mode_config_refusal(server_mode mode,
+                                              uint8_t     send_to,
+                                              bool        udp,
+                                              bool        has_master_pw)
+{
+    // Per RECIPIENT and not per flag: `in` and `out` answer nobody at all, so
+    // no recipient means anything there, while `master` names a connection
+    // that only mode_master ever claims.
+    if (send_to != send_to_unset)
+    {
+        if (mode == mode_in || mode == mode_out)
+            return "--send-to needs --mode inout or master: this mode carries "
+                   "messages one way and never answers one\n";
+
+        if ((send_to & send_to_master) && mode != mode_master)
+            return "--send-to master needs --mode master: nothing claims the "
+                   "master connection in any other mode, so there is nobody to "
+                   "send to\n";
+    }
+
+    // Master mode claims a CONNECTION as the master and a datagram has none,
+    // so process_message() reached the mode_master case with a null sender and
+    // a packet beginning "master " dereferenced it.  The case guards that line
+    // as well; this is the refusal that makes the documented promise true.
+    if (udp && mode == mode_master)
+        return "--udp cannot be combined with --mode master: master mode claims "
+               "one connection as the master and a datagram is not a "
+               "connection\n";
+
+    // The "master " prefix is read in exactly one place, the mode_master case,
+    // so in any other mode the password is not a credential -- it is an
+    // ordinary message, and the client that types it has its password relayed
+    // to every other connection verbatim.
+    if (has_master_pw && mode != mode_master)
+        return "--master-pw needs --mode master: no other mode reads the "
+               "\"master \" prefix, so the password is not a credential there "
+               "-- it is an ordinary message and is relayed to the other "
+               "connections verbatim\n";
+
+    return {};
+}
+
 struct upstream_target
 {
     std::string address;        // "host:port" as specified by user
@@ -371,6 +421,14 @@ public:
     // See runtime_instance::as_server(): this class is what the question is
     // asking for.
     server_instance* as_server() override { return this; }
+
+    // The four flags that are one answer, asked of this object so that a state
+    // file carrying a set no parser ever saw is refused at start.
+    std::string config_refusal() const override
+    {
+        return server_mode_config_refusal(m_mode, m_send_to, m_udp,
+                                          !m_master_pw.empty());
+    }
 
     void set_mode(server_mode mode);
     server_mode get_mode() const;

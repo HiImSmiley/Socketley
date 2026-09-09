@@ -1387,6 +1387,15 @@ int parse_server_edit_flags(server_instance* srv, const parsed_args& pa, size_t&
             srv->set_master_pw(pa.args[++i]);
             return 0;
         }
+        // The way back out of master mode.  `--master-pw ""` cannot express
+        // this: the daemon receives one line and splits it on whitespace, so an
+        // empty argument does not survive the wire and arrives as the flag with
+        // nothing after it.  Without a spelling of its own, a server that once
+        // had a password could never be edited to another mode again, because
+        // the pair is refused as a set and only one half was removable.
+        case fnv1a("--no-master-pw"):
+            srv->set_master_pw("");
+            return 0;
         case fnv1a("--http"):
         {
             if (i + 1 >= pa.count)
