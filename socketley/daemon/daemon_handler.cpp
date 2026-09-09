@@ -6246,6 +6246,11 @@ void daemon_handler::set_metrics_port(uint16_t port, bool bound)
     m_metrics_port = port;
 }
 
+void daemon_handler::set_config_path(std::string path)
+{
+    m_config_path = std::move(path);
+}
+
 // Named for what the caller means rather than exposing the reconciler itself,
 // which is an invariant of this class and not a service it offers.
 void daemon_handler::start_restored_workers()
@@ -6257,8 +6262,18 @@ int daemon_handler::cmd_dashboard(ipc_connection* conn)
 {
     if (m_metrics_port == 0)
     {
-        conn->write_buf = "metrics endpoint not configured\n"
-            "add metrics_port = 9100 to socketley.conf to enable the dashboard\n";
+        // Named with the path and the table, because the message that stood
+        // here sent the operator to `socketley.conf`, which is not the name of
+        // any file this daemon reads, and to a bare assignment, which is a Lua
+        // global the reader never looks at.  Following it produced this same
+        // message again.
+        conn->write_buf =
+            "metrics endpoint not configured\n"
+            "add this to " +
+            (m_config_path.empty() ? std::string("the daemon's config.lua")
+                                   : m_config_path) +
+            " and restart the daemon:\n"
+            "    daemon = { metrics_port = 9100 }\n";
         return 1;
     }
 

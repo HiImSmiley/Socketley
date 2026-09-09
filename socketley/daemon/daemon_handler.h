@@ -74,6 +74,9 @@ public:
     // Both, because a configured port and a bound one are different answers
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);
+    // The file this daemon read its settings from, so `dashboard` can say
+    // where to put the setting it is asking for.
+    void set_config_path(std::string path);
 
     // Called once after restore and before the loop runs.  restore_runtimes()
     // puts a runtime in `running` and forks nothing, so the first child used
@@ -193,6 +196,7 @@ private:
     std::string m_daemon_name;
     uint16_t m_metrics_port{0};
     bool     m_metrics_bound{false};
+    std::string m_config_path;
 
     // The last --cluster this daemon refused and why, so a node with
     // clustering off can say so rather than reporting the same as one never

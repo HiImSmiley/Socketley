@@ -50,15 +50,23 @@ struct daemon_config
     std::string cpus;
 };
 
+// Which file this daemon reads its settings from, extracted because `dashboard`
+// has to name it: telling an operator to configure a file and not saying which
+// one is the same as not telling them.
+static std::string resolve_config_path(const std::string& config_path)
+{
+    // SOCKETLEY_CONFIG first, which is also how the test suite gives each
+    // daemon a config of its own.
+    const char* env = std::getenv("SOCKETLEY_CONFIG");
+    if (env && env[0])
+        return env;
+    return config_path;
+}
+
 static daemon_config load_daemon_config(const std::string& config_path)
 {
     daemon_config out;
-    std::string path = config_path;
-
-    // Check SOCKETLEY_CONFIG env var first
-    const char* env = std::getenv("SOCKETLEY_CONFIG");
-    if (env && env[0])
-        path = env;
+    const std::string path = resolve_config_path(config_path);
 
     if (path.empty())
         return out;
@@ -658,6 +666,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // prints this as a URL, and a second daemon that lost the bind was sending
     // the operator to the first one's numbers.
     handler.set_metrics_port(metrics_port, metrics_bound);
+
+    // So `dashboard` can name the file rather than a name no path resolves to.
+    handler.set_config_path(resolve_config_path(paths.config_path.string()));
 
     // Restore persisted runtimes before entering the event loop
     restore_runtimes(persistence, manager, loop);
