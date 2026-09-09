@@ -283,6 +283,18 @@ public:
     std::string lua_cache_lpop(std::string_view key) override { return lua_lpop(key); }
     std::string lua_cache_rpop(std::string_view key) override { return lua_rpop(key); }
     int lua_cache_llen(std::string_view key) override { return lua_llen(key); }
+    // The same three names the wire protocol, `show` and --mode all use, so a
+    // script comparing against "readonly" is comparing against one vocabulary.
+    std::string_view lua_cache_mode() const override
+    {
+        switch (m_mode)
+        {
+            case cache_mode_readonly:  return "readonly";
+            case cache_mode_admin:     return "admin";
+            default:                   return "readwrite";
+        }
+    }
+
     int lua_cache_sadd(std::string_view key, std::string_view member) override { return lua_sadd(key, member); }
     bool lua_cache_srem(std::string_view key, std::string_view member) override { return lua_srem(key, member); }
     bool lua_cache_sismember(std::string_view key, std::string_view member) override { return lua_sismember(key, member); }

@@ -3318,6 +3318,24 @@ Access control mode:
 (GET, SET, DEL, SIZE \- default),
 .B admin
 (all commands including FLUSH, LOAD).
+.IP
+.B readonly
+applies to this cache's own Lua script as well, and there it is quieter than on
+the wire. A client that sends a write is told
+.RB \(dq "denied: readonly mode" \(dq;
+the twelve mutating
+.B self.*
+calls refuse by answering exactly what they answer when there was nothing to do
+\(em
+.B false
+for nine of them and an empty string for
+.B self.lpop
+and
+.BR self.rpop .
+.B self.cache_mode()
+is how a script tells the two apart, and the return values are listed with the
+calls under
+.BR "LUA API" .
 .TP
 .BI "\-\-maxmemory " "size"
 Maximum memory for cache data. Supports K, M, G suffixes (e.g., 100M, 1G).
@@ -5775,34 +5793,41 @@ self.upstream_send(conn_id, msg) -- Send to a specific upstream
 self.upstream_broadcast(msg)     -- Send to all connected upstreams
 self.upstreams()                 -- Table of connected upstream conn_ids
 
+-- Cache: mode
+-- A call and not a field, because --mode is editable and a field written when
+-- this table was built would go stale.  "readonly", "readwrite" or "admin" --
+-- the same three names --mode, `show` and the wire protocol use.
+self.cache_mode()   -- Which mode this cache is in
+
 -- Cache: strings
 self.get(key)       -- Get string value
-self.set(key, val)  -- Set string value
-self.del(key)       -- Delete key (any type)
+self.set(key, val)  -- Set string value; false in readonly mode
+self.del(key)       -- Delete key (any type); false in readonly mode
 
 -- Cache: lists
-self.lpush(key, val)        -- Push to front
-self.rpush(key, val)        -- Push to back
-self.lpop(key)              -- Pop from front
-self.rpop(key)              -- Pop from back
+self.lpush(key, val)        -- Push to front; false in readonly mode
+self.rpush(key, val)        -- Push to back; false in readonly mode
+self.lpop(key)              -- Pop from front; "" in readonly mode
+self.rpop(key)              -- Pop from back; "" in readonly mode
 self.llen(key)              -- List length
 
 -- Cache: sets
-self.sadd(key, member)      -- Add member
-self.srem(key, member)      -- Remove member
+self.sadd(key, member)      -- 1 added, 0 already a member,
+                            -- nil refused (readonly mode)
+self.srem(key, member)      -- Remove member; false in readonly mode
 self.sismember(key, member) -- Check membership
 self.scard(key)             -- Set cardinality
 
 -- Cache: hashes
-self.hset(key, field, val)  -- Set hash field
+self.hset(key, field, val)  -- Set hash field; false in readonly mode
 self.hget(key, field)       -- Get hash field
-self.hdel(key, field)       -- Delete hash field
+self.hdel(key, field)       -- Delete hash field; false in readonly mode
 self.hlen(key)              -- Hash field count
 
 -- Cache: TTL
-self.expire(key, seconds)   -- Set expiry
+self.expire(key, seconds)   -- Set expiry; false in readonly mode
 self.ttl(key)               -- Get remaining TTL
-self.persist(key)           -- Remove expiry
+self.persist(key)           -- Remove expiry; false in readonly mode
 
 -- Cache: pub/sub
 self.publish(channel, msg)  -- Publish to channel

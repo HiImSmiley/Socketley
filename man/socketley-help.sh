@@ -1410,6 +1410,10 @@ lua_config() {
     echo "  Hashes:  self.hset(key, f, v), self.hget(key, f)"
     echo "           self.hdel(key, f), self.hlen(key)"
     echo "  TTL:     self.expire(key, sec), self.ttl(key), self.persist(key)"
+    echo "  Mode:    self.cache_mode() - \"readonly\", \"readwrite\" or \"admin\""
+    echo "           In readonly every mutator above refuses by answering what"
+    echo "           it answers when there was nothing to do: false, or \"\" for"
+    echo "           the pops. self.sadd is 1 added / 0 present / nil refused."
     echo ""
 
     echo -e "${BOLD}JSON:${NC}"

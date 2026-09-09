@@ -3024,6 +3024,15 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
 
 void lua_context::register_cache_table(runtime_instance* owner, sol::table& self)
 {
+    // Which mode this cache is in, as a CALL and not a field: --mode is
+    // editable, and a field written when the table was built would go stale the
+    // way self.state did.  It is how a script tells a refusal from a call that
+    // had nothing to do, since every mutating entry below answers the same for
+    // both.
+    self["cache_mode"] = [owner]() -> std::string {
+        return std::string(owner->lua_cache_mode());
+    };
+
     // Strings
     self["get"] = [owner](std::string key) -> std::string {
         return owner->lua_cache_get(key);
@@ -3053,8 +3062,17 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
     };
 
     // Sets
-    self["sadd"] = [owner](std::string key, std::string member) -> int {
-        return owner->lua_cache_sadd(key, member);
+    // sol::optional, so a refusal is nil rather than -1.  In Lua every number
+    // is true, so `if self.sadd(k, m) then` was taken on a readonly cache that
+    // had added nothing -- the one value in this whole table where the refusal
+    // was TRUTHY.  1 and 0 still mean added and already-present, as they do
+    // over the wire.
+    self["sadd"] = [owner](std::string key,
+                           std::string member) -> sol::optional<int> {
+        const int added = owner->lua_cache_sadd(key, member);
+        if (added < 0)
+            return sol::nullopt;
+        return added;
     };
     self["srem"] = [owner](std::string key, std::string member) -> bool {
         return owner->lua_cache_srem(key, member);

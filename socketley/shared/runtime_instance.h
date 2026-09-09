@@ -504,6 +504,13 @@ public:
     virtual bool send_to(int /*client_id*/, std::string_view /*msg*/) { return false; }
 
     // Virtual methods for Lua cache access (overridden by cache_instance)
+    // Which of the three modes this cache is in.  Every mutating call below
+    // refuses in `readonly` by answering exactly what it answers when there was
+    // nothing to do -- false for nine of them, "" for the two pops -- so a
+    // script could not tell the two apart, while a client on the wire got
+    // "denied: readonly mode".  Empty for a runtime that is not a cache.
+    virtual std::string_view lua_cache_mode() const { return {}; }
+
     virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }
     virtual bool lua_cache_set(std::string_view /*key*/, std::string_view /*value*/) { return false; }
     virtual bool lua_cache_del(std::string_view /*key*/) { return false; }
