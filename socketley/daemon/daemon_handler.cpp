@@ -202,6 +202,30 @@ static std::string instance_send_to_refusal(const runtime_instance* inst)
     return {};
 }
 
+// Why --udp and --mode master cannot be honoured together.  The man page has
+// called them incompatible since the flag existed and nothing enforced it, and
+// the combination is not merely useless: master mode claims a CONNECTION as the
+// master, and a datagram has none, so process_message() reaches the mode_master
+// case with a null sender.  A datagram beginning "master " then dereferenced it
+// -- an unauthenticated packet, one per worker, SIGSEGV, and the daemon's own
+// log said `killed by signal 11` while the runtime came back and did it again.
+//
+// The dereference is guarded at the case as well.  This refusal is the one that
+// makes the documented promise true; that guard is the one that holds when a
+// state file written before this check carries the pair in anyway.
+static std::string instance_udp_master_refusal(const runtime_instance* inst)
+{
+    if (!inst || inst->get_type() != runtime_server)
+        return {};
+
+    const auto* srv = static_cast<const server_instance*>(inst);
+    if (!srv->is_udp() || srv->get_mode() != mode_master)
+        return {};
+
+    return "--udp cannot be combined with --mode master: master mode claims one "
+           "connection as the master and a datagram is not a connection\n";
+}
+
 // Who is on the other end of this connection, or 0 when the socket cannot say.
 static pid_t peer_pid(int conn_fd)
 {
@@ -1341,6 +1365,14 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    // And --udp against --mode master, which is the same question again.
+    if (const std::string msg = instance_udp_master_refusal(instance); !msg.empty())
+    {
+        std::cout << msg;
+        m_manager.remove(name);
+        return 1;
+    }
+
     // A registered type's required keys, at the point the TLS set is checked
     // and for the same reason, with declared defaults filled in on the way.
     if (const std::string msg = type_manifest::registered_create_refusal(instance);
@@ -1527,6 +1559,17 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // And --send-to against --mode, for the same reason: an edit can
             // move either half after the create checked them together.
             if (const std::string msg = instance_send_to_refusal(inst);
+                !msg.empty())
+            {
+                conn->write_buf += std::string(n) + ": " + msg;
+                ++failed;
+                continue;
+            }
+
+            // And --udp against --mode master.  This is the one that a state
+            // file predating the check reaches, so it refuses to START rather
+            // than only to be created.
+            if (const std::string msg = instance_udp_master_refusal(inst);
                 !msg.empty())
             {
                 conn->write_buf += std::string(n) + ": " + msg;

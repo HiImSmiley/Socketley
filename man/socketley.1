@@ -1847,7 +1847,15 @@ is the old UDP behaviour under a name.
 Use UDP instead of TCP. The server binds a single SOCK_DGRAM socket.
 Peers are auto-registered on first datagram. Each datagram is one message
 (no line-parsing). Broadcast sends to all known peers via sendto().
-Not available for cache or proxy. Incompatible with master mode.
+Not available for cache or proxy.
+.IP
+Refused with
+.BR "\-\-mode master" ,
+which this page called incompatible for a long time while nothing enforced it.
+Master mode claims a connection as the master and a datagram is not a
+connection, so the pair is not merely useless: a datagram beginning
+.B "master "
+reached that code with no sender and took the worker down with it.
 .TP
 .BI "\-\-master\-pw " "password"
 Static password for master mode authentication. A client sends "master <password>"

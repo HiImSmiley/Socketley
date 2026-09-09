@@ -3725,6 +3725,16 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             break;
         case mode_master:
         {
+            // Every branch below needs a connection to claim the master role,
+            // to charge a failed attempt to, or to forward from -- and a
+            // datagram has none.  Without this line a UDP server in master mode
+            // dereferenced null on the first packet beginning "master ", which
+            // is an unauthenticated remote SIGSEGV; instance_udp_master_refusal
+            // now stops the pair being configured at all, and this stops a
+            // state file that already carries it.
+            if (!sender)
+                break;
+
             // Master authentication: "master <password>"
             if (msg.size() > 7 && msg.starts_with("master "))
             {
@@ -3825,7 +3835,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             // What a NON-master said is what --send-to decides here.  Unset is
             // the empty set and drops it, which is what this mode did before
             // --master-forward and still does without a flag.
-            if (!sender || m_send_to == send_to_unset)
+            if (m_send_to == send_to_unset)
                 break;
 
             const bool master_live = m_master_fd >= 0 && m_master_fd < MAX_FDS &&
