@@ -5237,7 +5237,36 @@ If no
 callback is defined, the server falls back to static file serving
 .RB ( \-\-http )
 or returns 404. Returning nothing, or anything that is not a table, means the
-same thing: the request falls through to the static file or the 404.
+same thing: the request falls through to the static file or the 404. Only
+.B nil
+and no return at all are silent about it \(em those are how a handler declines.
+Anything else is a script that meant to answer, so the fall-through is named in
+the daemon's log as
+.BR "[lua <runtime>] on_http_request returned a string; expected a table or nil ..." .
+.IP
+In the returned table,
+.B status
+must be a number,
+.B body
+a string, and
+.B headers
+a table of string to string. A field the script never set takes its default
+(200, an empty body, no headers), but a
+.B status
+or
+.B body
+that is present and of the wrong type is a response this server cannot build:
+the request is answered
+.BR "500 Internal Server Error" ,
+and the field and the type it arrived as are written to the daemon's log. A
+header whose name or value is not a string costs the client that one header
+rather than the whole answer, and is logged the same way. None of these were
+reported before, and a
+.B body
+that was not a string was served as a
+.B 200
+with nothing in it.
+.IP
 Supports HTTP/1.1 keep-alive \(em the connection is reused
 for subsequent requests unless the client's
 .B Connection

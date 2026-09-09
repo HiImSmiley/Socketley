@@ -1128,6 +1128,7 @@ lua_config() {
     echo "│                              │ req={method,path,headers,body}   │"
     echo "│                              │ Return {status,headers,body}     │"
     echo "│                              │ nil = fall back to --http or 404 │"
+    echo "│                              │ bad status/body = 500, logged    │"
     echo "│                              │ Raise = 500, logged (not a 404)  │"
     echo "│ on_send(msg)                 │ Called on message sent           │"
     echo "│ on_route(method, path,       │ Proxy: custom backend selection. │"
