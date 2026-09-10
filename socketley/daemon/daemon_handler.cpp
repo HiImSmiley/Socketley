@@ -1352,7 +1352,21 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         std::string refusal;
         if (!m_manager.start(name, m_loop, &refusal))
         {
-            std::cout << (refusal.empty() ? "could not start runtime\n" : refusal);
+            // A refusal with a sentence is the operator's to fix, so the
+            // runtime stays where `ls` shows it and `edit` can reach it, and
+            // the command exits 1 -- bad input, not fatal.  That is the same
+            // answer `create -s` already gives a script whose on_start raised:
+            // created, named, exit 1, fix it and try again.
+            //
+            // Without a sentence the start failed for a reason nobody can act
+            // on -- a fork that did not happen -- and a half-made runtime is
+            // worse than none, which is what this path always did.
+            if (!refusal.empty())
+            {
+                std::cout << refusal;
+                return 1;
+            }
+            std::cout << "could not start runtime\n";
             m_manager.remove(name);
             return 2;
         }

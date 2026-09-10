@@ -201,12 +201,26 @@ else fail "a stale node left by a previous run is taken over" \
 
 # Now the live one: a second runtime asking for the same path must be refused,
 # and the first must still be serving afterwards.
-"$BIN" create server ul_squat --listen "unix:$SOCK" -s >/dev/null 2>&1 || true
+#
+# The requirement is "refused", and it is checked as that rather than as the
+# state a particular mechanism happens to leave behind.  It used to read
+# `Failed`, because the second runtime forked a worker that discovered the
+# collision at the bind and the supervisor marked the placeholder.  The daemon
+# now refuses before the fork -- it can see both runtimes and the kernel
+# cannot -- so nothing is built and the runtime is left `Created`, which is
+# what it is.  Both spellings satisfy the sentence above; neither is `Up`.
+SQUAT_OUT=$("$BIN" create server ul_squat --listen "unix:$SOCK" -s 2>&1) || true
 sleep 0.8
 SQUAT_STATUS=$("$BIN" ls 2>/dev/null | awk '$2 == "ul_squat" { print $7 }')
-if [ "$SQUAT_STATUS" = "Failed" ]; then pass
+if [ "$SQUAT_STATUS" != "Up" ] && [ -n "$SQUAT_STATUS" ]; then pass
 else fail "a second server on a live socket is refused" \
           "ls reports '${SQUAT_STATUS:-<nothing>}' for the second one"; fi
+
+# And the operator is told which runtime holds the path, on the terminal rather
+# than in a log they have to be told to go and read.
+if [[ "$SQUAT_OUT" == *"ul_srv"* && "$SQUAT_OUT" == *"already serving"* ]]; then pass
+else fail "the refusal names the runtime holding the path" \
+          "create said '${SQUAT_OUT:-<nothing>}'"; fi
 
 STILL=$(http_over_unix "$SOCK")
 if [[ "$STILL" == *"200 OK"* ]]; then pass
