@@ -126,18 +126,6 @@ const char* type_str(runtime_type t)
     return type_to_string(t);
 }
 
-const char* state_str(runtime_state s)
-{
-    switch (s)
-    {
-        case runtime_created: return "created";
-        case runtime_running: return "running";
-        case runtime_stopped: return "stopped";
-        case runtime_failed:  return "failed";
-        default:              return "unknown";
-    }
-}
-
 // The kernel's boot id, empty when /proc is not there, which makes every claim
 // foreign and every conflict a refusal.
 std::string read_boot_id()
@@ -392,7 +380,7 @@ std::string cluster_discovery::build_publish_json() const
             json.append(port_buf, static_cast<size_t>(pend - port_buf));
 
             json += ",\"state\":\"";
-            json += state_str(inst->get_state());
+            json += state_to_string(inst->get_state());
             json += "\",\"connections\":";
 
             char conn_buf[16];

@@ -23,13 +23,13 @@ runtime_instance::runtime_instance(runtime_type type, std::string_view name)
     : m_name(name), m_id(generate_runtime_id()), m_type(type), m_state(runtime_created),
       m_created_time(std::chrono::system_clock::now())
 {
+    // So an unwritable path is reported as the flag the operator typed rather
+    // than as a path with no provenance.
+    m_write_out.set_label("-w");
+    m_state_log.set_label("--log");
 }
 
-runtime_instance::~runtime_instance()
-{
-    if (m_write_fd >= 0)
-        ::close(m_write_fd);
-}
+runtime_instance::~runtime_instance() = default;
 
 void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 {
@@ -129,7 +129,7 @@ bool runtime_instance::start(event_loop& loop)
     if (const std::string msg = ring_policy_refusal(loop); !msg.empty())
     {
         LOG_ERROR(msg.c_str());
-        m_state.store(runtime_failed, std::memory_order_release);
+        store_state(runtime_failed);
         return false;
     }
 
@@ -141,7 +141,7 @@ bool runtime_instance::start(event_loop& loop)
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());
-        m_state.store(runtime_failed, std::memory_order_release);
+        store_state(runtime_failed);
         return false;
     }
 
@@ -151,7 +151,7 @@ bool runtime_instance::start(event_loop& loop)
     if (const std::string msg = config_refusal(); !msg.empty())
     {
         LOG_ERROR(msg.c_str());
-        m_state.store(runtime_failed, std::memory_order_release);
+        store_state(runtime_failed);
         return false;
     }
 
@@ -165,7 +165,7 @@ bool runtime_instance::start(event_loop& loop)
         // yet, and publish_endpoints() adds a member to its group on it.
         m_endpoint_live = false;
 
-        m_state.store(runtime_running, std::memory_order_release);
+        store_state(runtime_running);
         m_start_time = std::chrono::system_clock::now();
         return true;
     }
@@ -200,7 +200,7 @@ bool runtime_instance::start(event_loop& loop)
             }
             m_pid = child;
         }
-        m_state.store(runtime_running, std::memory_order_release);
+        store_state(runtime_running);
         m_start_time = std::chrono::system_clock::now();
         return true;  // skip setup(), on_start, tick timer
     }
@@ -218,7 +218,7 @@ bool runtime_instance::start(event_loop& loop)
         !msg.empty())
     {
         LOG_ERROR(msg.c_str());
-        m_state.store(runtime_failed, std::memory_order_release);
+        store_state(runtime_failed);
         return false;
     }
 
@@ -230,11 +230,11 @@ bool runtime_instance::start(event_loop& loop)
 
     if (!setup(loop))
     {
-        m_state.store(runtime_failed, std::memory_order_release);
+        store_state(runtime_failed);
         return false;
     }
 
-    m_state.store(runtime_running, std::memory_order_release);
+    store_state(runtime_running);
     m_start_time = std::chrono::system_clock::now();
 
     // The latch stop() raised comes down here, before on_start arms its timers
@@ -263,7 +263,7 @@ bool runtime_instance::stop(event_loop& loop)
     // stopped came back `Failed` in `ls`.
     if (m_state.load(std::memory_order_acquire) == runtime_failed)
     {
-        m_state.store(runtime_stopped, std::memory_order_release);
+        store_state(runtime_stopped);
         return true;
     }
 
@@ -274,7 +274,7 @@ bool runtime_instance::stop(event_loop& loop)
     // through the control socket while it still has a ring to cancel into.
     if (m_out_of_process)
     {
-        m_state.store(runtime_stopped, std::memory_order_release);
+        store_state(runtime_stopped);
         return true;
     }
 
@@ -286,7 +286,7 @@ bool runtime_instance::stop(event_loop& loop)
             if (m_managed)
                 waitpid(m_pid, nullptr, WNOHANG);  // reap immediately if already dead
         }
-        m_state.store(runtime_stopped, std::memory_order_release);
+        store_state(runtime_stopped);
         return true;  // skip teardown(), on_stop
     }
 
@@ -307,7 +307,7 @@ bool runtime_instance::stop(event_loop& loop)
 
     teardown(loop);
     loop.deregister_owner(this);
-    m_state.store(runtime_stopped, std::memory_order_release);
+    store_state(runtime_stopped);
 
     // Signal all interactive sessions that runtime has stopped
     for (int ifd : m_interactive_fds)
@@ -415,7 +415,17 @@ const std::vector<std::string>& runtime_instance::get_companion_paths() const
 
 void runtime_instance::set_log_file(std::string_view path)
 {
+    const bool moved = (path != m_log_file);
     m_log_file = path;
+    m_state_log.set_path(path);
+
+    // The file opens with where the runtime stands, which is the only way the
+    // `created` the man page promises can appear at all: the initial state is
+    // set in the constructor, long before any flag has been parsed.  Guarded
+    // on the path having moved, or an `edit` that re-sent the same --log would
+    // add a line for a transition nobody made.
+    if (moved && !path.empty())
+        append_state_line(m_state.load(std::memory_order_acquire));
 }
 
 std::string_view runtime_instance::get_log_file() const
@@ -425,20 +435,8 @@ std::string_view runtime_instance::get_log_file() const
 
 void runtime_instance::set_write_file(std::string_view path)
 {
-    // A path that changed has to drop the old descriptor, because `edit -w
-    // other.log` on a running runtime otherwise goes on appending to the file
-    // it was started with and the new name never receives a byte.  The latch
-    // is cleared with it, so a corrected path is tried again.
-    if (path != m_write_file)
-    {
-        if (m_write_fd >= 0)
-        {
-            ::close(m_write_fd);
-            m_write_fd = -1;
-        }
-        m_write_failed = false;
-    }
     m_write_file = path;
+    m_write_out.set_path(path);
 }
 
 std::string_view runtime_instance::get_write_file() const
@@ -539,46 +537,48 @@ void runtime_instance::print_bash_message(std::string_view msg) const
 // The file half of print_bash_message, called from the same two places: the
 // point in server_instance::process_message and client_instance::process_message
 // where total_messages is counted, which is what "every received message"
-// means.
-//
-// O_APPEND and one write per message, because N shards of one runtime are N
-// processes with the same path: an append under the pipe-buffer size is atomic
-// on a regular file, so the lines interleave but never tear.  Bytes as they
-// arrived, without print_bash_message's control-character scrubbing -- that
-// exists to stop a terminal being driven by a peer's escape sequence, and a
-// file is not a terminal.
+// means.  Everything about the file itself -- open on first use, append, one
+// write per line, latch a bad path -- is appending_file's, because --log wants
+// the identical three things.
 void runtime_instance::write_received_message(std::string_view msg)
 {
-    if (m_write_file.empty() || m_write_failed)
+    m_write_out.append(msg);
+}
+
+// ─── --log file ─────────────────────────────────────────────────────────────
+// Every transition, from the one place that makes them, so that a state added
+// later cannot be the one nobody logged.
+void runtime_instance::store_state(runtime_state s)
+{
+    const runtime_state was = m_state.exchange(s, std::memory_order_acq_rel);
+    if (was == s)
+        return;   // "transitions", so a stop of a stopped runtime is not one
+    append_state_line(s);
+}
+
+void runtime_instance::append_state_line(runtime_state s)
+{
+    if (m_log_file.empty())
         return;
 
-    if (m_write_fd < 0)
-    {
-        // Opened on the first message and not at start, so a runtime nobody
-        // sends anything to leaves no file behind.
-        m_write_fd = ::open(m_write_file.c_str(),
-                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (m_write_fd < 0)
-        {
-            // Latched, or an unwritable path is a line in the log per message
-            // through the runtime.
-            m_write_failed = true;
-            LOG_ERROR(("-w " + m_write_file + " could not be opened: " +
-                       std::string(std::strerror(errno)) +
-                       " -- messages are not being written").c_str());
-            return;
-        }
-    }
+    // The daemon's record and not the worker's copy of the same runtime: both
+    // carry the path, and both writing would double every line.  The daemon's
+    // is the right one because it is the state `ls` reports, which is what an
+    // operator watching this file is watching for.
+    if (in_worker_process())
+        return;
 
-    std::string line(msg);
-    line.push_back('\n');
-    if (!socketley::write_all(m_write_fd, line.data(), line.size()))
-    {
-        m_write_failed = true;
-        LOG_ERROR(("-w " + m_write_file + " could not be written: " +
-                   std::string(std::strerror(errno)) +
-                   " -- messages are not being written").c_str());
-    }
+    // Dated, not just clocked, because this file outlives a day -- the
+    // daemon's own log uses [HH:MM:SS] and is read while it is happening.
+    char stamp[32] = {0};
+    const auto now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+
+    m_state_log.append(std::string(stamp) + " " + m_name + " " +
+                       state_to_string(s));
 }
 
 // The script belongs to the worker, so the placeholder compiles the file and

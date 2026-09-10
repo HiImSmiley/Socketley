@@ -1197,7 +1197,50 @@ Start immediately after creation.
 Dry run. Validate configuration without starting.
 .TP
 .BI "\-\-log " "file"
-Log state transitions (created, running, stopped, failed) to file.
+Append one line per state transition to
+.IR file :
+.IP
+.EX
+2026\-09\-10 11:48:22 api created
+2026\-09\-10 11:48:22 api running
+2026\-09\-10 11:48:31 api stopped
+.EE
+.IP
+Dated as well as clocked, because this file outlives a day, unlike the daemon's
+own log. Created with mode 0600 and opened for append, so a restart adds to the
+record rather than replacing it.
+.IP
+The first line is the state the runtime was in when the flag was given, which
+is how
+.B created
+appears at all: it is the state a runtime is constructed in, before any flag
+has been parsed. Giving
+.B \-\-log
+by
+.B edit
+to a runtime that is already serving therefore opens the file with a
+.B running
+line, which is where the record starts rather than a transition anybody made.
+.IP
+What is recorded is the state
+.B ls
+reports, which is the daemon's. A runtime lives in its own process and that
+process keeps its own copy of the same value; both carry the path, and both
+writing would double every line. One consequence is visible and worth
+expecting: an out-of-process runtime whose worker refuses its configuration
+records
+.BR created ,
+.B running
+and then
+.BR failed ,
+because
+.B running
+is what the daemon had asked for and reported for the moment before the worker
+answered.
+.IP
+A path that cannot be opened or written is reported once, at
+.BR ERROR ,
+and then not again.
 .TP
 .BI "\-w " "file"
 Write every received message to file, one line each, in the bytes they arrived

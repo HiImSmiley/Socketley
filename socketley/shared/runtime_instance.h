@@ -23,6 +23,7 @@
 #include "shard_stats.h"
 #include "shard_clients.h"
 #include "event_loop_definitions.h"
+#include "appending_file.h"
 
 class event_loop;
 class lua_context;
@@ -278,7 +279,7 @@ public:
 
     // Straight to `failed`, for a supervisor that has decided a child is not
     // coming back, and not a transition any runtime makes to itself.
-    void mark_failed() { m_state.store(runtime_failed, std::memory_order_release); }
+    void mark_failed() { store_state(runtime_failed); }
 
     // The state of a runtime living in another process, for replicas only,
     // because the daemon's own placeholder owns that value and sets it from
@@ -573,22 +574,30 @@ protected:
     // Bash output helper
     void print_bash_message(std::string_view msg) const;
 
-    // The same message to the file -w named, which is the file half of the
-    // same thing print_bash_message does to stdout -- and which had never
-    // been written: the path was parsed by four flag doors, carried to the
-    // worker, persisted, and reported by `show`, and nothing anywhere opened
-    // it.  Not const, because the file is opened on the first message rather
-    // than at every start: a runtime nobody sends anything to should not
-    // create the file, and a path on an unwritable directory should be one
-    // complaint and not one per message.
+    // The same message to the file -w named, which is the file half of what
+    // print_bash_message does to stdout -- and which had never been written:
+    // the path was parsed by four flag doors, carried to the worker,
+    // persisted, and reported by `show`, and nothing anywhere opened it.
     void write_received_message(std::string_view msg);
 
 private:
-    // Opened lazily by write_received_message and closed by set_write_file and
-    // the destructor.  m_write_failed latches so an unwritable path is logged
-    // once rather than on every message through.
-    int  m_write_fd{-1};
-    bool m_write_failed{false};
+    // -w and --log, which want the same three things: no file for a runtime
+    // that never writes, an append rather than a truncate on restart, and one
+    // complaint for a bad path rather than one per line.  See appending_file.h
+    // for why that is one class and not two copies.
+    socketley::appending_file m_write_out;
+    socketley::appending_file m_state_log;
+
+    // Every transition goes through here, because --log has to see all of them
+    // and twelve stores in start()/stop() plus mark_failed() is twelve places
+    // to forget one.  set_replicated_state() deliberately does not: a replica
+    // is a copy of somebody else's runtime and would log a transition it did
+    // not make.
+    void store_state(runtime_state s);
+
+    // One line into the --log file for the state given, also called by
+    // set_log_file() so the file opens with where the runtime stood.
+    void append_state_line(runtime_state s);
 
     // Guards m_stat_detail only and is held for a single move, its own lock so
     // publishing never takes the runtime map exclusively on the event-loop

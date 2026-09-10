@@ -1734,16 +1734,7 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         {
             if (!first) out << ",";
             first = false;
-            runtime_state state = instance->get_state();
-            const char* state_str;
-            switch (state)
-            {
-                case runtime_created: state_str = "created"; break;
-                case runtime_running: state_str = "running"; break;
-                case runtime_stopped: state_str = "stopped"; break;
-                case runtime_failed:  state_str = "failed";  break;
-                default:              state_str = "unknown"; break;
-            }
+            const char* state_str = state_to_string(instance->get_state());
             uint16_t port = instance->get_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();

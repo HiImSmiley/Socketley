@@ -432,18 +432,6 @@ void lua_context::timer_pool_release(void* t)
     m_timer_pool.push_back(t);
 }
 
-static const char* state_to_string(runtime_state s)
-{
-    switch (s)
-    {
-        case runtime_created: return "created";
-        case runtime_running: return "running";
-        case runtime_stopped: return "stopped";
-        case runtime_failed:  return "failed";
-    }
-    return "unknown";
-}
-
 // One load-time refusal, into the daemon's log and into the buffer the asking
 // command reads back, which every `return false` in load_script and the two
 // validators goes through.

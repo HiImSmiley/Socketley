@@ -481,18 +481,6 @@ static const char* runtime_type_str(runtime_type t)
     return type_to_string(t);
 }
 
-static const char* runtime_state_str(runtime_state s)
-{
-    switch (s)
-    {
-        case runtime_created: return "created";
-        case runtime_running: return "running";
-        case runtime_stopped: return "stopped";
-        case runtime_failed:  return "failed";
-        default:              return "unknown";
-    }
-}
-
 std::string metrics_endpoint::build_json_overview() const
 {
     // Snapshot under lock
@@ -589,7 +577,7 @@ std::string metrics_endpoint::build_json_runtimes() const
         j += "\",\"type\":\"";
         j += runtime_type_str(s.type);
         j += "\",\"state\":\"";
-        j += runtime_state_str(s.state);
+        j += state_to_string(s.state);
         j += "\",\"port\":";
         json_append_uint(j, s.port);
         j += ",\"connections\":";
@@ -626,7 +614,7 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += "\",\"type\":\"";
     j += runtime_type_str(rt->get_type());
     j += "\",\"state\":\"";
-    j += runtime_state_str(rt->get_state());
+    j += state_to_string(rt->get_state());
     j += "\",\"port\":";
     json_append_uint(j, rt->get_port());
     j += ",\"connections\":";

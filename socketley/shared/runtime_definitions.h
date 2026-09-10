@@ -19,6 +19,23 @@ enum runtime_type : uint8_t
     runtime_cache  = 3
 };
 
+// The four names, once.  Five places had this switch -- lua_context,
+// cluster_discovery, metrics_endpoint, daemon_handler's ps --json, and the
+// --log file that was about to be the fifth -- all returning the same four
+// strings, which is exactly the shape a state renamed in one of them would
+// have gone wrong in.
+inline const char* state_to_string(runtime_state s)
+{
+    switch (s)
+    {
+        case runtime_created: return "created";
+        case runtime_running: return "running";
+        case runtime_stopped: return "stopped";
+        case runtime_failed:  return "failed";
+    }
+    return "unknown";
+}
+
 // A bound on the typo, here rather than in the parser because a state file is
 // a second way in.
 inline constexpr uint32_t max_shards = 64;
