@@ -1617,6 +1617,35 @@ bool server_instance::setup_unix_listener(const std::string& path)
     return true;
 }
 
+// The same three questions setup() asks below, in the same order and without
+// the syscalls, so the manager can refuse a second claim on an address before
+// a worker is forked to discover it.  Kept next to setup() because the two
+// have to agree: an answer here that setup() does not honour is a refusal
+// nobody earned.
+void server_instance::listen_addresses(std::vector<std::string>& out) const
+{
+    // A listen path and a port are mutually exclusive -- listen_config_refusal
+    // in setup() is what makes that true -- so this is a full answer, not the
+    // first half of one.
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        out.push_back("unix:" + listen_path);
+        return;
+    }
+
+    // Internal-only: a server reachable through its owner and through nothing
+    // else binds no socket, so it claims no address and collides with nobody.
+    if (get_port() == 0 && !get_owner().empty())
+        return;
+
+    // Datagrams and streams are separate namespaces in the kernel, and a UDP
+    // server beside a TCP one on the same number is two listeners that never
+    // meet -- measured, both up, each hearing only its own traffic.
+    const uint16_t port = get_port() ? get_port() : server_default_port;
+    out.push_back((m_udp ? "udp:" : "tcp:") + std::to_string(port));
+}
+
 bool server_instance::setup(event_loop& loop)
 {
     // Nothing is freed here, because teardown() deliberately kept the structs
@@ -1732,7 +1761,7 @@ bool server_instance::setup(event_loop& loop)
 
     uint16_t port = get_port();
     if (port == 0)
-        port = 8000;
+        port = server_default_port;
 
     if (m_udp)
     {

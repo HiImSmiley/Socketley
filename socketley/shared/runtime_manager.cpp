@@ -15,6 +15,77 @@
 namespace
 {
 
+// Which running runtime already holds an address this one is about to bind, or
+// an empty string.
+//
+// Here and nowhere below, because the kernel cannot answer it.  SO_REUSEPORT is
+// set on every listener so that --shards can spread one port across the workers
+// of ONE runtime, and a second runtime claiming the same number is
+// indistinguishable to the kernel from a second shard: it accepts the bind and
+// hands each new connection to one of them.  Measured on two servers created on
+// one port -- both started, both listened, and twenty messages arrived nine and
+// eleven.
+//
+// Only against runtimes that are RUNNING.  A stopped one has no listener, and a
+// restart passes through stopped, so judging by configuration instead would
+// refuse a runtime the chance to take back its own port.
+//
+// The caller holds runtime_manager::mutex.  Nothing here re-enters the manager:
+// listen_addresses() is a const accessor on each instance and no more.
+std::string address_conflict(
+    const runtime_manager::runtime_map& runtimes,
+    const runtime_instance& want, std::string_view want_name)
+{
+    std::vector<std::string> mine;
+    want.listen_addresses(mine);
+    if (mine.empty())
+        return {};
+
+    std::vector<std::string> theirs;
+    for (const auto& [name, inst] : runtimes)
+    {
+        if (!inst || name == want_name || inst.get() == &want)
+            continue;
+        if (inst->get_state() != runtime_running)
+            continue;
+        // An attached or managed process binds its own sockets and this daemon
+        // binds none for it, so the port it reports is a description and not a
+        // claim on anything.
+        if (inst->is_external())
+            continue;
+
+        theirs.clear();
+        inst->listen_addresses(theirs);
+        for (const std::string& a : theirs)
+        {
+            if (std::find(mine.begin(), mine.end(), a) == mine.end())
+                continue;
+
+            // Two different sentences because the two families fail
+            // differently, and one that describes the wrong mechanism sends
+            // the operator looking for the wrong thing.  A port is accepted by
+            // the kernel and blended; a path is refused at the bind, and this
+            // says so earlier and with both names in it.
+            const std::string why =
+                a.starts_with("unix:")
+                    ? "The second bind fails, so this is the same answer the "
+                      "kernel would give -- said before a worker is forked to "
+                      "discover it, and with both names in it."
+                    : "A second bind on that port either fails, or -- where "
+                      "SO_REUSEPORT is set, which is what lets --shards spread "
+                      "one port across the workers of one runtime -- succeeds "
+                      "and splits the incoming connections between the two "
+                      "runtimes at random. Neither is what was asked for.";
+
+            return "\"" + std::string(want_name) + "\" would bind " + a +
+                   ", which \"" + std::string(name) + "\" is already serving. " +
+                   why + " Stop \"" + std::string(name) + "\", or give one of "
+                   "the two an address of its own.\n";
+        }
+    }
+    return {};
+}
+
 // A replica is the base class plus a type tag, file-local so nothing can reach
 // past runtime_instance's interface into it, because building one out of the
 // real type would cost megabytes of fd-indexed tables per proxy per worker.
@@ -220,7 +291,8 @@ runtime_manager::try_create(runtime_type type, std::string_view name)
     return create_result::ok;
 }
 
-bool runtime_manager::start(std::string_view name, event_loop& loop)
+bool runtime_manager::start(std::string_view name, event_loop& loop,
+                            std::string* refusal)
 {
     // See create(): starting a replica would move a copy's state and bind
     // nothing anywhere.
@@ -248,6 +320,17 @@ bool runtime_manager::start(std::string_view name, event_loop& loop)
             return false;
 
         inst = it->second.get();
+
+        // Inside the lock that is already held, because the answer is about
+        // the whole map and re-taking a non-recursive shared_mutex to ask is
+        // how the one event-loop thread deadlocks against itself.
+        if (std::string msg = address_conflict(runtimes, *inst, name); !msg.empty())
+        {
+            LOG_ERROR(msg.c_str());
+            if (refusal)
+                *refusal = std::move(msg);
+            return false;
+        }
     }
 
     const bool started = inst->start(loop);

@@ -473,8 +473,10 @@ static void restore_runtimes(state_persistence& persistence,
         // Named, because a daemon restoring several runtimes would otherwise
         // report a refusal with nothing to attach it to, and the runtime is
         // left `failed` where `ls` shows it.
-        if (!manager.start(cfg.name, loop))
-            LOG_WARN(("restore: could not start runtime " + cfg.name).c_str());
+        std::string refusal;
+        if (!manager.start(cfg.name, loop, &refusal))
+            LOG_WARN(("restore: could not start runtime " + cfg.name +
+                      (refusal.empty() ? "" : " -- " + refusal)).c_str());
         else
             LOG_DEBUG("restored runtime");
     }

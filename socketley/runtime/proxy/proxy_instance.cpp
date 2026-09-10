@@ -1312,6 +1312,25 @@ void proxy_instance::trace_splice_sweep()
 }
 #endif
 
+// The same question setup() asks below, without the syscalls, so the manager
+// can refuse a second claim on an address before a worker is forked to find
+// out.  Kept next to setup() because the two have to agree: an answer here
+// that setup() does not honour is a refusal nobody earned.
+void proxy_instance::listen_addresses(std::vector<std::string>& out) const
+{
+    // A listen path and a port are mutually exclusive -- listen_config_refusal
+    // in setup() is what makes that true -- so this is a full answer.
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        out.push_back("unix:" + listen_path);
+        return;
+    }
+
+    out.push_back("tcp:" + std::to_string(get_port() ? get_port()
+                                                     : proxy_default_port));
+}
+
 bool proxy_instance::setup(event_loop& loop)
 {
 #ifdef SOCKETLEY_TRACE
@@ -1468,7 +1487,7 @@ bool proxy_instance::setup(event_loop& loop)
     {
         uint16_t port = get_port();
         if (port == 0)
-            port = 8080;
+            port = proxy_default_port;
 
         // SOCK_CLOEXEC, because in the daemon this listener must not reach a
         // worker forked for another runtime and in a worker it costs nothing.

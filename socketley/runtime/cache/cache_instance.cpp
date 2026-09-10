@@ -447,6 +447,43 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 
 
 
+// The same questions setup() asks below, without the syscalls, so the manager
+// can refuse a second claim on an address before a worker is forked to find
+// out.  Kept next to setup() because the two have to agree: an answer here
+// that setup() does not honour is a refusal nobody earned.
+void cache_instance::listen_addresses(std::vector<std::string>& out) const
+{
+    // A listen path and a port are mutually exclusive -- listen_config_refusal
+    // in setup() is what makes that true -- and --cluster is refused with a
+    // path, so a path is the whole answer.
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        out.push_back("unix:" + listen_path);
+        return;
+    }
+
+    // get_shards() and not m_shard_n, because this is asked of the daemon's
+    // placeholder, whose setup() has never run.
+    const uint16_t base   = get_port() ? get_port() : cache_default_port;
+    const uint32_t shards = get_shards() ? get_shards() : 1u;
+
+    // Every shard binds the configured port through SO_REUSEPORT, which is
+    // what spreads one address over them.
+    out.push_back("tcp:" + std::to_string(base));
+
+    // And under --cluster above one shard, a port apiece on top: the formula
+    // CLUSTER SLOTS publishes, so a runtime that took one of these from
+    // underneath a cache would be sent keys it does not hold.
+    if (m_cluster_forced && shards > 1)
+        for (uint32_t i = 0; i < shards; ++i)
+        {
+            const uint32_t p = static_cast<uint32_t>(base) + 1u + i;
+            if (p <= 65535u)
+                out.push_back("tcp:" + std::to_string(p));
+        }
+}
+
 bool cache_instance::setup(event_loop& loop)
 {
     // Nothing from the previous run is cleaned up here, because teardown()
@@ -480,7 +517,7 @@ bool cache_instance::setup(event_loop& loop)
 
     m_base_port = get_port();
     if (m_base_port == 0)
-        m_base_port = 9000;
+        m_base_port = cache_default_port;
 
     m_route_payload.assign(m_shard_n, std::string{});
     m_store.set_channel_observer(&on_channel_presence, this);

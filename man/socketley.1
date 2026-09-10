@@ -1720,6 +1720,56 @@ depends on it: a link that never forms, or one whose peer has gone, costs the
 speed it would have saved and nothing else. Routed connections are pinned to
 whichever path they opened on and keep it for their whole life, because a
 message that changed route mid\-stream could arrive ahead of one sent before it.
+.SS One address, one runtime
+A runtime is refused a start when another runtime on this daemon is already
+serving the address it would bind \(em a TCP port, a UDP port, or a
+.BI \-\-listen " unix:"
+path. The refusal names both runtimes and reaches the terminal, and on the boot
+restore it names both in the daemon log.
+.PP
+The kernel will not refuse it. Every listener is opened with
+.BR SO_REUSEPORT ,
+because that is the whole mechanism behind
+.BR \-\-shards :
+N worker processes of
+.I one
+runtime binding one port and letting the kernel hand each connection to one of
+them. A second
+.I runtime
+claiming the same number is indistinguishable from a second shard, so the bind
+succeeds and the connections split between the two at random. Measured before
+this was refused, on two servers created on one port: both started, both
+listened, nothing was logged, and twenty messages arrived nine and eleven.
+.PP
+What is still accepted, because it is not one address:
+.BR "\-\-udp beside TCP" ,
+which are separate namespaces in the kernel \(em a datagram server and a stream
+server on the same number are two listeners that never meet;
+.BR "a restart" ,
+which passes through
+.B stopped
+and takes back its own port, since the rule reads state and not configuration;
+.BR "\-\-shards" ,
+whose workers are one runtime; and a runtime that binds nothing at all \(em a
+client, a process registered with
+.BR attach ,
+or a server reachable only through its owner.
+.PP
+A clustered cache holds more than one: the configured port, and
+.IR base+1 .. base+N
+for the shards, which is the formula
+.B CLUSTER SLOTS
+publishes. A runtime that had taken one of those would be sent keys it does not
+hold.
+.PP
+The refused runtime is left in the state it was in \(em
+.B created
+or
+.BR stopped ,
+not
+.B failed
+\(em because nothing was built and nothing broke. Stop the runtime named in the
+refusal, or give one of the two an address of its own.
 .SH SERVER FLAGS
 .TP
 .BI "\-\-mode " "mode"

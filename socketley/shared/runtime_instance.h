@@ -332,6 +332,19 @@ public:
     // any one of them is a check the other three walk past.
     virtual std::string config_refusal() const { return {}; }
 
+    // Every address this runtime binds when it starts, and nothing at all for
+    // one that binds none -- a client, an attached process, a server that is
+    // only its owner's.  A set rather than one address because a clustered
+    // cache holds a port per shard.
+    //
+    // Asked by the manager, which is the only place that can see two runtimes
+    // claiming one address: SO_REUSEPORT is set so that --shards can share a
+    // port, and it makes the kernel accept the second binder rather than
+    // refuse it.  The spelling is "tcp:PORT", "udp:PORT" or "unix:PATH", and
+    // it only has to be consistent between two instances -- nothing parses it
+    // back.
+    virtual void listen_addresses(std::vector<std::string>& /*out*/) const {}
+
     // Out of process -- a placeholder for a runtime in a worker this daemon
     // supervises -- distinct from external/managed, and it changes only that
     // start()/stop() must not touch the ring.

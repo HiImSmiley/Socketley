@@ -77,7 +77,12 @@ public:
     // The old spelling, for callers that only need to know whether it worked.
     bool create(runtime_type type, std::string_view name)
     { return try_create(type, name) == create_result::ok; }
-    bool start(std::string_view name, event_loop& loop);
+    // `refusal`, when given, is filled with the reason a start did not happen
+    // in the cases that have one to give -- so the ten callers can hand the
+    // operator the sentence instead of "could not start runtime", and the boot
+    // restore can put it in the log.  Left untouched when the start succeeds.
+    bool start(std::string_view name, event_loop& loop,
+               std::string* refusal = nullptr);
     bool stop(std::string_view name, event_loop& loop);
     // Takes the runtime out of the map, freeing its name immediately, though
     // the object itself may outlive the call.

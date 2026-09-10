@@ -319,6 +319,12 @@ enum server_send_to : uint8_t
 // Judged as a set and never per flag, since --mode may be typed on either side
 // of any of them, and returned as a message rather than a bool so the caller
 // can say which half is wrong.
+// The port a server listens on when none was configured.  Named once because
+// setup() and listen_addresses() have to answer with the same number, which is
+// the reason the companion node in setup() is careful to ask get_port() rather
+// than the local variable this default has already been written into.
+inline constexpr uint16_t server_default_port = 8000;
+
 inline std::string server_mode_config_refusal(server_mode mode,
                                               uint8_t     send_to,
                                               bool        udp,
@@ -441,6 +447,9 @@ public:
 
     void set_udp(bool udp);
     bool is_udp() const override;
+
+    // What setup() will bind, answered without binding it; see the base class.
+    void listen_addresses(std::vector<std::string>& out) const override;
 
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;

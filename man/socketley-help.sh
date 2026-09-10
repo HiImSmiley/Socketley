@@ -2217,6 +2217,16 @@ troubleshooting() {
     echo -e "  ${CYAN}socketley create server api -p 9001 -s${NC}"
     echo ""
 
+    echo -e "${BOLD}Problem: \"would bind tcp:N, which X is already serving\"${NC}"
+    echo -e "  ${GREEN}Solution:${NC} Two runtimes of this daemon want one address."
+    echo -e "  The kernel would not have refused it: SO_REUSEPORT is set so that"
+    echo -e "  --shards can share a port between the workers of one runtime, and"
+    echo -e "  it lets a second runtime's bind succeed too, with the connections"
+    echo -e "  splitting between them at random. Stop the one named, or move one."
+    echo -e "  ${CYAN}socketley ps -a${NC}          # who holds what"
+    echo -e "  ${CYAN}socketley edit X -p 9001${NC} # -p moves only while stopped"
+    echo ""
+
     echo -e "${BOLD}Problem: Proxy returns 404${NC}"
     echo -e "  ${GREEN}Solution:${NC} Include proxy name in path"
     echo -e "  ${CYAN}curl localhost:8080/proxy-name/api/endpoint${NC}"

@@ -204,6 +204,11 @@ struct client_connection
     }
 };
 
+// The port a cache listens on when none was configured.  Named once because
+// setup() and listen_addresses() have to answer with the same number, and the
+// per-shard --cluster ports are counted up from it in both.
+inline constexpr uint16_t cache_default_port = 9000;
+
 enum cache_mode : uint8_t
 {
     cache_mode_readonly  = 0,  // GET, SIZE
@@ -233,6 +238,9 @@ public:
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
     void on_loop_turn() override;
+
+    // What setup() will bind, answered without binding it; see the base class.
+    void listen_addresses(std::vector<std::string>& out) const override;
 
     size_t get_connection_count() const override;
 

@@ -25,6 +25,10 @@ struct runtime_endpoint;
 
 class runtime_manager;
 
+// The port a proxy listens on when none was configured.  Named once because
+// setup() and listen_addresses() have to answer with the same number.
+inline constexpr uint16_t proxy_default_port = 8080;
+
 enum proxy_protocol : uint8_t { protocol_http = 0, protocol_tcp = 1 };
 enum proxy_strategy : uint8_t { strategy_round_robin = 0, strategy_random = 1, strategy_lua = 2 };
 enum conn_side : uint8_t { conn_none = 0, conn_client, conn_backend };
@@ -486,6 +490,9 @@ public:
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
     void teardown(event_loop& loop) override;
+
+    // What setup() will bind, answered without binding it; see the base class.
+    void listen_addresses(std::vector<std::string>& out) const override;
 
     size_t get_connection_count() const override;
 

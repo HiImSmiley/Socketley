@@ -1348,9 +1348,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
 
     if (autostart && !instance->get_test_mode())
     {
-        if (!m_manager.start(name, m_loop))
+        std::string refusal;
+        if (!m_manager.start(name, m_loop, &refusal))
         {
-            std::cout << "could not start runtime\n";
+            std::cout << (refusal.empty() ? "could not start runtime\n" : refusal);
             m_manager.remove(name);
             return 2;
         }
@@ -1515,9 +1516,12 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
                 continue;
             }
 
-            if (!m_manager.start(n, m_loop))
+            std::string refusal;
+            if (!m_manager.start(n, m_loop, &refusal))
             {
-                conn->write_buf += "failed to start: " + std::string(n) + "\n";
+                conn->write_buf += refusal.empty()
+                                       ? "failed to start: " + std::string(n) + "\n"
+                                       : refusal;
                 ++failed;
                 continue;
             }
@@ -3731,10 +3735,21 @@ int daemon_handler::cmd_reload(ipc_connection* conn, const parsed_args& pa)
         // serving the script the operator has just replaced.
         reconcile_proxy_workers();
 
-        if (m_manager.start(n, m_loop) && m_persistence)
+        std::string refusal;
+        if (m_manager.start(n, m_loop, &refusal))
         {
-            m_persistence->set_was_running(n, true);
-            restarted.push_back(n);
+            if (m_persistence)
+            {
+                m_persistence->set_was_running(n, true);
+                restarted.push_back(n);
+            }
+        }
+        // Said out loud, because a reload whose start was refused used to
+        // leave the runtime stopped and answer as though it had reloaded.
+        else if (!refusal.empty())
+        {
+            conn->write_buf += refusal;
+            ++refused;
         }
 
         // The on_start report is read in the collect pass below, for the reason
@@ -4865,10 +4880,12 @@ bool daemon_handler::serve_map_request(const std::string& op,
 
         // was_running is how the config carries the table's `start = true`;
         // see the encode side in lua_context.
-        if (cfg.was_running && !m_manager.start(name, m_loop))
+        std::string refusal;
+        if (cfg.was_running && !m_manager.start(name, m_loop, &refusal))
         {
             m_manager.remove(name);
-            err = "start = true, and it could not be started";
+            err = refusal.empty() ? "start = true, and it could not be started"
+                                  : refusal;
             return false;
         }
 
@@ -4921,9 +4938,11 @@ bool daemon_handler::serve_map_request(const std::string& op,
             return false;
         }
 
-        if (!m_manager.start(name, m_loop))
+        std::string refusal;
+        if (!m_manager.start(name, m_loop, &refusal))
         {
-            err = "\"" + name + "\" could not be started";
+            err = refusal.empty() ? "\"" + name + "\" could not be started"
+                                  : refusal;
             return false;
         }
         if (m_persistence)
