@@ -3159,27 +3159,39 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     if (m_persistence)
         m_persistence->save_runtime(instance);
 
-    // A runtime in a worker keeps its own copy of the configuration, and the
-    // object edited above is the daemon's placeholder.  Without this the edit
-    // was stored, reported by `show`, answered 0 -- and the process holding the
-    // port went on enforcing the value it was spawned with.
-    //
-    // Sent to every shard, because leaving one on the old limit is a runtime
-    // that enforces two.  What arrives is the whole configuration and not a
-    // delta; the worker takes the part a live runtime can take.
-    if (is_running && m_persistence)
-    {
-        if (auto it = m_proxy_workers.find(std::string(name));
-            it != m_proxy_workers.end() && !it->second.empty())
-        {
-            const runtime_config cfg = m_persistence->read_from_instance(instance);
-            const std::string json = m_persistence->format_json_pretty(cfg);
-            for (auto& sup : it->second)
-                sup->send_config(json);
-        }
-    }
+    if (is_running)
+        push_config_to_workers(name, instance);
 
     return 0;
+}
+
+// A runtime in a worker keeps its own copy of the configuration, and the object
+// a command edited is the daemon's placeholder.  Without this the change was
+// stored, reported by `show`, answered 0 -- and the process holding the port
+// went on enforcing the value it was spawned with.
+//
+// Sent to every shard, because leaving one on the old limit is a runtime that
+// enforces two.  What arrives is the whole configuration and not a delta; the
+// worker takes the part a live runtime can take.
+//
+// A function rather than the block it used to be inside cmd_edit, because
+// `import` is the other door onto the same fields -- and the one the
+// interactive editor goes through -- and it had no push at all: send_config had
+// exactly one call site in the tree.
+void daemon_handler::push_config_to_workers(std::string_view name,
+                                            runtime_instance* instance)
+{
+    if (!m_persistence || !instance)
+        return;
+
+    auto it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end() || it->second.empty())
+        return;
+
+    const runtime_config cfg  = m_persistence->read_from_instance(instance);
+    const std::string    json = m_persistence->format_json_pretty(cfg);
+    for (auto& sup : it->second)
+        sup->send_config(json);
 }
 
 int daemon_handler::cmd_dump(ipc_connection* conn, const parsed_args& pa)
@@ -3540,6 +3552,13 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (has("send_to") || has("master_forward"))
                 srv->set_send_to(cfg.send_to);
             if (has("udp"))  srv->set_udp(cfg.udp);
+            // Parsed by parse_json_string and printed by `show`, and applied
+            // nowhere: an operator who edited "http_dir" in the document the
+            // editor opened got exit 0 and a runtime still serving the old
+            // directory.  The flag door (edit --http-dir) always worked, so
+            // the two disagreed.
+            if (has("http_dir"))   srv->set_http_dir(cfg.http_dir);
+            if (has("http_cache")) srv->set_http_cache(cfg.http_cache);
             if (!cfg.cache_name.empty())
                 srv->set_runtime_manager(&m_manager);
             if (!cfg.master_pw.empty())
@@ -3574,21 +3593,20 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         case runtime_proxy:
         {
             auto* prx = static_cast<proxy_instance*>(instance);
-            if (has("protocol")) prx->set_protocol(static_cast<proxy_protocol>(cfg.protocol));
-            if (has("strategy")) prx->set_strategy(static_cast<proxy_strategy>(cfg.strategy));
-            if (has("backends"))
-            {
-                prx->clear_backends();
-                for (const auto& b : cfg.backends)
-                    prx->add_backend(b);
-            }
+            // The restore path's list, asked by presence instead of by "!=
+            // default".  Written out by hand here before, and the hand-written
+            // version applied seven of sixteen: protocol, strategy, backends
+            // and the three mesh_client_* paths.  The nine service-mesh fields
+            // the man page documents as editable in this very document --
+            // health_check, health_interval, health_path, health_threshold,
+            // circuit_threshold, circuit_timeout, backend_timeout,
+            // retry_count and retry_all -- were parsed into cfg, handed to no
+            // setter, and then written back over by save_runtime() at the end
+            // of this function.  The mesh_client_* three keep their meaning:
+            // asked by presence, an omitted path clears them, which is the
+            // escape hatch a proxy restored with unreadable mTLS files needs.
+            apply_proxy_config(*prx, cfg, /*by_presence=*/true);
             prx->set_runtime_manager(&m_manager);
-            // The clearing half of the escape hatch, without which a proxy
-            // restored with mesh mTLS paths could never be emptied and would
-            // refuse to start forever.
-            if (has("mesh_client_ca"))   prx->set_mesh_client_ca(cfg.mesh_client_ca);
-            if (has("mesh_client_cert")) prx->set_mesh_client_cert(cfg.mesh_client_cert);
-            if (has("mesh_client_key"))  prx->set_mesh_client_key(cfg.mesh_client_key);
             break;
         }
         case runtime_cache:
@@ -3616,6 +3634,14 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (renamed)
         m_persistence->remove_runtime(old_name);
     m_persistence->save_runtime(instance);
+
+    // The same push `edit` does, because this is the same set of fields
+    // arriving by the other door -- and the door the interactive editor uses,
+    // so `socketley edit NAME` with no flags went through here and told the
+    // worker nothing.
+    if (instance->get_state() == runtime_running)
+        push_config_to_workers(pa.args[1], instance);
+
     return 0;
 }
 

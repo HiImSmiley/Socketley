@@ -8,39 +8,56 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 
-void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg)
+void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
+                        bool by_presence)
 {
-    prx.set_protocol(static_cast<proxy_protocol>(cfg.protocol));
-    prx.set_strategy(static_cast<proxy_strategy>(cfg.strategy));
-    for (const auto& b : cfg.backends)
-        prx.add_backend(b);
+    // See the header for why there are two questions and only one list.  The
+    // "!= default" arms are kept exactly as the restore path had them, which
+    // matters for backend_timeout, where 0 means no deadline rather than not
+    // configured.
+    const auto want = [&](const char* key, bool differs) {
+        return by_presence ? cfg.has(key) : differs;
+    };
 
-    // The "!= default" tests are kept exactly as the restore path had them,
-    // which matters for backend_timeout, where 0 means no deadline rather than
-    // not configured.
-    if (cfg.health_check > 0)
+    if (want("protocol", true))
+        prx.set_protocol(static_cast<proxy_protocol>(cfg.protocol));
+    if (want("strategy", true))
+        prx.set_strategy(static_cast<proxy_strategy>(cfg.strategy));
+    if (want("backends", true))
+    {
+        // Replaced and not added to, but only on the document door: the
+        // restore builds a fresh instance with an empty list, and clearing on
+        // a document that never mentioned backends is a proxy with nowhere to
+        // forward.
+        if (by_presence)
+            prx.clear_backends();
+        for (const auto& b : cfg.backends)
+            prx.add_backend(b);
+    }
+
+    if (want("health_check", cfg.health_check > 0))
         prx.set_health_check(static_cast<mesh_config::health_type>(cfg.health_check));
-    if (cfg.health_interval != 5)
+    if (want("health_interval", cfg.health_interval != 5))
         prx.set_health_interval(cfg.health_interval);
-    if (!cfg.health_path.empty())
+    if (want("health_path", !cfg.health_path.empty()))
         prx.set_health_path(cfg.health_path);
-    if (cfg.health_threshold != 3)
+    if (want("health_threshold", cfg.health_threshold != 3))
         prx.set_health_threshold(cfg.health_threshold);
-    if (cfg.circuit_threshold != 5)
+    if (want("circuit_threshold", cfg.circuit_threshold != 5))
         prx.set_circuit_threshold(cfg.circuit_threshold);
-    if (cfg.circuit_timeout != 30)
+    if (want("circuit_timeout", cfg.circuit_timeout != 30))
         prx.set_circuit_timeout(cfg.circuit_timeout);
-    if (cfg.backend_timeout != 2)
+    if (want("backend_timeout", cfg.backend_timeout != 2))
         prx.set_backend_timeout(cfg.backend_timeout);
-    if (cfg.retry_count > 0)
+    if (want("retry_count", cfg.retry_count > 0))
         prx.set_retry_count(cfg.retry_count);
-    if (cfg.retry_all)
-        prx.set_retry_all(true);
-    if (!cfg.mesh_client_ca.empty())
+    if (want("retry_all", cfg.retry_all))
+        prx.set_retry_all(cfg.retry_all);
+    if (want("mesh_client_ca", !cfg.mesh_client_ca.empty()))
         prx.set_mesh_client_ca(cfg.mesh_client_ca);
-    if (!cfg.mesh_client_cert.empty())
+    if (want("mesh_client_cert", !cfg.mesh_client_cert.empty()))
         prx.set_mesh_client_cert(cfg.mesh_client_cert);
-    if (!cfg.mesh_client_key.empty())
+    if (want("mesh_client_key", !cfg.mesh_client_key.empty()))
         prx.set_mesh_client_key(cfg.mesh_client_key);
 }
 

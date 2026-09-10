@@ -11,7 +11,17 @@ struct runtime_config;
 
 // Everything in `cfg` that describes how a proxy forwards: protocol, strategy,
 // backends and the mesh settings.
-void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg);
+//
+// `by_presence` chooses which question decides whether a field was asked for.
+// The restore path has only the value -- a state file is the whole truth and an
+// absent field means the default -- so it leaves this false and the "!=
+// default" tests inside stand in for it.  `import` has the document's key set
+// and needs it: an operator setting circuit_timeout back to 30 is asking for
+// 30, and a "!= 30" test drops the request.  One list either way, because a
+// tenth mesh field added to a copy of this list is a field one of the two doors
+// would not apply.
+void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
+                        bool by_presence = false);
 
 // The fields every type has; not the ring settings, and not --lua, whose
 // failure to load means different things to a daemon and to a worker.

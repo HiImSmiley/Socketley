@@ -134,6 +134,10 @@ private:
                             const proxy_supervisor* exclude = nullptr);
     int cmd_edit(ipc_connection* conn, const parsed_args& pa);
     int cmd_dump(ipc_connection* conn, const parsed_args& pa);
+    // The whole configuration to every worker serving this runtime, so a change
+    // reaches the process holding the port; see the definition.
+    void push_config_to_workers(std::string_view name, runtime_instance* instance);
+
     int cmd_import(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);

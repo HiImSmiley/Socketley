@@ -742,17 +742,27 @@ alongside
 is rejected outright and nothing is applied, because replication is not
 encrypted (see
 .BR LIMITATIONS ).
-.BR client_ca ,
-.B client_cert
+.BR mesh_client_ca ,
+.B mesh_client_cert
 and
-.B client_key
+.B mesh_client_key
 belong to a proxy alone.
-A document that simply omits those fields is accepted and clears them, which
-is how a runtime restored from an older state file is made startable again:
+.PP
+Clearing any of them is written out and never implied, the same rule the
+paragraph above states for every field: a document that simply omits a field
+leaves the runtime's own value in place. That is how a runtime restored from an
+older state file with certificate paths it can no longer read is made startable
+again \(em by naming them empty, not by deleting the lines:
 .nf
-socketley show name > cfg.json   # drop the TLS fields in an editor
+socketley show name > cfg.json
+# set the TLS and mesh paths to "" in an editor, do not delete the lines
 socketley import name "$(cat cfg.json)"
 .fi
+.PP
+Deleting them used to clear them, and that is what changed: a runtime
+configured for TLS could be handed
+.B {"name":"x"}
+and answer in cleartext afterwards, with the command reporting success.
 .SS Edit: JSON Configuration Fields
 The interactive editor opens a JSON file with the following fields.
 Fields marked
@@ -839,6 +849,9 @@ mode	string	"inout", "in", "out", or "master"
 udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
 master_pw	string	Static password for master mode
 send_to	string	"sender", "others", "master", comma separated
+http_dir	string	Static file root, as \fB\-\-http\-dir\fR
+http_cache	bool	Hold those files in memory, as \fB\-\-http\-cache\fR
+upstreams	array	Upstream addresses, as \fB\-\-upstream\fR
 .TE
 .PP
 .B Client fields:
@@ -862,7 +875,10 @@ backends	array	T{
 .ad l
 List of backend addresses ["ip:port", "@group", ...]
 T}
-health_check	string	"tcp" or "http" (empty = disabled)
+health_check	number	T{
+.ad l
+0 disabled, 1 TCP connect, 2 HTTP GET \(em the number \fB\-\-health\-check\fR stored
+T}
 health_interval	number	T{
 .ad l
 Health check interval in seconds (default 5)
@@ -875,16 +891,39 @@ backend_timeout	number	T{
 .ad l
 Seconds for the first response byte (default 2, 0 = off)
 T}
-retry	number	Retry count (0 = disabled)
+retry_count	number	Retry count (0 = disabled)
 retry_all	bool	Also retry non-idempotent methods
-client_ca	string	T{
+mesh_client_ca	string	T{
 .ad l
 CA for certificates clients present \fB(needs tls)\fR
 T}
-client_cert	string	Client certificate presented to backends
-client_key	string	Its private key (both or neither)
-sidecar	bool	Enable sidecar defaults
+mesh_client_cert	string	T{
+.ad l
+Client certificate presented to backends
+T}
+mesh_client_key	string	Its private key (both or neither)
 .TE
+.PP
+These are the names in the document, which are not in every case the names of
+the flags or of the Lua configuration keys that set the same things: the
+document spells them
+.BR retry_count ,
+.BR mesh_client_ca ,
+.B mesh_client_cert
+and
+.BR mesh_client_key ,
+where
+.B \-\-retry
+and
+.B \-\-client\-ca
+are the flags and
+.B retry
+and
+.B client_ca
+are the config-file keys. There is no
+.B sidecar
+field: it is a flag and a config key that sets several of the fields above, and
+nothing writes or reads it in a state document.
 .PP
 .B Cache fields:
 .TS
