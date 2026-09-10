@@ -3745,6 +3745,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
 
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
     print_bash_message(msg);
+    write_received_message(msg);
     notify_interactive(msg);
 
     // Fire on_client_message callback (sender-aware)

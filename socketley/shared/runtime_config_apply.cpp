@@ -94,6 +94,13 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
 
+    // Unconditional, like backend_timeout below and for the same reason: the
+    // only caller parses a whole document, so an absent write_file means the
+    // operator cleared it, and a guarded form would make -w the one setting
+    // that could be turned on and never off.  set_write_file() drops the old
+    // descriptor when the path moves, so a live runtime follows the flag.
+    rt.set_write_file(cfg.write_file);
+
     // A proxy's routing and mesh POLICY, which is every mesh field this worker
     // reads at the moment it uses it rather than at setup: a strategy is read
     // when a backend is picked, a deadline when a request is armed, a circuit

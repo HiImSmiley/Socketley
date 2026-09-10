@@ -11,6 +11,7 @@
 #include <ctime>
 #include <unistd.h>
 #include <cerrno>
+#include <cstring>
 #include <sys/uio.h>
 #include <charconv>
 #include <csignal>
@@ -24,7 +25,11 @@ runtime_instance::runtime_instance(runtime_type type, std::string_view name)
 {
 }
 
-runtime_instance::~runtime_instance() = default;
+runtime_instance::~runtime_instance()
+{
+    if (m_write_fd >= 0)
+        ::close(m_write_fd);
+}
 
 void runtime_instance::tick_handler::on_cqe(struct io_uring_cqe* cqe)
 {
@@ -420,6 +425,19 @@ std::string_view runtime_instance::get_log_file() const
 
 void runtime_instance::set_write_file(std::string_view path)
 {
+    // A path that changed has to drop the old descriptor, because `edit -w
+    // other.log` on a running runtime otherwise goes on appending to the file
+    // it was started with and the new name never receives a byte.  The latch
+    // is cleared with it, so a corrected path is tried again.
+    if (path != m_write_file)
+    {
+        if (m_write_fd >= 0)
+        {
+            ::close(m_write_fd);
+            m_write_fd = -1;
+        }
+        m_write_failed = false;
+    }
     m_write_file = path;
 }
 
@@ -515,6 +533,52 @@ void runtime_instance::print_bash_message(std::string_view msg) const
             std::cout << c;
     }
     std::cout << std::endl;
+}
+
+// ─── -w file ────────────────────────────────────────────────────────────────
+// The file half of print_bash_message, called from the same two places: the
+// point in server_instance::process_message and client_instance::process_message
+// where total_messages is counted, which is what "every received message"
+// means.
+//
+// O_APPEND and one write per message, because N shards of one runtime are N
+// processes with the same path: an append under the pipe-buffer size is atomic
+// on a regular file, so the lines interleave but never tear.  Bytes as they
+// arrived, without print_bash_message's control-character scrubbing -- that
+// exists to stop a terminal being driven by a peer's escape sequence, and a
+// file is not a terminal.
+void runtime_instance::write_received_message(std::string_view msg)
+{
+    if (m_write_file.empty() || m_write_failed)
+        return;
+
+    if (m_write_fd < 0)
+    {
+        // Opened on the first message and not at start, so a runtime nobody
+        // sends anything to leaves no file behind.
+        m_write_fd = ::open(m_write_file.c_str(),
+                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (m_write_fd < 0)
+        {
+            // Latched, or an unwritable path is a line in the log per message
+            // through the runtime.
+            m_write_failed = true;
+            LOG_ERROR(("-w " + m_write_file + " could not be opened: " +
+                       std::string(std::strerror(errno)) +
+                       " -- messages are not being written").c_str());
+            return;
+        }
+    }
+
+    std::string line(msg);
+    line.push_back('\n');
+    if (!socketley::write_all(m_write_fd, line.data(), line.size()))
+    {
+        m_write_failed = true;
+        LOG_ERROR(("-w " + m_write_file + " could not be written: " +
+                   std::string(std::strerror(errno)) +
+                   " -- messages are not being written").c_str());
+    }
 }
 
 // The script belongs to the worker, so the placeholder compiles the file and

@@ -889,6 +889,7 @@ void client_instance::process_message(std::string_view msg)
 {
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
     print_bash_message(msg);
+    write_received_message(msg);
     notify_interactive(msg);
 
     switch (m_mode)

@@ -573,7 +573,23 @@ protected:
     // Bash output helper
     void print_bash_message(std::string_view msg) const;
 
+    // The same message to the file -w named, which is the file half of the
+    // same thing print_bash_message does to stdout -- and which had never
+    // been written: the path was parsed by four flag doors, carried to the
+    // worker, persisted, and reported by `show`, and nothing anywhere opened
+    // it.  Not const, because the file is opened on the first message rather
+    // than at every start: a runtime nobody sends anything to should not
+    // create the file, and a path on an unwritable directory should be one
+    // complaint and not one per message.
+    void write_received_message(std::string_view msg);
+
 private:
+    // Opened lazily by write_received_message and closed by set_write_file and
+    // the destructor.  m_write_failed latches so an unwritable path is logged
+    // once rather than on every message through.
+    int  m_write_fd{-1};
+    bool m_write_failed{false};
+
     // Guards m_stat_detail only and is held for a single move, its own lock so
     // publishing never takes the runtime map exclusively on the event-loop
     // thread.

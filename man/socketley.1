@@ -1200,7 +1200,33 @@ Dry run. Validate configuration without starting.
 Log state transitions (created, running, stopped, failed) to file.
 .TP
 .BI "\-w " "file"
-Write every received message to file.
+Write every received message to file, one line each, in the bytes they arrived
+in \(em this is the file half of
+.BR \-b ,
+and it is written at the same point in the runtime, where the message is
+counted.
+.IP
+The file is created with mode 0600 on the first message and not at the start,
+so a runtime nothing is sent leaves nothing behind, and it is opened for append,
+so a restart adds to it rather than truncating it. Under
+.BI \-\-shards " N"
+the N workers share the one path: an append this size is atomic on a regular
+file, so the lines interleave without tearing.
+.IP
+Unlike
+.BR \-b ,
+the bytes are not scrubbed of control characters. That scrubbing exists to stop
+a peer driving the operator's terminal with an escape sequence, and a file is
+not a terminal.
+.IP
+.B \-w
+takes effect on a runtime that is already serving, so
+.BI "edit " "name" " \-w other.log"
+moves the writing without a restart. A path that cannot be opened or written is
+reported once, at
+.BR ERROR ,
+and then not again \(em a runtime under load would otherwise put one line in
+the log per message through it.
 .TP
 .BI "\-\-lua " "script"
 Attach Lua configuration script with callbacks. A script that does not load
