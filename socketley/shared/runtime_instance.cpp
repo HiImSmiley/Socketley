@@ -309,9 +309,28 @@ bool runtime_instance::stop(event_loop& loop)
     loop.deregister_owner(this);
     store_state(runtime_stopped);
 
-    // Signal all interactive sessions that runtime has stopped
-    for (int ifd : m_interactive_fds)
-        if (::write(ifd, "\0", 1) < 0) {}
+    // ─── Not from a worker ──────────────────────────────────────────────────
+    // This byte means "the runtime you are attached to has stopped", and a
+    // worker cannot tell that from a restart or from its own shard being
+    // replaced: it stops in all three, and in two of them the runtime is still
+    // there a second later.  Only the daemon knows which happened.
+    //
+    // It had never fired for anyone.  The daemon's placeholder returns at the
+    // m_out_of_process branch above and never arrives here, and until an
+    // interactive session's descriptor was handed to the worker there was
+    // nothing in this list on the only path that reaches it.  Measured the
+    // moment there was: `restart` ended the session cleanly and gave the
+    // operator their shell back.
+    //
+    // Left rather than deleted, because the signal is right and only its
+    // sender is missing -- an operator attached to a runtime somebody stops
+    // deserves to be told.  Whoever adds it should add it in the daemon, where
+    // a stop can be told from a restart.
+    if (!in_worker_process())
+    {
+        for (int ifd : m_interactive_fds)
+            if (::write(ifd, "\0", 1) < 0) {}
+    }
     m_interactive_fds.clear();
 
     return true;

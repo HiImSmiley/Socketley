@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include "../shared/blocking_write.h"
 #include <charconv>
 #include <chrono>
 #include <optional>
@@ -964,6 +965,55 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
             if (!inst || inst->get_state() != runtime_running)
                 break;
 
+            // ─── The typed line goes where the runtime is ────────────────
+            // Every arm below used to call the instance directly, which was
+            // right while a runtime could live in the daemon and has been
+            // wrong since none can: this object is the placeholder.
+            // broadcast() and lua_send() return at their first guard -- both
+            // test m_loop, which only setup() assigns and a placeholder's
+            // setup() never runs -- so the line was accepted and discarded.
+            // The cache was worse than discarding: execute() answered out of
+            // the placeholder's own empty store, so `get k` said nil for a key
+            // that existed and `set k v` said ok into a store nothing could
+            // read.
+            //
+            // This is the THIRD site of that one defect.  `send` carries the
+            // fix and a comment naming it -- "calling broadcast() on a
+            // placeholder succeeded, returned 0, and sent the message
+            // nowhere" -- and `socketley <cache> <verb>` carries it with a
+            // test whose header describes this exact symptom.  Both routes
+            // are reused here rather than a third being written.
+            if (inst->is_out_of_process())
+            {
+                if (inst->get_type() == runtime_cache)
+                {
+                    // The whole line is one command, which is what
+                    // run_cache_action frames it as -- a value with a newline
+                    // in it would otherwise be read as further commands.  The
+                    // answer lands in write_buf, and an interactive session is
+                    // a stream rather than a command with a reply, so it goes
+                    // straight out and the buffer is left clean for whatever
+                    // asks next.
+                    const size_t sp = line.find(' ');
+                    run_cache_action(conn, conn->interactive_name,
+                                     line.substr(0, sp), line);
+                    if (!conn->write_buf.empty())
+                    {
+                        socketley::write_all(conn->fd, conn->write_buf.data(),
+                                             conn->write_buf.size());
+                        conn->write_buf.clear();
+                    }
+                }
+                else if (inst->get_type() == runtime_server
+                         || inst->get_type() == runtime_client)
+                {
+                    // Fanned across every shard, which is what a server's
+                    // broadcast means and what `send` already does.
+                    deliver_to_worker(conn->interactive_name, line);
+                }
+                continue;
+            }
+
             switch (inst->get_type())
             {
                 case runtime_server:
@@ -976,15 +1026,7 @@ void daemon_handler::handle_read(struct io_uring_cqe* cqe, io_request* req)
                 {
                     std::string resp = static_cast<cache_instance*>(inst)->execute(line);
                     if (!resp.empty())
-                    {
-                        size_t total = 0;
-                        while (total < resp.size())
-                        {
-                            ssize_t w = ::write(conn->fd, resp.data() + total, resp.size() - total);
-                            if (w < 0) break;
-                            total += static_cast<size_t>(w);
-                        }
-                    }
+                        socketley::write_all(conn->fd, resp.data(), resp.size());
                     break;
                 }
                 default:
@@ -1557,7 +1599,11 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
             // The proxy case was refused above, before anything was started.
             conn->interactive = true;
             conn->interactive_name = n;
+            // The daemon's own record of who is attached, which is what
+            // close_client() and teardown() read to detach.  It is NOT what
+            // delivers: the messages happen in the worker.
             inst->add_interactive_fd(conn->fd);
+            grant_interactive_to_workers(n, conn->fd);
         }
     }
 
@@ -3212,6 +3258,31 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 // `import` is the other door onto the same fields -- and the one the
 // interactive editor goes through -- and it had no push at all: send_config had
 // exactly one call site in the tree.
+// The operator's terminal to every worker serving this runtime, so what a
+// client says reaches the session.  Once per worker and not per message: the
+// descriptor is the channel, so notify_interactive() writes to the terminal
+// with nothing of the daemon's on the path.
+//
+// Under --shards N every shard gets it and every shard writes to it, which is
+// right -- each has its own clients -- and safe for the same reason -w's shared
+// file is: one write per message, atomic at this size.
+//
+// This is the "attaches without restarting" half.  A session opened on a
+// runtime whose worker is forked afterwards is granted in
+// reconcile_proxy_workers(), beside send_start(), because the supervisor does
+// not exist yet when the interactive block runs.
+void daemon_handler::grant_interactive_to_workers(std::string_view name, int fd)
+{
+    if (fd < 0)
+        return;
+    auto it = m_proxy_workers.find(std::string(name));
+    if (it == m_proxy_workers.end())
+        return;
+    for (auto& sup : it->second)
+        if (sup)
+            sup->grant_interactive(fd);
+}
+
 void daemon_handler::push_config_to_workers(std::string_view name,
                                             runtime_instance* instance)
 {
@@ -5649,6 +5720,19 @@ void daemon_handler::reconcile_proxy_workers()
             m_manager.publish_endpoints();
             for (auto* s : forked)
                 s->send_start();
+
+            // A session that was already open when this child was forked: a
+            // `start NAME -i`, whose interactive block runs BEFORE this
+            // function makes the worker, and a runtime restarted under a live
+            // session, whose old process took its copy of the descriptor away.
+            // Either one would come back mute without this.
+            for (const auto& [cfd, c] : m_clients)
+            {
+                if (!c || !c->interactive || c->interactive_name != name)
+                    continue;
+                for (auto* s : forked)
+                    s->grant_interactive(cfd);
+            }
         }
 
         // The descriptors have been placed into every child that wanted them,

@@ -163,6 +163,10 @@ public:
     // relay, which is where every crossing was before links existed.
     bool grant_peer_link(std::string_view peer, int fd);
 
+    // The operator's interactive session, over the same channel; see the
+    // definition for why it is a marker and not a second one.
+    bool grant_interactive(int fd);
+
     // Whether this child has been introduced to `peer` recently enough that a
     // second grant would be waste rather than repair.
     bool grant_suppressed(std::string_view peer);

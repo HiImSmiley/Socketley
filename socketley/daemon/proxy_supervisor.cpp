@@ -292,6 +292,28 @@ bool proxy_supervisor::grant_peer_link(std::string_view peer, int fd)
     return true;
 }
 
+// The operator's terminal, handed over the same channel a peer link travels on
+// and for the same reason: a descriptor cannot be pushed through the control
+// socket's standing recv, which has no control buffer.
+//
+// Unlike a peer link this is not recorded in m_granted -- there is nothing to
+// suppress a second grant of.  A session that outlives a worker is re-granted
+// when the next one reports, because the descriptor belongs to the session and
+// not to the process.
+bool proxy_supervisor::grant_interactive(int fd)
+{
+    if (m_link_chan_fd < 0 || fd < 0)
+        return false;
+    if (!socketley::peer_link::grant(m_link_chan_fd,
+                                     socketley::peer_link::interactive_marker, fd))
+    {
+        LOG_WARN("interactive: could not hand the session to a worker; what its "
+                 "clients say will not reach the terminal");
+        return false;
+    }
+    return true;
+}
+
 bool proxy_supervisor::grant_suppressed(std::string_view peer)
 {
     // A plain unordered_map, so the key is built rather than looked up

@@ -26,6 +26,14 @@ namespace socketley::peer_link
 // A runtime name is the whole message, so this is the message limit too.
 inline constexpr size_t max_name = 128;
 
+// The one cargo on this channel that is not a peer: the descriptor of an
+// operator's interactive session, handed to the worker so notify_interactive()
+// can write to their terminal directly.  A marker rather than a second channel
+// because the mechanism is identical -- one descriptor, one short message --
+// and '@' is what makes it unambiguous: runtime_manager::valid_name() allows
+// only [alnum], '-', '_' and '.', so no runtime can ever be called this.
+inline constexpr std::string_view interactive_marker = "@i";
+
 // The daemon's side.  Never blocking: this runs on the daemon's event-loop
 // thread, and a worker that has stopped reading its grant channel must cost a
 // refused introduction rather than the whole daemon.  A refusal leaves the two

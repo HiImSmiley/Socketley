@@ -333,6 +333,21 @@ so the runtime is left exactly as it was; see
 .BR LIMITATIONS .
 Press Ctrl+C to detach (runtime continues running).
 If the runtime is already running, attaches without restarting.
+.IP
+A runtime lives in its own process, and the session reaches it: what is typed
+is delivered to the workers holding the connections, and their descriptor for
+the session is handed to each of them so what a client says arrives at the
+terminal with nothing of the daemon's between. Under
+.BI \-\-shards " N"
+that is every shard \(em a typed line reaches all of their clients, and any of
+them can be heard back.
+.IP
+A session survives a
+.B restart
+of the runtime it is attached to and is re-attached to the new workers. It does
+not end when the runtime is
+.BR stop ped:
+nothing tells it, and the operator has to press Ctrl+C.
 .RE
 .IP
 For a runtime that lives in a worker process,

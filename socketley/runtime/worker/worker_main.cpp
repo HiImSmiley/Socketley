@@ -913,7 +913,23 @@ private:
         {
             m_link_recv = std::make_unique<socketley::peer_link::receiver>(
                 m_link_chan_fd,
-                [this](std::string peer, int fd) { adopt_peer_link(std::move(peer), fd); });
+                [this](std::string peer, int fd) {
+                    // The one cargo on this channel that is not a peer: an
+                    // operator's terminal, so notify_interactive() can reach
+                    // it from here.  Before this the descriptor was registered
+                    // on the DAEMON's placeholder, whose m_interactive_fds
+                    // nothing ever fires -- every message a client sent went
+                    // to a list in the wrong process.
+                    if (peer == socketley::peer_link::interactive_marker)
+                    {
+                        if (m_rt)
+                            m_rt->add_interactive_fd(fd);
+                        else
+                            ::close(fd);
+                        return;
+                    }
+                    adopt_peer_link(std::move(peer), fd);
+                });
             if (!m_link_recv->attach(m_loop))
                 LOG_WARN("peer links: the grant channel could not be armed; "
                          "crossings to other runtimes will relay through the daemon");

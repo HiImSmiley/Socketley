@@ -138,6 +138,11 @@ private:
     // reaches the process holding the port; see the definition.
     void push_config_to_workers(std::string_view name, runtime_instance* instance);
 
+    // An operator's interactive session to the workers, so what a client says
+    // reaches their terminal; and the same for a worker that has just been
+    // forked under a session that is already open.
+    void grant_interactive_to_workers(std::string_view name, int fd);
+
     int cmd_import(ipc_connection* conn, const parsed_args& pa);
     int cmd_action(ipc_connection* conn, const parsed_args& pa);
     int cmd_stats(ipc_connection* conn, const parsed_args& pa);
