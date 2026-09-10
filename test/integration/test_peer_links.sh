@@ -183,5 +183,88 @@ unset SOCKETLEY_NO_PEER_LINKS
 "$BIN" stop pl_c2 >/dev/null 2>&1; "$BIN" remove pl_c2 >/dev/null 2>&1
 daemon_stop
 
+# ── 5. A REPLACED link is armed under its own name ─────────────────────────
+#
+# When a peer restarts, the daemon grants a fresh link and adopt_peer_link()
+# pushes it BEHIND the live entry it replaces -- one grant at a time per peer,
+# so at most two entries ever share a name and the one to retire is always at
+# the lower index.
+#
+# arm_pending_peers() used to walk m_peer_links with a range-for while an inner
+# loop erased from the SAME vector, holding the outer reference across it.
+# erase() moves the later elements down and destroys the last slot, which is
+# exactly the slot the reference named, so the three statements after the inner
+# loop read and wrote a moved-from entry.  Measured, the signature is a log line
+# with no runtime in it at all:
+#
+#     peer links: pp_srv is now one socket away
+#     peer links:  is now one socket away        <- the dead entry
+#     peer links: pp_cache is now one socket away
+#
+# five lines where a healthy run has four, because the real link is armed on a
+# later pass instead.
+#
+# Asserted on the log rather than on the counters, and not on the sanitizer:
+# ASan is SILENT here.  The read is inside the vector's own buffer, past size()
+# and onto a destroyed object, which it only sees with
+# _GLIBCXX_SANITIZE_VECTOR -- and premake5.lua does not set it.
+daemon_isolate peerlinkreplace
+daemon_start "$BIN"
+"$BIN" create cache  pl_rc -p $((PORT+12))         -s >/dev/null 2>&1
+"$BIN" create server pl_rs -p $((PORT+13)) --cache pl_rc -s >/dev/null 2>&1
+sleep 1.5
+say "cache set rk rv" $((PORT+13)) >/dev/null
+for i in $(seq 1 15); do say "cache get rk" $((PORT+13)) >/dev/null; done
+sleep 3
+
+FIRST_LINKS=$(counter pl_rs peer_links)
+if [ "$FIRST_LINKS" -eq 1 ]; then
+    ok "a link is up before the peer restarts (peer_links $FIRST_LINKS)"
+else
+    bad "a link is up before the peer restarts" \
+        "peer_links is $FIRST_LINKS -- with no first link there is no" \
+        "replacement to test and everything below measures nothing"
+fi
+
+# The peer goes and comes back, so the daemon has a fresh link to grant to the
+# server's worker, which has not restarted and still holds the old entry.
+"$BIN" restart pl_rc >/dev/null 2>&1
+sleep 2
+say "cache set rk2 rv2" $((PORT+13)) >/dev/null
+for i in $(seq 1 25); do say "cache get rk2" $((PORT+13)) >/dev/null; done
+sleep 4
+
+RGOT=$(say "cache get rk2" $((PORT+13)))
+if [ "$RGOT" = "rv2" ]; then
+    ok "the value still crosses after the peer restarted"
+else
+    bad "the value still crosses after the peer restarted" \
+        "get said '${RGOT:-<nothing>}'"
+fi
+
+NAMELESS=$(grep -c "peer links:  is now" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "${NAMELESS:-0}" -eq 0 ]; then
+    ok "every armed link is named in the log"
+else
+    bad "every armed link is named in the log" \
+        "$NAMELESS line(s) read 'peer links:  is now one socket away' with no" \
+        "runtime in them -- that empty string is a moved-from peer_entry, read" \
+        "through a reference that did not survive an erase from its own vector"
+fi
+
+# And the replacement really is the one that got armed: the last arming line
+# names the peer, rather than the peer being armed before the empty pass.
+LAST_ARM=$(grep -o "peer links: [a-z_0-9]* is now one socket away" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)
+if [ -n "$LAST_ARM" ]; then
+    ok "the last link armed carries a name ($LAST_ARM)"
+else
+    bad "the last link armed carries a name" \
+        "no complete arming line in the log at all"
+fi
+
+"$BIN" stop pl_rs >/dev/null 2>&1; "$BIN" remove pl_rs >/dev/null 2>&1
+"$BIN" stop pl_rc >/dev/null 2>&1; "$BIN" remove pl_rc >/dev/null 2>&1
+daemon_stop
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || exit 1

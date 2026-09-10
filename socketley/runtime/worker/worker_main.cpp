@@ -1309,31 +1309,69 @@ private:
         if (ch.parked_count() != 0 || ch.pending() != 0)
             return;
 
-        for (auto& e : m_peer_links)
+        // The names waiting, taken before anything is erased.
+        //
+        // This was a range-for over m_peer_links with an inner loop erasing
+        // from the SAME vector and `e` held across it.  erase() moves the
+        // later elements down and destroys the last slot -- and that is always
+        // the slot `e` named, because adopt_peer_link() pushes a fresh grant
+        // BEHIND the live link it replaces, so the entry being erased is
+        // always at the lower index.  The three statements after the inner
+        // loop then read and wrote a moved-from entry: the replacement never
+        // got live = true, its sink was never registered -- register_sink
+        // refuses an empty name -- and the log line printed no runtime at all.
+        // Crossings to that peer went on relaying through the daemon for the
+        // rest of the worker's life, which is the behaviour a fresh link
+        // exists to end.
+        std::vector<std::string> pending;
+        for (const auto& e : m_peer_links)
+            if (!e.live && e.sink)
+                pending.push_back(e.name);
+
+        for (const std::string& peer : pending)
         {
-            if (e.live || !e.sink)
+            // Found afresh, because the pass below moves the table under
+            // itself.  At most two entries share a name -- an older live one
+            // and this grant -- since adopt_peer_link() refuses a second grant
+            // while a pending one exists.
+            size_t keep = m_peer_links.size();
+            for (size_t i = 0; i < m_peer_links.size(); ++i)
+                if (!m_peer_links[i].live && m_peer_links[i].sink
+                    && m_peer_links[i].name == peer)
+                {
+                    keep = i;
+                    break;
+                }
+            if (keep == m_peer_links.size())
                 continue;
 
             // Any earlier link to the same runtime leaves the table first, or
             // register_sink would replace it while its object still owns the
-            // name it was registered under.
-            for (auto it = m_peer_links.begin(); it != m_peer_links.end(); )
+            // name it was registered under.  By index, with nothing held
+            // across the erase.
+            for (size_t i = 0; i < m_peer_links.size(); )
             {
-                if (&*it != &e && it->name == e.name)
+                if (i == keep || m_peer_links[i].name != peer)
                 {
-                    if (it->sink)
-                        ch.drop_sink(it->sink.get());
-                    if (it->link)
-                        it->link->die("replaced by a fresh link", /*expected=*/true);
-                    m_retired_peers.push_back(std::move(*it));
-                    it = m_peer_links.erase(it);
+                    ++i;
+                    continue;
                 }
-                else
-                {
-                    ++it;
-                }
+                peer_entry& victim = m_peer_links[i];
+                if (victim.sink)
+                    ch.drop_sink(victim.sink.get());
+                if (victim.link)
+                    victim.link->die("replaced by a fresh link", /*expected=*/true);
+                m_retired_peers.push_back(std::move(victim));
+                m_peer_links.erase(m_peer_links.begin()
+                                   + static_cast<std::ptrdiff_t>(i));
+                // The survivor moved down with everything above the hole, and
+                // `i` stays put because the element that slid into this slot
+                // has not been looked at yet.
+                if (keep > i)
+                    --keep;
             }
 
+            peer_entry& e = m_peer_links[keep];
             ch.register_sink(e.name, e.sink.get());
             e.live = true;
             LOG_INFO(("peer links: " + e.name + " is now one socket away").c_str());
