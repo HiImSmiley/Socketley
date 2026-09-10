@@ -381,12 +381,18 @@ public:
     // retired one holds zero because the daemon cleared it.
     uint64_t sum_active() const
     {
-        if (!m_table)
+        // The pointer once, so the check and the loads below are the same
+        // value.  What keeps the MAPPING alive across them is the caller's
+        // lock -- see close() -- and this only makes the read itself
+        // well-defined rather than a null check followed by N loads of a field
+        // another thread may have cleared in between.
+        const table* t = m_table;
+        if (!t)
             return 0;
         uint64_t total = 0;
         const uint32_t n = m_count;
         for (uint32_t i = 0; i < n; ++i)
-            total += m_table->slots[i].active_connections.load(std::memory_order_acquire);
+            total += t->slots[i].active_connections.load(std::memory_order_acquire);
         return total;
     }
 
@@ -395,12 +401,14 @@ public:
     figures sum() const
     {
         figures f;
-        if (!m_table)
+        // Once, for sum_active()'s reason.
+        const table* t = m_table;
+        if (!t)
             return f;
         const uint32_t n = m_count;
         for (uint32_t i = 0; i < n; ++i)
         {
-            const slot& s = m_table->slots[i];
+            const slot& s = t->slots[i];
             f.active_connections += s.active_connections.load(std::memory_order_acquire);
             f.total_connections  += s.total_connections.load(std::memory_order_relaxed);
             f.total_messages     += s.total_messages.load(std::memory_order_relaxed);
@@ -447,6 +455,17 @@ public:
         return m_table->slots[i].active_connections.load(std::memory_order_acquire);
     }
 
+    // ─── WHO MAY CALL THIS, AND HOLDING WHAT ────────────────────────────────
+    // The unmap, and therefore the only transition in this class that can hurt
+    // a reader: attach_reader() going null -> valid costs a reader at worst a
+    // momentary zero, because m_count is still 0 for the instant between the
+    // two stores.  This one takes the pages away underneath one.
+    //
+    // sum() and sum_active() are called from the metrics thread under a SHARED
+    // lock on runtime_manager::mutex, and two shared holders exclude nothing.
+    // So the caller of close() must hold that mutex EXCLUSIVELY, or the unmap
+    // can land between a reader's null check and its loads and the daemon
+    // takes the fault on a thread that was only being asked for a number.
     void close()
     {
         if (m_table)

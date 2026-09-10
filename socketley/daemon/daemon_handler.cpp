@@ -22,6 +22,7 @@
 #include "../shared/unix_listener.h"
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
+#include <shared_mutex>
 #include "../shared/runtime_config_apply.h"
 #include "../shared/appending_file.h"
 #include "../shared/ipc_framing.h"
@@ -5265,7 +5266,21 @@ void daemon_handler::reconcile_proxy_workers()
             // duplicated reader is closed first, or the runtime would go on
             // answering `stats` out of a table no process writes any more.
             if (auto* inst = m_manager.get(it->first))
+            {
+                // Exclusively, and not under the shared lock this function
+                // takes further up: the metrics thread reads this same region
+                // in worker_figures() -> sum() while holding a SHARED lock,
+                // and two shared holders exclude nothing.  sum() null-checks
+                // the mapping once and then loads from it N times, so an unmap
+                // landing in between is a SIGSEGV in the daemon on a thread
+                // that was only being asked for a number.
+                //
+                // get() takes the shared lock itself, so the name is resolved
+                // first and the exclusive lock covers the unmap alone -- the
+                // mutex is not recursive.
+                std::unique_lock stats_lock(m_manager.mutex);
                 inst->shard_stats_table().close();
+            }
             m_shard_regions.erase(it->first);
             m_shard_client_regions.erase(it->first);
             it = m_proxy_workers.erase(it);
