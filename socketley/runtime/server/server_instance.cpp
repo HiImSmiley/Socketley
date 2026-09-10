@@ -1622,6 +1622,17 @@ bool server_instance::setup_unix_listener(const std::string& path)
 // a worker is forked to discover it.  Kept next to setup() because the two
 // have to agree: an answer here that setup() does not honour is a refusal
 // nobody earned.
+// The one number both this and listen_addresses() are built from, so the port
+// `ps` prints and the port the manager refuses a collision on cannot drift.
+uint16_t server_instance::effective_port() const
+{
+    if (!get_listen_path().empty())
+        return 0;                                   // a path, not a port
+    if (get_port() == 0 && !get_owner().empty())
+        return 0;                                   // internal-only: binds nothing
+    return get_port() ? get_port() : server_default_port;
+}
+
 void server_instance::listen_addresses(std::vector<std::string>& out) const
 {
     // A listen path and a port are mutually exclusive -- listen_config_refusal
@@ -1642,8 +1653,7 @@ void server_instance::listen_addresses(std::vector<std::string>& out) const
     // Datagrams and streams are separate namespaces in the kernel, and a UDP
     // server beside a TCP one on the same number is two listeners that never
     // meet -- measured, both up, each hearing only its own traffic.
-    const uint16_t port = get_port() ? get_port() : server_default_port;
-    out.push_back((m_udp ? "udp:" : "tcp:") + std::to_string(port));
+    out.push_back((m_udp ? "udp:" : "tcp:") + std::to_string(effective_port()));
 }
 
 bool server_instance::setup(event_loop& loop)

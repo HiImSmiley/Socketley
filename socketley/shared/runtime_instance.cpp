@@ -1029,7 +1029,9 @@ std::string runtime_instance::stats_prefix() const
     out += "\ntype:";
     out += type_to_string(m_type);
     out += "\nport:";
-    append_u64(m_port);
+    // The bound port and not the configured one, for `ps`'s reason: a runtime
+    // with no -p reported 0 while it was serving on its type's default.
+    append_u64(effective_port());
     out += "\nconnections:";
     // Not get_connection_count(): see reported_connection_count(), which is the
     // same question asked in a way that survives the runtime living in a worker.

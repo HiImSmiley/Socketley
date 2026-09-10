@@ -1751,7 +1751,10 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             if (!first) out << ",";
             first = false;
             const char* state_str = state_to_string(instance->get_state());
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
             // Escaped, all of them, because a group and an owner are arbitrary
@@ -1809,7 +1812,10 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         {
             const std::string status_buf = state_column(instance.get());
             const char* status_str = status_buf.c_str();
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             out << std::setw(10) << instance->get_id()
                 << std::setw(cw_name) << name
@@ -1842,7 +1848,10 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
         for (const auto& [name, instance] : runtimes)
         {
             std::string status = state_column(instance.get());
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
             bool first = true;
@@ -1952,7 +1961,10 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 continue;
             if (!first) out << ",";
             first = false;
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             auto group = instance->get_group();
             const bool running = instance->get_state() == runtime_running;
@@ -2017,7 +2029,10 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         {
             if (!listed(instance.get()))
                 continue;
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             out << std::setw(10) << instance->get_id()
                 << std::setw(cw_name) << name
@@ -2050,7 +2065,10 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
         {
             if (!listed(instance.get()))
                 continue;
-            uint16_t port = instance->get_port();
+            // The port it will actually bind, not the raw zero an unset -p
+            // leaves: a server with no -p serves on 8000 and this column
+            // read "-".  See runtime_instance::effective_port().
+            uint16_t port = instance->effective_port();
             auto owner = instance->get_owner();
             bool first = true;
             auto col = [&](const std::string& v) { if (!first) out << '\t'; out << v; first = false; };
@@ -3287,6 +3305,36 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (!why.empty())
             {
                 conn->write_buf = "listen: " + why + "\n";
+                return 1;
+            }
+        }
+    }
+
+    // The port re-read raw, for the reason the listen field above is: the
+    // parser narrows it.  `cfg.port` is a uint16_t and parse_json_string fills
+    // it with `static_cast<uint16_t>(json_get_int(...))`, so 70000 arrives as
+    // 4464 and there is nothing left for anyone downstream to refuse -- the
+    // runtime is configured for a port nobody asked for and `show` reports it
+    // as though it had been typed.  The flag door has always refused the same
+    // input: parse_uint16() checks std::errc::result_out_of_range and prints
+    // "invalid port number".
+    //
+    // The typed-extra-digit case is exactly what the interactive editor makes
+    // likely, and that editor sends its buffer through here.
+    if (cfg.has("port"))
+    {
+        const std::string raw = m_persistence->raw_field(json_str, "port");
+        if (!raw.empty())
+        {
+            long long value = 0;
+            const auto [ptr, ec] = std::from_chars(
+                raw.data(), raw.data() + raw.size(), value);
+            if (ec != std::errc{} || ptr != raw.data() + raw.size()
+                || value < 0 || value > 65535)
+            {
+                conn->write_buf = "port: \"" + raw + "\" is not a port number "
+                                  "(1 to 65535, or 0 for this runtime type's "
+                                  "default)\n";
                 return 1;
             }
         }

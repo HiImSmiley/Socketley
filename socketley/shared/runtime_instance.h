@@ -346,6 +346,20 @@ public:
     // back.
     virtual void listen_addresses(std::vector<std::string>& /*out*/) const {}
 
+    // The port this runtime will actually bind, which is not always the one it
+    // was configured with: an unset -p means the type's default, and every
+    // listing surface printed the raw zero -- "-" in `ps`, "port": 0 in `ps
+    // --json` and in `stats` -- for a server that was serving on 8000.  An
+    // operator could not learn from any command which port their runtime was
+    // on.  Zero here means it binds no port at all.
+    //
+    // The same answer listen_addresses() is built from, so the number `ps`
+    // prints and the number the address check refuses on cannot drift apart.
+    // NOT what `show` prints: that document goes back into `import`, and
+    // writing 8000 into it would pin a runtime that was deliberately left to
+    // its default.
+    virtual uint16_t effective_port() const { return 0; }
+
     // Out of process -- a placeholder for a runtime in a worker this daemon
     // supervises -- distinct from external/managed, and it changes only that
     // start()/stop() must not touch the ring.

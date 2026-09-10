@@ -41,6 +41,15 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib_daemon.sh"
 
+# SOCKETLEY_CONFIG is the daemon's CONFIG PATH as well as run_all.sh's choice
+# of build, so a `SOCKETLEY_CONFIG=Sanitize` run leaves every daemon looking for
+# a config file called "Sanitize", finding none, and never reading metrics_port
+# -- and this whole file then measures an endpoint that was never opened.
+# test_metrics_endpoint.sh carries the full account of it and the same unset;
+# measured here, 8/8 without the variable and 5/8 with it.  run_all.sh has
+# already resolved it into BIN by now, so nothing downstream needs it.
+unset SOCKETLEY_CONFIG
+
 MPORT=$((SL_PORT_BASE+1860))
 P=$((SL_PORT_BASE+1862))
 RUNTIMES="mc_a mc_b"

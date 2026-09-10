@@ -201,6 +201,38 @@ PYEOF
 )
 check "and the directory is really served" "hello" "$BODY"
 
+# ─── 6. A port the document cannot hold is refused, not truncated ──────────
+# cfg.port is a uint16_t and parse_json_string fills it with
+# static_cast<uint16_t>(json_get_int(...)), so 70000 used to arrive as 4464 --
+# accepted, exit 0, and `show` reporting a port nobody typed.  Measured: 70000
+# -> 4464, -1 -> 65535.  The flag door has always refused the same input,
+# because parse_uint16() checks std::errc::result_out_of_range.
+#
+# The document is re-read raw here for the same reason `listen` already was:
+# once the parser has narrowed the value there is nothing left to judge.
+KEEP=$(field if_srv port)
+for BADPORT in 70000 -1 99999999999 notanumber; do
+    # `|| true` because reimport hands back the import's own status, and a
+    # refusal is a 1 -- which under `set -e` ends the file at the assignment,
+    # after the refusal it was checking has already been produced.
+    OUT=$(reimport if_srv "{'port':$( [ "$BADPORT" = notanumber ] && echo "'x'" || echo "$BADPORT" )}") || true
+    case "$OUT" in
+        *"is not a port number"*) ok ;;
+        *) bad "port $BADPORT is refused" "import said '${OUT:-<nothing>}'" ;;
+    esac
+done
+check "and the runtime kept the port it had" "$KEEP" "$(field if_srv port)"
+
+# The spelling that is fine still is, so the refusal is about the range and not
+# about the field.  Stopped first, because a RUNNING runtime refuses a port
+# change on its own and correctly -- "cannot change port while running" -- and
+# that refusal would hide whether the range check let this one through.
+"$BIN" stop if_srv >/dev/null 2>&1 || true
+sleep 0.3
+OUT=$(reimport if_srv "{'port':$((P_SRV+3))}") || true
+if [ -z "$OUT" ]; then ok; else bad "a port in range is accepted" "got '$OUT'"; fi
+check "and it moved" "$((P_SRV+3))" "$(field if_srv port)"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 [ "$FAIL" -eq 0 ]

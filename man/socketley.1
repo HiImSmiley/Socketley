@@ -1839,6 +1839,41 @@ depends on it: a link that never forms, or one whose peer has gone, costs the
 speed it would have saved and nothing else. Routed connections are pinned to
 whichever path they opened on and keep it for their whole life, because a
 message that changed route mid\-stream could arrive ahead of one sent before it.
+.SS Which port a runtime is on
+.BR ls ,
+.BR ps ,
+.B stats
+and the metrics endpoint report the port a runtime
+.I binds
+\(em which is not always the one it was configured with. A runtime created
+without
+.B \-p
+takes its type's default (8000 for a server, 8080 for a proxy, 9000 for a
+cache), and those surfaces used to print the configured zero: the
+.B PORT
+column read
+.BR \- ,
+.B ps \-\-json
+and
+.B stats
+read
+.BR 0 ,
+and no command would tell an operator which port their runtime was actually
+answering on.
+.PP
+.B show
+is deliberately not in that list. Its output is the state document, and it goes
+back in through
+.BR import ,
+so writing the default into it would pin a runtime that had been left to take
+whichever default its type has.
+.PP
+A runtime that binds no port at all \(em a client, a
+.BI \-\-listen " unix:"
+listener, a process registered with
+.BR attach ,
+or a server reachable only through its owner \(em reports
+.BR 0 .
 .SS One address, one runtime
 A runtime is refused a start when another runtime on this daemon is already
 serving the address it would bind \(em a TCP port, a UDP port, or a

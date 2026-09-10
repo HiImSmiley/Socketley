@@ -553,7 +553,10 @@ std::string metrics_endpoint::build_json_runtimes() const
             // Published, not live — see build_metrics().
             const shard_stats::figures f = rt->worker_figures();
             snapshots.push_back({name, rt->get_type(), rt->get_state(),
-                rt->get_port(),
+                // The bound port, the same one `ps` prints: an unset -p means
+                // the type's default, and this reported 0 for a runtime that
+                // was serving.
+                rt->effective_port(),
                 f.total_connections,
                 f.total_messages,
                 f.bytes_in,
@@ -616,7 +619,7 @@ std::string metrics_endpoint::build_json_runtime(std::string_view name) const
     j += "\",\"state\":\"";
     j += state_to_string(rt->get_state());
     j += "\",\"port\":";
-    json_append_uint(j, rt->get_port());
+    json_append_uint(j, rt->effective_port());
     j += ",\"connections\":";
     // Published, not live, and for a runtime in a worker summed out of its
     // shared table at this instant.

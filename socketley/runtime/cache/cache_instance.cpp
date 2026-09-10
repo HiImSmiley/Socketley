@@ -451,6 +451,17 @@ bool cache_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
 // can refuse a second claim on an address before a worker is forked to find
 // out.  Kept next to setup() because the two have to agree: an answer here
 // that setup() does not honour is a refusal nobody earned.
+// See server_instance::effective_port(): one number, two readers.  The
+// configured port, which is the one every shard binds and the one an operator
+// connects to -- the per-shard --cluster ports are counted up from it in
+// listen_addresses() and are not what `ps` is asked for.
+uint16_t cache_instance::effective_port() const
+{
+    if (!get_listen_path().empty())
+        return 0;
+    return get_port() ? get_port() : cache_default_port;
+}
+
 void cache_instance::listen_addresses(std::vector<std::string>& out) const
 {
     // A listen path and a port are mutually exclusive -- listen_config_refusal
@@ -465,7 +476,7 @@ void cache_instance::listen_addresses(std::vector<std::string>& out) const
 
     // get_shards() and not m_shard_n, because this is asked of the daemon's
     // placeholder, whose setup() has never run.
-    const uint16_t base   = get_port() ? get_port() : cache_default_port;
+    const uint16_t base   = effective_port();
     const uint32_t shards = get_shards() ? get_shards() : 1u;
 
     // Every shard binds the configured port through SO_REUSEPORT, which is
@@ -1357,10 +1368,25 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
 
     // Register fd in fixed file table for fget/fput-free I/O
     int slot = m_loop->alloc_fixed_file_slot();
-    if (slot >= 0 && m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+    if (slot >= 0)
     {
-        conn->fixed_idx = slot;
-        conn->direct_fd = true;
+        if (m_loop->update_registered_file(static_cast<uint32_t>(slot), client_fd))
+        {
+            conn->fixed_idx = slot;
+            conn->direct_fd = true;
+        }
+        else
+        {
+            // The slot is already marked used, so a slot that cannot be
+            // pointed at this fd has to go back at once: the connection never
+            // learns its number, and nothing else in the process holds it.
+            // Folded into one `&&` here, this leaked one of MAX_FIXED_FILES
+            // per failed registration until alloc returned -1 for every later
+            // connection and the cache dropped off the direct-descriptor path
+            // for the rest of its life, silently.  The server's copy of these
+            // eight lines has had this arm all along.
+            m_loop->free_fixed_file_slot(static_cast<uint32_t>(slot));
+        }
     }
 
     conn->cluster_port = from_cluster;

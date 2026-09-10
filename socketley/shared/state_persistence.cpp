@@ -1,4 +1,5 @@
 #include "state_persistence.h"
+#include <cstring>
 #include "runtime_instance.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
@@ -1113,9 +1114,30 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
     std::error_code ec;
     fs::remove(tmp_path, ec);
 
+    // ─── Said out loud, at every one of them ────────────────────────────────
+    // This function had four ways to fail and not a word for any of them, and
+    // both callers drop the bool -- writer_loop's `write_json(j.cfg); break;`
+    // and the was_running flip's `if (!write_state_file(...)) {}`.  So a state
+    // directory that was full or read-only produced a daemon that accepted
+    // `create`, answered 0, served traffic, and had never heard of the runtime
+    // at the next start, with nothing anywhere to say why.
+    //
+    // The reason the sibling check three hundred lines up already gives for
+    // logging is this same one: a runtime whose state cannot be stored will
+    // not come back.
+    //
+    // errno is taken BEFORE the cleanup, because fs::remove is a syscall too
+    // and would report the tidying rather than the failure.
+    const auto refuse = [&path](const char* step, const std::string& why) {
+        LOG_ERROR(("state file " + path.string() + ": " + step + " failed: " +
+                   why + " -- this runtime will not come back after a restart")
+                      .c_str());
+        return false;
+    };
+
     int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0)
-        return false;
+        return refuse("open", std::strerror(errno));
 
     size_t off = 0;
     while (off < bytes.size())
@@ -1125,9 +1147,10 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
             continue;
         if (n <= 0)
         {
+            const int err = errno;
             ::close(fd);
             fs::remove(tmp_path, ec);
-            return false;
+            return refuse("write", n == 0 ? "wrote nothing" : std::strerror(err));
         }
         off += static_cast<size_t>(n);
     }
@@ -1140,15 +1163,17 @@ static bool write_state_file(const fs::path& path, std::string_view bytes)
     // surfaces, and it stands in for the f.fail() the ofstream form tested.
     if (::close(fd) < 0)
     {
+        const int err = errno;
         fs::remove(tmp_path, ec);
-        return false;
+        return refuse("close", std::strerror(err));
     }
 
     fs::rename(tmp_path, path, ec);
     if (ec)
     {
+        const std::string why = ec.message();
         fs::remove(tmp_path, ec);
-        return false;
+        return refuse("rename", why);
     }
     return true;
 }

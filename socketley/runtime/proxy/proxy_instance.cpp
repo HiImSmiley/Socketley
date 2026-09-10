@@ -1316,6 +1316,14 @@ void proxy_instance::trace_splice_sweep()
 // can refuse a second claim on an address before a worker is forked to find
 // out.  Kept next to setup() because the two have to agree: an answer here
 // that setup() does not honour is a refusal nobody earned.
+// See server_instance::effective_port(): one number, two readers.
+uint16_t proxy_instance::effective_port() const
+{
+    if (!get_listen_path().empty())
+        return 0;
+    return get_port() ? get_port() : proxy_default_port;
+}
+
 void proxy_instance::listen_addresses(std::vector<std::string>& out) const
 {
     // A listen path and a port are mutually exclusive -- listen_config_refusal
@@ -1327,8 +1335,7 @@ void proxy_instance::listen_addresses(std::vector<std::string>& out) const
         return;
     }
 
-    out.push_back("tcp:" + std::to_string(get_port() ? get_port()
-                                                     : proxy_default_port));
+    out.push_back("tcp:" + std::to_string(effective_port()));
 }
 
 bool proxy_instance::setup(event_loop& loop)

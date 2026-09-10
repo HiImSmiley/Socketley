@@ -450,6 +450,7 @@ public:
 
     // What setup() will bind, answered without binding it; see the base class.
     void listen_addresses(std::vector<std::string>& out) const override;
+    uint16_t effective_port() const override;
 
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
