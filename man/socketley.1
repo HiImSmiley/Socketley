@@ -1277,6 +1277,13 @@ because
 is what the daemon had asked for and reported for the moment before the worker
 answered.
 .IP
+The path must be absolute. A relative one would be resolved against the
+.I daemon's
+working directory \(em wherever it was started, and
+.B /
+under systemd \(em so it is refused rather than written somewhere the operator
+would not think to look.
+.IP
 A path that cannot be opened or written is reported once, at
 .BR ERROR ,
 and then not again.
@@ -1300,6 +1307,10 @@ Unlike
 the bytes are not scrubbed of control characters. That scrubbing exists to stop
 a peer driving the operator's terminal with an escape sequence, and a file is
 not a terminal.
+.IP
+The path must be absolute, for
+.BR \-\-log 's
+reason above.
 .IP
 .B \-w
 takes effect on a runtime that is already serving, so

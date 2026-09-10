@@ -194,7 +194,12 @@ fi
 # backslash in the document for their loss to be visible.
 "$BIN" remove rt_bs >/dev/null 2>&1 || true
 "$BIN" create server rt_bs -p "$BS_PORT" --max-conn 66 --idle-timeout 34 >/dev/null 2>&1
-"$BIN" edit rt_bs --log 'C:\' >/dev/null 2>&1 || true
+# Absolute, because --log now refuses a relative path -- a relative one
+# resolves against the DAEMON's working directory, and this fixture used to
+# leave a file called C:\ in the repository root once --log started opening
+# the file it was given.  The fixture is about the trailing backslash in the
+# JSON and nothing else, so where it points does not matter.
+"$BIN" edit rt_bs --log "$WORK/C:\\" >/dev/null 2>&1 || true
 "$BIN" show rt_bs > "$WORK/bs-before.json"
 
 # The document really does contain the escaped backslash and the two fields

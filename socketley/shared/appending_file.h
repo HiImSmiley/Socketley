@@ -23,6 +23,36 @@
 namespace socketley
 {
 
+// Why `path` may not be written to, or empty if it may.
+//
+// Absolute only, for the reason unix_sock::path_refusal gives about socket
+// paths: a relative path resolves against the DAEMON's working directory,
+// which is wherever it happened to be started and is "/" under systemd.  An
+// operator who types `--log app.log` and then cannot find app.log has been
+// told nothing, which is the whole class of defect these two flags were fixed
+// out of.
+//
+// Found by a test that passes `--log 'C:\'` as a JSON-escaping fixture and has
+// nothing to do with logging: once --log actually opened its file, that left a
+// file called C:\ in the repository root.
+inline std::string appended_path_refusal(std::string_view flag,
+                                         std::string_view path)
+{
+    if (path.empty())
+        return {};   // not given is not the same as given wrong
+
+    if (path[0] != '/')
+        return std::string(flag) + " needs an absolute path (got \"" +
+               std::string(path) + "\"): a relative one is resolved against the "
+               "daemon's working directory, which is wherever it was started "
+               "and is \"/\" under systemd\n";
+
+    if (path.find('\0') != std::string_view::npos)
+        return std::string(flag) + " path contains a NUL byte\n";
+
+    return {};
+}
+
 class appending_file
 {
 public:
@@ -44,8 +74,17 @@ public:
         if (path == m_path)
             return;
         close();
-        m_failed = false;
-        m_path   = path;
+        m_path = path;
+
+        // Latched here rather than at the open, because the flag doors refuse
+        // a relative path and this is the backstop for every other route -- a
+        // state file written before that refusal existed, most of all.  The
+        // runtime keeps serving; a file it may not write is not a reason to
+        // stop carrying traffic.
+        const std::string why = appended_path_refusal(m_label, m_path);
+        m_failed = !why.empty();
+        if (m_failed)
+            LOG_ERROR(why.c_str());
     }
 
     std::string_view path() const { return m_path; }

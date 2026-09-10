@@ -2,6 +2,7 @@
 #include "../shared/duration_parse.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/unix_listener.h"
+#include "../shared/appending_file.h"
 #include "../shared/lua_context.h"
 #include "../shared/tls_context.h"
 #include <iostream>
@@ -151,6 +152,14 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "--log requires a file\n";
                 return 1;
             }
+            // Absolute only: a relative path is resolved against the
+            // daemon's working directory, not the operator's.
+            if (const std::string why = socketley::appended_path_refusal(
+                    "--log", pa.args[i + 1]); !why.empty())
+            {
+                std::cout << why;
+                return 1;
+            }
             instance->set_log_file(pa.args[++i]);
             return 0;
 
@@ -158,6 +167,14 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             if (i + 1 >= pa.count)
             {
                 std::cout << "-w requires a file\n";
+                return 1;
+            }
+            // Absolute only: a relative path is resolved against the
+            // daemon's working directory, not the operator's.
+            if (const std::string why = socketley::appended_path_refusal(
+                    "-w", pa.args[i + 1]); !why.empty())
+            {
+                std::cout << why;
                 return 1;
             }
             instance->set_write_file(pa.args[++i]);
@@ -1157,6 +1174,14 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "--log requires a file path\n";
                 return 1;
             }
+            // Absolute only: a relative path is resolved against the
+            // daemon's working directory, not the operator's.
+            if (const std::string why = socketley::appended_path_refusal(
+                    "--log", pa.args[i + 1]); !why.empty())
+            {
+                std::cout << why;
+                return 1;
+            }
             instance->set_log_file(pa.args[++i]);
             return 0;
 
@@ -1164,6 +1189,14 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
             if (i + 1 >= pa.count)
             {
                 std::cout << "-w requires a file path\n";
+                return 1;
+            }
+            // Absolute only: a relative path is resolved against the
+            // daemon's working directory, not the operator's.
+            if (const std::string why = socketley::appended_path_refusal(
+                    "-w", pa.args[i + 1]); !why.empty())
+            {
+                std::cout << why;
                 return 1;
             }
             instance->set_write_file(pa.args[++i]);

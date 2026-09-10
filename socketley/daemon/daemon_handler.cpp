@@ -23,6 +23,7 @@
 #include "../shared/endpoint_table.h"
 #include "../shared/worker_protocol.h"
 #include "../shared/runtime_config_apply.h"
+#include "../shared/appending_file.h"
 #include "../shared/ipc_framing.h"
 #include "../shared/shard_target.h"
 #include <sys/resource.h>
@@ -3480,6 +3481,24 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
 
     if (has("port"))              instance->set_port(cfg.port);
     if (has("listen"))            instance->set_listen_path(cfg.listen_path);
+    // The same absolute-path rule the flag doors apply, because a document is
+    // the other way in and a state file written before that rule existed is a
+    // third.
+    for (const auto& [key, flag, value] :
+         { std::tuple<const char*, const char*, const std::string&>
+               { "log_file",   "--log", cfg.log_file },
+           std::tuple<const char*, const char*, const std::string&>
+               { "write_file", "-w",    cfg.write_file } })
+    {
+        if (!has(key))
+            continue;
+        if (const std::string why = socketley::appended_path_refusal(flag, value);
+            !why.empty())
+        {
+            conn->write_buf = why;
+            return 1;
+        }
+    }
     if (has("log_file"))          instance->set_log_file(cfg.log_file);
     if (has("write_file"))        instance->set_write_file(cfg.write_file);
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);

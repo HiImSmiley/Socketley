@@ -200,6 +200,25 @@ sleep 0.5
 STATE=$("$BIN" ps -a 2>/dev/null | awk '$2=="sl_srv2" { print $7 }')
 check "the runtime still starts" "Up" "$STATE"
 
+# ─── 7b. A relative path is refused, at every door ─────────────────────────
+# Found by a test that passes `--log 'C:\'` as a JSON-escaping fixture: once
+# --log opened the file it was given, that left a file called C:\ in the
+# repository root.  A relative path resolves against the DAEMON's working
+# directory, which is wherever it was started and "/" under systemd.
+refuses_relative() {   # label -- then the command
+    local label=$1; shift
+    local out
+    out=$("$@" 2>&1) && { bad "$label" "accepted, output '$out'"; return; }
+    case "$out" in
+        *"needs an absolute path"*) ok ;;
+        *) bad "$label" "refused for the wrong reason: '$out'" ;;
+    esac
+}
+refuses_relative "create --log app.log" \
+    "$BIN" create server sl_rel -p "$((P_SRV+6))" --log app.log
+refuses_relative "edit --log app.log"   "$BIN" edit sl_srv --log app.log
+refuses_relative "edit -w rx.log"       "$BIN" edit sl_srv -w rx.log
+
 # ─── 8. The state names are the same ones every other surface prints ────────
 # state_to_string() had four copies -- lua_context, cluster_discovery,
 # metrics_endpoint and ps --json -- and this file was about to be the fifth.
