@@ -42,6 +42,7 @@ PB=$((SL_PORT_BASE+350))
 RPC_PORT=$((PB + 0))    # the script under test, in the daemon
 HTTP_PORT=$((PB + 1))   # what socketley.http dials
 MADE_PORT=$((PB + 2))   # the runtime the script creates and removes
+RAW_PORT=$((PB + 3))    # a peer that answers something that is not HTTP
 
 PASS=0; FAIL=0; TOTAL=0
 pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -161,6 +162,7 @@ ask() { python3 "$SOCKETLEY_TMPD/ask.py" "$1" "$2" "${3:-2.0}"; }
 RPC_LUA="$SOCKETLEY_TMPD/glob.lua"
 cat > "$RPC_LUA" <<LUAEOF
 local HTTP_URL = "http://127.0.0.1:$HTTP_PORT/probe.txt"
+local RAW_PORT = $RAW_PORT
 local MADE_PORT = $MADE_PORT
 LUAEOF
 cat >> "$RPC_LUA" <<'LUAEOF'
@@ -268,6 +270,31 @@ function on_client_message(id, msg)
     elseif cmd == "http404" then
         local r = socketley.http({ url = HTTP_URL .. ".missing", timeout_ms = 3000 })
         reply(id, "ok=" .. tostring(r.ok) .. " status=" .. tostring(r.status))
+
+    -- headers is the fourth optional key and was the one read with a
+    -- converting optional, which cannot tell "not given" from "given as the
+    -- wrong thing": a string where the man page documents a table was dropped
+    -- without a word and the request went without it.  method, body and
+    -- timeout_ms each answer by name.
+    elseif cmd == "http_hdr_bad" then
+        local r = socketley.http({ url = HTTP_URL, headers = "X-A: b", timeout_ms = 3000 })
+        reply(id, "ok=" .. tostring(r.ok) .. " err=[" .. tostring(r.error) .. "]")
+
+    -- And a real table still works, or refusing every headers value would
+    -- satisfy the case above.
+    elseif cmd == "http_hdr_good" then
+        local r = socketley.http({ url = HTTP_URL, headers = { ["X-A"] = "b" },
+                                   timeout_ms = 3000 })
+        reply(id, "ok=" .. tostring(r.ok) .. " status=" .. tostring(r.status))
+
+    -- An answer that is not HTTP left status at 0, ok false, and `error` the
+    -- empty string the result table is created with -- the one failure here
+    -- that named no reason.
+    elseif cmd == "http_nonhttp" then
+        local r = socketley.http({ url = "http://127.0.0.1:" .. RAW_PORT .. "/x",
+                                   timeout_ms = 3000 })
+        reply(id, "ok=" .. tostring(r.ok) .. " status=" .. tostring(r.status) ..
+                  " err=[" .. tostring(r.error) .. "]")
     end
 end
 LUAEOF
@@ -281,6 +308,32 @@ create_ok "RPC server created in the daemon" "$BIN" create server glob \
     -p "$RPC_PORT" --mode in --lua "$RPC_LUA" -s
 ready_tcp 127.0.0.1 "$RPC_PORT" 10 || echo "  NOTE: the RPC server never accepted"
 ready_http 127.0.0.1 "$HTTP_PORT" /probe.txt 15 || echo "  NOTE: the HTTP target never answered"
+
+# A peer that answers bytes and closes cleanly -- cleanly, because a reset is a
+# transfer error and would be reported as one, which is a different sentence
+# from the one this is about.
+# stdout and stderr to /dev/null, or this background process keeps the file's
+# own stdout open and anything reading the results through a pipe waits for it
+# rather than for the test.
+python3 - "$RAW_PORT" >/dev/null 2>&1 <<'RAWPY' &
+import socket, sys, threading, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8)
+def go():
+    while True:
+        try:
+            c, _ = s.accept()
+            c.sendall(b"not-an-http-response\n")
+            c.shutdown(socket.SHUT_WR)
+            time.sleep(0.4)
+            c.close()
+        except Exception:
+            return
+threading.Thread(target=go, daemon=True).start()
+time.sleep(60)
+RAWPY
+RAW_PID=$!
+sleep 0.5
 
 # ── 1. json_encode ─────────────────────────────────────────────────────────
 ENC=$(ask "$RPC_PORT" encode)
@@ -412,6 +465,28 @@ assert_eq "socketley.http() reports a non-2xx as not ok, with the status" \
           "ok=false status=404" "$(ask "$RPC_PORT" http404 4.0)" \
     "the status is the half that says the request was made and answered;" \
     "ok=false alone is also what a connection failure produces"
+
+# ── 7. the two answers socketley.http used to give without words ───────────
+R=$(ask "$RPC_PORT" http_hdr_bad 4.0)
+assert_has "a headers value of the wrong type is refused by name" \
+           "headers must be a table" "$R" \
+    "it was read with a converting optional, which answers nullopt for a wrong" \
+    "type exactly as it does for an absent key -- so the request went without" \
+    "the headers and said nothing" "got: $R"
+
+assert_eq "and a real headers table still reaches the server" \
+          "ok=true status=200" "$(ask "$RPC_PORT" http_hdr_good 4.0)"
+
+R=$(ask "$RPC_PORT" http_nonhttp 5.0)
+assert_has "an answer that is not HTTP says so" \
+           "not an HTTP response" "$R" \
+    "status stayed 0 and error stayed the empty string the result table is" \
+    "created with, so a script asking why got nothing" "got: $R"
+
+# Before the results line and not in the EXIT trap: a trap whose last command
+# is a kill -9 hands the file's exit status to the signal, and run_all.sh reads
+# that status.
+{ kill -9 "$RAW_PID"; wait "$RAW_PID"; } 2>/dev/null || true
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

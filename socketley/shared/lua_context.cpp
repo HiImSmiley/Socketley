@@ -1058,6 +1058,26 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         timeout_ms = static_cast<int>(d);
     }
 
+    // The fourth of the optional keys, checked here with the other three and
+    // not at the point of use.  A converting optional cannot tell "not given"
+    // from "given as the wrong thing", so headers = "Content-Type: text/plain"
+    // -- a string where the man page documents a table -- was dropped in
+    // silence and the request went without it.
+    //
+    // Before the socket, the resolver and the TLS context, because a refusal
+    // down there has three things to unwind and this one has none.
+    sol::optional<sol::table> hdrs;
+    if (sol::object o = opts["headers"]; o.valid() && o != sol::nil)
+    {
+        if (o.get_type() != sol::type::table)
+        {
+            result["error"] = "headers must be a table of string keys and "
+                              "string values";
+            return result;
+        }
+        hdrs = o.as<sol::table>();
+    }
+
     // Inside the callback's budget and not beside it, with remaining_ms() of
     // -1 leaving timeout_ms as the script wrote it.
     {
@@ -1228,7 +1248,6 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         req.append(cl_buf, static_cast<size_t>(cl_res.ptr - cl_buf));
         req.append("\r\n");
     }
-    sol::optional<sol::table> hdrs = opts["headers"].get<sol::optional<sol::table>>();
     if (hdrs) {
         (*hdrs).for_each([&](sol::object k, sol::object v) {
             if (k.is<std::string>() && v.is<std::string>())
@@ -1440,6 +1459,20 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             std::from_chars(ss.data(), ss.data() + ss.size(), status);
         }
     }
+    // A reason, where there was none.  `status` stays 0 when the answer is not
+    // an HTTP response -- an empty read, a peer that speaks something else, a
+    // TLS-only port -- and the table then said ok=false with `error` still the
+    // empty string it was created with, so a script asking why got nothing.
+    // Every other failure here names itself.
+    if (status == 0)
+    {
+        result["error"] = response.empty()
+            ? "the peer closed without sending anything"
+            : "the peer's answer is not an HTTP response (it begins \""
+              + response.substr(0, std::min<size_t>(response.size(), 32)) + "\")";
+        return result;
+    }
+
     auto body_start = response.find("\r\n\r\n");
     result["status"] = status;
     result["body"]   = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
@@ -2881,6 +2914,15 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         const bool has_val = val && val->valid()
                              && val->get_type() != sol::type::lua_nil
                              && val->get_type() != sol::type::none;
+        // The same rule the empty KEY gets three lines up, for the same
+        // reason: get_data() answers nil for an empty value, so storing one is
+        // a write that cannot be observed -- it reads back exactly as "never
+        // set" does, and the call answered true.
+        if (has_val && val->get_type() == sol::type::string
+            && val->as<std::string>().empty())
+            return api_why("the metadata value is empty, and get_data cannot "
+                           "tell that from a key that was never set; pass nil "
+                           "to delete the key");
         if (has_val && val->get_type() != sol::type::string)
             return api_why("the metadata value is a "
                            + std::string(lua_typename(

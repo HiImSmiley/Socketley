@@ -196,6 +196,17 @@ function on_client_message(id, msg)
     elseif cmd == "self_setdata_emptykey" then
         reply(id, two(self.set_data(id, "", "v")))
 
+    -- The same thing the empty KEY is refused for, on the value.  get_data
+    -- answers nil for an empty string, so a write of one reads back exactly as
+    -- "never set" does -- and the call used to answer true.  The second half
+    -- is what makes it a contract question rather than a preference: a value
+    -- that was there must survive the refusal.
+    elseif cmd == "self_setdata_emptyval" then
+        self.set_data(id, "ev", "ORIGINAL")
+        local ok, why = self.set_data(id, "ev", "")
+        reply(id, tostring(ok) .. "|" .. tostring(why) ..
+                  "|kept=" .. tostring(self.get_data(id, "ev")))
+
     elseif cmd == "self_setdata_live" then
         reply(id, two(self.set_data(id, "k", "v")))
 
@@ -351,6 +362,15 @@ R=$(ask "$RPC_PORT" self_setdata_emptykey)
 assert_has "self.set_data with an empty key is refused" "the metadata key is empty" "$R" \
     "get_data(\"\") answers nil whether it was set or not, so a write under" \
     "that key cannot be observed by anything" "got: $R"
+R=$(ask "$RPC_PORT" self_setdata_emptyval)
+assert_has "self.set_data with an empty value is refused too" \
+           "the metadata value is empty" "$R" \
+    "get_data answers nil for an empty string, so the write reads back exactly" \
+    "as a key that was never set -- and the call answered true" "got: $R"
+assert_has "and the value already stored under that key survives it" \
+           "kept=ORIGINAL" "$R" \
+    "a refusal that still cleared the key would pass the assertion above" "got: $R"
+
 assert_eq "self.set_data on a live connection answers true" \
           "true|nil" "$(ask "$RPC_PORT" self_setdata_live)"
 
