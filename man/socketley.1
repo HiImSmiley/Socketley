@@ -1813,9 +1813,9 @@ or when its listener is TLS, since a cleartext node beside an encrypted port
 would undo what the port was configured to give. A proxy keeps its port alone,
 and so does a cache with
 .BR \-\-shards :
-a path is one node and N processes would unlink each other's, the way
+a path is one node and N processes would unlink each other's, which is why
 .B \-\-listen
-is refused for shards. One rule decides both what the daemon publishes and what
+gives each shard a node of its own. One rule decides both what the daemon publishes and what
 a runtime binds, so a type that is not wired to a listener is never advertised
 as having one \(em a path published into thin air is a backend that is simply
 down. A proxy configured with backend TLS keeps TCP for the same reason, rather
@@ -2429,14 +2429,25 @@ only while the runtime is stopped, for the same reason
 .B \-p
 may.
 .PP
-.B "\-\-shards is refused with \-\-listen."
+.B "\-\-shards gives each shard a node of its own."
 .B SO_REUSEPORT
-is not what a unix socket does, so
+is not what a unix socket does \(em
 .I N
-processes on one
-.B "\-\-listen unix:"
-path would unlink each other's node and only the last to bind would be
-reachable. Both are refused rather than accepted and quietly ignored. See
+processes binding one path would unlink each other's node and only the last
+would be reachable \(em so the path is not shared. A base of
+.I /run/app.sock
+becomes
+.IR /run/app#0.sock ,
+.IR /run/app#1.sock ,
+and so on, one per shard, and a caller picks any of them. A base with no
+.B .sock
+on the end gets the index appended instead.
+.PP
+Refused only when the longest of those names would not fit: the kernel's limit
+is on the node, and a shard whose name is truncated is a shard nothing can
+reach. The refusal names that longest member.
+.PP
+See
 .B Sharding
 under
 .B PROXY FLAGS
@@ -2713,10 +2724,12 @@ Serve the proxy's front door on an AF_UNIX socket instead of
 The full treatment is
 .B \-\-listen
 under
-.BR "COMMON FLAGS" ;
-refused with
+.BR "COMMON FLAGS" .
+With
 .B \-\-shards
-(SO_REUSEPORT is not a path).
+each shard binds a node of its own,
+.IR base#N.sock ,
+because SO_REUSEPORT is not a path.
 .TP
 .BI "\-\-backend " "addr"
 .B A hostname is resolved off the request path.
