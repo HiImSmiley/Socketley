@@ -6384,6 +6384,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
             if (SOCKETLEY_UNLIKELY(m_shard_n > 1))
             { rb.append("error: blpop is not available on a sharded cache\n", 48); return; }
+            // A blocking pop parks a waiter on a CONNECTION and answers it
+            // when a push arrives.  A cross-runtime request has none: it is
+            // served on the scratch connection, which has no descriptor, and
+            // the ticket it belongs to is answered and gone long before any
+            // push could wake it.  Measured before this: the caller got an
+            // empty answer and exit 0, which reads exactly like "the list was
+            // empty" -- and the waiter and its 100 ms timer stayed behind.
+            if (SOCKETLEY_UNLIKELY(conn == m_request_conn.get()))
+            { rb.append("error: blpop needs a connection to wait on, and a "
+                        "cross-runtime request has none\n", 79); return; }
             // Collected first, because the last word is the timeout and the
             // ones before it are the keys.
             std::vector<std::string_view> parts;
@@ -9285,6 +9295,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp::encode_error_code_into(rb,
                     "ERR BLPOP is not available on a sharded cache -- a waiting "
                     "client and the key it waits on can be in two processes");
+                break;
+            }
+            // And the other thing a waiter needs: a connection.  See the line
+            // protocol's copy of this for what an unguarded one answered.
+            if (SOCKETLEY_UNLIKELY(conn == m_request_conn.get()))
+            {
+                resp::encode_error_code_into(rb,
+                    "ERR BLPOP needs a connection to wait on, and a "
+                    "cross-runtime request has none");
                 break;
             }
             const bool from_head = (cmd_hash == fnv1a("blpop"));

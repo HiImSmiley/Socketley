@@ -177,6 +177,27 @@ case "$got" in *':1'*) ok "the push after the disconnect is served normally" ;;
 case "$got" in *':1'*':1'*) ok "and the element stayed in the list" ;;
                *) bad "disconnect" "the element went somewhere" "got: $got" ;; esac
 
+echo "--- 6b. a cross-runtime request has no connection to wait on ---"
+# A blocking pop parks a waiter on a CONNECTION and answers it when a push
+# arrives.  A request that crosses from another runtime is served on the cache's
+# scratch connection, which has no descriptor, and the ticket it belongs to is
+# answered and gone long before any push could wake it.
+#
+# Measured before this was refused: `socketley <cache> blpop key 0` answered
+# NOTHING and exited 0, which reads exactly like "the list was empty" -- and at
+# timeout 0 the waiter and its 100 ms timer stayed behind for good.
+RC=0
+OUT=$(timeout 10 "$BIN" bp_c blpop bp_nosuch 0 2>&1) || RC=$?
+if [ "$RC" -ne 0 ]; then ok "a blocking pop over a crossing is refused"
+else bad "crossing" "it answered '$OUT' and exited 0, which is what an empty list looks like"; fi
+case "$OUT" in *"connection to wait on"*) ok "and says what is missing" ;;
+    *) bad "crossing" "the refusal does not name the reason" "got: $OUT" ;; esac
+
+# The pairing that keeps this honest is already section 3 above -- a push wakes
+# a waiting client -- and it runs on the same cache, so refusing every blpop
+# would turn it red.  A second, worse-built copy of it here would only be one
+# more thing to get wrong.
+
 echo "--- 7. sharded is refused by name ---"
 "$BIN" create cache bp_s -p "$PS" --shards 4 --cluster -s >/dev/null 2>&1
 for _ in $(seq 1 80); do
