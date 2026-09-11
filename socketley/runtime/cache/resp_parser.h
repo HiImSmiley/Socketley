@@ -350,6 +350,22 @@ inline parse_result parse_message_views(std::string_view buf,
         if (count == 0)
             return parse_result::error;
 
+        // More words than there is room for is a REFUSAL, which is what the
+        // array form of the same command already answers -- "too many
+        // arguments in one command (limit N)".  The loop above stops AT
+        // max_args and fell through to ok, so the command ran short and
+        // nothing said so.
+        //
+        // Measured on a RESP connection, an inline DEL of 1200 keys: reply
+        // :1023, an integer and not an error, and DBSIZE 177 -- a hundred and
+        // seventy-seven keys the caller had asked to delete, still there.  The
+        // same DEL as a RESP array is refused outright.  MSET happens to be
+        // caught, but only because truncating an even list leaves an odd one.
+        while (p < end && *p == ' ')
+            ++p;
+        if (p < end)
+            return parse_result::too_many_args;
+
         argc = count;
         consumed = static_cast<size_t>(crlf - data) + 2;
         return parse_result::ok;

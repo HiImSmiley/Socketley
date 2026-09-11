@@ -77,6 +77,36 @@ out['overarity'] = probe(enc(['DEL'] + ['d:%d' % i for i in range(2000)]))
 # One under the ceiling still works, so the refusal is a ceiling and not a
 # wholesale rejection of long commands.
 out['atlimit']  = probe(enc(['DEL'] + ['d:%d' % i for i in range(1000)]))
+# The SAME ceiling, asked the other way the protocol allows.  An inline command
+# -- words on one line, which RESP accepts alongside arrays -- was parsed with a
+# loop that stopped AT the limit and then returned ok, so the command ran short
+# and nothing said so.  DEL is the shape with teeth: a truncated key list is
+# still a valid DEL.
+#
+# The keys have to BE there, or EXISTS below answers 0 whatever happened and the
+# assertion measures nothing.  In chunks, because 1200 pairs is 2401 arguments
+# and would hit the very ceiling this is about.
+for base in range(0, 1200, 400):
+    pairs = []
+    for i in range(base, base + 400):
+        pairs += ['i:%d' % i, 'v']
+    probe(enc(['MSET'] + pairs), 1.0)
+out['inline_pre']  = probe(enc(['EXISTS', 'i:1199']))
+out['inline_over'] = probe(enc(['PING'])
+                           + (b'DEL ' + b' '.join(b'i:%d' % i for i in range(1200))
+                              + b'\r\n'))
+# The keys it was asked to delete, counted afterwards on a connection that knows
+# nothing about any of it.  Before the fix: reply :1023, an integer and not an
+# error, and 177 of them still here.
+# i:0 and NOT i:1199.  The truncation kept the FIRST 1023 keys and deleted
+# them, so a key past that point survives either way and would pass this on a
+# broken tree.  The first key is the one the two outcomes disagree about.
+out['inline_left'] = probe(enc(['EXISTS', 'i:0']))
+# One under the ceiling on the same path, so this too is a ceiling and not a
+# dislike of inline commands.
+out['inline_at']   = probe(enc(['PING'])
+                           + (b'DEL ' + b' '.join(b'j:%d' % i for i in range(1000))
+                              + b'\r\n'))
 # And a good conversation on a fresh connection is untouched by any of it.
 out['healthy']  = probe(enc(['SET', 'pe', '1']) + enc(['GET', 'pe']))
 print(json.dumps(out))
@@ -115,6 +145,34 @@ case "$(val atlimit)" in *':0'*) ok "1000 arguments are accepted and answered" ;
     *) bad "atlimit" "a command under the ceiling was refused" "got: $(val atlimit | head -c 80)" ;; esac
 case "$(val healthy)" in *'+OK'*'$1'*'1'*) ok "an ordinary conversation is unaffected" ;;
     *) bad "healthy" "SET/GET did not work" "got: $(val healthy | head -c 80)" ;; esac
+
+echo "--- 4. and the same ceiling the other way the protocol allows ---"
+# RESP takes words on a line as well as arrays, and that path had its own loop:
+# it stopped AT the limit and returned ok, so the command ran short.  Measured
+# before the fix, an inline DEL of 1200 keys on a RESP connection answered
+# :1023 -- an integer, not an error -- and DBSIZE read 177.  A hundred and
+# seventy-seven keys the caller had asked to delete, still there, under a reply
+# that looked like success.  The array form of the same DEL is refused.
+# The fixture first: without the keys in the store, EXISTS answers 0 whether the
+# command was refused or ran, and the assertion below is about nothing.
+case "$(val inline_pre)" in *':1'*) ok "the 1200 keys are in the store to begin with" ;;
+    *) bad "inline_pre" "the fixture never wrote them" \
+           "EXISTS i:1199 said '$(val inline_pre | head -c 40)'" ;; esac
+
+V=$(val inline_over)
+case "$V" in
+    *"too many arguments"*) ok "an inline command past the ceiling is refused too" ;;
+    *':1023'*) bad "inline_over" "it ran short and answered an integer" \
+                   "got: ${V:0:80} -- the array form of this is refused" ;;
+    '') bad "inline_over" "the connection closed with no reply" ;;
+    *) bad "inline_over" "unexpected reply" "got: ${V:0:80}" ;;
+esac
+case "$(val inline_left)" in *':1'*) ok "and not one of its keys was deleted" ;;
+    *) bad "inline_left" "a refused command deleted part of what it named" \
+           "EXISTS i:0 said '$(val inline_left | head -c 40)'" ;; esac
+case "$(val inline_at)" in *':0'*) ok "while 1000 inline arguments still work" ;;
+    *) bad "inline_at" "an inline command under the ceiling was refused" \
+           "got: $(val inline_at | head -c 80)" ;; esac
 
 echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
