@@ -3528,10 +3528,21 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         renamed = true;
     }
 
-    // Validate changes that require restart
+    // ─── Changes that need a restart ────────────────────────────────────────
+    // Each of these asks cfg.has(key) first, because a field the document does
+    // not mention is left alone -- the rule the page states for import and the
+    // rule the apply below already follows: `if (has("port")) set_port(...)`.
+    //
+    // Without it these read the parser's DEFAULT as the operator's intent. A
+    // partial document -- the shape import exists for -- carries port 0,
+    // listen "", tls false, and a runtime running on any port was answered
+    // "cannot change port while running" for a change nobody asked for.
+    // Measured: {"name":"x","max_connections":42} against a running server on
+    // 26978 was refused; the identical document on the same runtime stopped
+    // was applied and left the port at 26978.
     if (is_running)
     {
-        if (cfg.port != instance->get_port())
+        if (cfg.has("port") && cfg.port != instance->get_port())
         {
             conn->write_buf = "cannot change port while running\n";
             return 1;
@@ -3539,19 +3550,19 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         // The listener's other spelling under the same rule, because a running
         // server is bound to the socket node it has and moving it would leave
         // that node for a teardown that never came.
-        if (cfg.listen_path != std::string(instance->get_listen_path()))
+        if (cfg.has("listen") && cfg.listen_path != std::string(instance->get_listen_path()))
         {
             conn->write_buf = "cannot change the listen socket while running\n";
             return 1;
         }
         // The same rule as the port above, because applying it to a running
         // proxy would retire workers out from under live connections.
-        if (cfg.shards != instance->get_shards())
+        if (cfg.has("shards") && cfg.shards != instance->get_shards())
         {
             conn->write_buf = "cannot change the shard count while running\n";
             return 1;
         }
-        if (cfg.tls != instance->get_tls())
+        if (cfg.has("tls") && cfg.tls != instance->get_tls())
         {
             conn->write_buf = "cannot change TLS while running\n";
             return 1;
@@ -3559,7 +3570,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (type == runtime_server || type == runtime_client)
         {
             bool cur_udp = instance->is_udp();
-            if (cfg.udp != cur_udp)
+            if (cfg.has("udp") && cfg.udp != cur_udp)
             {
                 conn->write_buf = "cannot change protocol while running\n";
                 return 1;
@@ -3567,7 +3578,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         }
         if (type == runtime_client)
         {
-            if (cfg.target != std::string(instance->get_target()))
+            if (cfg.has("target") && cfg.target != std::string(instance->get_target()))
             {
                 conn->write_buf = "cannot change target while running\n";
                 return 1;
@@ -3576,7 +3587,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (type == runtime_proxy)
         {
             auto* prx = static_cast<proxy_instance*>(instance);
-            if (cfg.protocol != static_cast<uint8_t>(prx->get_protocol()))
+            if (cfg.has("protocol") && cfg.protocol != static_cast<uint8_t>(prx->get_protocol()))
             {
                 conn->write_buf = "cannot change protocol while running\n";
                 return 1;
@@ -3585,7 +3596,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         if (type == runtime_cache)
         {
             auto* cache = static_cast<cache_instance*>(instance);
-            if (cfg.resp_forced != cache->get_resp_forced())
+            if (cfg.has("resp_forced") && cfg.resp_forced != cache->get_resp_forced())
             {
                 conn->write_buf = "cannot change RESP mode while running\n";
                 return 1;
@@ -3593,7 +3604,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             // A running cluster has already published its map, so every client
             // holding it would keep sending keys to ports that had stopped
             // answering.
-            if (cfg.cluster != cache->get_cluster())
+            if (cfg.has("cluster") && cfg.cluster != cache->get_cluster())
             {
                 conn->write_buf = "cannot change cluster mode while running\n";
                 return 1;

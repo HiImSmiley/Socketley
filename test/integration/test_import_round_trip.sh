@@ -233,6 +233,55 @@ else
     bad "ls --json is not valid JSON"
 fi
 
+# ── A PARTIAL DOCUMENT AGAINST A RUNNING RUNTIME ────────────────────────────
+#
+# "A field the document does not mention is left alone. Only what is named is
+# applied, so a partial document changes only those fields." The apply below
+# follows that -- every setter is `if (has(key))` -- and the restart checks
+# above it did not: they compared cfg.port, cfg.tls, cfg.shards and four more
+# against the instance, and a field the document omits arrives as the PARSER'S
+# DEFAULT.  So port 0 read as "change the port to 0" and a runtime running on
+# any port at all was answered
+#
+#     cannot change port while running
+#
+# for a change nobody had asked for.  Measured: the identical document applied
+# cleanly against the same runtime stopped, and left the port where it was --
+# which is what says it is the check and not the document.
+RP=$((SL_PORT_BASE+826))
+"$BIN" remove rt_run >/dev/null 2>&1 || true
+"$BIN" create server rt_run -p "$RP" -s >/dev/null 2>&1
+sleep 0.8
+
+RC=0
+OUT=$("$BIN" import rt_run '{"name":"rt_run","max_connections":42}' 2>&1) || RC=$?
+assert_rc "a partial document is applied to a running runtime" 0 "$RC"
+assert_contains "and the field it named took" \
+    "$("$BIN" show rt_run 2>/dev/null)" '"max_connections": 42'
+assert_contains "while the port it did not name is untouched" \
+    "$("$BIN" show rt_run 2>/dev/null)" "\"port\": $RP"
+
+# The other half, or a build that had simply dropped the checks would pass
+# everything above: a document that NAMES a different value for one of them is
+# still refused, by its own sentence.
+RC=0; OUT=$("$BIN" import rt_run "{\"name\":\"rt_run\",\"port\":$((RP+5))}" 2>&1) || RC=$?
+assert_rc "a port the document does name is still refused while running" 1 "$RC"
+assert_contains "with the sentence that belongs to it" "$OUT" "cannot change port while running"
+
+RC=0; OUT=$("$BIN" import rt_run '{"name":"rt_run","shards":4}' 2>&1) || RC=$?
+assert_rc "and so is a shard count" 1 "$RC"
+assert_contains "with its own" "$OUT" "cannot change the shard count while running"
+
+RC=0; OUT=$("$BIN" import rt_run '{"name":"rt_run","udp":true}' 2>&1) || RC=$?
+assert_rc "and a protocol" 1 "$RC"
+
+# Naming the value it already has is not a change and must not be read as one.
+RC=0; OUT=$("$BIN" import rt_run "{\"name\":\"rt_run\",\"port\":$RP}" 2>&1) || RC=$?
+assert_rc "naming the port it already has is accepted" 0 "$RC"
+
+"$BIN" stop rt_run >/dev/null 2>&1 || true
+"$BIN" remove rt_run >/dev/null 2>&1 || true
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
