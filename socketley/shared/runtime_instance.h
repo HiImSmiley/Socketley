@@ -236,8 +236,25 @@ public:
     // Refresh both, event-loop thread only, with the get_stats() string built
     // before the lock so the lock covers a move and nobody waits on string
     // construction.
+    //
+    // Nothing at all for a runtime whose figures are its worker's.  Both of
+    // these were written for an in-process runtime and neither is true of a
+    // placeholder: get_connection_count() walks containers that are empty
+    // here, and get_stats() for a worker-backed runtime is
+    //
+    //     stats_prefix() + stat_detail_snapshot()
+    //
+    // -- so storing its result back into m_stat_detail prepends a whole prefix
+    // block to the text on every health tick.  While a worker is pushing,
+    // set_worker_stats() overwrites it and nothing shows; once it stops
+    // pushing, nothing does.  Measured with the metrics endpoint on, a stopped
+    // runtime's `stats` text: 235 bytes, then 865, then 1495 over 24 seconds,
+    // by then thirteen name: blocks stacked on top of each other.
     void publish_offthread_stats()
     {
+        if (worker_backed())
+            return;
+
         m_stat_active_connections.store(static_cast<uint64_t>(get_connection_count()),
                                         std::memory_order_relaxed);
         std::string detail = get_stats();
