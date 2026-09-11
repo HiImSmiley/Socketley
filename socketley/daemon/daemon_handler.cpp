@@ -3094,39 +3094,137 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     // What the runtime's TLS configuration was before this edit, because the
     // flags only mean anything as a set and an incomplete one has to leave no
     // trace.
-    const bool        tls_before  = instance->get_tls();
-    const std::string cert_before(instance->get_cert_path());
-    const std::string key_before(instance->get_key_path());
-    const std::string ca_before(instance->get_ca_path());
-    // The same rule for the same reason, one set along: --shards and --listen
-    // are only meaningful together, and a pair that comes out incompatible has
-    // to leave the runtime exactly as it found it.
-    const uint32_t    shards_before = instance->get_shards();
-    const std::string listen_before(instance->get_listen_path());
-    // The proxy's half of the same set, whose backend leg is as much a set as
-    // the listener's.
-    std::string_view mca_v, mcert_v, mkey_v;
-    instance->get_mesh_tls_paths(mca_v, mcert_v, mkey_v);
-    const std::string mesh_ca_before(mca_v), mesh_cert_before(mcert_v),
-                      mesh_key_before(mkey_v);
-    // And the server's, which is four flags deciding one question: --mode says
-    // what this runtime is, and --send-to, --udp and --master-pw each mean
-    // something only in some of the answers.  `edit` accepts all four, so it
-    // can complete an incompatible set that `create` would have refused --
-    // measured: a legal master server edited to `--mode inout` kept its
-    // password and relayed it to the other connections again.
-    server_mode mode_before      = mode_inout;
-    uint8_t     send_to_before   = send_to_unset;
-    bool        udp_before       = false;
-    std::string master_pw_before;
+    // ─── Everything an edit can change, before the first flag is applied ────
+    //
+    // The parsers apply as they parse, so a refusal on the fourth flag left
+    // the first three in the runtime.  Measured:
+    //
+    //   edit x --max-connections 3 --bogus-flag    -> "unknown flag", exit 1,
+    //                                                 max_connections now 3
+    //   edit x --rate-limit 9 --max-connections -1 -> "invalid value", exit 1,
+    //                                                 rate_limit now 9
+    //   edit c --max-connections 3 --maxmemory 100 -> refused, exit 1,
+    //                                                 max_connections now 3
+    //
+    // The operator is told no and has no reason to look.  And it is not even
+    // stored: save_runtime() is past every one of those returns, so `show`
+    // reported the new value and the next boot read the old one.
+    //
+    // Three of these fields were already captured here, in three separate
+    // blocks, each for its own refusal -- the TLS set, --shards with --listen,
+    // and the server's four.  A fourth place needing the same thing is what
+    // says it belongs in one.  A field missed from this list stays changed,
+    // which is exactly what it did before, so the failure mode is the status
+    // quo rather than something worse.
+    struct edit_snapshot
+    {
+        bool        tls{false};
+        std::string cert, key, ca;
+        std::string mesh_ca, mesh_cert, mesh_key;
+        uint32_t    shards{1};
+        std::string listen;
+        uint16_t    port{0};
+        uint32_t    max_conns{0}, idle_timeout{0};
+        double      rate_limit{0.0}, global_rate_limit{0.0};
+        std::string group, log_file, write_file;
+        bool        bash_output{false}, bash_prefix{false}, bash_timestamp{false};
+        server_mode mode{mode_inout};
+        uint8_t     send_to{send_to_unset};
+        bool        udp{false};
+        std::string master_pw, cache_name, http_dir;
+        bool        http_cache{false};
+        client_mode cmode{client_mode_inout};
+        std::string target;
+    } before;
+
+    before.tls        = instance->get_tls();
+    before.cert       = std::string(instance->get_cert_path());
+    before.key        = std::string(instance->get_key_path());
+    before.ca         = std::string(instance->get_ca_path());
+    {
+        std::string_view mca_v, mcert_v, mkey_v;
+        instance->get_mesh_tls_paths(mca_v, mcert_v, mkey_v);
+        before.mesh_ca   = std::string(mca_v);
+        before.mesh_cert = std::string(mcert_v);
+        before.mesh_key  = std::string(mkey_v);
+    }
+    before.shards     = instance->get_shards();
+    before.listen     = std::string(instance->get_listen_path());
+    before.port       = instance->get_port();
+    before.max_conns  = instance->get_max_connections();
+    before.idle_timeout      = instance->get_idle_timeout();
+    before.rate_limit        = instance->get_rate_limit();
+    before.global_rate_limit = instance->get_global_rate_limit();
+    before.group      = std::string(instance->get_group());
+    before.log_file   = std::string(instance->get_log_file());
+    before.write_file = std::string(instance->get_write_file());
+    before.bash_output    = instance->get_bash_output();
+    before.bash_prefix    = instance->get_bash_prefix();
+    before.bash_timestamp = instance->get_bash_timestamp();
     if (type == runtime_server)
     {
         const auto* srv_b = static_cast<const server_instance*>(instance);
-        mode_before      = srv_b->get_mode();
-        send_to_before   = srv_b->get_send_to();
-        udp_before       = srv_b->is_udp();
-        master_pw_before = std::string(srv_b->get_master_pw());
+        before.mode       = srv_b->get_mode();
+        before.send_to    = srv_b->get_send_to();
+        before.udp        = srv_b->is_udp();
+        before.master_pw  = std::string(srv_b->get_master_pw());
+        before.cache_name = std::string(srv_b->get_cache_name());
+        before.http_dir   = srv_b->get_http_dir().string();
+        before.http_cache = srv_b->get_http_cache();
     }
+    else if (type == runtime_client)
+    {
+        const auto* cli_b = static_cast<const client_instance*>(instance);
+        before.cmode  = cli_b->get_mode();
+        before.udp    = cli_b->is_udp();
+        before.target = std::string(cli_b->get_target());
+    }
+
+    const auto restore_edit = [&]
+    {
+        instance->set_tls(before.tls);
+        instance->set_cert_path(before.cert);
+        instance->set_key_path(before.key);
+        instance->set_ca_path(before.ca);
+        instance->set_shards(before.shards);
+        instance->set_listen_path(before.listen);
+        instance->set_port(before.port);
+        instance->set_max_connections(before.max_conns);
+        instance->set_idle_timeout(before.idle_timeout);
+        instance->set_rate_limit(before.rate_limit);
+        instance->set_global_rate_limit(before.global_rate_limit);
+        instance->set_group(before.group);
+        instance->set_log_file(before.log_file);
+        instance->set_write_file(before.write_file);
+        instance->set_bash_output(before.bash_output);
+        instance->set_bash_prefix(before.bash_prefix);
+        instance->set_bash_timestamp(before.bash_timestamp);
+        if (type == runtime_proxy)
+        {
+            auto* prx_r = static_cast<proxy_instance*>(instance);
+            prx_r->set_mesh_client_ca(before.mesh_ca);
+            prx_r->set_mesh_client_cert(before.mesh_cert);
+            prx_r->set_mesh_client_key(before.mesh_key);
+        }
+        else if (type == runtime_server)
+        {
+            auto* srv_r = static_cast<server_instance*>(instance);
+            srv_r->set_mode(before.mode);
+            srv_r->set_send_to(before.send_to);
+            srv_r->set_udp(before.udp);
+            srv_r->set_master_pw(before.master_pw);
+            srv_r->set_cache_name(before.cache_name);
+            srv_r->set_http_dir(before.http_dir);
+            srv_r->set_http_cache(before.http_cache);
+        }
+        else if (type == runtime_client)
+        {
+            auto* cli_r = static_cast<client_instance*>(instance);
+            cli_r->set_mode(before.cmode);
+            cli_r->set_udp(before.udp);
+            cli_r->set_target(before.target);
+        }
+    };
 
     for (size_t i = 2; i < pa.count; ++i)
     {
@@ -3174,6 +3272,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
             if (is_cache_flag && type == runtime_cache)
             {
+                restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
                              "  A cache's own settings are applied by `import`:\n"
                              "    socketley show " << name
@@ -3182,27 +3281,23 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 return 1;
             }
 
+            restore_edit();
             std::cout << "unknown flag: " << pa.args[i] << "\n";
             return 1;
         }
 
+        // A parser's own refusal -- a value out of range, a flag that does not
+        // apply to this type -- which has already printed why.
         if (result > 0)
+        {
+            restore_edit();
             return result;
+        }
     }
 
     if (const std::string msg = instance_tls_refusal(instance); !msg.empty())
     {
-        instance->set_tls(tls_before);
-        instance->set_cert_path(cert_before);
-        instance->set_key_path(key_before);
-        instance->set_ca_path(ca_before);
-        if (type == runtime_proxy)
-        {
-            auto* prx = static_cast<proxy_instance*>(instance);
-            prx->set_mesh_client_ca(mesh_ca_before);
-            prx->set_mesh_client_cert(mesh_cert_before);
-            prx->set_mesh_client_key(mesh_key_before);
-        }
+        restore_edit();
         std::cout << msg;
         return 1;
     }
@@ -3212,8 +3307,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     // the same way.
     if (const std::string msg = instance_shards_refusal(instance); !msg.empty())
     {
-        instance->set_shards(shards_before);
-        instance->set_listen_path(listen_before);
+        restore_edit();
         std::cout << msg;
         return 1;
     }
@@ -3226,11 +3320,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         const std::string msg = instance_server_mode_refusal(instance);
         if (!msg.empty())
         {
-            auto* srv_r = static_cast<server_instance*>(instance);
-            srv_r->set_mode(mode_before);
-            srv_r->set_send_to(send_to_before);
-            srv_r->set_udp(udp_before);
-            srv_r->set_master_pw(master_pw_before);
+            restore_edit();
             std::cout << msg;
             return 1;
         }
