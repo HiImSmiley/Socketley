@@ -288,6 +288,64 @@ inline std::string ws_frame_text(std::string_view payload)
     return ws_frame_data(static_cast<uint8_t>(0x80 | WS_OP_TEXT), payload);
 }
 
+// Whether a payload may travel in a TEXT frame at all.
+//
+// RFC 6455 5.6: a text frame's payload MUST be valid UTF-8, and 8.1 says a
+// receiver that finds it is not MUST fail the connection.  So this is not a
+// preference between two framings -- for bytes that are not valid UTF-8, binary
+// is the only conforming one.
+//
+// Measured on a relaying server before this was asked: a client sent a BINARY
+// frame carrying ff fe 00 01 80 81, the other client received opcode 0x1 with
+// those bytes intact, and a conforming client must close on them.
+//
+// The ASCII pass first because it is what every relayed line is: one branch per
+// byte, no state, and the decoder below only runs once a high bit appears.
+inline bool ws_payload_is_utf8(std::string_view p)
+{
+    size_t i = 0;
+    const size_t n = p.size();
+    const auto* b = reinterpret_cast<const unsigned char*>(p.data());
+
+    while (i < n && b[i] < 0x80)
+        ++i;
+    if (i == n)
+        return true;
+
+    while (i < n)
+    {
+        const unsigned char c = b[i];
+        size_t need;
+        unsigned int cp;
+        if (c < 0x80)        { ++i; continue; }
+        else if (c < 0xC2)   return false;              // continuation, or an overlong lead
+        else if (c < 0xE0)   { need = 1; cp = c & 0x1Fu; }
+        else if (c < 0xF0)   { need = 2; cp = c & 0x0Fu; }
+        else if (c < 0xF5)   { need = 3; cp = c & 0x07u; }
+        else                 return false;              // beyond U+10FFFF
+
+        // The continuation bytes have to be there: i+1 .. i+need.
+        if (i + need >= n)
+            return false;                               // truncated sequence
+
+        for (size_t k = 1; k <= need; ++k)
+        {
+            const unsigned char cc = b[i + k];
+            if ((cc & 0xC0u) != 0x80u)
+                return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        // Overlong, surrogate, and out of range -- each of which some decoder
+        // somewhere accepts and the standard does not.
+        if (need == 2 && cp < 0x800u)                 return false;
+        if (need == 3 && cp < 0x10000u)               return false;
+        if (cp >= 0xD800u && cp <= 0xDFFFu)           return false;
+        if (cp > 0x10FFFFu)                            return false;
+        i += need + 1;
+    }
+    return true;
+}
+
 // Create binary frame, for a payload RFC 6455 5.6 would require be valid UTF-8
 // in a text frame.
 inline std::string ws_frame_binary(std::string_view payload)

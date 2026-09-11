@@ -4100,7 +4100,12 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
                 std::string_view payload(*msg);
                 if (!payload.empty() && payload.back() == '\n')
                     payload.remove_suffix(1);
-                ws_msg = ws_frame_text_shared(payload);
+                // Text only if the bytes may travel in one; see queue_send()
+                // for the rule and the measurement.  Built once for every
+                // websocket in the set, as the text frame always was -- the
+                // question is about the payload and not about the recipient.
+                ws_msg = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
+                                                      : ws_frame_binary_shared(payload);
             }
             conn->write_queue.push_shared(ws_msg,
                 server_connection::WRITE_COALESCE_LIMIT,
@@ -4142,7 +4147,27 @@ void server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
-        conn->write_queue.push_shared(ws_frame_text_shared(payload),
+
+        // ─── Which frame the bytes are allowed to travel in ──────────────────
+        // Every outbound frame was 0x81, text, and RFC 6455 5.6 says a text
+        // frame's payload MUST be valid UTF-8 -- with 8.1 saying a receiver
+        // that finds it is not MUST fail the connection.  So this is not a
+        // choice between two framings: for bytes that are not valid UTF-8,
+        // binary is the only conforming one.
+        //
+        // Reachable, and measured: a client sent a BINARY frame carrying
+        // ff fe 00 01 80 81, the server relayed it to the other client as
+        // opcode 0x1 with the bytes intact, and a conforming peer must close on
+        // that.  The opcode was the only thing wrong -- the payload arrived
+        // byte for byte -- so the payload is what decides, here where the
+        // destination is already known to be a websocket.
+        //
+        // Nothing that was already conforming moves: every relayed line is
+        // valid UTF-8 and still goes out as text, and ws_payload_is_utf8()
+        // spends one branch per byte on the ASCII that all of them are.
+        conn->write_queue.push_shared(
+            ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
+                                        : ws_frame_binary_shared(payload),
             server_connection::WRITE_COALESCE_LIMIT,
             server_connection::MAX_WRITE_BATCH);
     }
