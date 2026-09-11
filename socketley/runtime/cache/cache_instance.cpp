@@ -7712,25 +7712,66 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 return;
             }
 
-            // The replies are produced into the connection's own buffer, taken
-            // away between commands, because that is the only buffer the
-            // dispatch below writes to.
-            std::string body;
+            // The bound the OTHER RESP parse sites use, which is what the
+            // comment here used to claim and was not: it said 64 while
+            // MAX_RESP_ARGS at both of them is resp::RESP_MAX_ARRAY_SIZE,
+            // 1024.  13a6b475 raised them -- "A RESP command with more than 64
+            // arguments was a protocol error, and took the pipeline with it"
+            // -- and this replay was missed.
+            //
+            // Measured at the boundary: MSET with 31 pairs queued and ran,
+            // MSET with 32 answered +QUEUED and then "unparseable queued
+            // command" at EXEC, while the identical command outside a
+            // transaction answered +OK.
+            static constexpr int QUEUED_MAX_ARGS = resp::RESP_MAX_ARRAY_SIZE;
+
+            // Parsed through before anything runs, because the loop below used
+            // to answer the error in place and carry on: a transaction of
+            // three where the middle one was too long ran the other two and
+            // told the client so in an array of three.  Measured -- `before`
+            // was set, `after` was set, the MSET between them was not.
+            //
+            // "Nothing ran, because running part of what was asked is worse
+            // than running none of it" is this cache's own rule, stated at the
+            // line protocol's EXEC, and EXECABORT is how RESP says it.
+            //
+            // With the bound above matching the queue-time parse this arm is a
+            // net rather than a path: a command that would not re-parse cannot
+            // have been queued.  It is here so that the next time the two
+            // bounds drift the answer is a refused transaction and not a
+            // half-applied one, which is how this was found.
+            std::vector<std::string_view> parsed;
+            parsed.reserve(queued.size() * 4);
+            std::vector<int> counts;
+            counts.reserve(queued.size());
             for (const auto& q : queued)
             {
-                std::string held;
-                held.swap(rb);
-                // The same bound the other two RESP re-parse sites use.
-                static constexpr int QUEUED_MAX_ARGS = 64;
                 std::string_view qargs[QUEUED_MAX_ARGS];
                 int              qargc = 0;
                 size_t           qconsumed = 0;
                 if (resp::parse_message_views(q, qargs, QUEUED_MAX_ARGS, qargc,
-                                              qconsumed) == resp::parse_result::ok
-                    && qargc > 0)
-                    process_resp_command_local(conn, qargs, qargc);
-                else
-                    resp::encode_error_into(rb, "unparseable queued command");
+                                              qconsumed) != resp::parse_result::ok
+                    || qargc <= 0)
+                {
+                    resp::encode_error_into(
+                        rb, "EXECABORT Transaction discarded because of previous errors.");
+                    return;
+                }
+                counts.push_back(qargc);
+                parsed.insert(parsed.end(), qargs, qargs + qargc);
+            }
+
+            // The replies are produced into the connection's own buffer, taken
+            // away between commands, because that is the only buffer the
+            // dispatch below writes to.
+            std::string body;
+            size_t at = 0;
+            for (size_t i = 0; i < queued.size(); ++i)
+            {
+                std::string held;
+                held.swap(rb);
+                process_resp_command_local(conn, parsed.data() + at, counts[i]);
+                at += static_cast<size_t>(counts[i]);
                 body.append(rb);
                 rb.swap(held);
             }

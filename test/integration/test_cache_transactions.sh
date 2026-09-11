@@ -123,6 +123,70 @@ if command -v redis-cli >/dev/null 2>&1; then
     RAW=$(printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n' \
           | timeout 3 nc -q1 127.0.0.1 "$PORT" 2>/dev/null | tr -d '\r' | tr '\n' '|')
     eq "RESP: QUIT is answered and then closes" "$RAW" "+PONG|+OK|"
+
+    # ── A LONG COMMAND SURVIVES BEING QUEUED ────────────────────────────────
+    #
+    # EXEC re-parses each queued command, and that re-parse kept a 64-argument
+    # bound after 13a6b475 raised every other RESP parse site to
+    # RESP_MAX_ARRAY_SIZE -- under a comment claiming it matched them.  So a
+    # command that worked on its own was answered +QUEUED and then failed:
+    #
+    #   MSET, 31 pairs (63 args), in MULTI  -> +OK,  the key reads back
+    #   MSET, 32 pairs (65 args), in MULTI  -> "unparseable queued command"
+    #   the same 32-pair MSET on its own    -> +OK,  the key reads back
+    #
+    # And the failure was answered in place while the loop carried on, so a
+    # transaction of three with a long one in the middle ran the other two:
+    # `tbefore` set, `tafter` set, the MSET between them not.  This cache's
+    # line protocol states the rule at its own EXEC -- "Nothing ran, because
+    # running part of what was asked is worse than running none of it."
+    #
+    # The payload is built in python and not printf, because a RESP bulk string
+    # carries its own length and a fixed "$3" in front of a key that grew to
+    # four characters is a malformed frame -- which is how the first draft of
+    # this passed: the keys it checked had been written by a stray setup
+    # command, and the transaction it meant to measure never parsed at all.
+    RAW=$(timeout 10 python3 - "$PORT" <<'PYEOF' 2>/dev/null
+import socket, sys, time
+port = int(sys.argv[1])
+def enc(*a):
+    out = ("*%d\r\n" % len(a)).encode()
+    for x in a:
+        b = x.encode()
+        out += b"$%d\r\n" % len(b) + b + b"\r\n"
+    return out
+pairs = []
+for i in range(40):            # 81 arguments: past 64, far under 1024
+    pairs += ["lk%d" % i, "lv%d" % i]
+s = socket.create_connection(("127.0.0.1", port), 5); s.settimeout(3)
+s.sendall(enc("MULTI") + enc("SET", "tbefore", "B") + enc("MSET", *pairs)
+          + enc("SET", "tafter", "A") + enc("EXEC"))
+time.sleep(1.5)
+buf = b""
+try:
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        buf += c
+except Exception:
+    pass
+s.close()
+print(buf.decode(errors="replace").replace("\r\n", "|"))
+PYEOF
+)
+    case "$RAW" in *unparseable*|*EXECABORT*)
+            bad "RESP: an 81-argument MSET survives being queued" "EXEC said '$RAW'" ;;
+        *) ok ;; esac
+
+    # All three replies, none of them an error: a transaction is all or nothing.
+    case "$RAW" in *"|*3|+OK|+OK|+OK|"*) ok ;;
+        *) bad "RESP: all three commands in the transaction ran" "EXEC said '$RAW'" ;; esac
+
+    # And the store agrees, read on a connection that knows nothing about it.
+    eq "RESP: the long command really wrote" \
+       "$(redis-cli -p "$PORT" GET lk39 2>&1)" "lv39"
+    eq "RESP: and so did the one after it" \
+       "$(redis-cli -p "$PORT" GET tafter 2>&1)" "A"
 else
     echo "  (redis-cli absent — the RESP arm did not run)"
 fi
