@@ -1422,6 +1422,11 @@ and neither applies it.
 Limit total messages per second across all connections using a shared
 token bucket. Excess messages are silently dropped (server) or responded
 with an error (cache). 0 means unlimited (default).
+.IP
+Refused on a client for
+.BR \-\-rate\-limit 's
+reason: it caps the total across all inbound connections, and a client has one
+outbound connection.
 .TP
 .BI "\-\-idle\-timeout " "duration"
 Close connections that have been idle (no data received) for longer than
@@ -1448,6 +1453,10 @@ can disappear silently.
 .B \-\-drain
 Enable graceful shutdown. When stopping, the runtime closes its listener
 but flushes all pending write queues before closing connections.
+.IP
+Refused on a client, which has no listener and no inbound connections: what a
+client owes its peer on the way down is a separate question from this one, and
+the flag did nothing there.
 .TP
 .BI "\-\-cpus " "set"
 The CPUs this runtime's I/O may run on. Accepts
@@ -2685,6 +2694,12 @@ Enable automatic reconnection with exponential backoff when the connection
 is lost. Backoff starts at 1 second and doubles each attempt up to 30 seconds,
 with random jitter. Set to 0 for infinite attempts (default when flag is given
 without a value). Set to a positive number to limit reconnection attempts.
+.IP
+A client flag, and refused on a server, a proxy or a cache: it re-dials a
+connection this runtime made, and those three take connections rather than make
+them. It was accepted and reported by
+.B show
+on all four, and read by the client alone.
 .IP
 "When the connection is lost" includes a peer that never says so. A close sends
 a FIN or an RST and is acted on at once, but a machine that loses power, a link

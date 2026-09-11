@@ -28,6 +28,21 @@ static bool refuse_inbound_flag_on_client(const runtime_instance* instance,
     return true;
 }
 
+// The mirror, for the one flag that describes OUTBOUND traffic.  --reconnect is
+// read in client_instance.cpp and nowhere else, and the man page documents it
+// under CLIENT FLAGS, so on a server, proxy or cache it was stored, persisted
+// and reported by `show` with nothing to act on it -- the same shape the three
+// above were refused for.
+static bool refuse_client_flag_elsewhere(const runtime_instance* instance,
+                                         const char* flag, const char* why)
+{
+    if (!instance || instance->get_type() == runtime_client)
+        return false;
+
+    std::cout << flag << " applies to a client: " << why << "\n";
+    return true;
+}
+
 // Defined further down, beside validate_listen_value; declared here because
 // the common create and edit parsers dispatch to it.
 static int parse_listen_flag(runtime_instance* rt, const parsed_args& pa, size_t& i);
@@ -270,6 +285,17 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid global-rate-limit value\n";
                 return 1;
             }
+            // The fourth of them, and the one whose sibling was already
+            // refused: check_global_rate_limit() is called by the cache, the
+            // server and the proxy and by no client code at all, and "across
+            // all connections" means nothing to a runtime that has one.
+            if (refuse_inbound_flag_on_client(instance, "--global-rate-limit",
+                                              "it caps the total across all "
+                                              "inbound connections, and a client "
+                                              "has one outbound connection -- "
+                                              "--rate-limit is refused here for "
+                                              "the same reason"))
+                return 1;
             instance->set_global_rate_limit(rate);
             return 0;
         }
@@ -295,11 +321,35 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
         }
 
         case fnv1a("--drain"):
+            // The fifth of them.  get_drain() is read by the server, the proxy
+            // and the cache and by no client code, so a client stored it,
+            // persisted it and reported it in `show` while its teardown did the
+            // opposite of what the flag promises: m_write_queue.clear(), under
+            // a comment reading "Drain write queue".
+            //
+            // Refused rather than implemented, and that is a judgement worth
+            // stating.  Half the documented meaning -- "closes its listener" --
+            // has nothing to say about a runtime with no listener, and the
+            // other half is a feature to design: what a client owes its peer on
+            // the way down, and for how long, is not answered by copying the
+            // server's loop.  This helper's own rule is what decides it.
+            if (refuse_inbound_flag_on_client(instance, "--drain",
+                                              "it flushes the write queues of "
+                                              "inbound connections before closing "
+                                              "them, and a client has none -- what "
+                                              "it owes its peer on the way down is "
+                                              "a separate question"))
+                return 1;
             instance->set_drain(true);
             return 0;
 
         case fnv1a("--reconnect"):
         {
+            if (refuse_client_flag_elsewhere(
+                    instance, "--reconnect",
+                    "it re-dials a connection this runtime made, and a server, "
+                    "a proxy and a cache take connections rather than make them"))
+                return 1;
             int max_attempts = 0; // default: infinite
             if (i + 1 < pa.count)
             {
@@ -1258,6 +1308,17 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                 std::cout << "invalid global-rate-limit value\n";
                 return 1;
             }
+            // The fourth of them, and the one whose sibling was already
+            // refused: check_global_rate_limit() is called by the cache, the
+            // server and the proxy and by no client code at all, and "across
+            // all connections" means nothing to a runtime that has one.
+            if (refuse_inbound_flag_on_client(instance, "--global-rate-limit",
+                                              "it caps the total across all "
+                                              "inbound connections, and a client "
+                                              "has one outbound connection -- "
+                                              "--rate-limit is refused here for "
+                                              "the same reason"))
+                return 1;
             instance->set_global_rate_limit(rate);
             return 0;
         }

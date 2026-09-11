@@ -3638,23 +3638,43 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("bash_output"))       instance->set_bash_output(cfg.bash_output);
     if (has("bash_prefix"))       instance->set_bash_prefix(cfg.bash_prefix);
     if (has("bash_timestamp"))    instance->set_bash_timestamp(cfg.bash_timestamp);
-    // The three flags a client does not have are refused here too, because
-    // import does not go through the flag parser and a validation that guards
-    // one entrance is not there.
+    // The flags a client does not have are refused here too, because import
+    // does not go through the flag parser and a validation that guards one
+    // entrance is not there.
+    //
+    // Five now, not three.  global_rate_limit caps the total across all
+    // inbound connections and drain flushes their write queues -- neither is
+    // read by any client code, and both were stored and reported by `show`
+    // exactly as the first three were.
     if (type == runtime_client)
     {
-        const char* offender = has("rate_limit")      ? "rate_limit"
-                             : has("max_connections") ? "max_connections"
-                             : has("idle_timeout")    ? "idle_timeout"
+        const char* offender = has("rate_limit")        ? "rate_limit"
+                             : has("max_connections")   ? "max_connections"
+                             : has("idle_timeout")      ? "idle_timeout"
+                             : has("global_rate_limit") ? "global_rate_limit"
+                             : has("drain")             ? "drain"
                              : nullptr;
         if (offender)
         {
             conn->write_buf = std::string("\"") + offender +
                   "\" does not apply to a client: it accepts no connections, so "
-                  "there is nothing to limit or to time out. Remove the field and "
-                  "import again.\n";
+                  "there is nothing to limit, to time out or to flush. Remove the "
+                  "field and import again.\n";
             return 1;
         }
+    }
+
+    // And the other direction, for the one field that describes a connection
+    // this runtime MAKES.  reconnect is read in client_instance.cpp and
+    // nowhere else, so on the other three it was a stored number with nothing
+    // to act on it.
+    if (type != runtime_client && has("reconnect") && cfg.reconnect >= 0)
+    {
+        conn->write_buf =
+            "\"reconnect\" applies to a client: it re-dials a connection this "
+            "runtime made, and a server, a proxy and a cache take connections "
+            "rather than make them. Remove the field and import again.\n";
+        return 1;
     }
 
     if (has("max_connections"))   instance->set_max_connections(cfg.max_connections);

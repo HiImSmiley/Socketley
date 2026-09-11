@@ -68,7 +68,13 @@ TARGET=$((P + 1))
 "$BIN" create server cf_target -p "$TARGET" --mode in -s >/dev/null 2>&1 || true
 sleep 0.4
 
-FLAGS=("--rate-limit 5" "--max-connections 7" "--idle-timeout 30")
+# Five, not three.  --global-rate-limit caps the total across all inbound
+# connections and --drain flushes their write queues before closing them;
+# check_global_rate_limit() and get_drain() are read by the server, the proxy
+# and the cache and by no client code at all, and both were stored and reported
+# by `show` exactly as the first three were.
+FLAGS=("--rate-limit 5" "--max-connections 7" "--idle-timeout 30"
+       "--global-rate-limit 10" "--drain")
 
 # ─── create refuses, and says which flag and why ────────────────────────────
 n=0
@@ -97,16 +103,17 @@ else bad "a plain client is still created" \
 
 # ─── The other three runtimes still take all three flags ────────────────────
 if "$BIN" create server cf_srv -p $((P + 2)) --rate-limit 5 --max-connections 7 \
-        --idle-timeout 30 -s >/dev/null 2>&1; then ok
-else bad "a server still takes all three" "the guard is not restricted to clients"; fi
+        --idle-timeout 30 --global-rate-limit 10 --drain -s >/dev/null 2>&1; then ok
+else bad "a server still takes all five" "the guard is not restricted to clients"; fi
 
 if "$BIN" create cache cf_cache -p $((P + 3)) --rate-limit 5 --max-connections 7 \
-        --idle-timeout 30 -s >/dev/null 2>&1; then ok
-else bad "a cache still takes all three" "the guard is not restricted to clients"; fi
+        --idle-timeout 30 --global-rate-limit 10 --drain -s >/dev/null 2>&1; then ok
+else bad "a cache still takes all five" "the guard is not restricted to clients"; fi
 
 if "$BIN" create proxy cf_prox -p $((P + 4)) --backend "127.0.0.1:$TARGET" \
-        --rate-limit 5 --max-connections 7 --idle-timeout 30 -s >/dev/null 2>&1; then ok
-else bad "a proxy still takes all three" "the guard is not restricted to clients"; fi
+        --rate-limit 5 --max-connections 7 --idle-timeout 30 \
+        --global-rate-limit 10 --drain -s >/dev/null 2>&1; then ok
+else bad "a proxy still takes all five" "the guard is not restricted to clients"; fi
 
 # ─── edit is the second door ────────────────────────────────────────────────
 #
@@ -129,7 +136,7 @@ else bad "edit still works on a server" "the guard reaches runtimes it should no
 if command -v python3 >/dev/null 2>&1; then
     "$BIN" show cf_plain > "$SOCKETLEY_TMPD/c.json" 2>/dev/null || true
 
-    for field in rate_limit max_connections idle_timeout; do
+    for field in rate_limit max_connections idle_timeout global_rate_limit drain; do
         python3 - "$SOCKETLEY_TMPD/c.json" "$field" \
                   "$SOCKETLEY_TMPD/mod.json" <<'PY'
 import json, sys
@@ -168,6 +175,54 @@ PY
              "the field was dropped rather than carried"; fi
 else
     echo "  (python3 absent — the import assertions did not run)"
+fi
+
+# ─── The other direction: a client flag on the three that are not ──────────
+#
+# --reconnect re-dials a connection this runtime MADE.  get_reconnect() is read
+# in client_instance.cpp and nowhere else, and the man page documents it under
+# CLIENT FLAGS -- so on a server, a proxy and a cache it was stored, persisted
+# and reported by `show` with nothing to act on it.  The same shape as the five
+# above, pointing the other way.
+RC_PORT=$((P + 20))
+for t in server proxy cache; do
+    case "$t" in
+        proxy) EXTRA="--backend 127.0.0.1:$TARGET" ;;
+        *)     EXTRA="" ;;
+    esac
+    RC_PORT=$((RC_PORT + 1))
+    # shellcheck disable=SC2086
+    OUT=$("$BIN" create "$t" "cf_rc_$t" -p "$RC_PORT" $EXTRA --reconnect 5 2>&1) \
+        && RC=0 || RC=$?
+    if [ "$RC" -eq 1 ]; then ok
+    else bad "create $t --reconnect is refused" "exit $RC, said: $OUT"; fi
+    if grep -q -- "--reconnect" <<<"$OUT"; then ok
+    else bad "the refusal names --reconnect" "said: $OUT"; fi
+    if ! "$BIN" ls 2>/dev/null | grep -q "cf_rc_$t"; then ok
+    else bad "the refused $t was not created" "cf_rc_$t exists"; fi
+done
+
+# Paired, like every refusal in this file: the flag must still work where it is
+# read, or refusing it everywhere would satisfy the three cases above.
+if "$BIN" create client cf_rc_cli -t "127.0.0.1:$TARGET" --reconnect 5 -s >/dev/null 2>&1
+then ok
+else bad "a client still takes --reconnect" "the guard is not restricted to the other three"; fi
+
+# And import, the door that does not go through the flag parser -- which is
+# where the first three were last closed.
+if command -v python3 >/dev/null 2>&1; then
+    "$BIN" show cf_srv > "$SOCKETLEY_TMPD/rc.json" 2>/dev/null || true
+    python3 - "$SOCKETLEY_TMPD/rc.json" "$SOCKETLEY_TMPD/rcmod.json" <<'RCPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if isinstance(d, list): d = d[0]
+d["reconnect"] = 5
+json.dump(d, open(sys.argv[2], "w"))
+RCPY
+    if timeout 20 "$BIN" import cf_srv < "$SOCKETLEY_TMPD/rcmod.json" >/dev/null 2>&1
+    then bad "import cannot give a server a reconnect either" \
+             "the document door is still open"
+    else ok; fi
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
