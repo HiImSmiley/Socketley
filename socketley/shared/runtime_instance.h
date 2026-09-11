@@ -557,6 +557,19 @@ public:
     virtual std::string_view lua_cache_mode() const { return {}; }
 
     virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }
+
+    // The question lua_cache_get() cannot answer.  It returns "" both for a key
+    // that is not there and for one holding an empty string, so a script had no
+    // way to tell them apart -- and the project's own example leans on the
+    // ambiguity: examples/cache/cache-integration-handler.lua:27 reads
+    // `if self.get("config:timeout") == ""` to mean "not set yet".
+    //
+    // Answered by adding the missing question rather than by changing what
+    // get() returns.  Making it nil would be correct and would break that
+    // example and every script written the same way, and an empty string is a
+    // value a cache is entitled to hold -- EXISTS is what Redis offers for
+    // exactly this and the wire protocol here has had it all along.
+    virtual bool lua_cache_exists(std::string_view /*key*/) { return false; }
     virtual bool lua_cache_set(std::string_view /*key*/, std::string_view /*value*/) { return false; }
     virtual bool lua_cache_del(std::string_view /*key*/) { return false; }
 
@@ -576,6 +589,8 @@ public:
     // Hashes
     virtual bool lua_cache_hset(std::string_view /*key*/, std::string_view /*field*/, std::string_view /*val*/) { return false; }
     virtual std::string lua_cache_hget(std::string_view /*key*/, std::string_view /*field*/) { return ""; }
+    // The same question about a hash field, for the same reason.
+    virtual bool lua_cache_hexists(std::string_view /*key*/, std::string_view /*field*/) { return false; }
     virtual bool lua_cache_hdel(std::string_view /*key*/, std::string_view /*field*/) { return false; }
     virtual int lua_cache_hlen(std::string_view /*key*/) { return 0; }
 

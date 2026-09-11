@@ -6946,6 +6946,15 @@ std::string cache_instance::lua_get(std::string_view key)
     return "";
 }
 
+// The expiry check first, exactly as the wire's EXISTS does it: a key past its
+// deadline is not there, and asking without sweeping would answer that it is.
+bool cache_instance::lua_exists(std::string_view key)
+{
+    if (m_has_ttl_keys)
+        m_store.check_expiry(key);
+    return m_store.exists(key);
+}
+
 // Spell a script's write as the text command a client would have typed and
 // hand it to replicate_command(), because the journal and the followers log
 // that chokepoint and this API used to walk past both.
@@ -7142,6 +7151,12 @@ std::string cache_instance::lua_hget(std::string_view key, std::string_view fiel
     m_store.check_expiry(key);
     const std::string* val = m_store.hget(key, field);
     return val ? *val : "";
+}
+
+bool cache_instance::lua_hexists(std::string_view key, std::string_view field)
+{
+    m_store.check_expiry(key);
+    return m_store.hget(key, field) != nullptr;
 }
 
 bool cache_instance::lua_hdel(std::string_view key, std::string_view field)

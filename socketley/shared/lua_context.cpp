@@ -3073,6 +3073,13 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
     self["del"] = [owner](std::string key) -> bool {
         return owner->lua_cache_del(key);
     };
+    // self.get() answers "" for a key that is not there AND for one holding an
+    // empty string, which no script can tell apart -- see lua_cache_exists in
+    // runtime_instance.h for why the answer is this binding rather than a
+    // change to get().
+    self["exists"] = [owner](std::string key) -> bool {
+        return owner->lua_cache_exists(key);
+    };
 
     // Lists
     self["lpush"] = [owner](std::string key, std::string val) -> bool {
@@ -3120,6 +3127,9 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
     };
     self["hget"] = [owner](std::string key, std::string field) -> std::string {
         return owner->lua_cache_hget(key, field);
+    };
+    self["hexists"] = [owner](std::string key, std::string field) -> bool {
+        return owner->lua_cache_hexists(key, field);
     };
     self["hdel"] = [owner](std::string key, std::string field) -> bool {
         return owner->lua_cache_hdel(key, field);

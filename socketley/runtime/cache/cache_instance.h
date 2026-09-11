@@ -267,6 +267,7 @@ public:
 
     // Lua cache access — strings
     std::string lua_get(std::string_view key);
+    bool        lua_exists(std::string_view key);
     bool lua_set(std::string_view key, std::string_view value);
     bool lua_del(std::string_view key);
 
@@ -292,6 +293,7 @@ public:
     // Lua cache access — hashes
     bool lua_hset(std::string_view key, std::string_view field, std::string_view val);
     std::string lua_hget(std::string_view key, std::string_view field);
+    bool        lua_hexists(std::string_view key, std::string_view field);
     bool lua_hdel(std::string_view key, std::string_view field);
     int lua_hlen(std::string_view key);
 #ifndef SOCKETLEY_NO_LUA
@@ -305,6 +307,7 @@ public:
 
     // Virtual overrides for Lua API
     std::string lua_cache_get(std::string_view key) override { return lua_get(key); }
+    bool lua_cache_exists(std::string_view key) override { return lua_exists(key); }
     bool lua_cache_set(std::string_view key, std::string_view value) override { return lua_set(key, value); }
     bool lua_cache_del(std::string_view key) override { return lua_del(key); }
     bool lua_cache_lpush(std::string_view key, std::string_view val) override { return lua_lpush(key, val); }
@@ -330,6 +333,7 @@ public:
     int lua_cache_scard(std::string_view key) override { return lua_scard(key); }
     bool lua_cache_hset(std::string_view key, std::string_view field, std::string_view val) override { return lua_hset(key, field, val); }
     std::string lua_cache_hget(std::string_view key, std::string_view field) override { return lua_hget(key, field); }
+    bool lua_cache_hexists(std::string_view key, std::string_view field) override { return lua_hexists(key, field); }
     bool lua_cache_hdel(std::string_view key, std::string_view field) override { return lua_hdel(key, field); }
     int lua_cache_hlen(std::string_view key) override { return lua_hlen(key); }
     bool lua_cache_expire(std::string_view key, int seconds) override { return lua_expire(key, seconds); }

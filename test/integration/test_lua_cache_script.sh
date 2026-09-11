@@ -288,6 +288,28 @@ end
 -- This on_start stays because the log line it writes is asserted further down.
 function on_start()
     socketley.log("CSTART " .. tostring(self.state))
+
+    -- self.get() answers "" for a key that is not there AND for one holding an
+    -- empty string, so a script had no way to ask which it had -- and this
+    -- project's own example leans on the ambiguity:
+    -- examples/cache/cache-integration-handler.lua reads
+    -- `self.get("config:timeout") == ""` to mean "not set yet".
+    --
+    -- The question was added rather than get() changed, because nil would
+    -- break that reading everywhere it has been written and an empty string is
+    -- a value a cache is entitled to hold.  Both halves are logged: what
+    -- exists() answers, AND that get() still answers exactly what it did.
+    self.set("ex_empty", "")
+    self.set("ex_full", "v")
+    self.hset("ex_h", "empty_field", "")
+    socketley.log("EX"
+        .. " get_missing=[" .. self.get("ex_missing") .. "]"
+        .. " get_empty=[" .. self.get("ex_empty") .. "]"
+        .. " exists_missing=" .. tostring(self.exists("ex_missing"))
+        .. " exists_empty=" .. tostring(self.exists("ex_empty"))
+        .. " exists_full=" .. tostring(self.exists("ex_full"))
+        .. " hexists_empty=" .. tostring(self.hexists("ex_h", "empty_field"))
+        .. " hexists_missing=" .. tostring(self.hexists("ex_h", "nope")))
 end
 
 function on_write(key, value, ttl)
@@ -453,6 +475,27 @@ if [ "$(hits 'CS chan from-lua' "$SOCKETLEY_DLOG")" -ge 1 ]; then pass; else
          "fn(channel, message) is the documented signature; a callback handed" \
          "only one of them logs 'CS chan nil' and fails here"
 fi
+
+# ── self.exists, the question self.get could not answer ────────────────────
+EXLINE=$(grep -o 'EX .*' "$SOCKETLEY_DLOG" | tail -1)
+exf() { printf '%s\n' "$EXLINE" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
+
+# The half that must NOT have changed: an absent key and an empty one both read
+# back as "" from get(), which is what every script written against this API
+# relies on.
+assert_eq "self.get still answers empty for a key that is not there" \
+          "[]" "$(exf get_missing)"
+assert_eq "and for one holding an empty string"     "[]" "$(exf get_empty)"
+
+# And the half that is new: the two are now distinguishable.
+assert_eq "self.exists says no for a key that is not there" \
+          "false" "$(exf exists_missing)"
+assert_eq "and yes for one holding an empty string" \
+          "true"  "$(exf exists_empty)" \
+    "this is the whole point: get() cannot tell this from the line above"
+assert_eq "and yes for an ordinary value"          "true"  "$(exf exists_full)"
+assert_eq "self.hexists does the same for a field" "true"  "$(exf hexists_empty)"
+assert_eq "and says no for one that is not set"    "false" "$(exf hexists_missing)"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

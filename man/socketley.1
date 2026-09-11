@@ -6050,6 +6050,7 @@ self.cache_mode()   -- Which mode this cache is in
 self.get(key)       -- Get string value
 self.set(key, val)  -- Set string value; false in readonly mode
 self.del(key)       -- Delete key (any type); false in readonly mode
+self.exists(key)    -- Is the key there?  See below.
 
 -- Cache: lists
 self.lpush(key, val)        -- Push to front; false in readonly mode
@@ -6069,6 +6070,7 @@ self.scard(key)             -- Set cardinality
 self.hset(key, field, val)  -- Set hash field; false in readonly mode
 self.hget(key, field)       -- Get hash field
 self.hdel(key, field)       -- Delete hash field; false in readonly mode
+self.hexists(key, field)    -- Is the field there?  See below.
 self.hlen(key)              -- Hash field count
 
 -- Cache: TTL
@@ -6139,6 +6141,27 @@ self.backend_health()              -- Circuit-breaker state per backend,
 self.stats()                       -- {connections, bytes_in, bytes_out,
                                    --  total_connections, total_messages,
                                    --  backend_count}
+.fi
+.PP
+.B "Why exists and hexists are there."
+.B self.get
+answers with the value, and an absent key and a key holding an empty string
+both come back as the empty string.
+A script cannot tell those apart, and this page's own example leans on it \(em
+.I examples/cache/cache\-integration\-handler.lua
+reads
+.B "self.get(\(dqconfig:timeout\(dq) == \(dq\(dq"
+to mean "not set yet".
+.PP
+Making
+.B get
+answer
+.B nil
+for an absent key would settle it and would break that reading wherever it has
+been written, and an empty string is a value a cache is entitled to hold. So the
+missing question was added instead, under the name the wire protocol has always
+used for it.
+.nf
 .fi
 .PP
 .B "The proxy table is smaller than the server's on purpose."
