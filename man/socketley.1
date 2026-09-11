@@ -6034,6 +6034,26 @@ self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
 self.send(msg)             -- Send message (client)
 self.send(client_id, msg)  -- Send to specific client (server)
 self.broadcast(msg)        -- Broadcast to all clients (server)
+self.pending(client_id)    -- Queued for that client and not yet on the wire,
+                           -- in bytes (server); nil if the id is not one of
+                           -- this runtime's connections.  See below.
+
+-- ─── Sending faster than the socket ───
+-- A write is queued, not performed, and the queue has a bound.  Reach it and
+-- the runtime closes the connection -- which used to be the only way a script
+-- found out: the message that filled the queue was dropped and answered true,
+-- and the one after it was refused with "there is no open connection", the
+-- sentence a peer hanging up gets.
+--
+-- self.send() now answers false for a message that was not taken, and names
+-- the backlog when that is the reason, so a producer can tell "slow down" from
+-- "it is gone".  self.pending() is the number to watch BEFORE sending, which
+-- is the difference between pacing and a post-mortem:
+--
+--     if (self.pending(id) or 0) < 1048576 then self.send(id, chunk) end
+--
+-- Measured with a client that connects and never reads, against 400 chunks of
+-- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.
 
 -- Upstream actions (server with -u)
 self.upstream_send(conn_id, msg) -- Send to a specific upstream

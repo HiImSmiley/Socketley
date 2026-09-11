@@ -71,6 +71,10 @@ struct alignas(64) server_connection
     // alone so no emitter has to know.
     bool http_head{false};
     bool wr_shutdown{false};   // our FIN is already on the wire (shutdown SHUT_WR)
+    // This runtime closed the connection because the producer outran the
+    // socket, not because the peer went away.  Sticky, and read by the refusal
+    // a script gets so it can tell "slow down" from "it is gone".
+    bool closed_for_backlog{false};
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
 
@@ -236,6 +240,11 @@ struct alignas(64) server_connection
         read_pending = false;
         write_pending = false;
         closing = false;
+        // With `closing`, and for the same reason the neighbours above give:
+        // a struct that carried a producer which outran the socket would hand
+        // the next client on this slot a backlog it never had, and self.send()
+        // would name backpressure for a connection that simply went away.
+        closed_for_backlog = false;
         if (file_fd >= 0) { close(file_fd); file_fd = -1; }
         if (file_buf) { free(file_buf); file_buf = nullptr; }
         file_read_req = {};
@@ -447,6 +456,14 @@ public:
 
     void set_udp(bool udp);
     bool is_udp() const override;
+
+    // How many bytes are queued for this connection and not yet on the wire,
+    // and whether the runtime closed it because that number reached the bound.
+    // A producer that can ask this can pace; one that cannot finds out by
+    // having its connection taken away.  -1 for an id that is not a connection
+    // of this runtime, which a caller has to tell from 0.
+    long     pending_bytes(int client_id) const;
+    bool     closed_for_backlog(int client_id) const;
 
     // What setup() will bind, answered without binding it; see the base class.
     void listen_addresses(std::vector<std::string>& out) const override;
@@ -772,7 +789,9 @@ private:
     // `even_when_closing` is for an answer that was already promised, which
     // nothing else may set: the socket is still open precisely because that
     // answer is owed.
-    void queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+    // Answers whether the message was taken; see the definition for what a
+    // false costs a caller that ignores it.
+    bool queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                  bool even_when_closing = false);
     void flush_write_queue(server_connection* conn);
 

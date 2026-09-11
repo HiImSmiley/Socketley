@@ -2803,6 +2803,18 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                            "self.broadcast");
         if (owner->send_to(client_id, msg))
             return api_yes();
+        // A fifth way, and the only one the script can do something about:
+        // this runtime closed the connection because the producer outran the
+        // socket.  Named apart from the other four, because "it may have
+        // closed" reads as the peer's doing and the answer to this one is to
+        // pace rather than to give up.
+        if (static_cast<server_instance*>(owner)->closed_for_backlog(client_id))
+            return api_why("connection " + std::to_string(client_id) + " on "
+                           + q(m_owner_name) + " was closed because more was "
+                             "queued for it than it could take -- self.pending("
+                           + std::to_string(client_id) + ") is what to watch "
+                             "before sending the next one");
+
         // Four ways this used to be a silent no-op: an id that is not a
         // connection, one already closing, a routed-in handle whose origin is
         // gone, and an origin that has stopped.
@@ -2810,6 +2822,19 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
                        + " on " + q(m_owner_name)
                        + " — it may have closed, or it may never have been one");
     };
+    // How much this connection still owes the socket.  A producer with a large
+    // body loops self.send(), and until now nothing told it when it was going
+    // faster than the wire -- the queue filled, the runtime closed the
+    // connection, and the message that did it was answered true.
+    //
+    // nil and not -1 for an id that is not a connection of this runtime, so a
+    // caller cannot read "unknown" as "empty".
+    self["pending"] = [owner](int client_id) -> sol::optional<long> {
+        const long n = static_cast<server_instance*>(owner)->pending_bytes(client_id);
+        if (n < 0) return sol::nullopt;
+        return n;
+    };
+
     // shard_connection_count() and not get_connection_count(), because under
     // --shards a script asking how many clients its runtime has was answered
     // with how many this process had.

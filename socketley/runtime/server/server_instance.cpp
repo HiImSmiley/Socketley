@@ -4129,16 +4129,33 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
     }
 }
 
-void server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+// ─── Whether the message was taken ──────────────────────────────────────────
+// It used to answer nothing, and the comment at its caller said the rest out
+// loud: "a connection closed for exceeding the write-queue bound reported by
+// the connection going away".  Which is to say not reported at all -- a script
+// looping self.send() over a large body filled the queue, had the connection
+// closed under it, and was told true for the message that was dropped doing so.
+// The one after that answered "there is no open connection ... it may have
+// closed", which names the symptom and not the cause.
+//
+// So it says. false means the bytes are not going anywhere, and the caller can
+// pass that to whoever asked.
+bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                               bool even_when_closing)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || (conn->closing && !even_when_closing)))
-        return;
+        return false;
 
     if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
     {
+        // Sticky, so the refusal one call later can say which of the five
+        // reasons it was: a connection the runtime closed because the producer
+        // outran the socket is a different thing from a peer that hung up, and
+        // the answer a script acts on is different too -- one is "slow down",
+        // the other is "it is gone".
+        conn->closed_for_backlog = true;
         conn->closing = true;
-        return;
+        return false;
     }
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
@@ -4180,6 +4197,8 @@ void server_instance::queue_send(server_connection* conn, const std::shared_ptr<
 
     if (SOCKETLEY_LIKELY(!conn->write_pending))
         flush_write_queue(conn);
+
+    return true;
 }
 
 void server_instance::relay_hold_push(server_connection* conn,
@@ -5189,8 +5208,24 @@ std::string_view server_instance::get_client_route(int client_id) const
     return it->second;
 }
 
-// Whether the bytes were handed to a connection, which was void, so
-// self.send() reported none of the four ordinary refusals.
+// The two questions a producer needs and could not ask.  Both answer about a
+// connection this process holds; a routed handle belongs to another runtime and
+// its backlog is that runtime's to report.
+long server_instance::pending_bytes(int client_id) const
+{
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return -1;
+    return static_cast<long>(m_conn_idx[client_id]->write_queue.bytes());
+}
+
+bool server_instance::closed_for_backlog(int client_id) const
+{
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return false;
+    return m_conn_idx[client_id]->closed_for_backlog;
+}
+
+// Whether the bytes were taken, which used to be "yes" unconditionally.
 bool server_instance::send_to_client(int client_id, std::string_view msg)
 {
     // A handle names a connection that lives somewhere else, so the write is
@@ -5232,11 +5267,10 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     buf.append(msg);
     if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
     auto shared = std::make_shared<const std::string>(std::move(buf));
-    queue_send(conn, shared);
-    // Queued, which is what "sent" means on an async write path here, with a
-    // connection closed for exceeding the write-queue bound reported by the
-    // connection going away.
-    return true;
+    // Queued, which is what "sent" means on an async write path here -- and
+    // NOT queued is now an answer too, rather than a true for a message that
+    // was dropped on the way to closing the connection.
+    return queue_send(conn, shared);
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)
