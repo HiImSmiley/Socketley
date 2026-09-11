@@ -1,4 +1,5 @@
 #include "daemon.h"
+#include <unordered_set>
 #include "daemon_handler.h"
 #include "metrics_endpoint.h"
 #include "type_manifest.h"
@@ -307,6 +308,11 @@ static void restore_runtimes(state_persistence& persistence,
 
     LOG_INFO("restoring runtimes from state");
 
+    // The runtimes pass 1 refused, carried to pass 2 because the two are
+    // separate loops over the same list and a state file cannot say "and this
+    // one did not come up".
+    std::unordered_set<std::string> scriptless;
+
     // Pass 1: Create all runtimes and apply configs
     for (const auto& cfg : configs)
     {
@@ -393,8 +399,32 @@ static void restore_runtimes(state_persistence& persistence,
 
         if (!cfg.lua_script.empty())
         {
+            // Marked rather than warned about.  The other three routes to a
+            // runtime with a script refuse outright when it will not load --
+            // `create --lua` removes the runtime and exits 1, `import` answers
+            // 1, and a script's own socketley.create returns the reason -- and
+            // the Lua route says why in as many words: "a runtime with no
+            // callbacks is indistinguishable from a working one until traffic
+            // arrives."
+            //
+            // This route logged a WARN and started it anyway, so a server came
+            // back with no on_http_request answering 404, a filter chain gone,
+            // and `ls` green.  Coming back WRONG is worse than not coming back,
+            // and the only channel here is the log, where a WARN among the
+            // restore's other lines is easy to walk past.
             if (!instance->load_lua_script(cfg.lua_script))
-                LOG_WARN("restore: could not load lua script");
+            {
+                LOG_ERROR(("restore: " + cfg.name + " was not started: its script "
+                           + cfg.lua_script + " did not load"
+                           + (lua_diag::text().empty()
+                                  ? std::string{}
+                                  : " -- " + lua_diag::text())
+                           + ".  Fix the script and `start " + cfg.name
+                           + "`; it is left stopped rather than running with no "
+                             "callbacks at all").c_str());
+                instance->mark_failed();
+                scriptless.insert(cfg.name);
+            }
         }
 
         // Type-specific, and still a second copy knowingly, because
@@ -468,6 +498,11 @@ static void restore_runtimes(state_persistence& persistence,
     for (const auto& cfg : configs)
     {
         if (!cfg.was_running)
+            continue;
+
+        // Its script did not load, and pass 1 said so and marked it.  Starting
+        // it here would be the very thing that refusal was for.
+        if (scriptless.count(cfg.name))
             continue;
 
         // Named, because a daemon restoring several runtimes would otherwise

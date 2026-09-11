@@ -606,6 +606,19 @@ void runtime_instance::append_state_line(runtime_state s)
 // routes declaration.
 bool runtime_instance::load_lua_script(std::string_view path)
 {
+    // Remembered whether or not it loads.  The path is the CONFIGURATION and
+    // the compile is an attempt at it: a runtime whose script does not parse
+    // is still a runtime configured with that script, and forgetting the path
+    // on failure meant nothing could ever try it again.
+    //
+    // What that cost, measured: a boot restore whose script had been broken
+    // between reboots dropped the path, so every later `start` forked a worker
+    // with no lua_script in its config -- the file could be fixed and `start`,
+    // `reload-lua` and `reload` all left the runtime scriptless, answering 404
+    // where a callback used to be.  Only another daemon restart, which re-reads
+    // the state file, brought it back.
+    m_lua_script_path = path;
+
     if (m_out_of_process)
     {
         std::string err;
@@ -615,7 +628,6 @@ bool runtime_instance::load_lua_script(std::string_view path)
                       << err << std::endl;
             return false;
         }
-        m_lua_script_path = path;
         return true;
     }
 
@@ -623,11 +635,12 @@ bool runtime_instance::load_lua_script(std::string_view path)
 
     if (!m_lua->load_script(path, this))
     {
+        // The context goes and the path stays: every reader of m_lua tests it
+        // first, and the path is what a retry needs.
         m_lua.reset();
         return false;
     }
 
-    m_lua_script_path = path;
     return true;
 }
 
