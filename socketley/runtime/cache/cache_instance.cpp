@@ -696,10 +696,10 @@ bool cache_instance::setup(event_loop& loop)
     // The dump set was read at the top of setup(), before anything could be
     // served out of a store that is only part of what was stored.
 
-    // Cache config values to avoid virtual calls on hot paths
-    m_idle_timeout_cached = get_idle_timeout();
-    m_max_conns_cached = get_max_connections();
-    m_rate_limit_cached = get_rate_limit();
+    // Cache config values to avoid virtual calls on hot paths, through the one
+    // function an `edit` on a running cache also calls -- three lines here and
+    // an override that did not exist is exactly how the two came apart.
+    refresh_cached_limits();
     // Seed from the store rather than clearing, because load() restores expiry
     // timestamps and forcing this false would leave restored TTL keys immortal
     // until an unrelated command flipped it back.

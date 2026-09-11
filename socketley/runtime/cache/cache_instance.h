@@ -239,6 +239,26 @@ public:
     void teardown(event_loop& loop) override;
     void on_loop_turn() override;
 
+    // The three values setup() copies out of the configuration and the hot
+    // paths read instead of calling a virtual per accept and per message: the
+    // accept guard reads m_max_conns_cached, the idle sweep reads
+    // m_idle_timeout_cached, and every accepted connection is seeded from
+    // m_rate_limit_cached.
+    //
+    // Missing, this class cached and never refreshed -- which is the one thing
+    // the base class's comment says a caching type must not do: "made every
+    // setter a lie for a runtime that was already running ... A type that
+    // caches overrides this."  The server and the proxy had it; the cache is
+    // the third and had the members without the override, so `edit <cache>
+    // --max-connections 1` reached the worker, set the field, was reported by
+    // `show`, and the accept path went on enforcing whatever setup() had read.
+    void refresh_cached_limits() override
+    {
+        m_idle_timeout_cached = get_idle_timeout();
+        m_max_conns_cached    = get_max_connections();
+        m_rate_limit_cached   = get_rate_limit();
+    }
+
     // What setup() will bind, answered without binding it; see the base class.
     void listen_addresses(std::vector<std::string>& out) const override;
     uint16_t effective_port() const override;

@@ -246,6 +246,69 @@ fi
 "$BIN" stop ep >/dev/null 2>&1; "$BIN" remove ep >/dev/null 2>&1
 { kill -9 "$BE_PID"; wait "$BE_PID"; } 2>/dev/null; BE_PID=""
 
+# ── the third runtime, which had the cached copies and not the refresh ──────
+#
+# The server above and the proxy after it both override refresh_cached_limits().
+# The cache had the three members -- m_max_conns_cached read by the accept
+# guard, m_idle_timeout_cached by the idle sweep, m_rate_limit_cached by every
+# connection it seeds -- and no override, so apply_live_config()'s call landed
+# on the base class's empty body.
+#
+# Measured before the override: edit answered 0, `show` reported 1, and the
+# cache kept 4 of 4.  Only a restart put the limit in force, which is exactly
+# the state this whole file exists to catch on the other two.
+PC=$((SL_PORT_BASE+1497))
+"$BIN" create cache ec -p "$PC" --max-connections 10 -s >/dev/null 2>&1
+ready_tcp 127.0.0.1 "$PC" 10 >/dev/null 2>&1 || true
+
+cache_kept() {
+python3 -c "
+import socket, time
+kept, held = 0, []
+for _ in range(4):
+    try:
+        s = socket.create_connection(('127.0.0.1', $PC), timeout=2)
+        s.settimeout(0.6)
+        s.sendall(b'ping\n')
+        try:    d = s.recv(32)
+        except socket.timeout: d = b'-'
+        if d != b'': kept += 1
+        held.append(s)
+    except Exception:
+        pass
+    time.sleep(0.1)
+print(kept)
+for s in held:
+    try: s.close()
+    except Exception: pass
+"
+}
+
+CACHE_BEFORE=$(cache_kept)
+if [ "${CACHE_BEFORE:-0}" -eq 4 ]; then
+    ok "the cache starts where its flag put it (4 of 4 kept at --max-connections 10)"
+else
+    bad "the cache's starting state has to be the flag's state" \
+        "it kept ${CACHE_BEFORE:-<none>} of 4 with a limit of 10, so the" \
+        "assertion below would measure something else"
+fi
+
+"$BIN" edit ec --max-connections 1 >/dev/null 2>&1
+CACHE_EDIT_RC=$?
+sleep 0.8
+CACHE_AFTER=$(cache_kept)
+if [ "$CACHE_EDIT_RC" -eq 0 ] && [ "${CACHE_AFTER:-0}" -eq 1 ]; then
+    ok "--max-connections reaches a running cache too ($CACHE_AFTER of 4 kept)"
+else
+    bad "a cache reads its limits from a cached copy like the other two" \
+        "edit rc $CACHE_EDIT_RC, the worker kept ${CACHE_AFTER:-<none>} of 4 where it kept $CACHE_BEFORE;" \
+        "4 means the field was set and the accept path never saw it ---" \
+        "cache_instance is the third type with m_max_conns_cached, and" \
+        "refresh_cached_limits() is what makes the setter true"
+fi
+
+"$BIN" stop ec >/dev/null 2>&1; "$BIN" remove ec >/dev/null 2>&1
+
 "$BIN" stop et >/dev/null 2>&1; "$BIN" remove et >/dev/null 2>&1
 daemon_stop
 trap - EXIT
