@@ -30,6 +30,7 @@ and it is the mistake this directory exists to keep you out of.
 | `session-ids.lua` | A session id per connection, for end-to-end tracing |
 | `websocket-session.lua` | Session tracking from a browser `Cookie` header |
 | `redis-session.lua` | Distributed sessions against an **external Redis**, not a socketley cache. Needs `luarocks install redis-lua`, installed where LuaJIT looks — see the note at the top of the file, and be aware a `require` that cannot resolve fails the script load and the runtime never serves |
+| `large-export-streamed.lua` | Answering with a generated body larger than memory, via `self.respond_stream`/`send_chunk`/`end_response`, paced by `on_writable` |
 | `large-upload-streamed.lua` | Receiving a body larger than memory, writing it to a file from `on_http_body` and cleaning up a partial one in `on_disconnect` |
 | `large-body-paced.lua` | Sending a body past the write-queue bound, pacing on `self.pending`/`self.watermark()` and resuming in `on_writable` |
 | `upstream-hub.lua` | Bridging connected clients and an `--upstream` connection |

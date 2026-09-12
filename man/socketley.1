@@ -6337,6 +6337,11 @@ self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
 self.pending(client_id)    -- Queued for that client and not yet on the wire,
                            -- in bytes (server); nil if the id is not one of
                            -- this runtime's connections.  See below.
+self.respond_stream(id, status, headers)
+                           -- Begin a response this script will write itself,
+                           -- chunk by chunk (server).  See below.
+self.send_chunk(id, data)  -- One chunk of it; false means it was not taken
+self.end_response(id)      -- The last chunk has gone; finish the response
 self.watermark()           -- The byte count on_writable fires on the way down
                            -- through (server and client).  Pace against this,
                            -- not a literal.  A call and not a field, because
@@ -6380,6 +6385,43 @@ self.pending()             -- The client's own form, without an id: a client
 --
 -- Measured with a client that connects and never reads, against 400 chunks of
 -- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.
+
+-- ─── A response written rather than returned ───
+-- on_http_request has to RETURN its body, so a generated answer had to fit in
+-- memory.  A FILE of any size was already served by the splice path and a Range
+-- of it by the 206 path; a generated one of any size was not expressible at all
+-- -- transcoding, an export assembled from a cache, a CSV of ten million rows.
+--
+--     self.respond_stream(id, 200, {["Content-Type"] = "text/csv"})
+--     for row in rows() do
+--         if (self.pending(id) or 0) >= self.watermark() then return end   -- wait
+--         self.send_chunk(id, row)
+--     end
+--     self.end_response(id)
+--
+-- Paced through self.pending()/on_writable like any other producer, which is
+-- what makes it a stream rather than a slower way to run out of memory.
+-- Measured: 200 MB of generated rows through an 8 MiB queue, delivered in
+-- 51,200 chunks with on_writable resuming it 67 times, for 6 MB of resident
+-- memory.
+--
+-- The handler returns nothing after starting one: the response is already on
+-- its way, and the static-file and 404 fallbacks are skipped for this request.
+-- A handler that only tried to send a chunk has NOT answered, so its ordinary
+-- return still applies.
+--
+-- Content-Length, Transfer-Encoding and Connection are dropped from the header
+-- table if given: a Content-Length beside a chunked body is a message carrying
+-- two answers to its own length, which this server refuses with a 400 on the
+-- way in.  Measured with it passed through: the client read 119 bytes where 5
+-- were sent, having believed the wrong header.
+--
+-- send_chunk on a HEAD request answers false and names it, rather than dropping
+-- the bytes: a HEAD asked for the headers and nothing else, and a script that
+-- thinks it is sending a body to one has a bug this refusal is the only report
+-- of.  An empty chunk is accepted and not sent, because a zero-length chunk is
+-- how the terminator is spelled on the wire -- passing one through as payload
+-- would end the response while the script was still writing it.
 
 -- Upstream actions (server with -u)
 self.upstream_send(conn_id, msg) -- Send to a specific upstream

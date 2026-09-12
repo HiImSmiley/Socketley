@@ -2859,6 +2859,57 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         return static_cast<long>(owner->write_watermark_bytes());
     };
 
+    // ─── A response written here rather than returned ───────────────────────
+    // on_http_request has to return a complete body, so a generated response had
+    // to fit in memory: a FILE of any size was already served by the splice path
+    // and a generated one of any size was not expressible.  These three put a
+    // script on the same side of the bound its reads already have, and they pace
+    // through self.pending()/on_writable exactly as any other producer does --
+    // a stream without backpressure is only a slower way to run out of memory.
+    //
+    //     self.respond_stream(id, 200, {["Content-Type"] = "text/csv"})
+    //     ... self.send_chunk(id, row) ...
+    //     self.end_response(id)
+    self["respond_stream"] = [owner, this](int client_id, sol::optional<int> status,
+                                           sol::optional<sol::table> headers) -> api_result {
+        std::vector<std::pair<std::string, std::string>> hdrs;
+        if (headers)
+            for (const auto& kv : *headers)
+            {
+                // Skipped rather than refused: a header table with a number in
+                // it is a script's slip, and dropping the pair leaves a valid
+                // response where refusing the call would leave none.
+                if (!kv.first.is<std::string>() || !kv.second.is<std::string>())
+                    continue;
+                hdrs.emplace_back(kv.first.as<std::string>(), kv.second.as<std::string>());
+            }
+        if (static_cast<server_instance*>(owner)->begin_chunked_response(
+                client_id, status.value_or(200), hdrs))
+            return api_yes();
+        return api_why("cannot start a response on connection " + std::to_string(client_id)
+                       + " of " + q(m_owner_name)
+                       + " -- it may have closed, or a response may already have been"
+                         " started on it");
+    };
+    self["send_chunk"] = [owner, this](int client_id, std::string_view data) -> api_result {
+        if (static_cast<server_instance*>(owner)->send_response_chunk(client_id, data))
+            return api_yes();
+        // The three reasons named together, because only one of them is
+        // recoverable and a script has to be able to tell which it met.
+        return api_why("chunk refused on connection " + std::to_string(client_id)
+                       + " of " + q(m_owner_name)
+                       + " -- no response has been started on it, the request was a"
+                         " HEAD and has no body, or more was queued for it than it"
+                         " could take; self.pending(" + std::to_string(client_id)
+                       + ") is what to watch before the next one");
+    };
+    self["end_response"] = [owner, this](int client_id) -> api_result {
+        if (static_cast<server_instance*>(owner)->finish_chunked_response(client_id))
+            return api_yes();
+        return api_why("no response was open on connection " + std::to_string(client_id)
+                       + " of " + q(m_owner_name));
+    };
+
     // shard_connection_count() and not get_connection_count(), because under
     // --shards a script asking how many clients its runtime has was answered
     // with how many this process had.

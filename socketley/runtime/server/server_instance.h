@@ -179,6 +179,12 @@ struct alignas(64) server_connection
     // framing across reads.
     bool body_chunked{false};
     http_chunked_decoder chunk_dec;
+    // A response the script is writing itself.  Two flags and not one: the
+    // fall-through to the static file and the 404 must not also answer
+    // (response_started), and a HEAD gets the headers and no body at all, so
+    // whether chunks may be queued is a separate question (chunked_response).
+    bool response_started{false};
+    bool chunked_response{false};
     std::string http_head_saved;
     // Parsed once, at the top of the exchange, with its views rebased onto the
     // string above -- so the streamed request and a gathered one cannot come to
@@ -316,6 +322,8 @@ struct alignas(64) server_connection
         // client's first bytes for the rest of somebody else's upload.
         body_remaining = 0;
         body_chunked = false;
+        response_started = false;
+        chunked_response = false;
         chunk_dec = http_chunked_decoder{};
         http_head_saved.clear();
         http_req_saved.headers.clear();
@@ -521,6 +529,13 @@ public:
     // A producer that can ask this can pace; one that cannot finds out by
     // having its connection taken away.  -1 for an id that is not a connection
     // of this runtime, which a caller has to tell from 0.
+    // The id-taking forms, which is what a script has: a connection pointer is
+    // this runtime's own currency and never leaves it.
+    bool begin_chunked_response(int client_id, int status,
+                                const std::vector<std::pair<std::string, std::string>>& headers);
+    bool send_response_chunk(int client_id, std::string_view data);
+    bool finish_chunked_response(int client_id);
+
     long     pending_bytes(int client_id) const;
     bool     closed_for_backlog(int client_id) const;
 
@@ -829,6 +844,13 @@ private:
     // decrementing body_remaining.  Takes nothing and keeps nothing: the whole
     // point is that the runtime never holds the body.
     void deliver_body_chunks(server_connection* conn);
+    // A response the script sends itself, in three steps.  Each answers
+    // whether it was taken, which for the chunks is the backpressure that
+    // makes a body larger than memory possible at all.
+    bool begin_chunked_response(server_connection* conn, int status,
+                                const std::vector<std::pair<std::string, std::string>>& headers);
+    bool send_response_chunk(server_connection* conn, std::string_view data);
+    bool end_chunked_response(server_connection* conn);
     // The body is complete: re-parse the saved head and dispatch the request
     // with an empty body, so the response path is the one it always was.
     void finish_streamed_body(server_connection* conn);
@@ -1026,6 +1048,12 @@ private:
     // recycled fd would hand the call to whoever took the slot -- a serial
     // that no longer resolves is exactly the answer wanted.
     std::vector<uint64_t> m_drain_pending;
+    // Connections whose streamed response ended with a pipelined request still
+    // buffered.  end_chunked_response() is reached from inside a Lua callback,
+    // and calling the parser from there is re-entering the function that is
+    // running -- so the serial waits for the next loop turn, exactly as the
+    // drain dispatch above does and for the same reason.
+    std::vector<uint64_t> m_reparse_pending;
 
     // What another runtime has routed to us, of which we hold only the name
     // and a local handle to show Lua.

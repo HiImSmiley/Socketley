@@ -1394,6 +1394,30 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
 
 // Only reachable from the Lua on_http_request path below, so the no-Lua build
 // has no caller for any of these helpers.
+// Lifted out of the no-Lua guard below: a status-to-phrase map with no Lua
+// in it, and begin_chunked_response() is a caller outside that path.
+static std::string_view http_reason(int status)
+{
+    switch (status)
+    {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        default:  return "Unknown";
+    }
+}
+
 #ifndef SOCKETLEY_NO_LUA
 static std::string build_http_response_full(int status, std::string_view reason,
     const std::vector<std::pair<std::string, std::string>>& headers,
@@ -1455,27 +1479,6 @@ static const char* lua_value_type_name(lua_context& lc, const sol::object& v)
     return lua_typename(lc.state().lua_state(), static_cast<int>(v.get_type()));
 }
 
-static std::string_view http_reason(int status)
-{
-    switch (status)
-    {
-        case 200: return "OK";
-        case 201: return "Created";
-        case 204: return "No Content";
-        case 301: return "Moved Permanently";
-        case 302: return "Found";
-        case 304: return "Not Modified";
-        case 400: return "Bad Request";
-        case 401: return "Unauthorized";
-        case 403: return "Forbidden";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        case 500: return "Internal Server Error";
-        case 502: return "Bad Gateway";
-        case 503: return "Service Unavailable";
-        default:  return "Unknown";
-    }
-}
 #endif
 
 // The one place an HTTP response enters the write queue, so a HEAD is cut to
@@ -1512,6 +1515,15 @@ void server_instance::refuse_http_request(server_connection* conn,
 
 void server_instance::handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed)
 {
+    // A new request, so nothing the last one answered applies to it.  Here and
+    // not in end_chunked_response, because the fall-through to the static file
+    // and the 404 is tested after the callback RETURNS -- by which time
+    // end_response has run, and a flag cleared there would have reopened the
+    // fall-through for a request that was already answered.  Measured with it
+    // cleared there: two status lines on one socket for a single request.
+    conn->response_started = false;
+    conn->chunked_response = false;
+
     // Decided once, before anything can answer, so that every path below —
     // Lua, cached, disk, 404 — agrees about what the client asked for.
     conn->http_keep_alive = http_request_keep_alive(req);
@@ -1668,6 +1680,14 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         }
     }
 #endif
+
+    // A response the script started itself is already on its way, so the two
+    // fallbacks below must not send a second one down the same connection.
+    if (SOCKETLEY_UNLIKELY(conn->response_started))
+    {
+        conn->partial.erase(0, total_consumed);
+        return;
+    }
 
     // Fallback: serve static files if configured
     if (!m_http_dir.empty())
@@ -2859,6 +2879,26 @@ void server_instance::on_loop_turn()
     if (m_companion)
         m_companion->pump();
 
+    // The same shape as the drain dispatch below, and for the same reason: a
+    // streamed response that ended with a request already buffered behind it
+    // cannot re-enter the parser from inside the callback that ended it.
+    if (SOCKETLEY_UNLIKELY(!m_reparse_pending.empty()))
+    {
+        std::vector<uint64_t> due;
+        due.swap(m_reparse_pending);
+        for (const uint64_t serial : due)
+        {
+            auto it = m_conn_by_serial.find(serial);
+            if (it == m_conn_by_serial.end())
+                continue;
+            const int fd = it->second;
+            auto* c = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+            if (!c || c->closing || c->partial.empty())
+                continue;
+            parse_partial(c);
+        }
+    }
+
     // Taken by value, because a script's on_writable may send enough to fill
     // the queue again and land a fresh serial in the member while this loop is
     // still walking it.
@@ -3108,6 +3148,111 @@ void server_instance::finish_streamed_body(server_connection* conn)
     // req.body carrying them a second time is the memory this exists to avoid.
     hreq.body = std::string_view();
     handle_http_request(conn, hreq, 0);
+}
+
+// ─── A response the script writes itself ────────────────────────────────────
+// on_http_request has to return a complete body, so a generated response had to
+// fit in memory -- a file of any size was already served by the splice path and
+// a generated one of any size was not expressible.  These three put the script
+// on the other side of the same bound its reads already have.
+bool server_instance::begin_chunked_response(server_connection* conn, int status,
+    const std::vector<std::pair<std::string, std::string>>& headers)
+{
+    if (!m_loop || conn->closing || conn->response_started)
+        return false;
+
+    std::string head;
+    head.reserve(160);
+    head.append("HTTP/1.1 ");
+    char sbuf[8];
+    auto [s_end, s_ec] = std::to_chars(sbuf, sbuf + sizeof(sbuf), status);
+    head.append(sbuf, s_end - sbuf);
+    head.push_back(' ');
+    head.append(http_reason(status));
+    head.append("\r\n");
+
+    // The script's headers first, minus the two this owns: a Content-Length
+    // beside a chunked body is the message carrying two answers to how long it
+    // is, which is the framing hole this server refuses on the way in.
+    for (const auto& [k, v] : headers)
+    {
+        if (fnv1a_lower(k) == fnv1a("content-length") ||
+            fnv1a_lower(k) == fnv1a("transfer-encoding") ||
+            fnv1a_lower(k) == fnv1a("connection"))
+            continue;
+        head.append(k);
+        head.append(": ");
+        head.append(v);
+        head.append("\r\n");
+    }
+    head.append("Transfer-Encoding: chunked\r\n");
+    head.append(conn->http_keep_alive ? "Connection: keep-alive\r\n\r\n"
+                                      : "Connection: close\r\n\r\n");
+
+    conn->response_started = true;
+    // Not for a HEAD: its headers are a GET's, and its body is nothing at all.
+    conn->chunked_response = !conn->http_head;
+    return queue_send(conn, std::make_shared<const std::string>(std::move(head)));
+}
+
+bool server_instance::send_response_chunk(server_connection* conn, std::string_view data)
+{
+    if (!m_loop || conn->closing || !conn->response_started)
+        return false;
+    // A HEAD asked for the headers and nothing else, so there is no chunk to
+    // take -- answered false rather than dropped, because a script that thinks
+    // it is sending a body to a HEAD has a bug this is the only report of.
+    if (!conn->chunked_response)
+        return false;
+    // An empty chunk is the terminator's spelling, so it cannot be sent as
+    // payload: it would end the response with the script still writing.
+    if (data.empty())
+        return true;
+
+    std::string out;
+    out.reserve(data.size() + 24);
+    char hbuf[20];
+    auto [h_end, h_ec] = std::to_chars(hbuf, hbuf + sizeof(hbuf),
+                                      static_cast<uint64_t>(data.size()), 16);
+    out.append(hbuf, h_end - hbuf);
+    out.append("\r\n");
+    out.append(data);
+    out.append("\r\n");
+    return queue_send(conn, std::make_shared<const std::string>(std::move(out)));
+}
+
+bool server_instance::end_chunked_response(server_connection* conn)
+{
+    if (!m_loop || !conn->response_started)
+        return false;
+
+    bool taken = true;
+    if (conn->chunked_response)
+        taken = queue_send(conn,
+            std::make_shared<const std::string>(std::string("0\r\n\r\n")),
+            /*even_when_closing=*/false);
+
+    // response_started stays: it says this REQUEST has been answered, and the
+    // fall-through to the static file and the 404 is tested after the callback
+    // returns -- by which time end_response has already run.  Measured with it
+    // cleared here: two status lines on one socket for a single request, the
+    // streamed answer and then a 404 behind it.  It is cleared where the next
+    // request's headers are parsed instead.
+    conn->chunked_response = false;
+
+    if (!conn->http_keep_alive)
+    {
+        conn->closing = true;
+        return taken;
+    }
+    conn->proto = proto_unknown;
+    // A request that was pipelined behind this one is already buffered, and the
+    // client is waiting for its answer -- but this is reached from inside a Lua
+    // callback, so the parser is entered on the next loop turn instead of from
+    // within itself.
+    if (!conn->partial.empty() && conn->ref_serial != 0)
+        m_reparse_pending.push_back(conn->ref_serial);
+    return taken;
 }
 
 void server_instance::parse_partial(server_connection* conn)
@@ -5651,6 +5796,31 @@ std::string_view server_instance::get_client_route(int client_id) const
 // The two questions a producer needs and could not ask.  Both answer about a
 // connection this process holds; a routed handle belongs to another runtime and
 // its backlog is that runtime's to report.
+// Resolved the same way pending_bytes() below resolves, and refusing for the
+// same reason: a routed handle names a connection another runtime holds, and a
+// response is that runtime's to write.
+bool server_instance::begin_chunked_response(int client_id, int status,
+    const std::vector<std::pair<std::string, std::string>>& headers)
+{
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return false;
+    return begin_chunked_response(m_conn_idx[client_id], status, headers);
+}
+
+bool server_instance::send_response_chunk(int client_id, std::string_view data)
+{
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return false;
+    return send_response_chunk(m_conn_idx[client_id], data);
+}
+
+bool server_instance::finish_chunked_response(int client_id)
+{
+    if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
+        return false;
+    return end_chunked_response(m_conn_idx[client_id]);
+}
+
 long server_instance::pending_bytes(int client_id) const
 {
     if (client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])
