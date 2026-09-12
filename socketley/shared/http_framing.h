@@ -6,9 +6,11 @@
 // un-pooled socket and the cost of guessing wrong is a client reading someone
 // else's data.
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <system_error>
 
 // Same spelling and guards as event_loop_definitions.h, repeated rather than
 // included so this header stays reachable from a fuzz target that links
@@ -658,4 +660,86 @@ inline bool http_response_frame_complete(const http_response_framing& st)
 inline bool http_response_pool_safe(const http_response_framing& st)
 {
     return http_response_frame_complete(st) && !st.overrun;
+}
+
+// ─── One Range header, into numbers ─────────────────────────────────────────
+// RFC 9110 14.1.  Only `bytes` and only a single range: a multi-range request
+// needs a multipart/byteranges body, and 14.2 permits a server to ignore the
+// field entirely -- so the whole file is answered for those rather than a
+// wrong slice.  `first`/`last` are inclusive, as on the wire.
+struct http_range
+{
+    bool   present{false};   // a Range header was there and named `bytes`
+    bool   usable{false};    // and it parsed as exactly one range in the file
+    // Syntactically a single byte-range, and entirely past the end.  14.4 says
+    // answer 416 with Content-Range: bytes */<total>.  Kept apart from the
+    // merely unparseable, which 14.2 lets a server ignore and answer whole --
+    // collapsing the two would answer 416 for a malformed header, where the
+    // file is the more useful reply, or 200 for a seek past the end, which is
+    // what a player uses to learn the length.
+    bool   unsatisfiable{false};
+    size_t first{0};
+    size_t last{0};          // inclusive
+};
+
+inline bool http_range_num(std::string_view s, size_t& out)
+{
+    if (s.empty()) return false;
+    size_t v = 0;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (r.ec != std::errc{} || r.ptr != s.data() + s.size()) return false;
+    out = v;
+    return true;
+}
+
+// `total` is needed because a suffix range (`bytes=-500`) is defined against
+// the file's length, so this cannot be parsed without knowing it.
+inline http_range http_parse_range(std::string_view v, size_t total)
+{
+    http_range r;
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+    if (v.size() < 7 || v.substr(0, 6) != "bytes=") return r;
+    r.present = true;
+    v.remove_prefix(6);
+    // One range only; a comma means the multipart form this does not produce.
+    if (v.find(',') != std::string_view::npos) return r;
+    while (!v.empty() && v.front() == ' ') v.remove_prefix(1);
+
+    const size_t dash = v.find('-');
+    if (dash == std::string_view::npos) return r;
+    std::string_view a = v.substr(0, dash), b = v.substr(dash + 1);
+    while (!b.empty() && (b.back() == ' ' || b.back() == '\t')) b.remove_suffix(1);
+
+    if (a.empty())
+    {
+        // Suffix: the last N bytes.  N == 0 is meaningless and is not a range.
+        size_t n;
+        if (!http_range_num(b, n)) return r;
+        // A zero-length suffix is syntactically a range and names no bytes.
+        if (n == 0) { r.unsatisfiable = true; return r; }
+        if (total == 0) { r.unsatisfiable = true; return r; }
+        r.first = n >= total ? 0 : total - n;
+        r.last  = total - 1;
+        r.usable = true;
+        return r;
+    }
+
+    if (!http_range_num(a, r.first)) return r;
+    if (b.empty())
+    {
+        // Open-ended: to the end of what exists.
+        if (total == 0 || r.first >= total) { r.unsatisfiable = true; return r; }
+        r.last = total - 1;
+        r.usable = true;
+        return r;
+    }
+    if (!http_range_num(b, r.last)) return r;
+    // An inverted range is not a range at all, so it is ignored rather than
+    // refused: 416 claims the file is shorter than asked, which is not the
+    // complaint.
+    if (r.last < r.first) return r;
+    if (total == 0 || r.first >= total) { r.unsatisfiable = true; return r; }
+    if (r.last >= total) r.last = total - 1;            // clamped, per 14.1.1
+    r.usable = true;
+    return r;
 }

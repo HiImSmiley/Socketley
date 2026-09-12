@@ -144,6 +144,11 @@ struct alignas(64) server_connection
     io_request splice_out_req;
     int splice_file_fd{-1};
     size_t splice_remaining{0};
+    // A 206 in progress: where the slice starts, and the file's whole length,
+    // which Content-Range has to state and Content-Length must not.
+    size_t range_first{0};
+    size_t range_total{0};
+    bool   is_range{false};
     uint32_t splice_pipe_pending{0};
     // Headers are queued and the file→pipe splice starts once they are on the
     // wire; this says the transfer is owed, not that an op is armed.
@@ -266,6 +271,12 @@ struct alignas(64) server_connection
         splice_out_req = {};
         if (splice_file_fd >= 0) { close(splice_file_fd); splice_file_fd = -1; }
         splice_remaining = 0;
+        // With the rest of the per-response state: a struct that carried a
+        // 206 would answer the next client's whole-file request with that
+        // slice's headers.
+        range_first = 0;
+        range_total = 0;
+        is_range = false;
         splice_pipe_pending = 0;
         splice_pending = false;
         splice_in_pending = false;
@@ -761,7 +772,12 @@ private:
 #endif
 
     std::function<void(int, const ws_headers_result&)> m_cb_on_websocket;
-    void serve_http(server_connection* conn, std::string_view path);
+    // `range_hdr` is the client's Range field as text, resolved against the
+    // file's length here rather than at the caller, which does not know it
+    // yet.  Empty means no Range, which is every request that is not a media
+    // player seeking.
+    void serve_http(server_connection* conn, std::string_view path,
+                    std::string_view range_hdr = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
     void queue_http_response(server_connection* conn, std::shared_ptr<const std::string> resp);
 

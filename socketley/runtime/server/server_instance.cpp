@@ -627,9 +627,21 @@ static std::string build_http_response_at(std::string_view content_type,
     const size_t body_len = content.size() + (inject ? WS_INJECT_SCRIPT.size() : 0);
 
     std::string resp;
-    resp.reserve(128 + body_len);
+    resp.reserve(160 + body_len);
     resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
     resp.append(content_type);
+    // Here as well as on the splice arm's headers, and the omission was worth
+    // measuring: a first request for a small file takes THIS arm, so a whole
+    // file was answered without the field while a slice of it was answered
+    // with one.  A client that respects the field then never seeks at all,
+    // which is the common case and would have made the 206 path unreachable
+    // from a conforming player.
+    //
+    // Injected HTML is a 200 from this builder too, and a range on HTML is
+    // declined in serve_http -- the offsets do not survive the injection --
+    // so the field is not claimed for those.
+    if (!inject)
+        resp.append("\r\nAccept-Ranges: bytes");
     resp.append("\r\nContent-Length: ");
     char len_buf[24];
     auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body_len);
@@ -648,16 +660,63 @@ static std::string build_http_response_at(std::string_view content_type,
     return resp;
 }
 
+static void append_num(std::string& out, size_t n)
+{
+    char buf[24];
+    auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), n);
+    out.append(buf, end - buf);
+}
+
 static std::string build_http_headers_only(std::string_view content_type, size_t body_size, bool keep_alive)
 {
     std::string resp;
-    resp.reserve(128);
+    resp.reserve(160);
     resp.append("HTTP/1.1 200 OK\r\nContent-Type: ");
     resp.append(content_type);
+    // Said on the whole-file answer, because a player asks for the file and
+    // decides from this header whether it may seek at all.  Without it a
+    // conforming client downloads linearly and cannot scrub.
+    resp.append("\r\nAccept-Ranges: bytes\r\nContent-Length: ");
+    append_num(resp, body_size);
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
+    return resp;
+}
+
+// ─── A slice, and the two headers that make it one ──────────────────────────
+// Content-Length is the slice; Content-Range carries the whole length.  Giving
+// Content-Length the file's size is the classic way to write this wrong -- the
+// client then waits forever for bytes the server already finished sending.
+static std::string build_http_206_headers(std::string_view content_type,
+                                          size_t first, size_t last, size_t total,
+                                          bool keep_alive)
+{
+    std::string resp;
+    resp.reserve(192);
+    resp.append("HTTP/1.1 206 Partial Content\r\nContent-Type: ");
+    resp.append(content_type);
+    resp.append("\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
+    append_num(resp, first);
+    resp.push_back('-');
+    append_num(resp, last);
+    resp.push_back('/');
+    append_num(resp, total);
     resp.append("\r\nContent-Length: ");
-    char len_buf[24];
-    auto [len_end, len_ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body_size);
-    resp.append(len_buf, len_end - len_buf);
+    append_num(resp, last - first + 1);
+    resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
+    return resp;
+}
+
+// A seek past the end, which is how a player learns a file's length when it
+// was not told: the answer has to state the length it could not satisfy.
+static std::string build_http_416(size_t total, bool keep_alive)
+{
+    std::string resp;
+    resp.reserve(160);
+    resp.append("HTTP/1.1 416 Range Not Satisfiable\r\n"
+                "Content-Type: text/plain\r\nAccept-Ranges: bytes\r\n"
+                "Content-Range: bytes */");
+    append_num(resp, total);
+    resp.append("\r\nContent-Length: 0");
     resp.append(keep_alive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
     return resp;
 }
@@ -905,8 +964,15 @@ void server_instance::open_http_root()
     // which is what it did before this existed.
 }
 
-void server_instance::serve_http(server_connection* conn, std::string_view path)
+void server_instance::serve_http(server_connection* conn, std::string_view path,
+                                 std::string_view range_hdr)
 {
+    // Cleared per request and not per connection: under keep-alive this struct
+    // serves the next request without a reset(), and a path that does not
+    // reach the two arms below -- a 404, a cache hit -- would leave the last
+    // response's answer standing.
+    conn->is_range = false;
+
     // Normalize: "/" → "/index.html"
     std::string url_path(path);
     if (url_path == "/")
@@ -998,7 +1064,13 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         if (rel_path.empty())
             rel_path = ".";
 
-        bool reval_ok = http_reval_active();
+        // A cached entry is the WHOLE file's response, so serving it for a
+        // Range request would answer a seek with the entire body under a 200.
+        // Judged on the header being present at all rather than on it being
+        // usable, because usability needs the length and the length needs the
+        // fstat below -- a malformed Range then costs one uncached answer,
+        // which is the right way round.
+        bool reval_ok = http_reval_active() && range_hdr.empty();
         if (reval_ok)
         {
             auto rit = m_http_reval.find(url_path);
@@ -1123,6 +1195,27 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         bool is_html = (ext_hash == fnv1a(".html") || ext_hash == fnv1a(".htm"));
         auto ct = http_content_type(ext);
 
+        // ─── The range, against the length it is defined by ─────────────
+        // Not for HTML: the injected script changes the body's length, so a
+        // byte offset into the file is not an offset into what is served.
+        // 14.2 lets a server ignore the field, and that is the honest answer
+        // here rather than a slice of something else.
+        const http_range rng = is_html ? http_range{}
+                                       : http_parse_range(range_hdr, fsize);
+        if (SOCKETLEY_UNLIKELY(rng.unsatisfiable))
+        {
+            close_tracked(ffd);
+            queue_http_response(conn, std::make_shared<const std::string>(
+                build_http_416(fsize, conn->http_keep_alive)));
+            if (!conn->http_keep_alive)
+                conn->closing = true;
+            else
+                conn->proto = proto_unknown;
+            return;
+        }
+        const size_t send_first = rng.usable ? rng.first : 0;
+        const size_t send_len   = rng.usable ? (rng.last - rng.first + 1) : fsize;
+
         // An empty file exists, so it is a 200 with the body --http-cache
         // would build for it and no read, since a zero-length read completes
         // with 0 and 0 was being answered as 404.
@@ -1166,21 +1259,36 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // stream.
         if (!is_html && !conn->ssl && !m_splice_busy && m_splice_pipe[0] >= 0 && !reval_take)
         {
-            conn->splice_file_fd = ffd;
-            conn->splice_remaining = fsize;
-            conn->splice_pipe_pending = 0;
-            conn->splice_pending = true;
-            conn->file_content_type = std::string(ct);
-            m_splice_busy = true;
+            // The slice's start becomes the descriptor's offset, because
+            // splice() from a file advances that offset and has no argument
+            // for where to begin.  A failure here would splice from 0 and
+            // answer a 206 whose Content-Range says otherwise, so it falls
+            // through to the read arm instead of serving the wrong bytes.
+            if (send_first == 0 || lseek(ffd, static_cast<off_t>(send_first), SEEK_SET)
+                                       == static_cast<off_t>(send_first))
+            {
+                conn->splice_file_fd = ffd;
+                conn->splice_remaining = send_len;
+                conn->splice_pipe_pending = 0;
+                conn->splice_pending = true;
+                conn->file_content_type = std::string(ct);
+                conn->is_range = rng.usable;
+                conn->range_first = send_first;
+                conn->range_total = fsize;
+                m_splice_busy = true;
 
-            // Send HTTP headers via normal write path; splice starts after headers are sent
-            queue_http_response(conn, std::make_shared<const std::string>(
-                build_http_headers_only(ct, fsize, conn->http_keep_alive)));
-            return;
+                // Send HTTP headers via normal write path; splice starts after headers are sent
+                queue_http_response(conn, std::make_shared<const std::string>(
+                    rng.usable
+                        ? build_http_206_headers(ct, rng.first, rng.last, fsize,
+                                                 conn->http_keep_alive)
+                        : build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+                return;
+            }
         }
 
         // Fallback: malloc + async read (HTML files or splice busy)
-        char* fbuf = static_cast<char*>(malloc(fsize));
+        char* fbuf = static_cast<char*>(malloc(send_len));
         if (!fbuf)
         {
             close_tracked(ffd);
@@ -1195,8 +1303,15 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         // Store state on connection for completion handler
         conn->file_fd = ffd;
         conn->file_buf = fbuf;
-        conn->file_size = fsize;
+        // The slice's length, because the completion compares what arrived
+        // against this to decide whether it read the whole of what it asked
+        // for -- a 206 that stored the file's length here would read as a
+        // short read and answer 500.
+        conn->file_size = send_len;
         conn->file_content_type = std::string(ct);
+        conn->is_range = rng.usable;
+        conn->range_first = send_first;
+        conn->range_total = fsize;
         conn->file_is_html = is_html;
         conn->file_read_pending = true;
         // Non-empty only when the completion may keep the bytes, with the
@@ -1213,10 +1328,10 @@ void server_instance::serve_http(server_connection* conn, std::string_view path)
         }
 
         // Submit async read — req->fd = socket fd for CQE dispatch
-        conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(fsize), op_file_read,
+        conn->file_read_req = { this, fbuf, conn->fd, static_cast<uint32_t>(send_len), op_file_read,
                                 conn->generation };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(fsize), 0,
-                                                         &conn->file_read_req)))
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_file_read(ffd, fbuf, static_cast<uint32_t>(send_len),
+                                                         send_first, &conn->file_read_req)))
         {
             // No completion will arrive for a read that was never queued, and
             // the teardown closes file_fd and frees file_buf, both already
@@ -1508,8 +1623,19 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
     if (!m_http_dir.empty())
     {
         std::string path_str(req.path);
+        // Read here and turned into a plain string, because req.headers are
+        // views into conn->partial and the erase below is what they point at.
+        // The size is not known yet either, so the numbers are resolved in
+        // serve_http once fstat has answered -- this only carries the text.
+        std::string range_hdr;
+        for (const auto& [k, v] : req.headers)
+            if (fnv1a_lower(k) == fnv1a("range"))
+            {
+                range_hdr.assign(v);
+                break;
+            }
         conn->partial.erase(0, total_consumed);
-        serve_http(conn, path_str);
+        serve_http(conn, path_str, range_hdr);
     }
     else
     {
@@ -4847,7 +4973,14 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // or match a later truncation.  Whether it fits is asked here and not after
     // the fact: the store branch builds a second full response, and building
     // one to hand to a cache that will refuse it is the whole cost twice.
-    const bool store = !conn->file_url_path.empty() &&
+    // Never for a 206.  The map is keyed by url_path and holds the WHOLE
+    // file's response, so storing a slice under that key would answer the next
+    // request for the file with this request's bytes and this request's
+    // Content-Range.  serve_http already declines the cache on the way in; this
+    // is the other half, and the two together are why a seek cannot poison a
+    // path for every later reader.
+    const bool store = !conn->is_range &&
+                       !conn->file_url_path.empty() &&
                        static_cast<uint64_t>(cqe->res) ==
                            static_cast<uint64_t>(conn->file_st.st_size) &&
                        http_reval_would_fit(conn->file_url_path, 2 * (128 + body_len));
@@ -4860,11 +4993,25 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         queue_http_response(conn, conn->http_keep_alive ? ka : cl);
         http_reval_store(conn->file_url_path, conn->file_st, std::move(ka), std::move(cl));
     }
+    else if (conn->is_range)
+    {
+        // Headers and body assembled here rather than in build_http_response_at,
+        // which has no notion of a slice: the length it would state is the one
+        // it was handed, and a 206 needs two different lengths -- the slice in
+        // Content-Length and the file in Content-Range.
+        std::string out = build_http_206_headers(
+            conn->file_content_type, conn->range_first,
+            conn->range_first + file_content.size() - 1,
+            conn->range_total, conn->http_keep_alive);
+        out.append(file_content);
+        queue_http_response(conn, std::make_shared<const std::string>(std::move(out)));
+    }
     else
     {
         queue_http_response(conn, std::make_shared<const std::string>(build_http_response_at(
             conn->file_content_type, file_content, inject_at, conn->http_keep_alive)));
     }
+    conn->is_range = false;
     conn->file_url_path.clear();
 
     // Free file buffer
