@@ -143,6 +143,14 @@ struct alignas(64) server_connection
     io_request splice_in_req;
     io_request splice_out_req;
     int splice_file_fd{-1};
+    // This connection's own pipe, not the runtime's.  One shared pipe meant
+    // exactly one connection could take the zero-copy path at a time, and
+    // everything else fell back to read+write -- measured at 975 us against
+    // 6087 on a 4 MiB file, so the second concurrent download paid 6.2x for
+    // being second.  Owned here, it also cannot carry one response's leftover
+    // bytes into another's, which is what the drain loop in splice_cleanup()
+    // existed to prevent.
+    int splice_pipe[2]{-1, -1};
     size_t splice_remaining{0};
     // A 206 in progress: where the slice starts, and the file's whole length,
     // which Content-Range has to state and Content-Length must not.
@@ -776,6 +784,15 @@ private:
     // file's length here rather than at the caller, which does not know it
     // yet.  Empty means no Range, which is every request that is not a media
     // player seeking.
+    // A pipe for this connection, or false when the cap is reached -- in which
+    // case the caller serves the file the ordinary way, exactly as every
+    // connection but the first used to.
+    bool splice_pipe_acquire(server_connection* conn);
+    // Idempotent, because it is reached from the response's end, from the
+    // retire path and from pool_release, and only the first of those has to
+    // happen for a connection that finished normally.
+    void splice_pipe_release(server_connection* conn);
+
     void serve_http(server_connection* conn, std::string_view path,
                     std::string_view range_hdr = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
@@ -1114,8 +1131,11 @@ private:
                           std::shared_ptr<const std::string> cl);
 
     // Splice pipe for zero-copy file serving (shared across connections, one at a time)
-    int m_splice_pipe[2]{-1, -1};
-    bool m_splice_busy{false};
+    // How many connections hold a splice pipe right now.  A cap and not a
+    // pool: the pipes are per connection, so this only bounds how much kernel
+    // memory they add up to.
+    uint32_t m_splice_live{0};
+    static constexpr uint32_t MAX_CONCURRENT_SPLICE = 8;
 
     // Multicast groups: group_name → list of fds in that group
     std::unordered_map<std::string, std::vector<int>> m_groups;

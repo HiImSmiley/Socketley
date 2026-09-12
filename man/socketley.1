@@ -2241,6 +2241,30 @@ responses do not claim
 .B Accept-Ranges
 either, rather than inviting a seek that cannot be honoured.
 .IP
+.B "Concurrency of the zero-copy path."
+A file is sent with
+.BR splice (2)
+through a pipe, which keeps the bytes out of user space entirely. That pipe used
+to be one per runtime, so exactly one connection at a time could take the path
+and everything else fell back to a read into memory followed by a write.
+Measured on 4 MiB files, seven interleaved passes of each build:
+.IP
+.nf
+concurrent   before      after     factor
+1            2.9 ms      2.9 ms     0.98
+2           11.9 ms      4.2 ms     2.80
+4           26.1 ms      5.3 ms     4.97
+8           55.8 ms     10.5 ms     5.33
+.fi
+.IP
+Each connection now makes its own pipe, up to eight at a time; past that the
+read path serves the remainder exactly as it did before. The single\(hyconnection
+case is unchanged, which the first row is the control for. Pipe size follows
+.BR \-\-write\-buffer ,
+capped at 1 MB, because both answer how much may be in flight for one
+connection \(em a runtime configured small because it serves many streams
+should not then hold a megabyte of kernel pipe per stream.
+.IP
 A slice is never stored in the revalidation map and never answered from it.
 The map is keyed by path and holds the whole file's response, so a stored 206
 would answer every later request for that path with one reader's slice and
