@@ -3125,7 +3125,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         std::string listen;
         uint16_t    port{0};
         uint32_t    max_conns{0}, idle_timeout{0};
-        size_t      write_buffer{0};
+        size_t      write_buffer{0}, read_buffer{0};
         double      rate_limit{0.0}, global_rate_limit{0.0};
         std::string group, log_file, write_file;
         bool        bash_output{false}, bash_prefix{false}, bash_timestamp{false};
@@ -3155,6 +3155,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
     before.max_conns  = instance->get_max_connections();
     before.idle_timeout      = instance->get_idle_timeout();
     before.write_buffer      = instance->get_write_buffer();
+    before.read_buffer       = instance->get_read_buffer();
     before.rate_limit        = instance->get_rate_limit();
     before.global_rate_limit = instance->get_global_rate_limit();
     before.group      = std::string(instance->get_group());
@@ -3194,6 +3195,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         instance->set_max_connections(before.max_conns);
         instance->set_idle_timeout(before.idle_timeout);
         instance->set_write_buffer(before.write_buffer);
+        instance->set_read_buffer(before.read_buffer);
         instance->set_rate_limit(before.rate_limit);
         instance->set_global_rate_limit(before.global_rate_limit);
         instance->set_group(before.group);
@@ -3786,6 +3788,7 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
     if (has("global_rate_limit")) instance->set_global_rate_limit(cfg.global_rate_limit);
     if (has("idle_timeout"))      instance->set_idle_timeout(cfg.idle_timeout);
     if (has("write_buffer"))      instance->set_write_buffer(cfg.write_buffer);
+    if (has("read_buffer"))       instance->set_read_buffer(cfg.read_buffer);
     if (has("drain"))             instance->set_drain(cfg.drain);
     if (has("reconnect"))         instance->set_reconnect(cfg.reconnect);
     if (has("tls"))               instance->set_tls(cfg.tls);

@@ -510,9 +510,12 @@ private:
     };
 
     // Crossed for and unanswered, per connection, past which the read is
-    // withdrawn and the kernel's socket buffer holds the client; the same
-    // figure as MAX_PARTIAL_SIZE because it bounds the same client's memory.
-    static constexpr size_t MAX_CROSSING_BYTES = 1u << 20;
+    // withdrawn and the kernel's socket buffer holds the client.  It has to be
+    // the accumulation bound and not a literal beside it: the comment here
+    // already said "the same figure as MAX_PARTIAL_SIZE because it bounds the
+    // same client's memory", and leaving 1 MiB written down while --read-buffer
+    // moved the other one would have made that sentence false without anything
+    // saying so.
 
     // A batch that could grow without bound is a memory path a client
     // controls, so a run of routed commands is cut and the rest left in

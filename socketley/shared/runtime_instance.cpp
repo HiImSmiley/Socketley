@@ -1029,6 +1029,17 @@ void runtime_instance::set_write_buffer(size_t bytes)
 }
 size_t runtime_instance::get_write_buffer() const { return m_write_buffer; }
 
+// Floored at 64 KiB, so the derived bulk cap is never under 32 KiB -- below
+// that a RESP client cannot store an ordinary document and an HTTP client
+// cannot post an ordinary form, which is a runtime that looks broken rather
+// than configured.
+void runtime_instance::set_read_buffer(size_t bytes)
+{
+    constexpr size_t floor = 64u * 1024;
+    m_read_buffer = bytes < floor ? floor : bytes;
+}
+size_t runtime_instance::get_read_buffer() const { return m_read_buffer; }
+
 void runtime_instance::set_idle_timeout(uint32_t seconds) { m_idle_timeout = seconds; }
 uint32_t runtime_instance::get_idle_timeout() const { return m_idle_timeout; }
 

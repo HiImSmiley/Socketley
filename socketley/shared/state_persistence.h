@@ -48,6 +48,7 @@ struct runtime_config
     // 0 means "not given", so a record written before this existed restores a
     // runtime to the default rather than to a bound of zero.
     size_t   write_buffer = 0;
+    size_t   read_buffer  = 0;
     bool drain = false;
     int reconnect = -1;
     bool tls = false;

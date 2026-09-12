@@ -789,7 +789,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
     if (m_conn->ssl && m_mode == client_mode_out)
         m_conn->partial.clear();
 
-    if (m_conn->partial.size() > client_tcp_connection::MAX_PARTIAL_SIZE)
+    if (m_conn->partial.size() > read_buffer_bytes())
     {
         m_conn->closing = true;
         goto resubmit;
@@ -1123,7 +1123,7 @@ void client_instance::tls_feed(const char* data, size_t len)
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
             if (SOCKETLEY_UNLIKELY(m_conn->partial.size() >
-                                   client_tcp_connection::MAX_PARTIAL_SIZE))
+                                   read_buffer_bytes()))
             {
                 m_conn->closing = true;
                 break;

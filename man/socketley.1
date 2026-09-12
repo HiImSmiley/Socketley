@@ -1367,6 +1367,46 @@ Limit maximum concurrent connections. New connections beyond this limit
 are immediately closed. 0 means unlimited (default). Alias:
 .BR \-\-max\-conn .
 .TP
+.BI "\-\-read\-buffer " "size"
+How much may be accumulated FROM one connection before it is refused, with
+K/M/G suffixes. Default 1M. The inbound twin of
+.BR \-\-write\-buffer ,
+and like it, every runtime has one.
+.IP
+The largest single value inside that buffer is half of it, which leaves room
+for the framing around it. So the default gives a cache a 512K ceiling on any
+one value \(em and those were already the two numbers this was compiled with,
+1 MiB of accumulation and 512 KB of value, so the halving is named here rather
+than introduced. An unconfigured runtime accepts exactly what it accepted
+before.
+.IP
+Raise it for a cache holding documents rather than fields: Redis's own
+.B proto\-max\-bulk\-len
+defaults to 512M, a thousand times this. Lower it for a runtime facing the
+open internet, where the buffer is memory a client controls. Values under 64K
+are raised to it rather than refused, because the derived value ceiling would
+otherwise be under what an ordinary form post or JSON document needs.
+.IP
+A value past the ceiling is answered
+.B "\-ERR value is larger than this cache accepts (limit N bytes)"
+and the connection is closed, which is what Redis does for a bulk length it
+will not take \(em the body was never read, so there is no framed position to
+continue from. It is deliberately NOT
+.BR "\-ERR protocol error" :
+the command was framed correctly and only its value was too big, and a client
+library told its framing is broken reconnects and sends the same value again.
+A length that genuinely does not parse still gets the protocol error.
+.IP
+One caveat, measured: the refusal is written and then the connection closed, so
+a client still sending when that happens receives an RST and Linux discards the
+queued reply. Overshoots up to about two megabytes read the reason; one eight
+times the ceiling does not. Raising the bound is the answer for a deployment
+that needs the larger values.
+.IP
+Editable on a running runtime, and the change takes at once: the bound is
+compared on every read and the value ceiling is derived at each parse, so
+nothing holds the old number.
+.TP
 .BI "\-\-write\-buffer " "size"
 How much may be owed to ONE connection before the runtime stops waiting for it,
 with K/M/G suffixes. Default 8M. Every runtime has a write queue, so this
@@ -5112,6 +5152,7 @@ rate_limit                 \-\-rate\-limit
 global_rate_limit          \-\-global\-rate\-limit
 idle_timeout               \-\-idle\-timeout  300, or 5m / 2h / 1d
 write_buffer               \-\-write\-buffer   8M, 256K, 65536
+read_buffer                \-\-read\-buffer    1M, 8M, 65536
 drain (bool)               \-\-drain
 test (bool)                \-\-test
 tls (bool)                 \-\-tls

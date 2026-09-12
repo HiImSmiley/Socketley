@@ -185,6 +185,24 @@ public:
     // with room left to absorb what is already in flight.
     size_t write_watermark_bytes() const { return m_write_buffer / 2; }
 
+    // ─── And how much may be accumulated FROM one connection ────────────────
+    // The inbound twin, which was MAX_PARTIAL_SIZE -- a constexpr repeated in
+    // all four runtimes at 1 MiB -- with the cache's RESP bulk cap sitting at
+    // 512 KB beside it.  Those two were already exactly 2:1, so the halving is
+    // named here rather than introduced: the accumulation bound is the buffer,
+    // and the largest single value inside it is half, which leaves room for
+    // the framing around it.
+    void set_read_buffer(size_t bytes);
+    size_t get_read_buffer() const;
+    size_t read_buffer_bytes() const { return m_read_buffer; }
+    // Half, and as an int because the RESP decoders compare a parsed int
+    // against it; clamped so a very large buffer cannot make it negative.
+    int read_bulk_limit() const
+    {
+        const size_t half = m_read_buffer / 2;
+        return half > static_cast<size_t>(INT32_MAX) ? INT32_MAX : static_cast<int>(half);
+    }
+
     // Graceful shutdown
     void set_drain(bool enabled);
     bool get_drain() const;
@@ -740,6 +758,10 @@ private:
     // Defaulted to what the constants were, so a runtime nobody configures
     // behaves exactly as before.
     size_t m_write_buffer = socketley::write_queue_max_bytes;
+    // Defaulted to what MAX_PARTIAL_SIZE was, so an unconfigured runtime
+    // accepts exactly what it accepted before -- and its bulk cap lands on
+    // 512 KB, which is exactly what RESP_MAX_BULK_LEN was.
+    size_t m_read_buffer = 1u * 1024 * 1024;
 
     // Graceful shutdown
     bool m_drain = false;

@@ -1547,7 +1547,7 @@ void cache_instance::pause_read(client_connection* conn)
 bool cache_instance::resume_read(client_connection* conn, int fd)
 {
     if (!conn->read_paused || conn->read_pending || conn->closing
-        || conn->crossing_bytes >= MAX_CROSSING_BYTES)
+        || conn->crossing_bytes >= read_buffer_bytes())
         return true;
     conn->read_paused = false;
     return submit_client_read(conn, fd);
@@ -1680,7 +1680,7 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
             {
                 conn->closing = true;
                 break;
@@ -1897,7 +1897,7 @@ void cache_instance::pump(client_connection* conn)
             break;
     }
 
-    if (SOCKETLEY_UNLIKELY(conn->crossing_bytes >= MAX_CROSSING_BYTES))
+    if (SOCKETLEY_UNLIKELY(conn->crossing_bytes >= read_buffer_bytes()))
         pause_read(conn);
 }
 
@@ -2035,7 +2035,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         SKL_TRACE_ADD(conn, reads, 1);
     }
 
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > client_connection::MAX_PARTIAL_SIZE))
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
     {
         // A line that never ends and nothing else, because the pump parses
         // every whole command as it arrives, crossing or no crossing.
@@ -2606,12 +2606,15 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
         std::string_view args[MAX_RESP_ARGS];
         int    argc     = 0;
         size_t consumed = 0;
-        const auto pr = resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed);
+        const auto pr = resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed, read_bulk_limit());
         if (pr == resp::parse_result::ok && argc > 0)
             process_resp_command_local(conn, args, argc);
         else if (pr == resp::parse_result::too_many_args)
             resp::encode_error_into(conn->response_buf,
                                     "too many arguments in one command");
+        else if (pr == resp::parse_result::value_too_large)
+            resp::encode_error_into(conn->response_buf,
+                                    "value is larger than this cache accepts");
         else
             resp::encode_error_into(conn->response_buf, "protocol error");
     }
@@ -7282,7 +7285,7 @@ bool cache_instance::process_resp(client_connection* conn)
             break;
 
         std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
-        auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
+        auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed, read_bulk_limit());
 
         if (result == resp::parse_result::incomplete)
             break;
@@ -7300,6 +7303,33 @@ bool cache_instance::process_resp(client_connection* conn)
                 "-ERR too many arguments in one command (limit ");
             conn->response_buf.append(std::to_string(MAX_RESP_ARGS));
             conn->response_buf.append(")\r\n");
+            conn->partial.clear();
+            if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+            {
+                conn->closing = true;
+                return false;
+            }
+            conn->closing = true;
+            return false;
+        }
+
+        if (result == resp::parse_result::value_too_large)
+        {
+            // Named, with the limit in it, for the reason the branch above
+            // gives: a client told "protocol error" for a value that was
+            // merely large concludes its framing is broken and sends the same
+            // value again.  Measured before this branch existed --
+            // `SET b <600KB>` answered "-ERR protocol error" and the
+            // connection closed, which is both the wrong cause and the loop
+            // that comment warns about.
+            //
+            // Closed all the same, which is what Redis does for a bulk length
+            // it will not take: the body was never read, so there is no
+            // framed position to continue from.  What changes is that the
+            // client is told which wall it met.
+            conn->response_buf.append("-ERR value is larger than this cache accepts (limit ");
+            conn->response_buf.append(std::to_string(read_bulk_limit()));
+            conn->response_buf.append(" bytes)\r\n");
             conn->partial.clear();
             if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
             {
@@ -7775,7 +7805,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 int              qargc = 0;
                 size_t           qconsumed = 0;
                 if (resp::parse_message_views(q, qargs, QUEUED_MAX_ARGS, qargc,
-                                              qconsumed) != resp::parse_result::ok
+                                              qconsumed, read_bulk_limit()) != resp::parse_result::ok
                     || qargc <= 0)
                 {
                     resp::encode_error_into(

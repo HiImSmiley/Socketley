@@ -2991,7 +2991,7 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
             // The same ceiling the cleartext path applies, checked inside the
             // loop, because one read completion can decrypt everything the
             // inbound BIO had buffered.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
             {
                 conn->closing = true;
                 break;
@@ -3461,7 +3461,7 @@ reparse:
         // because waiting for it ends at handle_read's size cap with the
         // connection closed and nothing said.
         if (SOCKETLEY_UNLIKELY(content_length >
-                               server_connection::MAX_PARTIAL_SIZE - (hdr_end + 4)))
+                               read_buffer_bytes() - (hdr_end + 4)))
         {
             refuse_http_request(conn, http_413_response());
             return;
@@ -3521,7 +3521,8 @@ reparse:
         while (offset < conn->partial.size())
         {
             std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
-            auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed);
+            auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc,
+                                                    consumed, read_bulk_limit());
 
             if (result == resp::parse_result::incomplete) break;
             // Anything that is not ok, and not a test against the one failure
@@ -3690,7 +3691,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     if (SOCKETLEY_UNLIKELY(!conn->spoke) && !conn->partial.empty())
         conn->spoke = true;
 
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > server_connection::MAX_PARTIAL_SIZE))
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
     {
         conn->closing = true;
         goto submit_next_read;
@@ -6251,7 +6252,7 @@ void server_instance::handle_upstream_read(struct io_uring_cqe* cqe, upstream_co
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
     uc->partial.append(uc->read_buf, cqe->res);
 
-    if (uc->partial.size() > upstream_connection::MAX_PARTIAL_SIZE)
+    if (uc->partial.size() > read_buffer_bytes())
     {
         uc->closing = true;
         goto submit_next;

@@ -320,6 +320,23 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        case fnv1a("--read-buffer"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--read-buffer requires a size value\n";
+                return 1;
+            }
+            size_t bytes;
+            if (!parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "invalid --read-buffer value (use K/M/G suffix)\n";
+                return 1;
+            }
+            instance->set_read_buffer(bytes);
+            return 0;
+        }
+
         case fnv1a("--write-buffer"):
         {
             if (i + 1 >= pa.count)
@@ -1360,6 +1377,28 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                                               "the moment it is dropped"))
                 return 1;
             instance->set_idle_timeout(static_cast<uint32_t>(secs));
+            return 0;
+        }
+
+        case fnv1a("--read-buffer"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--read-buffer requires a size value\n";
+                return 1;
+            }
+            size_t bytes;
+            if (!parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "invalid --read-buffer value (use K/M/G suffix)\n";
+                return 1;
+            }
+            // Live, like its outbound twin: the bound is compared on every
+            // read and the bulk cap is derived at each parse, so nothing holds
+            // the old value.  A buffer already past a lowered bound is closed
+            // at its next read, which is the same answer it would get for
+            // having grown there.
+            instance->set_read_buffer(bytes);
             return 0;
         }
 

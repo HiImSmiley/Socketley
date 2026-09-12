@@ -2800,13 +2800,13 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         // If async connect is pending, buffer incoming data (with limit)
         if (SOCKETLEY_UNLIKELY(conn->connect_pending))
         {
-            if (conn->saved_request.size() < proxy_client_connection::MAX_PARTIAL_SIZE)
+            if (conn->saved_request.size() < read_buffer_bytes())
                 conn->saved_request.append(read_data, data_len);
             if (is_provided)
                 m_loop->return_buf(BUF_GROUP_ID, buf_id);
             // Pause reads if too much data buffered, resume in handle_connect
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending &&
-                conn->saved_request.size() < proxy_client_connection::MAX_PARTIAL_SIZE)
+                conn->saved_request.size() < read_buffer_bytes())
                 if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                 {
                     close_pair(fd, conn->backend_fd);
@@ -2951,7 +2951,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // to carry a megabyte rather than a malformed request, so 413 -- declined
     // by client_answerable when a response has already started, and answered
     // by tls_feed on a session, which hits its own ceiling while decrypting.
-    if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_PARTIAL_SIZE))
+    if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
     {
         answer_request_too_large(conn);
         // force: the refusal is the answer, and holding would leave the
@@ -8456,7 +8456,7 @@ void proxy_instance::tls_feed(Conn* conn, const char* data, size_t len)
             // loop rather than after it: one read completion can decrypt
             // everything the inbound BIO had buffered, so "one read cannot
             // produce more than one buffer's worth" is not true here.
-            if (SOCKETLEY_UNLIKELY(conn->partial.size() > Conn::MAX_PARTIAL_SIZE))
+            if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
             {
                 over_ceiling = true;
                 break;

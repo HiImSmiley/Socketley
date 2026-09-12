@@ -13,6 +13,9 @@ namespace resp {
 
 // Safety limits to prevent resource exhaustion
 constexpr int RESP_MAX_ARRAY_SIZE = 1024;
+// The default, and no longer the only value: a runtime passes its own, derived
+// from --read-buffer.  Kept here because the decoders are free functions that a
+// fuzz target calls with no runtime to ask.
 constexpr int RESP_MAX_BULK_LEN = 512 * 1024; // 512 KB
 
 // Fast \r\n scanner using memchr for the first byte, which beats a two-byte
@@ -198,11 +201,22 @@ inline std::string encode_simple(std::string_view msg)
 // more arguments than we accept and the next one would have been fine.  A
 // client told "protocol error" for an over-long DEL reconnects and sends it
 // again.
-enum class parse_result { ok, incomplete, error, too_many_args };
+//
+// value_too_large is the second of those and was left on the error path for as
+// long as the first one was fixed: the bulk-length cap refused a perfectly
+// framed `SET key <600 KB>` as a protocol error, so the client concluded its
+// own framing was broken, reconnected, and sent the same oversized value
+// again.  The declared length parsed cleanly -- it was simply larger than this
+// build accepts, and the words have to say which of those two it was.
+enum class parse_result { ok, incomplete, error, too_many_args, value_too_large };
 
 // Parse a single RESP message from a partial buffer, filling `args` and
 // setting `consumed` to how many bytes were taken.
-inline parse_result parse_message(std::string_view buf, std::vector<std::string>& args, size_t& consumed)
+// `max_bulk` defaults to what the constant was, which keeps every caller that
+// has no runtime to ask -- the unit tests and the fuzz target -- compiling and
+// testing the same limit they always did.
+inline parse_result parse_message(std::string_view buf, std::vector<std::string>& args,
+                                  size_t& consumed, int max_bulk = RESP_MAX_BULK_LEN)
 {
     args.clear();
     consumed = 0;
@@ -277,8 +291,11 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 
         int len = 0;
         auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
-        if (e2 != std::errc{} || p2 != end_crlf || len < 0 || len > RESP_MAX_BULK_LEN)
+        // Split, because only the first of these means the stream is lost.
+        if (e2 != std::errc{} || p2 != end_crlf || len < 0)
             return parse_result::error;
+        if (len > max_bulk)
+            return parse_result::value_too_large;
 
         offset = static_cast<size_t>(end_crlf - data) + 2;
 
@@ -303,7 +320,8 @@ inline parse_result parse_message(std::string_view buf, std::vector<std::string>
 // Zero-allocation RESP parser filling string_views into buf, safe in a tight
 // loop, with args[] needing room for max_args entries.
 inline parse_result parse_message_views(std::string_view buf,
-    std::string_view* args, int max_args, int& argc, size_t& consumed)
+    std::string_view* args, int max_args, int& argc, size_t& consumed,
+    int max_bulk = RESP_MAX_BULK_LEN)
 {
     argc = 0;
     consumed = 0;
@@ -435,9 +453,12 @@ inline parse_result parse_message_views(std::string_view buf,
 
             int len = 0;
             auto [p2, e2] = std::from_chars(data + offset + 1, end_crlf, len);
-            if (__builtin_expect(e2 != std::errc{} || p2 != end_crlf
-                                 || len < 0 || len > RESP_MAX_BULK_LEN, 0))
+            if (__builtin_expect(e2 != std::errc{} || p2 != end_crlf || len < 0, 0))
                 return parse_result::error;
+            // The same split as the other decoder above; the two paths have to
+            // agree or a command's answer would depend on which one read it.
+            if (__builtin_expect(len > max_bulk, 0))
+                return parse_result::value_too_large;
 
             offset = static_cast<size_t>(end_crlf - data) + 2;
 

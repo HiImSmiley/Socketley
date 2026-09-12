@@ -630,6 +630,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
     cfg.global_rate_limit = instance->get_global_rate_limit();
     cfg.idle_timeout = instance->get_idle_timeout();
     cfg.write_buffer = instance->get_write_buffer();
+    cfg.read_buffer  = instance->get_read_buffer();
     cfg.drain = instance->get_drain();
     cfg.reconnect = instance->get_reconnect();
     cfg.tls = instance->get_tls();
@@ -811,6 +812,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     // configured stay byte-identical to what they were.
     if (cfg.write_buffer > 0 && cfg.write_buffer != socketley::write_queue_max_bytes)
         append_int_field("write_buffer", cfg.write_buffer);
+    if (cfg.read_buffer > 0 && cfg.read_buffer != 1u * 1024 * 1024)
+        append_int_field("read_buffer", cfg.read_buffer);
     if (cfg.drain)
         append_bool_field("drain", true);
     if (cfg.reconnect >= 0)
@@ -1022,6 +1025,7 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
     cfg.global_rate_limit = json_get_double(json, "global_rate_limit");
     cfg.idle_timeout = json_get_uint32(json, "idle_timeout");
     cfg.write_buffer = json_get_size(json, "write_buffer");
+    cfg.read_buffer  = json_get_size(json, "read_buffer");
     cfg.drain = json_get_bool(json, "drain");
     cfg.reconnect = json_get_int(json, "reconnect", -1);
     cfg.tls = json_get_bool(json, "tls");
