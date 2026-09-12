@@ -71,10 +71,42 @@ NAMES="hb_stream hb_plain"
 LUA="$SOCKETLEY_TMPD/hb.lua"
 WWW="$SOCKETLEY_TMPD/www"
 
-PASS=0; FAIL=0; TOTAL=0
+PASS=0; FAIL=0; SKIP=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; fi; }
+
+# ─── The one assertion a sanitized build cannot answer ───────────────────────
+# Measured, Sanitize, this test's own script and one connection at a time:
+#
+#     start          122,836 kB
+#     after 50 MB    142,860 kB    +20,024 kB   (the buffer ring, once)
+#     after 200 MB   143,148 kB       +288 kB
+#     after 500 MB   142,972 kB       -176 kB
+#     after 500 MB   143,052 kB        +80 kB
+#
+# So the property holds under ASan too. What does not hold is MEASURING it from
+# inside the suite: there the worker began at 221,848 kB -- 100 MB above a fresh
+# ASan worker -- and the 200 MB body read as +242 MB. ASan's allocator does not
+# hand pages back under pressure, and by then the box has plenty, so the reading
+# is of the machine and not of this code.
+#
+# Declined rather than loosened, because a bound wide enough to pass there would
+# not catch an accumulation in Release either, and counted in its own column so
+# a nightly is not red for something nobody can act on -- which is exactly what
+# test_abrupt_client_abort.sh does with its own RSS bound, for the same reason.
+SANITIZED=""
+# grep and not grep -q, deliberately.  -q exits at the first match, nm gets
+# SIGPIPE, and under `set -o pipefail` the pipeline reports 141 -- so the test
+# read "not sanitized" precisely when it WAS, and the two RSS assertions below
+# stayed armed under ASan.  test_abrupt_client_abort.sh spells it this way for
+# the same reason, and this tree's notes record the same trap three times over.
+if nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED="ASan"; fi
+not_asserted() {
+    TOTAL=$((TOTAL+1)); SKIP=$((SKIP+1))
+    echo "  NOT ASSERTED [$1]: $2"
+    echo "        sanitized build ($SANITIZED) — its allocator's residency is what this would measure"
+}
 
 cleanup() {
     for n in $NAMES; do "$BIN" stop "$n"   >/dev/null 2>&1 || true; done
@@ -205,13 +237,22 @@ AFTER50=$(rss)
 post "$P_S" 200 >/dev/null
 AFTER200=$(rss)
 GROWTH=$(( AFTER200 - AFTER50 ))
-if [ "$GROWTH" -lt 20480 ]; then ok; else
+if [ -n "$SANITIZED" ]; then
+    not_asserted "memory does not follow the body's size" \
+        "RSS ${AFTER50}kB -> ${AFTER200}kB, growth ${GROWTH}kB"
+    not_asserted "and stays inside a bound unrelated to it" \
+        "RSS ${AFTER200}kB against a start of ${BASE}kB"
+elif [ "$GROWTH" -lt 20480 ]; then
+    ok
+    if [ "$AFTER200" -lt $(( BASE + 61440 )) ]; then ok; else
+        bad "and stays inside a bound unrelated to it" \
+            "RSS ${AFTER200}kB against a start of ${BASE}kB; 200 MB was received"; fi
+else
     bad "memory does not follow the body's size" \
         "RSS was ${AFTER50}kB after 50 MB and ${AFTER200}kB after 200 MB, a growth" \
-        "of ${GROWTH}kB -- four times the body for barely more memory is the claim"; fi
-if [ "$AFTER200" -lt $(( BASE + 61440 )) ]; then ok; else
-    bad "and stays inside a bound unrelated to it" \
-        "RSS ${AFTER200}kB against a start of ${BASE}kB; 200 MB was received"; fi
+        "of ${GROWTH}kB -- four times the body for barely more memory is the claim"
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+fi
 
 # ─── 4. A script without the callback is unchanged, including its refusal ────
 # The opt-in is the definition, so this is the control: same server, same POST,
@@ -275,6 +316,10 @@ check "the runtime is up"                  "Up" \
       "$("$BIN" ps -a 2>/dev/null | awk '$2=="hb_stream" { print $7 }')"
 
 echo "  measured: rss base=${BASE}kB after50=${AFTER50}kB after200=${AFTER200}kB growth=${GROWTH}kB"
-echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+if [ "$SKIP" -gt 0 ]; then
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed, $SKIP not asserted under $SANITIZED)"
+else
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+fi
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "    first: $A"; echo "  FAILED"; fi
 [ "$FAIL" -eq 0 ]
