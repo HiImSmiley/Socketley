@@ -1,5 +1,6 @@
 #pragma once
 #include "../../shared/conn_reachability.h"
+#include "../../shared/http_framing.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -173,6 +174,11 @@ struct alignas(64) server_connection
     // an http_request holds into it would dangle.  The proxy keeps the same
     // two things for the same reason, as saved_request and body_remaining.
     size_t body_remaining{0};
+    // Chunked has no length to count down, so body_remaining stays 0 and this
+    // is what says a body is still owed.  The decoder holds the position in the
+    // framing across reads.
+    bool body_chunked{false};
+    http_chunked_decoder chunk_dec;
     std::string http_head_saved;
     // Parsed once, at the top of the exchange, with its views rebased onto the
     // string above -- so the streamed request and a gathered one cannot come to
@@ -309,6 +315,8 @@ struct alignas(64) server_connection
         // A struct that carried a half-received body would take the next
         // client's first bytes for the rest of somebody else's upload.
         body_remaining = 0;
+        body_chunked = false;
+        chunk_dec = http_chunked_decoder{};
         http_head_saved.clear();
         http_req_saved.headers.clear();
         http_req_saved = http_request{};

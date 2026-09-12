@@ -1017,6 +1017,22 @@ void runtime_instance::invoke_on_http_body([[maybe_unused]] int client_id,
 #endif
 }
 
+void runtime_instance::invoke_on_http_body_unknown([[maybe_unused]] int client_id,
+                                                  [[maybe_unused]] std::string_view chunk)
+{
+    if (!wants_on_http_body())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    sol::protected_function_result r = m_lua->on_http_body()(client_id, chunk, sol::nil);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
+        std::cerr << lua_diag::tag(get_name()) << " on_http_body error: " << e.what() << std::endl;
+    }
+#endif
+}
+
 // ─── Resource limits ───
 
 void runtime_instance::set_max_connections(uint32_t max) { m_max_connections = max; }

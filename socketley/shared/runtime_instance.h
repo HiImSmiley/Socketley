@@ -682,6 +682,11 @@ protected:
     // One chunk of a request body, with how much is still owed after it.  The
     // script is handed the bytes and the runtime keeps none of them.
     void invoke_on_http_body(int client_id, std::string_view chunk, size_t remaining);
+    // The same callback with `remaining` as nil, for a chunked body where how
+    // much is still owed is not knowable.  A separate entry rather than a
+    // sentinel number, because any number a script compared against would be a
+    // wrong answer about the end of the body.
+    void invoke_on_http_body_unknown(int client_id, std::string_view chunk);
     // Asked before the headers are done, because it decides whether the body
     // is streamed at all -- and therefore whether it may exceed the bound.
     bool wants_on_http_body() const;

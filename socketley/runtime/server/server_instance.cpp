@@ -3030,6 +3030,55 @@ void server_instance::fail_ws_connection(server_connection* conn)
 // them.  A 4 GB upload and a 4 KB one cost the same here.
 void server_instance::deliver_body_chunks(server_connection* conn)
 {
+    if (SOCKETLEY_UNLIKELY(conn->body_chunked))
+    {
+        // No length to count down, so the decoder says where the payload runs
+        // are.  It consumes from the front of what it is given, and what it
+        // leaves is the start of framing it has not seen the end of yet.
+        std::string_view in(conn->partial);
+        for (;;)
+        {
+            std::string_view out;
+            const chunk_step r = http_chunked_next(conn->chunk_dec, in, out);
+            if (r == chunk_step::payload)
+            {
+                // Copied, not passed as a view: the erase below moves `partial`
+                // and the script may send from inside the callback, either of
+                // which invalidates a view into it.  One read's worth, so the
+                // copy is bounded by the read and not by the body.
+                const std::string piece(out);
+                // nil for a chunked body, because how much is still owed is
+                // genuinely unknown -- and 0 would claim the body has ended.
+                invoke_on_http_body_unknown(conn->fd, piece);
+                if (SOCKETLEY_UNLIKELY(conn->closing))
+                {
+                    conn->partial.erase(0, conn->partial.size() - in.size());
+                    return;
+                }
+                continue;
+            }
+            const size_t consumed = conn->partial.size() - in.size();
+            conn->partial.erase(0, consumed);
+            if (r == chunk_step::done)
+            {
+                conn->body_chunked = false;
+                // The one call that reaches zero, so "remaining reaches 0
+                // exactly once per body" holds for both forms and a script
+                // written against Content-Length works unchanged.
+                invoke_on_http_body(conn->fd, std::string_view(), 0);
+            }
+            else if (r == chunk_step::bad)
+            {
+                // The framing is gone, so nothing after this is payload and
+                // nothing can be resynchronised from it.
+                conn->body_chunked = false;
+                conn->http_head_saved.clear();
+                refuse_http_request(conn, http_400_response());
+            }
+            return;   // need_more, done or bad all end this pass
+        }
+    }
+
     while (conn->body_remaining > 0 && !conn->partial.empty())
     {
         const size_t n = std::min(conn->body_remaining, conn->partial.size());
@@ -3069,10 +3118,12 @@ reparse:
     // erased -- sniffing them would read a PUT's payload as the next request.
     // Checked before detection for that reason, which is where the proxy
     // checks the same thing.
-    if (SOCKETLEY_UNLIKELY(conn->body_remaining > 0))
+    if (SOCKETLEY_UNLIKELY(conn->body_remaining > 0 || conn->body_chunked))
     {
         deliver_body_chunks(conn);
-        if (conn->body_remaining > 0)
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            return;
+        if (conn->body_remaining > 0 || conn->body_chunked)
             return;   // more of it is still coming
         finish_streamed_body(conn);
         if (conn->closing || conn->partial.empty())
@@ -3502,7 +3553,19 @@ reparse:
         // A transfer coding this server does not implement, refused rather
         // than framed by a Content-Length that is not there -- treating the
         // chunk data as the next request is the answer that is not defensible.
-        if (SOCKETLEY_UNLIKELY(framing.transfer_encoding))
+        // Still 501 for a coding this server cannot take the framing off -- and
+        // `chunked` with a script that asked for the body is now one it can.
+        // The proxy forwards a chunked body without decoding it, which is all a
+        // backend needs; delivering it to a script means taking the framing off,
+        // and that decoder is the one piece the proxy could not lend.
+        // Chunked and nothing else.  "gzip, chunked" is framable and its
+        // contents are still compressed, so taking the framing off and handing
+        // the bytes on as the body would hand on gzip and call it the body --
+        // that stays 501, which is what a coding this does not implement is.
+        const bool chunked_to_script =
+            framing.transfer_encoding && framing.chunked
+            && !framing.other_codings && wants_on_http_body();
+        if (SOCKETLEY_UNLIKELY(framing.transfer_encoding && !chunked_to_script))
         {
             refuse_http_request(conn, http_501_response());
             return;
@@ -3519,7 +3582,8 @@ reparse:
         // so the bound the refusal protects is never approached and the body's
         // size stops being this server's business -- which is what the proxy
         // has always done with a request body it forwards.
-        const bool stream_body = content_length > 0 && wants_on_http_body();
+        const bool stream_body =
+            chunked_to_script || (content_length > 0 && wants_on_http_body());
         if (SOCKETLEY_UNLIKELY(!stream_body && content_length >
                                read_buffer_bytes() - (hdr_end + 4)))
         {
@@ -3577,13 +3641,19 @@ reparse:
                 hreq.body = std::string_view();
                 conn->http_req_saved = std::move(hreq);
             }
-            conn->body_remaining = content_length;
+            // For chunked there is no length: body_chunked is what says a body
+            // is still owed, and the decoder holds the position in the framing.
+            conn->body_chunked = chunked_to_script;
+            conn->chunk_dec = http_chunked_decoder{};
+            conn->body_remaining = chunked_to_script ? 0 : content_length;
             conn->partial.erase(0, hdr_end + 4);
             // Whatever of the body already arrived with the head goes now; the
             // rest is delivered by the branch at the top of this function as
             // the reads land.
             deliver_body_chunks(conn);
-            if (conn->body_remaining > 0)
+            if (SOCKETLEY_UNLIKELY(conn->closing))
+                return;
+            if (conn->body_remaining > 0 || conn->body_chunked)
                 return;
             finish_streamed_body(conn);
             if (!conn->closing && !conn->partial.empty())

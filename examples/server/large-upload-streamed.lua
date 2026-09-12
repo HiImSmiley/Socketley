@@ -6,6 +6,11 @@
 --
 -- Measured on one worker: 500 MB received inside 37 MB resident memory, and
 -- three consecutive 50 MB uploads with no growth at all between them.
+--
+-- Both forms arrive here. With Content-Length, `remaining` counts down; with
+-- Transfer-Encoding: chunked it is nil, because how much is still owed is not
+-- knowable -- and either way it is 0 exactly once, on the call that ends the
+-- body. So nothing below has to know which form the client chose.
 
 local UPLOAD_DIR = "/tmp/socketley-uploads"
 
@@ -44,8 +49,9 @@ function on_http_body(client_id, chunk, remaining)
     up.fh:write(chunk)
     up.bytes = up.bytes + #chunk
 
-    -- `remaining` is what is still owed AFTER this chunk, so this is true
-    -- exactly once per body.
+    -- `remaining` is what is still owed after this chunk, or nil for a chunked
+    -- body where that is unknown.  Either way it is 0 exactly once, on the call
+    -- that ends the body -- which is why this test is the same for both.
     if remaining == 0 then
         up.fh:close()
         up.fh = nil

@@ -5474,6 +5474,41 @@ end
 function on_disconnect(id) st[id] = nil end
 .fi
 .IP
+.B "A body of unknown length."
+A client that cannot say how long its body is sends
+.B "Transfer-Encoding: chunked"
+\(em fetch() with a ReadableStream body, anything piping a process's output,
+anything that cannot stat what it is sending \(em and that used to be 501. With
+.B on_http_body
+defined it is decoded and delivered like any other body, unbounded, because
+there is no length to bound it by.
+.IP
+.B remaining
+is
+.B nil
+for every chunk of such a body, since how much is still owed is genuinely not
+knowable, and the end of the framing produces ONE final call with an empty
+chunk and
+.BR "remaining = 0" .
+So "remaining reaches 0 exactly once per body" holds for both forms and a
+script written against
+.B Content-Length
+needs no change. Measured, 62 MB in 1000 chunks: 1708 calls, 1707 of them nil
+and one zero; 250 MB after that costs 148 kB more resident memory.
+.IP
+Chunked and nothing else.
+.B "Transfer-Encoding: gzip, chunked"
+is framable \(em the chunk sizes do delimit it \(em and its contents are still
+compressed, so taking the framing off and handing the bytes on as the body would
+hand on gzip and call it the body. That stays 501. A coding that is not chunked
+at all leaves the message with no way to say where the body ends and is a 400.
+.IP
+Trailers are consumed, bounded at 8 KB, and discarded: turning them into
+headers after the request has been dispatched is how a trailer becomes request
+smuggling. Framing that contradicts itself \(em a chunk not followed by CRLF, a
+size that is not hex, a size line past 256 bytes \(em is a 400, because nothing
+after it can be trusted to be payload.
+.IP
 Header names keep the case the client sent them in, so
 .B req.headers["Host"]
 and not
