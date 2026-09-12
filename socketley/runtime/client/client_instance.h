@@ -83,6 +83,18 @@ public:
     // Lua actions
     bool lua_send(std::string_view msg) override;
 
+    // The two questions a producer needs, as on the server -- without an id,
+    // because a client has one connection and naming it would be a fiction.
+    long pending_bytes() const;
+    // Whether the last refusal was the queue and not the connection.  Guarded
+    // on being connected, so a latch left up by a stall is not blamed for a
+    // disconnection that happened underneath it.
+    bool write_backlogged() const;
+
+    // The drain crossing is already detected twice in the write paths; this is
+    // where the script is told about it, off those stacks.
+    void on_loop_turn() override;
+
 private:
     void handle_read(struct io_uring_cqe* cqe);
     void handle_write(struct io_uring_cqe* cqe);
@@ -167,6 +179,16 @@ private:
     // Latches the "not draining" report, because one line per dropped message
     // would bury the first, which is the only one that says anything new.
     bool m_write_queue_full{false};
+    // Armed at the soft watermark by lua_send, cleared by the crossing back
+    // down, which is the moment on_writable is owed.  Separate from the latch
+    // above: that one is raised only at the hard cap, and a producer told to
+    // pace has to hear about the crossing it actually stopped at.
+    bool m_drain_wanted{false};
+    // Set by the crossing, consumed on the next loop turn.  Not called from
+    // the crossing itself, because a script's on_writable sends and the write
+    // path still holds its own state -- the server's dispatch gives the long
+    // form of this reasoning.
+    bool m_drain_due{false};
 
     // Reconnect state, whose request and timespec live in m_conn because they
     // are storage the ring can name.

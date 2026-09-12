@@ -10168,6 +10168,19 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             // regardless.
             if (sub_conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
             {
+                // Said out loud, on the house rule flush_responses() states for
+                // the same drop on the reply path: "dropping the connection is
+                // right but must not happen quietly".  Two doors here were the
+                // quiet ones, and a subscriber that stops receiving without a
+                // word is indistinguishable from a channel that went idle.
+                //
+                // Once per subscriber and not once per publish: `closing` is
+                // set, and the test at the top of this loop skips it from here
+                // on.
+                std::cerr << "[cache] subscriber " << fd << " on channel '"
+                          << channel << "' is not draining its socket ("
+                          << sub_conn->write_queue.bytes()
+                          << " bytes queued), dropping its subscription\n";
                 sub_conn->closing = true;
                 continue;
             }
@@ -10235,7 +10248,18 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 auto* pc = m_conn_idx[fd];
                 if (pc->closing || pc->is_follower) continue;
                 if (pc->write_queue.bytes() >= socketley::write_queue_max_bytes)
-                { pc->closing = true; continue; }
+                {
+                    // The pattern is named as well as the channel, because a
+                    // psubscriber dropped on one channel of a pattern is not
+                    // findable from the channel alone.
+                    std::cerr << "[cache] psubscriber " << fd << " on pattern '"
+                              << pat << "' matching '" << channel
+                              << "' is not draining its socket ("
+                              << pc->write_queue.bytes()
+                              << " bytes queued), dropping its subscription\n";
+                    pc->closing = true;
+                    continue;
+                }
 
                 // pmessage and not message: the pattern is part of the reply,
                 // because a client subscribed to two patterns cannot otherwise

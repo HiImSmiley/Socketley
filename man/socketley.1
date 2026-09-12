@@ -5269,6 +5269,56 @@ to relay messages manually.
 Called when message received with sender identification (server only).
 Fires alongside on_message for backward compatibility.
 .TP
+.B on_writable(client_id)
+The write queue for this connection has come back down under
+.BR self.watermark ,
+so a producer that stopped because
+.B self.pending(client_id)
+was high can carry on. Edge\(hytriggered: it fires on the crossing, once per
+crossing, not once per completed write.
+.IP
+A client runtime has the same callback without the argument \(em
+.B on_writable()
+\(em because it has one connection and a number naming it would be a fiction.
+Its refusal is named too: a connected
+.B \-\-mode out
+client whose server has stopped reading used to be told it "is not connected to
+its server, or was created \-\-mode in and does not send", three statements
+that are all false of it. Measured, 400 chunks of 64 KB into a peer reading
+nothing: 129 taken, 271 refused, 8,396,928 bytes standing.
+.IP
+This is what makes a body larger than the queue bound sendable at all. Without
+it a script had the hard bound and nothing leading up to it \(em at 8 MiB the
+connection is closed \(em so the only safe strategy was to know the bound in
+advance and never approach it. Measured with a client reading in 256 KB bites
+with a 5 ms pause, sending 200 chunks of 64 KB (13,107,400 bytes):
+.IP
+.nf
+unpaced   8,454,273 bytes delivered, then the connection closed
+paced    13,107,400 bytes delivered, on_writable fired 3 times
+.fi
+.IP
+Pace against
+.B self.watermark
+and not a number of your own. The callback fires on the crossing, so a producer
+that stops below the watermark never crosses it and is never called back \(em it
+would wait for an event its own caution prevented:
+.IP
+.nf
+local function pump(id)
+    while remaining > 0 do
+        if (self.pending(id) or 0) >= self.watermark then return end
+        if not self.send(id, next_chunk()) then return end
+        remaining = remaining \- 1
+    end
+end
+
+function on_writable(id) pump(id) end
+.fi
+.IP
+The call is made a loop turn after the write that emptied the queue, not on that
+write's completion, so a connection that closes in between is simply not called.
+.TP
 .B on_connect(client_id)
 Called when a client connects (server/client). Also called on a sub\-server when
 a connection is routed to it. The client_id is opaque: for this runtime's own
@@ -6033,10 +6083,18 @@ self.protocol  -- server/client: "tcp" or "udp"; proxy: "tcp" or "http"
                -- (not set on a cache)
 self.send(msg)             -- Send message (client)
 self.send(client_id, msg)  -- Send to specific client (server)
-self.broadcast(msg)        -- Broadcast to all clients (server)
+self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
+                           -- numbers: how many took it, and how many were
+                           -- dropped because their queue was full.  See below.
 self.pending(client_id)    -- Queued for that client and not yet on the wire,
                            -- in bytes (server); nil if the id is not one of
                            -- this runtime's connections.  See below.
+self.watermark             -- The byte count on_writable fires on the way down
+                           -- through (server and client).  Pace against this,
+                           -- not a literal.  See on_writable.
+self.pending()             -- The client's own form, without an id: a client
+                           -- has one connection.  Bytes queued for its server
+                           -- and not yet on the wire.
 
 -- ─── Sending faster than the socket ───
 -- A write is queued, not performed, and the queue has a bound.  Reach it and
@@ -6050,7 +6108,24 @@ self.pending(client_id)    -- Queued for that client and not yet on the wire,
 -- "it is gone".  self.pending() is the number to watch BEFORE sending, which
 -- is the difference between pacing and a post-mortem:
 --
---     if (self.pending(id) or 0) < 1048576 then self.send(id, chunk) end
+--     if (self.pending(id) or 0) >= self.watermark then return end
+--
+-- and on_writable(id) is how a producer that stopped there is started again,
+-- which is what makes a body past the bound sendable rather than merely
+-- survivable.  See on_writable in CALLBACKS.
+--
+-- self.broadcast() has the same bound at its own door, and used to report
+-- nothing at all: a broadcast to 3000 clients that dropped a third of them was
+-- indistinguishable from one that reached every single one.  It answers two
+-- numbers now --
+--
+--     local taken, behind = self.broadcast(msg)
+--
+-- counting THIS shard's connections, which is the scope a script can act on; a
+-- held message counts as taken, because an unclassified connection's hold is a
+-- deferred take and not a drop.  And a client dropped by the broadcast gets
+-- the backlog sentence from a later self.send() rather than the peer's, which
+-- it did not before -- one flag, both entrances.
 --
 -- Measured with a client that connects and never reads, against 400 chunks of
 -- 64 KB: 129 taken, 271 refused, and the queue standing at its bound.

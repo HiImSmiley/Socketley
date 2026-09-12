@@ -201,6 +201,7 @@ public:
         CB_ON_HTTP_REQUEST       = 1u << 24,
         CB_FILTERS               = 1u << 25,
         CB_ROUTES                = 1u << 26,
+        CB_ON_WRITABLE           = 1u << 27,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -213,6 +214,9 @@ public:
     bool has_on_route()              const { return m_callback_mask & CB_ON_ROUTE; }
     bool has_on_master_auth()        const { return m_callback_mask & CB_ON_MASTER_AUTH; }
     bool has_on_client_message()     const { return m_callback_mask & CB_ON_CLIENT_MESSAGE; }
+    // A connection's write queue has come back down under the watermark, so a
+    // producer that stopped because self.pending() was high can go on.
+    bool has_on_writable()           const { return m_callback_mask & CB_ON_WRITABLE; }
     bool has_on_tick()               const { return m_callback_mask & CB_ON_TICK; }
     bool has_on_miss()               const { return m_callback_mask & CB_ON_MISS; }
     bool has_on_write()              const { return m_callback_mask & CB_ON_WRITE; }
@@ -253,6 +257,7 @@ public:
     guarded_protected on_route()       { return {m_on_route,       "on_route",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_master_auth() { return {m_on_master_auth, "on_master_auth", m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_writable()   { return {m_on_writable,   "on_writable",   m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_tick()       { return {m_on_tick,       "on_tick",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_miss()       { return {m_on_miss,       "on_miss",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_write()      { return {m_on_write,      "on_write",      m_deadline_ms, m_owner_name.c_str()}; }
@@ -357,6 +362,7 @@ private:
     // refused it, which is the whole defect this callback was just fixed for.
     sol::protected_function m_on_master_auth;
     sol::protected_function m_on_client_message;
+    sol::protected_function m_on_writable;
     sol::protected_function m_on_tick;
     sol::protected_function m_on_miss;
     sol::protected_function m_on_write;
@@ -507,6 +513,7 @@ public:
     bool has_on_route()          const { return false; }
     bool has_on_master_auth()    const { return false; }
     bool has_on_client_message() const { return false; }
+    bool has_on_writable()       const { return false; }
     bool has_on_tick()           const { return false; }
     bool has_on_miss()           const { return false; }
     bool has_on_write()          const { return false; }

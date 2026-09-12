@@ -44,6 +44,7 @@ namespace lua_diag
 #include "cluster_discovery.h"
 #include "event_loop.h"
 #include "../runtime/server/server_instance.h"
+#include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../cli/command_hashing.h"
 #include "../cli/runtime_type_parser.h"
@@ -589,6 +590,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_route = m_lua["on_route"];
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
+    m_on_writable       = m_lua["on_writable"];
     m_on_tick = m_lua["on_tick"];
     // A tick_ms below the floor is refused rather than substituted, absent
     // still means 100, and the read is a double with an integrality test
@@ -642,6 +644,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_route.valid())              m_callback_mask |= CB_ON_ROUTE;
     if (m_on_master_auth.valid())        m_callback_mask |= CB_ON_MASTER_AUTH;
     if (m_on_client_message.valid())     m_callback_mask |= CB_ON_CLIENT_MESSAGE;
+    if (m_on_writable.valid())           m_callback_mask |= CB_ON_WRITABLE;
     if (m_on_tick.valid())               m_callback_mask |= CB_ON_TICK;
     if (m_on_miss.valid())               m_callback_mask |= CB_ON_MISS;
     if (m_on_write.valid())              m_callback_mask |= CB_ON_WRITE;
@@ -2791,8 +2794,14 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // broadcast_all() and not broadcast(), which is this process's
     // connection table and under --shards reaches a quarter of the clients
     // while reporting success.
+    // Two values, because a broadcast that dropped a third of its recipients
+    // for backlog used to look exactly like one that reached everybody.  Both
+    // count this shard's connections -- see fanout_count for why that is the
+    // right scope here and the wrong one for shard_connection_count().
     self["broadcast"] = [owner](std::string_view msg) {
-        owner->broadcast_all(msg);
+        const auto c = owner->broadcast_all(msg);
+        return std::make_tuple(static_cast<long>(c.taken),
+                               static_cast<long>(c.backlogged));
     };
     // The same contract at the other door, because checking at one and not the
     // other teaches a script author that the check exists.
@@ -2834,6 +2843,11 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
         if (n < 0) return sol::nullopt;
         return n;
     };
+    // The number on_writable is defined against, so pacing does not mean
+    // hardcoding it.  A producer that stops below this never crosses the
+    // watermark and is never called back -- it would wait for an event it
+    // prevented -- so the field and the callback have to name one value.
+    self["watermark"] = static_cast<long>(socketley::write_queue_backpressure_bytes);
 
     // shard_connection_count() and not get_connection_count(), because under
     // --shards a script asking how many clients its runtime has was answered
@@ -3066,9 +3080,22 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
                                  std::string_view msg) -> api_result {
         if (owner->lua_send(msg))
             return api_yes();
+        // A fourth reason, named apart from the three above for the same
+        // cause as on the server: the sentence for a missing connection is
+        // the wrong one for a connection that is merely behind, and only one
+        // of the two is something a script can act on.
+        if (static_cast<client_instance*>(owner)->write_backlogged())
+            return api_why(q(m_owner_name) + " has more queued for its server "
+                           "than it could take -- self.pending() is what to "
+                           "watch before sending the next one");
         return api_why(q(m_owner_name) + " is not connected to its server, "
                        "or was created --mode in and does not send");
     };
+    // As on the server, minus the id: this runtime has one connection.
+    self["pending"] = [owner]() -> long {
+        return static_cast<client_instance*>(owner)->pending_bytes();
+    };
+    self["watermark"] = static_cast<long>(socketley::write_queue_backpressure_bytes);
     // One runtime's connections and not one process's; see the note on the
     // server's copy of this binding, in register_server_table above.
     self["connections"] = [owner]() -> size_t {

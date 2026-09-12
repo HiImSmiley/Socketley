@@ -75,6 +75,11 @@ struct alignas(64) server_connection
     // socket, not because the peer went away.  Sticky, and read by the refusal
     // a script gets so it can tell "slow down" from "it is gone".
     bool closed_for_backlog{false};
+    // The queue has been over the backpressure watermark since the last time
+    // on_writable fired, so the next crossing back down owes the script a
+    // call.  Edge-triggered: cleared when the call is queued, which is what
+    // keeps a draining 8 MiB queue from firing once per completion.
+    bool drain_wanted{false};
     uint32_t active_idx{0};  // index in m_active_fds for O(1) removal
     uint32_t write_batch_count{0};
 
@@ -245,6 +250,9 @@ struct alignas(64) server_connection
         // the next client on this slot a backlog it never had, and self.send()
         // would name backpressure for a connection that simply went away.
         closed_for_backlog = false;
+        // And the next client would be owed an on_writable for a queue it
+        // never filled.
+        drain_wanted = false;
         if (file_fd >= 0) { close(file_fd); file_fd = -1; }
         if (file_buf) { free(file_buf); file_buf = nullptr; }
         file_read_req = {};
@@ -495,7 +503,7 @@ public:
     size_t get_connection_count() const override;
 
     // Lua actions
-    void broadcast(std::string_view msg) override;
+    fanout_count broadcast(std::string_view msg) override;
     bool send_to(int client_id, std::string_view msg) override;
     bool        disconnect(int client_fd);
     std::string peer_ip(int client_fd);
@@ -783,7 +791,9 @@ private:
     // Two exclusions, because `others` in master mode means everyone who is
     // neither the sender nor the master, and one of those is the only thing
     // this ever needed before.
-    void queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
+    // Answers what it reached; see fanout_count.  A broadcast drops a client
+    // whose queue is full exactly as a send does, and nothing counted it.
+    fanout_count queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
                          int exclude_fd2 = -1);
     void remove_active_fd(int fd);
     // `even_when_closing` is for an answer that was already promised, which
@@ -937,6 +947,12 @@ private:
     // conn_ref becomes an fd, with the entry removed the moment the connection
     // closes.
     std::unordered_map<uint64_t, int> m_conn_by_serial;
+    // Connections whose queue crossed back under the watermark, to be told so
+    // on the next loop turn.  Serials and not descriptors, because the point
+    // of waiting a turn is that the connection may be gone by then and a
+    // recycled fd would hand the call to whoever took the slot -- a serial
+    // that no longer resolves is exactly the answer wanted.
+    std::vector<uint64_t> m_drain_pending;
 
     // What another runtime has routed to us, of which we hold only the name
     // and a local handle to show Lua.

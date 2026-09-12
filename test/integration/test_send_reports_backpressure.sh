@@ -133,7 +133,7 @@ PYEOF
 )
 check "an ordinary send still reaches the client" "QUIET-REPLY" "$QUIET"
 
-QL=$(grep -o 'BP quiet .*' "$SOCKETLEY_DLOG" | tail -1)
+QL=$(grep -o 'BP quiet .*' "$SOCKETLEY_DLOG" | tail -1) || true
 qf() { printf '%s\n' "$QL" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 check "and still answers true"                    "true" "$(qf ok)"
 check "self.pending answers nil for a non-connection" "nil" "$(qf nosuch)"
@@ -151,7 +151,7 @@ s.close()
 PYEOF
 sleep 1
 
-FL=$(grep -o 'BP flood .*' "$SOCKETLEY_DLOG" | tail -1)
+FL=$(grep -o 'BP flood .*' "$SOCKETLEY_DLOG" | tail -1) || true
 ff() { printf '%s\n' "$FL" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 
 if [ -n "$FL" ]; then ok; else

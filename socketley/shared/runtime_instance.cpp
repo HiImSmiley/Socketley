@@ -975,6 +975,26 @@ void runtime_instance::invoke_on_client_message(int client_id, std::string_view 
 #endif
 }
 
+bool runtime_instance::wants_on_writable() const
+{
+    return m_lua && m_lua->has_on_writable();
+}
+
+void runtime_instance::invoke_on_writable([[maybe_unused]] int client_id)
+{
+    if (!wants_on_writable())
+        return;
+
+#ifndef SOCKETLEY_NO_LUA
+    sol::protected_function_result r = m_lua->on_writable()(client_id);
+    if (SOCKETLEY_UNLIKELY(!r.valid()))
+    {
+        sol::error e = r;
+        std::cerr << lua_diag::tag(get_name()) << " on_writable error: " << e.what() << std::endl;
+    }
+#endif
+}
+
 // ─── Resource limits ───
 
 void runtime_instance::set_max_connections(uint32_t max) { m_max_connections = max; }

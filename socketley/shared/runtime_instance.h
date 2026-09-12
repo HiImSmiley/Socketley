@@ -419,13 +419,29 @@ public:
     using sibling_sink = std::function<void(std::string_view message)>;
     void set_sibling_sink(sibling_sink s) { m_sibling_sink = std::move(s); }
 
+    // What a broadcast did, which used to be nothing anyone could ask.  A
+    // client whose queue is full is dropped by the broadcast the same way it
+    // was dropped by a send, and that was equally silent.
+    //
+    // These count THIS shard's connections, deliberately: a sharded runtime
+    // runs this script once per shard, and the connections a script can
+    // actually throttle are its own.  That is the opposite case from
+    // shard_connection_count(), where the question is "how many clients does
+    // my runtime have" and only the global answer is true.
+    struct fanout_count
+    {
+        uint32_t taken{0};        // queued for a connection of this shard
+        uint32_t backlogged{0};   // dropped because its queue was already full
+    };
+
     // Every client of this runtime and not of this process, local first so a
     // script that broadcasts and then reads its own state sees a consistent
     // one.
-    void broadcast_all(std::string_view msg)
+    fanout_count broadcast_all(std::string_view msg)
     {
-        broadcast(msg);
+        const fanout_count c = broadcast(msg);
         fanout_to_siblings(msg);
+        return c;
     }
 
     // The message on its way to this runtime's other shards, separate from
@@ -543,7 +559,9 @@ public:
     // Whether the message was written or queued, false for a runtime with no
     // outward connection of its own.
     virtual bool lua_send(std::string_view /*msg*/) { return false; }
-    virtual void broadcast(std::string_view /*msg*/) {}
+    // Answers what it did; see fanout_count.  A runtime with no connection
+    // table of its own did nothing, which is what {} says.
+    virtual fanout_count broadcast(std::string_view /*msg*/) { return {}; }
     // Whether the bytes reached a connection, which the base holds none of, so
     // the honest answer here is no.
     virtual bool send_to(int /*client_id*/, std::string_view /*msg*/) { return false; }
@@ -613,6 +631,14 @@ protected:
     bool invoke_on_auth(int client_id);
     void invoke_on_send(std::string_view msg);
     void invoke_on_client_message(int client_id, std::string_view msg);
+    // The write queue for this connection has drained back under the
+    // backpressure watermark.  Dispatched a loop turn after the completion
+    // that emptied it, not on that completion's stack -- see the server's
+    // on_loop_turn().
+    void invoke_on_writable(int client_id);
+    // Asked before a crossing is recorded at all, so a server whose script has
+    // no on_writable queues nothing and walks no list.
+    bool wants_on_writable() const;
 
     // Global rate limit check (token bucket, shared across all connections)
     bool check_global_rate_limit();

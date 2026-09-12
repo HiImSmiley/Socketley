@@ -2691,6 +2691,29 @@ void server_instance::on_loop_turn()
 {
     if (m_companion)
         m_companion->pump();
+
+    // Taken by value, because a script's on_writable may send enough to fill
+    // the queue again and land a fresh serial in the member while this loop is
+    // still walking it.
+    if (SOCKETLEY_UNLIKELY(!m_drain_pending.empty()))
+    {
+        std::vector<uint64_t> due;
+        due.swap(m_drain_pending);
+        for (const uint64_t serial : due)
+        {
+            // Resolved now and not when it was queued: a connection that went
+            // away in between is one whose producer has nothing left to write,
+            // and its serial no longer resolving is how that is known.
+            auto it = m_conn_by_serial.find(serial);
+            if (it == m_conn_by_serial.end())
+                continue;
+            const int fd = it->second;
+            auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
+            if (!conn || conn->closing)
+                continue;
+            invoke_on_writable(fd);
+        }
+    }
 }
 
 void server_instance::handle_accept(struct io_uring_cqe* cqe)
@@ -4015,17 +4038,19 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     }
 }
 
-void server_instance::broadcast(std::string_view msg)
+server_instance::fanout_count server_instance::broadcast(std::string_view msg)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
-        return;
+        return {};
 
     invoke_on_send(msg);
 
     if (SOCKETLEY_UNLIKELY(m_udp))
     {
+        // A datagram has no queue to fall behind in, so there is no backlog to
+        // report and the count is left at zero rather than guessed at.
         udp_broadcast(msg, nullptr);
-        return;
+        return {};
     }
 
     // Build newline-terminated message (single allocation via make_shared)
@@ -4035,7 +4060,7 @@ void server_instance::broadcast(std::string_view msg)
     if (buf.empty() || buf.back() != '\n')
         buf.push_back('\n');
     auto full_msg = std::make_shared<const std::string>(std::move(buf));
-    queue_broadcast(full_msg, -1);  // -1 = don't exclude anyone
+    const fanout_count counted = queue_broadcast(full_msg, -1);  // -1 = don't exclude anyone
 
     // Also reach the connections routed here through the runtime that owns
     // each, so a ref that no longer resolves is dropped there rather than
@@ -4048,17 +4073,23 @@ void server_instance::broadcast(std::string_view msg)
         route_relay::write(get_runtime_manager(), fc.origin, get_name(),
                            fc.ref, msg);
     }
+
+    // The routed ones are not in the count: their queues belong to the runtime
+    // that owns each, and that runtime is the one that can report them.
+    return counted;
 }
 
 // One pass, one submission per connection and no return to the loop between,
 // which is why a full submission queue reported as permanent left 952 of 3000
 // clients marked closing and never told -- fixed in event_loop.cpp, and
 // anything added here inherits that history.
-void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
-                                      int exclude_fd2)
+server_instance::fanout_count server_instance::queue_broadcast(
+    const std::shared_ptr<const std::string>& msg, int exclude_fd,
+    int exclude_fd2)
 {
+    fanout_count counted;
     if (SOCKETLEY_UNLIKELY(!m_loop))
-        return;
+        return counted;
 
     std::shared_ptr<const std::string> ws_msg; // Lazy WS frame creation
 
@@ -4082,15 +4113,36 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
         // already sent.
         if (SOCKETLEY_UNLIKELY(proto_unsettled(conn)))
         {
+            // Counted as taken, because the hold is a deferred take and not a
+            // drop: these bytes are delivered as soon as the protocol is
+            // known.  Measured while this was `continue` alone -- a broadcast
+            // to three connected clients reported taken=1, the only one that
+            // had spoken yet, which reads as two clients missed.
             relay_hold_push(conn, msg);
+            ++counted.taken;
             continue;
         }
 
-        if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
+        const size_t queued = conn->write_queue.bytes();
+        if (SOCKETLEY_UNLIKELY(queued >= socketley::write_queue_max_bytes))
         {
+            // Sticky here as at the send door, because otherwise a client this
+            // broadcast dropped answers the script's next self.send() with
+            // "there is no open connection" -- the peer's sentence for the
+            // runtime's decision.  One flag, both entrances.
+            conn->closed_for_backlog = true;
             conn->closing = true;
+            ++counted.backlogged;
             continue;
         }
+
+        // The same watermark as the send door, so a broadcaster is woken by
+        // on_writable too.  A publisher with 3000 subscribers is exactly the
+        // producer that needs it.
+        if (SOCKETLEY_UNLIKELY(queued + msg->size() >= socketley::write_queue_backpressure_bytes))
+            conn->drain_wanted = true;
+
+        ++counted.taken;
 
         if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
         {
@@ -4127,6 +4179,8 @@ void server_instance::queue_broadcast(const std::shared_ptr<const std::string>& 
                 flush_write_queue(conn);
         }
     }
+
+    return counted;
 }
 
 // ─── Whether the message was taken ──────────────────────────────────────────
@@ -4146,7 +4200,8 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
     if (SOCKETLEY_UNLIKELY(!m_loop || (conn->closing && !even_when_closing)))
         return false;
 
-    if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
+    const size_t queued = conn->write_queue.bytes();
+    if (SOCKETLEY_UNLIKELY(queued >= socketley::write_queue_max_bytes))
     {
         // Sticky, so the refusal one call later can say which of the five
         // reasons it was: a connection the runtime closed because the producer
@@ -4157,6 +4212,21 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         conn->closing = true;
         return false;
     }
+
+    // The soft watermark, which is the proxy's and the client's already and was
+    // the server's nowhere -- so the server had the hard cap and no slope
+    // leading up to it.  Nothing is refused here and the bytes still go: the
+    // watermark only records that an on_writable is owed when the queue comes
+    // back down, so a producer has somewhere to be woken.
+    //
+    // Judged on the size this message LEAVES behind, not the one it arrived
+    // to.  A producer pacing on self.pending() stops on the same number, so
+    // arming on the size before the append arms one send too late -- and that
+    // send never comes, because the script has already stopped.  Measured
+    // before this line said `queued`: the paced arm delivered 65 of 200 chunks
+    // and waited forever for a callback it had itself prevented.
+    if (SOCKETLEY_UNLIKELY(queued + msg->size() >= socketley::write_queue_backpressure_bytes))
+        conn->drain_wanted = true;
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
@@ -4634,6 +4704,20 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
         conn->write_batch[i].clear();
     conn->write_batch_count = 0;
+
+    // The queue has shrunk, so this is the moment the crossing can be seen.
+    // Recorded and not called: a script's on_writable will send, which reaches
+    // flush_write_queue and can mark this same connection closing, and the
+    // rest of this function still holds the pointer.  The tree's own answer to
+    // that shape is three lines below the read path's Lua call -- "answered a
+    // turn later, rather than run on this stack through a pointer".
+    if (SOCKETLEY_UNLIKELY(conn->drain_wanted)
+        && conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+    {
+        conn->drain_wanted = false;
+        if (wants_on_writable() && conn->ref_serial != 0)
+            m_drain_pending.push_back(conn->ref_serial);
+    }
 
     // The response is on the wire with an empty queue behind it, which is the
     // only moment sending the FIN cannot overtake anything; it declines by

@@ -333,9 +333,37 @@ void client_instance::flush_queued_write()
     m_conn->write_buf = m_write_queue.take_front();
     // Once there is room again, a later stall is worth reporting afresh.
     if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+    {
         m_write_queue_full = false;
+        // The same crossing, read for the other purpose: a producer that
+        // stopped at the watermark is owed a call.
+        if (m_drain_wanted) { m_drain_wanted = false; m_drain_due = true; }
+    }
     m_conn->write_off = 0;
     arm_write(m_conn->write_buf.data(), static_cast<uint32_t>(m_conn->write_buf.size()));
+}
+
+long client_instance::pending_bytes() const
+{
+    return static_cast<long>(m_write_queue.bytes());
+}
+
+bool client_instance::write_backlogged() const
+{
+    return m_write_queue_full && m_connected;
+}
+
+void client_instance::on_loop_turn()
+{
+    if (SOCKETLEY_UNLIKELY(m_drain_due))
+    {
+        m_drain_due = false;
+        // No id: a client has one connection, and inventing a number for it
+        // would be a fiction a script could try to use.  The argument is
+        // passed as 0 so the binding is one function for both runtimes; a
+        // client's on_writable() simply takes none, which Lua allows.
+        invoke_on_writable(0);
+    }
 }
 
 // Losing the socket: one teardown, reached from every path that loses it.
@@ -948,6 +976,9 @@ bool client_instance::lua_send(std::string_view msg)
             // test_udp_client_sends.sh at 2 of 10 -- and the same fact is
             // written three functions away in udp_broadcast(), which has no
             // queue at all for exactly this reason.
+            if (m_write_queue.bytes() + msg.size()
+                >= socketley::write_queue_backpressure_bytes)
+                m_drain_wanted = true;
             m_write_queue.push(std::string(msg.data(), msg.size()));
             return true;
         }
@@ -980,6 +1011,13 @@ bool client_instance::lua_send(std::string_view msg)
                 }
                 return false;
             }
+            // Judged on the size the message leaves behind, not the one it
+            // arrived to: a producer pacing on self.pending() stops on this
+            // same number, so arming on the size before the push arms one send
+            // too late and that send never comes.
+            if (m_write_queue.bytes() + msg.size()
+                >= socketley::write_queue_backpressure_bytes)
+                m_drain_wanted = true;
             std::string out(msg.data(), msg.size());
             if (out.empty() || out.back() != '\n')
                 out.push_back('\n');
@@ -1146,9 +1184,13 @@ void client_instance::tls_flush()
             m_write_queue.pop();
         }
         // Once there is room again, a later stall is worth reporting afresh —
-        // the same latch the cleartext path lowers in flush_queued_write.
+        // the same latch the cleartext path lowers in flush_queued_write, and
+        // the same crossing noted for on_writable.
         if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+        {
             m_write_queue_full = false;
+            if (m_drain_wanted) { m_drain_wanted = false; m_drain_due = true; }
+        }
     }
 
     if (!tls_context::has_pending_out(m_conn->ssl))
