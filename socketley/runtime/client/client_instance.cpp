@@ -332,7 +332,7 @@ void client_instance::flush_queued_write()
 
     m_conn->write_buf = m_write_queue.take_front();
     // Once there is room again, a later stall is worth reporting afresh.
-    if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+    if (m_write_queue.bytes() < write_watermark_bytes())
     {
         m_write_queue_full = false;
         // The same crossing, read for the other purpose: a producer that
@@ -959,7 +959,7 @@ bool client_instance::lua_send(std::string_view msg)
         {
             // The bound is memory and not entries, on the same reasoning the
             // TCP arm gives below.
-            if (m_write_queue.bytes() >= socketley::write_queue_max_bytes)
+            if (m_write_queue.bytes() >= write_buffer_bytes())
             {
                 if (!m_write_queue_full)
                 {
@@ -977,7 +977,7 @@ bool client_instance::lua_send(std::string_view msg)
             // written three functions away in udp_broadcast(), which has no
             // queue at all for exactly this reason.
             if (m_write_queue.bytes() + msg.size()
-                >= socketley::write_queue_backpressure_bytes)
+                >= write_watermark_bytes())
                 m_drain_wanted = true;
             m_write_queue.push(std::string(msg.data(), msg.size()));
             return true;
@@ -1000,7 +1000,7 @@ bool client_instance::lua_send(std::string_view msg)
             // The bound is memory and not entries, because an entry cap
             // dropped 20-byte lines after 80 KB and let megabyte payloads
             // queue gigabytes.
-            if (m_write_queue.bytes() >= socketley::write_queue_max_bytes)
+            if (m_write_queue.bytes() >= write_buffer_bytes())
             {
                 if (!m_write_queue_full)
                 {
@@ -1016,7 +1016,7 @@ bool client_instance::lua_send(std::string_view msg)
             // same number, so arming on the size before the push arms one send
             // too late and that send never comes.
             if (m_write_queue.bytes() + msg.size()
-                >= socketley::write_queue_backpressure_bytes)
+                >= write_watermark_bytes())
                 m_drain_wanted = true;
             std::string out(msg.data(), msg.size());
             if (out.empty() || out.back() != '\n')
@@ -1186,7 +1186,7 @@ void client_instance::tls_flush()
         // Once there is room again, a later stall is worth reporting afresh —
         // the same latch the cleartext path lowers in flush_queued_write, and
         // the same crossing noted for on_writable.
-        if (m_write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+        if (m_write_queue.bytes() < write_watermark_bytes())
         {
             m_write_queue_full = false;
             if (m_drain_wanted) { m_drain_wanted = false; m_drain_due = true; }

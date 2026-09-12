@@ -123,7 +123,7 @@ local sent, refused, first, fired = 0, 0, nil, 0
 -- The flood, from on_connect: the peer is not reading, so this is certain to
 -- reach the bound however fast the machine is.
 function on_connect()
-    socketley.log("CP start watermark=" .. tostring(self.watermark)
+    socketley.log("CP start watermark=" .. tostring(self.watermark())
         .. " pending=" .. tostring(self.pending()))
     for _ = 1, 400 do
         local okay, why = self.send(CHUNK)

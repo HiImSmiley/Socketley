@@ -78,6 +78,7 @@ void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.rate_limit > 0.0)        rt.set_rate_limit(cfg.rate_limit);
     if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
+    if (cfg.write_buffer > 0)        rt.set_write_buffer(cfg.write_buffer);
     if (cfg.drain)                   rt.set_drain(true);
     if (cfg.tls)                     rt.set_tls(true);
     if (!cfg.cert_path.empty())      rt.set_cert_path(cfg.cert_path);
@@ -110,6 +111,7 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
     if (cfg.rate_limit > 0.0)        rt.set_rate_limit(cfg.rate_limit);
     if (cfg.global_rate_limit > 0.0) rt.set_global_rate_limit(cfg.global_rate_limit);
     if (cfg.idle_timeout > 0)        rt.set_idle_timeout(cfg.idle_timeout);
+    if (cfg.write_buffer > 0)        rt.set_write_buffer(cfg.write_buffer);
 
     // Unconditional, like backend_timeout below and for the same reason: the
     // only caller parses a whole document, so an absent write_file means the

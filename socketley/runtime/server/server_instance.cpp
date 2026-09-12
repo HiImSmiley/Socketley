@@ -4250,7 +4250,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
         }
 
         const size_t queued = conn->write_queue.bytes();
-        if (SOCKETLEY_UNLIKELY(queued >= socketley::write_queue_max_bytes))
+        if (SOCKETLEY_UNLIKELY(queued >= write_buffer_bytes()))
         {
             // Sticky here as at the send door, because otherwise a client this
             // broadcast dropped answers the script's next self.send() with
@@ -4265,7 +4265,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
         // The same watermark as the send door, so a broadcaster is woken by
         // on_writable too.  A publisher with 3000 subscribers is exactly the
         // producer that needs it.
-        if (SOCKETLEY_UNLIKELY(queued + msg->size() >= socketley::write_queue_backpressure_bytes))
+        if (SOCKETLEY_UNLIKELY(queued + msg->size() >= write_watermark_bytes()))
             conn->drain_wanted = true;
 
         ++counted.taken;
@@ -4327,7 +4327,7 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         return false;
 
     const size_t queued = conn->write_queue.bytes();
-    if (SOCKETLEY_UNLIKELY(queued >= socketley::write_queue_max_bytes))
+    if (SOCKETLEY_UNLIKELY(queued >= write_buffer_bytes()))
     {
         // Sticky, so the refusal one call later can say which of the five
         // reasons it was: a connection the runtime closed because the producer
@@ -4351,7 +4351,7 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
     // send never comes, because the script has already stopped.  Measured
     // before this line said `queued`: the paced arm delivered 65 of 200 chunks
     // and waited forever for a callback it had itself prevented.
-    if (SOCKETLEY_UNLIKELY(queued + msg->size() >= socketley::write_queue_backpressure_bytes))
+    if (SOCKETLEY_UNLIKELY(queued + msg->size() >= write_watermark_bytes()))
         conn->drain_wanted = true;
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
@@ -4838,7 +4838,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     // that shape is three lines below the read path's Lua call -- "answered a
     // turn later, rather than run on this stack through a pointer".
     if (SOCKETLEY_UNLIKELY(conn->drain_wanted)
-        && conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes)
+        && conn->write_queue.bytes() < write_watermark_bytes())
     {
         conn->drain_wanted = false;
         if (wants_on_writable() && conn->ref_serial != 0)
@@ -5998,7 +5998,7 @@ size_t server_instance::group_send(std::string_view group, std::string_view msg)
     {
         auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
         if (!conn || conn->closing) continue;
-        if (conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
+        if (conn->write_queue.bytes() >= write_buffer_bytes())
         {
             conn->closing = true;
             continue;
@@ -6363,7 +6363,7 @@ void server_instance::queue_upstream_send(upstream_connection* uc, const std::sh
     if (!m_loop || !uc->connected || uc->closing)
         return;
 
-    if (uc->write_queue.bytes() >= socketley::write_queue_max_bytes)
+    if (uc->write_queue.bytes() >= write_buffer_bytes())
     {
         uc->closing = true;
         return;

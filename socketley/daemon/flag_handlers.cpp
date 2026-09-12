@@ -320,6 +320,26 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             return 0;
         }
 
+        case fnv1a("--write-buffer"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--write-buffer requires a size value\n";
+                return 1;
+            }
+            size_t bytes;
+            if (!parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "invalid --write-buffer value (use K/M/G suffix)\n";
+                return 1;
+            }
+            // Every runtime has a write queue, so unlike --idle-timeout there
+            // is nothing to refuse this on: the client's queue is the one that
+            // fills when its server stops reading.
+            instance->set_write_buffer(bytes);
+            return 0;
+        }
+
         case fnv1a("--drain"):
             // The fifth of them.  get_drain() is read by the server, the proxy
             // and the cache and by no client code, so a client stored it,
@@ -1340,6 +1360,28 @@ int parse_common_edit_flags(runtime_instance* instance, const parsed_args& pa,
                                               "the moment it is dropped"))
                 return 1;
             instance->set_idle_timeout(static_cast<uint32_t>(secs));
+            return 0;
+        }
+
+        case fnv1a("--write-buffer"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--write-buffer requires a size value\n";
+                return 1;
+            }
+            size_t bytes;
+            if (!parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "invalid --write-buffer value (use K/M/G suffix)\n";
+                return 1;
+            }
+            // Live: the bound is read on every send rather than cached per
+            // connection, so there is nothing to refresh and nothing holding
+            // the old value.  A queue already past a lowered bound is closed
+            // at its next send, which is the same answer it would get for
+            // having grown there.
+            instance->set_write_buffer(bytes);
             return 0;
         }
 

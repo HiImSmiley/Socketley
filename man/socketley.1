@@ -1367,6 +1367,43 @@ Limit maximum concurrent connections. New connections beyond this limit
 are immediately closed. 0 means unlimited (default). Alias:
 .BR \-\-max\-conn .
 .TP
+.BI "\-\-write\-buffer " "size"
+How much may be owed to ONE connection before the runtime stops waiting for it,
+with K/M/G suffixes. Default 8M. Every runtime has a write queue, so this
+applies to all four types \(em a client's queue is the one that fills when its
+server stops reading.
+.IP
+This is arithmetic rather than a preference. The queue is per connection, so
+the bound multiplies:
+.IP
+.nf
+100 streams        800 MB
+1,000 streams        8 GB     (a box with 11 GiB serves about this many)
+10,000 streams      80 GB     not possible
+.fi
+.IP
+8M is right for a few large transfers and wrong by about sixty for many
+concurrent streams; nginx serves ten thousand with 32\(hy64 KB apiece. Nothing
+could previously say which shape a runtime was, because these were two
+compile\(hytime constants. Measured, 400 sends of 64 KB into a peer that is
+not reading: a default runtime takes 129 of them and one at
+.B "\-\-write\-buffer 256K"
+takes 5.
+.IP
+One number and not two: the pacing watermark that
+.B on_writable
+fires on is half of this, which is the ratio the constants had. A pair could be
+set inconsistently, and a watermark above the bound is a runtime that paces
+only after it has already closed the connection. A script reads the derived
+value as
+.BR self.watermark() .
+.IP
+Values under 128K are raised to it rather than refused: the watermark is half
+the bound and the largest single entry these queues build is 64 KB, so a
+smaller bound is a runtime that cannot send one message. Editable on a running
+runtime, and the change reaches the script at once \(em the bound is read on
+every send rather than cached anywhere.
+.TP
 .BI "\-\-rate\-limit " "n"
 Limit messages per second per connection using a token bucket algorithm.
 Excess messages are silently dropped (server); a
@@ -5050,6 +5087,7 @@ max_connections            \-\-max\-connections
 rate_limit                 \-\-rate\-limit
 global_rate_limit          \-\-global\-rate\-limit
 idle_timeout               \-\-idle\-timeout  300, or 5m / 2h / 1d
+write_buffer               \-\-write\-buffer   8M, 256K, 65536
 drain (bool)               \-\-drain
 test (bool)                \-\-test
 tls (bool)                 \-\-tls
@@ -5323,7 +5361,7 @@ Fires alongside on_message for backward compatibility.
 .TP
 .B on_writable(client_id)
 The write queue for this connection has come back down under
-.BR self.watermark ,
+.BR self.watermark() ,
 so a producer that stopped because
 .B self.pending(client_id)
 was high can carry on. Edge\(hytriggered: it fires on the crossing, once per
@@ -5351,15 +5389,18 @@ paced    13,107,400 bytes delivered, on_writable fired 3 times
 .fi
 .IP
 Pace against
-.B self.watermark
-and not a number of your own. The callback fires on the crossing, so a producer
+.B self.watermark()
+and not a number of your own. It is a call and not a field because
+.B \-\-write\-buffer
+is editable, and a number copied into the script's table at load would go
+stale the moment it moved. The callback fires on the crossing, so a producer
 that stops below the watermark never crosses it and is never called back \(em it
 would wait for an event its own caution prevented:
 .IP
 .nf
 local function pump(id)
     while remaining > 0 do
-        if (self.pending(id) or 0) >= self.watermark then return end
+        if (self.pending(id) or 0) >= self.watermark() then return end
         if not self.send(id, next_chunk()) then return end
         remaining = remaining \- 1
     end
@@ -6141,9 +6182,10 @@ self.broadcast(msg)        -- Broadcast to all clients (server).  Answers two
 self.pending(client_id)    -- Queued for that client and not yet on the wire,
                            -- in bytes (server); nil if the id is not one of
                            -- this runtime's connections.  See below.
-self.watermark             -- The byte count on_writable fires on the way down
+self.watermark()           -- The byte count on_writable fires on the way down
                            -- through (server and client).  Pace against this,
-                           -- not a literal.  See on_writable.
+                           -- not a literal.  A call and not a field, because
+                           -- --write-buffer is editable.  See on_writable.
 self.pending()             -- The client's own form, without an id: a client
                            -- has one connection.  Bytes queued for its server
                            -- and not yet on the wire.
@@ -6160,7 +6202,7 @@ self.pending()             -- The client's own form, without an id: a client
 -- "it is gone".  self.pending() is the number to watch BEFORE sending, which
 -- is the difference between pacing and a post-mortem:
 --
---     if (self.pending(id) or 0) >= self.watermark then return end
+--     if (self.pending(id) or 0) >= self.watermark() then return end
 --
 -- and on_writable(id) is how a producer that stopped there is started again,
 -- which is what makes a body past the bound sendable rather than merely

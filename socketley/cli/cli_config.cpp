@@ -54,6 +54,7 @@ constexpr config_key config_keys[] = {
     // scalar, not integer: a duration key takes `300` or `"5m"`, and the
     // daemon's duration parser is the one judge of both spellings.
     { "idle_timeout",       "--idle-timeout",       key_kind::scalar  },
+    { "write_buffer",       "--write-buffer",       key_kind::scalar  },
     { "drain",              "--drain",              key_kind::boolean },
     { "test",               "--test",               key_kind::boolean },
     { "tls",                "--tls",                key_kind::boolean },

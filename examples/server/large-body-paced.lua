@@ -5,7 +5,7 @@
 --
 -- The three pieces that make it work instead:
 --   self.pending(id)  bytes queued for that client and not yet on the wire
---   self.watermark    the number on_writable fires on the way down through
+--   self.watermark()  the number on_writable fires on the way down through
 --   on_writable(id)   the queue has come back under it; carry on
 
 local CHUNK_SIZE = 65536
@@ -18,11 +18,11 @@ local function pump(id)
     if not left then return end
 
     while left > 0 do
-        -- Pace against self.watermark and not a literal. on_writable fires on
+        -- Pace against self.watermark() and not a literal. on_writable fires on
         -- the crossing, so a producer that stops below the watermark never
         -- crosses it and is never called back -- it would wait for an event
         -- its own caution prevented.
-        if (self.pending(id) or 0) >= self.watermark then
+        if (self.pending(id) or 0) >= self.watermark() then
             remaining[id] = left
             return
         end

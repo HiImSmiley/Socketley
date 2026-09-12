@@ -15,7 +15,7 @@
 # -- tell the producer, and call it back:
 #
 #     self.pending(id)   how much is still owed        (landed previously)
-#     self.watermark     the number to compare against
+#     self.watermark()   the number to compare against
 #     on_writable(id)    the queue came back under it
 #
 # ─── THE ASSERTION ──────────────────────────────────────────────────────────
@@ -43,9 +43,14 @@
 # on_writable fires on the crossing, so a producer that paces BELOW the
 # watermark never crosses it and is never called back -- it would wait forever
 # for an event its own caution prevented. The field and the callback have to
-# name one value, and it is not the script's to guess. Hence self.watermark,
-# and the fifth case below asserts it is the number the runtime actually uses
+# name one value, and it is not the script's to guess. Hence self.watermark(),
+# and the first case below asserts it is the number the runtime actually uses
 # rather than a plausible-looking one.
+#
+# A CALL and not a field, which --write-buffer is the reason for: measured as a
+# field, `edit x --write-buffer 512K` moved the runtime's bound while the script
+# went on reading 4194304 until the runtime was restarted. The cache's mode()
+# carries the same note for the same reason.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -84,11 +89,11 @@ local sent, fired, done = 0, 0, false
 local paced_id = nil
 
 -- Sends until the queue reaches the watermark, then stops and waits to be
--- called back.  self.watermark and not a literal: pacing below the number
+-- called back.  self.watermark() and not a literal: pacing below the number
 -- on_writable fires on would wait for a crossing it prevented.
 local function pump(id)
     while sent < CHUNKS do
-        if (self.pending(id) or 0) >= self.watermark then return end
+        if (self.pending(id) or 0) >= self.watermark() then return end
         local okay, why = self.send(id, CHUNK)
         if not okay then
             socketley.log("WR paced refused at=" .. sent .. " why=[" .. tostring(why) .. "]")
@@ -125,7 +130,7 @@ function on_client_message(id, msg)
         socketley.log("WR flood sent=" .. s .. " failed=" .. f)
 
     elseif msg == "probe" then
-        socketley.log("WR probe watermark=" .. tostring(self.watermark)
+        socketley.log("WR probe watermark=" .. tostring(self.watermark())
             .. " pending=" .. tostring(self.pending(id)))
         self.send(id, "PROBE-OK")
     end

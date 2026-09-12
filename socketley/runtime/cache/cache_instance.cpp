@@ -6803,7 +6803,7 @@ bool cache_instance::flush_responses(client_connection* conn)
     }
     SKL_TRACE_ADD(conn, bytes_queued, conn->response_buf.size());
 
-    if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= socketley::write_queue_max_bytes))
+    if (SOCKETLEY_UNLIKELY(conn->write_queue.bytes() >= write_buffer_bytes()))
     {
         // The peer has genuinely stopped reading while megabytes pile up, so
         // dropping the connection is right but must not happen quietly.
@@ -10166,7 +10166,7 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             // rather than entries, and reaching it needs a write in flight, so
             // the chokepoint sees the connection on that completion
             // regardless.
-            if (sub_conn->write_queue.bytes() >= socketley::write_queue_max_bytes)
+            if (sub_conn->write_queue.bytes() >= write_buffer_bytes())
             {
                 // Said out loud, on the house rule flush_responses() states for
                 // the same drop on the reply path: "dropping the connection is
@@ -10247,7 +10247,7 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 if (fd < 0 || fd >= MAX_FDS || !m_conn_idx[fd]) continue;
                 auto* pc = m_conn_idx[fd];
                 if (pc->closing || pc->is_follower) continue;
-                if (pc->write_queue.bytes() >= socketley::write_queue_max_bytes)
+                if (pc->write_queue.bytes() >= write_buffer_bytes())
                 {
                     // The pattern is named as well as the channel, because a
                     // psubscriber dropped on one channel of a pattern is not

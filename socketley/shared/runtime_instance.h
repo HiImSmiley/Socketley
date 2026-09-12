@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include "route_table.h"
+#include "write_queue.h"
 #include <chrono>
 #include <sstream>
 #include <utility>
@@ -163,6 +164,26 @@ public:
     // Idle connection timeout (seconds, 0 = disabled)
     void set_idle_timeout(uint32_t seconds);
     uint32_t get_idle_timeout() const;
+
+    // ─── How much may be owed to one connection ─────────────────────────────
+    // The write queue's bound, per connection, which was two compile-time
+    // constants and therefore the same for a runtime serving four large
+    // transfers and one serving ten thousand small ones.  The arithmetic is
+    // what makes it a knob: 8 MiB times ten thousand connections is 80 GB, and
+    // a box with 11 GiB serves about a thousand before it is the memory and
+    // not the code that decides.
+    //
+    // One value and not two: the watermark is half the bound, which is the
+    // ratio the constants had, so a caller has one number to reason about
+    // rather than a pair that can be set inconsistently.
+    void set_write_buffer(size_t bytes);
+    size_t get_write_buffer() const;
+    // The bound, past which the connection is closed because it is not going
+    // to catch up.
+    size_t write_buffer_bytes() const { return m_write_buffer; }
+    // And the point where a producer is told to pace and a reader is stopped,
+    // with room left to absorb what is already in flight.
+    size_t write_watermark_bytes() const { return m_write_buffer / 2; }
 
     // Graceful shutdown
     void set_drain(bool enabled);
@@ -716,6 +737,9 @@ private:
     double m_global_tokens = 0.0;
     std::chrono::steady_clock::time_point m_global_last{};
     uint32_t m_idle_timeout = 0;
+    // Defaulted to what the constants were, so a runtime nobody configures
+    // behaves exactly as before.
+    size_t m_write_buffer = socketley::write_queue_max_bytes;
 
     // Graceful shutdown
     bool m_drain = false;

@@ -2903,7 +2903,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 {
                     auto& be = m_conn_idx[conn->backend_fd];
                     if (be.side == conn_backend &&
-                        be.backend->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
+                        be.backend->write_queue.bytes() >= write_watermark_bytes())
                         backpressured = true;
                 }
                 if (!backpressured)
@@ -3188,7 +3188,7 @@ proxy_http_resubmit:
             {
                 auto& be = m_conn_idx[conn->backend_fd];
                 if (be.side == conn_backend &&
-                    be.backend->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
+                    be.backend->write_queue.bytes() >= write_watermark_bytes())
                     bp = true;
             }
             if (!bp)
@@ -3568,7 +3568,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             {
                 auto& ce = m_conn_idx[conn->client_fd];
                 if (ce.side == conn_client &&
-                    ce.client->write_queue.bytes() >= socketley::write_queue_backpressure_bytes)
+                    ce.client->write_queue.bytes() >= write_watermark_bytes())
                     backpressured = true;
             }
             if (!backpressured)
@@ -8156,7 +8156,7 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
 #endif
 
     SKL_TRACE_ADD(bconn, bytes_queued, (unsigned long long)data.size());
-    if (SOCKETLEY_UNLIKELY(bconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
+    if (SOCKETLEY_UNLIKELY(bconn->write_queue.bytes() >= write_buffer_bytes()))
     {
         // The backend is not draining and the queue has hit its bound, and
         // marking only the backend left the client writing into a void.
@@ -8277,7 +8277,7 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     }
 #endif
 
-    if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= socketley::write_queue_max_bytes))
+    if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= write_buffer_bytes()))
     {
         cconn->closing = true;
         return false;
@@ -8796,7 +8796,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     }
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
-    if (conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes &&
+    if (conn->write_queue.bytes() < write_watermark_bytes() &&
         conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
     {
         auto& be = m_conn_idx[conn->backend_fd];
@@ -8950,7 +8950,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     // Backpressure resume, never onto a socket that reported end of stream,
     // because a read armed there completes res=0 at once and re-enters the
     // loop the EOF branch documents.
-    if (conn->write_queue.bytes() < socketley::write_queue_backpressure_bytes &&
+    if (conn->write_queue.bytes() < write_watermark_bytes() &&
         conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
         auto& ce = m_conn_idx[conn->client_fd];

@@ -1018,6 +1018,17 @@ bool runtime_instance::check_global_rate_limit()
     return true;
 }
 
+// Floored rather than refused, because the watermark is half of it and a bound
+// below one message is a runtime that cannot send at all.  The floor is twice
+// WRITE_COALESCE_LIMIT (64 KiB, the largest single entry these queues build),
+// so the watermark itself is never under one entry.
+void runtime_instance::set_write_buffer(size_t bytes)
+{
+    constexpr size_t floor = 2 * 64u * 1024;
+    m_write_buffer = bytes < floor ? floor : bytes;
+}
+size_t runtime_instance::get_write_buffer() const { return m_write_buffer; }
+
 void runtime_instance::set_idle_timeout(uint32_t seconds) { m_idle_timeout = seconds; }
 uint32_t runtime_instance::get_idle_timeout() const { return m_idle_timeout; }
 

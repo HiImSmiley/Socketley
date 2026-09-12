@@ -2846,8 +2846,16 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // The number on_writable is defined against, so pacing does not mean
     // hardcoding it.  A producer that stops below this never crosses the
     // watermark and is never called back -- it would wait for an event it
-    // prevented -- so the field and the callback have to name one value.
-    self["watermark"] = static_cast<long>(socketley::write_queue_backpressure_bytes);
+    // prevented -- so this and the callback have to name one value.
+    //
+    // A CALL and not a field, on the same reasoning the cache's mode() gives:
+    // --write-buffer is editable, and a number written into this table when
+    // the script was loaded goes stale the moment it is edited.  Measured as a
+    // field: `edit x --write-buffer 512K` moved the runtime's bound and the
+    // script went on reading 4194304 until the runtime was restarted.
+    self["watermark"] = [owner]() -> long {
+        return static_cast<long>(owner->write_watermark_bytes());
+    };
 
     // shard_connection_count() and not get_connection_count(), because under
     // --shards a script asking how many clients its runtime has was answered
@@ -3095,7 +3103,9 @@ void lua_context::register_client_table(runtime_instance* owner, sol::table& sel
     self["pending"] = [owner]() -> long {
         return static_cast<client_instance*>(owner)->pending_bytes();
     };
-    self["watermark"] = static_cast<long>(socketley::write_queue_backpressure_bytes);
+    self["watermark"] = [owner]() -> long {
+        return static_cast<long>(owner->write_watermark_bytes());
+    };
     // One runtime's connections and not one process's; see the note on the
     // server's copy of this binding, in register_server_table above.
     self["connections"] = [owner]() -> size_t {
