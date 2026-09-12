@@ -679,6 +679,13 @@ protected:
     // no on_writable queues nothing and walks no list.
     bool wants_on_writable() const;
 
+    // One chunk of a request body, with how much is still owed after it.  The
+    // script is handed the bytes and the runtime keeps none of them.
+    void invoke_on_http_body(int client_id, std::string_view chunk, size_t remaining);
+    // Asked before the headers are done, because it decides whether the body
+    // is streamed at all -- and therefore whether it may exceed the bound.
+    bool wants_on_http_body() const;
+
     // Global rate limit check (token bucket, shared across all connections)
     bool check_global_rate_limit();
 

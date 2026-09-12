@@ -38,6 +38,20 @@ enum proto_state : uint8_t {
     proto_resp        = 5   // RESP2 wire protocol
 };
 
+// Declared ahead of server_connection because a connection holds one while
+// it streams a body: the views below point into the head the connection
+// owns, not into the buffer the body is being erased from.
+struct http_request
+{
+    std::string_view method;
+    std::string_view path;
+    std::string_view version;
+    std::string_view body;
+    std::string_view query;  // everything after '?'
+    std::vector<std::pair<std::string_view, std::string_view>> headers;
+    int client_id{-1};
+};
+
 struct alignas(64) server_connection
 {
     static constexpr size_t MAX_WRITE_BATCH = 32;
@@ -152,6 +166,19 @@ struct alignas(64) server_connection
     // existed to prevent.
     int splice_pipe[2]{-1, -1};
     size_t splice_remaining{0};
+    // ─── A request body being streamed rather than gathered ─────────────
+    // How many body bytes are still owed for the request whose headers were
+    // already parsed, and the head itself, owned -- because the point of
+    // streaming is that `partial` is erased as the body arrives, and the views
+    // an http_request holds into it would dangle.  The proxy keeps the same
+    // two things for the same reason, as saved_request and body_remaining.
+    size_t body_remaining{0};
+    std::string http_head_saved;
+    // Parsed once, at the top of the exchange, with its views rebased onto the
+    // string above -- so the streamed request and a gathered one cannot come to
+    // different conclusions about the same head.
+    http_request http_req_saved;
+
     // A 206 in progress: where the slice starts, and the file's whole length,
     // which Content-Range has to state and Content-Length must not.
     size_t range_first{0};
@@ -279,6 +306,13 @@ struct alignas(64) server_connection
         splice_out_req = {};
         if (splice_file_fd >= 0) { close(splice_file_fd); splice_file_fd = -1; }
         splice_remaining = 0;
+        // A struct that carried a half-received body would take the next
+        // client's first bytes for the rest of somebody else's upload.
+        body_remaining = 0;
+        http_head_saved.clear();
+        http_req_saved.headers.clear();
+        http_req_saved = http_request{};
+
         // With the rest of the per-response state: a struct that carried a
         // 206 would answer the next client's whole-file request with that
         // slice's headers.
@@ -310,16 +344,6 @@ struct alignas(64) server_connection
     }
 };
 
-struct http_request
-{
-    std::string_view method;
-    std::string_view path;
-    std::string_view version;
-    std::string_view body;
-    std::string_view query;  // everything after '?'
-    std::vector<std::pair<std::string_view, std::string_view>> headers;
-    int client_id{-1};
-};
 
 enum server_mode : uint8_t
 {
@@ -792,6 +816,14 @@ private:
     // retire path and from pool_release, and only the first of those has to
     // happen for a connection that finished normally.
     void splice_pipe_release(server_connection* conn);
+
+    // Hands whatever of the body is in `partial` to the script and erases it,
+    // decrementing body_remaining.  Takes nothing and keeps nothing: the whole
+    // point is that the runtime never holds the body.
+    void deliver_body_chunks(server_connection* conn);
+    // The body is complete: re-parse the saved head and dispatch the request
+    // with an empty body, so the response path is the one it always was.
+    void finish_streamed_body(server_connection* conn);
 
     void serve_http(server_connection* conn, std::string_view path,
                     std::string_view range_hdr = {});

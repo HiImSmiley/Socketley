@@ -5424,6 +5424,61 @@ to relay messages manually.
 Called when message received with sender identification (server only).
 Fires alongside on_message for backward compatibility.
 .TP
+.B on_http_body(client_id, chunk, remaining)
+A piece of a request body, with how many bytes are still owed after it \(em so
+.B remaining
+reaches 0 exactly once per body. Defining this callback IS the opt\(hyin: a
+server whose script has it streams request bodies to it instead of gathering
+them, and a server whose script does not gets the behaviour it always had,
+including the 413 past
+.BR \-\-read\-buffer .
+.IP
+That is what makes a body larger than memory possible. The bytes are handed
+over and erased as they arrive, so
+.B req.body
+in the
+.B on_http_request
+that follows is deliberately EMPTY \(em carrying them a second time is the
+memory this exists to avoid. Measured on one worker, one connection at a time:
+.IP
+.nf
+start             19,796 kB
+after 50 MB #1    37,344 kB
+after 50 MB #2    37,344 kB     unchanged
+after 50 MB #3    37,344 kB     unchanged
+after 200 MB      37,428 kB     +84 kB
+after 500 MB      37,444 kB     +16 kB
+.fi
+.IP
+The first upload costs 17.5 MB once, which is the provided\(hybuffer ring being
+faulted in, and every one after it costs nothing: half a gigabyte received
+inside 37 MB resident.
+.IP
+Keep per\(hyupload state keyed by
+.BR client_id ,
+and clear it in
+.BR on_disconnect :
+a body that is abandoned never reaches
+.BR on_http_request ,
+so nothing there can be the reset, and
+.B on_disconnect
+is the only signal it produces. It does fire, with whatever arrived, which is
+what a script writing to a temporary file needs in order to remove it.
+.IP
+.nf
+local st = {}
+function on_http_body(id, chunk, remaining)
+    st[id] = (st[id] or 0) + #chunk
+    if remaining == 0 then ... end
+end
+function on_disconnect(id) st[id] = nil end
+.fi
+.IP
+Header names keep the case the client sent them in, so
+.B req.headers["Host"]
+and not
+.BR req.headers["host"] .
+.TP
 .B on_writable(client_id)
 The write queue for this connection has come back down under
 .BR self.watermark() ,
@@ -6251,6 +6306,8 @@ self.watermark()           -- The byte count on_writable fires on the way down
                            -- through (server and client).  Pace against this,
                            -- not a literal.  A call and not a field, because
                            -- --write-buffer is editable.  See on_writable.
+on_http_body(id, chunk, n) -- A request body streamed, rather than gathered
+                           -- whole (server).  Defining it is the opt-in.
 self.pending()             -- The client's own form, without an id: a client
                            -- has one connection.  Bytes queued for its server
                            -- and not yet on the wire.

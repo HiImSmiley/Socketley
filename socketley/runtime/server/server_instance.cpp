@@ -3024,9 +3024,62 @@ void server_instance::fail_ws_connection(server_connection* conn)
 // `partial` can hold an unanswered request, and put in the loop and the three
 // async-response arms rather than at the fifteen sites that mean "may have
 // another".
+// ─── A body handed over rather than gathered ─────────────────────────────────
+// One read's worth at a time, which is what bounds the memory: `partial` holds
+// the bytes only from the completion that delivered them to the call that takes
+// them.  A 4 GB upload and a 4 KB one cost the same here.
+void server_instance::deliver_body_chunks(server_connection* conn)
+{
+    while (conn->body_remaining > 0 && !conn->partial.empty())
+    {
+        const size_t n = std::min(conn->body_remaining, conn->partial.size());
+        conn->body_remaining -= n;
+        // The count BEFORE the erase and the call, because the script may send
+        // from inside the callback and anything holding a view into `partial`
+        // across that is holding a view into a buffer that moved.
+        const size_t left = conn->body_remaining;
+        invoke_on_http_body(conn->fd, std::string_view(conn->partial.data(), n), left);
+        conn->partial.erase(0, n);
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            return;   // the script disconnected it, or a send did
+    }
+}
+
+void server_instance::finish_streamed_body(server_connection* conn)
+{
+    if (SOCKETLEY_UNLIKELY(conn->http_head_saved.empty()))
+        return;
+
+    // A copy, because handle_http_request() can reach code that resets this
+    // connection, and the request it is given must not be the storage that
+    // reset clears.  The views still point at http_head_saved, which reset
+    // does not free before this call returns.
+    http_request hreq = conn->http_req_saved;
+    // Empty and not absent: the script was handed every byte as it arrived, so
+    // req.body carrying them a second time is the memory this exists to avoid.
+    hreq.body = std::string_view();
+    handle_http_request(conn, hreq, 0);
+}
+
 void server_instance::parse_partial(server_connection* conn)
 {
 reparse:
+    // A body being streamed is not a protocol.  These bytes belong to a request
+    // whose headers were parsed already, so they go to the script and are
+    // erased -- sniffing them would read a PUT's payload as the next request.
+    // Checked before detection for that reason, which is where the proxy
+    // checks the same thing.
+    if (SOCKETLEY_UNLIKELY(conn->body_remaining > 0))
+    {
+        deliver_body_chunks(conn);
+        if (conn->body_remaining > 0)
+            return;   // more of it is still coming
+        finish_streamed_body(conn);
+        if (conn->closing || conn->partial.empty())
+            return;
+        goto reparse;   // what is left is the next request
+    }
+
     // Multi-protocol auto-detection
     if (conn->proto == proto_unknown)
     {
@@ -3460,7 +3513,14 @@ reparse:
         // A body that cannot fit in `partial` is refused now, with an answer,
         // because waiting for it ends at handle_read's size cap with the
         // connection closed and nothing said.
-        if (SOCKETLEY_UNLIKELY(content_length >
+        //
+        // Unless nobody is going to gather it.  A script with on_http_body is
+        // handed the bytes as they arrive and `partial` is erased behind them,
+        // so the bound the refusal protects is never approached and the body's
+        // size stops being this server's business -- which is what the proxy
+        // has always done with a request body it forwards.
+        const bool stream_body = content_length > 0 && wants_on_http_body();
+        if (SOCKETLEY_UNLIKELY(!stream_body && content_length >
                                read_buffer_bytes() - (hdr_end + 4)))
         {
             refuse_http_request(conn, http_413_response());
@@ -3489,6 +3549,46 @@ reparse:
                 }
                 line_start = line_end + 2;
             }
+        }
+
+        if (SOCKETLEY_UNLIKELY(stream_body))
+        {
+            // The head is copied because everything hreq holds is a view into
+            // `partial`, and `partial` is about to be erased under it.  It is
+            // re-parsed at the end rather than carried as fields: one parser
+            // for the head means the streamed request and the gathered one
+            // cannot come to different conclusions about it.
+            conn->http_head_saved.assign(full.substr(0, hdr_end + 4));
+            // Every view in hreq points into `full`, which is `partial`, and
+            // `partial` is about to be erased under it.  The saved head is a
+            // byte-for-byte prefix copy, so each view keeps its offset and
+            // only its base moves -- which is what makes this one parse rather
+            // than a second one that could disagree.
+            {
+                const char* from = full.data();
+                const char* to   = conn->http_head_saved.data();
+                auto rebase = [&](std::string_view& v) {
+                    if (!v.empty())
+                        v = std::string_view(to + (v.data() - from), v.size());
+                };
+                rebase(hreq.method); rebase(hreq.path);
+                rebase(hreq.version); rebase(hreq.query);
+                for (auto& kv : hreq.headers) { rebase(kv.first); rebase(kv.second); }
+                hreq.body = std::string_view();
+                conn->http_req_saved = std::move(hreq);
+            }
+            conn->body_remaining = content_length;
+            conn->partial.erase(0, hdr_end + 4);
+            // Whatever of the body already arrived with the head goes now; the
+            // rest is delivered by the branch at the top of this function as
+            // the reads land.
+            deliver_body_chunks(conn);
+            if (conn->body_remaining > 0)
+                return;
+            finish_streamed_body(conn);
+            if (!conn->closing && !conn->partial.empty())
+                goto reparse;
+            return;
         }
 
         size_t total_expected = hdr_end + 4 + content_length;

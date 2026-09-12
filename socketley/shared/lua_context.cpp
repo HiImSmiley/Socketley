@@ -591,6 +591,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_master_auth = m_lua["on_master_auth"];
     m_on_client_message = m_lua["on_client_message"];
     m_on_writable       = m_lua["on_writable"];
+    m_on_http_body      = m_lua["on_http_body"];
     m_on_tick = m_lua["on_tick"];
     // A tick_ms below the floor is refused rather than substituted, absent
     // still means 100, and the read is a double with an integrality test
@@ -645,6 +646,7 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_master_auth.valid())        m_callback_mask |= CB_ON_MASTER_AUTH;
     if (m_on_client_message.valid())     m_callback_mask |= CB_ON_CLIENT_MESSAGE;
     if (m_on_writable.valid())           m_callback_mask |= CB_ON_WRITABLE;
+    if (m_on_http_body.valid())          m_callback_mask |= CB_ON_HTTP_BODY;
     if (m_on_tick.valid())               m_callback_mask |= CB_ON_TICK;
     if (m_on_miss.valid())               m_callback_mask |= CB_ON_MISS;
     if (m_on_write.valid())              m_callback_mask |= CB_ON_WRITE;
