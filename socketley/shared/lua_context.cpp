@@ -3045,14 +3045,38 @@ void lua_context::register_server_table(runtime_instance* owner, sol::table& sel
     // Upstream actions
     self["upstream_send"] = [owner](int conn_id,
                                     std::string_view msg) -> api_result {
-        if (static_cast<server_instance*>(owner)->upstream_send(conn_id, msg))
+        auto* srv = static_cast<server_instance*>(owner);
+        if (srv->upstream_send(conn_id, msg))
             return api_yes();
+        // A second reason, and the one this used to answer with the first: an
+        // upstream whose queue reached the bound has `closing` set and
+        // `connected` still true, so "is not connected" was false AND every
+        // later send answered true for ever while nothing left the process.
+        if (srv->upstream_closed_for_backlog(conn_id))
+            return api_why("upstream " + std::to_string(conn_id)
+                           + " was closed because more was queued for it than it "
+                             "could take -- self.upstream_pending("
+                           + std::to_string(conn_id)
+                           + ") is what to watch before sending the next one");
         return api_why("upstream " + std::to_string(conn_id)
                        + " is not connected — self.upstreams() lists the ones "
                          "that are");
     };
+    // Two numbers, like the client-facing broadcast's and for the same reason:
+    // a fan-out that dropped half its targets used to be indistinguishable
+    // from one that reached all of them.
     self["upstream_broadcast"] = [owner](std::string_view msg) {
-        static_cast<server_instance*>(owner)->upstream_broadcast(msg);
+        const auto c = static_cast<server_instance*>(owner)->upstream_broadcast(msg);
+        return std::make_tuple(static_cast<long>(c.taken),
+                               static_cast<long>(c.backlogged));
+    };
+    // The upstream side of self.pending(), as its own call because an upstream
+    // id and a client id are different spaces: nil for an id that is not one of
+    // this runtime's upstreams, so a caller cannot read "unknown" as "empty".
+    self["upstream_pending"] = [owner](int conn_id) -> sol::optional<long> {
+        const long n = static_cast<server_instance*>(owner)->upstream_pending(conn_id);
+        if (n < 0) return sol::nullopt;
+        return n;
     };
     self["upstreams"] = [owner, this]() -> sol::table {
         auto ids = static_cast<server_instance*>(owner)->upstreams();

@@ -6424,9 +6424,32 @@ self.pending()             -- The client's own form, without an id: a client
 -- would end the response while the script was still writing it.
 
 -- Upstream actions (server with -u)
-self.upstream_send(conn_id, msg) -- Send to a specific upstream
-self.upstream_broadcast(msg)     -- Send to all connected upstreams
+self.upstream_send(conn_id, msg) -- Send to a specific upstream; false means
+                                 -- the bytes are not going.  See below.
+self.upstream_broadcast(msg)     -- Send to all connected upstreams.  Answers how
+                                 -- many took it and how many were dropped
+self.upstream_pending(conn_id)   -- Bytes queued for that upstream and not yet on
+                                 -- the wire; nil if the id is not one of this
+                                 -- runtime's upstreams
 self.upstreams()                 -- Table of connected upstream conn_ids
+
+-- ─── The same bound, pointed outwards ───
+-- An upstream's write queue fills exactly as a client's does, and these used to
+-- report none of it.  upstream_send() tested only whether the upstream was
+-- connected; a queue that reached the bound sets `closing` and leaves
+-- `connected` alone, so every later send answered TRUE for ever while nothing
+-- left the process.  Measured, 400 sends of 64 KB at an upstream that accepted
+-- the connection and then read nothing:
+--
+--     before   sent=400  failed=0    with 8,396,928 bytes standing in the queue
+--     after    sent=129  failed=271  the same 129/271 the client-facing side
+--                                    reports, because it is the same bound
+--
+-- The refusal names the backlog apart from a missing upstream, because "is not
+-- connected" is false of a connected upstream whose queue this runtime filled --
+-- and the two want opposite reactions.  Pace with self.upstream_pending() and
+-- not self.pending(): that one resolves a CLIENT id, and an upstream is in
+-- another map entirely.
 
 -- Cache: mode
 -- A call and not a field, because --mode is editable and a field written when

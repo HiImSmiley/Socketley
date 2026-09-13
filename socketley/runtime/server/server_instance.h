@@ -480,6 +480,16 @@ struct upstream_connection
     bool write_pending{false};
     bool closing{false};
     bool connected{false};
+    // An upstream's write queue fills the same way a client's does, so it
+    // carries the same sticky fact: this runtime closed the connection because
+    // the producer outran the socket, and not because the peer went away.
+    // Without it a script's next upstream_send() is answered "is not
+    // connected", which is the peer's sentence for this runtime's decision.
+    bool closed_for_backlog{false};
+    // Armed at the soft watermark, on the size a message LEAVES behind: a
+    // producer pacing on upstream_pending() stops on that same number, so
+    // arming on the size before the push arms one send too late.
+    bool drain_wanted{false};
     int reconnect_attempt{0};
     io_request timeout_req{};
     struct __kernel_timespec timeout_ts{};
@@ -538,6 +548,11 @@ public:
 
     long     pending_bytes(int client_id) const;
     bool     closed_for_backlog(int client_id) const;
+    // The upstream side of the same two questions.  A separate id space, so a
+    // separate call: self.pending() resolves a CLIENT id and an upstream is in
+    // another map entirely.
+    long     upstream_pending(int conn_id) const;
+    bool     upstream_closed_for_backlog(int conn_id) const;
 
     // What setup() will bind, answered without binding it; see the base class.
     void listen_addresses(std::vector<std::string>& out) const override;
@@ -671,8 +686,13 @@ public:
     const std::vector<upstream_target>& get_upstream_targets() const;
 
     // Lua upstream actions
+    // Answers whether the bytes were taken, which was unconditionally `true`:
+    // it tested only `connected`, and a queue that had reached its bound set
+    // `closing` without clearing `connected` -- so every later send reported
+    // success for ever while nothing left the process.
     bool upstream_send(int conn_id, std::string_view msg);
-    void upstream_broadcast(std::string_view msg);
+    // What it reached, counted like the client-facing broadcast's.
+    fanout_count upstream_broadcast(std::string_view msg);
     std::vector<int> upstreams() const;
 
     // ── request_origin ──────────────────────────────────────────────────────
@@ -876,7 +896,8 @@ private:
     void upstream_disconnect(upstream_connection* uc);
     void handle_upstream_read(struct io_uring_cqe* cqe, upstream_connection* uc);
     void handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc);
-    void queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
+    // Answers whether the message was taken; see the definition.
+    bool queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
     void upstream_flush_write_queue(upstream_connection* uc);
     void invoke_on_upstream(int conn_id, std::string_view data);
     void invoke_on_upstream_connect(int conn_id);

@@ -6737,16 +6737,24 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
     }
 }
 
-void server_instance::queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg)
+bool server_instance::queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg)
 {
     if (!m_loop || !uc->connected || uc->closing)
-        return;
+        return false;
 
-    if (uc->write_queue.bytes() >= write_buffer_bytes())
+    const size_t queued = uc->write_queue.bytes();
+    if (queued >= write_buffer_bytes())
     {
+        // Sticky, so the refusal one call later can say which of the reasons it
+        // was.  The comment below already noted this door is "the same decision
+        // queue_send() makes one function up" -- and that one was taught to
+        // answer while this one was not, which is the whole of this change.
+        uc->closed_for_backlog = true;
         uc->closing = true;
-        return;
+        return false;
     }
+    if (queued + msg->size() >= write_watermark_bytes())
+        uc->drain_wanted = true;
 
     // The same decision queue_send() makes one function up, because
     // upstream_broadcast() is the same shape pointed outwards: one payload,
@@ -6757,6 +6765,7 @@ void server_instance::queue_upstream_send(upstream_connection* uc, const std::sh
         upstream_connection::MAX_WRITE_BATCH);
     if (!uc->write_pending)
         upstream_flush_write_queue(uc);
+    return true;
 }
 
 void server_instance::upstream_flush_write_queue(upstream_connection* uc)
@@ -6813,12 +6822,16 @@ bool server_instance::upstream_send(int conn_id, std::string_view msg)
     if (buf.empty() || buf.back() != '\n')
         buf.push_back('\n');
     auto shared = std::make_shared<const std::string>(std::move(buf));
-    queue_upstream_send(it->second.get(), std::move(shared));
-    return true;
+    // Answered rather than assumed: the old `return true` here is the same
+    // defect send_to_client() carried, whose own comment admitted it -- "a
+    // connection closed for exceeding the write-queue bound reported by the
+    // connection going away".
+    return queue_upstream_send(it->second.get(), std::move(shared));
 }
 
-void server_instance::upstream_broadcast(std::string_view msg)
+server_instance::fanout_count server_instance::upstream_broadcast(std::string_view msg)
 {
+    fanout_count counted;
     std::string buf;
     buf.reserve(msg.size() + 1);
     buf.append(msg);
@@ -6827,9 +6840,28 @@ void server_instance::upstream_broadcast(std::string_view msg)
     auto shared = std::make_shared<const std::string>(std::move(buf));
     for (auto& [cid, uc] : m_upstreams)
     {
-        if (uc->connected && !uc->closing)
-            queue_upstream_send(uc.get(), shared);
+        if (!uc->connected || uc->closing)
+            continue;
+        if (queue_upstream_send(uc.get(), shared))
+            ++counted.taken;
+        else
+            ++counted.backlogged;
     }
+    return counted;
+}
+
+long server_instance::upstream_pending(int conn_id) const
+{
+    auto it = m_upstreams.find(conn_id);
+    if (it == m_upstreams.end())
+        return -1;
+    return static_cast<long>(it->second->write_queue.bytes());
+}
+
+bool server_instance::upstream_closed_for_backlog(int conn_id) const
+{
+    auto it = m_upstreams.find(conn_id);
+    return it != m_upstreams.end() && it->second->closed_for_backlog;
 }
 
 std::vector<int> server_instance::upstreams() const
