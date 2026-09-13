@@ -2719,19 +2719,38 @@ request and is served, as is a value with trailing whitespace. Values reach
 with that whitespace removed from both ends.
 .PP
 .B Transfer\-Encoding
-is answered
-.B 501 Not Implemented
-and the connection is closed. This server implements no transfer coding,
-including
-.BR chunked ,
-and a body it cannot read is a body whose end it cannot find \(em so the
-request is refused rather than treated as though it had no body at all.
-Send a
-.B Content\-Length
-instead. A proxy in front forwards
+depends on what the script asked for, and on which coding it is.
+.IP \(bu 2
 .B chunked
-verbatim, so a chunked request through a socketley proxy to a socketley
-server is answered 501 by the server and the 501 is relayed.
+alone, with a script that defines
+.BR on_http_body :
+decoded, and the body delivered in pieces like any other. There is no length
+to bound it by, which is what chunked is for.
+.IP \(bu 2
+.B chunked
+alone, without that callback: still
+.BR "501 Not Implemented" ,
+because nothing is going to read the body incrementally and a body whose end
+this end cannot find is refused rather than treated as though it had none.
+.IP \(bu 2
+.BR "gzip, chunked" :
+.B 501
+even with the callback. Chunked is the final coding, so the chunk sizes do
+delimit it, and the bytes inside are still compressed \(em taking the framing
+off and handing them on as the body would hand on gzip and call it the body.
+.IP \(bu 2
+A coding that is not chunked at all, such as
+.B gzip
+by itself:
+.BR "400 Bad Request" ,
+because nothing can say where the body ends.
+.PP
+So a chunked request through a socketley proxy to a socketley server is served
+when the server's script takes bodies and answered 501 when it does not; the
+proxy forwards the framing verbatim either way and relays whatever comes back.
+.B Content\-Length
+remains the simpler form and is what a client that knows its own length should
+send.
 .PP
 Why a server bothers with any of this, when it is the last recipient and
 has nobody to disagree with: it usually is not. The moment anything sits
