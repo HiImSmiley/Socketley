@@ -1429,7 +1429,6 @@ compile\(hytime constants. Measured, 400 sends of 64 KB into a peer that is
 not reading: a default runtime takes 129 of them and one at
 .B "\-\-write\-buffer 256K"
 takes 5.
-.IP
 One number and not two: the pacing watermark that
 .B on_writable
 fires on is half of this, which is the ratio the constants had. A pair could be
@@ -2305,6 +2304,12 @@ capped at 1 MB. So the default allows 64, and a runtime configured small because
 it serves many streams gets MORE pipes out of the same budget rather than fewer.
 Past the count the read path serves the remainder exactly as it did before.
 .IP
+More requests reach for a pipe than used to: the splice arm now starts at
+256 KiB rather than at 1 MiB, because that is where a kept response stops being
+the faster answer. A server of 300 KiB images that never touched this budget
+before may now sit against it, and what it gets when it does is the read path,
+which is what it had for those files all along.
+.IP
 That boundary is worth knowing, because the fallback is not merely slower. Worker
 throughput and RSS on 4 MiB files:
 .IP
@@ -2392,12 +2397,40 @@ timestamp exactly.
 The memory this uses is bounded, unlike
 .BR \-\-http\-cache 's,
 because it fills from whatever is requested rather than from a directory the
-operator can see the size of before starting: a file larger than 1 MiB is never
-kept, and once the kept responses reach 64 MiB in total no further file is
-added. Files not kept are served exactly as before, by reading them per
-request. See
+operator can see the size of before starting: once the kept responses reach
+64 MiB in total no further file is added, and the per\-file cap depends on
+whether the connection asking has a faster path available at all.
+.IP
+.nf
+plaintext, not .html   256 KiB   anything larger is spliced instead
+TLS, or an .html         1 MiB   neither has a splice arm
+.fi
+.IP
+That split is measured rather than tidy. A kept response is sent by copying it
+into the socket; splicing sends the page cache by reference and copies nothing.
+At 64 concurrent requests for a 1 MiB file that is 5,931 responses a second kept
+against 14,049 spliced, and 11,977 against 26,599 at 512 KiB \(em so keeping a
+large file makes serving it slower, not faster. Small files reverse it, because
+splice's own setup is then the whole cost: at 4 KiB it is 146,987 a second kept
+against 66,905 spliced.
+.IP
+The cap sits at 256 KiB rather than lower because splice buys that throughput
+partly with CPU, and the price falls with size: per MiB served it is 340 us at
+256 KiB, 163 us at 1 MiB and 143 us at 2 MiB, against a flat ~170 us for the
+copy. Above the cap the trade is free or better; at 256 KiB it would be 59 per
+cent more CPU for 115 per cent more throughput, which is a trade and not
+something a default should decide for an operator.
+.IP
+A TLS connection cannot splice at all, since that would hand the peer plaintext
+in the middle of an encrypted stream, and an .html has a script injected into it
+\(em so for those two the larger cap stands, and there the map is what keeps a
+file from being read, and allocated, once per request.
+.IP
+A file that is not kept is not read either, outside those two cases: it goes
+from the page cache to the socket without passing through this process. See
 .B SOCKETLEY_HTTP_REVALIDATE
-to switch the whole mechanism off.
+to switch the whole mechanism off, which also puts every size back on the
+copying path.
 .TP
 .B \-\-http\-cache
 When used with \-\-http, reads all files into memory at startup instead of

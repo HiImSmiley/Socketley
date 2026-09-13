@@ -30,9 +30,12 @@
 #     (mtime, size), which is the natural thing to write and is wrong: this is
 #     what `mv new old`, `cp` into place, git checkout and every editor that
 #     writes-then-renames actually do.
-#   * the same four on a .txt file, because non-HTML takes the splice path in
-#     disk mode and HTML takes the read path -- two different code paths, and a
-#     cache populated on one of them says nothing about the other.
+#   * the same four on a .txt file, because an .html has a script injected into
+#     it and a .txt does not, so the same file becomes two different responses
+#     and a map populated by one says nothing about the other. Both are read
+#     rather than spliced at these sizes, which is what the clause here used to
+#     claim the .txt was not: a plaintext connection splices from 256 KiB up,
+#     and the size that decides it is the map's own per-file cap.
 #   * a replacement made in the middle of a keep-alive connection, because the
 #     cache is per-server and the connection is not, and a per-connection
 #     memo would pass every case above.

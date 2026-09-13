@@ -1214,12 +1214,18 @@ private:
     // map.
     static constexpr size_t HTTP_REVAL_MAX_FILE  = 1u << 20;   // 1 MiB
     static constexpr size_t HTTP_REVAL_MAX_TOTAL = 64u << 20;  // 64 MiB
+    // The cap for a connection that has the splice arm available, which is a
+    // different question: see the measurement at the reval_take that reads it.
+    static constexpr size_t HTTP_REVAL_SPLICE_MAX_FILE = 256u << 10;  // 256 KiB
 
     // SOCKETLEY_HTTP_REVALIDATE=0 restores the per-request open and read
     // exactly, read once at start.
     bool m_http_reval_enabled{true};
     bool http_reval_active() const { return m_http_reval_enabled && m_http_root_fd >= 0; }
     bool http_reval_would_fit(const std::string& url_path, size_t cost) const;
+    // Says once that the map stopped taking files; see the definition for why
+    // it is called from two places.
+    void note_http_reval_full();
     void http_reval_store(const std::string& url_path, const struct stat& st,
                           std::shared_ptr<const std::string> ka,
                           std::shared_ptr<const std::string> cl);

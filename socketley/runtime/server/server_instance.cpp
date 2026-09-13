@@ -964,6 +964,26 @@ bool server_instance::http_reval_would_fit(const std::string& url_path, size_t c
     return m_http_reval_bytes - reclaimed + cost <= HTTP_REVAL_MAX_TOTAL;
 }
 
+// Once per worker, because an operator needs to know the content cache stopped
+// taking files and does not need telling per request.
+//
+// Called from both doors, which is the point.  The estimate at the read
+// completion is what actually declines when the map is full -- it is checked
+// before the responses are built, so the exact test inside http_reval_store()
+// below is reached only in the sliver where a finished response is larger than
+// the estimate was.  The line lived at that second door alone, so in practice it
+// never fired: 200 files of 200 KiB fill the 64 MiB map and logged nothing.
+void server_instance::note_http_reval_full()
+{
+    if (m_http_reval_full_logged)
+        return;
+    m_http_reval_full_logged = true;
+    LOG_INFO("server: --http content cache reached its 64 MiB limit; the "
+             "files already in it stay fast, the rest are spliced from the "
+             "page cache -- or read per request on TLS and for .html, "
+             "neither of which can be spliced");
+}
+
 void server_instance::http_reval_store(const std::string& url_path, const struct stat& st,
                                        std::shared_ptr<const std::string> ka,
                                        std::shared_ptr<const std::string> cl)
@@ -974,12 +994,7 @@ void server_instance::http_reval_store(const std::string& url_path, const struct
         // Full: stop taking new files rather than evicting one, because every
         // hit is revalidated so only speed is at stake and a stable answer
         // beats a cache that thrashes.
-        if (!m_http_reval_full_logged)
-        {
-            m_http_reval_full_logged = true;
-            LOG_INFO("server: --http content cache reached its 64 MiB limit; the "
-                     "files already in it stay fast, the rest are read per request");
-        }
+        note_http_reval_full();
         return;
     }
     auto& e = m_http_reval[url_path];
@@ -1285,11 +1300,28 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
         }
 
         // Whether this miss may become a map entry, which needs the bytes in
-        // user space, so a small non-HTML file takes the read path -- splice
-        // measured 17.19 us against read's 0.72 and only wins above the
-        // per-file cap.
+        // user space -- and the size it stops at depends on whether THIS
+        // connection has the splice arm at all, because a kept response is sent
+        // by COPYING it into the socket and the alternative sends the page cache
+        // by reference.  Measured at 64 concurrent: 1 MiB is 5,931 responses a
+        // second kept against 14,049 spliced, 512 KiB 11,977 against 26,599, and
+        // the other way round at 4 KiB, 146,987 kept against 66,905, where
+        // splice's own setup is the whole cost.  The 17.19 us against read's
+        // 0.72 that this comment used to cite is that small-transfer figure, and
+        // it was read as though it held at the cap.
+        // 256 KiB and not lower, because splice buys that throughput partly with
+        // CPU and the price falls with size: per MiB it is 340 us at 256 KiB,
+        // 163 at 1 MiB and 143 at 2 MiB, against a flat ~170 for the copy.  So
+        // above the cap the trade is free or better, at 512 KiB it is +31% CPU
+        // for +122% throughput, and at 256 KiB it would be +59% for +115% --
+        // a trade rather than a win, which is not what a default should make.
+        // A TLS connection and an injected .html have no splice arm, so for them
+        // the cap stays where it was: there the map is what keeps a file from
+        // being read, and allocated, once per request.
+        const size_t reval_cap = (!is_html && !conn->ssl) ? HTTP_REVAL_SPLICE_MAX_FILE
+                                                          : HTTP_REVAL_MAX_FILE;
         const bool reval_take = reval_ok && used_beneath &&
-                                fsize <= HTTP_REVAL_MAX_FILE &&
+                                fsize <= reval_cap &&
                                 m_http_reval_bytes < HTTP_REVAL_MAX_TOTAL;
 
         // A HEAD owes the headers a GET would send and no body, so a non-HTML
@@ -5355,11 +5387,17 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     // Content-Range.  serve_http already declines the cache on the way in; this
     // is the other half, and the two together are why a seek cannot poison a
     // path for every later reader.
-    const bool store = !conn->is_range &&
-                       !conn->file_url_path.empty() &&
-                       static_cast<uint64_t>(cqe->res) ==
-                           static_cast<uint64_t>(conn->file_st.st_size) &&
-                       http_reval_would_fit(conn->file_url_path, 2 * (128 + body_len));
+    const bool keepable = !conn->is_range && !conn->file_url_path.empty() &&
+                          static_cast<uint64_t>(cqe->res) ==
+                              static_cast<uint64_t>(conn->file_st.st_size);
+    const bool fits = http_reval_would_fit(conn->file_url_path, 2 * (128 + body_len));
+    // This is the door the full map is actually refused at, so this is where it
+    // gets said -- and only for a file that was otherwise keepable, since a 206
+    // or a short read is declined for its own reasons and says nothing about the
+    // map being full.
+    if (keepable && !fits)
+        note_http_reval_full();
+    const bool store = keepable && fits;
     if (store)
     {
         auto ka = std::make_shared<const std::string>(build_http_response_at(
