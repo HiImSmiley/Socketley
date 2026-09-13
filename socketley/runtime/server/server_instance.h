@@ -174,6 +174,28 @@ struct alignas(64) server_connection
     // an http_request holds into it would dangle.  The proxy keeps the same
     // two things for the same reason, as saved_request and body_remaining.
     size_t body_remaining{0};
+    // ── A file sent in pieces, for a connection with no splice arm ──────────
+    // TLS cannot be spliced -- that would hand the peer plaintext inside an
+    // encrypted stream -- so before this a TLS listener answered every request
+    // by allocating the whole file and then building the response around it:
+    // measured, one request for a 256 MB file took the worker to 505 MB and
+    // three at once to 1,250 MB, with the client deciding how many there are.
+    // Here the memory is one piece plus whatever the write queue holds, and
+    // neither follows the file's size.
+    int      stream_fd{-1};
+    // Read into directly and then MOVED into the queue, so a piece is copied
+    // zero times on its way out.
+    std::string stream_buf;
+    uint64_t stream_offset{0};
+    uint64_t stream_remaining{0};
+    bool     stream_pending{false};
+    io_request stream_req{};
+
+    // Set when a body was finished straight out of the read buffer, which
+    // leaves body_remaining at 0 and body_chunked false -- the two things
+    // parse_partial() looks at to decide whether a body is in progress.  Without
+    // it the request that body belonged to would never be answered.
+    bool body_done_pending{false};
     // Chunked has no length to count down, so body_remaining stays 0 and this
     // is what says a body is still owed.  The decoder holds the position in the
     // framing across reads.
@@ -322,6 +344,16 @@ struct alignas(64) server_connection
         // client's first bytes for the rest of somebody else's upload.
         body_remaining = 0;
         body_chunked = false;
+        body_done_pending = false;
+        // A struct that carried a half-sent file would send the rest of it to
+        // whoever gets this descriptor next.
+        if (stream_fd >= 0) { close(stream_fd); stream_fd = -1; }
+        stream_buf.clear();
+        stream_buf.shrink_to_fit();
+        stream_offset = 0;
+        stream_remaining = 0;
+        stream_pending = false;
+        stream_req = {};
         response_started = false;
         chunked_response = false;
         chunk_dec = http_chunked_decoder{};
@@ -867,6 +899,29 @@ private:
     // decrementing body_remaining.  Takes nothing and keeps nothing: the whole
     // point is that the runtime never holds the body.
     void deliver_body_chunks(server_connection* conn);
+    // The same delivery straight out of the read buffer, for the case that needs
+    // no accumulation at all; returns how many of those bytes were body.
+    size_t deliver_body_span(server_connection* conn, const char* p, size_t n);
+
+    // ── Sending a file in pieces ────────────────────────────────────────────
+    // Above this size a file that cannot be spliced is streamed rather than
+    // allocated whole.  Not lower, because one read of the whole thing is
+    // cheaper when the whole thing is small, and a megabyte is already the cap
+    // on what the revalidation map will hold.
+    static constexpr size_t HTTP_STREAM_MIN   = 1u << 20;    // 1 MiB
+    // One piece in flight, which is what the memory bound is made of.
+    static constexpr size_t HTTP_STREAM_PIECE = 256u << 10;  // 256 KiB
+
+    // Begins it: headers are already queued by the caller, this arms the first
+    // read.  False if the read could not be armed at all.
+    bool stream_file_begin(server_connection* conn, int ffd, uint64_t first, uint64_t len);
+    // Arms the next piece, if one is owed and the queue has room for it.
+    void stream_file_more(server_connection* conn, bool force = false);
+    // A piece arrived: queue it, and either arm the next or wait for the drain.
+    void handle_file_stream(struct io_uring_cqe* cqe, server_connection* conn);
+    // Closes the descriptor and forgets the state, from every path that ends a
+    // stream -- finished, refused or torn down.
+    void stream_file_cleanup(server_connection* conn);
     // A response the script sends itself, in three steps.  Each answers
     // whether it was taken, which for the chunks is the backpressure that
     // makes a body larger than memory possible at all.

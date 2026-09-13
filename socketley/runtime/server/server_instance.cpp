@@ -149,7 +149,11 @@ conn_ref server_instance::ref_for_fd(int fd) const
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
     return conn->read_pending || conn->write_pending
-        || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending;
+        || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending
+        // The streamed file's read writes into this struct's own buffer, so a
+        // reuse while it is armed is the kernel writing into the next client's
+        // connection.
+        || conn->stream_pending;
 }
 
 // Every flag this connection can carry sorted by who must report it, which is
@@ -1373,6 +1377,31 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
             }
         }
 
+        // A file this size, on a connection with no splice arm: headers now and
+        // one piece at a time after them.  Two exclusions, both because the path
+        // needs the whole body in user space: an .html has a script injected into
+        // it and its Content-Length counts that, and a file the revalidation map
+        // may keep has to be kept -- and that cap is below this threshold anyway.
+        if (!is_html && !reval_take && send_len > HTTP_STREAM_MIN)
+        {
+            conn->file_content_type = std::string(ct);
+            conn->is_range    = rng.usable;
+            conn->range_first = send_first;
+            conn->range_total = fsize;
+            queue_http_response(conn, std::make_shared<const std::string>(
+                rng.usable
+                    ? build_http_206_headers(ct, rng.first, rng.last, fsize,
+                                             conn->http_keep_alive)
+                    : build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+            if (SOCKETLEY_UNLIKELY(!stream_file_begin(conn, ffd, send_first, send_len)))
+            {
+                // The headers promised a length that is now not coming.
+                conn->closing = true;
+                maybe_shutdown_write(conn);
+            }
+            return;
+        }
+
         // Fallback: malloc + async read (HTML files or splice busy)
         char* fbuf = static_cast<char*>(malloc(send_len));
         if (!fbuf)
@@ -2476,9 +2505,15 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
         {
             // Async file read completion — route via socket fd in req->fd
             auto* conn = (req->fd >= 0 && req->fd < MAX_FDS) ? m_conn_idx[req->fd] : nullptr;
-            if (SOCKETLEY_LIKELY(conn && req == &conn->file_read_req
-                                 && req->generation == conn->generation))
-                handle_file_read(cqe, req);
+            if (SOCKETLEY_LIKELY(conn && req->generation == conn->generation))
+            {
+                // Two readers of the same operation, told apart by which request
+                // the completion names -- the way the two splice arms are.
+                if (req == &conn->file_read_req)
+                    handle_file_read(cqe, req);
+                else if (req == &conn->stream_req)
+                    handle_file_stream(cqe, conn);
+            }
             break;
         }
         case op_splice:
@@ -2986,6 +3021,14 @@ void server_instance::on_loop_turn()
             auto* conn = (fd >= 0 && fd < MAX_FDS) ? m_conn_idx[fd] : nullptr;
             if (!conn || conn->closing)
                 continue;
+            // An internal producer first, and instead: a file being streamed to
+            // this connection owes the rest of a response the script knows
+            // nothing about, and on_writable is about the script's own sends.
+            if (SOCKETLEY_UNLIKELY(conn->stream_remaining > 0))
+            {
+                stream_file_more(conn);
+                continue;
+            }
             invoke_on_writable(fd);
         }
     }
@@ -3136,6 +3179,166 @@ void server_instance::fail_ws_connection(server_connection* conn)
 // One read's worth at a time, which is what bounds the memory: `partial` holds
 // the bytes only from the completion that delivered them to the call that takes
 // them.  A 4 GB upload and a 4 KB one cost the same here.
+// ── Sending a file in pieces, for a connection that cannot splice ───────────
+//
+// The splice arm carries a file with the pipe as its buffer and the write queue
+// holding only the headers, so its memory does not follow the file's size.  A TLS
+// connection has no splice arm, and what it had instead was one allocation of
+// whatever was asked for.  This is the same shape as the splice arm, with a read
+// where the splice was: one piece in flight, paced by the same crossing the write
+// queue already reports, so the bound is the piece plus the queue.
+bool server_instance::stream_file_begin(server_connection* conn, int ffd,
+                                        uint64_t first, uint64_t len)
+{
+    conn->stream_fd        = ffd;
+    conn->stream_offset    = first;
+    conn->stream_remaining = len;
+    conn->stream_pending   = false;
+    // Forced: the queue holds the headers and nothing else at this point, and a
+    // deferral here would be read below as a read that could not be submitted.
+    stream_file_more(conn, true);
+    // Nothing armed and nothing owed means the read could not be submitted, and
+    // the headers have already gone out: the connection cannot be left promising
+    // a length it will never send.
+    if (!conn->stream_pending)
+    {
+        stream_file_cleanup(conn);
+        return false;
+    }
+    return true;
+}
+
+void server_instance::stream_file_more(server_connection* conn, bool force)
+{
+    if (conn->stream_remaining == 0 || conn->stream_pending || conn->closing
+        || conn->stream_fd < 0)
+        return;
+    // Paced on the same number a script would pace on, so a slow client holds a
+    // piece and a queue rather than a file: without this the queue reaches its
+    // hard bound and the connection is closed for a backlog it did not cause.
+    if (!force && conn->write_queue.bytes() >= write_watermark_bytes())
+        return;
+
+    const size_t want = static_cast<size_t>(
+        std::min<uint64_t>(conn->stream_remaining, HTTP_STREAM_PIECE));
+    // Read into the string's own storage, so the piece is moved into the queue
+    // rather than copied into it.
+    conn->stream_buf.resize(want);
+    conn->stream_req = { this, conn->stream_buf.data(), conn->fd,
+                         static_cast<uint32_t>(want), op_file_read, conn->generation };
+    if (!m_loop->submit_file_read(conn->stream_fd, conn->stream_buf.data(),
+                                  static_cast<uint32_t>(want), conn->stream_offset,
+                                  &conn->stream_req))
+        return;
+    conn->stream_pending = true;
+}
+
+void server_instance::stream_file_cleanup(server_connection* conn)
+{
+    if (conn->stream_fd >= 0) { close_tracked(conn->stream_fd); conn->stream_fd = -1; }
+    conn->stream_buf.clear();
+    conn->stream_buf.shrink_to_fit();
+    conn->stream_offset    = 0;
+    conn->stream_remaining = 0;
+}
+
+void server_instance::handle_file_stream(struct io_uring_cqe* cqe, server_connection* conn)
+{
+    conn->stream_pending = false;
+
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+    {
+        stream_file_cleanup(conn);
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+        return;
+    }
+
+    // A short read or an error in the middle of a body whose length has already
+    // been promised: there is no way to answer correctly from here, so the
+    // connection goes rather than the client being left to wait for bytes that
+    // are not coming.
+    if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
+    {
+        stream_file_cleanup(conn);
+        conn->closing = true;
+        maybe_shutdown_write(conn);
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
+        return;
+    }
+
+    const size_t got = static_cast<size_t>(cqe->res);
+    conn->stream_buf.resize(got);
+    conn->stream_offset    += got;
+    conn->stream_remaining -= std::min<uint64_t>(conn->stream_remaining, got);
+    queue_send(conn, std::make_shared<const std::string>(std::move(conn->stream_buf)));
+    conn->stream_buf.clear();
+
+    if (conn->stream_remaining > 0)
+    {
+        // Either there is room now, or the crossing the queue reports will bring
+        // this back -- on_loop_turn() walks the same drain list a script's
+        // producer is woken from.
+        stream_file_more(conn);
+        return;
+    }
+
+    stream_file_cleanup(conn);
+    if (!conn->http_keep_alive)
+    {
+        conn->closing = true;
+        maybe_shutdown_write(conn);
+    }
+    else
+    {
+        conn->proto = proto_unknown;
+        if (!conn->read_pending)
+            submit_conn_read(conn);
+        // Last statement, for the reason the splice arm gives: parse_partial()
+        // can start the next response on this connection.
+        parse_partial(conn);
+    }
+}
+
+// A body the script is being handed in pieces does not have to be accumulated
+// first, and accumulating it is not free: profiled on an 8 MiB upload through
+// on_http_body, 18.1 per cent of the worker's core was handle_read appending the
+// provided buffer into `partial` -- and the erase that follows moves whatever is
+// behind it, so each byte is touched twice here before sol2 copies it a third
+// time into a Lua string.  Delivered from the read buffer there is one copy left,
+// the one the script's own string needs.
+//
+// Only the counted form takes this path.  A chunked body's framing is a resumable
+// decoder whose state lives across reads, and splitting its bookkeeping between
+// two callers is where a bug would hide; it keeps the accumulating path, which is
+// the one its 147 split cases were verified against.
+size_t server_instance::deliver_body_span(server_connection* conn, const char* p, size_t n)
+{
+    size_t off = 0;
+    while (conn->body_remaining > 0 && off < n)
+    {
+        const size_t take = std::min(conn->body_remaining, n - off);
+        conn->body_remaining -= take;
+        // Read before the call, as in the accumulating twin: the script may send
+        // from inside the callback, and this count is what it is told is left.
+        const size_t left = conn->body_remaining;
+        invoke_on_http_body(conn->fd, std::string_view(p + off, take), left);
+        off += take;
+        // The script may have disconnected this client, or a send may have: the
+        // struct survives in m_conn_retired until no ring op names it, so reading
+        // these fields is safe, but nothing more may be delivered into it.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            return off;
+    }
+    // Said here rather than finished here, because finishing reaches
+    // handle_http_request() and that belongs on the other side of this read's
+    // buffer iteration, not inside it.
+    if (conn->body_remaining == 0)
+        conn->body_done_pending = true;
+    return off;
+}
+
 void server_instance::deliver_body_chunks(server_connection* conn)
 {
     if (SOCKETLEY_UNLIKELY(conn->body_chunked))
@@ -3331,8 +3534,12 @@ reparse:
     // erased -- sniffing them would read a PUT's payload as the next request.
     // Checked before detection for that reason, which is where the proxy
     // checks the same thing.
-    if (SOCKETLEY_UNLIKELY(conn->body_remaining > 0 || conn->body_chunked))
+    if (SOCKETLEY_UNLIKELY(conn->body_remaining > 0 || conn->body_chunked ||
+                           conn->body_done_pending))
     {
+        // A body that finished in the read buffer leaves nothing for
+        // deliver_body_chunks() to do and everything below it still to do.
+        conn->body_done_pending = false;
         deliver_body_chunks(conn);
         if (SOCKETLEY_UNLIKELY(conn->closing))
             return;
@@ -4053,9 +4260,23 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         // first.
         m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [&](char* p, uint32_t n) {
             if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
+            {
                 tls_feed(conn, p, static_cast<size_t>(n));
-            else
-                conn->partial.append(p, n);
+                return;
+            }
+            // Mid-body with nothing pending: these bytes are the script's and
+            // nobody else's, so they go straight there.  `partial` has to be
+            // empty for that -- bytes already accumulated come first, and this
+            // read's would otherwise be delivered ahead of them.
+            if (conn->body_remaining > 0 && !conn->body_chunked &&
+                conn->partial.empty() && !conn->closing)
+            {
+                const size_t used = deliver_body_span(conn, p, static_cast<size_t>(n));
+                if (used < n)
+                    conn->partial.append(p + used, static_cast<size_t>(n) - used);
+                return;
+            }
+            conn->partial.append(p, n);
         });
     }
     else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
@@ -4064,7 +4285,22 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
     else
     {
-        conn->partial.append(conn->read_buf, cqe->res);
+        // The same decision at the other door, because a fix at one and not its
+        // sibling is how this file grew most of its asymmetries: a runtime whose
+        // reads do not come from the provided ring accumulates a streamed body
+        // for exactly as little reason.
+        if (conn->body_remaining > 0 && !conn->body_chunked &&
+            conn->partial.empty() && !conn->closing)
+        {
+            const size_t n = static_cast<size_t>(cqe->res);
+            const size_t used = deliver_body_span(conn, conn->read_buf, n);
+            if (used < n)
+                conn->partial.append(conn->read_buf + used, n - used);
+        }
+        else
+        {
+            conn->partial.append(conn->read_buf, cqe->res);
+        }
     }
 
     // This client has said something and is now owed an answer rather than
@@ -5266,7 +5502,12 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         && conn->write_queue.bytes() < write_watermark_bytes())
     {
         conn->drain_wanted = false;
-        if (wants_on_writable() && conn->ref_serial != 0)
+        // A file this runtime is streaming is a producer of its own, and it has
+        // to be woken whether or not a script asked to hear about crossings: an
+        // --http server with no Lua at all defines no on_writable, so the pump
+        // was waiting for a wake-up nobody was going to send.  One request never
+        // showed it -- 3.4 MB stays under the watermark -- and three at once hung.
+        if ((wants_on_writable() || conn->stream_remaining > 0) && conn->ref_serial != 0)
             m_drain_pending.push_back(conn->ref_serial);
     }
 
