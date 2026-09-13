@@ -107,7 +107,8 @@ local function pump(id)
         j.left = j.left - 1
         j.sent = j.sent + 1
     end
-    socketley.log("SR done id=" .. id .. " rows=" .. j.sent .. " resumed=" .. j.resumed)
+    socketley.log("SR done id=" .. id .. " want=" .. j.want
+        .. " rows=" .. j.sent .. " resumed=" .. j.resumed)
     self.end_response(id)
     jobs[id] = nil
 end
@@ -162,7 +163,7 @@ function on_http_request(req)
 
     -- /rows/<n>
     local n = tonumber(p:match("^/rows/(%d+)$") or "") or 4
-    jobs[req.client_id] = { left = n, sent = 0, resumed = 0 }
+    jobs[req.client_id] = { left = n, want = n, sent = 0, resumed = 0 }
     if not self.respond_stream(req.client_id, 200, {["Content-Type"] = "text/plain"}) then
         jobs[req.client_id] = nil
         return { status = 500, body = "could not start\n" }
@@ -187,7 +188,9 @@ get() {   # $1=path $2=method $3=keepalive("1"/"") ; prints "status|te|cl|bytes|
     timeout 300 python3 - "$P" "$1" "${2:-GET}" "${3:-}" <<'PYEOF' 2>/dev/null || true
 import hashlib, socket, sys
 port, path, method, keep = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-s = socket.create_connection(("127.0.0.1", port), 5); s.settimeout(120)
+# 300 and not 120: under suite load a 200 MB body takes longer than a quiet box
+# suggests, and a timeout is the harness giving up rather than an answer.
+s = socket.create_connection(("127.0.0.1", port), 5); s.settimeout(300)
 req = ("%s %s HTTP/1.1\r\nHost: h\r\nConnection: %s\r\n\r\n"
        % (method, path, "keep-alive" if keep else "close")).encode()
 s.sendall(req)
@@ -216,7 +219,11 @@ def field(k):
 chunked = field("transfer-encoding").lower() == "chunked"
 h = hashlib.sha256()
 total = 0
-statuses = head.count(b"HTTP/1.1 ")
+# `rest` too, and not only `head` and the later reads: the first read stops at
+# the header terminator but can carry far past it, so a pipelined second
+# response's status line may already be in there.  Counting only `head` made
+# this case pass or fail depending on where the kernel split the reads.
+statuses = head.count(b"HTTP/1.1 ") + rest.count(b"HTTP/1.1 ")
 buf = bytearray(rest)
 ok = True
 want = 0          # bytes of the current chunk still to take
@@ -232,14 +239,18 @@ def pump():
             del buf[:take]; want -= take
             if want == 0:
                 if len(buf) < 2: return
-                if bytes(buf[:2]) != b"\r\n": ok = False; done = True; return
+                if buf[0] != 13 or buf[1] != 10: ok = False; done = True; return
                 del buf[:2]
             continue
         if not chunked:
             if not buf: return
             h.update(buf); total += len(buf); del buf[:]
             continue
-        nl = bytes(buf).find(b"\r\n")
+        # buf.find on the bytearray itself: bytes(buf) copied the WHOLE buffer
+        # once per chunk, which over 200 MB of 4 KB rows is 51,200 copies of up
+        # to 256 KB -- the driver, not the server, and it made a working server
+        # look like it stalled at 85%.
+        nl = buf.find(b"\r\n")
         if nl < 0:
             if len(buf) > 512: ok = False; done = True
             return
@@ -295,7 +306,10 @@ case "$(f 6 "$A")" in *framed=1*) ok ;;
 BASE=$(rss)
 B=$(get /rows/51200)
 check "200 MB of generated body arrives" "209715200" "$(f 4 "$B")"
-RES=$(grep -o 'SR done id=[0-9]* rows=[0-9]* resumed=[0-9]*' "$SOCKETLEY_DLOG" | tail -1)
+# want=51200 in the pattern, so this cannot read another case's line -- the
+# first draft grepped the last "SR done" of any case and reported resumed=0 from
+# a four-row one when the big case had not finished at all.
+RES=$(grep -o 'SR done id=[0-9]* want=51200 rows=[0-9]* resumed=[0-9]*' "$SOCKETLEY_DLOG" | tail -1) || true
 R=$(printf '%s\n' "$RES" | grep -oE 'resumed=[0-9]+' | cut -d= -f2)
 if [ "${R:-0}" -gt 0 ]; then ok; else
     bad "and on_writable is what let it continue" \
