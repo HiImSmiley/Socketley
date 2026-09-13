@@ -116,6 +116,24 @@ PYEOF
 python3 "$SOCKETLEY_TMPD/peer.py" "$P" "$GO" > "$SOCKETLEY_TMPD/listener.out" 2>&1 &
 LPID=$!
 
+# Bound before the client is created, and checked with ss rather than by
+# connecting: this peer accepts exactly one connection and `nc -z` would spend it.
+#
+# Without the wait this file failed about one run in six, and the reason is worth
+# writing down because it is not the test's alone.  python needs a moment to bind;
+# the client's non-blocking connect answers EINPROGRESS and client_instance.cpp
+# falls straight through to its `connected:` label, so on_connect fires and the
+# script queues its 8 MB flood on a socket whose connect has not finished.  When
+# that connect is then refused, the armed write completes ECONNREFUSED and the
+# connection goes with everything queued on it -- `stats` read connections:0 and
+# the daemon log said nothing at all until the WARN this commit adds.  Waiting
+# here removes the race; on_connect firing before a connect completes is a
+# separate thing and is named in the message.
+for _ in $(seq 1 200); do
+    ss -ltn 2>/dev/null | grep -q ":$P " && break
+    sleep 0.05
+done
+
 cat > "$LUA" <<'LUAEOF'
 local CHUNK = string.rep("z", 65536)
 local sent, refused, first, fired = 0, 0, nil, 0

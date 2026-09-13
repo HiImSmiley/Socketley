@@ -859,6 +859,18 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
 
     if (cqe->res < 0 || (cqe->res == 0 && !empty_datagram_sent))
     {
+        // Said, because a connection this runtime drops must not vanish quietly:
+        // test_client_can_pace_its_sends.sh lost one here about one run in six and
+        // the daemon log carried nothing at all -- the callback it was waiting for
+        // could not fire because there was nothing left to drain, and stats read
+        // connections:0 with no reason anywhere.
+        char why[128];
+        std::snprintf(why, sizeof why,
+                      "client: write failed (%s), dropping the connection with "
+                      "%zu bytes still queued",
+                      cqe->res < 0 ? std::strerror(-cqe->res) : "peer closed",
+                      m_write_queue.bytes());
+        LOG_WARN(why);
         m_conn->closing = true;
         if (!m_conn->read_pending)
             drop_connection();
