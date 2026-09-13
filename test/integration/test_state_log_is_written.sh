@@ -81,9 +81,16 @@ states() { sed 's/^.* //' "$1" 2>/dev/null | tr '\n' ',' | sed 's/,$//'; }
 # broken tree gets believed.
 lines() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
 
+# Twenty seconds and not six.  Six was short of a restore under suite load: the
+# run at 2026-09-13 23:15 had `created,running,created` -- the restored runtime
+# was started and had not yet reported `running` -- and the same file passes 6 of
+# 6 in isolation and failed 1 of 6 on the build before this one, so the bound was
+# the flake and not the build.  A waiting bound can only stop a slow correct build
+# from failing; it cannot make a broken one pass, because the assertion below is
+# still on what the log SAYS.
 await_lines() {   # file count
     local i
-    for i in $(seq 1 60); do
+    for i in $(seq 1 200); do
         [ -f "$1" ] && [ "$(lines "$1")" -ge "$2" ] && return 0
         sleep 0.1
     done
