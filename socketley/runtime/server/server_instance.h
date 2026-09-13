@@ -1229,7 +1229,28 @@ private:
     // pool: the pipes are per connection, so this only bounds how much kernel
     // memory they add up to.
     uint32_t m_splice_live{0};
-    static constexpr uint32_t MAX_CONCURRENT_SPLICE = 8;
+    // ─── A budget in bytes, not a count ─────────────────────────────────────
+    // This was 8, chosen to keep the kernel pipe memory small, and the
+    // measurement says that was cautious in the expensive direction: past the
+    // cap a connection takes the read path, which allocates the WHOLE file per
+    // request.  Worker RSS and throughput on 4 MiB files, 64 concurrent:
+    //
+    //     cap 8    1.03 GB/s   RSS 202 MB
+    //     cap 32   1.31 GB/s   RSS 171 MB
+    //     cap 64  12.80 GB/s   RSS  35 MB
+    //
+    // The pipes cost less than the fallback they avoid, because the kernel
+    // allocates a pipe's buffer as it is used while the read path allocates the
+    // file up front.  At and below the cap this serves 13-14 GB/s flat; past it
+    // the rate falls 13x and CPU per request rises 6x.
+    //
+    // Expressed as bytes so it follows the pipe size when --write-buffer moves
+    // it: a runtime configured small because it serves many streams gets more
+    // pipes, not fewer, out of the same budget.  The count is bounded as well,
+    // because each pipe is two descriptors and a byte budget alone would let a
+    // very small --write-buffer ask for thousands.
+    static constexpr size_t   MAX_SPLICE_PIPE_BYTES = 64u * 1024 * 1024;
+    static constexpr uint32_t MAX_CONCURRENT_SPLICE = 256;
 
     // Multicast groups: group_name → list of fds in that group
     std::unordered_map<std::string, std::vector<int>> m_groups;

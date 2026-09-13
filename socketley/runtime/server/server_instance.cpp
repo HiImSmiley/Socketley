@@ -195,20 +195,24 @@ bool server_instance::splice_pipe_acquire(server_connection* conn)
 {
     if (conn->splice_pipe[0] >= 0)
         return true;
-    if (m_splice_live >= MAX_CONCURRENT_SPLICE)
+    // Sized first, because how many fit is the budget divided by the size.
+    const size_t pipe_bytes = std::min<size_t>(1024u * 1024, write_buffer_bytes());
+    uint32_t allowed = static_cast<uint32_t>(MAX_SPLICE_PIPE_BYTES / pipe_bytes);
+    if (allowed > MAX_CONCURRENT_SPLICE) allowed = MAX_CONCURRENT_SPLICE;
+    if (allowed == 0) allowed = 1;
+    if (m_splice_live >= allowed)
         return false;
     if (pipe2(conn->splice_pipe, O_NONBLOCK | O_CLOEXEC) != 0)
     {
         conn->splice_pipe[0] = conn->splice_pipe[1] = -1;
         return false;
     }
-    // Sized from the same knob as the write queue, because both answer "how
+    // The same size the budget above was divided by, because both answer "how
     // much may be in flight for one connection" -- a runtime configured small
     // because it serves many streams should not then hold a megabyte of kernel
     // pipe per stream.  A pipe cannot be smaller than a page and the kernel
     // rounds, so the result is advisory and the return is not read.
-    const size_t want = std::min<size_t>(1024u * 1024, write_buffer_bytes());
-    if (fcntl(conn->splice_pipe[0], F_SETPIPE_SZ, static_cast<int>(want)) < 0) {}
+    if (fcntl(conn->splice_pipe[0], F_SETPIPE_SZ, static_cast<int>(pipe_bytes)) < 0) {}
     ++m_splice_live;
     return true;
 }

@@ -19,6 +19,12 @@
 #     4      26.1 ms     5.3 ms    4.97x         25%
 #     8      55.8 ms    10.5 ms    5.33x         13%
 #
+# The count was 8 when that was measured, and a later benchmark showed 8 put the
+# boundary at about ten concurrent requests -- past which the read path's
+# per-request allocation of the whole file costs 13x the throughput and grows
+# RSS with concurrency.  It is a 64 MB pipe budget now, so the count follows the
+# pipe size; see the man page for the figures.
+#
 # The conc=1 row is the control and says the single case did not move; its 262%
 # spread says it could not have said much anyway. The rest grow apart exactly
 # as the mechanism predicts -- the old arm serialises onto one pipe and pays the
@@ -176,11 +182,16 @@ BASE=$(fds)
 # own file exactly is the property under test.
 check "eight concurrent downloads are each byte-exact" "ok" "$(run_downloads 8 3)"
 
-# ─── 3. And past the cap, where the read path serves the remainder ──────────
-# MAX_CONCURRENT_SPLICE bounds how many pipes exist, not how many clients are
-# served: the ones that do not get a pipe take the path every connection but
-# one used to take, and must be just as correct.
-check "sixteen at once are still each byte-exact" "ok" "$(run_downloads 16 2)"
+# ─── 3. And past the count, where the read path serves the remainder ────────
+# The budget bounds how many pipes exist, not how many clients are served: the
+# ones that do not get a pipe take the path every connection but one used to
+# take, and must be just as correct.
+#
+# 96 and not 16, because the count is 64 now.  This case was written against a
+# cap of 8 and said "sixteen at once", which stopped reaching the fallback the
+# moment the measurement moved the cap -- an assertion still passing and no
+# longer testing what it names.
+check "ninety-six at once are still each byte-exact" "ok" "$(run_downloads 96 1)"
 
 # ─── 4. The descriptors come back ───────────────────────────────────────────
 # The new invariant. A leak is not a wrong answer -- it is the cap filling

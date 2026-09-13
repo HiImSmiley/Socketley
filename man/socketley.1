@@ -2297,13 +2297,29 @@ concurrent   before      after     factor
 8           55.8 ms     10.5 ms     5.33
 .fi
 .IP
-Each connection now makes its own pipe, up to eight at a time; past that the
-read path serves the remainder exactly as it did before. The single\(hyconnection
-case is unchanged, which the first row is the control for. Pipe size follows
-.BR \-\-write\-buffer ,
-capped at 1 MB, because both answer how much may be in flight for one
-connection \(em a runtime configured small because it serves many streams
-should not then hold a megabyte of kernel pipe per stream.
+Each connection now makes its own pipe. How many exist at once is a budget in
+bytes and not a count \(em 64 MB of kernel pipe, divided by the pipe size, which
+follows
+.B \-\-write\-buffer
+capped at 1 MB. So the default allows 64, and a runtime configured small because
+it serves many streams gets MORE pipes out of the same budget rather than fewer.
+Past the count the read path serves the remainder exactly as it did before.
+.IP
+That boundary is worth knowing, because the fallback is not merely slower. Worker
+throughput and RSS on 4 MiB files:
+.IP
+.nf
+                     at/below the count      past it
+default (64)         12.7-14.2 GB/s          1.20 GB/s
+                     RSS 35 MB               RSS 234 MB
+\-\-write\-buffer 512K  12.3-14.0 GB/s at 128 concurrent, RSS 36 MB
+.fi
+.IP
+The read path allocates the WHOLE file per request, which is why memory there
+follows concurrency times file size while the pipes do not: the kernel fills a
+pipe's buffer as it is used. That is also why the count is 64 and not the 8 it
+was first set to \(em the pipes cost less than the fallback they avoid, and 8
+put the boundary at about ten concurrent requests.
 .IP
 A slice is never stored in the revalidation map and never answered from it.
 The map is keyed by path and holds the whole file's response, so a stored 206
