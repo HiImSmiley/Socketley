@@ -2321,6 +2321,37 @@ pipe's buffer as it is used. That is also why the count is 64 and not the 8 it
 was first set to \(em the pipes cost less than the fallback they avoid, and 8
 put the boundary at about ten concurrent requests.
 .IP
+.B "On a TLS listener there is no zero-copy path at all,"
+and this is the bound to know before serving large files over one. Splicing
+would hand the peer plaintext in the middle of an encrypted stream, so every
+request takes the read path whatever the pipe budget says. Measured, worker RSS
+on a 256 MB file:
+.IP
+.nf
+plaintext, one request        +2 MB          (splice)
+TLS, one request            505 MB          about twice the file
+TLS, three concurrent     1,250 MB
+.fi
+.IP
+Twice, because the file is read into memory and the response is then assembled
+around it \(em the same doubling recorded for a 400 MiB .html, where it came to
+1219 MiB. It is held for the duration of the request, and it is the client that
+decides how many such requests there are: ten concurrent 256 MB requests would
+be about 5 GB.
+.IP
+.B \-\-http\-cache
+bounds the multiplication but not the size. The file is held once and shared, so
+concurrency stops mattering, at the cost of holding it permanently from startup
+\(em measured at 154 MB for a 64 MB file, which is the file plus the two
+prebuilt responses. Otherwise keep the files a TLS listener serves small, or put
+a plaintext listener behind something else that terminates TLS.
+.IP
+The repair is a read path that works in bounded pieces, as the request side now
+does with
+.BR on_http_body ,
+rather than one allocation the size of whatever was asked for. That is a change
+to the most intricate function in this path and is not made here.
+.IP
 A slice is never stored in the revalidation map and never answered from it.
 The map is keyed by path and holds the whole file's response, so a stored 206
 would answer every later request for that path with one reader's slice and
