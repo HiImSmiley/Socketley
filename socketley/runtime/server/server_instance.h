@@ -582,6 +582,9 @@ public:
     bool wire_protocol_declared() const { return m_wire_protocol_declared; }
 
     size_t get_connection_count() const override;
+    // The bytes this server owes across every queue it holds; see the definition
+    // for why it is summed rather than tracked.
+    size_t total_queued_bytes() const override;
 
     // Lua actions
     fanout_count broadcast(std::string_view msg) override;

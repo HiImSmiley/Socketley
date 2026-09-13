@@ -17,7 +17,9 @@
 # large transfers" and wrong by a factor of about sixty for "many streams", and
 # nothing could say which a runtime was.
 #
-# One knob and not two: the watermark is half the bound, which is the ratio the
+# One knob and not two: the watermark is derived from the bound -- half of it
+# while the runtime is keeping up, and that budget over the live connections when
+# it is not -- which is the ratio the
 # constants had. A pair would let them be set inconsistently -- a watermark
 # above the bound is a runtime that paces only after it has already closed the
 # connection.
@@ -150,8 +152,9 @@ if [ -z "$(f wb_def)" ]; then ok; else
         "show printed write_buffer=$(f wb_def) for a runtime nobody configured"; fi
 
 # ─── 4. A value too small to hold one message is raised, not refused ────────
-# The watermark is half the bound, and the largest single entry these queues
-# build is WRITE_COALESCE_LIMIT at 64 KiB -- so the floor is twice that.
+# Half the bound is the watermark's CEILING, and the largest single entry these
+# queues build is WRITE_COALESCE_LIMIT at 64 KiB -- so the floor on the bound is
+# twice that, whatever the pacing point is doing at the time.
 "$BIN" edit wb_small --write-buffer 1K >/dev/null 2>&1 || true
 check "a bound under one message is floored" "131072" "$(f wb_small)"
 

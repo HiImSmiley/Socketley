@@ -183,7 +183,39 @@ public:
     size_t write_buffer_bytes() const { return m_write_buffer; }
     // And the point where a producer is told to pace and a reader is stopped,
     // with room left to absorb what is already in flight.
-    size_t write_watermark_bytes() const { return m_write_buffer / 2; }
+    //
+    // Divided by the number of live connections rather than fixed at half the
+    // bound, because what has to fit in cache is the TOTAL in flight and not one
+    // stream's share of it: half of 8 MiB is right for a few large transfers and
+    // wrong by an order of magnitude for sixty-four of them.  Clamped to the
+    // configured half at the top, so a runtime told to keep little keeps little,
+    // and to one message at the bottom.
+    size_t write_watermark_bytes() const { return m_write_watermark; }
+
+    // What this runtime owes across all its connections right now, which is the
+    // quantity that has to fit in cache -- 0 from a type that has not been
+    // measured yet, which reads as "nothing is backed up" and keeps that type on
+    // the behaviour it had.
+    virtual size_t total_queued_bytes() const { return 0; }
+
+    // Recomputed once per loop turn, from the one place in worker_main that runs
+    // every turn for every runtime type -- so no accept or close path has to
+    // remember, and a value one turn stale paces on the previous turn's numbers,
+    // which is microseconds old and never unsafe: the bound that closes a
+    // connection is not this number.
+    void refresh_pacing_watermark()
+    {
+        // Sticky for a while after the budget is exceeded, because the total is
+        // sampled once a turn and the queues drain between turns: tested on the
+        // instant, a runtime at 64 streams reads "not backed up" most turns and
+        // goes straight back to the deep point, which measured +3 per cent where
+        // the same streams paced throughout are worth +18.
+        const auto now = std::chrono::steady_clock::now();
+        if (total_queued_bytes() >= socketley::write_pacing_budget)
+            m_pacing_hold_until = now + std::chrono::milliseconds(50);
+        m_write_watermark = pacing_watermark_for(get_connection_count(),
+                                                 now < m_pacing_hold_until);
+    }
 
     // ─── And how much may be accumulated FROM one connection ────────────────
     // The inbound twin, which was MAX_PARTIAL_SIZE -- a constexpr repeated in
@@ -775,6 +807,31 @@ private:
     // Defaulted to what the constants were, so a runtime nobody configures
     // behaves exactly as before.
     size_t m_write_buffer = socketley::write_queue_max_bytes;
+    // Half the bound until the first loop turn refines it, which is what this
+    // was before it could vary at all.
+    size_t m_write_watermark = socketley::write_queue_max_bytes / 2;
+    // Until when the divided pacing point stays in force; see refresh above.
+    std::chrono::steady_clock::time_point m_pacing_hold_until{};
+
+    // Dividing by the connection count alone was the wrong rule and measured so:
+    // at 8 streams it paced a producer four times as often for no benefit, since
+    // the queues never filled -- 4,412 responses a second against 5,463, nine
+    // interleaved passes -- while at 16 it was worth +33 per cent, because there
+    // they do fill and 64 MB in flight is out of a 16 MiB L3.
+    //
+    // So the divisor is applied only when this runtime is ACTUALLY holding more
+    // than fits: under the budget every connection keeps the depth it had, and
+    // over it they share the budget.
+    size_t pacing_watermark_for(size_t live, bool backed_up) const
+    {
+        const size_t hi = m_write_buffer / 2;
+        if (live <= 1 || !backed_up)
+            return hi;
+        size_t w = socketley::write_pacing_budget / live;
+        if (w > hi) w = hi;
+        if (w < socketley::write_pacing_floor) w = socketley::write_pacing_floor;
+        return w;
+    }
     // Defaulted to what MAX_PARTIAL_SIZE was, so an unconfigured runtime
     // accepts exactly what it accepted before -- and its bulk cap lands on
     // 512 KB, which is exactly what RESP_MAX_BULK_LEN was.

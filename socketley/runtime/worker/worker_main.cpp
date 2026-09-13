@@ -405,8 +405,17 @@ public:
 
             // And whatever the runtime itself has that no completion returns
             // for, which today is a listener the ring refused to arm.
+            // Two statements now, so braces: without them the second one left
+            // the guard and ran on a null runtime, which -Wmisleading-indentation
+            // caught before any measurement did.
             if (m_rt)
+            {
+                // Before the runtime's own turn, because the pacing point is
+                // derived from the live connection count and this is the one
+                // place that runs every turn for every runtime type.
+                m_rt->refresh_pacing_watermark();
                 m_rt->on_loop_turn();
+            }
 
             // A state the runtime reached on its own, reported as soon as it
             // changes.  send_state() ran on start, stop and config and nowhere

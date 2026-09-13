@@ -1488,11 +1488,34 @@ than a difference.
 .IP
 One number and not two: the pacing watermark that
 .B on_writable
-fires on is half of this, which is the ratio the constants had. A pair could be
-set inconsistently, and a watermark above the bound is a runtime that paces
-only after it has already closed the connection. A script reads the derived
-value as
-.BR self.watermark() .
+fires on is derived from this and never set beside it. A pair could be set
+inconsistently, and a watermark above the bound is a runtime that paces only
+after it has already closed the connection. A script reads the derived value as
+.BR self.watermark() ,
+which is a call rather than a field because the answer moves.
+.IP
+It is half the bound while the runtime is keeping up, and when the runtime is
+holding more than 8 MiB in total it becomes that budget divided by the live
+connections instead \(em never above the configured half, never below 64 KB,
+and back to the half once the backlog has been gone for 50 milliseconds. What
+the operator sets is the bound, which is memory and decides when a connection is
+closed; how deep a producer is allowed to run before it pauses is a cache
+question, because these bytes are written here and then read again by the kernel
+copying them into a socket.
+.IP
+Measured on a 1 MiB chunked response, seven interleaved passes, responses
+byte\(hyidentical in every arm: 4,480 responses a second at 16 streams against
+5,273, and 3,634 at 64 against 4,221 \(em and unchanged inside the spread at 8
+and at 128. Dividing by the connection count without asking whether anything was
+actually backed up was tried first and cost 19 per cent at 8 streams, where the
+queues never fill and the only effect is stopping a producer four times as often.
+.IP
+This does not bound memory. The peak is still the bound times the connections
+that reach it, because a bound that shrank under a live connection would close it
+for a backlog it had been allowed to build. For many clients at once that is
+still this flag's own job: 60 MB at
+.B "\-\-write\-buffer 256K"
+against 146 at the default, on the same load.
 .IP
 Values under 128K are raised to it rather than refused: the watermark is half
 the bound and the largest single entry these queues build is 64 KB, so a

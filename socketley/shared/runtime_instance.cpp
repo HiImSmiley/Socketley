@@ -1085,6 +1085,10 @@ void runtime_instance::set_write_buffer(size_t bytes)
 {
     constexpr size_t floor = 2 * 64u * 1024;
     m_write_buffer = bytes < floor ? floor : bytes;
+    // The deep value now and the divided one at the next loop turn, because an
+    // edit lands before any turn does and a script reading self.watermark()
+    // between the two must not be told a number from the old bound.
+    m_write_watermark = m_write_buffer / 2;
 }
 size_t runtime_instance::get_write_buffer() const { return m_write_buffer; }
 

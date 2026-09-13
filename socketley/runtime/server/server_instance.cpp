@@ -1765,6 +1765,23 @@ size_t server_instance::get_connection_count() const
     return m_active_fds.size() + m_forwarded.size() + upstream_connected;
 }
 
+// What this server owes right now, over every connection and every upstream.
+//
+// Summed once per loop turn rather than tracked per push, because a counter kept
+// by hand across four runtimes is a counter that drifts, and this loop is the
+// same size as the one above it: a few hundred adds on a turn that already walks
+// its completions.  It decides the pacing point and nothing else, so a value one
+// turn old only ever paces on the previous turn.
+size_t server_instance::total_queued_bytes() const
+{
+    size_t total = 0;
+    for (const auto& [_, conn] : m_clients)
+        total += conn->write_queue.bytes();
+    for (const auto& [_, uc] : m_upstreams)
+        total += uc->write_queue.bytes();
+    return total;
+}
+
 // The TCP listener lifted out of setup() so the address family is one branch,
 // with SOCK_CLOEXEC because every worker would otherwise inherit this port and
 // hold it after the daemon exits.

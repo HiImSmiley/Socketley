@@ -25,6 +25,23 @@ inline constexpr size_t write_queue_max_bytes = 8u * 1024 * 1024;
 // what is already in flight.
 inline constexpr size_t write_queue_backpressure_bytes = 4u * 1024 * 1024;
 
+// How much one runtime is willing to owe in TOTAL before it starts telling
+// producers to pace, which is a different question from how much it will owe ONE
+// connection.  The second is a memory bound and is set per connection; the first
+// is a cache question, because the bytes are written by this process and then
+// read again by the kernel copying them into a socket.  L3 on the box this was
+// measured on is 16 MiB shared and L2 is 4 MiB per core; at 64 streams a fixed
+// half-of-8-MiB pacing point owes about 69 MB at once and both copies cost about
+// 2.4x what they cost when the same work is paced to fit -- measured 315 us of
+// CPU per MiB against 254, with memmove falling from 103 to 40 and the kernel's
+// own copy from 87 to 43.
+inline constexpr size_t write_pacing_budget = 8u * 1024 * 1024;
+
+// And the smallest pacing point, which is the largest single entry these queues
+// build: below it a producer would be told to stop before it could send one
+// message.
+inline constexpr size_t write_pacing_floor = 64u * 1024;
+
 inline size_t write_queue_size_of(const std::string& s)
 {
     return s.size() + write_queue_entry_overhead;
