@@ -19,6 +19,25 @@
 -- faster as well as smaller, because what is owed to all of them has to fit in
 -- cache; socketley(1) has the crossover.
 
+-- Two things about the deadline, measured on exactly this shape of handler.
+--
+-- callback_timeout_ms = 0 installs no instruction hook, which is the only way
+-- LuaJIT's trace compiler opens at all -- worth 34% here, and 48% at 64
+-- concurrent requests. It gives up being able to interrupt a runaway callback,
+-- which is a real thing to give up; socketley(1) has both sides.
+--
+-- string.format instead of a chain of .. is worth nothing on its own (4% behind,
+-- inside the noise) and +23% once the compiler is on, because it builds one
+-- string per row instead of a chain of intermediates and formats an integer
+-- rather than a double -- the double formatter alone was 15.6% of the core.
+-- The two together are +64% at 8 streams and +110% at 64, for half the CPU.
+--
+-- What neither fixes: a C server building these rows with snprintf still serves
+-- 2.4x this. How much of a stream's per-byte work belongs in Lua is the question
+-- underneath, and the answer is "as little as possible".
+callback_timeout_ms = 0
+
+local fmt  = string.format
 local ROWS = 10000000          -- ten million, which is ~400 MB of CSV
 local jobs = {}
 
@@ -37,7 +56,7 @@ local function pump(client_id)
 
         -- One line per chunk is the simple form; batching a few hundred rows
         -- per chunk costs less framing per byte if the rows are small.
-        local line = job.row .. ",item-" .. job.row .. ",generated\n"
+        local line = fmt("%d,item-%d,generated\n", job.row, job.row)
         local sent, why = self.send_chunk(client_id, line)
         if not sent then
             -- Not backpressure: pending() was checked above. The client is

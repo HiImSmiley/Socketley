@@ -6181,6 +6181,54 @@ against 3.9 and 4.0%, which is the compiler doing a little work on two
 bytecodes. Round it to about 1% end to end, against 2.4x on a callback that
 computes.
 .PP
+A streaming producer sits between those two and had never been measured, which
+matters because it is the shape that runs per byte rather than per message. A
+handler generating 40,000 CSV rows into
+.B self.send_chunk
+gains 25 to 48 per cent, not 2.4x \(em and the profile says why: with the hook
+installed the interpreter is 92.7 per cent of the worker's core, but what is
+inside that is
+.BR lj_str_new ,
+.BR lj_str_resize ,
+.B gc_sweepstr
+and the allocator, about 35 per cent between them. A compiled trace allocates
+and interns every string it builds exactly as the interpreter does, so the
+compiler removes the dispatch and leaves the string machinery standing.
+.PP
+Which makes how the script builds its strings the larger lever, and the two
+multiply rather than add. The same handler with
+.B string.format
+in place of a chain of
+.B ..
+concatenations, at 8 concurrent requests and then 64:
+.IP
+.nf
+                        bounded      unbounded
+\&.. concatenation        97.8/s      130.6/s   (+34%)
+string.format           93.8/s      160.0/s   (+71%)
+\&.. at 64 concurrent      68.0/s      100.8/s   (+48%)
+string.format at 64     71.5/s      142.7/s  (+100%)
+.fi
+.IP
+Both arms put byte\-identical responses on the wire. Note the second column is
+what changes:
+.B string.format
+is worth nothing in the interpreter \(em 4 per cent behind the concatenation,
+inside the spread \(em because there it is one C call per row either way. It
+pays only once the compiler is on, and then it pays twice: one string per row
+instead of a chain of intermediates, and an integer formatter instead of the
+double one, which was 15.6 per cent of the core on its own. End to end, from
+the default with concatenation to the compiler with
+.BR string.format ,
+that is 64 per cent more throughput at 8 streams and 110 per cent at 64, for
+about half the CPU per request.
+.PP
+A C server building the same rows with
+.BR snprintf (3)
+still serves 2.4x what the best of those does, so this is a decision about how
+much of a stream's work belongs in Lua at all \(em not a setting that closes
+the gap.
+.PP
 .B What 0 gives up.
 A compiled trace does not call an instruction hook back, so with the compiler
 on a runaway callback cannot be interrupted at all. Measured:
