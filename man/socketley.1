@@ -6247,7 +6247,29 @@ A C server building the same rows with
 still serves 2.4x what the best of those does, so this is a decision about how
 much of a stream's work belongs in Lua at all \(em not a setting that closes
 the gap.
-
+.PP
+.B What decides the size of the gain
+is how much of the work is at the Lua level, not how many bytes pass through.
+Measured on a proxy, which is a second runtime type with a per\(hybyte hook, both
+handlers forwarding the bytes untouched so only the work differs:
+.IP
+.nf
+                              bounded   unbounded   CPU per request
+one C library call per chunk    120.9      121.9     8223 -> 8155 us
+a Lua loop over every row       417.1     1452.0     2378 ->  669 us
+.fi
+.IP
+The first is a
+.B gsub
+over each chunk and gains one per cent: the call is C either way and there is
+almost no Lua around it to compile. The second walks the rows in a Lua
+.B while
+loop and gains 248 per cent at 72 per cent less CPU. Every runtime type reads the
+same setting from the same place, so the five shapes measured so far order
+themselves by that one question \(em about one per cent for a C call per byte or
+a callback that only answers, 34 to 48 per cent for building strings (where the
+allocator and the intern table are the cost and the compiler cannot remove them),
+2.4x for arithmetic, and 248 per cent for Lua control flow over many items.
 .PP
 .B What 0 gives up.
 A compiled trace does not call an instruction hook back, so with the compiler
