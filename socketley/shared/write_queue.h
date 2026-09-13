@@ -234,6 +234,17 @@ public:
             append_back(*value);
             return;
         }
+        // The copy below is a seed: it buys the NEXT message an appendable tail.
+        // A payload already at the limit cannot pay for that, because
+        // fits_in_tail would then fail on its size alone whatever arrives after
+        // it -- so the copy is the whole cost and none of the benefit.  Every
+        // chunk of a 64 KiB streamed response is this shape, and so is a kept
+        // --http response of any size once the queue is deep.
+        if (value->size() >= limit)
+        {
+            push(T(value));
+            return;
+        }
         push(T(std::string(*value)));
     }
 
