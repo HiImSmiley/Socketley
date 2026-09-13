@@ -232,13 +232,27 @@ done = False
 def pump():
     global buf, want, total, ok, done, statuses
     while True:
+        if want == -1:
+            # A payload that ended exactly at a read boundary owes its trailing
+            # CRLF, and that is a state of its own.  Without it the next pump()
+            # saw want == 0, read the CRLF as a chunk header and int(b'', 16)
+            # threw -- reported as a body truncated at a random point, about one
+            # run in five on the 200 MB case and never on a short one, because
+            # the odds are per chunk and this case has 51,200 of them.  Captured
+            # at 41,758,720 bytes with the buffer starting b'\r\n1000\r\nrrrr'.
+            if len(buf) < 2: return
+            if buf[0] != 13 or buf[1] != 10: ok = False; done = True; return
+            del buf[:2]; want = 0
+            continue
         if want > 0:
             take = min(want, len(buf))
             if take == 0: return
             h.update(memoryview(buf)[:take]); total += take
             del buf[:take]; want -= take
             if want == 0:
-                if len(buf) < 2: return
+                if len(buf) < 2:
+                    want = -1
+                    return
                 if buf[0] != 13 or buf[1] != 10: ok = False; done = True; return
                 del buf[:2]
             continue
