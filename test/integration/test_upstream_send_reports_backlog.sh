@@ -55,7 +55,9 @@ daemon_isolate upstreamback
 
 P_SRV=$((SL_PORT_BASE+1984))
 P_UP=$((SL_PORT_BASE+1986))
-NAMES="ub_srv"
+P_SRV2=$((SL_PORT_BASE+1988))
+P_UP2=$((SL_PORT_BASE+1990))
+NAMES="ub_srv ub_paced"
 LUA="$SOCKETLEY_TMPD/ub.lua"
 GO="$SOCKETLEY_TMPD/drain_now"
 
@@ -64,9 +66,9 @@ ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 bad() { TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; fi; }
 
-UPID=""
+UPID=""; UPID2=""
 cleanup() {
-    if [ -n "$UPID" ]; then { kill -9 "$UPID" && wait "$UPID"; } 2>/dev/null || true; fi
+    for p in $UPID $UPID2; do { kill -9 "$p" && wait "$p"; } 2>/dev/null || true; done
     for n in $NAMES; do "$BIN" stop "$n"   >/dev/null 2>&1 || true; done
     sleep 0.3
     for n in $NAMES; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
@@ -101,9 +103,35 @@ PYEOF
 python3 "$SOCKETLEY_TMPD/peer.py" "$P_UP" "$GO" > "$SOCKETLEY_TMPD/peer.out" 2>&1 &
 UPID=$!
 
+# The second peer reads from the start -- its GO already exists -- because the
+# paced case is about a queue that DOES drain, and the flood's peer cannot also
+# be that: it must not read, and the flood then closes the upstream for good.
+touch "$SOCKETLEY_TMPD/go2"
+python3 "$SOCKETLEY_TMPD/peer.py" "$P_UP2" "$SOCKETLEY_TMPD/go2" > "$SOCKETLEY_TMPD/peer2.out" 2>&1 &
+UPID2=$!
+
 cat > "$LUA" <<'LUAEOF'
 local CHUNK = string.rep("u", 65536)
-local fired = 0
+local paced = nil
+
+-- The slope, not just the cliff.  A producer that checks upstream_pending()
+-- against the watermark and waits to be called back gets NO refusals at all --
+-- which is the difference between "129 of 400 went" and "all of it went".
+function on_upstream_writable(uid)
+    local p = paced
+    if not p then return end
+    p.resumed = p.resumed + 1
+    while p.left > 0 do
+        if (self.upstream_pending(uid) or 0) >= self.watermark() then return end
+        local okay = self.upstream_send(uid, CHUNK)
+        if not okay then p.refused = p.refused + 1; paced = nil; return end
+        p.left = p.left - 1
+        p.sent = p.sent + 1
+    end
+    socketley.log("UB paced sent=" .. p.sent .. " refused=" .. p.refused
+        .. " resumed=" .. p.resumed)
+    paced = nil
+end
 
 function on_client_message(id, msg)
     local uid = (self.upstreams() or {})[1]
@@ -121,6 +149,21 @@ function on_client_message(id, msg)
         local taken, behind = self.upstream_broadcast("hello")
         socketley.log("UB bcast taken=" .. tostring(taken)
             .. " behind=" .. tostring(behind))
+
+    elseif msg == "paced" then
+        paced = { left = 400, sent = 0, refused = 0, resumed = 0 }
+        -- The same 400 x 64 KB as the flood below, paced.  It cannot finish
+        -- inside this call: the queue fills long before 400 and the rest can
+        -- only leave when on_upstream_writable brings the producer back.
+        while paced.left > 0 do
+            if (self.upstream_pending(uid) or 0) >= self.watermark() then break end
+            local okay = self.upstream_send(uid, CHUNK)
+            if not okay then paced.refused = paced.refused + 1; break end
+            paced.left = paced.left - 1
+            paced.sent = paced.sent + 1
+        end
+        socketley.log("UB paced-start sent=" .. paced.sent
+            .. " left=" .. paced.left .. " refused=" .. paced.refused)
 
     elseif msg == "flood" then
         local sent, failed, first = 0, 0, nil
@@ -144,10 +187,14 @@ daemon_start "$BIN"
 
 create_ok "a server with an upstream" "$BIN" create server ub_srv -p "$P_SRV" \
     -u "127.0.0.1:$P_UP" --lua "$LUA" -s
-ready_tcp 127.0.0.1 "$P_SRV" >/dev/null 2>&1 || true
+create_ok "and one whose upstream reads" "$BIN" create server ub_paced -p "$P_SRV2" \
+    -u "127.0.0.1:$P_UP2" --lua "$LUA" -s
+ready_tcp 127.0.0.1 "$P_SRV"  >/dev/null 2>&1 || true
+ready_tcp 127.0.0.1 "$P_SRV2" >/dev/null 2>&1 || true
 sleep 1.5
 
-poke() { printf '%s\n' "$1" | timeout 25 nc -q0 127.0.0.1 "$P_SRV" >/dev/null 2>&1 || true; sleep 0.8; }
+poke()  { printf '%s\n' "$1" | timeout 25 nc -q0 127.0.0.1 "$P_SRV"  >/dev/null 2>&1 || true; sleep 0.8; }
+poke2() { printf '%s\n' "$1" | timeout 25 nc -q0 127.0.0.1 "$P_SRV2" >/dev/null 2>&1 || true; sleep 0.8; }
 g() { printf '%s\n' "$2" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"; }
 
 # ─── 1. The upstream is there, and the ordinary send works ──────────────────
@@ -207,12 +254,42 @@ if [ "${PEND:-0}" -gt 1000000 ]; then ok; else
         "pending=${PEND:-0} after 400 x 64 KB at an upstream that read nothing;" \
         "without it a script told 'false' can only retry blindly"; fi
 
-# ─── 6. The runtime is still there ──────────────────────────────────────────
+# ─── 6. And the slope, which is the answer to the ratio above ──────────────
+# 129 of 400 is what a producer that does not look gets.  One that checks
+# upstream_pending() against the watermark and waits to be called back gets all
+# 400 and no refusals -- and that is only possible if on_upstream_writable
+# fires, which is the flag this file was written after finding set and unread.
+poke2 paced
+PS=$(grep -o 'UB paced-start .*' "$SOCKETLEY_DLOG" | tail -1) || true
+S1=$(g sent "$PS")
+if [ "${S1:-0}" -gt 0 ]; then ok; else
+    bad "a paced producer starts sending" "paced-start=[$PS]"; fi
+
+PD=""
+for _ in $(seq 1 60); do
+    PD=$(grep -o 'UB paced sent=[0-9]* refused=[0-9]* resumed=[0-9]*' "$SOCKETLEY_DLOG" | tail -1) || true
+    [ -n "$PD" ] && break
+    sleep 0.5
+done
+if [ -n "$PD" ]; then ok; else
+    bad "and on_upstream_writable brings it back" \
+        "no 'UB paced' completion after 30s -- the producer stopped at the" \
+        "watermark and was never called again, which is the flag being set and" \
+        "nothing reading it"; fi
+check "the whole 400 went"   "400" "$(g sent "$PD")"
+check "with no refusals"     "0"   "$(g refused "$PD")"
+R2=$(g resumed "$PD")
+if [ "${R2:-0}" -gt 0 ]; then ok; else
+    bad "and it was resumed at least once" \
+        "resumed=${R2:-0}; 400 x 64 KB cannot fit under the watermark in one go"; fi
+
+# ─── 7. The runtime is still there ──────────────────────────────────────────
 check "the runtime survived it" "Up" \
       "$("$BIN" ps -a 2>/dev/null | awk '$2=="ub_srv" { print $7 }')"
 
 echo "  measured: quiet=[$QL]"
 echo "            flood=[$FL]"
+echo "            paced=[$PD]"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || { cat "$SOCKETLEY_TMPD/peer.out" 2>/dev/null | sed 's/^/    peer: /'; echo "  FAILED"; }
 [ "$FAIL" -eq 0 ]

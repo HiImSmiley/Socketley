@@ -1075,6 +1075,11 @@ private:
     // running -- so the serial waits for the next loop turn, exactly as the
     // drain dispatch above does and for the same reason.
     std::vector<uint64_t> m_reparse_pending;
+    // Upstreams whose queue crossed back under the watermark, told so on the
+    // next loop turn.  conn_ids and not pointers: the id is stable across
+    // reconnects and re-resolving it is how an upstream that went away in
+    // between is simply not called.
+    std::vector<int> m_upstream_drain_pending;
 
     // What another runtime has routed to us, of which we hold only the name
     // and a local handle to show Lua.

@@ -203,6 +203,7 @@ public:
         CB_ROUTES                = 1u << 26,
         CB_ON_WRITABLE           = 1u << 27,
         CB_ON_HTTP_BODY          = 1u << 28,
+        CB_ON_UPSTREAM_WRITABLE  = 1u << 29,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -221,6 +222,10 @@ public:
     // Defining it is the opt-in: a request body is streamed to it instead of
     // being gathered whole, which is why there is no flag for this.
     bool has_on_http_body()          const { return m_callback_mask & CB_ON_HTTP_BODY; }
+    // An upstream's write queue has come back under the watermark.  Its own
+    // callback and not on_writable, because an upstream id and a client id are
+    // different spaces and one function taking both would have to be told which.
+    bool has_on_upstream_writable()   const { return m_callback_mask & CB_ON_UPSTREAM_WRITABLE; }
     bool has_on_tick()               const { return m_callback_mask & CB_ON_TICK; }
     bool has_on_miss()               const { return m_callback_mask & CB_ON_MISS; }
     bool has_on_write()              const { return m_callback_mask & CB_ON_WRITE; }
@@ -263,6 +268,7 @@ public:
     guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_writable()   { return {m_on_writable,   "on_writable",   m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_http_body()  { return {m_on_http_body,  "on_http_body",  m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_upstream_writable() { return {m_on_upstream_writable, "on_upstream_writable", m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_tick()       { return {m_on_tick,       "on_tick",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_miss()       { return {m_on_miss,       "on_miss",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_write()      { return {m_on_write,      "on_write",      m_deadline_ms, m_owner_name.c_str()}; }
@@ -369,6 +375,7 @@ private:
     sol::protected_function m_on_client_message;
     sol::protected_function m_on_writable;
     sol::protected_function m_on_http_body;
+    sol::protected_function m_on_upstream_writable;
     sol::protected_function m_on_tick;
     sol::protected_function m_on_miss;
     sol::protected_function m_on_write;
@@ -521,6 +528,7 @@ public:
     bool has_on_client_message() const { return false; }
     bool has_on_writable()       const { return false; }
     bool has_on_http_body()      const { return false; }
+    bool has_on_upstream_writable() const { return false; }
     bool has_on_tick()           const { return false; }
     bool has_on_miss()           const { return false; }
     bool has_on_write()          const { return false; }

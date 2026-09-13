@@ -5514,6 +5514,16 @@ Header names keep the case the client sent them in, so
 and not
 .BR req.headers["host"] .
 .TP
+.B on_upstream_writable(conn_id)
+An upstream's write queue has come back under
+.BR self.watermark() ,
+so a producer that stopped because
+.B self.upstream_pending(conn_id)
+was high can carry on. Its own callback and not
+.BR on_writable ,
+because an upstream id and a client id are different spaces and one function
+taking both would have to be told which it had been given.
+.TP
 .B on_writable(client_id)
 The write queue for this connection has come back down under
 .BR self.watermark() ,
@@ -6450,6 +6460,17 @@ self.upstreams()                 -- Table of connected upstream conn_ids
 -- and the two want opposite reactions.  Pace with self.upstream_pending() and
 -- not self.pending(): that one resolves a CLIENT id, and an upstream is in
 -- another map entirely.
+--
+-- on_upstream_writable(conn_id) is the other half, and without it the number
+-- above is only a post-mortem: a producer could ask how deep the queue was and
+-- never be told when there was room.  The same 400 sends of 64 KB, at an
+-- upstream that reads:
+--
+--     unpaced   sent=129  failed=271   and the upstream closed
+--     paced     sent=400  refused=0    resumed 6 times
+--
+-- Same messages, same bound, same upstream.  129 of 400 is what a producer that
+-- does not look gets, and it is not a limit on how much can be sent.
 
 -- Cache: mode
 -- A call and not a field, because --mode is editable and a field written when

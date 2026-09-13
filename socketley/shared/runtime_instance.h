@@ -691,6 +691,11 @@ protected:
     // is streamed at all -- and therefore whether it may exceed the bound.
     bool wants_on_http_body() const;
 
+    // The upstream side of on_writable.  Its own callback because an upstream
+    // id and a client id are different spaces.
+    void invoke_on_upstream_writable(int conn_id);
+    bool wants_on_upstream_writable() const;
+
     // Global rate limit check (token bucket, shared across all connections)
     bool check_global_rate_limit();
 

@@ -2899,6 +2899,21 @@ void server_instance::on_loop_turn()
         }
     }
 
+    // The upstream side of the same thing, resolved by conn_id: stable across
+    // reconnects, and an upstream that went away in between simply is not found.
+    if (SOCKETLEY_UNLIKELY(!m_upstream_drain_pending.empty()))
+    {
+        std::vector<int> due;
+        due.swap(m_upstream_drain_pending);
+        for (const int cid : due)
+        {
+            auto it = m_upstreams.find(cid);
+            if (it == m_upstreams.end() || !it->second->connected || it->second->closing)
+                continue;
+            invoke_on_upstream_writable(cid);
+        }
+    }
+
     // Taken by value, because a script's on_writable may send enough to fill
     // the queue again and land a fresh serial in the member while this loop is
     // still walking it.
@@ -6726,6 +6741,20 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
     for (uint32_t i = 0; i < uc->write_batch_count; i++)
         uc->write_batch[i].clear();
     uc->write_batch_count = 0;
+
+    // The queue has shrunk, so this is where the crossing can be seen.  Without
+    // this the drain_wanted set one function down was a flag nothing read: an
+    // upstream producer could ASK how deep its queue was and never be told when
+    // there was room, which is the cliff without the slope that this whole
+    // session has been closing.  Recorded and not called, for the reason the
+    // client-facing dispatch gives at length: a script's callback sends.
+    if (SOCKETLEY_UNLIKELY(uc->drain_wanted)
+        && uc->write_queue.bytes() < write_watermark_bytes())
+    {
+        uc->drain_wanted = false;
+        if (wants_on_upstream_writable())
+            m_upstream_drain_pending.push_back(uc->conn_id);
+    }
 
     if (!uc->write_queue.empty())
     {

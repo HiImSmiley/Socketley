@@ -1142,6 +1142,8 @@ lua_config() {
     echo "│ respond_stream/send_chunk/   │ Server: a response written chunk │"
     echo "│   end_response (self.*)      │ by chunk, for a generated body   │"
     echo "│                              │ larger than memory               │"
+    echo "│ on_upstream_writable(id)     │ Server: an upstream's queue      │"
+    echo "│                              │ dropped under self.watermark()   │"
     echo "│ on_writable(client_id)       │ Server: the write queue dropped  │"
     echo "│                              │ under self.watermark() — paced   │"
     echo "│                              │ producer carries on here.  See   │"
