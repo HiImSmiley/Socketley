@@ -1448,16 +1448,35 @@ So a deep queue wins with few streams and loses with many: at 64 streams,
 dropping the default to
 .B 256K
 is 28 per cent more throughput for 22 per cent less CPU per request, and at 8
-streams the same move costs 24 per cent. The reason is the cache and not the
-queue. L2 is 4 MiB per core and L3 16 MiB shared, so 64 connections each owed a
-megabyte is a working set that has left both by the time the kernel copies it
-into the socket. Profiled at 64 streams, this process spends 32.7 per cent of
-its core in
+streams the same move costs 24 per cent.
+.IP
+The reason is the cache and not the queue, and the two settings measured against
+each other are the proof: same code, same bytes, the same number of copies, one
+number changed. CPU per MiB served at 64 streams, with the profile taken from the
+same window as the rate so that a component divides inside one run:
+.IP
+.nf
+                total   memmove   kernel copy   page clearing
+8M (default)     315      103          87            29
+256K             254       40          43            30
+.fi
+.IP
+Both copies halve. Ours is one
 .B memmove
-and 26.5 in the kernel's
+per byte either way and the kernel's
 .B _copy_from_iter
-against the floor's 19.9 and 12.0 \(em each copies once per byte, so what
-differs is where the bytes were when it did.
+is one copy per byte either way, so neither does less work \(em the bytes are
+closer. L2 is 4 MiB per core here and L3 is 16 MiB shared; at 64 streams the
+default owes up to about 69 MB at once, out of both, while
+.B 256K
+owes about 8 MB and stays in. A C floor doing the same one copy per byte, into a
+buffer it reuses, spends 29 and 21 on those two components, so what is left once
+the working set is accounted for is small.
+.IP
+This was measured the wrong way first and the wrong way is worth naming: a share
+from one profile multiplied by a total from another run. Each share was sound
+\(em 32.7 and 27.6 per cent of a core \(em but the core was doing different
+amounts of work in the two runs, so the product was a figure with no referent.
 .IP
 The sweep also measured
 .B 64K
@@ -6228,6 +6247,7 @@ A C server building the same rows with
 still serves 2.4x what the best of those does, so this is a decision about how
 much of a stream's work belongs in Lua at all \(em not a setting that closes
 the gap.
+
 .PP
 .B What 0 gives up.
 A compiled trace does not call an instruction hook back, so with the compiler
