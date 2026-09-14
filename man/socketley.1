@@ -4148,6 +4148,34 @@ The second is not pedantry: redirecting it would send the client to a shard
 that would redirect it back.
 .SS Cache Protocol
 .PP
+.B A pipelined batch's replies are built before any bound is consulted,
+so what one connection can make this runtime hold is the number of commands in
+one read multiplied by what each answers with. The per\(hyconnection write bound
+is 8 MiB and it is checked when the finished replies are queued \(em by which
+time they exist. Measured, one connection asking for a 256 KiB value over and
+over and reading nothing:
+.IP
+.nf
+    64 pipelined GET   16 MB asked for     peak RSS  +17 MB
+   512 pipelined GET  128 MB asked for     peak RSS +141 MB
+  4,096 pipelined GET   1 GB asked for     peak RSS +1,063 MB
+.fi
+.IP
+The connection is closed afterwards, and the log says so \(em but the memory was
+already spent. A GET command is about thirty bytes and its answer here is 256 KiB,
+so the amplification is about 8,700 to one, bounded only by
+.B \-\-read\-buffer
+\(em a megabyte of requests is roughly nine gigabytes of replies.
+.IP
+Until this is bounded, a cache reachable by untrusted clients wants a small
+.B \-\-read\-buffer
+(which caps how many commands arrive in one read) or something in front of it that
+does. Bounding it properly means stopping a batch when its replies reach the write
+bound and resuming it when the queue drains, and this runtime has no resume path
+for that: the loop's existing early stops either come straight back in
+(\fBcut\fR, which would spin) or wait on a specific event (\fBblocked\fR). That
+is a change to the command loop and is not made here.
+.PP
 .B A read of a key held as another type answers \-WRONGTYPE over RESP.
 .B get
 on a list, 
