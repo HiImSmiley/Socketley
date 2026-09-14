@@ -1838,6 +1838,12 @@ bool cache_instance::parse_text_lines(client_connection* conn)
         if (SOCKETLEY_UNLIKELY(conn->blocked))
             break;
 
+        // And the same one it makes for a connection already closing, for the
+        // same reason: nothing after this point can be delivered, and answering
+        // it anyway is memory spent on a socket that is going away.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+            break;
+
         std::string_view line(conn->partial.data() + scan_from, pos - scan_from);
 
         if (!line.empty() && line.back() == '\r')
@@ -7282,6 +7288,19 @@ bool cache_instance::process_resp(client_connection* conn)
         // through `cut`: that path's caller loops straight back in, which for
         // a connection that is still blocked never ends.
         if (SOCKETLEY_UNLIKELY(conn->blocked))
+            break;
+
+        // And a connection already on its way out answers nothing more.
+        //
+        // Without this the rest of a pipelined batch was still parsed and still
+        // answered into response_buf, while every flush it triggered was skipped
+        // -- flush_responses() returns true for a closing connection, which the
+        // callers read as success, so the 1 MiB cap below called a flush that did
+        // nothing and then cleared nothing.  Measured before this, one connection
+        // asking for a 256 KiB value 4,096 times and reading none of it: the
+        // worker peaked at 1,063 MB, for a bound of 8 MiB it had already decided
+        // to enforce.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
             break;
 
         std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);

@@ -4148,33 +4148,34 @@ The second is not pedantry: redirecting it would send the client to a shard
 that would redirect it back.
 .SS Cache Protocol
 .PP
-.B A pipelined batch's replies are built before any bound is consulted,
-so what one connection can make this runtime hold is the number of commands in
-one read multiplied by what each answers with. The per\(hyconnection write bound
-is 8 MiB and it is checked when the finished replies are queued \(em by which
-time they exist. Measured, one connection asking for a 256 KiB value over and
-over and reading nothing:
+.B A pipelined batch is answered in full or the connection is closed,
+and either way what it costs is bounded. One connection may owe 8 MiB; a batch's
+replies are built before the loop returns to the ring, so nothing drains while it
+runs and a batch has to fit inside that bound. Past it the client is closed, with
+a line saying which one and how much it was owed.
+.IP
+So the depth worth using is the one whose replies fit: sixteen 256 KiB values is
+4 MiB and is answered whole, sixty\(hyfour is 16 MiB and is cut. For small values
+the bound is nowhere near \(em a 64 byte value at depth 16 is a kilobyte.
+.IP
+That bound used to be a number the runtime failed to keep. The batch loop did not
+stop when the connection had been marked closing, and
+.B flush_responses()
+answers true for a closing connection \(em a skip its callers read as success \(em
+so the 1 MiB cap on the reply buffer called a flush that did nothing and cleared
+nothing, and the rest of the batch was still parsed and still answered into it.
+Measured, one connection asking for a 256 KiB value and reading none of it:
 .IP
 .nf
-    64 pipelined GET   16 MB asked for     peak RSS  +17 MB
-   512 pipelined GET  128 MB asked for     peak RSS +141 MB
-  4,096 pipelined GET   1 GB asked for     peak RSS +1,063 MB
+                        before        after
+    64 pipelined GET    +17 MB        +11 MB
+   512 pipelined GET   +141 MB        +10 MB
+  4,096 pipelined GET  +1,063 MB      +11 MB
+ 16,384 pipelined GET    +941 MB      +11 MB
 .fi
 .IP
-The connection is closed afterwards, and the log says so \(em but the memory was
-already spent. A GET command is about thirty bytes and its answer here is 256 KiB,
-so the amplification is about 8,700 to one, bounded only by
-.B \-\-read\-buffer
-\(em a megabyte of requests is roughly nine gigabytes of replies.
-.IP
-Until this is bounded, a cache reachable by untrusted clients wants a small
-.B \-\-read\-buffer
-(which caps how many commands arrive in one read) or something in front of it that
-does. Bounding it properly means stopping a batch when its replies reach the write
-bound and resuming it when the queue drains, and this runtime has no resume path
-for that: the loop's existing early stops either come straight back in
-(\fBcut\fR, which would spin) or wait on a specific event (\fBblocked\fR). That
-is a change to the command loop and is not made here.
+A GET is about thirty bytes against a 256 KiB answer, so that was roughly 8,700 to
+one, bounded by nothing but how many commands fit in one read. It is flat now.
 .PP
 .B A read of a key held as another type answers \-WRONGTYPE over RESP.
 .B get
