@@ -496,6 +496,9 @@ public:
     uint16_t effective_port() const override;
 
     size_t get_connection_count() const override;
+    // What this proxy owes across both legs, which is what decides the pacing
+    // point; without it the base answers 0 and the point never moves.
+    size_t total_queued_bytes() const override;
 
     // C++ proxy intercept hooks
     void set_on_proxy_request(proxy_hook cb);

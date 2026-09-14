@@ -933,6 +933,47 @@ size_t proxy_instance::get_connection_count() const
     return m_client_count;
 }
 
+// What this proxy owes right now, over both legs.
+//
+// refresh_pacing_watermark() asks this once a turn and the base class answers 0,
+// so until this existed a proxy was told "nothing is backed up" every turn and
+// kept the deep point -- --write-buffer / 2 per connection -- however many
+// connections were holding it.  Measured with sixteen clients that ask for a
+// large body and then stop reading: 139 MB held, against the 8 MiB budget the
+// pacing rule exists to keep.
+//
+// This alone does not bound that, and the comment in setup() says why: the
+// watermark does move now -- 4 MiB down to 493 KiB at seventeen connections,
+// read off the running worker -- and the queues go on growing past it anyway,
+// because the backpressure it feeds has nothing to decline while a multishot
+// recv is armed.  It is the half of the mechanism that was missing, and it is
+// inert until the other half is settled.
+//
+// Bounded by the counts rather than by MAX_FDS, which is the shape the splice
+// accounting above already uses: descriptors cluster low, so the walk ends as
+// soon as every live connection has been seen.
+size_t proxy_instance::total_queued_bytes() const
+{
+    size_t total = 0;
+    size_t rem = m_client_count;
+    for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
+    {
+        auto* c = m_client_slots[fd].get();
+        if (!c) continue;
+        rem--;
+        total += c->write_queue.bytes();
+    }
+    rem = m_backend_count;
+    for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
+    {
+        auto* b = m_backend_slots[fd].get();
+        if (!b) continue;
+        rem--;
+        total += b->write_queue.bytes();
+    }
+    return total;
+}
+
 // Tune socket for high-throughput proxying: TCP_NODELAY, SO_SNDBUF/RCVBUF, keepalive
 inline void proxy_instance::tune_socket(int fd)
 {
@@ -1447,7 +1488,35 @@ bool proxy_instance::setup(event_loop& loop)
     announce_group_nodes();
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+    // On, and the switch beside it is how that was established rather than a
+    // preference: SOCKETLEY_RECV_MULTISHOT=0 turns it off, same binary and same
+    // pool geometry, only the arm differing.
+    //
+    // It is worth stating what it costs, because both halves were measured and
+    // the second one is why it stays on anyway.
+    //
+    // Every backpressure decision here is made by declining to re-arm the read
+    // on one leg while the other leg's queue is above the watermark.  A
+    // multishot recv stays armed in the kernel, so there is nothing to decline
+    // and the peer goes on being read from at full speed.  Sixteen clients that
+    // ask for a large body and then stop reading hold 139 MB with it on against
+    // 26 MB with it off, reproduced twice, against an 8 MiB pacing budget.  It
+    // costs throughput too, for the same reason -- reading ahead into a queue
+    // nothing drains is work either way: level at 32 connections and 8 KiB
+    // bodies, and +34.8% with it off at 1 MiB bodies, 479 -> 355 us of CPU per
+    // request at spreads of 1 and 5.
+    //
+    // And it cannot be turned off, because the same always-armed recv is what
+    // notices a client that goes away while this proxy is waiting on the
+    // backend: with nothing armed there is no completion to carry the abort.
+    // test_abrupt_client_abort strands about 1,100 connections with it off and
+    // passes 20/20 with it on, three runs each way.  The two uses are in
+    // conflict and reconciling them needs a third mechanism -- a poll armed for
+    // POLLRDHUP while no read is -- which is a change to this proxy's
+    // connection lifecycle and is not made here.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] == '0' && e[1] == '\0')
+        m_recv_multishot = false;
     // This proxy deliberately does not bundle, because handle_read takes one
     // contiguous buffer out of the completion and a bundle would hand it k
     // discontiguous ones.
