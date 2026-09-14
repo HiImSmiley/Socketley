@@ -942,12 +942,12 @@ size_t proxy_instance::get_connection_count() const
 // large body and then stop reading: 139 MB held, against the 8 MiB budget the
 // pacing rule exists to keep.
 //
-// This alone does not bound that, and the comment in setup() says why: the
-// watermark does move now -- 4 MiB down to 493 KiB at seventeen connections,
-// read off the running worker -- and the queues go on growing past it anyway,
-// because the backpressure it feeds has nothing to decline while a multishot
-// recv is armed.  It is the half of the mechanism that was missing, and it is
-// inert until the other half is settled.
+// The watermark does move now -- 4 MiB down to 493 KiB at seventeen
+// connections, read off the running worker -- but it bounds the queue only
+// where the read can actually be declined, and a multishot recv stays armed in
+// the kernel.  So the same sixteen clients hold 26 MB with
+// SOCKETLEY_RECV_MULTISHOT=0 and 139 MB with it on, which is the measurement
+// the default in setup() is weighed against.
 //
 // Bounded by the counts rather than by MAX_FDS, which is the shape the splice
 // accounting above already uses: descriptors cluster low, so the walk ends as
@@ -1506,14 +1506,16 @@ bool proxy_instance::setup(event_loop& loop)
     // bodies, and +34.8% with it off at 1 MiB bodies, 479 -> 355 us of CPU per
     // request at spreads of 1 and 5.
     //
-    // And it cannot be turned off, because the same always-armed recv is what
-    // notices a client that goes away while this proxy is waiting on the
-    // backend: with nothing armed there is no completion to carry the abort.
-    // test_abrupt_client_abort strands about 1,100 connections with it off and
-    // passes 20/20 with it on, three runs each way.  The two uses are in
-    // conflict and reconciling them needs a third mechanism -- a poll armed for
-    // POLLRDHUP while no read is -- which is a change to this proxy's
-    // connection lifecycle and is not made here.
+    // Turning it off used to strand about 1,100 connections in
+    // test_abrupt_client_abort, which was read here as the two uses of an armed
+    // recv being in conflict.  They were not: the abort watch was firing and
+    // the teardown was deferring correctly, and what leaked was the closing
+    // test this file now makes on the TCP read path.  With that in place the
+    // test is 20/20 with it off, three runs.
+    //
+    // So the default is a throughput decision and no longer a safety one, and
+    // it stays on because only the 1 MiB row moves outside its spread; whether
+    // that row should decide it is a change of default with its own gate.
     m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
     if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] == '0' && e[1] == '\0')
         m_recv_multishot = false;
@@ -2862,6 +2864,19 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
     if (m_protocol == protocol_tcp)
     {
+        // A connection already on its way out opens no backend, because the
+        // read this teardown is deferred on delivers the bytes queued ahead of
+        // the reset rather than the reset itself -- and taken for a fresh
+        // request they built a second backend leg for a client already gone.
+        if (SOCKETLEY_UNLIKELY(conn->closing))
+        {
+            if (is_provided)
+                m_loop->return_buf(BUF_GROUP_ID, buf_id);
+            if (!conn->write_pending)
+                close_pair(fd, conn->backend_fd);
+            return;
+        }
+
         // The decrypted length when there is a session, the completion's own
         // when there is not.
         const size_t data_len = conn->ssl ? tls_plain.size()
