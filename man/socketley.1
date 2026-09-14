@@ -4177,6 +4177,72 @@ Measured, one connection asking for a 256 KiB value and reading none of it:
 A GET is about thirty bytes against a 256 KiB answer, so that was roughly 8,700 to
 one, bounded by nothing but how many commands fit in one read. It is flat now.
 .PP
+.B A cache serving large values spends most of its time copying them,
+and that is a property of the design rather than a defect to tune around.
+Profiled at 256 KiB values, 16 clients, one command in flight, sampling the
+worker process:
+.IP
+.nf
+              userspace memcpy   kernel copy   page clearing
+  GET               28%             18%            13%
+  SET               42%             28%             \(em
+.fi
+.IP
+A GET copies the stored value once, into the reply buffer, and the kernel copies
+it again into the socket. A SET copies twice: once out of the receive ring into
+the connection's parse buffer, and once out of that into the store. Removing the
+GET copy means writing straight out of the store while a send is in flight, which
+needs the store to promise that a value outlives it \(em a promise every mutating
+path would have to keep, including the LRU eviction and TTL expiry that an
+unrelated key's write can trigger. Removing a SET copy means accumulating a bulk
+body outside the parse buffer, which the replication, sharding and cluster paths
+would all have to carry. Neither is a local change and neither is made here.
+.IP
+.B Sharding is not the answer to it, which is worth knowing before reaching for
+.BR \-\-shards .
+Measured at 256 KiB values, 32 clients, against one shard:
+.IP
+.nf
+                                   SET       GET    cpu/op
+  1 shard                       14,903    14,503     66 us
+  4 shards, client not routing  23,175     8,306    151 us
+  4 shards, \-\-cluster, routed   19,920    19,960    158 us
+.fi
+.IP
+A sharded cache without
+.B \-\-cluster
+relays a command that arrived on the wrong shard rather than answering \-MOVED,
+which is what lets an ordinary client work against one at all \(em and relaying a
+256 KiB value puts it through a second process, so GET comes out at 0.57 of the
+single shard. With
+.B \-\-cluster
+and a client that routes, four shards buy 1.38x on GET and 1.34x on SET, against
+the 3.2\(en3.6x at eight shards that small messages see. Either way the arm burns
+about 2.4 times the CPU per operation.
+.IP
+So what is left for an operator is the value size itself. In one run at sixteen
+clients: 64 bytes costs 4.4 us of CPU per operation, 4 KiB costs 4.8, 64 KiB
+costs 11.4 and 256 KiB costs 40.8. No setting closes that gap.
+.IP
+.B The receive ring's buffers are 4 KiB and larger is worse.
+They are 64 KiB on a proxy and 16 KiB on a server, and the temptation is to
+raise them here so a large value arrives in fewer pieces. Measured on one binary
+with only
+.B SOCKETLEY_CACHE_BUF_SIZE
+differing, 4 KiB against 64 KiB:
+.IP
+.nf
+  64 B values     \(mi4.5%
+  64 KiB values  \(mi14.5%
+  256 KiB values \(mi24.5%,  40.8 \(-> 57.0 us of CPU per operation
+.fi
+.IP
+SET carries all of it and GET is unchanged, and resident size doubles. A
+provided\(hybuffer ring is charged for the size of a buffer and not for the bytes
+put in it, so a protocol whose commands are usually small wants small buffers,
+and the sixty\(hyfour of them a large value consumes are cheaper than four that
+are mostly empty. The knob exists to be measured, and it has been.
+.PP
 .B A read of a key held as another type answers \-WRONGTYPE over RESP.
 .B get
 on a list, 
