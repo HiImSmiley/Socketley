@@ -6389,6 +6389,51 @@ a callback that only answers, 34 to 48 per cent for building strings (where the
 allocator and the intern table are the cost and the compiler cannot remove them),
 2.4x for arithmetic, and 248 per cent for Lua control flow over many items.
 .PP
+.B How the reply is assembled decides both,
+and the number of pieces decides whether it matters at all. Four idioms building
+one reply out of N parts, on a server, one binary and one C client, interleaved,
+each pair of rows below the same script with the compiler closed and open:
+.IP
+.nf
+  N = 24, compiler closed       exchanges/s   spread
+    s = s .. piece                 160,495      22%
+    s = s .. string.format(..)     153,658      24%
+    t[i] = piece, concat once      159,721      23%
+    t[i] = format, concat once     166,023      15%
+.fi
+.IP
+Nothing there is a finding: every spread is larger than every difference. A short
+reply is assembled the way that reads best, and reaching for
+.B string.format
+because it is faster is reaching for something that is not there.
+.IP
+.nf
+  N = 1000                      exchanges/s   us cpu/req   spread
+    s = s .. piece                   1,251         801      6%
+                  compiler open      1,426         703      6%
+    s = s .. string.format(..)         923       1,087      8%
+                  compiler open        843       1,192      5%
+    t[i] = piece, concat once        7,618         131      6%
+                  compiler open     13,361          75      2%
+    t[i] = format, concat once       8,656         115      7%
+                  compiler open     17,675          57      5%
+.fi
+.IP
+At a thousand pieces the best shape is 14.1 times the worst at a fourteenth of
+the CPU per request. Joining once is most of it \(em 6.1x on its own \(em and the
+formatter is worth a further 14 per cent behind it, against being 26 per cent
+.I slower
+when it is used to accumulate instead. The same call, opposite signs, decided by
+the shape around it.
+.IP
+What it does to the compiler is the part worth keeping. Opening it is worth 14
+per cent on the accumulating shape, nothing outside the spread on the
+accumulating one that formats, and 75 and 104 per cent on the two that join
+once. That is the rule above seen from the other side: accumulating moves the
+work out of Lua and into the allocator, where there is nothing left for the
+compiler to reach. A script that is slow because of its idiom does not become
+fast because of the setting.
+.PP
 .B What 0 gives up.
 A compiled trace does not call an instruction hook back, so with the compiler
 on a runaway callback cannot be interrupted at all. Measured:
