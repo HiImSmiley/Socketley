@@ -965,10 +965,12 @@ private:
     // held against 943 and 1046 with the arm pinned on, interleaved.  The reason
     // is the line above: the fleet was already armed during the ramp, before any
     // queue existed, and an armed multishot recv keeps its arm.  Making it bite
-    // needs those reads withdrawn, which is submit_cancel_request() per
-    // connection plus -ECANCELED handled in the read path as a re-arm -- today
-    // it lands in the res <= 0 branch and would close live connections.  That is
-    // a change to this proxy's connection lifecycle and is not made here.
+    // needs those reads withdrawn, and the template for that is already in this
+    // file: detach_and_pool_backend() withdraws an armed multishot recv by
+    // request, and finish_pool_drain() takes the -ECANCELED with the MORE flag
+    // handled.  The client read path has neither, so a cancel there lands in the
+    // res <= 0 branch and would close live connections; giving it both is a
+    // change to this proxy's connection lifecycle and is not made here.
     //
     // So what the count alone is worth is the whole of it.  Clients that ask for
     // a 1 MiB body and then stop reading, interleaved, worker RSS above its own
@@ -983,6 +985,14 @@ private:
     // Below the threshold it is worth about half, and at 1200 it is the same
     // thing measured twice -- which is the point: the bound comes from the arm
     // the count picks, and above the threshold the count picks the other one.
+    //
+    // What that table does not show is the arm the rule declines to pick up
+    // there, and it is the number this threshold has to be defended against:
+    // three arms in one run, three passes each, interleaved, 1,200 of those
+    // clients -- pinned on 1044 MB, the rule 1007, pinned OFF 351.  So above
+    // the threshold this is not a bound at all, it is a choice: about 650 MB of
+    // worst-case hold for the 21 per cent.  Withdrawing the armed reads is what
+    // would stop it being a choice, and that is the paragraph above.
     static constexpr size_t MULTISHOT_MIN_CLIENTS = 1024;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
