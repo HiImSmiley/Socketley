@@ -254,6 +254,7 @@ void proxy_client_connection::reset(int new_fd)
     read_pending = false;
     write_pending = false;
     closing = false;
+    recv_withdrawing = false;
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
@@ -982,10 +983,14 @@ void proxy_instance::on_loop_turn()
     const bool backed_up = pacing_backed_up();
     m_recv_multishot = !backed_up && get_connection_count() >= MULTISHOT_MIN_CLIENTS;
 
-    // The line above is the next read; this is the ones already in the kernel,
-    // which no decision above can reach.
+    // The line above is the next read; these are the ones already in the kernel,
+    // which no decision above can reach.  Both legs, because the decline each
+    // one defeats is the same decline in the other direction.
     if (backed_up)
+    {
         withdraw_armed_backend_reads();
+        withdraw_armed_client_reads();
+    }
 }
 
 // Whether the client this backend feeds is holding more than the pacing point.
@@ -1000,6 +1005,37 @@ bool proxy_instance::client_backpressured(const proxy_backend_connection* conn) 
     const auto& ce = m_conn_idx[conn->client_fd];
     return ce.side == conn_client &&
            ce.client->write_queue.bytes() >= write_watermark_bytes();
+}
+
+// Whether the backend this client feeds is holding more than the pacing point,
+// which is the mirror of client_backpressured() and asked for the same reason:
+// three places now turn on it and they have to agree.
+// Whether a read may be armed on this connection at all, which is a different
+// question from whether the queue it feeds has room.
+//
+// The withdrawal has to ask exactly what the resume asks, or it takes a read
+// back into a state nothing re-arms.  client_eof is in here for the reason the
+// resume in handle_backend_write gives at its own call site: a read armed on a
+// socket that reported end of stream completes res=0 at once and goes round
+// again.  splice_active, because a spliced connection is not read this way at
+// all.
+bool proxy_instance::client_read_armable(const proxy_client_connection* conn) const
+{
+    return !conn->closing && !conn->splice_active && !conn->client_eof;
+}
+
+bool proxy_instance::backend_read_armable(const proxy_backend_connection* conn) const
+{
+    return !conn->closing && !conn->splice_active;
+}
+
+bool proxy_instance::backend_backpressured(const proxy_client_connection* conn) const
+{
+    if (conn->backend_fd < 0 || conn->backend_fd >= MAX_FDS)
+        return false;
+    const auto& be = m_conn_idx[conn->backend_fd];
+    return be.side == conn_backend &&
+           be.backend->write_queue.bytes() >= write_watermark_bytes();
 }
 
 // The decline an armed multishot recv cannot make, made after the fact.
@@ -1020,7 +1056,10 @@ void proxy_instance::withdraw_armed_backend_reads()
         // A single-shot read declines itself at the bottom of
         // handle_backend_read, and a read already being taken back for the pool
         // is spoken for by finish_pool_drain().
-        if (!b->read_pending || b->recv_withdrawing || b->pool_draining || b->closing)
+        if (!b->read_pending || b->recv_withdrawing || b->pool_draining)
+            continue;
+        // Only a read this proxy could arm again is worth taking back.
+        if (!backend_read_armable(b))
             continue;
         if (!is_multishot_recv_op(b->read_req.type))
             continue;
@@ -1035,6 +1074,68 @@ void proxy_instance::withdraw_armed_backend_reads()
             return;
         b->recv_withdrawing = true;
     }
+}
+
+// The client half, and the larger one: a backend sends what it has, while
+// clients uploading through a TCP proxy are bounded only by the loopback.
+// Measured at 1,200 of them into a backend that never reads -- 357 MB held on a
+// single-shot arm against 5,032 with the arm pinned on.
+void proxy_instance::withdraw_armed_client_reads()
+{
+    size_t rem = m_client_count;
+    for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
+    {
+        auto* c = m_client_slots[fd].get();
+        if (!c) continue;
+        rem--;
+        if (!c->read_pending || c->recv_withdrawing)
+            continue;
+        if (!client_read_armable(c))
+            continue;
+        if (!is_multishot_recv_op(c->read_req.type))
+            continue;
+        if (!backend_backpressured(c))
+            continue;
+        if (!m_loop->submit_cancel_request(&c->read_req))
+            return;
+        c->recv_withdrawing = true;
+    }
+}
+
+void proxy_instance::finish_client_recv_withdraw(proxy_client_connection* conn,
+                                                 struct io_uring_cqe* cqe, io_request* req)
+{
+    const int fd = conn->fd;
+
+    if (cqe->flags & IORING_CQE_F_BUFFER)
+    {
+        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+        m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    }
+
+    // Still armed -- the completion that ends the read is yet to come.
+    if (is_multishot_recv_op(req->type) && (cqe->flags & IORING_CQE_F_MORE))
+        return;
+
+    conn->read_pending = false;
+    conn->recv_withdrawing = false;
+
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+    {
+        if (!conn->write_pending)
+            close_pair(fd, conn->backend_fd);
+        return;
+    }
+
+    // Re-armed only if the queue has already drained, for the reason the
+    // backend half gives: the resume fires on a write completion and there may
+    // be none left to fire on.  And on the same terms, client_eof included --
+    // arming there spins on res=0.
+    if (!client_read_armable(conn) || backend_backpressured(conn))
+        return;
+    if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot,
+                                           m_use_provided_bufs, BUF_GROUP_ID)))
+        close_pair(fd, conn->backend_fd);
 }
 
 // The withdrawal landing.
@@ -1071,8 +1172,9 @@ void proxy_instance::finish_recv_withdraw(proxy_backend_connection* conn,
     // Re-armed here if the queue has already drained, and not otherwise: the
     // resume lives in handle_client_write and fires on a write completion, so a
     // queue that emptied while this cancellation was in flight leaves no write
-    // to complete and would leave this backend armed by nobody.
-    if (client_backpressured(conn))
+    // to complete and would leave this backend armed by nobody.  And only on the
+    // same terms that resume would use, which is what backend_read_armable() is.
+    if (!backend_read_armable(conn) || client_backpressured(conn))
         return;
     if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, fd, conn, m_recv_multishot,
                                                    m_use_provided_bufs, BUF_GROUP_ID)))
@@ -2789,6 +2891,16 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
 
     auto* conn = entry.client;
 
+    // The withdrawal this turn's pacing asked for, landing.  Only the
+    // -ECANCELED is the withdrawal: a data completion queued ahead of it is a
+    // piece of the request and goes down the normal path, or the body the
+    // backend receives loses a chunk in the middle.
+    if (SOCKETLEY_UNLIKELY(conn->recv_withdrawing) && cqe->res == -ECANCELED)
+    {
+        finish_client_recv_withdraw(conn, cqe, req);
+        return;
+    }
+
     bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
@@ -2796,6 +2908,11 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         conn->read_pending = false;
     else if (!multishot_more)
         conn->read_pending = false;
+
+    // Something else ended the read first, so the cancel this flag stands for
+    // has nothing left to find.
+    if (SOCKETLEY_UNLIKELY(conn->recv_withdrawing && !conn->read_pending))
+        conn->recv_withdrawing = false;
 
     bool is_provided = (req->type == op_read_provided || is_multishot_recv);
 
@@ -3110,15 +3227,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 // Backpressure: pause client reads while the backend write
                 // queue fills, and handle_backend_write resumes them when it
                 // drains.
-                bool backpressured = false;
-                if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
-                {
-                    auto& be = m_conn_idx[conn->backend_fd];
-                    if (be.side == conn_backend &&
-                        be.backend->write_queue.bytes() >= write_watermark_bytes())
-                        backpressured = true;
-                }
-                if (!backpressured)
+                if (!backend_backpressured(conn))
                     if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                     {
                         close_pair(fd, conn->backend_fd);
@@ -3395,15 +3504,7 @@ proxy_http_resubmit:
         {
             // Backpressure: pause client reads while the backend write queue
             // fills, and handle_backend_write resumes them when it drains.
-            bool bp = false;
-            if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS)
-            {
-                auto& be = m_conn_idx[conn->backend_fd];
-                if (be.side == conn_backend &&
-                    be.backend->write_queue.bytes() >= write_watermark_bytes())
-                    bp = true;
-            }
-            if (!bp)
+            if (!backend_backpressured(conn))
                 if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                 {
                     // The request has gone to a backend and the pair is being
@@ -9018,7 +9119,7 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
     {
         auto& be = m_conn_idx[conn->backend_fd];
         if (be.side == conn_backend && !be.backend->read_pending &&
-            !be.backend->closing && !be.backend->splice_active)
+            backend_read_armable(be.backend))
         {
             if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, conn->backend_fd, be.backend,
                                                            m_recv_multishot, m_use_provided_bufs,
@@ -9172,8 +9273,7 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     {
         auto& ce = m_conn_idx[conn->client_fd];
         if (ce.side == conn_client && !ce.client->read_pending &&
-            !ce.client->closing && !ce.client->splice_active &&
-            !ce.client->client_eof)
+            client_read_armable(ce.client))
         {
             if (SOCKETLEY_UNLIKELY(!submit_read_op(m_loop, conn->client_fd, ce.client,
                                                    m_recv_multishot, m_use_provided_bufs,

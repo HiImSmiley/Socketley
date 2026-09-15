@@ -99,6 +99,11 @@ struct alignas(64) proxy_client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
+    // A multishot read taken back because the backend it feeds is over the
+    // pacing point: set when the cancel is submitted, cleared by the -ECANCELED
+    // that ends it or by any other completion that ends it first.  The backend
+    // half of this is proxy_backend_connection::recv_withdrawing.
+    bool recv_withdrawing{false};
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
@@ -508,6 +513,12 @@ public:
     // two numbers this reads.
     void on_loop_turn() override;
     void withdraw_armed_backend_reads();
+    void withdraw_armed_client_reads();
+    void finish_client_recv_withdraw(proxy_client_connection* conn,
+                                     struct io_uring_cqe* cqe, io_request* req);
+    bool backend_backpressured(const proxy_client_connection* conn) const;
+    bool client_read_armable(const proxy_client_connection* conn) const;
+    bool backend_read_armable(const proxy_backend_connection* conn) const;
     void finish_recv_withdraw(proxy_backend_connection* conn,
                               struct io_uring_cqe* cqe, io_request* req);
     bool client_backpressured(const proxy_backend_connection* conn) const;
