@@ -952,6 +952,30 @@ size_t proxy_instance::get_connection_count() const
 // Bounded by the counts rather than by MAX_FDS, which is the shape the splice
 // accounting above already uses: descriptors cluster low, so the walk ends as
 // soon as every live connection has been seen.
+// Which arm the next read is submitted with, decided once a turn because the
+// count it reads is a property of the turn and not of any one completion.
+//
+// An already-armed multishot recv keeps its own arm, so this moves the fleet
+// rather than switching it: connections change over as they complete.  That is
+// also the limit of what any rule here can do -- see MULTISHOT_MIN_CLIENTS.
+void proxy_instance::on_loop_turn()
+{
+    if (!m_recv_multishot_supported || m_multishot_arm == multishot_arm::never)
+    {
+        m_recv_multishot = false;
+        return;
+    }
+    if (m_multishot_arm == multishot_arm::always)
+    {
+        m_recv_multishot = true;
+        return;
+    }
+
+    // Many connections, and nothing else: see the declaration of
+    // MULTISHOT_MIN_CLIENTS for why the queue depth is not asked about here.
+    m_recv_multishot = get_connection_count() >= MULTISHOT_MIN_CLIENTS;
+}
+
 size_t proxy_instance::total_queued_bytes() const
 {
     size_t total = 0;
@@ -1488,37 +1512,38 @@ bool proxy_instance::setup(event_loop& loop)
     announce_group_nodes();
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
-    // On, and the switch beside it is how that was established rather than a
-    // preference: SOCKETLEY_RECV_MULTISHOT=0 turns it off, same binary and same
-    // pool geometry, only the arm differing.
+    // Neither arm is right everywhere, so neither is fixed here; see
+    // on_loop_turn() for the rule and MULTISHOT_MIN_CLIENTS for the number.
     //
-    // It is worth stating what it costs, because both halves were measured and
-    // the second one is why it stays on anyway.
+    // A multishot recv stays armed in the kernel, which is worth two opposite
+    // things.  It saves the re-arm, and that is the whole cost at high
+    // connection counts: at 1024 connections and 8 KiB bodies a single-shot arm
+    // is 21.0% slower and spends 26.6% more CPU per request, nine passes, no
+    // pass of either sign against it.  And it cannot be declined, which is how
+    // every backpressure decision here is made -- so it reads ahead into a queue
+    // nothing drains, and holds about twice as much for it below the threshold.
+    // The numbers and the rule are in MULTISHOT_MIN_CLIENTS.
     //
-    // Every backpressure decision here is made by declining to re-arm the read
-    // on one leg while the other leg's queue is above the watermark.  A
-    // multishot recv stays armed in the kernel, so there is nothing to decline
-    // and the peer goes on being read from at full speed.  Sixteen clients that
-    // ask for a large body and then stop reading hold 139 MB with it on against
-    // 26 MB with it off, reproduced twice, against an 8 MiB pacing budget.  It
-    // costs throughput too, for the same reason -- reading ahead into a queue
-    // nothing drains is work either way: level at 32 connections and 8 KiB
-    // bodies, and +34.8% with it off at 1 MiB bodies, 479 -> 355 us of CPU per
-    // request at spreads of 1 and 5.
+    // SOCKETLEY_RECV_MULTISHOT pins the arm rather than expressing a
+    // preference: it is how both columns above were measured, same binary and
+    // same pool geometry with only the arm differing, and 0 and 1 are the two
+    // fixed arms the rule sits between.
     //
     // Turning it off used to strand about 1,100 connections in
     // test_abrupt_client_abort, which was read here as the two uses of an armed
     // recv being in conflict.  They were not: the abort watch was firing and
     // the teardown was deferring correctly, and what leaked was the closing
-    // test this file now makes on the TCP read path.  With that in place the
-    // test is 20/20 with it off, three runs.
-    //
-    // So the default is a throughput decision and no longer a safety one, and
-    // it stays on because only the 1 MiB row moves outside its spread; whether
-    // that row should decide it is a change of default with its own gate.
-    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
-    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] == '0' && e[1] == '\0')
-        m_recv_multishot = false;
+    // test this file now makes on the TCP read path.
+    m_recv_multishot_supported = m_use_provided_bufs && loop.recv_multishot_supported();
+    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] && e[1] == '\0')
+    {
+        if (e[0] == '0')      m_multishot_arm = multishot_arm::never;
+        else if (e[0] == '1') m_multishot_arm = multishot_arm::always;
+    }
+    // A fresh instance holds nothing, so the rule starts on the arm it would
+    // choose for that and the first turn moves it if the count says otherwise.
+    m_recv_multishot = m_recv_multishot_supported &&
+                       m_multishot_arm == multishot_arm::always;
     // This proxy deliberately does not bundle, because handle_read takes one
     // contiguous buffer out of the completion and a bundle would hand it k
     // discontiguous ones.

@@ -500,6 +500,10 @@ public:
     // point; without it the base answers 0 and the point never moves.
     size_t total_queued_bytes() const override;
 
+    // Once a turn, immediately after refresh_pacing_watermark() has settled the
+    // two numbers this reads.
+    void on_loop_turn() override;
+
     // C++ proxy intercept hooks
     void set_on_proxy_request(proxy_hook cb);
     void set_on_proxy_response(proxy_hook cb);
@@ -934,7 +938,51 @@ private:
                    ? static_cast<int>(buf_id) : -1;
     }
     bool m_use_provided_bufs{false};
+    // Which arm the NEXT read is submitted with, recomputed once a turn by
+    // on_loop_turn(); an already-armed multishot recv keeps its own.
     bool m_recv_multishot{false};
+    // Whether this kernel and this buffer ring could do it at all, which is a
+    // different question from whether this turn wants it.
+    bool m_recv_multishot_supported{false};
+    // SOCKETLEY_RECV_MULTISHOT pins the arm for a measurement; unset is the
+    // rule.
+    enum class multishot_arm : uint8_t { adaptive, always, never };
+    multishot_arm m_multishot_arm{multishot_arm::adaptive};
+    // Where a multishot recv starts paying for itself.  Measured on this box at
+    // 8 KiB bodies, median of the per-pass differences against a single-shot arm
+    // of the same binary: +6.9% for single-shot at 128 connections, +3.4% at
+    // 640, +0.05% at 768, -12.9% at 896, -21.0% at 1024.  The crossover is 768
+    // and this sits above it, because between the two the measurement says
+    // nothing either way and the switch belongs where the gain is not in doubt.
+    //
+    // The queue depth is deliberately NOT part of the rule, and that is a
+    // measurement rather than an omission.  Multishot cannot be declined, so it
+    // reads ahead into a queue nothing drains, and gating on
+    // pacing_backed_up() looks like the answer: 1,200 clients that ask for a
+    // 1 MiB body and stop reading put the gate on for 96.5% of turns and had it
+    // pick single-shot on 99% of them.  It changed nothing -- 949 and 1014 MB
+    // held against 943 and 1046 with the arm pinned on, interleaved.  The reason
+    // is the line above: the fleet was already armed during the ramp, before any
+    // queue existed, and an armed multishot recv keeps its arm.  Making it bite
+    // needs those reads withdrawn, which is submit_cancel_request() per
+    // connection plus -ECANCELED handled in the read path as a re-arm -- today
+    // it lands in the res <= 0 branch and would close live connections.  That is
+    // a change to this proxy's connection lifecycle and is not made here.
+    //
+    // So what the count alone is worth is the whole of it.  Clients that ask for
+    // a 1 MiB body and then stop reading, interleaved, worker RSS above its own
+    // baseline:
+    //
+    //      clients   arm pinned on   this rule
+    //           16           34 MB       26 MB
+    //           64           97 MB       54 MB
+    //          128          165 MB       69 MB
+    //         1200         1003 MB      988 MB
+    //
+    // Below the threshold it is worth about half, and at 1200 it is the same
+    // thing measured twice -- which is the point: the bound comes from the arm
+    // the count picks, and above the threshold the count picks the other one.
+    static constexpr size_t MULTISHOT_MIN_CLIENTS = 1024;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
     bool m_splice_supported{false};
