@@ -960,7 +960,7 @@ size_t proxy_instance::get_connection_count() const
 // also the limit of what any rule here can do -- see MULTISHOT_MIN_CLIENTS.
 void proxy_instance::on_loop_turn()
 {
-    if (!m_recv_multishot_supported || m_multishot_arm == multishot_arm::never)
+    if (!m_recv_multishot_supported)
     {
         m_recv_multishot = false;
         return;
@@ -1534,12 +1534,12 @@ bool proxy_instance::setup(event_loop& loop)
     // recv being in conflict.  They were not: the abort watch was firing and
     // the teardown was deferring correctly, and what leaked was the closing
     // test this file now makes on the TCP read path.
-    m_recv_multishot_supported = m_use_provided_bufs && loop.recv_multishot_supported();
-    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] && e[1] == '\0')
-    {
-        if (e[0] == '0')      m_multishot_arm = multishot_arm::never;
-        else if (e[0] == '1') m_multishot_arm = multishot_arm::always;
-    }
+    // recv_multishot_enabled(), not recv_multishot_supported(): the loop reads
+    // SOCKETLEY_RECV_MULTISHOT=0 for every runtime, so only the arm this proxy
+    // alone has -- overriding its own rule -- is read here.
+    m_recv_multishot_supported = m_use_provided_bufs && loop.recv_multishot_enabled();
+    if (const char* e = getenv("SOCKETLEY_RECV_MULTISHOT"); e && e[0] == '1' && e[1] == '\0')
+        m_multishot_arm = multishot_arm::always;
     // A fresh instance holds nothing, so the rule starts on the arm it would
     // choose for that and the first turn moves it if the count says otherwise.
     m_recv_multishot = m_recv_multishot_supported &&

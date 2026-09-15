@@ -725,7 +725,9 @@ bool cache_instance::setup(event_loop& loop)
         if (end != e && v >= 1024) buf_size = static_cast<uint32_t>(v);
     }
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, buf_count, buf_size);
-    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    // On always, for the server's reason: nothing here declines a read at a
+    // watermark, so there is no second side to trade the throughput against.
+    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
     // Probed by a real submission inside recv_bundle_enabled(), and off under
     // SOCKETLEY_RECV_BUNDLE=0 — which is also the A/B switch: same binary,
     // same pool geometry, only the arm differs.

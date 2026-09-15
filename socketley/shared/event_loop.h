@@ -183,6 +183,11 @@ public:
     bool submit_recv_multishot(int fd, uint16_t group_id, io_request* req);
     bool recv_multishot_supported() const;
 
+    // Whether arming one is worth attempting -- kernel support and not disabled
+    // by SOCKETLEY_RECV_MULTISHOT=0 -- which is the switch every runtime's A/B
+    // is taken on, so it is read in one place and means one thing.
+    bool recv_multishot_enabled() const;
+
     // ── Bundled multishot recv ──────────────────────────────────────────────
     // IORING_RECVSEND_BUNDLE packs as many provided buffers into one
     // completion as the socket queue could fill, so a handler that arms it

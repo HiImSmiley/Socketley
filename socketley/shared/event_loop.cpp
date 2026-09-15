@@ -1741,6 +1741,17 @@ bool event_loop::recv_multishot_supported() const
     return m_recv_multishot_supported;
 }
 
+bool event_loop::recv_multishot_enabled() const
+{
+    // The environment read once, the same way recv_bundle_enabled() reads its
+    // own: neither it nor the kernel changes under a running process.
+    static const bool opted_out = [] {
+        const char* e = getenv("SOCKETLEY_RECV_MULTISHOT");
+        return e && e[0] == '0' && e[1] == '\0';
+    }();
+    return m_recv_multishot_supported && !opted_out;
+}
+
 bool event_loop::submit_recv_multishot(int fd, uint16_t group_id, io_request* req)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)

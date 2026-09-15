@@ -2136,7 +2136,10 @@ bool server_instance::setup(event_loop& loop)
 
     // Setup provided buffer ring for zero-copy reads
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
-    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_supported();
+    // On, at every connection count measured, because this runtime declines a
+    // read at the watermark in no place at all -- see the proxy's
+    // MULTISHOT_MIN_CLIENTS for the rule that answer is the other half of.
+    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
     // Bundled recv, probed by a real submission and switchable by
     // SOCKETLEY_RECV_BUNDLE=0, which is also the A/B switch on one binary.
     m_recv_bundle = m_recv_multishot && loop.recv_bundle_enabled();

@@ -944,9 +944,10 @@ private:
     // Whether this kernel and this buffer ring could do it at all, which is a
     // different question from whether this turn wants it.
     bool m_recv_multishot_supported{false};
-    // SOCKETLEY_RECV_MULTISHOT pins the arm for a measurement; unset is the
-    // rule.
-    enum class multishot_arm : uint8_t { adaptive, always, never };
+    // SOCKETLEY_RECV_MULTISHOT=1 pins the arm on for a measurement; unset is
+    // the rule.  There is no `never` here because =0 is answered by the loop,
+    // for every runtime at once.
+    enum class multishot_arm : uint8_t { adaptive, always };
     multishot_arm m_multishot_arm{multishot_arm::adaptive};
     // Where a multishot recv starts paying for itself.  Measured on this box at
     // 8 KiB bodies, median of the per-pass differences against a single-shot arm
