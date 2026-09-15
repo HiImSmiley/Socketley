@@ -213,9 +213,14 @@ public:
         const auto now = std::chrono::steady_clock::now();
         if (total_queued_bytes() >= socketley::write_pacing_budget)
             m_pacing_hold_until = now + std::chrono::milliseconds(50);
+        m_pacing_backed_up = now < m_pacing_hold_until;
         m_write_watermark = pacing_watermark_for(get_connection_count(),
-                                                 now < m_pacing_hold_until);
+                                                 m_pacing_backed_up);
     }
+
+    // The same sticky state the watermark was just derived from, for a runtime
+    // that has to act on the fact and not only on the number it produced.
+    bool pacing_backed_up() const { return m_pacing_backed_up; }
 
     // ─── And how much may be accumulated FROM one connection ────────────────
     // The inbound twin, which was MAX_PARTIAL_SIZE -- a constexpr repeated in
@@ -812,6 +817,7 @@ private:
     size_t m_write_watermark = socketley::write_queue_max_bytes / 2;
     // Until when the divided pacing point stays in force; see refresh above.
     std::chrono::steady_clock::time_point m_pacing_hold_until{};
+    bool m_pacing_backed_up{false};
 
     // Dividing by the connection count alone was the wrong rule and measured so:
     // at 8 streams it paced a producer four times as often for no benefit, since

@@ -10,10 +10,14 @@
 # per-pass differences against a single-shot arm of the same binary at 8 KiB
 # bodies: +6.9% for single-shot at 128 connections, +0.05% at 768, -21.0% at 1024.
 #
-# So the arm is chosen once a turn from the live client count, and this file is
-# about the half of that which is observable from outside: below the threshold the
-# proxy picks single-shot, and single-shot is what keeps the write queues bounded
-# when clients stop draining.
+# So the arm is chosen once a turn, from the live client count AND from whether
+# the runtime is over its pacing budget, and this file is about the half of that
+# which is observable from outside.  Two mechanisms, at two connection counts:
+# below the threshold the proxy picks single-shot and backpressure declines the
+# read itself, and above it the proxy picks multishot on purpose, so the only
+# thing that can bound the queue is withdraw_armed_backend_reads() taking the
+# armed read back.  There is a row for each, and a build missing either one reads
+# a ratio of 1.
 #
 # ─── WHY THE ASSERTION IS A RATIO AND NOT A CEILING ─────────────────────────
 #
@@ -38,6 +42,10 @@
 #   * the multishot path still serving correctly -- before the rule every proxy
 #     test exercised it, and after the rule NOTHING in this suite reaches it
 #     without the pin, which is coverage this change would otherwise have removed
+#   * armed reads NOT being taken back above the threshold, which is the only
+#     thing that bounds the queue there -- the rule arms multishot on purpose at
+#     that count, so backpressure cannot decline anything and the ratio is the
+#     whole proof that withdraw_armed_backend_reads() runs
 #   * more connections than the threshold, so the switch itself is walked
 #   * the proxy still serving after both storms
 set -euo pipefail
@@ -71,20 +79,35 @@ elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED="
 echo "=== Integration: a proxy's recv arm follows its client count ==="
 
 BODY=4194304           # what the slow clients ask for: the pinned arm buffers it
+BODY_MID=1048576       # what the above-threshold row asks for: big enough that
+                       # the body takes many reads, which is the only shape a
+                       # withdrawal can do anything about -- at 256 KiB both arms
+                       # came out at exactly 383 MB, because the whole body is
+                       # queued before the next turn can take the read back
 BODY_SMALL=262144      # and what the correctness rows ask for, so they stay quick
 SLOW_CLIENTS=128
 MANY_CLIENTS=1100      # above MULTISHOT_MIN_CLIENTS, so the switch itself is walked
 RATIO_MIN=20           # tenths: 2.0x
+BIG_FRAC=88            # hundredths: above the threshold the rule must hold under
+                       # 88% of the pinned arm.  In THIS file's shape the two
+                       # builds read 100% (no withdrawal: 874 MB against 869) and
+                       # 75% (with it: 648 against 869), so 88 sits between them
+                       # with about equal room on each side.  The effect is
+                       # larger than 25% off a C backend -- 449 MB against 1016
+                       # at 1200 clients -- but a Python backend with 1100
+                       # threads delivers the bodies in dribbles, so this row
+                       # understates it on purpose rather than by accident.
 
 # A backend that serves a 1 MiB body, thread per connection so 1100 at once do
 # not queue behind each other and read as the proxy being slow.
 cat >"$WORK/be.py" <<'PY'
 import socket, sys, threading
-port, big, small = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+port, big, mid, small = (int(sys.argv[1]), int(sys.argv[2]),
+                         int(sys.argv[3]), int(sys.argv[4]))
 def resp(size):
     return (("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n"
              "Content-Type: text/plain\r\n\r\n" % size).encode() + b"v" * size)
-R = {big: resp(big), small: resp(small)}
+R = {big: resp(big), mid: resp(mid), small: resp(small)}
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", port)); srv.listen(2048)
 def handle(c):
@@ -93,7 +116,9 @@ def handle(c):
         while True:
             req = c.recv(65536)
             if not req: return
-            c.sendall(R[small] if b"/small" in req.split(b"\r\n")[0] else R[big])
+            line = req.split(b"\r\n")[0]
+            c.sendall(R[small] if b"/small" in line else
+                      R[mid] if b"/mid" in line else R[big])
     except OSError:
         pass
     finally:
@@ -107,6 +132,12 @@ PY
 
 # N connections that ask and then stop reading, so the proxy is left owing the
 # body to peers that never drain.  No threads: the sockets just sit there.
+#
+# Connected in one pass and asked in a second, because the arm is decided from
+# the live client count: connect-then-ask per socket took eleven seconds for
+# 1100 and the count was still under the threshold when most of the reads were
+# armed, so every one of them got the single-shot arm and the row measured the
+# ramp rather than the arm.
 cat >"$WORK/slow.py" <<'PY'
 import socket, sys, time
 port, n, path, hold = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
@@ -114,12 +145,12 @@ req = ("GET %s HTTP/1.1\r\nHost: x\r\n\r\n" % path).encode()
 socks = []
 for _ in range(n):
     try:
-        s = socket.create_connection(("127.0.0.1", port), 5)
-        s.sendall(req)
-        s.settimeout(0.01)
-        try: s.recv(4096)        # the head, then nothing more on purpose
-        except OSError: pass
-        socks.append(s)
+        socks.append(socket.create_connection(("127.0.0.1", port), 5))
+    except OSError:
+        pass
+for s in socks:
+    try:
+        s.sendall(req)          # and nothing is ever read back, on purpose
     except OSError:
         pass
 print(len(socks), flush=True)
@@ -166,7 +197,7 @@ full = sum(1 for i in got if got[i] >= want)
 print("%d %d %d" % (opened, done, full))
 PY
 
-python3 "$WORK/be.py" "$((SL_PORT_BASE + 1746))" "$BODY" "$BODY_SMALL" >"$WORK/be.log" 2>&1 &
+python3 "$WORK/be.py" "$((SL_PORT_BASE + 1746))" "$BODY" "$BODY_MID" "$BODY_SMALL" >"$WORK/be.log" 2>&1 &
 BEPID=$!
 BPORT=$((SL_PORT_BASE + 1746))
 for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$BPORT " && break; sleep 0.1; done
@@ -179,8 +210,9 @@ HELD=0; WORKER=""
 
 # One arm: its own daemon, because the pin is an environment variable and the
 # worker inherits it from the daemon it was forked by.
-run_arm() {   # tag  (SOCKETLEY_RECV_MULTISHOT already set or unset)
-    local tag=$1 base peak r i carried
+run_arm() {   # tag [clients] [path] [hold] [samples]   (the pin is the caller's)
+    local tag=$1 clients=${2:-$SLOW_CLIENTS} path=${3:-/pa/} hold=${4:-6} samples=${5:-90}
+    local base peak r i carried
     daemon_isolate "recvarm-$tag"
     daemon_start "$BIN"
     "$BIN" create proxy pa -p "$PPORT" --backend "127.0.0.1:$BPORT" -s >/dev/null 2>&1 || true
@@ -200,18 +232,33 @@ run_arm() {   # tag  (SOCKETLEY_RECV_MULTISHOT already set or unset)
               awk -F= '/^SOCKETLEY_RECV_MULTISHOT=/{print $2}')
     ARM_CARRIED="${carried:-absent}"
     base=$(awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo 0)
-    python3 "$WORK/slow.py" "$PPORT" "$SLOW_CLIENTS" "/pa/" 6 >"$WORK/slow.$tag" 2>&1 &
+    python3 "$WORK/slow.py" "$PPORT" "$clients" "$path" "$hold" >"$WORK/slow.$tag" 2>&1 &
     local sp=$!
     peak=$base
-    for i in $(seq 1 90); do
+    # Two figures, because they answer different questions.  The peak includes
+    # the ramp, which both arms pay alike.  The median of the samples taken
+    # after the storm is up and before it closes is what the proxy HOLDS while
+    # the clients sit there, and that is the only one a withdrawal moves: it
+    # cannot un-queue what arrived before the turn that withdrew the read.
+    local up=0
+    : >"$WORK/rss.$tag"
+    for i in $(seq 1 "$samples"); do
         sleep 0.1
+        kill -0 "$sp" 2>/dev/null || break
         r=$(awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo "")
         [ -z "$r" ] && break
         [ "$r" -gt "$peak" ] && peak=$r
+        # slow.py prints its count the moment every socket has asked, so a
+        # non-empty file is the storm being up.
+        [ "$up" = 0 ] && [ -s "$WORK/slow.$tag" ] && up=1
+        [ "$up" = 1 ] && echo "$r" >>"$WORK/rss.$tag"
     done
     wait "$sp" 2>/dev/null || true
     ARM_OPENED=$(head -1 "$WORK/slow.$tag" 2>/dev/null || echo 0)
     HELD=$(( (peak - base) / 1024 ))
+    ARM_STEADY=$(sort -g "$WORK/rss.$tag" 2>/dev/null |
+        awk -v b="$base" '{a[NR]=$1}
+             END{ if (NR > 0) print int((a[int((NR+1)/2)] - b) / 1024); else print 0 }')
 }
 
 # ── 1. the rule, which below the threshold means single-shot ─────────────────
@@ -281,7 +328,57 @@ daemon_stop
 unset SOCKETLEY_RECV_MULTISHOT
 for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
 
-# ── 6. and more clients than the threshold, so the switch itself is walked ──
+# ── 6. the same ratio ABOVE the threshold, where the arm is multishot ───────
+# This is the row the withdrawal exists for.  Below the threshold the rule picks
+# single-shot and backpressure declines the read itself; above it the rule picks
+# multishot on purpose, so the only thing that can bound the queue is taking the
+# armed read back -- and on a build that does not, this row reads 1.0 because
+# both arms are the same arm.
+#
+# 1 MiB and not the 4 MiB above, because 1100 clients times 4 MiB is more than
+# this box has and the row would be measuring the OOM killer -- and not the
+# 256 KiB of the correctness rows either, because a body that fits in one turn is
+# fully queued before any withdrawal can be submitted, which read as both arms
+# holding exactly 383 MB.
+unset SOCKETLEY_RECV_MULTISHOT
+run_arm bigrule "$MANY_CLIENTS" /pa/mid 10 400
+HELD_BR=$ARM_STEADY; OPENED_BR=$ARM_OPENED
+echo "  above the threshold, the rule: $OPENED_BR slow clients, held ${HELD_BR} MB (peak ${HELD} MB)"
+daemon_stop
+for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+
+export SOCKETLEY_RECV_MULTISHOT=1
+run_arm bigpin "$MANY_CLIENTS" /pa/mid 10 400
+HELD_BP=$ARM_STEADY; OPENED_BP=$ARM_OPENED
+echo "  above the threshold, pinned:   $OPENED_BP slow clients, held ${HELD_BP} MB (peak ${HELD} MB)"
+daemon_stop
+unset SOCKETLEY_RECV_MULTISHOT
+for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
+
+if [ -n "$SANITIZED" ]; then
+    not_asserted "above the threshold the rule still bounds the queue" \
+        "held ${HELD_BR} MB against ${HELD_BP} MB; RSS under $SANITIZED measures the allocator's quarantine"
+elif [ "${OPENED_BR:-0}" -lt $((MANY_CLIENTS / 2)) ] || [ "${OPENED_BP:-0}" -lt $((MANY_CLIENTS / 2)) ]; then
+    fail "above the threshold the rule still bounds the queue" \
+         "opened $OPENED_BR and $OPENED_BP of $MANY_CLIENTS" \
+         "-- neither storm arrived, so the megabytes are about nothing"
+elif [ "${HELD_BP:-0}" -le 0 ]; then
+    fail "above the threshold the rule still bounds the queue" \
+         "the pinned arm held ${HELD_BP} MB, so there is no ratio to take" \
+         "-- the clients did not make the proxy hold anything, so the body or the" \
+         "   hold window is wrong rather than the proxy"
+else
+    echo "  ratio: rule/pinned = $(( HELD_BR * 100 / HELD_BP ))%, must be under ${BIG_FRAC}%"
+    if [ $(( HELD_BR * 100 )) -lt $(( HELD_BP * BIG_FRAC )) ]; then pass
+    else fail "above the threshold the rule still bounds the queue" \
+              "the rule held ${HELD_BR} MB against the pinned arm's ${HELD_BP} MB," \
+              "which is $(( HELD_BR * 100 / HELD_BP ))% where it must be under ${BIG_FRAC}%" \
+              "-- above MULTISHOT_MIN_CLIENTS the rule arms multishot deliberately," \
+              "   so the bound comes from withdraw_armed_backend_reads() alone; a" \
+              "   ratio near 1.0 means the armed reads are not being taken back"; fi
+fi
+
+# ── 7. and more clients than the threshold, so the switch itself is walked ──
 daemon_isolate recvarm-many
 daemon_start "$BIN"
 "$BIN" create proxy pa -p "$PPORT" --backend "127.0.0.1:$BPORT" -s >/dev/null 2>&1 || true
@@ -296,7 +393,7 @@ else fail "more clients than the threshold are served correctly" \
           "-- above MULTISHOT_MIN_CLIENTS the rule switches arm mid-flight, and a" \
           "   connection already armed keeps its own, so both arms are live at once"; fi
 
-# ── 7. and the proxy is still there ─────────────────────────────────────────
+# ── 8. and the proxy is still there ─────────────────────────────────────────
 LAST=$(timeout 30 python3 "$WORK/many.py" "$PPORT" 1 "/pa/small" "$BODY_SMALL" 2>/dev/null || echo "0 0 0")
 read -r l_open l_done l_full <<<"$LAST"
 if [ "${l_full:-0}" = 1 ]; then pass

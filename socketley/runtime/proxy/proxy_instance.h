@@ -248,6 +248,10 @@ struct alignas(64) proxy_backend_connection
     // with a cancelled read still owed, so nothing may touch the fd until that
     // completion lands.
     bool pool_draining{false};
+    // A multishot read taken back because the client it feeds is over the
+    // pacing point: set when the cancel is submitted, cleared by the
+    // -ECANCELED that ends it or by any other completion that ends it first.
+    bool recv_withdrawing{false};
     // Application bytes came off this backend socket and went to the client,
     // stated so a TCP proxy can ask it, since response_started is never set
     // outside HTTP mode.
@@ -503,6 +507,10 @@ public:
     // Once a turn, immediately after refresh_pacing_watermark() has settled the
     // two numbers this reads.
     void on_loop_turn() override;
+    void withdraw_armed_backend_reads();
+    void finish_recv_withdraw(proxy_backend_connection* conn,
+                              struct io_uring_cqe* cqe, io_request* req);
+    bool client_backpressured(const proxy_backend_connection* conn) const;
 
     // C++ proxy intercept hooks
     void set_on_proxy_request(proxy_hook cb);
@@ -956,43 +964,42 @@ private:
     // and this sits above it, because between the two the measurement says
     // nothing either way and the switch belongs where the gain is not in doubt.
     //
-    // The queue depth is deliberately NOT part of the rule, and that is a
-    // measurement rather than an omission.  Multishot cannot be declined, so it
-    // reads ahead into a queue nothing drains, and gating on
-    // pacing_backed_up() looks like the answer: 1,200 clients that ask for a
-    // 1 MiB body and stop reading put the gate on for 96.5% of turns and had it
-    // pick single-shot on 99% of them.  It changed nothing -- 949 and 1014 MB
-    // held against 943 and 1046 with the arm pinned on, interleaved.  The reason
-    // is the line above: the fleet was already armed during the ramp, before any
-    // queue existed, and an armed multishot recv keeps its arm.  Making it bite
-    // needs those reads withdrawn, and the template for that is already in this
-    // file: detach_and_pool_backend() withdraws an armed multishot recv by
-    // request, and finish_pool_drain() takes the -ECANCELED with the MORE flag
-    // handled.  The client read path has neither, so a cancel there lands in the
-    // res <= 0 branch and would close live connections; giving it both is a
-    // change to this proxy's connection lifecycle and is not made here.
+    // The count is not the whole rule: the queue depth is the second condition,
+    // and it is worth something only because withdraw_armed_backend_reads()
+    // exists.  Gated on pacing_backed_up() ALONE it was measured to change
+    // nothing at all -- 1,200 clients that ask for a 1 MiB body and stop reading
+    // put the gate on for 96.5% of turns and had it pick single-shot on 99% of
+    // them, and the hold was 949 and 1014 MB against 943 and 1046 with the arm
+    // pinned on.  The fleet was already armed during the ramp, before any queue
+    // existed, and an armed multishot recv keeps its arm; deciding the next read
+    // differently reaches none of them.
     //
-    // So what the count alone is worth is the whole of it.  Clients that ask for
-    // a 1 MiB body and then stop reading, interleaved, worker RSS above its own
-    // baseline:
+    // What the two conditions together are worth, and what the count alone was.
+    // Clients that ask for a 1 MiB body and then stop reading, three arms in one
+    // run, three passes each, interleaved, worker RSS above its own baseline:
     //
-    //      clients   arm pinned on   this rule
-    //           16           34 MB       26 MB
-    //           64           97 MB       54 MB
-    //          128          165 MB       69 MB
-    //         1200         1003 MB      988 MB
+    //      clients   pinned on   this rule   pinned off
+    //           16       34 MB       26 MB           --
+    //           64       97 MB       54 MB           --
+    //          128      165 MB       69 MB           --
+    //         1200     1016 MB      449 MB       351 MB
     //
-    // Below the threshold it is worth about half, and at 1200 it is the same
-    // thing measured twice -- which is the point: the bound comes from the arm
-    // the count picks, and above the threshold the count picks the other one.
+    // Below the threshold the rule IS the off arm, which is why that column is
+    // empty there.  At 1200 it was 1007 MB before the withdrawal existed -- the
+    // count had picked multishot and nothing could decline it -- and 449 after,
+    // against a 351 MB floor.  The 100 MB above the floor is the ramp: the
+    // withdrawal acts a turn late and cannot un-queue what already arrived.
     //
-    // What that table does not show is the arm the rule declines to pick up
-    // there, and it is the number this threshold has to be defended against:
-    // three arms in one run, three passes each, interleaved, 1,200 of those
-    // clients -- pinned on 1044 MB, the rule 1007, pinned OFF 351.  So above
-    // the threshold this is not a bound at all, it is a choice: about 650 MB of
-    // worst-case hold for the 21 per cent.  Withdrawing the armed reads is what
-    // would stop it being a choice, and that is the paragraph above.
+    // It is not free, and the price is on the other side of the same condition:
+    // 1,200 connections with 1 MiB bodies and clients that DO read cost 7.5%
+    // against the arm pinned on, because a total over the pacing budget cannot
+    // tell a slow peer from a busy one.  At 8 KiB bodies the same comparison is
+    // -0.50%, since 1,200 of those never reach the budget at all.  Two narrower
+    // shapes were measured and refused: withdrawing without gating the arm holds
+    // 760 MB, because the connection is re-armed multishot and reads ahead
+    // again; making the single-shot arm sticky per connection instead holds
+    // 542 MB and costs 11.1%, because a connection that crossed the watermark
+    // once never goes back.
     static constexpr size_t MULTISHOT_MIN_CLIENTS = 1024;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.

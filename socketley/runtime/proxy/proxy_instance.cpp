@@ -333,6 +333,7 @@ void proxy_backend_connection::reset(int new_fd)
     splice_in_pending = false;
     splice_out_pending = false;
     pool_draining = false;
+    recv_withdrawing = false;
     sent_to_client = false;
     pool_abandoned = false;
     pool_backend_idx = 0;
@@ -965,15 +966,117 @@ void proxy_instance::on_loop_turn()
         m_recv_multishot = false;
         return;
     }
+
+    // Pinned on is the arm with nothing done about it, because that is what a
+    // control is for: the withdrawal below would make =1 and the rule measure
+    // the same thing, and then nothing could say what multishot alone costs.
     if (m_multishot_arm == multishot_arm::always)
     {
         m_recv_multishot = true;
         return;
     }
 
-    // Many connections, and nothing else: see the declaration of
-    // MULTISHOT_MIN_CLIENTS for why the queue depth is not asked about here.
-    m_recv_multishot = get_connection_count() >= MULTISHOT_MIN_CLIENTS;
+    // Two conditions now, and the second is worth something only because the
+    // reads already in the kernel can be taken back -- see MULTISHOT_MIN_CLIENTS,
+    // where the depth on its own was measured to change nothing at all.
+    const bool backed_up = pacing_backed_up();
+    m_recv_multishot = !backed_up && get_connection_count() >= MULTISHOT_MIN_CLIENTS;
+
+    // The line above is the next read; this is the ones already in the kernel,
+    // which no decision above can reach.
+    if (backed_up)
+        withdraw_armed_backend_reads();
+}
+
+// Whether the client this backend feeds is holding more than the pacing point.
+//
+// Asked in one place because two things now turn on it -- the re-arm at the
+// bottom of handle_backend_read and the withdrawal below -- and they have to
+// agree about it; two copies of the test would not have to.
+bool proxy_instance::client_backpressured(const proxy_backend_connection* conn) const
+{
+    if (conn->client_fd < 0 || conn->client_fd >= MAX_FDS)
+        return false;
+    const auto& ce = m_conn_idx[conn->client_fd];
+    return ce.side == conn_client &&
+           ce.client->write_queue.bytes() >= write_watermark_bytes();
+}
+
+// The decline an armed multishot recv cannot make, made after the fact.
+//
+// A read already in the kernel keeps its arm whatever on_loop_turn() decides,
+// so above MULTISHOT_MIN_CLIENTS the pacing point bounded nothing: 1,200
+// clients that ask for a 1 MiB body and stop reading held 1,007 MB where the
+// same clients on a single-shot arm held 351.  Taking the read back by request
+// is what closes that, and finish_recv_withdraw() takes the -ECANCELED.
+void proxy_instance::withdraw_armed_backend_reads()
+{
+    size_t rem = m_backend_count;
+    for (int fd = 0; fd < MAX_FDS && rem > 0; ++fd)
+    {
+        auto* b = m_backend_slots[fd].get();
+        if (!b) continue;
+        rem--;
+        // A single-shot read declines itself at the bottom of
+        // handle_backend_read, and a read already being taken back for the pool
+        // is spoken for by finish_pool_drain().
+        if (!b->read_pending || b->recv_withdrawing || b->pool_draining || b->closing)
+            continue;
+        if (!is_multishot_recv_op(b->read_req.type))
+            continue;
+        if (!client_backpressured(b))
+            continue;
+        // By REQUEST and not by descriptor, for the reason
+        // detach_and_pool_backend() gives: named directly, the kernel has
+        // nothing to search for.  And the flag goes up only once the submission
+        // is taken, so a refused cancel leaves no trace and the next turn tries
+        // this connection again.
+        if (!m_loop->submit_cancel_request(&b->read_req))
+            return;
+        b->recv_withdrawing = true;
+    }
+}
+
+// The withdrawal landing.
+//
+// Only the -ECANCELED is the withdrawal: a data completion queued ahead of it
+// is a piece of the response and goes down the normal path, or the body loses a
+// chunk in the middle.
+void proxy_instance::finish_recv_withdraw(proxy_backend_connection* conn,
+                                          struct io_uring_cqe* cqe, io_request* req)
+{
+    const int fd = conn->fd;
+
+    // The buffer belongs to the ring whatever ended the read.
+    if (cqe->flags & IORING_CQE_F_BUFFER)
+    {
+        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+        m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    }
+
+    // Still armed -- the completion that ends the read is yet to come.
+    if (is_multishot_recv_op(req->type) && (cqe->flags & IORING_CQE_F_MORE))
+        return;
+
+    conn->read_pending = false;
+    conn->recv_withdrawing = false;
+
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+    {
+        if (!conn->write_pending)
+            close_pair(conn->client_fd, fd);
+        return;
+    }
+
+    // Re-armed here if the queue has already drained, and not otherwise: the
+    // resume lives in handle_client_write and fires on a write completion, so a
+    // queue that emptied while this cancellation was in flight leaves no write
+    // to complete and would leave this backend armed by nobody.
+    if (client_backpressured(conn))
+        return;
+    if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, fd, conn, m_recv_multishot,
+                                                   m_use_provided_bufs, BUF_GROUP_ID)))
+        close_pair(conn->client_fd, fd);
 }
 
 size_t proxy_instance::total_queued_bytes() const
@@ -3353,6 +3456,13 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         return;
     }
 
+    // The withdrawal this turn's pacing asked for, landing.
+    if (SOCKETLEY_UNLIKELY(conn->recv_withdrawing) && cqe->res == -ECANCELED)
+    {
+        finish_recv_withdraw(conn, cqe, req);
+        return;
+    }
+
     bool is_multishot_recv = is_multishot_recv_op(req->type);
     bool multishot_more = is_multishot_recv && (cqe->flags & IORING_CQE_F_MORE);
 
@@ -3360,6 +3470,12 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         conn->read_pending = false;
     else if (!multishot_more)
         conn->read_pending = false;
+
+    // Something else ended the read first, so the cancel this flag stands for
+    // has nothing left to find: cleared with the arm rather than left to be
+    // answered by a completion belonging to the next read.
+    if (SOCKETLEY_UNLIKELY(conn->recv_withdrawing && !conn->read_pending))
+        conn->recv_withdrawing = false;
 
     bool is_provided = (req->type == op_read_provided || is_multishot_recv);
 
@@ -3672,15 +3788,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         {
             // Backpressure: pause backend reads while the client write queue
             // fills, and handle_client_write resumes them when it drains.
-            bool backpressured = false;
-            if (conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
-            {
-                auto& ce = m_conn_idx[conn->client_fd];
-                if (ce.side == conn_client &&
-                    ce.client->write_queue.bytes() >= write_watermark_bytes())
-                    backpressured = true;
-            }
-            if (!backpressured)
+            if (!client_backpressured(conn))
                 if (SOCKETLEY_UNLIKELY(!submit_read_op_backend(m_loop, fd, conn, m_recv_multishot, m_use_provided_bufs, BUF_GROUP_ID)))
                 {
                     close_pair(conn->client_fd, fd);
