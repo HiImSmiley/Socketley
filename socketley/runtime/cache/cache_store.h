@@ -281,9 +281,12 @@ public:
     // when it is done -- SCAN's contract, over one key instead of the
     // keyspace.  A missing key is an immediate 0 with nothing emitted, which
     // is what Redis answers rather than an error.
+    // `value_pattern` filters on what each field HOLDS, where `pattern` matches
+    // what it is called; absent and empty are different requests, as elsewhere.
     uint64_t hscan(std::string_view key, uint64_t cursor, std::string_view pattern,
                    size_t count,
-                   std::vector<std::pair<std::string_view, std::string_view>>& out) const;
+                   std::vector<std::pair<std::string_view, std::string_view>>& out,
+                   const std::string_view* value_pattern = nullptr) const;
     uint64_t sscan(std::string_view key, uint64_t cursor, std::string_view pattern,
                    size_t count, std::vector<std::string_view>& out) const;
     uint64_t zscan(std::string_view key, uint64_t cursor, std::string_view pattern,

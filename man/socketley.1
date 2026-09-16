@@ -4659,7 +4659,7 @@ if it is absent, and return the new value.
 .BI "hsetnx " "key field value"
 Set the field only if it does not exist. Returns 1 or 0.
 .TP
-.BI "hscan " "key cursor" " [match " pattern "] [count " n "]"
+.BI "hscan " "key cursor" " [match " pattern "] [count " n "] [valuematch " glob "]"
 .TQ
 .BI "sscan " "key cursor" " [match " pattern "] [count " n "]"
 .TQ
@@ -4668,8 +4668,13 @@ Set the field only if it does not exist. Returns 1 or 0.
 over one key's collection instead of over the keyspace: start at 0, pass back
 the cursor each call, and 0 again means the walk is done.
 .I valuematch
-is not among their options: it asks what value a KEY holds, and the members of
-a collection are not that.
+is
+.B hscan\'s
+alone among the three: it asks what a field HOLDS, where
+.I match
+asks what it is called.  A set's members and a zset's scores are not values in
+that sense, and both answer a syntax error rather than pretending -- one option
+meaning three things is worse than one option fewer.
 .I count
 is a hint and defaults to 10, as it does on Redis; a collection smaller than
 one bucket-load comes back whole with cursor 0.

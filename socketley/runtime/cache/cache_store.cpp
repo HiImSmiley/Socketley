@@ -1780,8 +1780,14 @@ static inline std::string_view scan_key_of(const std::pair<A, B>& p) { return p.
 // going back into is the one it left, and a rehash restarts rather than
 // silently skipping half the elements.
 template <typename Map, typename Emit>
+// `emit` answers whether it kept the entry, which is what lets a caller filter
+// on something the pattern cannot see -- a hash field's VALUE, where the pattern
+// matches its name.  A page then ends on entries EXAMINED rather than kept, for
+// the reason walk_buckets() gives: a selective predicate under the other rule
+// walks the whole collection in one call.
 static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
-                                    std::string_view pattern, size_t count, Emit emit)
+                                    std::string_view pattern, size_t count, Emit emit,
+                                    bool bound_by_examined = false)
 {
     const bool match_all = (pattern == "*");   // see scan(): "" is a pattern
     const auto match = [&](std::string_view k) {
@@ -1798,15 +1804,18 @@ static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
     if (was_buckets != 0 && was_buckets != (nbuckets & 0xFFFFFFu))
         bucket = 0;
 
-    size_t emitted = 0;
+    size_t emitted = 0, examined = 0;
     for (size_t b = bucket; b < nbuckets; ++b)
     {
         for (auto it = map.begin(b); it != map.end(b); ++it)
-            if (match(scan_key_of(*it))) { emit(*it); ++emitted; }
+        {
+            ++examined;
+            if (match(scan_key_of(*it)) && emit(*it)) ++emitted;
+        }
 
         // Whole buckets only: half of one would need an element index the
         // cursor has no room for.
-        if (emitted >= count && b + 1 < nbuckets)
+        if ((bound_by_examined ? examined : emitted) >= count && b + 1 < nbuckets)
             return ((static_cast<uint64_t>(nbuckets) & 0xFFFFFFu) << 32)
                  | (static_cast<uint64_t>(b + 1) & 0xFFFFFFFFu);
     }
@@ -1815,13 +1824,20 @@ static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
 
 uint64_t cache_store::hscan(std::string_view key, uint64_t cursor,
                             std::string_view pattern, size_t count,
-                            std::vector<std::pair<std::string_view, std::string_view>>& out) const
+                            std::vector<std::pair<std::string_view, std::string_view>>& out,
+                            const std::string_view* value_pattern) const
 {
     auto it = m_hashes.find(key);
     if (it == m_hashes.end()) return 0;
+    const bool match_all_vals = (!value_pattern || *value_pattern == "*");
     return scan_one_collection(it->second, cursor, pattern, count,
-        [&out](const auto& e) { out.emplace_back(std::string_view(e.first),
-                                                 std::string_view(e.second)); });
+        [&](const auto& e) {
+            if (!match_all_vals && !socketley::glob_match(*value_pattern, e.second))
+                return false;
+            out.emplace_back(std::string_view(e.first), std::string_view(e.second));
+            return true;
+        },
+        /*bound_by_examined=*/value_pattern != nullptr);
 }
 
 uint64_t cache_store::sscan(std::string_view key, uint64_t cursor,
@@ -1831,7 +1847,7 @@ uint64_t cache_store::sscan(std::string_view key, uint64_t cursor,
     auto it = m_sets.find(key);
     if (it == m_sets.end()) return 0;
     return scan_one_collection(it->second, cursor, pattern, count,
-        [&out](const auto& e) { out.emplace_back(std::string_view(e)); });
+        [&out](const auto& e) { out.emplace_back(std::string_view(e)); return true; });
 }
 
 uint64_t cache_store::zscan(std::string_view key, uint64_t cursor,
@@ -1841,7 +1857,7 @@ uint64_t cache_store::zscan(std::string_view key, uint64_t cursor,
     auto it = m_zsets.find(key);
     if (it == m_zsets.end()) return 0;
     return scan_one_collection(it->second.score, cursor, pattern, count,
-        [&out](const auto& e) { out.emplace_back(std::string_view(e.first), e.second); });
+        [&out](const auto& e) { out.emplace_back(std::string_view(e.first), e.second); return true; });
 }
 
 // ─── Hashes, the field spellings ───

@@ -6687,13 +6687,14 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             auto [key, r1]   = extract_key(args);
             auto [cur_s, r2] = extract_key(r1);
             if (key.empty() || cur_s.empty())
-            { rb.append("usage: hscan key cursor [match pat] [count n]\n", 45); return; }
+            { rb.append("usage: hscan key cursor [match pat] [count n] [valuematch g]\n", 64); return; }
             uint64_t cur = 0;
             if (!parse_int_sv(cur_s, cur)) { rb.append("error: invalid cursor\n", 22); return; }
             // "*" and not empty: an ABSENT MATCH means everything, an explicit
             // MATCH "" means the member whose name is empty, and the store can
             // only tell them apart if the default is spelled here.
             std::string_view pat = "*"; size_t want = 10;
+            std::string_view vpat; bool has_v = false, count_given = false;
             std::string_view walk = r2;
             while (!walk.empty())
             {
@@ -6702,24 +6703,33 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (o.empty()) break;
                 const uint32_t oh = fnv1a_lower(o);
                 if (oh == fnv1a("match")) pat = v;
+                else if (oh == fnv1a("valuematch")) { vpat = v; has_v = true; }
                 else if (oh == fnv1a("count"))
                 {
                     int64_t c = 0;
                     if (!parse_int_sv(v, c) || c < 1)
                     { rb.append("error: invalid count\n", 21); return; }
-                    want = static_cast<size_t>(c);
+                    want = static_cast<size_t>(c); count_given = true;
                 }
                 else { rb.append("error: syntax\n", 14); return; }
                 walk = r4;
             }
-            if (m_has_ttl_keys) m_store.check_expiry(key);
             const uint32_t which = fnv1a_lower(cmd);
+            // Only a hash has values to match: a set's members and a zset's
+            // scores are not that, and answering as if they were would make the
+            // option mean three things.
+            if (has_v && which != fnv1a("hscan"))
+            { rb.append("error: syntax\n", 14); return; }
+            // Same rule as scan's: a selective predicate returns almost nothing
+            // per page, so ten fields examined per call is not a page size.
+            if (has_v && !count_given) want = 1000;
+            if (m_has_ttl_keys) m_store.check_expiry(key);
             uint64_t next = 0;
             std::string listing;
             if (which == fnv1a("hscan"))
             {
                 std::vector<std::pair<std::string_view, std::string_view>> got;
-                next = m_store.hscan(key, cur, pat, want, got);
+                next = m_store.hscan(key, cur, pat, want, got, has_v ? &vpat : nullptr);
                 for (const auto& [f, v] : got)
                 { listing.append(f); listing += ' '; listing.append(v); listing += '\n'; }
             }
@@ -9792,19 +9802,26 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_into(rb, "invalid cursor"); break; }
             std::string_view pat = "*";   // absent MATCH is everything; see above
             size_t want = 10;                       // Redis's own default COUNT
+            std::string_view vpat; bool has_v = false, count_given = false;
             for (int i = 3; i + 1 < argc; i += 2)
             {
                 const uint32_t o = fnv1a_lower(args[i]);
                 if (o == fnv1a("match")) pat = args[i + 1];
+                else if (o == fnv1a("valuematch")) { vpat = args[i + 1]; has_v = true; }
                 else if (o == fnv1a("count"))
                 {
                     int64_t c = 0;
                     if (!parse_int_sv(args[i + 1], c) || c < 1)
                     { resp::encode_error_into(rb, "syntax error"); return; }
-                    want = static_cast<size_t>(c);
+                    want = static_cast<size_t>(c); count_given = true;
                 }
                 else { resp::encode_error_into(rb, "syntax error"); return; }
             }
+            // Only a hash has values to match, for the reason the text door
+            // gives, and the same page-size rule as scan's.
+            if (has_v && cmd_hash != fnv1a("hscan"))
+            { resp::encode_error_into(rb, "syntax error"); return; }
+            if (has_v && !count_given) want = 1000;
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
 
             // Two elements: the cursor to come back with, then the flat list.
@@ -9817,7 +9834,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (cmd_hash == fnv1a("hscan"))
             {
                 std::vector<std::pair<std::string_view, std::string_view>> got;
-                next = m_store.hscan(args[1], cur, pat, want, got);
+                next = m_store.hscan(args[1], cur, pat, want, got, has_v ? &vpat : nullptr);
                 for (const auto& [f, v] : got)
                 { resp::encode_bulk_into(body, f); resp::encode_bulk_into(body, v); n += 2; }
             }

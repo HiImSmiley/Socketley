@@ -112,6 +112,32 @@ if mode == 'setup':
         send(f, s, spec.split('\x1f'))
         read_reply(f)
     print("ok")
+elif mode == 'cmd':
+    send(f, s, rest)
+    r = read_reply(f)
+    print(r.decode('latin1') if isinstance(r, bytes) else r)
+elif mode == 'hpairs':
+    # The same cursor loop for HSCAN, whose reply is field and value
+    # interleaved.  rest[0] is the key; the rest are the options.
+    key, opts = rest[0], rest[1:]
+    cursor, prs, pages = '0', {}, 0
+    while True:
+        send(f, s, ['HSCAN', key, cursor, 'COUNT', '10000'] + opts)
+        r = read_reply(f)
+        pages += 1
+        if not isinstance(r, list):
+            print("ERR " + repr(r)); sys.exit(0)
+        cursor = r[0].decode()
+        e = r[1]
+        if len(e) % 2:
+            print("ERR odd page of %d elements" % len(e)); sys.exit(0)
+        for i in range(0, len(e), 2):
+            prs[e[i].decode('latin1')] = e[i+1].decode('latin1')
+        if cursor == '0':
+            break
+        if pages > 5000:
+            print("ERR runaway cursor"); sys.exit(0)
+    print("%d %s" % (pages, ' '.join('%s=%s' % kv for kv in sorted(prs.items()))))
 elif mode == 'pairs':
     # The reply is key and value interleaved, so it is read two at a time and
     # printed as one token per pair: a helper that sorted the flat list would
@@ -332,6 +358,37 @@ else
         "   the walk starts partway into the string map and the keys before that" \
         "   point are never returned by any call of the iteration"
 fi
+
+echo "--- 12. the same predicate one level in, on a hash's fields ---"
+hp() { local port=$1; shift; python3 "$SCAN_PY" "$port" hpairs "$@" 2>/dev/null; }
+python3 "$SCAN_PY" "$P" setup \
+  $'HSET\x1ftbl\x1ff1\x1fberlin\x1ff2\x1fhamburg\x1ff3\x1fberlin\x1ff4\x1f' >/dev/null
+R=$(hp "$P" tbl VALUEMATCH berlin)
+if [ "$(keys_of "$R")" = "f1=berlin f3=berlin" ]; then
+    ok "HSCAN VALUEMATCH returns the fields holding that value"
+else
+    bad "HSCAN VALUEMATCH returns the fields holding that value" \
+        "got '$(cut_long "$(keys_of "$R")")'" \
+        "-- every field back means the option was not applied; hscan's own MATCH" \
+        "   asks what a field is CALLED and this asks what it holds"
+fi
+R=$(hp "$P" tbl VALUEMATCH '')
+if [ "$(keys_of "$R")" = "f4=" ]; then ok "and the empty value is asked for by name"
+else bad "the empty value is asked for by name" "got '$(keys_of "$R")'"; fi
+R=$(hp "$P" tbl MATCH 'f[13]' VALUEMATCH berlin)
+if [ "$(keys_of "$R")" = "f1=berlin f3=berlin" ]; then ok "the two patterns are ANDed"
+else bad "the two patterns are ANDed" "got '$(keys_of "$R")'"; fi
+
+echo "--- 13. and a collection with no values to match refuses ---"
+# sscan's members and zscan's scores are not values in this sense, and answering
+# as if they were would make one option mean three things.
+python3 "$SCAN_PY" "$P" setup $'SADD\x1fst\x1fa' $'ZADD\x1fzt\x1f1\x1fa' >/dev/null
+BAD_S=$(python3 "$SCAN_PY" "$P" cmd SSCAN st 0 VALUEMATCH a 2>/dev/null)
+BAD_Z=$(python3 "$SCAN_PY" "$P" cmd ZSCAN zt 0 VALUEMATCH a 2>/dev/null)
+case "$BAD_S$BAD_Z" in
+    *syntax*syntax*) ok "SSCAN and ZSCAN refuse VALUEMATCH as a syntax error" ;;
+    *) bad "SSCAN and ZSCAN refuse VALUEMATCH" "sscan said '$BAD_S', zscan said '$BAD_Z'" ;;
+esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1

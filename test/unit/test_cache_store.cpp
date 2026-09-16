@@ -1465,3 +1465,86 @@ TEST_CASE("cache_store scan filtering on a hash field")
         CHECK(out.size() == 302);                     // the 300 plus u:1 and u:3
     }
 }
+
+// hscan's pattern matches what a field is CALLED; this is what it holds.  A
+// hash used as a table has the interesting part in the value, and transferring
+// every value to compare them in the client is the round trip being removed.
+TEST_CASE("cache_store hscan filtering on the field's value")
+{
+    cache_store store;
+    store.hset("t", "f1", "berlin");
+    store.hset("t", "f2", "hamburg");
+    store.hset("t", "f3", "berlin");
+    store.hset("t", "f4", "");
+
+    using pairs = std::vector<std::pair<std::string_view, std::string_view>>;
+    auto names = [](const pairs& p) {
+        std::set<std::string_view> s;
+        for (auto& [f, v] : p) s.insert(f);
+        return s;
+    };
+
+    SUBCASE("without a predicate it is every field, as before")
+    {
+        pairs got;
+        CHECK(store.hscan("t", 0, "*", 100000, got) == 0);
+        CHECK(got.size() == 4);
+    }
+
+    SUBCASE("with one it is the fields holding that value")
+    {
+        std::string_view berlin = "berlin";
+        pairs got;
+        CHECK(store.hscan("t", 0, "*", 100000, got, &berlin) == 0);
+        auto n = names(got);
+        CHECK(n.size() == 2);
+        CHECK(n.count("f1") == 1);
+        CHECK(n.count("f3") == 1);
+    }
+
+    SUBCASE("absent is not empty here either")
+    {
+        std::string_view empty = "";
+        pairs got;
+        CHECK(store.hscan("t", 0, "*", 100000, got, &empty) == 0);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].first == "f4");
+    }
+
+    SUBCASE("the field pattern and the value predicate are both required")
+    {
+        std::string_view berlin = "berlin";
+        pairs got;
+        CHECK(store.hscan("t", 0, "f1*", 100000, got, &berlin) == 0);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0].first == "f1");
+    }
+
+    SUBCASE("count bounds the fields examined once there is a predicate")
+    {
+        for (int i = 0; i < 400; i++)
+            store.hset("t", "g" + std::to_string(i), "hamburg");
+        std::string_view nowhere = "atlantis";
+        pairs got;
+        const uint64_t next = store.hscan("t", 0, "*", 4, got, &nowhere);
+        CHECK(got.empty());
+        CHECK(next != 0);
+    }
+
+    SUBCASE("and a whole paged round still finds every match")
+    {
+        for (int i = 0; i < 400; i++)
+            store.hset("t", "g" + std::to_string(i), i % 5 == 0 ? "berlin" : "hamburg");
+        std::string_view berlin = "berlin";
+        std::set<std::string_view> seen;
+        uint64_t cur = 0;
+        int guard = 0;
+        do {
+            pairs page;
+            cur = store.hscan("t", cur, "*", 8, page, &berlin);
+            for (auto& [f, v] : page) { CHECK(v == "berlin"); seen.insert(f); }
+            REQUIRE(++guard < 10000);
+        } while (cur != 0);
+        CHECK(seen.size() == 82);          // 80 of the g's, plus f1 and f3
+    }
+}
