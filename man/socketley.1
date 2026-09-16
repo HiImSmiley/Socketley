@@ -4374,9 +4374,22 @@ Set key with millisecond-precision expiry. Returns "ok".
 .TP
 .BI "scan " "cursor [match pattern] [count n] [valuematch glob] [withvalues]"
 .TQ
-.BI "     " "[type t] [field f]"
+.BI "     " "[type t] [field f] [valuerange " min " " max "]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B A numeric range, which a glob cannot express.
+.I valuerange
+takes the bounds a zset range already speaks --
+.BR \-inf ", " +inf ", and a leading " (
+for an exclusive one -- and keeps the values that fall between them.  With
+.I field
+it is that field that has to be in range.
+.IP
+A value that is not a number matches NO range, not even
+.BR "\-inf +inf" .
+The whole of the value has to be the number: "30kg" is not thirty, and a reader
+that stopped at the digits would be answering a question nobody asked.
 .IP
 .B Asking what a FIELD of a hash holds.
 .I field

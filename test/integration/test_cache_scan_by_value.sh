@@ -390,5 +390,34 @@ case "$BAD_S$BAD_Z" in
     *) bad "SSCAN and ZSCAN refuse VALUEMATCH" "sscan said '$BAD_S', zscan said '$BAD_Z'" ;;
 esac
 
+echo "--- 14. the question a glob cannot ask ---"
+python3 "$SCAN_PY" "$P" setup \
+  $'SET\x1fr:10\x1f10' $'SET\x1fr:20\x1f20' $'SET\x1fr:30\x1f30' \
+  $'SET\x1fr:f\x1f25.5' $'SET\x1fr:na\x1f30kg' >/dev/null
+R=$(scan "$P" COUNT 10000 MATCH 'r:*' VALUERANGE 20 30)
+if [ "$(keys_of "$R")" = "r:20 r:30 r:f" ]; then
+    ok "VALUERANGE takes the values between its bounds, inclusive"
+else
+    bad "VALUERANGE takes the values between its bounds" \
+        "got '$(cut_long "$(keys_of "$R")")', wanted 'r:20 r:30 r:f'"
+fi
+R=$(scan "$P" COUNT 10000 MATCH 'r:*' VALUERANGE '(20' '(30')
+if [ "$(keys_of "$R")" = "r:f" ]; then ok "and a leading ( makes a bound exclusive"
+else bad "a leading ( makes a bound exclusive" "got '$(keys_of "$R")'"; fi
+
+echo "--- 15. and a value that is not a number is in no range at all ---"
+# Not even -inf..+inf.  from_chars would read the 30 out of "30kg" and stop, so
+# the whole of the value has to be the number or it is not one.
+R=$(scan "$P" COUNT 10000 MATCH 'r:*' VALUERANGE -inf +inf)
+if [ "$(keys_of "$R")" = "r:10 r:20 r:30 r:f" ]; then
+    ok "'30kg' matches no range, not even the one every number matches"
+else
+    bad "'30kg' matches no range" "got '$(cut_long "$(keys_of "$R")")'" \
+        "-- r:na in the answer means the value was read as far as it parsed"
+fi
+BADR=$(python3 "$SCAN_PY" "$P" cmd SCAN 0 VALUERANGE abc 40 2>/dev/null)
+case "$BADR" in *float*) ok "a bound that is not a float is an error, not a filter" ;;
+                *) bad "a bound that is not a float is an error" "got '$BADR'" ;; esac
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1

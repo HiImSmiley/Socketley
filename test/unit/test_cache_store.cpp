@@ -2,6 +2,7 @@
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
 #include <map>
+#include <limits>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -1546,5 +1547,79 @@ TEST_CASE("cache_store hscan filtering on the field's value")
             REQUIRE(++guard < 10000);
         } while (cur != 0);
         CHECK(seen.size() == 82);          // 80 of the g's, plus f1 and f3
+    }
+}
+
+// A glob cannot say "between 20 and 30", and that is the one question a store
+// full of records is asked that none of the other filters can answer.
+TEST_CASE("cache_store scan filtering on a numeric range")
+{
+    using vr = cache_store::scan_filter::value_range;
+    cache_store store;
+    store.set("n:10", "10");
+    store.set("n:20", "20");
+    store.set("n:30", "30");
+    store.set("n:f",  "25.5");
+    store.set("n:na", "30kg");
+    store.set("n:e",  "");
+    store.hset("u:1", "age", "30");
+    store.hset("u:2", "age", "22");
+    store.hset("u:3", "age", "older than that");
+
+    auto names = [&](cache_store::scan_filter f) {
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out, f) == 0);
+        return std::set<std::string_view>(out.begin(), out.end());
+    };
+
+    SUBCASE("the bounds are inclusive unless asked otherwise")
+    {
+        vr inc{10, 30, true, true};
+        auto a = names({ nullptr, -1, false, nullptr, &inc });
+        CHECK(a == std::set<std::string_view>{"n:10", "n:20", "n:30", "n:f"});
+
+        vr exc{10, 30, false, false};
+        auto b = names({ nullptr, -1, false, nullptr, &exc });
+        CHECK(b == std::set<std::string_view>{"n:20", "n:f"});
+    }
+
+    SUBCASE("a value that is not a number matches no range at all")
+    {
+        // Not even this one, which every number matches.  from_chars would
+        // happily read the 30 out of "30kg" and stop; the whole of the value has
+        // to be the number or it is not one.
+        vr all{-std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), true, true};
+        auto got = names({ nullptr, -1, false, nullptr, &all });
+        CHECK(got.count("n:na") == 0);
+        CHECK(got.count("n:e")  == 0);
+        CHECK(got.count("n:10") == 1);
+        CHECK(got.count("n:f")  == 1);
+    }
+
+    SUBCASE("a range and a glob are both required")
+    {
+        std::string_view two = "2*";
+        vr r{10, 30, true, true};
+        auto got = names({ &two, -1, false, nullptr, &r });
+        CHECK(got == std::set<std::string_view>{"n:20", "n:f"});
+    }
+
+    SUBCASE("with a field it is the field that has to be in range")
+    {
+        std::string_view age = "age";
+        vr r{25, 40, true, true};
+        auto got = names({ nullptr, -1, false, &age, &r });
+        REQUIRE(got.size() == 1);
+        CHECK(got.count("u:1") == 1);
+    }
+
+    SUBCASE("a field whose value is not a number is not in any range either")
+    {
+        std::string_view age = "age";
+        vr all{-std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), true, true};
+        auto got = names({ nullptr, -1, false, &age, &all });
+        CHECK(got == std::set<std::string_view>{"u:1", "u:2"});
     }
 }

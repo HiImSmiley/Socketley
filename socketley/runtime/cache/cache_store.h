@@ -180,6 +180,11 @@ public:
         // against what that field holds rather than against the key's own
         // value.  Absent means the key's own value, as before.
         const std::string_view* field = nullptr;
+        // A numeric range on the same value a glob would be matched against.
+        // A value that is not a number matches no range at all, which is a
+        // different answer from matching every range -- "30kg" is not thirty.
+        struct value_range { double lo, hi; bool lo_inclusive, hi_inclusive; };
+        const value_range* range = nullptr;
     };
 
     uint64_t scan(uint64_t cursor, std::string_view pattern,

@@ -4129,12 +4129,13 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 uint64_t& next, bool node_local,
                                 const std::string_view* value_pattern,
                                 int type_map, bool with_values,
-                                const std::string_view* field)
+                                const std::string_view* field,
+                                const cache_store::scan_filter::value_range* range)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
         next = m_store.scan(cursor, pattern, count, out,
-                            { value_pattern, type_map, with_values, field });
+                            { value_pattern, type_map, with_values, field, range });
         return true;
     }
 
@@ -4145,7 +4146,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     {
         const uint64_t store_next =
             m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                         { value_pattern, type_map, with_values, field });
+                         { value_pattern, type_map, with_values, field, range });
         next = store_next == 0 ? 0
                                : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
@@ -4157,7 +4158,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
 
     const uint64_t store_next =
         m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                     { value_pattern, type_map, with_values, field });
+                     { value_pattern, type_map, with_values, field, range });
 
     if (store_next != 0)
         next = cache_scan_cursor_make(m_shard_i, store_next);
@@ -6095,7 +6096,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             std::string_view scan_value;
             std::string_view scan_field;
             bool scan_has_value = false, scan_count_given = false, scan_has_type = false;
-            bool scan_with_values = false, scan_has_field = false;
+            bool scan_with_values = false, scan_has_field = false, scan_has_range = false;
+            cache_store::scan_filter::value_range scan_range{};
             int scan_type = -1;
             size_t scan_count = 10;
             while (!rest2.empty())
@@ -6125,6 +6127,23 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
                     scan_has_field = true;
                 }
+                // Two tokens, where every other option here takes one -- the
+                // bounds a zset range already speaks, so there is one numeric
+                // vocabulary on this port and not two.
+                else if (fnv1a_lower(opt) == fnv1a("valuerange") && !rest2.empty())
+                {
+                    sp2 = rest2.find(' ');
+                    std::string_view lo_s = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
+                    rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
+                    sp2 = rest2.find(' ');
+                    std::string_view hi_s = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
+                    rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
+                    if (lo_s.empty() || hi_s.empty()
+                     || !parse_score_bound(lo_s, scan_range.lo, scan_range.lo_inclusive)
+                     || !parse_score_bound(hi_s, scan_range.hi, scan_range.hi_inclusive))
+                    { rb.append("error: min or max is not a float\n", 34); return; }
+                    scan_has_range = true;
+                }
                 else if (fnv1a_lower(opt) == fnv1a("type") && !rest2.empty())
                 {
                     sp2 = rest2.find(' ');
@@ -6143,11 +6162,11 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 }
             }
             // Same default as the RESP door, for the same reason.
-            if ((scan_has_value || scan_has_field) && !scan_count_given)
+            if ((scan_has_value || scan_has_field || scan_has_range) && !scan_count_given)
                 scan_count = 1000;
             // Same requirement as the RESP door, for the same reason.
             const int scan_needs = scan_has_field ? 3
-                                 : (scan_has_value || scan_with_values) ? 0 : -1;
+                                 : (scan_has_value || scan_with_values || scan_has_range) ? 0 : -1;
             if (scan_has_type && (scan_type < 0 ||
                                   (scan_needs >= 0 && scan_type != scan_needs)))
             {
@@ -6159,7 +6178,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
                             conn->cluster_port, scan_has_value ? &scan_value : nullptr,
                             scan_has_type ? scan_type : -1, scan_with_values,
-                            scan_has_field ? &scan_field : nullptr))
+                            scan_has_field ? &scan_field : nullptr,
+                            scan_has_range ? &scan_range : nullptr))
             {
                 rb.append("error: invalid cursor\n", 22);
                 return;
@@ -9100,7 +9120,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             std::string_view scan_value;
             std::string_view scan_field;
             bool scan_has_value = false, scan_count_given = false, scan_has_type = false;
-            bool scan_with_values = false, scan_has_field = false;
+            bool scan_with_values = false, scan_has_field = false, scan_has_range = false;
+            cache_store::scan_filter::value_range scan_range{};
             int scan_type = -1;
             size_t scan_count = 10;
             for (int i = 2; i < argc; i++)
@@ -9124,6 +9145,16 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     scan_field = args[++i];
                     scan_has_field = true;
                 }
+                // The bounds a zset range already speaks: -inf, +inf, and a
+                // leading ( for exclusive.  One numeric vocabulary, not two.
+                else if (fnv1a_lower(args[i]) == fnv1a("valuerange") && i + 2 < argc)
+                {
+                    if (!parse_score_bound(args[i + 1], scan_range.lo, scan_range.lo_inclusive)
+                     || !parse_score_bound(args[i + 2], scan_range.hi, scan_range.hi_inclusive))
+                    { resp::encode_error_into(rb, "min or max is not a float"); return; }
+                    scan_has_range = true;
+                    i += 2;
+                }
                 else if (fnv1a_lower(args[i]) == fnv1a("count") && i + 1 < argc)
                 {
                     size_t cnt = 10;
@@ -9135,15 +9166,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             // of those returns almost nothing per page: a client that did not
             // say otherwise would be asked for sixty thousand round trips over a
             // keyspace one call could walk in 74 ms.
-            if ((scan_has_value || scan_has_field) && !scan_count_given)
+            if ((scan_has_value || scan_has_field || scan_has_range) && !scan_count_given)
                 scan_count = 1000;
             // Which map the other options require, if they require one: a field
-            // names hashes, a value predicate or WITHVALUES without one names
-            // strings.  A type filter that disagrees with that, or a type name
-            // no type has, can match nothing -- and the walk is skipped rather
-            // than run to find that out.
+            // names hashes, and a value predicate, a range or WITHVALUES without
+            // one names strings.  A type filter that disagrees with that, or a
+            // type name no type has, can match nothing -- and the walk is skipped
+            // rather than run to find that out.
             const int scan_needs = scan_has_field ? 3
-                                 : (scan_has_value || scan_with_values) ? 0 : -1;
+                                 : (scan_has_value || scan_with_values || scan_has_range) ? 0 : -1;
             if (scan_has_type && (scan_type < 0 ||
                                   (scan_needs >= 0 && scan_type != scan_needs)))
             {
@@ -9157,7 +9188,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
                             conn->cluster_port, scan_has_value ? &scan_value : nullptr,
                             scan_has_type ? scan_type : -1, scan_with_values,
-                            scan_has_field ? &scan_field : nullptr))
+                            scan_has_field ? &scan_field : nullptr,
+                            scan_has_range ? &scan_range : nullptr))
             {
                 resp::encode_error_into(rb, "invalid cursor");
                 return;

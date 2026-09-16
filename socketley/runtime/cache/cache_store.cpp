@@ -1096,6 +1096,23 @@ static inline uint64_t scan_cursor_pack(uint8_t map, size_t buckets, size_t buck
 // is usually broad; a value predicate is selective by construction, so under
 // scan()'s rule one call would walk the whole map -- measured at 74 ms over
 // 632,331 keys, and that is 74 ms with this shard answering nobody.
+// A stored value read as a number, with the whole of it consumed.  "30" is
+// thirty and "30kg" is not a number at all: from_chars would happily stop after
+// the digits, and a range that matched "30kg" would be answering a question
+// nobody asked.
+static bool value_in_range(std::string_view sv,
+                           const cache_store::scan_filter::value_range& r)
+{
+    if (sv.empty()) return false;
+    double v = 0;
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+    if (ec != std::errc{} || ptr != sv.data() + sv.size())
+        return false;
+    if (r.lo_inclusive ? (v < r.lo) : (v <= r.lo)) return false;
+    if (r.hi_inclusive ? (v > r.hi) : (v >= r.hi)) return false;
+    return true;
+}
+
 // One page of a bucket-walked map, which is the shape all three scans have.
 //
 // `visit` is handed each entry; `page_full` is asked after each whole bucket and
@@ -1168,6 +1185,8 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
                 return;
             if (!match_all_vals && !socketley::glob_match(*filter.value, fit->second))
                 return;
+            if (filter.range && !value_in_range(fit->second, *filter.range))
+                return;
             out.push_back(e.first);
             if (filter.with_values)
                 out.push_back(fit->second);
@@ -1193,6 +1212,8 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
                 return;
             if (!match_all_vals && !socketley::glob_match(*filter.value, e.second))
                 return;
+            if (filter.range && !value_in_range(e.second, *filter.range))
+                return;
             out.push_back(e.first);
             if (filter.with_values)
                 out.push_back(e.second);
@@ -1209,7 +1230,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     // that disagrees was answered empty by the caller before it got here.
     if (filter.field)
         return scan_hash_field(cursor, pattern, count, out, filter);
-    if (filter.value || filter.with_values)
+    if (filter.value || filter.with_values || filter.range)
         return scan_values(cursor, pattern, count, out, filter);
 
     // Not `pattern.empty() ||`: MATCH "" asks for the key that has no name,

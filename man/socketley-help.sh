@@ -529,7 +529,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC}            setnx key val, setex key sec val, psetex key ms val ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}            scan cursor [match pat] [count n]                   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}                 [valuematch glob] [withvalues]                 ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}                 [type t] [field f]                             ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                 [type t] [field f] [valuerange min max]        ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   Lists:   lpush/rpush key val, lpop/rpop key, llen key       ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}            lrange key start stop, lindex key idx               ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   Sets:    sadd key member, srem key member, scard key         ${CYAN}│${NC}"
