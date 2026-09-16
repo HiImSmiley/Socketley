@@ -217,6 +217,30 @@ want "keys on two shards are -CROSSSLOT" "CROSSSLOT" \
 want "a script with no keys runs where asked" "+ok" \
   '[["EVAL","return redis.status_reply(\"ok\")","0"]]' "$PS"
 
+# A script reaches the cache through the same door a client does -- redis.call
+# builds a RESP array and hands it to the dispatch -- so every option scan has
+# is a script's too.  That follows from the structure and would stop following
+# it the day somebody gives scripts a dispatch of their own, which is what these
+# rows are for.
+echo ""
+echo "--- scan's filters are reachable from a script ---"
+resp '[["FLUSHDB"],["SET","u:1","{\"city\":\"berlin\"}"],["SET","u:2","{\"city\":\"hamburg\"}"],["HSET","h:1","city","berlin"],["HSET","h:2","city","hamburg"]]' >/dev/null
+# The COUNT and not a key name: four keys are seeded and every one of them comes
+# back on a build that skips the option, so a row looking for "u:1" in the reply
+# passes there too and measures nothing.
+want "a script can filter on the value" ":1" \
+  '[["EVAL","local r = redis.call(\"scan\",0,\"count\",10000,\"valuematch\",\"*berlin*\"); return #r[2]","0"]]'
+want "a script can restrict to a type" ":2" \
+  '[["EVAL","local r = redis.call(\"scan\",0,\"count\",10000,\"type\",\"hash\"); return #r[2]","0"]]'
+want "a script can ask what a field holds" ":1" \
+  '[["EVAL","local r = redis.call(\"scan\",0,\"count\",10000,\"field\",\"city\",\"valuematch\",\"berlin\"); return #r[2]","0"]]'
+want "a script can count a type without walking it" ":2" \
+  '[["EVAL","return redis.call(\"dbsize\",\"type\",\"hash\")","0"]]'
+# The whole loop inside one script, which is what a client would otherwise do
+# over the wire: one answer instead of a page at a time.
+want "a script can run the cursor loop itself" ":1" \
+  '[["EVAL","local c,n = \"0\",0; repeat local r = redis.call(\"scan\",c,\"count\",1000,\"field\",\"city\",\"valuematch\",\"berlin\"); c = r[1]; n = n + #r[2]; until c == \"0\"; return n","0"]]'
+
 echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && { echo "  OK"; exit 0; } || exit 1
