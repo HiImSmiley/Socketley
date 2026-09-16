@@ -4126,11 +4126,12 @@ uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
 // walk cache_shard_map.h describes.
 bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 size_t count, std::vector<std::string_view>& out,
-                                uint64_t& next, bool node_local)
+                                uint64_t& next, bool node_local,
+                                const std::string_view* value_pattern)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
-        next = m_store.scan(cursor, pattern, count, out);
+        next = m_store.scan(cursor, pattern, count, out, value_pattern);
         return true;
     }
 
@@ -4140,7 +4141,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     if (node_local)
     {
         const uint64_t store_next =
-            m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out);
+            m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out, value_pattern);
         next = store_next == 0 ? 0
                                : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
@@ -4151,7 +4152,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
         return false;           // a cursor from a shard set that is not this one
 
     const uint64_t store_next =
-        m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out);
+        m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out, value_pattern);
 
     if (store_next != 0)
         next = cache_scan_cursor_make(m_shard_i, store_next);
@@ -6086,6 +6087,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (!parse_int_sv(cursor_str, scan_cursor)) { rb.append("error: invalid cursor\n", 22); return; }
             }
             std::string_view scan_pattern = "*";
+            std::string_view scan_value;
+            bool scan_has_value = false, scan_count_given = false;
             size_t scan_count = 10;
             while (!rest2.empty())
             {
@@ -6098,19 +6101,29 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     scan_pattern = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
                     rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
                 }
+                else if (fnv1a_lower(opt) == fnv1a("valuematch") && !rest2.empty())
+                {
+                    sp2 = rest2.find(' ');
+                    scan_value = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
+                    rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
+                    scan_has_value = true;
+                }
                 else if (fnv1a_lower(opt) == fnv1a("count") && !rest2.empty())
                 {
                     sp2 = rest2.find(' ');
                     std::string_view cnt_str = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
                     rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
                     size_t cnt = 10;
-                    if (parse_int_sv(cnt_str, cnt)) scan_count = cnt;
+                    if (parse_int_sv(cnt_str, cnt)) { scan_count = cnt; scan_count_given = true; }
                 }
             }
+            // Same default as the RESP door, for the same reason.
+            if (scan_has_value && !scan_count_given)
+                scan_count = 1000;
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
-                            conn->cluster_port))
+                            conn->cluster_port, scan_has_value ? &scan_value : nullptr))
             {
                 rb.append("error: invalid cursor\n", 22);
                 return;
@@ -9009,22 +9022,35 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 if (!parse_int_sv(args[1], scan_cursor)) { resp::encode_error_into(rb, "invalid cursor"); return; }
             }
             std::string_view scan_pattern = "*";
+            std::string_view scan_value;
+            bool scan_has_value = false, scan_count_given = false;
             size_t scan_count = 10;
             for (int i = 2; i < argc; i++)
             {
                 if (fnv1a_lower(args[i]) == fnv1a("match") && i + 1 < argc)
                     scan_pattern = args[++i];
+                else if (fnv1a_lower(args[i]) == fnv1a("valuematch") && i + 1 < argc)
+                {
+                    scan_value = args[++i];
+                    scan_has_value = true;
+                }
                 else if (fnv1a_lower(args[i]) == fnv1a("count") && i + 1 < argc)
                 {
                     size_t cnt = 10;
-                    if (parse_int_sv(args[i+1], cnt)) scan_count = cnt;
+                    if (parse_int_sv(args[i+1], cnt)) { scan_count = cnt; scan_count_given = true; }
                     i++;
                 }
             }
+            // COUNT means keys EXAMINED once there is a value predicate, and ten
+            // of those returns almost nothing per page: a client that did not
+            // say otherwise would be asked for sixty thousand round trips over a
+            // keyspace one call could walk in 74 ms.
+            if (scan_has_value && !scan_count_given)
+                scan_count = 1000;
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
-                            conn->cluster_port))
+                            conn->cluster_port, scan_has_value ? &scan_value : nullptr))
             {
                 resp::encode_error_into(rb, "invalid cursor");
                 return;

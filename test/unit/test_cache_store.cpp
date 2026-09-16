@@ -1077,3 +1077,95 @@ TEST_CASE("accounted memory tracks contents, not deletion history")
     CHECK(with_history.get_memory_used() == fresh.get_memory_used());
     CHECK(with_history.size() == fresh.size());
 }
+
+// A value predicate is answered out of the string map alone, and it shares its
+// cursor with the ordinary scan -- which packs a map index beside a bucket
+// index, so a cursor handed over from a walk that had already moved on carries
+// a bucket number belonging to a different table.
+TEST_CASE("cache_store scan filtering on the value")
+{
+    cache_store store;
+    std::string_view berlin = "*berlin*";
+
+    SUBCASE("only a string key holds a value")
+    {
+        store.set("s:hit",  "wohnt in berlin");
+        store.set("s:miss", "wohnt in hamburg");
+        store.rpush("l:1", "berlin");
+        store.sadd("t:1", "berlin");
+        store.hset("h:1", "city", "berlin");
+        store.zadd("z:1", 1.0, "berlin");
+
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out, &berlin) == 0);
+        REQUIRE(out.size() == 1);
+        CHECK(out[0] == "s:hit");
+    }
+
+    SUBCASE("absent is not empty")
+    {
+        store.set("e:1", "");
+        store.set("e:2", "not empty");
+
+        std::vector<std::string_view> out;
+        std::string_view none = "";
+        CHECK(store.scan(0, "*", 100000, out, &none) == 0);
+        REQUIRE(out.size() == 1);
+        CHECK(out[0] == "e:1");
+
+        // And without the predicate the same call answers both.
+        std::vector<std::string_view> all;
+        CHECK(store.scan(0, "*", 100000, all) == 0);
+        CHECK(all.size() == 2);
+    }
+
+    SUBCASE("the key pattern and the value pattern are both required")
+    {
+        store.set("u:1", "berlin");
+        store.set("u:2", "hamburg");
+        store.set("x:1", "berlin");
+
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "u:*", 100000, out, &berlin) == 0);
+        REQUIRE(out.size() == 1);
+        CHECK(out[0] == "u:1");
+    }
+
+    SUBCASE("count bounds the keys examined, not the keys returned")
+    {
+        for (int i = 0; i < 400; i++)
+            store.set("k:" + std::to_string(i), "hamburg");
+
+        // Nothing matches, so a page bounded by results would run to the end of
+        // the map in one call and answer 0.  Bounded by keys examined it stops
+        // early and hands back a cursor.
+        std::vector<std::string_view> out;
+        const uint64_t next = store.scan(0, "*", 8, out, &berlin);
+        CHECK(out.empty());
+        CHECK(next != 0);
+    }
+
+    SUBCASE("a cursor naming another map restarts rather than skipping")
+    {
+        for (int i = 0; i < 300; i++)
+            store.set("v:" + std::to_string(i), "berlin");
+
+        // The store does not publish its bucket count and guessing it is how this
+        // subcase first passed against the defect it is for.  A real cursor
+        // carries it: one page of an ordinary scan comes back with the string
+        // map's own bucket count packed into bits 32..54.
+        std::vector<std::string_view> probe;
+        const uint64_t real = store.scan(0, "*", 1, probe);
+        REQUIRE(real != 0);
+        const uint64_t buckets = (real >> 32) & 0x7FFFFFull;
+
+        // Same bucket count, different map -- the one shape the rehash guard
+        // cannot tell from a legitimate resume.  Taken at face value it starts
+        // the walk at bucket five and the keys before it are returned by no call
+        // of the iteration at all.
+        const uint64_t foreign = (1ull << 55) | (buckets << 32) | 5ull;
+        std::vector<std::string_view> out;
+        CHECK(store.scan(foreign, "*", 100000, out, &berlin) == 0);
+        CHECK(out.size() == 300);
+    }
+}

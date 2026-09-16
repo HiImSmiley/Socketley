@@ -154,8 +154,18 @@ public:
     // and the top six bits are free for a shard tag only while the map index
     // fits in the two below them.
     static constexpr uint8_t scan_last_map = 4;   // m_data, m_lists, m_sets, m_hashes, m_zsets
+    // `value_pattern` is a pointer and not an empty string_view because absent
+    // and empty are different requests, the same distinction MATCH "" makes.
     uint64_t scan(uint64_t cursor, std::string_view pattern,
-                  size_t count, std::vector<std::string_view>& out) const;
+                  size_t count, std::vector<std::string_view>& out,
+                  const std::string_view* value_pattern = nullptr) const;
+
+    // The string map alone, which is the only one a value predicate can be
+    // answered from, with the page bounded by keys examined rather than keys
+    // returned -- see the definition for why those are not the same contract.
+    uint64_t scan_values(uint64_t cursor, std::string_view pattern, size_t count,
+                         std::vector<std::string_view>& out,
+                         std::string_view value_pattern) const;
 
     // --- Atomic increment ---
     bool incr(std::string_view key, int64_t delta, int64_t& result);

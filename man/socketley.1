@@ -4372,9 +4372,25 @@ rather than nil, because a caller asking for the old value wants to hear that.
 .BI "psetex " "key milliseconds value"
 Set key with millisecond-precision expiry. Returns "ok".
 .TP
-.BI "scan " "cursor [match pattern] [count n]"
+.BI "scan " "cursor [match pattern] [count n] [valuematch glob]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B Filtering on the value.
+.I valuematch
+returns only the keys whose VALUE matches the glob, which a client would
+otherwise do by fetching the whole keyspace and discarding nearly all of it.
+Only a string key holds a single value, so a list, set, hash or zset never
+matches one, not even when it contains the pattern as a member.
+With
+.I valuematch
+present,
+.I count
+bounds the keys EXAMINED rather than the keys returned and defaults to 1000:
+the predicate is selective, so a page bounded by results would walk the whole
+keyspace in a single call.
+This is a scan and not an index. It costs about 8 per cent over a plain scan
+per key examined, and nothing is maintained on the write path.
 .IP
 .B What an iteration guarantees.
 A key that is present for the whole iteration is returned at least once,
@@ -4583,6 +4599,9 @@ Set the field only if it does not exist. Returns 1 or 0.
 .B scan
 over one key's collection instead of over the keyspace: start at 0, pass back
 the cursor each call, and 0 again means the walk is done.
+.I valuematch
+is not among their options: it asks what value a KEY holds, and the members of
+a collection are not that.
 .I count
 is a hint and defaults to 10, as it does on Redis; a collection smaller than
 one bucket-load comes back whole with cursor 0.

@@ -1076,9 +1076,73 @@ bool cache_store::setnx(std::string_view key, std::string_view value)
 // and what is still not guaranteed is a rehash mid-iteration, which restarts
 // the map being walked and trades duplicates, which the contract allows, for a
 // skip, which it does not.
-uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
-                            size_t count, std::vector<std::string_view>& out) const
+// The cursor layout, in one place, because scan() and scan_values() hand each
+// other cursors and two copies of a bit layout is two chances to disagree.
+static inline uint64_t scan_cursor_pack(uint8_t map, size_t buckets, size_t bucket)
 {
+    return (static_cast<uint64_t>(map & 0x7u) << 55)
+         | ((static_cast<uint64_t>(buckets) & 0x7FFFFF) << 32)
+         | (static_cast<uint64_t>(bucket) & 0xFFFFFFFFu);
+}
+
+// One page of the string map, filtered on the VALUE a key holds.
+//
+// Only this map, because the other four hold no single value to match against:
+// a list, set, hash or zset key can never satisfy a value predicate, so walking
+// them is time spent to return nothing.
+//
+// And the page ends on keys EXAMINED where scan() ends on keys returned, which
+// is the contract that matters here.  scan() can afford its rule because MATCH
+// is usually broad; a value predicate is selective by construction, so under
+// scan()'s rule one call would walk the whole map -- measured at 74 ms over
+// 632,331 keys, and that is 74 ms with this shard answering nobody.
+uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
+                                  size_t count, std::vector<std::string_view>& out,
+                                  std::string_view value_pattern) const
+{
+    const bool match_all_keys = (pattern == "*");
+    const bool match_all_vals = (value_pattern == "*");
+
+    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
+    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
+    const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
+
+    const size_t nbuckets = m_data.bucket_count();
+    size_t b = 0;
+    // A cursor naming another map came from a walk that was not this one -- an
+    // iteration that changed its options midway -- and its bucket index means
+    // nothing here.  Restarting repeats keys, which the contract allows; taking
+    // the number at face value would start this walk partway into m_data and
+    // skip everything before it, which the contract does not.
+    if (cursor != 0 && in_map == 0)
+        b = (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
+
+    size_t examined = 0;
+    for (; b < nbuckets; ++b)
+    {
+        for (auto it = m_data.begin(b); it != m_data.end(b); ++it)
+        {
+            ++examined;
+            if (!match_all_keys && !socketley::glob_match(pattern, it->first))
+                continue;
+            if (!match_all_vals && !socketley::glob_match(value_pattern, it->second))
+                continue;
+            out.push_back(it->first);
+        }
+        // Whole buckets and never half of one, for the reason scan() gives.
+        if (examined >= count && b + 1 < nbuckets)
+            return scan_cursor_pack(0, nbuckets, b + 1);
+    }
+    return 0;
+}
+
+uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
+                            size_t count, std::vector<std::string_view>& out,
+                            const std::string_view* value_pattern) const
+{
+    if (value_pattern)
+        return scan_values(cursor, pattern, count, out, *value_pattern);
+
     // Not `pattern.empty() ||`: MATCH "" asks for the key that has no name,
     // and answering it with the whole keyspace is the opposite of the request.
     // Callers spell an absent MATCH as "*".
@@ -1099,11 +1163,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
     uint64_t       in_bucket  = cursor & 0xFFFFFFFFu;
 
-    auto pack = [](uint8_t map, size_t buckets, size_t bucket) -> uint64_t {
-        return (static_cast<uint64_t>(map & 0x7u) << 55)
-             | ((static_cast<uint64_t>(buckets) & 0x7FFFFF) << 32)
-             | (static_cast<uint64_t>(bucket) & 0xFFFFFFFFu);
-    };
+    auto pack = scan_cursor_pack;
 
     // One map from `first_bucket` on, returning the cursor to resume with or 0
     // when this map is exhausted.
