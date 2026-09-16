@@ -1322,3 +1322,51 @@ TEST_CASE("cache_store scan returning values beside keys")
         CHECK(pairs == 303);               // 300 plus u:1, u:2 and e:1
     }
 }
+
+// How many keys of a type there are is a question the maps answer by existing,
+// and counting the same thing with a scan is the whole map walked.
+TEST_CASE("cache_store counts one type without walking it")
+{
+    cache_store store;
+    for (int i = 0; i < 7; i++)  store.set("s:" + std::to_string(i), "v");
+    for (int i = 0; i < 3; i++)  store.rpush("l:" + std::to_string(i), "e");
+    for (int i = 0; i < 2; i++)  store.sadd("t:" + std::to_string(i), "m");
+    for (int i = 0; i < 11; i++) store.hset("h:" + std::to_string(i), "f", "v");
+    for (int i = 0; i < 5; i++)  store.zadd("z:" + std::to_string(i), 1.0, "m");
+
+    SUBCASE("each map is counted on its own")
+    {
+        CHECK(store.size_of_type(0) == 7);
+        CHECK(store.size_of_type(1) == 3);
+        CHECK(store.size_of_type(2) == 2);
+        CHECK(store.size_of_type(3) == 11);
+        CHECK(store.size_of_type(4) == 5);
+    }
+
+    SUBCASE("a map no type names counts nothing")
+    {
+        CHECK(store.size_of_type(-1) == 0);
+        CHECK(store.size_of_type(5)  == 0);
+        CHECK(store.size_of_type(99) == 0);
+    }
+
+    SUBCASE("and the five of them are the whole keyspace")
+    {
+        // The invariant that makes the five answers trustworthy together: a map
+        // counted twice or missed entirely shows up here and nowhere else.
+        uint32_t sum = 0;
+        for (int m = 0; m <= 4; m++) sum += store.size_of_type(m);
+        CHECK(sum == store.size());
+        CHECK(sum == 28);
+    }
+
+    SUBCASE("it agrees with what a walk of the same map returns")
+    {
+        for (int m = 0; m <= 4; m++)
+        {
+            std::vector<std::string_view> out;
+            CHECK(store.scan(0, "*", 1000000, out, nullptr, m) == 0);
+            CHECK(out.size() == store.size_of_type(m));
+        }
+    }
+}

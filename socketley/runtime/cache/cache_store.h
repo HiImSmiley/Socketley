@@ -172,6 +172,10 @@ public:
     // The map a type name names, or -1 for a name no type has.
     static int scan_map_of_type(std::string_view name);
 
+    // How many keys one map holds, which is O(1) where counting the same thing
+    // with a scan is the whole map walked and every key name sent back.
+    uint32_t size_of_type(int map) const;
+
     // The string map alone, which is the only one a value predicate can be
     // answered from, with the page bounded by keys examined rather than keys
     // returned -- see the definition for why those are not the same contract.

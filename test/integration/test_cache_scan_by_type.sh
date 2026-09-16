@@ -23,6 +23,9 @@
 #     empty answer and a pointless full walk
 #   * the case of the name, which a client should not have to guess
 #   * and the plain SCAN they all share a function with, unchanged
+#   * a per-type COUNT that disagrees with a walk of the same type, or five
+#     counts that do not add up to the keyspace -- the two ways an O(1) answer
+#     can drift away from the O(n) one it stands in for
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -101,6 +104,12 @@ if mode == 'setup':
         send(f, s, spec.split('\x1f'))
         read_reply(f)
     print("ok")
+elif mode == 'cmd':
+    # One command, one reply, printed flat -- for the counting rows, which are
+    # not walks and must not be run through the cursor loop.
+    send(f, s, rest)
+    r = read_reply(f)
+    print(r.decode('latin1') if isinstance(r, bytes) else r)
 elif mode == 'resume':
     # A cursor from a plain scan that has moved past the string map: its top
     # bits name another map, and its bucket index is that map's, not m_data's.
@@ -228,6 +237,41 @@ if ss -ltn 2>/dev/null | grep -q ":$PS "; then
             "   restriction dropped on the hand-off shows up only here"; fi
 else
     bad "the sharded cache bound its port" "nothing listening on $PS"
+fi
+
+echo "--- 9. counting a type, which the maps answer by existing ---"
+cmd() { python3 "$SCAN_PY" "$1" cmd "${@:2}" 2>/dev/null; }
+COUNT_OK=1
+for pair in "string 5" "list 1" "set 1" "hash 1" "zset 1"; do
+    set -- $pair
+    GOT=$(cmd "$P" DBSIZE TYPE "$1")
+    [ "$GOT" = "$2" ] || { bad "DBSIZE TYPE $1 counts its own map" "got '$GOT', wanted $2"; COUNT_OK=0; }
+done
+[ "$COUNT_OK" = 1 ] && ok "DBSIZE TYPE counts each of the five maps"
+
+echo "--- 10. a name no type has counts nothing, not everything ---"
+GOT=$(cmd "$P" DBSIZE TYPE stream)
+if [ "$GOT" = 0 ]; then ok "DBSIZE TYPE stream is 0"
+else bad "a type name no type has counts nothing" "got '$GOT'" \
+        "-- the whole keyspace here means the name fell through to no filter"; fi
+
+echo "--- 11. the O(1) answer and the O(n) one have to agree ---"
+TOTAL_KEYS=$(cmd "$P" DBSIZE)
+SUM=0
+AGREE=1
+for t in string list set hash zset; do
+    C=$(cmd "$P" DBSIZE TYPE "$t")
+    SUM=$(( SUM + C ))
+    W=$(scan "$P" COUNT 10000 TYPE "$t")
+    N=$(keys_of "$W"); N=$([ -z "$N" ] && echo 0 || echo "$N" | wc -w)
+    [ "$C" = "$N" ] || { bad "the count of $t agrees with a walk of it" "count $C, walk $N"; AGREE=0; }
+done
+if [ "$AGREE" = 1 ] && [ "$SUM" = "$TOTAL_KEYS" ]; then
+    ok "the five counts sum to DBSIZE ($SUM) and each agrees with its own walk"
+else
+    bad "the five counts sum to DBSIZE and each agrees with its own walk" \
+        "sum $SUM against DBSIZE $TOTAL_KEYS" \
+        "-- a map counted twice or missed entirely shows up here and nowhere else"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

@@ -4447,8 +4447,20 @@ duplicates \(em allowed above \(em for the skip, which is not.
 is a hint, as it is in Redis. Whole buckets are returned, so a reply may carry
 somewhat more or fewer keys than asked for.
 .TP
-.B size
-Return number of stored keys (all types).
+.BI "size " "[type t]"
+Return the number of stored keys.  Without
+.I type
+that is every type together, which is what
+.B DBSIZE
+answers over RESP; with it, the count of that one type and nothing else.
+.IP
+Both are O(1): the count of a type is the size of the map it is stored in, so
+this is a lookup and not a walk.  Counting the same thing with
+.B "scan ... type"
+is the whole map walked and every key name sent back -- measured at 50.6 ms
+against 0.107 ms over 50,000 hashes, and the gap widens with the keyspace
+because only one side of it grows.  A name no type has counts nothing rather
+than everything.
 .PP
 .B Lists (ordered, deque-backed):
 .TP

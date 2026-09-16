@@ -2069,6 +2069,19 @@ bool cache_store::del(std::string_view key)
     return drop_value(key);
 }
 
+uint32_t cache_store::size_of_type(int map) const
+{
+    switch (map)
+    {
+        case 0:  return static_cast<uint32_t>(m_data.size());
+        case 1:  return static_cast<uint32_t>(m_lists.size());
+        case 2:  return static_cast<uint32_t>(m_sets.size());
+        case 3:  return static_cast<uint32_t>(m_hashes.size());
+        case 4:  return static_cast<uint32_t>(m_zsets.size());
+        default: return 0;          // a name no type has holds no keys
+    }
+}
+
 uint32_t cache_store::size() const
 {
     return static_cast<uint32_t>(m_data.size() + m_lists.size() + m_sets.size()

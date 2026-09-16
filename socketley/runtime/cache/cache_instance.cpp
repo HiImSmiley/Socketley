@@ -6211,6 +6211,20 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         }
         case fnv1a("size"):
         {
+            // size [type t] -- the same option the RESP door's dbsize takes.
+            size_t sp_t = args.find(' ');
+            std::string_view opt_t = (sp_t == std::string_view::npos) ? args : args.substr(0, sp_t);
+            if (!opt_t.empty() && fnv1a_lower(opt_t) == fnv1a("type") &&
+                sp_t != std::string_view::npos)
+            {
+                std::string_view rest_t = args.substr(sp_t + 1);
+                const size_t sp_n = rest_t.find(' ');
+                const std::string_view tn =
+                    (sp_n == std::string_view::npos) ? rest_t : rest_t.substr(0, sp_n);
+                const int m = cache_store::scan_map_of_type(tn);
+                append_int_nl(rb, m < 0 ? 0u : m_store.size_of_type(m));
+                break;
+            }
             append_int_nl(rb, m_store.size());
             break;
         }
@@ -8348,6 +8362,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         }
         case fnv1a("dbsize"):
         {
+            // dbsize [type t] -- the count of one map, answered from its size
+            // rather than by walking it.  Same vocabulary as scan's type filter,
+            // and a name no type has counts nothing rather than everything.
+            if (argc >= 3 && fnv1a_lower(args[1]) == fnv1a("type"))
+            {
+                const int m = cache_store::scan_map_of_type(args[2]);
+                resp::encode_integer_into(rb, m < 0 ? 0u : m_store.size_of_type(m));
+                break;
+            }
             resp::encode_integer_into(rb, m_store.size());
             break;
         }

@@ -482,7 +482,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC} --shards N: N worker processes on one port. A key belongs to   ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   one shard (hash of the key), and a command naming another    ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   shard's key is answered by that shard - so it stays ONE       ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}   store: dbsize sums, keys lists all of them, scan walks the    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}   store: dbsize [type t] sums, keys lists them, scan walks the  ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   whole keyspace, publish reaches every subscriber.             ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   Measured, 4 clients, depth 1: 172k -> 289k ops/s, 1.68x at 4. ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   --persistent works across a CHANGED shard count: each shard   ${CYAN}│${NC}"
