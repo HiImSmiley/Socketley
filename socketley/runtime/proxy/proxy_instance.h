@@ -1038,6 +1038,30 @@ private:
     // again; making the single-shot arm sticky per connection instead holds
     // 542 MB and costs 11.1%, because a connection that crossed the watermark
     // once never goes back.
+    // NOT per connection.  The withdrawal asks client_backpressured() about one
+    // connection while the arm reads this count, which looks like the two halves
+    // disagreeing -- so the arm was made to ask the same per-connection question
+    // and the gate on the total was dropped.  That is 5.40% faster at 1,200
+    // connections and 1 MiB bodies with clients that read (seven passes, range
+    // 2.71..7.89, worker at 1.00 cores in both arms, client at 0.25), and it
+    // costs the property this rule exists for.  Held against the arm pinned on,
+    // one run each, same day, same box:
+    //
+    //      what the arm asks              upload hold   slow-client hold
+    //      the total (this rule)                 42%          70%
+    //      the connection                        74% FAIL     80%
+    //      the connection, under 1/4 point       57%          85%
+    //      the connection, under 1/16 point      58%          93% FAIL
+    //
+    // The bounds there are 60% and 88%, from the two tests that measure them.
+    // Margin at the arm does not buy the bound back, and 1/16 is worse than 1/4
+    // on the second row: the depth at arm time says little about what an armed
+    // recv goes on to deliver, because it keeps delivering until the cancel
+    // lands and the cancel is a turn late.  The gate on the total is a brake on
+    // the whole fleet the moment the proxy is over budget, which is earlier and
+    // broader than any question about one connection.  The two halves were not
+    // disagreeing: what they owe each other is that the withdrawal must not take
+    // back a read nothing re-arms, which is liveness and not a shared threshold.
     static constexpr size_t MULTISHOT_MIN_CLIENTS = 768;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
