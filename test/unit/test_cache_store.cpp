@@ -1562,6 +1562,10 @@ TEST_CASE("cache_store scan filtering on a numeric range")
     store.set("n:f",  "25.5");
     store.set("n:na", "30kg");
     store.set("n:e",  "");
+    // from_chars reads all three of these as numbers.  Two of them are numbers.
+    store.set("n:nan", "nan");
+    store.set("n:NAN", "NaN");
+    store.set("n:inf", "inf");
     store.hset("u:1", "age", "30");
     store.hset("u:2", "age", "22");
     store.hset("u:3", "age", "older than that");
@@ -1595,6 +1599,27 @@ TEST_CASE("cache_store scan filtering on a numeric range")
         CHECK(got.count("n:e")  == 0);
         CHECK(got.count("n:10") == 1);
         CHECK(got.count("n:f")  == 1);
+        // An infinity IS a number and belongs in the range that spans
+        // everything; a NaN is not, and belongs in none.
+        CHECK(got.count("n:inf") == 1);
+        CHECK(got.count("n:nan") == 0);
+        CHECK(got.count("n:NAN") == 0);
+    }
+
+    SUBCASE("and NaN is in no range at all, not even one it is nowhere near")
+    {
+        // This is the one the comparisons cannot catch by themselves: every
+        // comparison against NaN is false, so a range that only asks "not below
+        // and not above" contains it.  Measured before the guard: a valuerange
+        // of 100 to 200 answered with a value of "nan".
+        for (auto [lo, hi] : { std::pair{100.0, 200.0}, std::pair{-1.0, 0.0},
+                               std::pair{0.0, 0.0} })
+        {
+            vr r{lo, hi, true, true};
+            auto got = names({ nullptr, -1, false, nullptr, &r });
+            CHECK(got.count("n:nan") == 0);
+            CHECK(got.count("n:NAN") == 0);
+        }
     }
 
     SUBCASE("a range and a glob are both required")

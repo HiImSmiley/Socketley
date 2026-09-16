@@ -1108,6 +1108,12 @@ static bool value_in_range(std::string_view sv,
     const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
     if (ec != std::errc{} || ptr != sv.data() + sv.size())
         return false;
+    // from_chars reads "nan" as a number too, and NaN is false against every
+    // comparison below -- so without this a value of "nan" falls inside every
+    // range, including ones it is nowhere near.  Measured: `valuerange 100 200`
+    // answered with it, and so did a FIELD query on an age of "nan".
+    if (std::isnan(v))
+        return false;
     if (r.lo_inclusive ? (v < r.lo) : (v <= r.lo)) return false;
     if (r.hi_inclusive ? (v > r.hi) : (v >= r.hi)) return false;
     return true;

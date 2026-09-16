@@ -419,5 +419,31 @@ BADR=$(python3 "$SCAN_PY" "$P" cmd SCAN 0 VALUERANGE abc 40 2>/dev/null)
 case "$BADR" in *float*) ok "a bound that is not a float is an error, not a filter" ;;
                 *) bad "a bound that is not a float is an error" "got '$BADR'" ;; esac
 
+echo "--- 16. and NaN, which reads as a number and behaves as none ---"
+# Every comparison against NaN is false, so a range asking "not below and not
+# above" contains it.  Measured before the guard: a value of "nan" came back from
+# a range of 100 to 200, and a FIELD query answered with a record whose age was
+# "nan".  An infinity is a different matter -- that IS a number and belongs in
+# the range that spans everything.
+python3 "$SCAN_PY" "$P" setup \
+  $'SET\x1fr:nan\x1fnan' $'SET\x1fr:NAN\x1fNaN' $'SET\x1fr:inf\x1finf' >/dev/null
+R=$(scan "$P" COUNT 10000 MATCH 'r:*' VALUERANGE 100 200)
+if [ -z "$(keys_of "$R")" ]; then ok "a value of 'nan' is in no range it is nowhere near"
+else bad "a value of 'nan' is in no range it is nowhere near" \
+        "got '$(keys_of "$R")'" \
+        "-- NaN compares false against both bounds, so a range that only asks" \
+        "   'not below and not above' answers true for it"; fi
+R=$(scan "$P" COUNT 10000 MATCH 'r:*' VALUERANGE -inf +inf)
+if [ "$(keys_of "$R")" = "r:10 r:20 r:30 r:f r:inf" ]; then
+    ok "an infinity is in the range that spans everything, and NaN still is not"
+else
+    bad "an infinity is in the range that spans everything" \
+        "got '$(cut_long "$(keys_of "$R")")'" \
+        "wanted 'r:10 r:20 r:30 r:f r:inf'"; fi
+NANB=$(python3 "$SCAN_PY" "$P" cmd SCAN 0 VALUERANGE nan nan 2>/dev/null)
+case "$NANB" in *float*) ok "and a NaN BOUND is refused rather than opening the range" ;;
+                 *) bad "a NaN bound is refused" "got '$NANB'" \
+                    "-- accepted, it does not narrow the range, it removes it" ;; esac
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1

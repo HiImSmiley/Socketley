@@ -127,6 +127,18 @@ eq "a zset survives a restart"        "$(pt 'zrange lb 0 -1 withscores')" "cyd 7
 eq "and its type came back with it"   "$(pt 'type lb')"                   "zset|"
 eq "a fractional score survives too"  "$(pt 'zscore f m')"                "1.5|"
 
+# A bound that is NaN does not narrow a range, it opens it: every comparison
+# against NaN is false, so "not below and not above" is true of every member.
+# Measured before the parser refused it -- `zrangebyscore nan nan` answered with
+# the whole set and zcount agreed.  Redis refuses it for the same reason.
+pt 'zadd nanset 10 a' >/dev/null; pt 'zadd nanset 20 b' >/dev/null; pt 'zadd nanset 30 c' >/dev/null
+eq "a NaN bound is refused, not treated as no bound" \
+   "$(pt 'zrangebyscore nanset nan nan')" "error: min or max is not a float|"
+eq "and zcount refuses it too"        "$(pt 'zcount nanset nan nan')" "error: min or max is not a float|"
+eq "an ordinary range still works"    "$(pt 'zrangebyscore nanset 15 25')" "b|end|"
+eq "and so do the infinities, which ARE numbers" \
+   "$(pt 'zrangebyscore nanset -inf +inf')" "a|b|c|end|"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

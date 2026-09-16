@@ -16,6 +16,7 @@
 #include "../../shared/version.h"
 
 #include <unistd.h>
+#include <cmath>
 #include <cstring>
 #include <cerrno>
 #include "../../shared/glob_match.h"
@@ -2296,6 +2297,12 @@ static bool parse_double_sv(std::string_view sv, double& out)
     char* end = nullptr;
     const double v = std::strtod(buf, &end);
     if (end != buf + sv.size() || errno == ERANGE)
+        return false;
+    // strtod reads "nan" as a number, and NaN compares false against everything
+    // -- so a bound that is NaN does not narrow a range, it opens it: measured,
+    // `zrangebyscore k nan nan` answered with every member of the set.  Redis
+    // refuses it for the same reason and this is where every bound comes past.
+    if (std::isnan(v))
         return false;
     out = v;
     return true;
