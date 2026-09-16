@@ -523,6 +523,11 @@ public:
                               struct io_uring_cqe* cqe, io_request* req);
     bool client_backpressured(const proxy_backend_connection* conn) const;
 
+    // Arming a read goes through here and nowhere else, so the question that
+    // decides multishot is asked in one place rather than at twenty call sites.
+    bool arm_read(int fd, proxy_client_connection* conn);
+    bool arm_read(int fd, proxy_backend_connection* conn);
+
     // C++ proxy intercept hooks
     void set_on_proxy_request(proxy_hook cb);
     void set_on_proxy_response(proxy_hook cb);
