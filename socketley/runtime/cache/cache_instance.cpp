@@ -5047,7 +5047,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("incr"):
         {
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
-            if (args.empty()) { rb.append("usage: incr key\n", 17); return; }
+            if (args.empty()) { rb.append("usage: incr key\n"); return; }
             int64_t result = 0;
             if (!m_store.incr(args, 1, result))
                 rb.append("error: not an integer\n", 22);
@@ -5061,7 +5061,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         case fnv1a("decr"):
         {
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
-            if (args.empty()) { rb.append("usage: decr key\n", 17); return; }
+            if (args.empty()) { rb.append("usage: decr key\n"); return; }
             int64_t result = 0;
             if (!m_store.incr(args, -1, result))
                 rb.append("error: not an integer\n", 22);
@@ -6141,7 +6141,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     if (lo_s.empty() || hi_s.empty()
                      || !parse_score_bound(lo_s, scan_range.lo, scan_range.lo_inclusive)
                      || !parse_score_bound(hi_s, scan_range.hi, scan_range.hi_inclusive))
-                    { rb.append("error: min or max is not a float\n", 34); return; }
+                    { rb.append("error: min or max is not a float\n"); return; }
                     scan_has_range = true;
                 }
                 else if (fnv1a_lower(opt) == fnv1a("type") && !rest2.empty())
@@ -6483,7 +6483,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
             if (SOCKETLEY_UNLIKELY(m_shard_n > 1))
-            { rb.append("error: blpop is not available on a sharded cache\n", 48); return; }
+            { rb.append("error: blpop is not available on a sharded cache\n"); return; }
             // A blocking pop parks a waiter on a CONNECTION and answers it
             // when a push arrives.  A cross-runtime request has none: it is
             // served on the scratch connection, which has no descriptor, and
@@ -6681,7 +6681,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             auto [key, rest] = extract_key(args);
             if (key.empty() || rest.empty())
-            { rb.append("usage: hmset key field value [field value ...]\n", 46); return; }
+            { rb.append("usage: hmset key field value [field value ...]\n"); return; }
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
             std::string_view walk = rest;
             while (!walk.empty())
@@ -6707,7 +6707,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             auto [key, r1]   = extract_key(args);
             auto [cur_s, r2] = extract_key(r1);
             if (key.empty() || cur_s.empty())
-            { rb.append("usage: hscan key cursor [match pat] [count n] [valuematch g]\n", 64); return; }
+            { rb.append("usage: hscan key cursor [match pat] [count n] [valuematch g]\n"); return; }
             uint64_t cur = 0;
             if (!parse_int_sv(cur_s, cur)) { rb.append("error: invalid cursor\n", 22); return; }
             // "*" and not empty: an ABSENT MATCH means everything, an explicit
