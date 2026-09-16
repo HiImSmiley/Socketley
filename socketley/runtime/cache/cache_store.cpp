@@ -1096,6 +1096,59 @@ static inline uint64_t scan_cursor_pack(uint8_t map, size_t buckets, size_t buck
 // is usually broad; a value predicate is selective by construction, so under
 // scan()'s rule one call would walk the whole map -- measured at 74 ms over
 // 632,331 keys, and that is 74 ms with this shard answering nobody.
+// One page of the hash map, filtered on what a named field of each hash holds.
+//
+// This is the database question -- "which records have city = berlin" -- for the
+// layout most records are actually stored in.  Answered from outside it is an
+// HGET per hash key; answered here it is one probe of that hash's own field map,
+// where the walk already is, and no round trip at all.
+//
+// The page is bounded by keys examined rather than keys returned, for the reason
+// scan_values() gives: the predicate is selective by construction.
+uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
+                                      size_t count, std::vector<std::string_view>& out,
+                                      const scan_filter& filter) const
+{
+    const bool match_all_keys = (pattern == "*");
+    const bool match_all_vals = (!filter.value || *filter.value == "*");
+
+    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
+    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
+    const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
+
+    const size_t nbuckets = m_hashes.bucket_count();
+    size_t b = 0;
+    // Map three is the hash map; a cursor naming another one carries a bucket
+    // index belonging to a different table, and taking it at face value would
+    // start this walk partway in and skip what came before.
+    if (cursor != 0 && in_map == 3)
+        b = (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
+
+    size_t examined = 0;
+    for (; b < nbuckets; ++b)
+    {
+        for (auto it = m_hashes.begin(b); it != m_hashes.end(b); ++it)
+        {
+            ++examined;
+            if (!match_all_keys && !socketley::glob_match(pattern, it->first))
+                continue;
+            // A hash without the field is not a hash whose field is empty, so
+            // it does not match even a predicate that matches everything.
+            const auto fit = it->second.find(*filter.field);
+            if (fit == it->second.end())
+                continue;
+            if (!match_all_vals && !socketley::glob_match(*filter.value, fit->second))
+                continue;
+            out.push_back(it->first);
+            if (filter.with_values)
+                out.push_back(fit->second);
+        }
+        if (examined >= count && b + 1 < nbuckets)
+            return scan_cursor_pack(3, nbuckets, b + 1);
+    }
+    return 0;
+}
+
 uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
                                   size_t count, std::vector<std::string_view>& out,
                                   const scan_filter& filter) const
@@ -1144,9 +1197,11 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out,
                             const scan_filter& filter) const
 {
-    // Either of these is the string map and nothing else, so a type filter that
-    // agrees with them adds nothing and one that disagrees was answered empty by
-    // the caller before it got here.
+    // A field names the hash map, and a value or WITHVALUES without one names
+    // the string map.  Either way a type filter that agrees adds nothing, and one
+    // that disagrees was answered empty by the caller before it got here.
+    if (filter.field)
+        return scan_hash_field(cursor, pattern, count, out, filter);
     if (filter.value || filter.with_values)
         return scan_values(cursor, pattern, count, out, filter);
 

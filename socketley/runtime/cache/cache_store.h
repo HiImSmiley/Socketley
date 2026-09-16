@@ -175,6 +175,11 @@ public:
         // and value.  Restricts to strings for the reason `value` does: nothing
         // else holds one value to return.
         bool with_values = false;
+        // A named field of a hash, which is the other place a single value
+        // lives: with this the walk is the hash map, and `value` is matched
+        // against what that field holds rather than against the key's own
+        // value.  Absent means the key's own value, as before.
+        const std::string_view* field = nullptr;
     };
 
     uint64_t scan(uint64_t cursor, std::string_view pattern,
@@ -201,6 +206,11 @@ public:
     uint64_t scan_values(uint64_t cursor, std::string_view pattern, size_t count,
                          std::vector<std::string_view>& out,
                          const scan_filter& filter) const;
+
+    // The hash map, filtered on what a named field of each hash holds.
+    uint64_t scan_hash_field(uint64_t cursor, std::string_view pattern, size_t count,
+                             std::vector<std::string_view>& out,
+                             const scan_filter& filter) const;
 
     // --- Atomic increment ---
     bool incr(std::string_view key, int64_t delta, int64_t& result);

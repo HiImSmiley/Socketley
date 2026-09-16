@@ -4128,12 +4128,13 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 size_t count, std::vector<std::string_view>& out,
                                 uint64_t& next, bool node_local,
                                 const std::string_view* value_pattern,
-                                int type_map, bool with_values)
+                                int type_map, bool with_values,
+                                const std::string_view* field)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
         next = m_store.scan(cursor, pattern, count, out,
-                            { value_pattern, type_map, with_values });
+                            { value_pattern, type_map, with_values, field });
         return true;
     }
 
@@ -4144,7 +4145,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     {
         const uint64_t store_next =
             m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                         { value_pattern, type_map, with_values });
+                         { value_pattern, type_map, with_values, field });
         next = store_next == 0 ? 0
                                : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
@@ -4156,7 +4157,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
 
     const uint64_t store_next =
         m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                     { value_pattern, type_map, with_values });
+                     { value_pattern, type_map, with_values, field });
 
     if (store_next != 0)
         next = cache_scan_cursor_make(m_shard_i, store_next);
@@ -6092,8 +6093,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             }
             std::string_view scan_pattern = "*";
             std::string_view scan_value;
+            std::string_view scan_field;
             bool scan_has_value = false, scan_count_given = false, scan_has_type = false;
-            bool scan_with_values = false;
+            bool scan_with_values = false, scan_has_field = false;
             int scan_type = -1;
             size_t scan_count = 10;
             while (!rest2.empty())
@@ -6116,6 +6118,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 }
                 else if (fnv1a_lower(opt) == fnv1a("withvalues"))
                     scan_with_values = true;
+                else if (fnv1a_lower(opt) == fnv1a("field") && !rest2.empty())
+                {
+                    sp2 = rest2.find(' ');
+                    scan_field = (sp2 == std::string_view::npos) ? rest2 : rest2.substr(0, sp2);
+                    rest2 = (sp2 == std::string_view::npos) ? std::string_view{} : rest2.substr(sp2 + 1);
+                    scan_has_field = true;
+                }
                 else if (fnv1a_lower(opt) == fnv1a("type") && !rest2.empty())
                 {
                     sp2 = rest2.find(' ');
@@ -6134,11 +6143,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 }
             }
             // Same default as the RESP door, for the same reason.
-            if (scan_has_value && !scan_count_given)
+            if ((scan_has_value || scan_has_field) && !scan_count_given)
                 scan_count = 1000;
-            // Same refusal as the RESP door, for the same reason.
+            // Same requirement as the RESP door, for the same reason.
+            const int scan_needs = scan_has_field ? 3
+                                 : (scan_has_value || scan_with_values) ? 0 : -1;
             if (scan_has_type && (scan_type < 0 ||
-                                  ((scan_has_value || scan_with_values) && scan_type != 0)))
+                                  (scan_needs >= 0 && scan_type != scan_needs)))
             {
                 rb.append("0\nend\n", 6);
                 break;
@@ -6147,7 +6158,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
                             conn->cluster_port, scan_has_value ? &scan_value : nullptr,
-                            scan_has_type ? scan_type : -1, scan_with_values))
+                            scan_has_type ? scan_type : -1, scan_with_values,
+                            scan_has_field ? &scan_field : nullptr))
             {
                 rb.append("error: invalid cursor\n", 22);
                 return;
@@ -9076,8 +9088,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             std::string_view scan_pattern = "*";
             std::string_view scan_value;
+            std::string_view scan_field;
             bool scan_has_value = false, scan_count_given = false, scan_has_type = false;
-            bool scan_with_values = false;
+            bool scan_with_values = false, scan_has_field = false;
             int scan_type = -1;
             size_t scan_count = 10;
             for (int i = 2; i < argc; i++)
@@ -9096,6 +9109,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 }
                 else if (fnv1a_lower(args[i]) == fnv1a("withvalues"))
                     scan_with_values = true;
+                else if (fnv1a_lower(args[i]) == fnv1a("field") && i + 1 < argc)
+                {
+                    scan_field = args[++i];
+                    scan_has_field = true;
+                }
                 else if (fnv1a_lower(args[i]) == fnv1a("count") && i + 1 < argc)
                 {
                     size_t cnt = 10;
@@ -9107,13 +9125,17 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             // of those returns almost nothing per page: a client that did not
             // say otherwise would be asked for sixty thousand round trips over a
             // keyspace one call could walk in 74 ms.
-            if (scan_has_value && !scan_count_given)
+            if ((scan_has_value || scan_has_field) && !scan_count_given)
                 scan_count = 1000;
-            // A type no key can have, or a type filter asking for something a
-            // value predicate cannot be answered from: nothing matches, and the
-            // walk is skipped rather than run to find that out.
+            // Which map the other options require, if they require one: a field
+            // names hashes, a value predicate or WITHVALUES without one names
+            // strings.  A type filter that disagrees with that, or a type name
+            // no type has, can match nothing -- and the walk is skipped rather
+            // than run to find that out.
+            const int scan_needs = scan_has_field ? 3
+                                 : (scan_has_value || scan_with_values) ? 0 : -1;
             if (scan_has_type && (scan_type < 0 ||
-                                  ((scan_has_value || scan_with_values) && scan_type != 0)))
+                                  (scan_needs >= 0 && scan_type != scan_needs)))
             {
                 rb.append("*2\r\n");
                 resp::encode_bulk_into(rb, "0");
@@ -9124,7 +9146,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
                             conn->cluster_port, scan_has_value ? &scan_value : nullptr,
-                            scan_has_type ? scan_type : -1, scan_with_values))
+                            scan_has_type ? scan_type : -1, scan_with_values,
+                            scan_has_field ? &scan_field : nullptr))
             {
                 resp::encode_error_into(rb, "invalid cursor");
                 return;

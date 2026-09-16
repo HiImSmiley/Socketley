@@ -2,6 +2,7 @@
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
 #include <map>
+#include <set>
 #include <thread>
 #include <unistd.h>
 
@@ -1368,5 +1369,99 @@ TEST_CASE("cache_store counts one type without walking it")
             CHECK(store.scan(0, "*", 1000000, out, { nullptr, m }) == 0);
             CHECK(out.size() == store.size_of_type(m));
         }
+    }
+}
+
+// The database question for the layout records are usually stored in: which
+// hashes have city = berlin.  From outside it is an HGET per hash key.
+TEST_CASE("cache_store scan filtering on a hash field")
+{
+    cache_store store;
+    store.hset("u:1", "city", "berlin");
+    store.hset("u:2", "city", "hamburg");
+    store.hset("u:3", "city", "berlin");
+    store.hset("u:4", "name", "no city at all");
+    store.hset("u:5", "city", "");
+    store.set("plain", "berlin");
+    store.rpush("l:1", "berlin");
+
+    std::string_view field_city = "city";
+    auto walk = [&](cache_store::scan_filter f, std::string_view pat = "*") {
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, pat, 100000, out, f) == 0);
+        return out;
+    };
+
+    SUBCASE("having the field is not the same as the field being empty")
+    {
+        auto has = walk({ nullptr, -1, false, &field_city });
+        CHECK(has.size() == 4);                       // u:4 has no city
+        std::string_view empty = "";
+        auto is_empty = walk({ &empty, -1, false, &field_city });
+        REQUIRE(is_empty.size() == 1);
+        CHECK(is_empty[0] == "u:5");                  // and u:5's city IS empty
+    }
+
+    SUBCASE("the predicate is matched against the field, not against the key")
+    {
+        std::string_view berlin = "berlin";
+        auto got = walk({ &berlin, -1, false, &field_city });
+        REQUIRE(got.size() == 2);
+        std::set<std::string_view> s(got.begin(), got.end());
+        CHECK(s.count("u:1") == 1);
+        CHECK(s.count("u:3") == 1);
+        // The string and the list hold "berlin" too, and neither is a hash with
+        // a city field, so neither is an answer to this question.
+        CHECK(s.count("plain") == 0);
+        CHECK(s.count("l:1") == 0);
+    }
+
+    SUBCASE("the key pattern still applies")
+    {
+        std::string_view berlin = "berlin";
+        auto got = walk({ &berlin, -1, false, &field_city }, "u:1*");
+        REQUIRE(got.size() == 1);
+        CHECK(got[0] == "u:1");
+    }
+
+    SUBCASE("with values it is the field's value that comes back")
+    {
+        auto got = walk({ nullptr, -1, true, &field_city });
+        REQUIRE(got.size() == 8);                     // four pairs
+        std::map<std::string, std::string> m;
+        for (size_t i = 0; i < got.size(); i += 2)
+            m[std::string(got[i])] = std::string(got[i + 1]);
+        CHECK(m["u:1"] == "berlin");
+        CHECK(m["u:2"] == "hamburg");
+        CHECK(m["u:5"] == "");
+        CHECK(m.count("u:4") == 0);
+    }
+
+    SUBCASE("count bounds the keys examined, not the keys returned")
+    {
+        for (int i = 0; i < 400; i++)
+            store.hset("h:" + std::to_string(i), "city", "hamburg");
+        std::string_view nowhere = "atlantis";
+        std::vector<std::string_view> out;
+        const uint64_t next = store.scan(0, "*", 8, out, { &nowhere, -1, false, &field_city });
+        CHECK(out.empty());
+        CHECK(next != 0);
+    }
+
+    SUBCASE("a cursor naming another map starts the hash map at its top")
+    {
+        for (int i = 0; i < 300; i++)
+            store.hset("h:" + std::to_string(i), "city", "berlin");
+
+        std::vector<std::string_view> probe;
+        const uint64_t real = store.scan(0, "*", 1, probe);
+        REQUIRE(real != 0);
+        const uint64_t buckets = (real >> 32) & 0x7FFFFFull;
+        const uint64_t foreign = (0ull << 55) | (buckets << 32) | 5ull;   // the string map
+
+        std::string_view berlin = "berlin";
+        std::vector<std::string_view> out;
+        CHECK(store.scan(foreign, "*", 1000000, out, { &berlin, -1, false, &field_city }) == 0);
+        CHECK(out.size() == 302);                     // the 300 plus u:1 and u:3
     }
 }

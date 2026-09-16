@@ -4372,9 +4372,29 @@ rather than nil, because a caller asking for the old value wants to hear that.
 .BI "psetex " "key milliseconds value"
 Set key with millisecond-precision expiry. Returns "ok".
 .TP
-.BI "scan " "cursor [match pattern] [count n] [valuematch glob] [withvalues] [type t]"
+.BI "scan " "cursor [match pattern] [count n] [valuematch glob] [withvalues]"
+.TQ
+.BI "     " "[type t] [field f]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B Asking what a FIELD of a hash holds.
+.I field
+walks the hashes and matches
+.I valuematch
+against what the named field of each one holds, rather than against the key's own
+value -- which is the question a database is asked, for the layout records are
+usually kept in.  A hash WITHOUT the field does not match, not even a predicate
+that matches everything: that is a different answer from a hash whose field is
+empty, and asking for the empty one is
+.IR "valuematch \(dq\(dq" .
+With
+.I withvalues
+it is the field's value that comes back beside the key.  From outside this is an
+.B hget
+per hash key: measured at 15.8 ms against 1.5 ms over 5,000 hashes, and that
+against a client already pipelining and already using
+.IR type .
 .IP
 .B Returning the value beside the key.
 .I withvalues
