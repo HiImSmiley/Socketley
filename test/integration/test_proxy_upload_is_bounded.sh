@@ -244,9 +244,9 @@ if [ "$CARRIED_PIN" = 1 ]; then pass
 else fail "the pinned arm carries the pin" \
           "the worker for the pinned arm carries MULTISHOT='$CARRIED_PIN', not 1"; fi
 
-if [ "${OPENED_RULE:-0}" -gt 1024 ] && [ "${OPENED_PIN:-0}" -gt 1024 ]; then pass
+if [ "${OPENED_RULE:-0}" -gt 768 ] && [ "${OPENED_PIN:-0}" -gt 768 ]; then pass
 else fail "both storms are above the threshold" \
-          "opened $OPENED_RULE and $OPENED_PIN, and the threshold is 1024" \
+          "opened $OPENED_RULE and $OPENED_PIN, and the threshold is 768" \
           "-- below it the rule arms single-shot and the row is about nothing"; fi
 
 # ── 3. the ratio ────────────────────────────────────────────────────────────

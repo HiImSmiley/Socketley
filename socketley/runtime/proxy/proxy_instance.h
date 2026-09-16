@@ -968,12 +968,34 @@ private:
     // for every runtime at once.
     enum class multishot_arm : uint8_t { adaptive, always };
     multishot_arm m_multishot_arm{multishot_arm::adaptive};
-    // Where a multishot recv starts paying for itself.  Measured on this box at
-    // 8 KiB bodies, median of the per-pass differences against a single-shot arm
-    // of the same binary: +6.9% for single-shot at 128 connections, +3.4% at
-    // 640, +0.05% at 768, -12.9% at 896, -21.0% at 1024.  The crossover is 768
-    // and this sits above it, because between the two the measurement says
-    // nothing either way and the switch belongs where the gain is not in doubt.
+    // Where a multishot recv starts paying for itself, measured on this box at
+    // 8 KiB bodies as the median of the per-pass differences against a
+    // single-shot arm of the same binary.  Positive is single-shot ahead:
+    //
+    //      connections      difference        range
+    //              128           +7.70%   +6.7 .. +12.7
+    //              256           +7.70%   +3.7 ..  +8.5
+    //              512           +6.01%   +3.1 ..  +9.9
+    //              640           -6.84%  -12.0 ..  +3.9    <- crosses zero
+    //              768          -15.01%  -18.6 ..  +0.1
+    //
+    // 768 is the first count where the answer is not in doubt, which is the
+    // rule this threshold was set by the first time as well.
+    //
+    // IT MOVED.  Set at 1024 on the first measurement, where the crossover read
+    // 768 and 896 read -12.9%; re-measured after the withdrawal commits it is
+    // between 512 and 768, so 1024 had drifted a full step above the point it
+    // was chosen to sit just past.  Between the two the proxy was picking
+    // single-shot where multishot is 15% faster.  A number measured once is a
+    // number for that day: this one is worth re-taking after anything that
+    // touches on_loop_turn or the read path.
+    //
+    // NOT the buffer ring.  BUF_COUNT is 512 and the crossover sits just above
+    // it, which looks like a mechanism and is not: at 768 connections multishot
+    // leads by 11.96%, 15.01% and 15.89% with the ring at 256, 512 and 1024, and
+    // at 384 connections single-shot still leads with a ring of 256.  The
+    // crossover does not track the ring, so this stays a measured number rather
+    // than a derived one.
     //
     // The count is not the whole rule: the queue depth is the second condition,
     // and it is worth something only because withdraw_armed_backend_reads()
@@ -1011,7 +1033,7 @@ private:
     // again; making the single-shot arm sticky per connection instead holds
     // 542 MB and costs 11.1%, because a connection that crossed the watermark
     // once never goes back.
-    static constexpr size_t MULTISHOT_MIN_CLIENTS = 1024;
+    static constexpr size_t MULTISHOT_MIN_CLIENTS = 768;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
     bool m_splice_supported{false};

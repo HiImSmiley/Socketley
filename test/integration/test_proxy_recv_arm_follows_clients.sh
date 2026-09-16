@@ -8,7 +8,7 @@
 # it cannot be declined, which is how every backpressure decision in this proxy is
 # made -- so it reads ahead into a queue nothing drains.  Measured, median of the
 # per-pass differences against a single-shot arm of the same binary at 8 KiB
-# bodies: +6.9% for single-shot at 128 connections, +0.05% at 768, -21.0% at 1024.
+# bodies: +7.7% for single-shot at 128 connections, +6.0% at 512, -15.0% at 768.
 #
 # So the arm is chosen once a turn, from the live client count AND from whether
 # the runtime is over its pacing budget, and this file is about the half of that
@@ -385,7 +385,7 @@ daemon_start "$BIN"
 for i in $(seq 1 150); do ss -ltn 2>/dev/null | grep -q ":$PPORT " && break; sleep 0.1; done
 MANY=$(timeout 180 python3 "$WORK/many.py" "$PPORT" "$MANY_CLIENTS" "/pa/small" "$BODY_SMALL" 2>/dev/null || echo "0 0 0")
 read -r n_open n_done n_full <<<"$MANY"
-if [ "${n_open:-0}" -gt 1024 ] && [ "${n_full:-0}" -ge $(( n_open * 95 / 100 )) ]; then
+if [ "${n_open:-0}" -gt 768 ] && [ "${n_full:-0}" -ge $(( n_open * 95 / 100 )) ]; then
     echo "  past the threshold: $n_open clients, $n_full complete bodies"
     pass
 else fail "more clients than the threshold are served correctly" \
