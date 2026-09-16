@@ -1700,3 +1700,79 @@ TEST_CASE("cache_store zincrby refuses a result that is not a number")
         CHECK(store.zincrby("s", 1.0, "m", out) == zr::type_conflict);
     }
 }
+
+// Two things asked of one key at once, which is the question a store full of
+// records is asked and the one a single predicate cannot express.
+TEST_CASE("cache_store scan with more than one predicate")
+{
+    using vr = cache_store::scan_filter::value_range;
+    cache_store store;
+    store.hset("u:1", "city", "berlin");  store.hset("u:1", "age", "30");
+    store.hset("u:2", "city", "berlin");  store.hset("u:2", "age", "55");
+    store.hset("u:3", "city", "hamburg"); store.hset("u:3", "age", "30");
+    store.hset("u:4", "city", "berlin");
+    store.set("plain", "berlin");
+
+    std::string_view f_city = "city", f_age = "age", berlin = "berlin";
+    vr r25_40{25, 40, true, true};
+
+    auto run = [&](cache_store::scan_filter f) {
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out, f) == 0);
+        return std::set<std::string_view>(out.begin(), out.end());
+    };
+
+    SUBCASE("each on its own, so the conjunction has something to be between")
+    {
+        CHECK(run(cache_store::scan_filter::one(&berlin, -1, false, &f_city))
+              == std::set<std::string_view>{"u:1", "u:2", "u:4"});
+        CHECK(run(cache_store::scan_filter::one(nullptr, -1, false, &f_age, &r25_40))
+              == std::set<std::string_view>{"u:1", "u:3"});
+    }
+
+    SUBCASE("and together they are the intersection, not the union")
+    {
+        cache_store::scan_filter f;
+        f.preds[0] = { &f_city, &berlin, nullptr };
+        f.preds[1] = { &f_age,  nullptr, &r25_40 };
+        f.pred_count = 2;
+        CHECK(run(f) == std::set<std::string_view>{"u:1"});
+
+        // Order is not part of the answer: a conjunction commutes and a walk
+        // that let the last predicate win would not.
+        cache_store::scan_filter g;
+        g.preds[0] = { &f_age,  nullptr, &r25_40 };
+        g.preds[1] = { &f_city, &berlin, nullptr };
+        g.pred_count = 2;
+        CHECK(run(g) == run(f));
+    }
+
+    SUBCASE("a field a hash does not have fails the conjunction")
+    {
+        // u:4 has city=berlin and no age at all, so it answers the first
+        // predicate and cannot answer the second.
+        std::string_view nowhere = "*";
+        cache_store::scan_filter f;
+        f.preds[0] = { &f_city, &berlin, nullptr };
+        f.preds[1] = { &f_age,  &nowhere, nullptr };
+        f.pred_count = 2;
+        CHECK(run(f) == std::set<std::string_view>{"u:1", "u:2"});
+    }
+
+    SUBCASE("two predicates on the key's own value are two tests of one string")
+    {
+        std::string_view ber = "*berlin*", star_n = "*n";
+        cache_store::scan_filter f;
+        f.preds[0] = { nullptr, &ber,    nullptr };
+        f.preds[1] = { nullptr, &star_n, nullptr };
+        f.pred_count = 2;
+        CHECK(run(f) == std::set<std::string_view>{"plain"});
+
+        std::string_view star_z = "*z";
+        cache_store::scan_filter g;
+        g.preds[0] = { nullptr, &ber,    nullptr };
+        g.preds[1] = { nullptr, &star_z, nullptr };
+        g.pred_count = 2;
+        CHECK(run(g).empty());
+    }
+}

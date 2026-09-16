@@ -151,5 +151,30 @@ expect "size of all types"           9 'one|8'
 expect "hscan on a field's value"   10 'list|city berlin'
 expect "sscan refuses valuematch"   11 'one|error: syntax'
 
+echo "--- and two conditions at once, on this port too ---"
+# The stateful half of the option list -- a FIELD applies to what follows it --
+# is written once and used by both parsers, and this is the row that says the
+# second parser gets it too.
+# Its own seeding and its own connection: the rows above assert exact key sets
+# and a dbsize, so a key added for this one would have broken four of them.
+OUT2=$(run <<'ASK'
+hset q:1 city berlin
+hset q:1 age 30
+hset q:2 city berlin
+hset q:2 age 55
+hset q:3 city hamburg
+hset q:3 age 30
+--
+list	scan 0 count 10000 match q:* field city valuematch berlin field age valuerange 25 40
+list	scan 0 count 10000 match q:* field age valuerange 25 40 field city valuematch berlin
+ASK
+)
+got=$(echo "$OUT2" | sed -n 1p)
+if [ "$got" = 'list|q:1' ]; then ok "two field predicates are the intersection"
+else bad "two field predicates are the intersection" "got '$got'" "wanted 'list|q:1'"; fi
+got=$(echo "$OUT2" | sed -n 2p)
+if [ "$got" = 'list|q:1' ]; then ok "and the answer does not depend on their order"
+else bad "the answer does not depend on their order" "got '$got'" "wanted 'list|q:1'"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1

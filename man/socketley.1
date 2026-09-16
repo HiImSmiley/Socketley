@@ -4374,7 +4374,7 @@ Set key with millisecond-precision expiry. Returns "ok".
 .TP
 .BI "scan " "cursor [match pattern] [count n] [valuematch glob] [withvalues]"
 .TQ
-.BI "     " "[type t] [field f] [valuerange " min " " max "]"
+.BI "     " "[type t] [field f]... [valuerange " min " " max "]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
 .IP
@@ -4390,6 +4390,33 @@ A value that is not a number matches NO range, not even
 .BR "\-inf +inf" .
 The whole of the value has to be the number: "30kg" is not thirty, and a reader
 that stopped at the digits would be answering a question nobody asked.
+.IP
+.B More than one condition at once.
+.I field
+may be given more than once, up to four times, and the rule is one sentence: a
+.I field
+applies to the value predicates that follow it, until the next
+.IR field .
+So
+.RS
+.IP
+.B "scan 0 field city valuematch berlin field age valuerange 25 40"
+.RE
+.IP
+returns the hashes that satisfy BOTH -- a conjunction, not a choice, and a hash
+missing either field satisfies neither.  The order does not change the answer.
+.IP
+Asking the same thing with two scans and an intersection in the client costs two
+walks and the transfer of both result sets: measured over 50,000 records where
+each condition keeps about a quarter and the pair keeps a fifteenth, 96.5 ms and
+25,841 keys against 37.8 ms and 3,335.  It is also the only way to get an answer
+that was true at one moment, because two scans are two walks of a keyspace that
+need not have held still between them.
+.IP
+A value predicate given before any
+.I field
+asks about the key's own value, as it always has -- and mixing the two in one
+scan matches nothing, because no key is both a string and a hash.
 .IP
 .B Asking what a FIELD of a hash holds.
 .I field

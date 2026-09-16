@@ -23,6 +23,9 @@
 #   * FIELD and a TYPE that cannot hold one, which can match nothing
 #   * the value returned by WITHVALUES being the key's rather than the field's
 #   * and the plain SCAN it shares a function with, unchanged
+#   * two predicates read as a choice instead of a conjunction, or the last one
+#     winning over the first -- which is why one of the rows below asks the same
+#     question with the two swapped and requires the same answer
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -101,6 +104,10 @@ if mode == 'setup':
         send(f, s, spec.split('\x1f'))
         read_reply(f)
     print("ok")
+elif mode == 'cmd':
+    send(f, s, rest)
+    r = read_reply(f)
+    print(r.decode('latin1') if isinstance(r, bytes) else r)
 elif mode == 'pairs':
     cursor, prs, pages = '0', {}, 0
     while True:
@@ -280,6 +287,41 @@ if ss -ltn 2>/dev/null | grep -q ":$PS "; then
 else
     bad "the sharded cache bound its port" "nothing listening on $PS"
 fi
+
+echo "--- 11. two conditions at once, which is the whole point of a record ---"
+python3 "$SCAN_PY" "$P" setup \
+  $'HSET\x1fq:1\x1fcity\x1fberlin\x1fage\x1f30' \
+  $'HSET\x1fq:2\x1fcity\x1fberlin\x1fage\x1f55' \
+  $'HSET\x1fq:3\x1fcity\x1fhamburg\x1fage\x1f30' \
+  $'HSET\x1fq:4\x1fcity\x1fberlin' >/dev/null
+EXP="q:1 q:2 q:4"; check "city alone"  MATCH 'q:*' FIELD city VALUEMATCH berlin
+EXP="q:1 q:3";     check "age alone"   MATCH 'q:*' FIELD age VALUERANGE 25 40
+EXP="q:1"
+check "both together are the intersection" \
+      MATCH 'q:*' FIELD city VALUEMATCH berlin FIELD age VALUERANGE 25 40
+check "and the same with the two swapped" \
+      MATCH 'q:*' FIELD age VALUERANGE 25 40 FIELD city VALUEMATCH berlin
+
+echo "--- 12. a hash without the second field fails the conjunction ---"
+# q:4 answers the first condition and has no age at all, so it cannot answer the
+# second -- which is the difference between a conjunction and a choice.
+EXP="q:1 q:2"
+check "a field the hash does not have is not a field that matches" \
+      MATCH 'q:*' FIELD city VALUEMATCH berlin FIELD age VALUEMATCH '*'
+
+echo "--- 13. and the two refusals ---"
+R=$(scan "$P" COUNT 10000 VALUEMATCH '*berlin*' FIELD city VALUEMATCH berlin)
+if [ -z "$(keys_of "$R")" ]; then
+    ok "the key's own value and a field at once matches nothing"
+else
+    bad "the key's own value and a field at once matches nothing" \
+        "got '$(keys_of "$R")'" \
+        "-- one asks what a string holds and the other what a hash field does," \
+        "   and no key is both"
+fi
+TOOMANY=$(python3 "$SCAN_PY" "$P" cmd SCAN 0 FIELD a FIELD b FIELD c FIELD d FIELD e 2>/dev/null)
+case "$TOOMANY" in *"too many"*) ok "a fifth field predicate is refused by name" ;;
+                   *) bad "a fifth field predicate is refused" "got '$TOOMANY'" ;; esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1
