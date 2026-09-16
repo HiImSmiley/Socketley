@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
+#include <map>
 #include <thread>
 #include <unistd.h>
 
@@ -1250,5 +1251,74 @@ TEST_CASE("cache_store scan restricted to one type")
         std::vector<std::string_view> out;
         CHECK(store.scan(earlier, "*", 1000000, out, nullptr, 3) == 0);
         CHECK(out.size() == 301);       // the 300 plus h:1
+    }
+}
+
+// What the store says this key holds, so a pair can be checked against the
+// store rather than against the other half of the same reply.
+static std::string store_value_of(const cache_store& st, std::string_view key)
+{
+    std::string out;
+    const_cast<cache_store&>(st).get(key, out);
+    return out;
+}
+
+// The value is in the walker's hand when it matches a key, and throwing it away
+// only to have the client ask for it again is the round trip this removes.
+TEST_CASE("cache_store scan returning values beside keys")
+{
+    cache_store store;
+    store.set("u:1", "berlin");
+    store.set("u:2", "hamburg");
+    store.set("e:1", "");
+    store.hset("h:1", "f", "berlin");
+
+    SUBCASE("key and value, interleaved, strings only")
+    {
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out, nullptr, -1, /*with_values=*/true) == 0);
+        REQUIRE(out.size() == 6);          // three pairs, and not the hash
+        std::map<std::string, std::string> got;
+        for (size_t i = 0; i < out.size(); i += 2)
+            got[std::string(out[i])] = std::string(out[i + 1]);
+        CHECK(got.size() == 3);
+        CHECK(got["u:1"] == "berlin");
+        CHECK(got["u:2"] == "hamburg");
+        // Present with an empty value, which is a different answer from absent.
+        REQUIRE(got.count("e:1") == 1);
+        CHECK(got["e:1"] == "");
+        CHECK(got.count("h:1") == 0);
+    }
+
+    SUBCASE("with a predicate it is the matches and their values")
+    {
+        std::string_view berlin = "*berlin*";
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out, &berlin, -1, true) == 0);
+        REQUIRE(out.size() == 2);
+        CHECK(out[0] == "u:1");
+        CHECK(out[1] == "berlin");
+    }
+
+    SUBCASE("a page never ends between a key and its value")
+    {
+        for (int i = 0; i < 300; i++)
+            store.set("v:" + std::to_string(i), "value-" + std::to_string(i));
+
+        uint64_t cur = 0;
+        size_t pairs = 0;
+        int guard = 0;
+        do {
+            std::vector<std::string_view> page;
+            cur = store.scan(cur, "*", 4, page, nullptr, -1, true);
+            // The one property that makes the reply parseable at all: a client
+            // reading two at a time must never be handed an odd page.
+            REQUIRE(page.size() % 2 == 0);
+            for (size_t i = 0; i < page.size(); i += 2)
+                CHECK(page[i + 1] == store_value_of(store, page[i]));
+            pairs += page.size() / 2;
+            REQUIRE(++guard < 10000);
+        } while (cur != 0);
+        CHECK(pairs == 303);               // 300 plus u:1, u:2 and e:1
     }
 }

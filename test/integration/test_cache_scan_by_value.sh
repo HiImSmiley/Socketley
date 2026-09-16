@@ -112,6 +112,26 @@ if mode == 'setup':
         send(f, s, spec.split('\x1f'))
         read_reply(f)
     print("ok")
+elif mode == 'pairs':
+    # The reply is key and value interleaved, so it is read two at a time and
+    # printed as one token per pair: a helper that sorted the flat list would
+    # scramble exactly the property this is here to check.
+    cursor, pairs, pages = '0', {}, 0
+    while True:
+        send(f, s, ['SCAN', cursor, 'COUNT', '10000'] + rest)
+        r = read_reply(f)
+        pages += 1
+        cursor = r[0].decode()
+        e = r[1]
+        if len(e) % 2:
+            print("ERR odd page of %d elements" % len(e)); sys.exit(0)
+        for i in range(0, len(e), 2):
+            pairs[e[i].decode('latin1')] = e[i+1].decode('latin1')
+        if cursor == '0':
+            break
+        if pages > 5000:
+            print("ERR runaway cursor"); sys.exit(0)
+    print("%d %s" % (pages, ' '.join('%s=%s' % kv for kv in sorted(pairs.items()))))
 elif mode == 'resume':
     # A cursor from a plain scan that has moved past the string map: its top
     # bits name another map, and its bucket index is that map's, not m_data's.
@@ -173,6 +193,8 @@ scan() {   # port args...
     python3 "$SCAN_PY" "$port" scan "$@" 2>/dev/null
 }
 keys_of() { echo "$1" | cut -d' ' -f2-; }
+# A failing pair row can otherwise print two hundred pairs into the log.
+cut_long(){ if [ ${#1} -gt 220 ]; then echo "${1:0:220}... (${#1} Zeichen)"; else echo "$1"; fi; }
 pages_of(){ echo "$1" | cut -d' ' -f1; }
 
 seed "$P"
@@ -253,7 +275,39 @@ else
     bad "the sharded cache bound its port" "nothing listening on $PS"
 fi
 
-echo "--- 8. a cursor that names another map restarts rather than skipping ---"
+echo "--- 8. the value beside the key, so the client needs no second trip ---"
+pairs() { local port=$1; shift; python3 "$SCAN_PY" "$port" pairs "$@" 2>/dev/null; }
+R=$(pairs "$P" WITHVALUES)
+EXPP='empty:1= other:1=berlin but another prefix u:1={"city":"berlin","age":30} u:2={"city":"hamburg","age":41} u:3={"city":"berlin","age":22}'
+if [ "$(keys_of "$R")" = "$EXPP" ]; then
+    ok "WITHVALUES returns every string key with its value, the empty one included"
+else
+    bad "WITHVALUES returns every string key with its value" \
+        "got '$(cut_long "$(keys_of "$R")")'" \
+        "wanted '$EXPP'" \
+        "-- a key returned without its value means the option was skipped as" \
+        "   unknown; empty:1 missing means an empty value was taken for absent"
+fi
+
+echo "--- 9. and together with the predicate, which is the whole use ---"
+R=$(pairs "$P" VALUEMATCH '*"city":"berlin"*' WITHVALUES)
+EXPP='u:1={"city":"berlin","age":30} u:3={"city":"berlin","age":22}'
+if [ "$(keys_of "$R")" = "$EXPP" ]; then
+    ok "the matches come back with their values in one walk"
+else
+    bad "the matches come back with their values in one walk" \
+        "got '$(cut_long "$(keys_of "$R")")', wanted '$EXPP'"
+fi
+
+echo "--- 10. and a type that holds no single value returns nothing ---"
+R=$(pairs "$P" TYPE hash WITHVALUES)
+if [ "$(keys_of "$R")" = "" ]; then
+    ok "TYPE hash with WITHVALUES matches nothing"
+else
+    bad "TYPE hash with WITHVALUES matches nothing" "got '$(cut_long "$(keys_of "$R")")'"
+fi
+
+echo "--- 11. a cursor that names another map restarts rather than skipping ---"
 # Enough string keys that skipping any bucket loses some of them: with five the
 # miss depends on where the hash puts them, which is a test that passes by luck.
 python3 - "$SCAN_PY" "$P" <<'SEED'

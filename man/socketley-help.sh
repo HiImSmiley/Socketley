@@ -528,7 +528,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC}            type key, keys pattern                              ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}            setnx key val, setex key sec val, psetex key ms val ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}            scan cursor [match pat] [count n]                   ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}                 [valuematch glob] [type t]                     ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                 [valuematch glob] [withvalues] [type t]        ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   Lists:   lpush/rpush key val, lpop/rpop key, llen key       ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}            lrange key start stop, lindex key idx               ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}   Sets:    sadd key member, srem key member, scard key         ${CYAN}│${NC}"

@@ -4372,9 +4372,27 @@ rather than nil, because a caller asking for the old value wants to hear that.
 .BI "psetex " "key milliseconds value"
 Set key with millisecond-precision expiry. Returns "ok".
 .TP
-.BI "scan " "cursor [match pattern] [count n] [valuematch glob] [type t]"
+.BI "scan " "cursor [match pattern] [count n] [valuematch glob] [withvalues] [type t]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B Returning the value beside the key.
+.I withvalues
+returns key and value interleaved, the way
+.B hscan
+returns field and value, so a client that wanted the records does not send a
+second
+.B mget
+for them: the walk had the value in hand when it matched the key.  It restricts
+to strings for the same reason
+.I valuematch
+does.  Measured as one page used as a query it is worth about a sixth of the
+operation, two round trips becoming one; over a whole keyspace it is worth less,
+because the bytes move either way and only the second lookup and the extra
+commands go.  Note that the reply is then sized by VALUES rather than by keys,
+which is why
+.I count
+keeps its small default here and only a value predicate raises it.
 .IP
 .B Restricting to one type.
 .I type

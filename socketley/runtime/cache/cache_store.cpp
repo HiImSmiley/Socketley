@@ -1098,10 +1098,13 @@ static inline uint64_t scan_cursor_pack(uint8_t map, size_t buckets, size_t buck
 // 632,331 keys, and that is 74 ms with this shard answering nobody.
 uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
                                   size_t count, std::vector<std::string_view>& out,
-                                  std::string_view value_pattern) const
+                                  const std::string_view* value_pattern,
+                                  bool with_values) const
 {
     const bool match_all_keys = (pattern == "*");
-    const bool match_all_vals = (value_pattern == "*");
+    // No predicate at all is not the same as one that matches everything in the
+    // source, but it is the same walk, so both take the short path here.
+    const bool match_all_vals = (!value_pattern || *value_pattern == "*");
 
     const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
     const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
@@ -1125,9 +1128,11 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
             ++examined;
             if (!match_all_keys && !socketley::glob_match(pattern, it->first))
                 continue;
-            if (!match_all_vals && !socketley::glob_match(value_pattern, it->second))
+            if (!match_all_vals && !socketley::glob_match(*value_pattern, it->second))
                 continue;
             out.push_back(it->first);
+            if (with_values)
+                out.push_back(it->second);
         }
         // Whole buckets and never half of one, for the reason scan() gives.
         if (examined >= count && b + 1 < nbuckets)
@@ -1139,13 +1144,13 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out,
                             const std::string_view* value_pattern,
-                            int type_map) const
+                            int type_map, bool with_values) const
 {
-    // A value predicate is the string map and nothing else, so a type filter
-    // that agrees with it adds nothing and one that disagrees was answered
-    // empty by the caller before it got here.
-    if (value_pattern)
-        return scan_values(cursor, pattern, count, out, *value_pattern);
+    // Either of these is the string map and nothing else, so a type filter that
+    // agrees with them adds nothing and one that disagrees was answered empty by
+    // the caller before it got here.
+    if (value_pattern || with_values)
+        return scan_values(cursor, pattern, count, out, value_pattern, with_values);
 
     // Not `pattern.empty() ||`: MATCH "" asks for the key that has no name,
     // and answering it with the whole keyspace is the opposite of the request.
