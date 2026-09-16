@@ -1,6 +1,7 @@
 #include "../../shared/socket_tuning.h"
 #include "client_instance.h"
 #include "../../shared/unix_listener.h"
+#include "../../shared/dial_address.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
 #include "../../shared/tls_context.h"
@@ -123,17 +124,15 @@ bool client_instance::try_connect()
 
     if (!target.empty())
     {
-        auto colon = target.rfind(':');
-        if (colon != std::string_view::npos)
+        // Judged here and not only at the flag, because a target reaches a
+        // runtime four other ways -- a config file, an import, a Lua create,
+        // the API -- and a port that cannot work used to become whichever port
+        // -p had set instead.
+        if (const std::string why = socketley::dial_addr::refusal(target, host, port);
+            !why.empty())
         {
-            host = std::string(target.substr(0, colon));
-            auto port_sv = target.substr(colon + 1);
-            uint32_t parsed_port = 0;
-            // The whole of it: `host:8080x` took the 8080 and connected there.
-            auto [ptr, ec] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), parsed_port);
-            if (ec == std::errc{} && ptr == port_sv.data() + port_sv.size()
-                && parsed_port > 0 && parsed_port <= 65535)
-                port = static_cast<uint16_t>(parsed_port);
+            LOG_ERROR(("client target \"" + std::string(target) + "\": " + why).c_str());
+            return false;
         }
     }
 

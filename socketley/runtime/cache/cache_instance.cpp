@@ -2,6 +2,7 @@
 #include "cache_instance.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
+#include "../../shared/dial_address.h"
 #include "../../shared/ipc_framing.h"
 #include "../../shared/trace.h"
 #include "resp_parser.h"
@@ -706,9 +707,16 @@ bool cache_instance::setup(event_loop& loop)
     // until an unrelated command flipped it back.
     m_has_ttl_keys = m_store.has_expiry_keys();
 
-    // Connect to master if follower
-    if (m_repl_role == repl_follower && !m_replicate_target.empty())
-        connect_to_master();
+    // Connect to master if follower.
+    //
+    // Checked, because a follower that never reached its master looks exactly
+    // like one that did until somebody writes to the master and waits: the
+    // return was discarded, and `--replicate 1.2.3.4:abc` came up, stayed up
+    // and logged nothing at all.
+    if (m_repl_role == repl_follower && !m_replicate_target.empty() &&
+        !connect_to_master())
+        LOG_ERROR(("cache \"" + std::string(get_name()) + "\": could not dial master \"" +
+                   m_replicate_target + "\"").c_str());
 
     // Provided-buffer ring geometry, where the size decides how many commands
     // one completion can carry and the count how much concurrent traffic fits,
@@ -10416,7 +10424,34 @@ void cache_instance::build_info_reply(std::string& out) const
     out += "\r\n# Stats\r\n";
     out += "total_commands_processed:" + std::to_string(m_stat_commands) + "\r\n";
     out += "\r\n# Replication\r\n";
-    out += std::string("role:") + (m_mode == cache_mode_readonly ? "slave" : "master") + "\r\n";
+    // The replication role, and not whether the cache is read-only: derived
+    // from m_mode, a follower reported "master" unless it also happened to be
+    // read-only, which is the one field a client asks this section for.
+    const bool is_follower = (m_repl_role == repl_follower);
+    out += std::string("role:") + (is_follower ? "slave" : "master") + "\r\n";
+    if (is_follower)
+    {
+        // Whom it follows and whether the link is standing.  A follower that
+        // never reached its master answers every read out of an empty dataset
+        // and is otherwise indistinguishable from one in sync; m_master exists
+        // only once the connect completed and a read was armed on it, so its
+        // presence is the link.  A target that was never usable leaves the host
+        // empty and the port 0, which is the honest answer to "where".
+        std::string master_host;
+        uint16_t master_port = 0;
+        socketley::dial_addr::refusal(m_replicate_target, master_host, master_port);
+        out += "master_host:" + master_host + "\r\n";
+        out += "master_port:" + std::to_string(master_port) + "\r\n";
+        out += std::string("master_link_status:") + (m_master ? "up" : "down") + "\r\n";
+    }
+    else
+    {
+        size_t live = 0;
+        for (const auto& f : m_followers)
+            if (f && !f->dead && f->fd >= 0)
+                ++live;
+        out += "connected_slaves:" + std::to_string(live) + "\r\n";
+    }
     out += "\r\n# Cluster\r\n";
     out += std::string("cluster_enabled:") + (m_cluster_forced ? "1" : "0") + "\r\n";
     out += "\r\n# Keyspace\r\n";
@@ -11171,6 +11206,9 @@ std::string cache_instance::stats_lines() const
         << "eviction:" << static_cast<int>(m_store.get_eviction()) << "\n"
         << "channels:" << m_store.channel_count() << "\n"
         << "repl_role:" << static_cast<int>(m_repl_role) << "\n"
+        // The one thing repl_role cannot say: a follower with no link is a
+        // follower all the same, and reads as one here until this line.
+        << "master_link:" << (m_master ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
     return out.str();
 }

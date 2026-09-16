@@ -2,6 +2,7 @@
 #include "../shared/duration_parse.h"
 #include "../shared/runtime_instance.h"
 #include "../shared/unix_listener.h"
+#include "../shared/dial_address.h"
 #include "../shared/appending_file.h"
 #include "../shared/lua_context.h"
 #include "../shared/tls_context.h"
@@ -770,6 +771,11 @@ int parse_client_flags(client_instance* cli, const parsed_args& pa, size_t& i,
                     return 1;
                 }
             }
+            else if (std::string why = socketley::dial_addr::refusal(v); !why.empty())
+            {
+                std::cout << "-t: " << why << "\n";
+                return 1;
+            }
             cli->set_target(pa.args[i]);
             return 0;
         }
@@ -1156,7 +1162,20 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
                 std::cout << "--replicate requires host:port\n";
                 return 1;
             }
-            cache->set_replicate_target(pa.args[++i]);
+            // An empty value means follows nobody, which set_replicate_target
+            // documents; anything else has to be an address a follower can
+            // dial, port included, because there is no second flag to take one
+            // from.
+            if (std::string_view v = pa.args[++i]; !v.empty())
+            {
+                if (std::string why = socketley::dial_addr::refusal(v, true);
+                    !why.empty())
+                {
+                    std::cout << "--replicate: " << why << "\n";
+                    return 1;
+                }
+            }
+            cache->set_replicate_target(pa.args[i]);
             return 0;
         }
         default:
@@ -1659,6 +1678,11 @@ int parse_client_edit_flags(client_instance* cli, const parsed_args& pa, size_t&
                     std::cout << "-t: " << why << "\n";
                     return 1;
                 }
+            }
+            else if (std::string why = socketley::dial_addr::refusal(v); !why.empty())
+            {
+                std::cout << "-t: " << why << "\n";
+                return 1;
             }
             cli->set_target(pa.args[i]);
             return 0;
