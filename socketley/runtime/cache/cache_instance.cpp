@@ -5528,8 +5528,14 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             { rb.append("error: invalid score\n", 21); return; }
             m_store.check_expiry(key);
             double zout = 0.0;
-            if (!m_store.zincrby(key, zdelta, member, zout))
-            { rb.append("error: type conflict\n", 21); return; }
+            switch (m_store.zincrby(key, zdelta, member, zout))
+            {
+                case cache_store::zincr_result::ok: break;
+                case cache_store::zincr_result::not_a_number:
+                    rb.append("error: resulting score is not a number (NaN)\n"); return;
+                case cache_store::zincr_result::type_conflict:
+                    rb.append("error: type conflict\n"); return;
+            }
             append_score(rb, zout);
             replicate_command(line);
             break;
@@ -8658,8 +8664,15 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_into(rb, "value is not a valid float"); return; }
             m_store.check_expiry(args[1]);
             double zout = 0.0;
-            if (!m_store.zincrby(args[1], zd, args[3], zout))
-            { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+            switch (m_store.zincrby(args[1], zd, args[3], zout))
+            {
+                case cache_store::zincr_result::ok: break;
+                case cache_store::zincr_result::not_a_number:
+                    resp::encode_error_into(rb, "resulting score is not a number (NaN)");
+                    return;
+                case cache_store::zincr_result::type_conflict:
+                    resp::encode_error_code_into(rb, wrongtype_msg); return;
+            }
             repl(args, argc);
             std::string zs;
             append_score_bare(zs, zout);

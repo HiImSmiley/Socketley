@@ -1648,3 +1648,55 @@ TEST_CASE("cache_store scan filtering on a numeric range")
         CHECK(got == std::set<std::string_view>{"u:1", "u:2"});
     }
 }
+
+// inf plus -inf is NaN, and a NaN score is in every range and in none.  It also
+// broke the store's own "did that work" check, which compares the score it read
+// back against the one it wrote -- and NaN equals nothing, including itself.
+TEST_CASE("cache_store zincrby refuses a result that is not a number")
+{
+    using zr = cache_store::zincr_result;
+    cache_store store;
+
+    SUBCASE("an ordinary increment still works")
+    {
+        double out = 0;
+        CHECK(store.zincrby("z", 5.0, "m", out) == zr::ok);
+        CHECK(out == 5.0);
+        CHECK(store.zincrby("z", 2.5, "m", out) == zr::ok);
+        CHECK(out == 7.5);
+        double sc = 0;
+        CHECK(store.zscore("z", "m", sc));
+        CHECK(sc == 7.5);
+    }
+
+    SUBCASE("an infinite score is allowed, because a zset may hold one")
+    {
+        double out = 0;
+        CHECK(store.zincrby("z", std::numeric_limits<double>::infinity(), "m", out) == zr::ok);
+        CHECK(std::isinf(out));
+        double sc = 0;
+        CHECK(store.zscore("z", "m", sc));
+        CHECK(std::isinf(sc));
+    }
+
+    SUBCASE("but an increment that would make it NaN is refused")
+    {
+        double out = 0;
+        REQUIRE(store.zincrby("z", std::numeric_limits<double>::infinity(), "m", out) == zr::ok);
+        CHECK(store.zincrby("z", -std::numeric_limits<double>::infinity(), "m", out)
+              == zr::not_a_number);
+
+        // And refused BEFORE the write: the member still holds what it held.
+        double sc = 0;
+        REQUIRE(store.zscore("z", "m", sc));
+        CHECK(std::isinf(sc));
+        CHECK(sc > 0);
+    }
+
+    SUBCASE("a type conflict is still its own answer")
+    {
+        store.set("s", "not a zset");
+        double out = 0;
+        CHECK(store.zincrby("s", 1.0, "m", out) == zr::type_conflict);
+    }
+}

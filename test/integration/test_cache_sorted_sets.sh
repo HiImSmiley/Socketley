@@ -139,6 +139,21 @@ eq "an ordinary range still works"    "$(pt 'zrangebyscore nanset 15 25')" "b|en
 eq "and so do the infinities, which ARE numbers" \
    "$(pt 'zrangebyscore nanset -inf +inf')" "a|b|c|end|"
 
+# A score can also BECOME NaN, which no bound parser can stop: inf plus -inf.
+# Before this was refused, zincrby wrote the NaN and then reported a type
+# conflict -- because its own check compares the score it read back against the
+# one it wrote, and NaN equals nothing, itself included.  The member was left
+# holding a score that sat in every range at once.
+pt 'zadd infset inf a' >/dev/null
+eq "an increment that would make the score NaN is refused by name" \
+   "$(pt 'zincrby infset -inf a')" "error: resulting score is not a number (NaN)|"
+eq "and the member still holds what it held" "$(pt 'zscore infset a')" "inf|"
+eq "so it is in the range that spans everything" \
+   "$(pt 'zrangebyscore infset -inf +inf')" "a|end|"
+eq "and in no range it is not in"     "$(pt 'zrangebyscore infset 0 1')" "end|"
+eq "an ordinary increment is untouched by any of this" \
+   "$(pt 'zincrby nanset 5 a')" "15|"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

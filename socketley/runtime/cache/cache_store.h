@@ -250,8 +250,13 @@ public:
     void   zrange(std::string_view key, int64_t start, int64_t stop,
                   std::vector<std::pair<std::string_view, double>>& out,
                   bool reverse = false) const;
-    bool   zincrby(std::string_view key, double delta, std::string_view member,
-                   double& out);
+    // An increment can be refused for two different reasons and the caller has
+    // to tell them apart: a type conflict is about the client's KEY, a NaN
+    // result is about its arithmetic, and Redis names the second one separately
+    // rather than reporting the first.
+    enum class zincr_result { ok, type_conflict, not_a_number };
+    zincr_result zincrby(std::string_view key, double delta, std::string_view member,
+                         double& out);
 
     // --- Strings, the range and float spellings ---
     // Inclusive ends, negative counting from the last, empty when inverted --

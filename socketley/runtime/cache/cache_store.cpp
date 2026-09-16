@@ -199,8 +199,9 @@ void cache_store::zrange(std::string_view key, int64_t start, int64_t stop,
     }
 }
 
-bool cache_store::zincrby(std::string_view key, double delta, std::string_view member,
-                          double& out)
+cache_store::zincr_result
+cache_store::zincrby(std::string_view key, double delta, std::string_view member,
+                     double& out)
 {
     double current = 0.0;
     if (zscore(key, member, current))
@@ -208,11 +209,27 @@ bool cache_store::zincrby(std::string_view key, double delta, std::string_view m
     else
         out = delta;
 
+    // inf plus -inf is NaN, and a NaN score is in every range and in none: it
+    // compares false against both bounds, so `zrangebyscore k 0 1` answered with
+    // a member whose score was NaN.  Refused BEFORE anything is written, which
+    // is what leaves the set as it was -- incrbyfloat one screen up refuses the
+    // same way and for the same reason.
+    //
+    // It also broke the check below, which is how this surfaced: NaN == NaN is
+    // false, so the store reported a failure for a write it had just made and
+    // the door turned that into a type conflict.
+    //
+    // An INFINITE score is fine and stays allowed: a zset may hold one, and
+    // Redis refuses only the NaN here.
+    if (std::isnan(out))
+        return zincr_result::not_a_number;
+
     // zadd carries the type check and the memory refusal, and answers `new`
     // rather than `stored`, so the score is what says this worked.
     zadd(key, out, member);
     double check = 0.0;
-    return zscore(key, member, check) && check == out;
+    return (zscore(key, member, check) && check == out)
+         ? zincr_result::ok : zincr_result::type_conflict;
 }
 
 size_t cache_store::entry_cost(const std::string& key, const hash_inner& fields)
