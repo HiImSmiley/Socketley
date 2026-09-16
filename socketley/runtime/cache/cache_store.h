@@ -156,9 +156,17 @@ public:
     static constexpr uint8_t scan_last_map = 4;   // m_data, m_lists, m_sets, m_hashes, m_zsets
     // `value_pattern` is a pointer and not an empty string_view because absent
     // and empty are different requests, the same distinction MATCH "" makes.
+    // `type_map` restricts the walk to one of the five maps, which is what a
+    // type filter IS here: the type of a key is the map it lives in.  -1 walks
+    // all five, and a name no type has never reaches this -- the caller answers
+    // an empty page for that rather than asking for a walk of nothing.
     uint64_t scan(uint64_t cursor, std::string_view pattern,
                   size_t count, std::vector<std::string_view>& out,
-                  const std::string_view* value_pattern = nullptr) const;
+                  const std::string_view* value_pattern = nullptr,
+                  int type_map = -1) const;
+
+    // The map a type name names, or -1 for a name no type has.
+    static int scan_map_of_type(std::string_view name);
 
     // The string map alone, which is the only one a value predicate can be
     // answered from, with the page bounded by keys examined rather than keys

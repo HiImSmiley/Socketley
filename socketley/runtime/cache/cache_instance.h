@@ -593,7 +593,8 @@ private:
     bool     shard_scan(uint64_t cursor, std::string_view pattern, size_t count,
                         std::vector<std::string_view>& out, uint64_t& next,
                         bool node_local,
-                        const std::string_view* value_pattern = nullptr);
+                        const std::string_view* value_pattern = nullptr,
+                        int type_map = -1);
 
     // Append a finished batch's slots to the connection's reply buffer and let
     // the rest of its pipeline run.

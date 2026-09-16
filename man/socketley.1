@@ -4372,9 +4372,27 @@ rather than nil, because a caller asking for the old value wants to hear that.
 .BI "psetex " "key milliseconds value"
 Set key with millisecond-precision expiry. Returns "ok".
 .TP
-.BI "scan " "cursor [match pattern] [count n] [valuematch glob]"
+.BI "scan " "cursor [match pattern] [count n] [valuematch glob] [type t]"
 Cursor-based key iteration. Returns next cursor (0 = done), then matching keys, then "end".
 Use cursor=0 to start; repeat with returned cursor until 0 is returned.
+.IP
+.B Restricting to one type.
+.I type
+takes one of
+.BR string ", " list ", " set ", " hash " or " zset
+in any case, and returns only keys of that type.  It is close to free: the type
+of a key is the map it is stored in, and the walk visits the five maps in a
+fixed order anyway, so a restriction is a walk of one map instead of five.  A
+name no type has matches nothing rather than everything.
+.IP
+.B Keep the options constant across an iteration.
+.IR match ", " count ", " valuematch " and " type
+are properties of the whole walk, not of one call: the cursor names the map the
+walk has reached, so handing a cursor from a restricted walk back without the
+restriction resumes partway through the keyspace and never returns what came
+before it.  The reverse direction is caught -- a value or type walk given a
+cursor from elsewhere starts its map again rather than trusting a bucket index
+belonging to a different table.
 .IP
 .B Filtering on the value.
 .I valuematch

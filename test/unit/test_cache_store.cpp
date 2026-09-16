@@ -1169,3 +1169,86 @@ TEST_CASE("cache_store scan filtering on the value")
         CHECK(out.size() == 300);
     }
 }
+
+// The type of a key is the map it lives in, so a type filter is a restriction
+// on which of the five the walk visits -- which makes the scan cheaper rather
+// than dearer, the same way the value predicate does.
+TEST_CASE("cache_store scan restricted to one type")
+{
+    cache_store store;
+    store.set("s:1", "v");
+    store.set("s:2", "v");
+    store.rpush("l:1", "e");
+    store.sadd("t:1", "m");
+    store.hset("h:1", "f", "v");
+    store.zadd("z:1", 1.0, "m");
+
+    SUBCASE("a name maps to its map, and a name no type has to nothing")
+    {
+        CHECK(cache_store::scan_map_of_type("string") == 0);
+        CHECK(cache_store::scan_map_of_type("list")   == 1);
+        CHECK(cache_store::scan_map_of_type("set")    == 2);
+        CHECK(cache_store::scan_map_of_type("hash")   == 3);
+        CHECK(cache_store::scan_map_of_type("zset")   == 4);
+        // Spelled however the caller likes, because the names are all letters.
+        CHECK(cache_store::scan_map_of_type("HASH")   == 3);
+        CHECK(cache_store::scan_map_of_type("ZSet")   == 4);
+        CHECK(cache_store::scan_map_of_type("stream") == -1);
+        CHECK(cache_store::scan_map_of_type("")       == -1);
+    }
+
+    SUBCASE("each restriction returns its own map and nothing else")
+    {
+        // The prefix each map's keys were seeded with, so "it returned two
+        // things" cannot pass for "it returned the right two things".
+        struct { int map; size_t n; char prefix; } want[] = {
+            {0, 2, 's'}, {1, 1, 'l'}, {2, 1, 't'}, {3, 1, 'h'}, {4, 1, 'z'},
+        };
+        for (const auto& w : want)
+        {
+            std::vector<std::string_view> out;
+            CHECK(store.scan(0, "*", 100000, out, nullptr, w.map) == 0);
+            REQUIRE(out.size() == w.n);
+            for (auto k : out)
+            {
+                REQUIRE(k.size() >= 2);
+                CHECK(k[0] == w.prefix);
+                CHECK(k[1] == ':');
+            }
+        }
+    }
+
+    SUBCASE("the whole keyspace is still the default")
+    {
+        std::vector<std::string_view> out;
+        CHECK(store.scan(0, "*", 100000, out) == 0);
+        CHECK(out.size() == 6);
+    }
+
+    SUBCASE("a cursor already past the one map has nothing left to do")
+    {
+        // Restricted to the string map, resumed with a cursor naming the hash
+        // map: under this restriction that iteration is over, and walking the
+        // string map again would only repeat what the client already has.
+        const uint64_t past = (3ull << 55);
+        std::vector<std::string_view> out;
+        CHECK(store.scan(past, "*", 100000, out, nullptr, 0) == 0);
+        CHECK(out.empty());
+    }
+
+    SUBCASE("a cursor naming an earlier map starts the restricted one at its top")
+    {
+        for (int i = 0; i < 300; i++)
+            store.hset("big:" + std::to_string(i), "f", "v");
+
+        // Bits that name the string map, fed to a walk restricted to hashes.
+        std::vector<std::string_view> probe;
+        const uint64_t real = store.scan(0, "*", 1, probe);
+        REQUIRE(real != 0);
+        const uint64_t earlier = (real >> 32) << 32 | 7ull;   // map 0, bucket 7
+
+        std::vector<std::string_view> out;
+        CHECK(store.scan(earlier, "*", 1000000, out, nullptr, 3) == 0);
+        CHECK(out.size() == 301);       // the 300 plus h:1
+    }
+}

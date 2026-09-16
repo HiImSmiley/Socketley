@@ -1138,8 +1138,12 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
 
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out,
-                            const std::string_view* value_pattern) const
+                            const std::string_view* value_pattern,
+                            int type_map) const
 {
+    // A value predicate is the string map and nothing else, so a type filter
+    // that agrees with it adds nothing and one that disagrees was answered
+    // empty by the caller before it got here.
     if (value_pattern)
         return scan_values(cursor, pattern, count, out, *value_pattern);
 
@@ -1183,9 +1187,19 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
         return 0;
     };
 
-    // The five in a fixed order, so a cursor names the same map on every call.
-    const uint8_t last_map = scan_last_map;
-    for (uint8_t idx = in_map; idx <= last_map; ++idx)
+    // The five in a fixed order, so a cursor names the same map on every call --
+    // or exactly one of them when a type was asked for, because the type of a
+    // key is the map it is in.
+    const uint8_t first_map = (type_map >= 0) ? static_cast<uint8_t>(type_map) : in_map;
+    const uint8_t last_map  = (type_map >= 0) ? static_cast<uint8_t>(type_map) : scan_last_map;
+
+    // A cursor already past the single map this walk may visit has nothing left
+    // to do.  Without this the walk below would start that map again from the
+    // top, which repeats keys -- allowed, but pointlessly.
+    if (type_map >= 0 && in_map > static_cast<uint8_t>(type_map))
+        return 0;
+
+    for (uint8_t idx = first_map; idx <= last_map; ++idx)
     {
         size_t start = 0;
         if (idx == in_map && cursor != 0)
@@ -1940,6 +1954,26 @@ bool cache_store::holds_other_type(std::string_view key, char expect) const
     if (expect != 'h' && !m_hashes.empty() && m_hashes.count(key)) return true;
     if (expect != 'z' && !m_zsets.empty()  && m_zsets.count(key))  return true;
     return false;
+}
+
+// Beside type() deliberately: the two share a vocabulary, and a reader who
+// changes one has to have the other on the same screen.
+int cache_store::scan_map_of_type(std::string_view name)
+{
+    // The names are all letters, so ORing in 0x20 lowercases them and a caller
+    // may spell the type however it likes.
+    auto eq = [](std::string_view a, std::string_view lower) {
+        if (a.size() != lower.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (static_cast<char>(a[i] | 0x20) != lower[i]) return false;
+        return true;
+    };
+    if (eq(name, "string")) return 0;
+    if (eq(name, "list"))   return 1;
+    if (eq(name, "set"))    return 2;
+    if (eq(name, "hash"))   return 3;
+    if (eq(name, "zset"))   return 4;
+    return -1;
 }
 
 std::string_view cache_store::type(std::string_view key) const
