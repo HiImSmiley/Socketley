@@ -1096,6 +1096,49 @@ static inline uint64_t scan_cursor_pack(uint8_t map, size_t buckets, size_t buck
 // is usually broad; a value predicate is selective by construction, so under
 // scan()'s rule one call would walk the whole map -- measured at 74 ms over
 // 632,331 keys, and that is 74 ms with this shard answering nobody.
+// One page of a bucket-walked map, which is the shape all three scans have.
+//
+// `visit` is handed each entry; `page_full` is asked after each whole bucket and
+// says whether this page has done enough.  What "enough" means is the caller's,
+// and the two answers are not interchangeable: the plain walk ends on entries
+// RETURNED, which is right while the pattern is broad, and the filtered walks end
+// on entries EXAMINED, because a selective predicate under the other rule walks
+// the whole map in one call -- 74 ms over 632,331 keys with the shard answering
+// nobody.  Written once here because it had been written three times.
+template <class Map, class Visit, class Full>
+static uint64_t walk_buckets(const Map& map, uint8_t map_index, size_t first_bucket,
+                             Visit visit, Full page_full)
+{
+    const size_t nbuckets = map.bucket_count();
+    size_t examined = 0;
+    for (size_t b = first_bucket; b < nbuckets; ++b)
+    {
+        for (auto it = map.begin(b); it != map.end(b); ++it)
+        {
+            ++examined;
+            visit(*it);
+        }
+        // Whole buckets and never half of one: a page boundary inside a bucket
+        // would need an element index the cursor has no room for.
+        if (page_full(examined) && b + 1 < nbuckets)
+            return scan_cursor_pack(map_index, nbuckets, b + 1);
+    }
+    return 0;
+}
+
+// Where a walk of one map resumes, given a cursor that may name another map or a
+// table that has been rehashed since.  Both answers are "start again": repeating
+// keys is allowed by the contract and skipping them is not.
+static size_t resume_bucket(uint64_t cursor, uint8_t want_map, size_t nbuckets)
+{
+    if (cursor == 0) return 0;
+    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
+    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
+    const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
+    if (in_map != want_map) return 0;
+    return (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
+}
+
 // One page of the hash map, filtered on what a named field of each hash holds.
 //
 // This is the database question -- "which records have city = berlin" -- for the
@@ -1112,41 +1155,24 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
     const bool match_all_keys = (pattern == "*");
     const bool match_all_vals = (!filter.value || *filter.value == "*");
 
-    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
-    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
-    const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
-
-    const size_t nbuckets = m_hashes.bucket_count();
-    size_t b = 0;
     // Map three is the hash map; a cursor naming another one carries a bucket
-    // index belonging to a different table, and taking it at face value would
-    // start this walk partway in and skip what came before.
-    if (cursor != 0 && in_map == 3)
-        b = (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
-
-    size_t examined = 0;
-    for (; b < nbuckets; ++b)
-    {
-        for (auto it = m_hashes.begin(b); it != m_hashes.end(b); ++it)
-        {
-            ++examined;
-            if (!match_all_keys && !socketley::glob_match(pattern, it->first))
-                continue;
-            // A hash without the field is not a hash whose field is empty, so
-            // it does not match even a predicate that matches everything.
-            const auto fit = it->second.find(*filter.field);
-            if (fit == it->second.end())
-                continue;
+    // index belonging to a different table.
+    return walk_buckets(m_hashes, 3, resume_bucket(cursor, 3, m_hashes.bucket_count()),
+        [&](const auto& e) {
+            if (!match_all_keys && !socketley::glob_match(pattern, e.first))
+                return;
+            // A hash without the field is not a hash whose field is empty, so it
+            // does not match even a predicate that matches everything.
+            const auto fit = e.second.find(*filter.field);
+            if (fit == e.second.end())
+                return;
             if (!match_all_vals && !socketley::glob_match(*filter.value, fit->second))
-                continue;
-            out.push_back(it->first);
+                return;
+            out.push_back(e.first);
             if (filter.with_values)
                 out.push_back(fit->second);
-        }
-        if (examined >= count && b + 1 < nbuckets)
-            return scan_cursor_pack(3, nbuckets, b + 1);
-    }
-    return 0;
+        },
+        [&](size_t examined) { return examined >= count; });
 }
 
 uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
@@ -1158,39 +1184,20 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
     // source, but it is the same walk, so both take the short path here.
     const bool match_all_vals = (!filter.value || *filter.value == "*");
 
-    const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
-    const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
-    const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
-
-    const size_t nbuckets = m_data.bucket_count();
-    size_t b = 0;
     // A cursor naming another map came from a walk that was not this one -- an
     // iteration that changed its options midway -- and its bucket index means
-    // nothing here.  Restarting repeats keys, which the contract allows; taking
-    // the number at face value would start this walk partway into m_data and
-    // skip everything before it, which the contract does not.
-    if (cursor != 0 && in_map == 0)
-        b = (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
-
-    size_t examined = 0;
-    for (; b < nbuckets; ++b)
-    {
-        for (auto it = m_data.begin(b); it != m_data.end(b); ++it)
-        {
-            ++examined;
-            if (!match_all_keys && !socketley::glob_match(pattern, it->first))
-                continue;
-            if (!match_all_vals && !socketley::glob_match(*filter.value, it->second))
-                continue;
-            out.push_back(it->first);
+    // nothing here.
+    return walk_buckets(m_data, 0, resume_bucket(cursor, 0, m_data.bucket_count()),
+        [&](const auto& e) {
+            if (!match_all_keys && !socketley::glob_match(pattern, e.first))
+                return;
+            if (!match_all_vals && !socketley::glob_match(*filter.value, e.second))
+                return;
+            out.push_back(e.first);
             if (filter.with_values)
-                out.push_back(it->second);
-        }
-        // Whole buckets and never half of one, for the reason scan() gives.
-        if (examined >= count && b + 1 < nbuckets)
-            return scan_cursor_pack(0, nbuckets, b + 1);
-    }
-    return 0;
+                out.push_back(e.second);
+        },
+        [&](size_t examined) { return examined >= count; });
 }
 
 uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
@@ -1229,20 +1236,12 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
 
     // One map from `first_bucket` on, returning the cursor to resume with or 0
     // when this map is exhausted.
+    // Ends on keys RETURNED and across the five maps together: `out` is what the
+    // whole page has so far, not what this one map contributed.
     auto walk = [&](const auto& map, uint8_t idx, size_t first_bucket) -> uint64_t {
-        const size_t nbuckets = map.bucket_count();
-        for (size_t b = first_bucket; b < nbuckets; ++b)
-        {
-            for (auto it = map.begin(b); it != map.end(b); ++it)
-                if (match(it->first))
-                    out.push_back(it->first);
-
-            // Whole buckets and never half of one, because a page boundary
-            // inside a bucket would need the element index this is replacing.
-            if (out.size() >= count && b + 1 < nbuckets)
-                return pack(idx, nbuckets, b + 1);
-        }
-        return 0;
+        return walk_buckets(map, idx, first_bucket,
+            [&](const auto& e) { if (match(e.first)) out.push_back(e.first); },
+            [&](size_t) { return out.size() >= count; });
     };
 
     // The five in a fixed order, so a cursor names the same map on every call --
