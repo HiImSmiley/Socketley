@@ -4132,7 +4132,8 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
-        next = m_store.scan(cursor, pattern, count, out, value_pattern, type_map, with_values);
+        next = m_store.scan(cursor, pattern, count, out,
+                            { value_pattern, type_map, with_values });
         return true;
     }
 
@@ -4143,7 +4144,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     {
         const uint64_t store_next =
             m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                         value_pattern, type_map, with_values);
+                         { value_pattern, type_map, with_values });
         next = store_next == 0 ? 0
                                : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
@@ -4155,7 +4156,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
 
     const uint64_t store_next =
         m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                     value_pattern, type_map, with_values);
+                     { value_pattern, type_map, with_values });
 
     if (store_next != 0)
         next = cache_scan_cursor_make(m_shard_i, store_next);
