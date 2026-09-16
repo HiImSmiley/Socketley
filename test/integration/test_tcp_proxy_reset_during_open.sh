@@ -76,7 +76,13 @@ DRAIN_SECS=8
 # A floor rather than a target: the kernel drops connections reset before they
 # are accepted, so well under STORM is normal and near zero means the storm
 # never reached the proxy.
-MIN_SEEN=40
+MIN_SEEN=200           # of STORM.  Was 40, which is what a floor becomes when the
+                       # storm is a race: the count read 19 of 300 under load and 206
+                       # idle on the same build, so 40 caught neither a degraded storm
+                       # nor a healthy one.  With the reset paced behind the read it is
+                       # 300 of 300 in four loaded runs, and a floor can mean something
+                       # again: two thirds of the storm, or the box is too slow to be
+                       # measuring this at all.
 
 # The backend holds a payload beginning with SLOW for 150ms, so the reply is
 # still owed when the client stops existing.
@@ -117,6 +123,15 @@ for _ in range(n):
         s.sendall(b"SLOW-abort:" + b"v" * 200 + b"\n"); sent += 1
     except OSError:
         pass
+    # A moment before the reset, and it is not a nicety.  SO_LINGER 0 discards
+    # whatever the peer has not read yet, so without this the count below is a
+    # measure of how promptly the proxy got round to reading -- 19 of 300 under
+    # load against 206 idle, on the same build.  And a connection whose bytes
+    # were discarded contributes nothing here anyway: the defect needs the
+    # request READ before the reset, because what leaked was a second backend
+    # opened for bytes delivered after the client had gone.  The reset still
+    # lands inside the backend open, which takes 150ms.
+    time.sleep(0.005)
     if how == "rst":
         try: s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         except OSError: pass
