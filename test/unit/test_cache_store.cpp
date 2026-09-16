@@ -1100,7 +1100,7 @@ TEST_CASE("cache_store scan filtering on the value")
         store.zadd("z:1", 1.0, "berlin");
 
         std::vector<std::string_view> out;
-        CHECK(store.scan(0, "*", 100000, out, { &berlin }) == 0);
+        CHECK(store.scan(0, "*", 100000, out, cache_store::scan_filter::one(&berlin)) == 0);
         REQUIRE(out.size() == 1);
         CHECK(out[0] == "s:hit");
     }
@@ -1112,7 +1112,7 @@ TEST_CASE("cache_store scan filtering on the value")
 
         std::vector<std::string_view> out;
         std::string_view none = "";
-        CHECK(store.scan(0, "*", 100000, out, { &none }) == 0);
+        CHECK(store.scan(0, "*", 100000, out, cache_store::scan_filter::one(&none)) == 0);
         REQUIRE(out.size() == 1);
         CHECK(out[0] == "e:1");
 
@@ -1129,7 +1129,7 @@ TEST_CASE("cache_store scan filtering on the value")
         store.set("x:1", "berlin");
 
         std::vector<std::string_view> out;
-        CHECK(store.scan(0, "u:*", 100000, out, { &berlin }) == 0);
+        CHECK(store.scan(0, "u:*", 100000, out, cache_store::scan_filter::one(&berlin)) == 0);
         REQUIRE(out.size() == 1);
         CHECK(out[0] == "u:1");
     }
@@ -1143,7 +1143,7 @@ TEST_CASE("cache_store scan filtering on the value")
         // the map in one call and answer 0.  Bounded by keys examined it stops
         // early and hands back a cursor.
         std::vector<std::string_view> out;
-        const uint64_t next = store.scan(0, "*", 8, out, { &berlin });
+        const uint64_t next = store.scan(0, "*", 8, out, cache_store::scan_filter::one(&berlin));
         CHECK(out.empty());
         CHECK(next != 0);
     }
@@ -1168,7 +1168,7 @@ TEST_CASE("cache_store scan filtering on the value")
         // of the iteration at all.
         const uint64_t foreign = (1ull << 55) | (buckets << 32) | 5ull;
         std::vector<std::string_view> out;
-        CHECK(store.scan(foreign, "*", 100000, out, { &berlin }) == 0);
+        CHECK(store.scan(foreign, "*", 100000, out, cache_store::scan_filter::one(&berlin)) == 0);
         CHECK(out.size() == 300);
     }
 }
@@ -1210,7 +1210,7 @@ TEST_CASE("cache_store scan restricted to one type")
         for (const auto& w : want)
         {
             std::vector<std::string_view> out;
-            CHECK(store.scan(0, "*", 100000, out, { nullptr, w.map }) == 0);
+            CHECK(store.scan(0, "*", 100000, out, cache_store::scan_filter::one(nullptr, w.map)) == 0);
             REQUIRE(out.size() == w.n);
             for (auto k : out)
             {
@@ -1235,7 +1235,7 @@ TEST_CASE("cache_store scan restricted to one type")
         // string map again would only repeat what the client already has.
         const uint64_t past = (3ull << 55);
         std::vector<std::string_view> out;
-        CHECK(store.scan(past, "*", 100000, out, { nullptr, 0 }) == 0);
+        CHECK(store.scan(past, "*", 100000, out, cache_store::scan_filter::one(nullptr, 0)) == 0);
         CHECK(out.empty());
     }
 
@@ -1251,7 +1251,7 @@ TEST_CASE("cache_store scan restricted to one type")
         const uint64_t earlier = (real >> 32) << 32 | 7ull;   // map 0, bucket 7
 
         std::vector<std::string_view> out;
-        CHECK(store.scan(earlier, "*", 1000000, out, { nullptr, 3 }) == 0);
+        CHECK(store.scan(earlier, "*", 1000000, out, cache_store::scan_filter::one(nullptr, 3)) == 0);
         CHECK(out.size() == 301);       // the 300 plus h:1
     }
 }
@@ -1278,7 +1278,7 @@ TEST_CASE("cache_store scan returning values beside keys")
     SUBCASE("key and value, interleaved, strings only")
     {
         std::vector<std::string_view> out;
-        CHECK(store.scan(0, "*", 100000, out, { nullptr, -1, /*with_values=*/true }) == 0);
+        CHECK(store.scan(0, "*", 100000, out, cache_store::scan_filter::one(nullptr, -1, /*with_values=*/true)) == 0);
         REQUIRE(out.size() == 6);          // three pairs, and not the hash
         std::map<std::string, std::string> got;
         for (size_t i = 0; i < out.size(); i += 2)
@@ -1296,7 +1296,7 @@ TEST_CASE("cache_store scan returning values beside keys")
     {
         std::string_view berlin = "*berlin*";
         std::vector<std::string_view> out;
-        CHECK(store.scan(0, "*", 100000, out, { &berlin, -1, true }) == 0);
+        CHECK(store.scan(0, "*", 100000, out, cache_store::scan_filter::one(&berlin, -1, true)) == 0);
         REQUIRE(out.size() == 2);
         CHECK(out[0] == "u:1");
         CHECK(out[1] == "berlin");
@@ -1312,7 +1312,7 @@ TEST_CASE("cache_store scan returning values beside keys")
         int guard = 0;
         do {
             std::vector<std::string_view> page;
-            cur = store.scan(cur, "*", 4, page, { nullptr, -1, true });
+            cur = store.scan(cur, "*", 4, page, cache_store::scan_filter::one(nullptr, -1, true));
             // The one property that makes the reply parseable at all: a client
             // reading two at a time must never be handed an odd page.
             REQUIRE(page.size() % 2 == 0);
@@ -1367,7 +1367,7 @@ TEST_CASE("cache_store counts one type without walking it")
         for (int m = 0; m <= 4; m++)
         {
             std::vector<std::string_view> out;
-            CHECK(store.scan(0, "*", 1000000, out, { nullptr, m }) == 0);
+            CHECK(store.scan(0, "*", 1000000, out, cache_store::scan_filter::one(nullptr, m)) == 0);
             CHECK(out.size() == store.size_of_type(m));
         }
     }
@@ -1395,10 +1395,10 @@ TEST_CASE("cache_store scan filtering on a hash field")
 
     SUBCASE("having the field is not the same as the field being empty")
     {
-        auto has = walk({ nullptr, -1, false, &field_city });
+        auto has = walk(cache_store::scan_filter::one(nullptr, -1, false, &field_city));
         CHECK(has.size() == 4);                       // u:4 has no city
         std::string_view empty = "";
-        auto is_empty = walk({ &empty, -1, false, &field_city });
+        auto is_empty = walk(cache_store::scan_filter::one(&empty, -1, false, &field_city));
         REQUIRE(is_empty.size() == 1);
         CHECK(is_empty[0] == "u:5");                  // and u:5's city IS empty
     }
@@ -1406,7 +1406,7 @@ TEST_CASE("cache_store scan filtering on a hash field")
     SUBCASE("the predicate is matched against the field, not against the key")
     {
         std::string_view berlin = "berlin";
-        auto got = walk({ &berlin, -1, false, &field_city });
+        auto got = walk(cache_store::scan_filter::one(&berlin, -1, false, &field_city));
         REQUIRE(got.size() == 2);
         std::set<std::string_view> s(got.begin(), got.end());
         CHECK(s.count("u:1") == 1);
@@ -1420,14 +1420,14 @@ TEST_CASE("cache_store scan filtering on a hash field")
     SUBCASE("the key pattern still applies")
     {
         std::string_view berlin = "berlin";
-        auto got = walk({ &berlin, -1, false, &field_city }, "u:1*");
+        auto got = walk(cache_store::scan_filter::one(&berlin, -1, false, &field_city), "u:1*");
         REQUIRE(got.size() == 1);
         CHECK(got[0] == "u:1");
     }
 
     SUBCASE("with values it is the field's value that comes back")
     {
-        auto got = walk({ nullptr, -1, true, &field_city });
+        auto got = walk(cache_store::scan_filter::one(nullptr, -1, true, &field_city));
         REQUIRE(got.size() == 8);                     // four pairs
         std::map<std::string, std::string> m;
         for (size_t i = 0; i < got.size(); i += 2)
@@ -1444,7 +1444,7 @@ TEST_CASE("cache_store scan filtering on a hash field")
             store.hset("h:" + std::to_string(i), "city", "hamburg");
         std::string_view nowhere = "atlantis";
         std::vector<std::string_view> out;
-        const uint64_t next = store.scan(0, "*", 8, out, { &nowhere, -1, false, &field_city });
+        const uint64_t next = store.scan(0, "*", 8, out, cache_store::scan_filter::one(&nowhere, -1, false, &field_city));
         CHECK(out.empty());
         CHECK(next != 0);
     }
@@ -1462,7 +1462,7 @@ TEST_CASE("cache_store scan filtering on a hash field")
 
         std::string_view berlin = "berlin";
         std::vector<std::string_view> out;
-        CHECK(store.scan(foreign, "*", 1000000, out, { &berlin, -1, false, &field_city }) == 0);
+        CHECK(store.scan(foreign, "*", 1000000, out, cache_store::scan_filter::one(&berlin, -1, false, &field_city)) == 0);
         CHECK(out.size() == 302);                     // the 300 plus u:1 and u:3
     }
 }
@@ -1579,11 +1579,11 @@ TEST_CASE("cache_store scan filtering on a numeric range")
     SUBCASE("the bounds are inclusive unless asked otherwise")
     {
         vr inc{10, 30, true, true};
-        auto a = names({ nullptr, -1, false, nullptr, &inc });
+        auto a = names(cache_store::scan_filter::one(nullptr, -1, false, nullptr, &inc));
         CHECK(a == std::set<std::string_view>{"n:10", "n:20", "n:30", "n:f"});
 
         vr exc{10, 30, false, false};
-        auto b = names({ nullptr, -1, false, nullptr, &exc });
+        auto b = names(cache_store::scan_filter::one(nullptr, -1, false, nullptr, &exc));
         CHECK(b == std::set<std::string_view>{"n:20", "n:f"});
     }
 
@@ -1594,7 +1594,7 @@ TEST_CASE("cache_store scan filtering on a numeric range")
         // to be the number or it is not one.
         vr all{-std::numeric_limits<double>::infinity(),
                 std::numeric_limits<double>::infinity(), true, true};
-        auto got = names({ nullptr, -1, false, nullptr, &all });
+        auto got = names(cache_store::scan_filter::one(nullptr, -1, false, nullptr, &all));
         CHECK(got.count("n:na") == 0);
         CHECK(got.count("n:e")  == 0);
         CHECK(got.count("n:10") == 1);
@@ -1616,7 +1616,7 @@ TEST_CASE("cache_store scan filtering on a numeric range")
                                std::pair{0.0, 0.0} })
         {
             vr r{lo, hi, true, true};
-            auto got = names({ nullptr, -1, false, nullptr, &r });
+            auto got = names(cache_store::scan_filter::one(nullptr, -1, false, nullptr, &r));
             CHECK(got.count("n:nan") == 0);
             CHECK(got.count("n:NAN") == 0);
         }
@@ -1626,7 +1626,7 @@ TEST_CASE("cache_store scan filtering on a numeric range")
     {
         std::string_view two = "2*";
         vr r{10, 30, true, true};
-        auto got = names({ &two, -1, false, nullptr, &r });
+        auto got = names(cache_store::scan_filter::one(&two, -1, false, nullptr, &r));
         CHECK(got == std::set<std::string_view>{"n:20", "n:f"});
     }
 
@@ -1634,7 +1634,7 @@ TEST_CASE("cache_store scan filtering on a numeric range")
     {
         std::string_view age = "age";
         vr r{25, 40, true, true};
-        auto got = names({ nullptr, -1, false, &age, &r });
+        auto got = names(cache_store::scan_filter::one(nullptr, -1, false, &age, &r));
         REQUIRE(got.size() == 1);
         CHECK(got.count("u:1") == 1);
     }
@@ -1644,7 +1644,7 @@ TEST_CASE("cache_store scan filtering on a numeric range")
         std::string_view age = "age";
         vr all{-std::numeric_limits<double>::infinity(),
                 std::numeric_limits<double>::infinity(), true, true};
-        auto got = names({ nullptr, -1, false, &age, &all });
+        auto got = names(cache_store::scan_filter::one(nullptr, -1, false, &age, &all));
         CHECK(got == std::set<std::string_view>{"u:1", "u:2"});
     }
 }

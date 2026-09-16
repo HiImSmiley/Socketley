@@ -4134,15 +4134,12 @@ uint32_t cache_instance::scan_cursor_owner(std::string_view cursor_arg) const
 bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
                                 size_t count, std::vector<std::string_view>& out,
                                 uint64_t& next, bool node_local,
-                                const std::string_view* value_pattern,
-                                int type_map, bool with_values,
-                                const std::string_view* field,
-                                const cache_store::scan_filter::value_range* range)
+                                const cache_store::scan_filter& filter)
 {
     if (SOCKETLEY_LIKELY(m_shard_n <= 1))
     {
         next = m_store.scan(cursor, pattern, count, out,
-                            { value_pattern, type_map, with_values, field, range });
+                            filter);
         return true;
     }
 
@@ -4153,7 +4150,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
     {
         const uint64_t store_next =
             m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                         { value_pattern, type_map, with_values, field, range });
+                         filter);
         next = store_next == 0 ? 0
                                : cache_scan_cursor_make(m_shard_i, store_next);
         return true;
@@ -4165,7 +4162,7 @@ bool cache_instance::shard_scan(uint64_t cursor, std::string_view pattern,
 
     const uint64_t store_next =
         m_store.scan(cache_scan_cursor_store(cursor), pattern, count, out,
-                     { value_pattern, type_map, with_values, field, range });
+                     filter);
 
     if (store_next != 0)
         next = cache_scan_cursor_make(m_shard_i, store_next);
@@ -6189,10 +6186,12 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
-                            conn->cluster_port, scan_has_value ? &scan_value : nullptr,
-                            scan_has_type ? scan_type : -1, scan_with_values,
-                            scan_has_field ? &scan_field : nullptr,
-                            scan_has_range ? &scan_range : nullptr))
+                            conn->cluster_port,
+                            cache_store::scan_filter::one(
+                                scan_has_value ? &scan_value : nullptr,
+                                scan_has_type ? scan_type : -1, scan_with_values,
+                                scan_has_field ? &scan_field : nullptr,
+                                scan_has_range ? &scan_range : nullptr)))
             {
                 rb.append("error: invalid cursor\n", 22);
                 return;
@@ -9206,10 +9205,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             std::vector<std::string_view> scan_keys;
             uint64_t next_cursor = 0;
             if (!shard_scan(scan_cursor, scan_pattern, scan_count, scan_keys, next_cursor,
-                            conn->cluster_port, scan_has_value ? &scan_value : nullptr,
-                            scan_has_type ? scan_type : -1, scan_with_values,
-                            scan_has_field ? &scan_field : nullptr,
-                            scan_has_range ? &scan_range : nullptr))
+                            conn->cluster_port,
+                            cache_store::scan_filter::one(
+                                scan_has_value ? &scan_value : nullptr,
+                                scan_has_type ? scan_type : -1, scan_with_values,
+                                scan_has_field ? &scan_field : nullptr,
+                                scan_has_range ? &scan_range : nullptr)))
             {
                 resp::encode_error_into(rb, "invalid cursor");
                 return;

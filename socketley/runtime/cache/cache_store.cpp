@@ -1179,7 +1179,20 @@ static size_t resume_bucket(uint64_t cursor, uint8_t want_map, size_t nbuckets)
     return (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
 }
 
-// One page of the hash map, filtered on what a named field of each hash holds.
+// Whether one value satisfies one predicate's value tests.  The field is not
+// looked at here: which value this is was decided by the caller, which is the
+// only part the two walks disagree about.
+static bool value_satisfies(std::string_view v,
+                            const cache_store::scan_filter::predicate& p)
+{
+    if (p.value && *p.value != "*" && !socketley::glob_match(*p.value, v))
+        return false;
+    if (p.range && !value_in_range(v, *p.range))
+        return false;
+    return true;
+}
+
+// One page of the hash map, filtered on what named fields of each hash hold.
 //
 // This is the database question -- "which records have city = berlin" -- for the
 // layout most records are actually stored in.  Answered from outside it is an
@@ -1193,7 +1206,6 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
                                       const scan_filter& filter) const
 {
     const bool match_all_keys = (pattern == "*");
-    const bool match_all_vals = (!filter.value || *filter.value == "*");
 
     // Map three is the hash map; a cursor naming another one carries a bucket
     // index belonging to a different table.
@@ -1201,18 +1213,26 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
         [&](const auto& e) {
             if (!match_all_keys && !socketley::glob_match(pattern, e.first))
                 return;
-            // A hash without the field is not a hash whose field is empty, so it
-            // does not match even a predicate that matches everything.
-            const auto fit = e.second.find(*filter.field);
-            if (fit == e.second.end())
-                return;
-            if (!match_all_vals && !socketley::glob_match(*filter.value, fit->second))
-                return;
-            if (filter.range && !value_in_range(fit->second, *filter.range))
-                return;
+            // EVERY predicate, which is what makes two of them a conjunction and
+            // not a choice.  The first that fails ends it.
+            std::string_view shown;
+            for (size_t i = 0; i < filter.pred_count; i++)
+            {
+                const auto& p = filter.preds[i];
+                // A hash without the field is not a hash whose field is empty,
+                // so it does not match even a predicate that matches everything.
+                const auto fit = e.second.find(p.field ? *p.field : std::string_view{});
+                if (fit == e.second.end())
+                    return;
+                if (!value_satisfies(fit->second, p))
+                    return;
+                if (i == 0) shown = fit->second;
+            }
             out.push_back(e.first);
+            // The FIRST predicate's field, because that is the one the caller
+            // named first and a reply cannot carry four values per key.
             if (filter.with_values)
-                out.push_back(fit->second);
+                out.push_back(shown);
         },
         [&](size_t examined) { return examined >= count; });
 }
@@ -1222,9 +1242,6 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
                                   const scan_filter& filter) const
 {
     const bool match_all_keys = (pattern == "*");
-    // No predicate at all is not the same as one that matches everything in the
-    // source, but it is the same walk, so both take the short path here.
-    const bool match_all_vals = (!filter.value || *filter.value == "*");
 
     // A cursor naming another map came from a walk that was not this one -- an
     // iteration that changed its options midway -- and its bucket index means
@@ -1233,10 +1250,11 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
         [&](const auto& e) {
             if (!match_all_keys && !socketley::glob_match(pattern, e.first))
                 return;
-            if (!match_all_vals && !socketley::glob_match(*filter.value, e.second))
-                return;
-            if (filter.range && !value_in_range(e.second, *filter.range))
-                return;
+            // A key has one value of its own, so more than one predicate on it
+            // is more than one test of the same string.
+            for (size_t i = 0; i < filter.pred_count; i++)
+                if (!value_satisfies(e.second, filter.preds[i]))
+                    return;
             out.push_back(e.first);
             if (filter.with_values)
                 out.push_back(e.second);
@@ -1248,12 +1266,12 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                             size_t count, std::vector<std::string_view>& out,
                             const scan_filter& filter) const
 {
-    // A field names the hash map, and a value or WITHVALUES without one names
-    // the string map.  Either way a type filter that agrees adds nothing, and one
-    // that disagrees was answered empty by the caller before it got here.
-    if (filter.field)
+    // A field names the hash map, and a predicate or WITHVALUES without one
+    // names the string map.  Either way a type filter that agrees adds nothing,
+    // and one that disagrees was answered empty by the caller before it got here.
+    if (filter.wants_hashes())
         return scan_hash_field(cursor, pattern, count, out, filter);
-    if (filter.value || filter.with_values || filter.range)
+    if (filter.any_predicate() || filter.with_values)
         return scan_values(cursor, pattern, count, out, filter);
 
     // Not `pattern.empty() ||`: MATCH "" asks for the key that has no name,

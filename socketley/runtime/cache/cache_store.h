@@ -158,33 +158,72 @@ public:
     // and empty are different requests, the same distinction MATCH "" makes.
     // What one scan call was asked for, beside the cursor and the page size.
     //
-    // A struct and not four more parameters, because `scan(0, "*", n, out,
+    // A struct and not six more parameters, because `scan(0, "*", n, out,
     // nullptr, -1, true)` does not say at the call site which of those is the
     // type and which the values.
     struct scan_filter
     {
-        // A pointer and not an empty string_view because absent and empty are
-        // different requests, the same distinction MATCH "" makes.
-        const std::string_view* value = nullptr;
+        // A numeric range on the value a glob would be matched against.  A value
+        // that is not a number matches no range at all, which is a different
+        // answer from matching every range -- "30kg" is not thirty.
+        struct value_range { double lo, hi; bool lo_inclusive, hi_inclusive; };
+
+        // One thing a key has to satisfy.  `field` names where the value comes
+        // from -- a hash field, or the key's own value when it is absent -- and
+        // `value` and `range` are what that value has to be.  Both are pointers
+        // and not empty values because absent and empty are different requests,
+        // the same distinction MATCH "" makes.
+        struct predicate
+        {
+            const std::string_view* field = nullptr;
+            const std::string_view* value = nullptr;
+            const value_range*      range = nullptr;
+        };
+
+        // Four, and a caller asking for a fifth is refused rather than served
+        // from the heap: this is built on the stack for every call of a command
+        // on the hot path, and four field predicates in one scan is already past
+        // what anybody has asked for.
+        static constexpr size_t MAX_PREDICATES = 4;
+        predicate preds[MAX_PREDICATES]{};
+        size_t    pred_count = 0;
+
         // Which of the five maps to walk, which is what a type filter IS here:
         // the type of a key is the map it lives in.  -1 walks all five, and a
         // name no type has never reaches this -- the caller answers an empty
         // page for that rather than asking for a walk of nothing.
         int  type_map = -1;
         // Put the value after each key, interleaved the way hscan returns field
-        // and value.  Restricts to strings for the reason `value` does: nothing
-        // else holds one value to return.
+        // and value.  Restricts to strings unless a field says otherwise, for
+        // the reason a value predicate does: nothing else holds one value.
         bool with_values = false;
-        // A named field of a hash, which is the other place a single value
-        // lives: with this the walk is the hash map, and `value` is matched
-        // against what that field holds rather than against the key's own
-        // value.  Absent means the key's own value, as before.
-        const std::string_view* field = nullptr;
-        // A numeric range on the same value a glob would be matched against.
-        // A value that is not a number matches no range at all, which is a
-        // different answer from matching every range -- "30kg" is not thirty.
-        struct value_range { double lo, hi; bool lo_inclusive, hi_inclusive; };
-        const value_range* range = nullptr;
+
+        // Whether any predicate names a field, which is what decides the map.
+        bool wants_hashes() const
+        {
+            for (size_t i = 0; i < pred_count; i++)
+                if (preds[i].field) return true;
+            return false;
+        }
+        bool any_predicate() const { return pred_count != 0; }
+
+        // The one-predicate case, which is most of them, spelled so a call site
+        // does not have to build a list to ask one question.
+        static scan_filter one(const std::string_view* value = nullptr,
+                               int type_map = -1, bool with_values = false,
+                               const std::string_view* field = nullptr,
+                               const value_range* range = nullptr)
+        {
+            scan_filter f;
+            f.type_map = type_map;
+            f.with_values = with_values;
+            if (value || field || range)
+            {
+                f.preds[0] = { field, value, range };
+                f.pred_count = 1;
+            }
+            return f;
+        }
     };
 
     uint64_t scan(uint64_t cursor, std::string_view pattern,
