@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <cmath>
 #include "doctest.h"
 #include "../../socketley/daemon/flag_handlers.h"
 
@@ -69,6 +70,26 @@ TEST_CASE("parse_double takes the whole string or nothing")
     CHECK_FALSE(parse_double("0.5 ", d));
     CHECK_FALSE(parse_double("", d));
     CHECK_FALSE(parse_double("abc", d));
+}
+
+// NaN parses as a number and behaves as none: every comparison against it is
+// false, so the guards a caller writes afterwards neither reject nor accept it.
+// --rate-limit nan was taken and meant NO rate limit at all -- 40 of 40 commands
+// served, where a limit of 5 served 5 -- because `rate < 0` did not reject it at
+// the door and `rate > 0` did not enable the limiter behind it.
+TEST_CASE("parse_double refuses NaN, which is not a number a flag can mean")
+{
+    double d = 0;
+    CHECK_FALSE(parse_double("nan", d));
+    CHECK_FALSE(parse_double("NaN", d));
+    CHECK_FALSE(parse_double("-nan", d));
+    CHECK_FALSE(parse_double("NAN", d));
+
+    // An infinity is left alone on purpose: for a rate it is a thing to mean,
+    // and unlike NaN it compares the way a reader expects.
+    CHECK(parse_double("inf", d));   CHECK(std::isinf(d)); CHECK(d > 0);
+    CHECK(parse_double("-inf", d));  CHECK(std::isinf(d)); CHECK(d < 0);
+    CHECK(parse_double("0", d));     CHECK(d == doctest::Approx(0.0));
 }
 
 TEST_CASE("parse_size_suffix: the suffixes it documents")

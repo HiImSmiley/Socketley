@@ -1,4 +1,5 @@
 #include "state_persistence.h"
+#include <cmath>
 #include <cstring>
 #include "runtime_instance.h"
 #include "../runtime/server/server_instance.h"
@@ -407,8 +408,12 @@ uint32_t json_get_uint32(const std::string& json, std::string_view key, uint32_t
 
 double json_get_double(const std::string& json, std::string_view key, double default_val = 0.0)
 {
-    return json_get_number<double>(json, key, default_val,
+    const double v = json_get_number<double>(json, key, default_val,
         [](const std::string& s, size_t& n) { return std::stod(s, &n); });
+    // A NaN read back out of a state file is not a number anything here can act
+    // on -- it is false against every comparison a caller makes -- so it gets
+    // the answer a field that would not parse gets, which is the default.
+    return std::isnan(v) ? default_val : v;
 }
 
 size_t json_get_size(const std::string& json, std::string_view key, size_t default_val = 0)

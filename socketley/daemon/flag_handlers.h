@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -36,6 +37,12 @@ inline bool parse_double(std::string_view sv, double& out)
         size_t consumed = 0;
         const double v = std::stod(s, &consumed);
         if (consumed != s.size()) return false;
+        // "nan" parses, and NaN is false against every comparison a caller then
+        // makes: `rate < 0` does not reject it and `rate > 0` does not accept
+        // it, so --rate-limit nan was taken and meant no rate limit at all --
+        // measured at 40 of 40 commands served where a limit of 5 served 5.
+        // An infinity is left alone: for a rate that is a thing to mean.
+        if (std::isnan(v)) return false;
         out = v;
         return true;
     } catch (...) {

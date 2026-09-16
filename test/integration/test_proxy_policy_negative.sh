@@ -405,6 +405,37 @@ make_proxy "127.0.0.1:$BE1"
 assert_eq "$(python3 "$TMPD/burst.py" "$PX" 60)" "60" "with no rate limit configured, all 60 are answered"
 stop_backends
 
+# ── a rate limit that is not a number is not a rate limit ───────────────────
+# NaN parses as a double and is false against every comparison, so it passed the
+# `rate < 0` check at the door and failed the `rate > 0` check that turns the
+# limiter on -- measured before it was refused: 40 of 40 commands served, where a
+# limit of 5 served 5.  A configuration that looks set and is not.
+"$BIN" stop pn_px >/dev/null 2>&1 || true
+sleep 0.2
+"$BIN" remove pn_px >/dev/null 2>&1 || true
+RL_OUT=$("$BIN" create proxy pn_px -p "$PX" --backend "127.0.0.1:$BE1" --rate-limit nan -s 2>&1 || true)
+TOTAL=$((TOTAL+1))
+case "$RL_OUT" in
+    *invalid*) PASS=$((PASS+1)); echo "  PASS: --rate-limit nan is refused at the door" ;;
+    *) FAIL=$((FAIL+1)); echo "  FAIL: --rate-limit nan was accepted: '$RL_OUT'"
+       echo "        -- accepted it does not limit anything, and stats shows a limit" ;;
+esac
+# And it did not create anything either, which is the half a refusal owes.
+TOTAL=$((TOTAL+1))
+if "$BIN" stats pn_px >/dev/null 2>&1; then
+    FAIL=$((FAIL+1)); echo "  FAIL: a refused --rate-limit still left a proxy behind"
+else
+    PASS=$((PASS+1)); echo "  PASS: and nothing was created by the refusal"
+fi
+# An infinity is deliberately still allowed: for a rate that is a thing to mean,
+# and unlike NaN it compares the way a reader expects.  Backends up first -- the
+# first draft of this row ran after the stop above and measured a proxy with
+# nowhere to send anything, which answered 1 of 60 and read as a broken limiter.
+start_backend binf "$BE1" ok
+make_proxy "127.0.0.1:$BE1" --rate-limit inf
+assert_eq "$(python3 "$TMPD/burst.py" "$PX" 60)" "60" "--rate-limit inf is accepted and means unlimited"
+stop_backends
+
 echo "  $PASS/$TOTAL passed"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "DONE"
