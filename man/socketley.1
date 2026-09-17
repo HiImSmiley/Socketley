@@ -4264,6 +4264,25 @@ they are its documented contract and a text client is not a Redis client.
 
 Connect via TCP and send commands (newline-terminated, all lowercase).
 .PP
+Nine of the commands listed below are RESP only, and the line protocol answers
+"failed: unknown command" to them:
+.BR client ,
+.BR config ,
+.BR eval ,
+.BR evalsha ,
+.BR hello ,
+.BR psubscribe ,
+.BR punsubscribe ,
+.B script
+and
+.BR smismember .
+.PP
+Six of those are protocol and administration. The other three have one reason
+between them: the line protocol has no spelling for a list of arguments, since
+everything after the key is the value so that a value may contain spaces. That
+leaves no way to write smismember's members, or the keys and arguments eval and
+evalsha take after their script.
+.PP
 .B Strings:
 .TP
 .BI "set " "key value"
