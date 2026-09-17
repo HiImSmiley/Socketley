@@ -1061,6 +1061,24 @@ private:
     };
     std::unique_ptr<master_link> m_master;
 
+    // A dial in flight, which is not a link yet.  The address lives here for as
+    // long as the kernel is reading it -- the reason the proxy's health probe
+    // keeps its own copy -- and an abandoned dial goes to retire() like every
+    // other request the ring still owes.
+    struct master_dial
+    {
+        io_request req{};
+        struct sockaddr_in addr{};
+        int fd{-1};
+    };
+    std::unique_ptr<master_dial> m_master_dial;
+    // One retry chain at a time and the attempt it counts from, which is the
+    // shape upstream_schedule_reconnect() uses one runtime over, for the reason
+    // timer_op gives: re-arming a request the ring still holds leaves two
+    // chains driving one piece of state.
+    std::unique_ptr<timer_op> m_master_retry;
+    uint32_t m_master_attempt{0};
+
     // Start a write if nothing is in flight, moving queued data into out.
     void follower_kick(follower_conn& f);
     // Queue data for a follower and start writing if nothing is in flight,
@@ -1086,6 +1104,11 @@ private:
     void handle_replicate_request(client_connection* conn);
     bool send_full_dump(follower_conn& f);
     bool connect_to_master();
+    void handle_master_connect(struct io_uring_cqe* cqe, io_request* req);
+    // Arm the next dial, or do nothing when this cache no longer follows
+    // anybody.  Called from every path that ends a link, so there is one place
+    // that decides whether a follower keeps trying.
+    void schedule_master_retry();
     void handle_master_read(struct io_uring_cqe* cqe);
 
     // Provided buffer ring

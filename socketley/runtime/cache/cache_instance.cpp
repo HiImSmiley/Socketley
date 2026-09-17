@@ -716,8 +716,14 @@ bool cache_instance::setup(event_loop& loop)
     // and logged nothing at all.
     if (m_repl_role == repl_follower && !m_replicate_target.empty() &&
         !connect_to_master())
+    {
+        // The dial never reached the ring -- a target with no port, no socket,
+        // a refused submission.  What the ring comes back with is reported by
+        // handle_master_connect(); this is the half that never got that far.
         LOG_ERROR(("cache \"" + std::string(get_name()) + "\": could not dial master \"" +
                    m_replicate_target + "\"").c_str());
+        schedule_master_retry();
+    }
 
     // Provided-buffer ring geometry, where the size decides how many commands
     // one completion can carry and the count how much concurrent traffic fits,
@@ -972,6 +978,18 @@ void cache_instance::teardown(event_loop& /*loop*/)
             owed[n++] = &m_master->read_req;
         retire(std::shared_ptr<void>(std::move(m_master)), owed, n);
     }
+    // A dial the ring is still holding: the connect owes a completion whatever
+    // this runtime does next, and the address it is reading lives in there.
+    if (m_master_dial)
+    {
+        if (m_master_dial->fd >= 0)
+        {
+            close_tracked(m_master_dial->fd);
+            m_master_dial->fd = -1;
+        }
+        io_request* owed[1] = { &m_master_dial->req };
+        retire(std::shared_ptr<void>(std::move(m_master_dial)), owed, 1);
+    }
     for (auto& f : m_followers)
     {
         // The socket belonged to the client connection, which has already
@@ -1002,6 +1020,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
             withdrawn &= m_loop->submit_timeout_remove(&m_idle_sweep_timer->req);
         if (m_accept_backoff_timer)
             withdrawn &= m_loop->submit_timeout_remove(&m_accept_backoff_timer->req);
+        if (m_master_retry)
+            withdrawn &= m_loop->submit_timeout_remove(&m_master_retry->req);
         m_loop->flush();
 
         if (SOCKETLEY_UNLIKELY(!withdrawn))
@@ -1044,6 +1064,11 @@ void cache_instance::teardown(event_loop& /*loop*/)
         {
             owed[0] = &m_accept_backoff_timer->req;
             retire(std::shared_ptr<void>(std::move(m_accept_backoff_timer)), owed, 1);
+        }
+        if (m_master_retry)
+        {
+            owed[0] = &m_master_retry->req;
+            retire(std::shared_ptr<void>(std::move(m_master_retry)), owed, 1);
         }
     }
 
@@ -1198,7 +1223,19 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
         case op_writev:
             handle_write(cqe, req);
             break;
+        case op_connect:
+            handle_master_connect(cqe, req);
+            break;
         case op_timeout:
+            // Before the sweeps, because it owns its request outright and a
+            // fired timer that nothing claims falls through to their scans.
+            if (m_master_retry && req == &m_master_retry->req)
+            {
+                m_master_retry.reset();
+                if (!connect_to_master())
+                    schedule_master_retry();
+                break;
+            }
             if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
             {
                 auto now = std::chrono::steady_clock::now();
@@ -11044,33 +11081,66 @@ bool cache_instance::connect_to_master()
         }
     }
 
-    if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    // Read-only from the moment this cache intends to follow, and not once the
+    // link stands: the dial is asynchronous now, and a follower that took
+    // writes in the window before its leader answered would have them erased
+    // without a word by the dump that follows.  A leader that is down does not
+    // make a follower writable either, which is what a replica is.
+    m_mode = cache_mode_readonly;
+
+    // Asked of the ring rather than waited for, because the retry below cannot
+    // block the loop for five seconds every time a leader is slow to answer.
+    // One dial at a time: the struct holds the address for as long as the
+    // kernel is reading it.
+    auto dial = std::make_unique<master_dial>();
+    dial->fd = fd;
+    dial->addr = addr;
+    dial->req = { this, nullptr, fd, 0, op_connect };
+
+    if (!m_loop ||
+        SOCKETLEY_UNLIKELY(!m_loop->submit_connect(fd,
+                reinterpret_cast<const struct sockaddr*>(&dial->addr),
+                sizeof(dial->addr), &dial->req)))
     {
-        if (errno != EINPROGRESS)
-        {
-            close_tracked(fd);
-            return false;
-        }
-        // Wait for non-blocking connect to complete (up to 5s)
-        struct pollfd pfd{fd, POLLOUT, 0};
-        if (poll(&pfd, 1, 5000) <= 0 || !(pfd.revents & POLLOUT))
-        {
-            close_tracked(fd);
-            return false;
-        }
-        int sock_err = 0;
-        socklen_t errlen = sizeof(sock_err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &errlen);
-        if (sock_err != 0)
-        {
-            close_tracked(fd);
-            return false;
-        }
+        close_tracked(fd);
+        return false;
     }
 
-    // Send REPLICATE command
+    m_master_dial = std::move(dial);
+    return true;
+}
+
+// The dial landing.  Everything that used to follow the blocking connect is
+// here, because this is where the socket first exists as a connected one.
+void cache_instance::handle_master_connect(struct io_uring_cqe* cqe, io_request* req)
+{
+    // A completion for a dial nobody is waiting for any more -- the target
+    // changed, or the runtime stopped -- owns nothing and must touch nothing.
+    if (!m_master_dial || req != &m_master_dial->req)
+        return;
+
+    auto dial = std::move(m_master_dial);
+    const int fd = dial->fd;
+
+    if (cqe->res < 0)
+    {
+        close_tracked(fd);
+        LOG_ERROR(("cache \"" + std::string(get_name()) + "\": could not dial master \"" +
+                   m_replicate_target + "\": " + std::strerror(-cqe->res)).c_str());
+        schedule_master_retry();
+        return;
+    }
+
+    // Ten bytes into the send buffer of a socket that has just connected, so
+    // the short write this cannot handle is not one that happens.
     const char* cmd = "replicate\n";
-    if (::write(fd, cmd, 10) < 0) { ::close(fd); return false; }
+    if (::write(fd, cmd, 10) < 0)
+    {
+        close_tracked(fd);
+        LOG_ERROR("cache: the master link connected and would not take `replicate`");
+        schedule_master_retry();
+        return;
+    }
 
     // A link of its own and never the previous one reused, because the read
     // armed on the old link survives its socket and a reconnect usually lands
@@ -11080,25 +11150,48 @@ bool cache_instance::connect_to_master()
     link->read_req = { this, link->buf, fd, sizeof(link->buf), op_read };
     link->read_pending = true;
 
-    if (m_loop && SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, link->buf,
-                                                          sizeof(link->buf), &link->read_req)))
+    if (SOCKETLEY_UNLIKELY(!m_loop || !m_loop->submit_read(fd, link->buf,
+                                                           sizeof(link->buf), &link->read_req)))
     {
         // Without this read the node is connected and deaf, so failing the
         // connect outright keeps the follower visibly unsynced rather than
         // silently frozen at an empty dataset.
         LOG_ERROR("cache: read from master could not be armed — replication link not established");
         close_tracked(fd);
-        return false;
+        schedule_master_retry();
+        return;
     }
-    if (!m_loop)
-        link->read_pending = false;
 
+    // A link that stands is what resets the backoff; anything else and the next
+    // failure would start counting from one again and never spread out.
+    m_master_attempt = 0;
     m_master = std::move(link);
+}
 
-    // Set mode to readonly as follower
-    m_mode = cache_mode_readonly;
+// The same backoff the server uses for an upstream -- 1, 2, 4, 8, 16 seconds
+// capped at 30, with jitter so a shard fleet that lost one leader does not
+// dial it back in lockstep.
+void cache_instance::schedule_master_retry()
+{
+    // Not a follower any more, or on the way out: both are answers, and
+    // neither is "try again".
+    if (!m_loop || m_repl_role != repl_follower || m_replicate_target.empty())
+        return;
+    if (m_master || m_master_dial || m_master_retry)
+        return;
 
-    return true;
+    const uint32_t step = m_master_attempt < 4 ? m_master_attempt : 4;
+    int delay_sec = 1 << step;              // 1, 2, 4, 8, 16
+    if (delay_sec > 30) delay_sec = 30;
+    const long jitter_ms = (m_master_attempt * 137L) % 500;
+    ++m_master_attempt;
+
+    auto t = std::make_unique<timer_op>();
+    t->ts.tv_sec = delay_sec;
+    t->ts.tv_nsec = jitter_ms * 1000000L;
+    t->req = { this, nullptr, -1, 0, op_timeout };
+    if (m_loop->submit_timeout(&t->ts, &t->req))
+        m_master_retry = std::move(t);
 }
 
 void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
@@ -11117,6 +11210,9 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         if (link.fd >= 0)
             close_tracked(link.fd);
         m_master.reset();
+        // And connect_to_master() does hand back a fresh one now, on a backoff,
+        // which is what this comment used to only promise.
+        schedule_master_retry();
         return;
     }
 
@@ -11184,6 +11280,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         if (link.fd >= 0)
             close_tracked(link.fd);
         m_master.reset();
+        schedule_master_retry();
         return;
     }
 
@@ -11209,6 +11306,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             link.read_pending = false;
             close_tracked(link.fd);
             m_master.reset();
+            schedule_master_retry();
         }
     }
 }

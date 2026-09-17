@@ -329,6 +329,44 @@ if command -v redis-cli >/dev/null 2>&1; then
         "a RESP MSET reached the follower (second pair)"
 fi
 
+# ─── A leader that goes away and comes back ─────────────────────────────────
+#
+# connect_to_master() ran once, at start, and the comment at the drop site
+# promised "a fresh one" that nothing ever asked for.  So a follower whose
+# leader restarted sat there holding whatever it had at the moment the link
+# broke -- not stale for a second, stale until somebody restarted the follower
+# too -- and said nothing about it.
+"$BIN" stop replleader >/dev/null 2>&1 || true
+sleep 1.2
+"$BIN" start replleader >/dev/null 2>&1 || true
+
+# The leader has to actually be back, or the poll below would be measuring a
+# failed restart and reporting it as a failed reconnect.  Probed with the write
+# it needs anyway, and not with `ping`: that is a RESP command and this is the
+# line protocol, which answers "failed: unknown command" to it.
+LEADER_BACK=""
+for _ in $(seq 1 10); do
+    send_to "$LEADER_PORT" 'set afterrestart backagain' >/dev/null 2>&1
+    [ "$(send_to "$LEADER_PORT" 'get afterrestart')" = "backagain" ] && { LEADER_BACK=yes; break; }
+    sleep 0.5
+done
+assert_eq "$LEADER_BACK" "yes" "the leader came back on its own port"
+
+# The backoff is 1, 2, 4, 8, 16 seconds, so the reconnect lands on one of the
+# early attempts.  Polled rather than slept through, because the slowest case
+# is what the sleep would have to be and the usual case is the second attempt.
+GOT=""
+for _ in $(seq 1 15); do
+    GOT=$(send_to "$FOLLOWER_PORT" 'get afterrestart')
+    [ "$GOT" = "backagain" ] && break
+    sleep 1
+done
+assert_eq "$GOT" "backagain" "the follower dialled its leader again after it came back"
+
+# And it says so, which is the half that makes it diagnosable.
+assert_eq "$(send_to "$FOLLOWER_PORT" 'info' | grep -c 'master_link_status:up')" "1" \
+    "the recovered follower reports its link as standing"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
