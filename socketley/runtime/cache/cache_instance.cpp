@@ -798,7 +798,9 @@ bool cache_instance::setup(event_loop& loop)
         m_journal_write_warned = false;
     }
 
-    if (m_idle_timeout_cached > 0)
+    // Armed for either question: the idle timeout if one was configured, and
+    // the handshake deadline on a TLS listener whether one was or not.
+    if (m_idle_timeout_cached > 0 || m_tls)
     {
         m_idle_sweep_timer = std::make_unique<timer_op>();
         m_idle_sweep_timer->ts.tv_sec = 30;
@@ -1269,14 +1271,30 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
             {
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
+                // Gated rather than left to the comparison: with no
+                // --idle-timeout the timeout is zero seconds, so every
+                // connection is past it and arming this sweep for the
+                // handshake deadline alone would close the lot.
+                const bool sweep_idle = (m_idle_timeout_cached > 0);
+                const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
                 for (auto& [cfd, cconn] : m_clients)
                 {
                     // A replication follower is idle by definition, so
                     // sweeping it would tear replication down on a timer for
                     // behaving correctly.
-                    if (cconn->is_follower)
+                    if (cconn->is_follower || cconn->closing)
                         continue;
-                    if (!cconn->closing && (now - cconn->last_activity) > timeout)
+                    // A peer that has not finished its handshake is not a
+                    // client yet, so this one does not wait for a timeout
+                    // nobody configured.
+                    if (cconn->tls_state == tls_conn_handshake &&
+                        (now - cconn->last_activity) > hs)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                        continue;
+                    }
+                    if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);

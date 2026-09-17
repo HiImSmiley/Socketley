@@ -17,6 +17,22 @@ enum tls_conn_state : uint8_t {
     tls_conn_ready     = 2   // handshake complete, application data flowing
 };
 
+// How long a peer may sit in tls_conn_handshake before the runtime stops
+// counting it as a client.  It is not the idle timeout and does not wait for
+// one: a quiet connection that DID handshake is legitimate on a daemon built
+// for long-living ones, while a peer that has sent nothing the record layer
+// accepts has not become a client at all.
+//
+// Measured before it was written.  A server with --max-connections 2 and two
+// TCP connections that send zero bytes refused every real client -- control arm
+// ok, loaded arm refused, ok again once the two were gone -- and nothing in the
+// tree reclaimed the slots, because the idle sweep is not armed unless
+// --idle-timeout is set.
+//
+// Half a minute rather than seconds, because it is also the sweep's tick and a
+// deadline shorter than the tick cannot be honoured anyway.
+inline constexpr uint32_t tls_handshake_deadline_secs = 30;
+
 // The one question every place a TLS configuration takes effect asks,
 // including the refusal of a TLS cache with --replicate, whose replication
 // writes raw bytes around the record layer.

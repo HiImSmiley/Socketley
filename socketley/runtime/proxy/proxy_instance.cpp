@@ -1880,7 +1880,9 @@ bool proxy_instance::setup(event_loop& loop)
     m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
     m_idle_sweep_armed = false;
     m_idle_sweep_warned = false;
-    if (m_idle_timeout_cached > 0)
+    // Armed for either question: the idle timeout if one was configured, and
+    // the handshake deadline on a TLS listener whether one was or not.
+    if (m_idle_timeout_cached > 0 || m_tls)
         arm_idle_sweep();
 
     // Same reasoning, own chain: this one runs only while a request is actually
@@ -2246,6 +2248,36 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                     }
                 }
 
+                // A peer that has not finished its handshake is not a client
+                // yet: it has sent nothing the record layer accepted, and it
+                // holds a slot against --max-connections for as long as it
+                // keeps the socket open.  Its own block rather than a branch in
+                // the walk above, because that walk runs only when an idle
+                // timeout was configured and this deadline does not wait for
+                // one.  Collected and then closed for the same reason.
+                if (m_tls)
+                {
+                    const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
+                    std::vector<int> stalled;
+                    size_t seen = 0;
+                    for (int cfd = 0; cfd < MAX_FDS && seen < m_client_count; cfd++)
+                    {
+                        auto& cconn = m_client_slots[cfd];
+                        if (!cconn) continue;
+                        seen++;
+                        if (cconn->closing) continue;
+                        if (cconn->tls_state == tls_conn_handshake &&
+                            (now - cconn->last_activity) > hs)
+                            stalled.push_back(cfd);
+                    }
+                    for (int cfd : stalled)
+                    {
+                        auto& cconn = m_client_slots[cfd];
+                        if (!cconn || cconn->closing) continue;
+                        close_pair(cfd, cconn->backend_fd, close_reason::force);
+                    }
+                }
+
                 // Evict stale pooled connections, for every proxy whether or
                 // not a client idle timeout is configured, because the pool is
                 // the only place a backend socket sits with nobody watching
@@ -2319,7 +2351,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                 // armed timeout holds a removed proxy in the graveyard -- and
                 // an unresolved backend is work, without which the name is
                 // never looked up again.
-                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left)
+                if (m_idle_timeout_cached > 0 || pooled_left || unresolved_left || m_tls)
                     arm_idle_sweep();
             }
             // Backend response deadline sweep: this link has spoken, so it may
@@ -2713,8 +2745,11 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
             ptr->tls_state = tls_conn_handshake;
         }
 
-        if (m_idle_timeout_cached > 0)
-            ptr->last_activity = std::chrono::steady_clock::now();
+        // Set whether or not --idle-timeout is on, because the handshake
+        // deadline reads the same field; under the old guard it stayed at the
+        // epoch and the deadline would fire on the first sweep for every peer
+        // still handshaking, legitimate ones included.
+        ptr->last_activity = std::chrono::steady_clock::now();
 
         // The bucket starts full, so a burst up to the configured rate is
         // allowed, because a limiter that started empty would delay every

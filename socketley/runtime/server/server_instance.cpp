@@ -2587,10 +2587,28 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 m_idle_sweep_armed = false;   // this link of the chain is done
                 auto now = std::chrono::steady_clock::now();
                 auto timeout = std::chrono::seconds(m_idle_timeout_cached);
+                // Gated rather than left to the comparison: with no
+                // --idle-timeout the timeout is zero seconds, so every
+                // connection is past it and arming this sweep for the
+                // handshake deadline alone would close the lot.
+                const bool sweep_idle = (m_idle_timeout_cached > 0);
+                const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
                 for (int cfd : m_active_fds)
                 {
                     auto* cconn = m_conn_idx[cfd];
-                    if (cconn && !cconn->closing && (now - cconn->last_activity) > timeout)
+                    if (!cconn || cconn->closing)
+                        continue;
+                    // A peer that has not finished its handshake is not a
+                    // client yet, so this one does not wait for a timeout
+                    // nobody configured.
+                    if (cconn->tls_state == tls_conn_handshake &&
+                        (now - cconn->last_activity) > hs)
+                    {
+                        cconn->closing = true;
+                        shutdown(cfd, SHUT_RD);
+                        continue;
+                    }
+                    if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
@@ -2603,10 +2621,10 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // eviction in find_or_add_peer is the only bound, which is
                 // what keeps this from changing behaviour for anyone who has
                 // not asked for a timeout.
-                if (m_udp && !m_udp_peers.empty())
+                if (sweep_idle && m_udp && !m_udp_peers.empty())
                     forget_idle_udp_peers(now, timeout);
 
-                if (m_idle_timeout_cached > 0)
+                if (sweep_idle || m_tls)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
             // The relay-hold flag is lowered before the sweep and not after,
@@ -2901,8 +2919,12 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
 
     auto now_tp = std::chrono::steady_clock::now();
 
-    if (m_idle_timeout_cached > 0)
-        ptr->last_activity = now_tp;
+    // Set whether or not --idle-timeout is on, because the handshake deadline
+    // reads the same field and the clock is already taken one line up.  Under
+    // the old guard it stayed at the epoch, which would have made the deadline
+    // fire on the first sweep for every peer still handshaking -- legitimate
+    // ones included.
+    ptr->last_activity = now_tp;
 
     m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
     auto current_size = static_cast<uint32_t>(m_clients.size());
@@ -6454,7 +6476,9 @@ void server_instance::withdraw_timers(event_loop& loop)
 // restart.
 void server_instance::arm_idle_sweep()
 {
-    if (!m_loop || m_idle_timeout_cached <= 0 || m_idle_sweep_armed)
+    // Armed for either question: the idle timeout if one was configured, and
+    // the handshake deadline on any TLS listener whether one was or not.
+    if (!m_loop || m_idle_sweep_armed || (m_idle_timeout_cached <= 0 && !m_tls))
         return;
 
     m_idle_sweep_ts.tv_sec  = 30;
