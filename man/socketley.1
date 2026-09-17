@@ -5019,6 +5019,36 @@ cache the key count is
 slice, for the reason
 .B dbsize
 answers that way on a per-shard port.
+.IP
+The replication section is the one that differs by role, because half of its
+fields have no meaning on the other side.
+.B role
+answers
+.BR master " or " slave .
+A follower adds
+.BR master_host ,
+.BR master_port ,
+.B master_link_status
+and
+.BR master_sync_in_progress ;
+a leader adds
+.B connected_slaves
+\(em the number of followers whose connection is live, not the number that ever
+attached.
+.IP
+.B master_link_status
+reads
+.B up
+once a full sync has finished and not when the socket opens, and
+.B master_sync_in_progress
+separates the two reasons it can read
+.BR down :
+no leader was reached at all, or a dump is still arriving. A follower whose
+target was never usable leaves
+.B master_host
+empty and
+.B master_port
+at zero, which is the honest answer to "where".
 .TP
 .BI "config get " "parameter"
 .B maxmemory
