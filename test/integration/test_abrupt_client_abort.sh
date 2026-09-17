@@ -703,6 +703,15 @@ OUT="$TMPDIR_T/harness.out"
 python3 "$H" storm "$CACHE_PORT" "$PROXY_PORT" "$LOAD_SECS" >"$OUT" 2>&1 || true
 TOTALS=$(grep '^TOTALS ' "$OUT" 2>/dev/null | head -1 || true)
 
+# Printed on a green run too, beside the floors it is judged against.  The two
+# other measurements in this file -- fds: and rss: -- print unconditionally and
+# name their bound on the same line; this one printed only when something had
+# already failed, so the margin was visible in exactly the runs where it was
+# too late to act on it.  Under Sanitize the throughput floor is skipped and
+# the numbers appear; under Release it is asserted, passes, and said nothing.
+echo "  ${TOTALS:-<no TOTALS line>}"
+echo "  floors: ok>=$MIN_OK per runtime, aborts>=$MIN_ABORTS per runtime"
+
 field() {
     printf '%s\n' "$TOTALS" | grep -o "\b$1=[0-9]\+" | cut -d= -f2 | head -1 || true
 }
@@ -868,10 +877,6 @@ esac
 sleep 0.8
 assert_fds_returned "$BASE_FD" "$(fd_count)" "$FD_TOLERANCE"
 assert_rss_bounded  "$BASE_RSS" "$(rss_kb)"  "$RSS_BOUND_KB"
-
-if [ "$FAIL" -gt 0 ] || [ "$SKIP" -gt 0 ]; then
-    echo "  ${TOTALS:-<no TOTALS line>}"
-fi
 
 # The summary has to add up, or it cannot be acted on and nobody re-checks the
 # arithmetic by eye.
