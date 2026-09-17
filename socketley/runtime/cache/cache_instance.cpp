@@ -26,6 +26,7 @@
 #include <charconv>
 #include <iostream>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <liburing.h>
@@ -11014,8 +11015,33 @@ bool cache_instance::connect_to_master()
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
     {
-        close_tracked(fd);
-        return false;
+        // A name, which is what the manual offers -- "--replicate host:port",
+        // "replicate_target: Leader host:port" -- and what inet_pton alone
+        // refused, so `--replicate localhost:6379` could never connect.
+        // Resolved here and not on the loop, for the reason the client's own
+        // resolver gives about stalling it: this runs once, at start, beside a
+        // connect that already waits.
+        struct addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* res = nullptr;
+        if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res)
+        {
+            close_tracked(fd);
+            return false;
+        }
+        // The length is checked before the cast, as the client's own resolver
+        // checks it before its copy: AF_INET hints cannot return anything else,
+        // and reading four bytes out of a shorter answer would not say so.
+        const bool usable = (res->ai_addrlen >= sizeof(struct sockaddr_in));
+        if (usable)
+            addr.sin_addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
+        if (!usable)
+        {
+            close_tracked(fd);
+            return false;
+        }
     }
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)

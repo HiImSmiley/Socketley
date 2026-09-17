@@ -127,6 +127,21 @@ if [ "$(send_to "$FOLLOWER" 'get repllive')" = "afterattach" ]; then pass
 else fail "a live write still reaches the follower" \
           "got: '$(send_to "$FOLLOWER" 'get repllive')'"; fi
 
+# ─── A leader named rather than spelled in dotted quads ─────────────────────
+#
+# The manual offers "--replicate host:port" and connect_to_master() asked
+# inet_pton, which takes literals only, so `--replicate localhost:6379` refused
+# every time and said nothing.  Forced to AF_INET, so this resolves to
+# 127.0.0.1 and not ::1.
+RC=0
+timeout 20 "$BIN" create cache rep_named -p $((P + 16)) \
+    --replicate "localhost:$LEADER" -s >/dev/null 2>&1 || RC=$?
+sleep 1.2
+if [ "$RC" -eq 0 ] && [ "$(send_to $((P + 16)) 'get replok')" = "beforeattach" ]; then pass
+else fail "a leader named rather than spelled is followed too" \
+          "create exited $RC and the follower does not have the leader's key" \
+          "got: '$(send_to $((P + 16)) 'get replok')'"; fi
+
 # The same three questions on a pair that IS connected, which is what separates
 # the lines above from a build that always says "down".
 INFO_LIVE=$(send_to "$FOLLOWER" 'info')
