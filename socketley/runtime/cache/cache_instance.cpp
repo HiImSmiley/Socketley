@@ -11015,13 +11015,17 @@ void cache_instance::handle_replicate_request(client_connection* conn)
 
 bool cache_instance::send_full_dump(follower_conn& f)
 {
-    std::string buf;
+    // A full sync replaces the follower's dataset rather than merging into it.
+    // The dump is a list of `set` and `rpush` lines with nothing in front of
+    // them, so a follower that reconnects still holding data keeps every key
+    // the leader dropped meanwhile and appends a second time to every list it
+    // already had -- measured, a list of two came back as four.
+    std::string buf = "flushall\n";
     buf.reserve(65536);
     m_store.dump_commands(buf);
 
-    if (buf.empty())
-        return true;
-
+    // Sent even when the dump adds nothing, because a leader flushed while the
+    // link was down is exactly the case that leaves the follower full.
     // Queued rather than written synchronously, because a dataset exceeds the
     // socket buffer and the follower may be a runtime inside this very daemon.
     return follower_write(f, buf);

@@ -336,6 +336,24 @@ fi
 # leader restarted sat there holding whatever it had at the moment the link
 # broke -- not stale for a second, stale until somebody restarted the follower
 # too -- and said nothing about it.
+# The dump is a list of `set` and `rpush` commands with nothing in front of
+# them, so a full sync into a follower that still holds data merges rather than
+# replacing: a key the leader dropped while the link was down survives on the
+# follower, and a list it already had is appended to a second time.  Seeded
+# before the link breaks, because a follower holding data of its own when the
+# dump arrives is the only shape that can tell the two apart.
+send_to "$LEADER_PORT" 'set ghostkey shouldvanish' >/dev/null
+send_to "$LEADER_PORT" 'rpush ghostlist a' >/dev/null
+send_to "$LEADER_PORT" 'rpush ghostlist b' >/dev/null
+SEEDED=""
+for _ in $(seq 1 10); do
+    [ "$(send_to "$FOLLOWER_PORT" 'get ghostkey')" = "shouldvanish" ] && { SEEDED=yes; break; }
+    sleep 0.5
+done
+assert_eq "$SEEDED" "yes" "the follower holds data of its own before the link breaks"
+assert_eq "$(send_to "$FOLLOWER_PORT" 'llen ghostlist')" "2" \
+    "and holds the list at its leader's length"
+
 "$BIN" stop replleader >/dev/null 2>&1 || true
 sleep 1.2
 "$BIN" start replleader >/dev/null 2>&1 || true
@@ -352,6 +370,14 @@ for _ in $(seq 1 10); do
 done
 assert_eq "$LEADER_BACK" "yes" "the leader came back on its own port"
 
+# The premise the two assertions at the end rest on, asserted rather than
+# assumed: a leader that came back carrying its old dataset would make a merge
+# and a replacement look identical.
+assert_eq "$(send_to "$LEADER_PORT" 'exists ghostkey')" "0" \
+    "the restarted leader does not carry the dataset it had before"
+send_to "$LEADER_PORT" 'rpush ghostlist a' >/dev/null
+send_to "$LEADER_PORT" 'rpush ghostlist b' >/dev/null
+
 # The backoff is 1, 2, 4, 8, 16 seconds, so the reconnect lands on one of the
 # early attempts.  Polled rather than slept through, because the slowest case
 # is what the sleep would have to be and the usual case is the second attempt.
@@ -366,6 +392,13 @@ assert_eq "$GOT" "backagain" "the follower dialled its leader again after it cam
 # And it says so, which is the half that makes it diagnosable.
 assert_eq "$(send_to "$FOLLOWER_PORT" 'info' | grep -c 'master_link_status:up')" "1" \
     "the recovered follower reports its link as standing"
+
+# Whatever order the reconnect fell in -- dump then live pushes, or the pushes
+# first -- both answers are the leader's, and both differ from the merge.
+assert_eq "$(send_to "$FOLLOWER_PORT" 'exists ghostkey')" "0" \
+    "a resync replaced the follower's dataset rather than merging into it"
+assert_eq "$(send_to "$FOLLOWER_PORT" 'llen ghostlist')" "2" \
+    "and a list the follower already had was not appended to twice"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
