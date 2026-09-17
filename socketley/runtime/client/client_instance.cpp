@@ -440,6 +440,10 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     {
         m_reconnect_pending = false;
     }
+    else if (req == &m_conn->hs_req)
+    {
+        m_conn->hs_armed = false;
+    }
 }
 
 // A completion carrying bytes is the first thing that proves the peer accepted
@@ -447,6 +451,18 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
 // the backoff and the --reconnect limit start counting from again.
 void client_instance::note_established()
 {
+    // Not while the handshake is still in progress.  The bytes crossing then
+    // are handshake records, and one of the two callers is a WRITE completion
+    // -- which means the local kernel took them, the one thing the sentence
+    // above says this is not.  A target that accepts and never handshakes
+    // wrote its ClientHello successfully on every re-dial and zeroed the
+    // counter each time, so `--reconnect N` was never reached: measured, six
+    // deadlines in three minutes and not one refusal.
+    //
+    // A plaintext client is unaffected, its tls_state being tls_conn_none.
+    if (m_conn && m_conn->tls_state == tls_conn_handshake)
+        return;
+
     m_reconnect_attempt = 0;
 }
 
@@ -635,6 +651,16 @@ void client_instance::teardown(event_loop& loop)
         loop.flush();
     }
 
+    // The same reasoning for the handshake deadline, which hangs off no
+    // descriptor either.
+    if (m_conn->hs_armed)
+    {
+        if (!loop.submit_timeout_remove(&m_conn->hs_req))
+            LOG_WARN("client: the handshake deadline withdrawal did not reach the ring — "
+                     "this instance stays retired until the timer fires on its own");
+        loop.flush();
+    }
+
     // Its request keeps its owner, because the loop reads the request when the
     // completion lands, and the pending flags are left standing since a
     // withdrawn timeout is still owed exactly one.
@@ -676,7 +702,7 @@ void client_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_write(cqe);
             break;
         case op_timeout:
-            handle_timeout(cqe);
+            handle_timeout(cqe, req);
             break;
         default:
             break;
@@ -915,8 +941,25 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
         drop_connection();
 }
 
-void client_instance::handle_timeout(struct io_uring_cqe* cqe)
+void client_instance::handle_timeout(struct io_uring_cqe* cqe, io_request* req)
 {
+    // Told apart by the request the ring names rather than by state: the
+    // handshake deadline fires while m_connected is true, and the reconnect
+    // clock's own guard below reads that as a timer to ignore.
+    if (m_conn && req == &m_conn->hs_req)
+    {
+        m_conn->hs_armed = false;
+        if (cqe->res != -ETIME && cqe->res != 0)
+            return;
+        // Finished, or the socket went while this was in flight.
+        if (m_conn->tls_state != tls_conn_handshake)
+            return;
+        LOG_ERROR("client: the target accepted the connection and did not finish the "
+                  "TLS handshake — dropped, so --reconnect applies to it");
+        drop_connection();
+        return;
+    }
+
     m_reconnect_pending = false;
 
     // io_uring timeout fires with -ETIME on expiration
@@ -1095,7 +1138,26 @@ bool client_instance::start_tls()
         return false;
 
     tls_flush();
+    arm_handshake_deadline();
     return true;
+}
+
+// A flat deadline and not a progress one.  The dump a follower takes can
+// legitimately run for minutes, so that deadline had to measure bytes; a
+// handshake is bounded by round trips rather than by data, and no real peer
+// spends half a minute on one.
+void client_instance::arm_handshake_deadline()
+{
+    if (!m_loop || !m_conn || m_conn->hs_armed)
+        return;
+
+    m_conn->hs_ts.tv_sec  = tls_handshake_deadline_secs;
+    m_conn->hs_ts.tv_nsec = 0;
+    m_conn->hs_req = { this, nullptr, -1, 0, op_timeout, m_conn_generation };
+    m_conn->hs_armed = m_loop->submit_timeout(&m_conn->hs_ts, &m_conn->hs_req);
+    if (SOCKETLEY_UNLIKELY(!m_conn->hs_armed))
+        LOG_ERROR("client: the handshake deadline could not be submitted — a target that "
+                  "accepts and never handshakes will not be dropped");
 }
 
 // Ciphertext in and plaintext into m_conn->partial, one call per read

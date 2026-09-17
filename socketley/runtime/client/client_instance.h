@@ -40,6 +40,13 @@ struct client_tcp_connection
     io_request timeout_req{};
     struct __kernel_timespec timeout_ts{};
 
+    // The handshake deadline's own clock, beside the reconnect one and never
+    // sharing it: this one fires while m_connected is true, which is exactly
+    // the state the reconnect clock's guard treats as "stale, do nothing".
+    io_request hs_req{};
+    struct __kernel_timespec hs_ts{};
+    bool hs_armed{false};
+
     // Non-null only with --tls, on a memory BIO pair so every byte on the wire
     // is still moved by io_uring -- and nothing the ring can name lives inside
     // the SSL, which is what makes it safe to free with a write in flight.
@@ -98,7 +105,13 @@ public:
 private:
     void handle_read(struct io_uring_cqe* cqe);
     void handle_write(struct io_uring_cqe* cqe);
-    void handle_timeout(struct io_uring_cqe* cqe);
+    // Takes the request as well as the completion, because two clocks share
+    // op_timeout and state cannot tell them apart.
+    void handle_timeout(struct io_uring_cqe* cqe, io_request* req);
+    // A dial that connected is not a connection: the TCP half succeeded and
+    // the peer may never finish the handshake, in which case nothing is ever
+    // lost and --reconnect is never reached.
+    void arm_handshake_deadline();
 
     void process_message(std::string_view msg);
     // Returns whether the reconnect clock is actually armed, since a caller
