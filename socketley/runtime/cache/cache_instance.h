@@ -1058,6 +1058,10 @@ private:
         std::string partial;
         int fd{-1};
         bool read_pending{false};
+        // A socket is not a sync: the dump arrives after the read is armed, so
+        // between the two the follower is connected and answering out of a
+        // dataset that is on its way to being replaced.
+        bool synced{false};
     };
     std::unique_ptr<master_link> m_master;
 

@@ -10480,7 +10480,14 @@ void cache_instance::build_info_reply(std::string& out) const
         socketley::dial_addr::refusal(m_replicate_target, master_host, master_port);
         out += "master_host:" + master_host + "\r\n";
         out += "master_port:" + std::to_string(master_port) + "\r\n";
-        out += std::string("master_link_status:") + (m_master ? "up" : "down") + "\r\n";
+        // Connected is not synced, and a follower that reports "up" while the
+        // dump is still arriving is answering out of a dataset it is in the
+        // middle of replacing -- the same two fields the dialect uses, for the
+        // same reason.
+        const bool syncing = (m_master && !m_master->synced);
+        out += std::string("master_link_status:") +
+               ((m_master && m_master->synced) ? "up" : "down") + "\r\n";
+        out += std::string("master_sync_in_progress:") + (syncing ? "1" : "0") + "\r\n";
     }
     else
     {
@@ -11013,6 +11020,12 @@ void cache_instance::handle_replicate_request(client_connection* conn)
     }
 }
 
+// The end of a full dump, which the stream has no other way to mark.  Read by
+// the link rather than handed to the interpreter, so it never becomes a command
+// a client could send, and it cannot collide with a framed line because those
+// begin with ipc_frame::marker and this begins with a letter.
+static constexpr std::string_view repl_sync_done = "replicate-sync-done";
+
 bool cache_instance::send_full_dump(follower_conn& f)
 {
     // A full sync replaces the follower's dataset rather than merging into it.
@@ -11023,6 +11036,9 @@ bool cache_instance::send_full_dump(follower_conn& f)
     std::string buf = "flushall\n";
     buf.reserve(65536);
     m_store.dump_commands(buf);
+
+    buf.append(repl_sync_done);
+    buf.push_back('\n');
 
     // Sent even when the dump adds nothing, because a leader flushed while the
     // link was down is exactly the case that leaves the follower full.
@@ -11259,6 +11275,12 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             scan_from = pos + 1;
         }
 
+        if (line == repl_sync_done)
+        {
+            link.synced = true;
+            continue;
+        }
+
         if (!line.empty())
         {
             // The same interpreter the leader ran, because the hand-picked
@@ -11337,6 +11359,10 @@ std::string cache_instance::stats_lines() const
         // The one thing repl_role cannot say: a follower with no link is a
         // follower all the same, and reads as one here until this line.
         << "master_link:" << (m_master ? 1 : 0) << "\n"
+        // Beside it rather than folded into it: master_link still answers
+        // "is there a socket", which is the question that tells a dial apart
+        // from a leader that accepts and then says nothing.
+        << "master_sync_in_progress:" << ((m_master && !m_master->synced) ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
     return out.str();
 }
