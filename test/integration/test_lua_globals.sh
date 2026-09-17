@@ -97,8 +97,17 @@ daemon_start "$BIN"
 # with a known body for /probe.txt and 404 for anything else, one request per
 # connection, HTTP/1.0.
 cat > "$SOCKETLEY_TMPD/httpd.py" <<'PYEOF'
-import os, socket, sys, threading
+import os, socket, sys, threading, time
 port, stop_path = int(sys.argv[1]), sys.argv[2]
+# Two exits besides the stop file, because the stop file is not guaranteed to
+# arrive.  A run killed rather than finished never touches it, and the
+# directory it would live in gets removed either way -- after which
+# os.path.exists can never become true again.  Witnessed: one of these held a
+# port for five days, which takes a whole 2000-port window out of the thirteen
+# lib_ports.sh can choose from, and the run that then lands in a busy window
+# reports the collision as a product failure.
+stop_dir = os.path.dirname(stop_path) or "."
+deadline = time.time() + 600
 ls = socket.socket()
 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 ls.bind(("127.0.0.1", port))
@@ -122,7 +131,8 @@ def serve(c):
         try: c.close()
         except Exception: pass
 
-while not os.path.exists(stop_path):
+while (not os.path.exists(stop_path) and os.path.isdir(stop_dir)
+       and time.time() < deadline):
     try:
         c, _ = ls.accept()
     except socket.timeout:

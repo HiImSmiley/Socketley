@@ -65,7 +65,9 @@ else fail "the page's info entry names replication fields at all" \
           "entry was $(printf '%s' "$ENTRY" | wc -l) lines"; fi
 
 # ─── A live pair ────────────────────────────────────────────────────────────
-P=$((SL_PORT_BASE + 930))
+# An offset nothing else in the directory claims: +930 is also
+# test_state_dir_asymmetric's and test_command_diagnostics'.
+P=$((SL_PORT_BASE + 1021))
 daemon_start "$BIN"
 RC=0
 timeout 20 "$BIN" create cache inf_leader -p "$P" -s >/dev/null 2>&1 || RC=$?

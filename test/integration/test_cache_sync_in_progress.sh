@@ -49,7 +49,13 @@ field()   { grep -m1 "^$2" <<<"$1" | tr -d '\r' || true; }
 echo "=== Integration: a follower says whether it is synced, not just connected ==="
 
 daemon_start "$BIN"
-P=$((SL_PORT_BASE + 910))
+# An offset nothing else in the directory claims, which matters here more than
+# elsewhere: the listener below is not a runtime, so daemon_stop does not reap
+# it, and a run killed hard enough to skip the trap would leave it holding the
+# port for the rest of the suite -- landing on two files that would each read as
+# a product defect.  test_ipc_framing, test_proxy_circuit_breaker and
+# test_lua_config_parity are what +910 and +920 would have hit.
+P=$((SL_PORT_BASE + 1001))
 STALL_PORT=$((P + 0))
 LEADER_PORT=$((P + 1))
 
@@ -61,15 +67,23 @@ LEADER_PORT=$((P + 1))
 ACCEPTS="$TMPDIR_T/stall.accepts"
 : > "$ACCEPTS"
 python3 -c "
-import socket, sys
+import socket, sys, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $STALL_PORT)); s.listen(8)
 sys.stderr.write('ready\n'); sys.stderr.flush()
 held = []
 n = 0
-while True:
-    c, _ = s.accept()
+# Its own deadline, because the trap that kills it does not run if this test is
+# killed rather than finished, and the port has to come back either way.  The
+# assertions below need it for about 35 seconds.
+s.settimeout(5)
+deadline = time.time() + 180
+while time.time() < deadline:
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
     held.append(c); n += 1
     with open('$ACCEPTS', 'w') as f:
         f.write(str(n) + '\n')

@@ -115,7 +115,7 @@ daemon_start "$BIN"
 # connection after each reply — see test_lua_globals.sh for why the target is
 # not a socketley --http server.
 cat > "$SOCKETLEY_TMPD/httpd.py" <<'PYEOF'
-import os, socket, ssl, sys, threading
+import os, socket, ssl, sys, threading, time
 tls_port, plain_port, cert, key, stop_path = (
     int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5])
 BODY = b"TLS-BODY-FROM-SOCKETLEY"
@@ -136,7 +136,13 @@ def listener(port, wrap):
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.bind(("127.0.0.1", port)); ls.listen(16); ls.settimeout(0.2)
-    while not os.path.exists(stop_path):
+    # The same two exits as test_lua_globals', for the reason given there: a
+    # stop file that never arrives left one of these holding a port for five
+    # days.
+    stop_dir = os.path.dirname(stop_path) or "."
+    deadline = time.time() + 600
+    while (not os.path.exists(stop_path) and os.path.isdir(stop_dir)
+           and time.time() < deadline):
         try:
             c, _ = ls.accept()
         except socket.timeout:
