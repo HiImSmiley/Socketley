@@ -1022,6 +1022,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
             withdrawn &= m_loop->submit_timeout_remove(&m_accept_backoff_timer->req);
         if (m_master_retry)
             withdrawn &= m_loop->submit_timeout_remove(&m_master_retry->req);
+        if (m_master_sync_deadline)
+            withdrawn &= m_loop->submit_timeout_remove(&m_master_sync_deadline->req);
         m_loop->flush();
 
         if (SOCKETLEY_UNLIKELY(!withdrawn))
@@ -1069,6 +1071,11 @@ void cache_instance::teardown(event_loop& /*loop*/)
         {
             owed[0] = &m_master_retry->req;
             retire(std::shared_ptr<void>(std::move(m_master_retry)), owed, 1);
+        }
+        if (m_master_sync_deadline)
+        {
+            owed[0] = &m_master_sync_deadline->req;
+            retire(std::shared_ptr<void>(std::move(m_master_sync_deadline)), owed, 1);
         }
     }
 
@@ -1234,6 +1241,28 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 m_master_retry.reset();
                 if (!connect_to_master())
                     schedule_master_retry();
+                break;
+            }
+            if (m_master_sync_deadline && req == &m_master_sync_deadline->req)
+            {
+                m_master_sync_deadline.reset();
+                if (!m_master || m_master->synced)
+                    break;                          // done, or no link left to judge
+                if (m_master->bytes_seen != m_master->bytes_at_deadline)
+                {
+                    arm_master_sync_deadline();      // slow, not stopped
+                    break;
+                }
+                LOG_ERROR(("cache \"" + std::string(get_name()) + "\": the master link "
+                           "stood for 30s without finishing its sync — dropped, and "
+                           "dialled again on a backoff").c_str());
+                // Shut down rather than torn down here.  The read is still in
+                // flight, so resetting the link would hand the ring a buffer
+                // that is gone; a shutdown completes that read with 0, which
+                // walks the drop handle_master_read() already performs -- close,
+                // reset, schedule a retry -- and adds no second lifetime.
+                if (m_master->fd >= 0)
+                    ::shutdown(m_master->fd, SHUT_RDWR);
                 break;
             }
             if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
@@ -11182,10 +11211,29 @@ void cache_instance::handle_master_connect(struct io_uring_cqe* cqe, io_request*
         return;
     }
 
-    // A link that stands is what resets the backoff; anything else and the next
-    // failure would start counting from one again and never spread out.
-    m_master_attempt = 0;
     m_master = std::move(link);
+
+    // The backoff is reset by a sync and not by a connect, because a leader
+    // that accepts and then says nothing would otherwise get a fresh 1-second
+    // retry every time the deadline below dropped it.
+    arm_master_sync_deadline();
+}
+
+// One deadline at a time, re-armed from its own firing rather than from every
+// read: a busy live link would otherwise pay two submissions per read for a
+// timer it never needs.
+void cache_instance::arm_master_sync_deadline()
+{
+    if (!m_loop || !m_master || m_master_sync_deadline)
+        return;
+
+    auto t = std::make_unique<timer_op>();
+    t->ts.tv_sec = 30;
+    t->ts.tv_nsec = 0;
+    t->req = { this, nullptr, -1, 0, op_timeout };
+    m_master->bytes_at_deadline = m_master->bytes_seen;
+    if (m_loop->submit_timeout(&t->ts, &t->req))
+        m_master_sync_deadline = std::move(t);
 }
 
 // The same backoff the server uses for an upstream -- 1, 2, 4, 8, 16 seconds
@@ -11240,6 +11288,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     // for the reason the bytes_in note gives.
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
+    link.bytes_seen += static_cast<uint64_t>(cqe->res);
     link.partial.append(link.buf, cqe->res);
 
     // Framed or line, decided by a first byte no line command can begin with,
@@ -11278,6 +11327,10 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
         if (line == repl_sync_done)
         {
             link.synced = true;
+            // A sync is what resets the backoff, not a connect: a leader that
+            // accepts and then says nothing would otherwise be re-dialled one
+            // second after every deadline, forever, at full rate.
+            m_master_attempt = 0;
             continue;
         }
 

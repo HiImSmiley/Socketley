@@ -21,11 +21,13 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_ports.sh"
 daemon_isolate sync_progress
+TMPDIR_T=$(mktemp -d)
 PASS=0; FAIL=0; TOTAL=0
 
 STALL_PID=""
 cleanup() {
     [ -n "$STALL_PID" ] && kill -9 "$STALL_PID" 2>/dev/null
+    rm -rf "$TMPDIR_T" 2>/dev/null
     "$BIN" stop  sync_stalled sync_leader sync_live >/dev/null 2>&1 || true
     "$BIN" remove sync_stalled >/dev/null 2>&1 || true
     "$BIN" remove sync_leader  >/dev/null 2>&1 || true
@@ -56,15 +58,21 @@ LEADER_PORT=$((P + 1))
 # It has to hold the connection rather than close it: a close is a link drop,
 # which the follower already reported correctly.  What was never reported is a
 # connection that stands with no dump behind it.
+ACCEPTS="$TMPDIR_T/stall.accepts"
+: > "$ACCEPTS"
 python3 -c "
-import socket, sys, time
+import socket, sys
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $STALL_PORT)); s.listen(8)
 sys.stderr.write('ready\n'); sys.stderr.flush()
 held = []
+n = 0
 while True:
-    c, _ = s.accept(); held.append(c)
+    c, _ = s.accept()
+    held.append(c); n += 1
+    with open('$ACCEPTS', 'w') as f:
+        f.write(str(n) + '\n')
 " 2>/dev/null &
 STALL_PID=$!
 disown "$STALL_PID" 2>/dev/null || true
@@ -143,6 +151,36 @@ INFO_LEADER=$(send_to "$LEADER_PORT" 'info')
 if ! grep -q "master_sync_in_progress" <<<"$INFO_LEADER"; then pass
 else fail "a leader does not answer a follower's question" \
           "got: $(field "$INFO_LEADER" master_sync_in_progress)"; fi
+
+# ─── And it does not wait forever ───────────────────────────────────────────
+#
+# The link never dropped, so the retry chain never saw it: a follower could sit
+# on a standing socket with no dump behind it for as long as the leader kept the
+# connection open.  The deadline is 30s of no bytes at all, so a dump that is
+# merely slow re-arms it instead of being dropped.
+#
+# Asserted on the leader's accept count rather than on the follower's link
+# state: the window between the drop and the next dial is one second, and a
+# poll that has to land inside it is a coin toss.  An accept that happened is
+# permanent.
+ACC=0
+for _ in $(seq 1 50); do
+    ACC=$(cat "$ACCEPTS" 2>/dev/null || echo 0)
+    [ "${ACC:-0}" -ge 2 ] && break
+    sleep 1
+done
+if [ "${ACC:-0}" -ge 2 ]; then pass
+else fail "a sync that never finishes is given up on and dialled again" \
+          "the silent leader was connected to ${ACC:-0} time(s) in 50s, expected at least 2"; fi
+
+# The real follower is not collateral: its deadline fires too, finds itself
+# synced, and must do nothing.
+if [ "$(send_to $((P + 11)) 'get synckey')" = "syncval" ]; then pass
+else fail "the synced follower survived its own deadline" \
+          "got: '$(send_to $((P + 11)) 'get synckey')'"; fi
+if grep -q "master_link_status:up" <<<"$(send_to $((P + 11)) 'info')"; then pass
+else fail "and still calls its link standing afterwards" \
+          "got: $(field "$(send_to $((P + 11)) 'info')" master_link_status)"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

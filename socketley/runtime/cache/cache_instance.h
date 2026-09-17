@@ -1062,6 +1062,10 @@ private:
         // between the two the follower is connected and answering out of a
         // dataset that is on its way to being replaced.
         bool synced{false};
+        // What the deadline below compares against, so a dump that is slow is
+        // told apart from a leader that has stopped sending.
+        uint64_t bytes_seen{0};
+        uint64_t bytes_at_deadline{0};
     };
     std::unique_ptr<master_link> m_master;
 
@@ -1082,6 +1086,11 @@ private:
     // chains driving one piece of state.
     std::unique_ptr<timer_op> m_master_retry;
     uint32_t m_master_attempt{0};
+    // A leader that accepts the connection and then says nothing leaves the
+    // read armed forever, which the retry chain never sees because there was
+    // no drop.  Measured against bytes rather than against the clock, so a
+    // dump that takes longer than the window re-arms instead of being dropped.
+    std::unique_ptr<timer_op> m_master_sync_deadline;
 
     // Start a write if nothing is in flight, moving queued data into out.
     void follower_kick(follower_conn& f);
@@ -1113,6 +1122,7 @@ private:
     // anybody.  Called from every path that ends a link, so there is one place
     // that decides whether a follower keeps trying.
     void schedule_master_retry();
+    void arm_master_sync_deadline();
     void handle_master_read(struct io_uring_cqe* cqe);
 
     // Provided buffer ring
