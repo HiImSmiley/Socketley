@@ -22,6 +22,21 @@
 #define SOCKETLEY_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
+// How long a peer may take to finish an HTTP head.  Here for the same reason
+// the length question is: both the proxy and the server ask it, and before this
+// only the proxy answered.  Both bound the SIZE of an incomplete head at 16 KB
+// already; neither bounded the time, so a peer that sent "GET / HTTP/1.1" and
+// stopped held its slot for ever.  Measured on a server with
+// --max-connections 2: two such peers refused every real request and nothing
+// reclaimed them in 75 seconds.
+//
+// The two runtimes check it at different rates, which is deliberate rather than
+// an oversight: the proxy has a 250 ms chain of its own, the server rides its
+// 30-second idle sweep, so the same 10-second deadline is noticed in 10-20
+// seconds there and 10-40 here.  A second chain in the server for this alone is
+// more machinery than the defect is worth.
+inline constexpr int http_header_deadline_secs = 10;
+
 // ─── shared header-line helpers ─────────────────────────────────────────────
 
 inline bool header_name_equals(std::string_view line, const char* lower_name, size_t name_len)

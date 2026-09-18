@@ -86,7 +86,9 @@ static constexpr size_t PROXY_READ_BUF_SIZE = 65536;
 // How long a client may take to finish a header block once it has started one,
 // deliberately not a flag and not tied to --idle-timeout, whose default of 0
 // must not switch it off.
-static constexpr int PROXY_HEADER_TIMEOUT_SEC = 10;
+// In shared/http_framing.h now, because the server asks the same question and
+// answered it differently -- which is to say not at all.
+static constexpr int PROXY_HEADER_TIMEOUT_SEC = http_header_deadline_secs;
 
 struct alignas(64) proxy_client_connection
 {

@@ -114,6 +114,14 @@ struct alignas(64) server_connection
     // WITH --idle-timeout and lost it in 63 seconds without.  Flat, like the
     // client's, because a handshake is bounded by round trips and not by data.
     std::chrono::steady_clock::time_point handshake_since{};
+    // An HTTP head that has arrived in part and stopped.  The size of one is
+    // bounded at 16 KB in parse_partial(); the time was not, so a peer that
+    // sent a request line and nothing else held its slot against
+    // --max-connections until it chose to let go.  Dated from the first
+    // incomplete read and never renewed, for the reason the proxy's own arm
+    // gives: renewing it hands the bound back to the client.
+    bool awaiting_headers{false};
+    std::chrono::steady_clock::time_point header_deadline{};
 
     io_request read_req;
     io_request write_req;
@@ -394,6 +402,11 @@ struct alignas(64) server_connection
         ws_frag_len = 0;
         ws_frag_opcode = 0;
         pipe_peer_fd = -1;
+        // A slot comes back from the pool for a new peer, and a clock left
+        // running belongs to the last one -- which would drop the new peer
+        // mid-head for something its predecessor did.
+        awaiting_headers = false;
+        header_deadline = {};
         partial.clear();
         meta.clear();
         groups.clear();
@@ -1027,6 +1040,10 @@ private:
     // returns before the TCP path ever reaches the arm, so --idle-timeout was
     // accepted and did nothing on a UDP server.
     void arm_idle_sweep();
+    // Starts the clock on a head that arrived in part, and arms the sweep that
+    // reads it -- a plain --http server has neither --idle-timeout nor TLS, so
+    // without this there is no chain running at all.
+    void arm_header_deadline(server_connection* conn);
 
     // And its withdrawal, for the same reason at the other end: teardown() has
     // the same two exits, and a timer this instance armed and did not withdraw
@@ -1104,6 +1121,10 @@ private:
     bool m_accept_armed{false};
     bool m_accept_backoff_armed{false};
     bool m_idle_sweep_armed{false};
+    // Set by arm_header_deadline() and cleared by the sweep that finds nobody
+    // waiting, because the sweep decides whether to re-arm and a walk it has
+    // already finished is the only place that knows.
+    bool m_headers_outstanding{false};
     bool m_relay_deadline_armed{false};
     bool m_udp_recv_armed{false};
 

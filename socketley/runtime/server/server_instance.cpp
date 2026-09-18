@@ -2593,6 +2593,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // handshake deadline alone would close the lot.
                 const bool sweep_idle = (m_idle_timeout_cached > 0);
                 const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
+                bool heads_left = false;
                 for (int cfd : m_active_fds)
                 {
                     auto* cconn = m_conn_idx[cfd];
@@ -2608,12 +2609,29 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                         continue;
                     }
+                    // A head that arrived in part and stopped.  Not the idle
+                    // question: this connection HAS spoken, it just never
+                    // finished saying anything a request could be made of.
+                    if (cconn->awaiting_headers)
+                    {
+                        if (now > cconn->header_deadline)
+                        {
+                            cconn->closing = true;
+                            shutdown(cfd, SHUT_RD);
+                            continue;
+                        }
+                        heads_left = true;
+                    }
                     if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
                     }
                 }
+                // Decided by the walk that just finished rather than kept as a
+                // count, because a connection can stop awaiting headers on any
+                // read and nothing would have decremented it.
+                m_headers_outstanding = heads_left;
                 // A UDP peer has no connection to close, so the same timeout
                 // means forgetting it: it is out of the broadcast fan-out and
                 // out of the count `ps` prints, and its next datagram enters
@@ -2624,7 +2642,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (sweep_idle && m_udp && !m_udp_peers.empty())
                     forget_idle_udp_peers(now, timeout);
 
-                if (sweep_idle || m_tls)
+                if (sweep_idle || m_tls || m_headers_outstanding)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
             // The relay-hold flag is lowered before the sweep and not after,
@@ -3657,8 +3675,15 @@ reparse:
                 conn->closing = true;
                 return;
             }
+            // The size was bounded here and the time was not, so an upgrade
+            // that stops one line short held its slot until the peer let go.
+            arm_header_deadline(conn);
             return; // Incomplete headers
         }
+
+        // The head is whole, so whatever clock was running on it is spent, the
+        // same as in the plain HTTP branch below.
+        conn->awaiting_headers = false;
 
         // Single-pass header scan: find Upgrade + Sec-WebSocket-Key without allocation
         {
@@ -3928,8 +3953,14 @@ reparse:
                 conn->closing = true;
                 return;
             }
+            arm_header_deadline(conn);
             return;
         }
+
+        // The head is whole, so whatever clock was running on it is spent --
+        // cleared here and not in the sweep, because the sweep may be thirty
+        // seconds away and this connection is a client again now.
+        conn->awaiting_headers = false;
 
         // Down before the refusals below, which can answer ahead of the
         // request line being parsed and would otherwise answer for the last
@@ -6475,11 +6506,30 @@ void server_instance::withdraw_timers(event_loop& loop)
 // A timeout hangs off no fd, so the previous run's sweep is still counting down
 // on this very request and arming another gives the server a second chain per
 // restart.
+// Dated from the first incomplete read and not renewed, which is the whole
+// point: a deadline the next byte pushes out is a deadline the client owns.
+// The same sentence arm_header_deadline() carries in the proxy, about the same
+// trap -- and the one my TLS handshake deadline got wrong by reading
+// last_activity.
+void server_instance::arm_header_deadline(server_connection* conn)
+{
+    if (!conn || conn->awaiting_headers)
+        return;
+
+    conn->awaiting_headers = true;
+    conn->header_deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(http_header_deadline_secs);
+    m_headers_outstanding = true;
+    arm_idle_sweep();
+}
+
 void server_instance::arm_idle_sweep()
 {
-    // Armed for either question: the idle timeout if one was configured, and
-    // the handshake deadline on any TLS listener whether one was or not.
-    if (!m_loop || m_idle_sweep_armed || (m_idle_timeout_cached <= 0 && !m_tls))
+    // Armed for any of three questions: the idle timeout if one was
+    // configured, the handshake deadline on any TLS listener whether one was or
+    // not, and a head that has arrived in part.
+    if (!m_loop || m_idle_sweep_armed ||
+        (m_idle_timeout_cached <= 0 && !m_tls && !m_headers_outstanding))
         return;
 
     m_idle_sweep_ts.tv_sec  = 30;
