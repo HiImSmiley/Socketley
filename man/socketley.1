@@ -1387,6 +1387,18 @@ open internet, where the buffer is memory a client controls. Values under 64K
 are raised to it rather than refused, because the derived value ceiling would
 otherwise be under what an ordinary form post or JSON document needs.
 .IP
+It is per connection, and nothing bounds the sum but
+.BR \-\-max\-connections ,
+which defaults to 0 \(em no limit. Measured on a cache with 200 connections:
+one that has sent nothing costs about 13 KB, and one holding an unfinished
+command costs the whole of what it has sent, up to this buffer. So the figure
+to size against is
+.BR \-\-read\-buffer " \(mu " \-\-max\-connections ,
+and at both defaults that product is unbounded: the ceiling is the worker's
+descriptor limit, over a million here. An unfinished command is not a
+malformed one and nothing refuses it \(em only its size is bounded, and only
+per connection.
+.IP
 A value past the ceiling is answered
 .B "\-ERR value is larger than this cache accepts (limit N bytes)"
 and the connection is closed, which is what Redis does for a bulk length it
