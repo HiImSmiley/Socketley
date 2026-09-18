@@ -2270,12 +2270,23 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                             (now - cconn->handshake_since) > hs)
                             stalled.push_back(cfd);
                     }
+                    uint32_t hs_dropped = 0;
                     for (int cfd : stalled)
                     {
                         auto& cconn = m_client_slots[cfd];
                         if (!cconn || cconn->closing) continue;
                         close_pair(cfd, cconn->backend_fd, close_reason::force);
+                        ++hs_dropped;
                     }
+                    // Once for the tick, not once per connection: the attack
+                    // this deadline exists for is many peers at once, and
+                    // nothing is said to the peer itself because there is no
+                    // protocol yet to say it in.
+                    if (hs_dropped > 0)
+                        LOG_WARN(("proxy \"" + std::string(get_name()) + "\": dropped " +
+                                  std::to_string(hs_dropped) + " connection(s) that did not "
+                                  "finish a TLS handshake within " +
+                                  std::to_string(tls_handshake_deadline_secs) + "s").c_str());
                 }
 
                 // Evict stale pooled connections, for every proxy whether or

@@ -1277,6 +1277,9 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 // handshake deadline alone would close the lot.
                 const bool sweep_idle = (m_idle_timeout_cached > 0);
                 const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
+                // Once for the tick, not once per connection: the attack this
+                // deadline exists for is many peers at once.
+                uint32_t hs_dropped = 0;
                 for (auto& [cfd, cconn] : m_clients)
                 {
                     // A replication follower is idle by definition, so
@@ -1292,6 +1295,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
+                        ++hs_dropped;
                         continue;
                     }
                     if (sweep_idle && (now - cconn->last_activity) > timeout)
@@ -1300,6 +1304,15 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                         shutdown(cfd, SHUT_RD);
                     }
                 }
+                // Nothing is said to a peer dropped this way -- there is no
+                // protocol yet to say it in -- so the log is the only record
+                // that this and not something else closed it.
+                if (hs_dropped > 0)
+                    LOG_WARN(("cache \"" + std::string(get_name()) + "\": dropped " +
+                              std::to_string(hs_dropped) + " connection(s) that did not "
+                              "finish a TLS handshake within " +
+                              std::to_string(tls_handshake_deadline_secs) + "s").c_str());
+
                 if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
                                                                &m_idle_sweep_timer->req)))
                     LOG_ERROR("cache: idle sweep timer refused — no further sweeps will run");

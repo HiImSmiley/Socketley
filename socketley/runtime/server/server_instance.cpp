@@ -2612,6 +2612,11 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 const bool sweep_idle = (m_idle_timeout_cached > 0);
                 const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
                 bool heads_left = false;
+                // Counted and reported once for the tick rather than per
+                // connection: the attack this deadline exists for is many
+                // peers at once, so a line each would be a log flood produced
+                // by the defence.
+                uint32_t hs_dropped = 0, head_dropped = 0;
                 for (int cfd : m_active_fds)
                 {
                     auto* cconn = m_conn_idx[cfd];
@@ -2625,6 +2630,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
+                        ++hs_dropped;
                         continue;
                     }
                     // A head that arrived in part and stopped.  Not the idle
@@ -2641,6 +2647,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                             // sets closing itself.
                             cconn->awaiting_headers = false;
                             refuse_http_request(cconn, http_408_response());
+                            ++head_dropped;
                             continue;
                         }
                         heads_left = true;
@@ -2655,6 +2662,24 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // count, because a connection can stop awaiting headers on any
                 // read and nothing would have decremented it.
                 m_headers_outstanding = heads_left;
+
+                // A peer dropped on a deadline has nothing said to it -- there
+                // is no protocol yet to say it in -- so the log is the only
+                // record that this and not something else closed it.  Which
+                // matters because the deadline is flat by choice: if half a
+                // minute turns out to be too little for somebody's slow
+                // client, the symptom is connections failing at random and
+                // this line is what points at the cause.
+                if (hs_dropped > 0)
+                    LOG_WARN(("server \"" + std::string(get_name()) + "\": dropped " +
+                              std::to_string(hs_dropped) + " connection(s) that did not "
+                              "finish a TLS handshake within " +
+                              std::to_string(tls_handshake_deadline_secs) + "s").c_str());
+                if (head_dropped > 0)
+                    LOG_WARN(("server \"" + std::string(get_name()) + "\": answered 408 to " +
+                              std::to_string(head_dropped) + " connection(s) whose request "
+                              "head stopped arriving within " +
+                              std::to_string(http_header_deadline_secs) + "s").c_str());
                 // A UDP peer has no connection to close, so the same timeout
                 // means forgetting it: it is out of the broadcast fan-out and
                 // out of the count `ps` prints, and its next datagram enters

@@ -219,7 +219,34 @@ for kind in server cache proxy dribbled; do
               "no real client got in within 120s while the peers were held"; fi
 done
 
+# ─── And it leaves a record, once ───────────────────────────────────────────
+#
+# Nothing is said to a peer dropped this way -- there is no protocol yet to say
+# it in -- so the log is the only evidence the deadline and not something else
+# closed it.  Read before daemon_stop, which deletes it.
+#
+# The count matters as much as the presence: the attack this deadline exists
+# for is many peers at once, so a line each would be a flood produced by the
+# defence.  Six peers fell on the server, the cache and the proxy together, and
+# each runtime must have said so exactly once per sweep.
+DROP_LINES=$(grep -c "did not finish a TLS handshake" "$SOCKETLEY_DLOG" 2>/dev/null || true)
+if [ "${DROP_LINES:-0}" -ge 1 ]; then pass
+else fail "the drop is written down at all" \
+          "nothing in the daemon log names a handshake deadline" \
+          "an operator seeing connections fail has no way to reach the cause"; fi
+
+# Two per runtime would mean per-connection logging, since each was loaded with
+# two peers; four runtimes, so anything past four is a line per peer.
+if [ "${DROP_LINES:-0}" -le 4 ]; then pass
+else fail "and written down once per sweep, not once per peer" \
+          "$DROP_LINES lines for $((CAP * 4)) peers across 4 runtimes"; fi
+
+if grep -q "dropped $CAP connection(s) that did not finish" "$SOCKETLEY_DLOG" 2>/dev/null; then pass
+else fail "and the line carries the count" \
+          "got: $(grep -m1 'did not finish a TLS handshake' "$SOCKETLEY_DLOG" 2>/dev/null || echo '<no line>')"; fi
+
 echo "  reclaimed: server ${WHEN[server]}, cache ${WHEN[cache]}, proxy ${WHEN[proxy]}, dribbled+idle-timeout ${WHEN[dribbled]}"
+echo "  the drop was written down in $DROP_LINES line(s) for $((CAP * 4)) peers"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
