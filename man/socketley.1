@@ -2923,8 +2923,22 @@ one message in, two answered, and the client chooses what the second one
 says. Compliant clients emit none of these shapes.
 .PP
 A request whose header block is still arriving is held until the
-terminating blank line, subject to a 16 KiB header limit; past that the
-connection is closed.
+terminating blank line, subject to a 16 KiB header limit and a 10 second
+header deadline; past either the connection is closed.
+.PP
+The deadline is the same one the proxy applies, and for the reason given
+there: it is fixed, is not configurable, and is deliberately independent of
+.BR \-\-idle\-timeout ,
+which defaults to 0 and so cannot end a half\-sent request \(em a client
+that sends a request line and then stops sends no further bytes for the
+16 KiB limit to count. It starts at the first read that left the block
+incomplete and later bytes do not renew it. Neither an idle keep\-alive
+connection between requests nor a slow request body is measured against it.
+.PP
+The server notices it on the sweep that runs every 30 seconds, so a
+connection is closed between 10 and 40 seconds after it stops speaking; a
+proxy has a chain of its own and closes between 10 and 20. The deadline is
+the same in both.
 .SS Cache Access via Server
 When a server is linked to a cache with
 .BR \-\-cache ,
@@ -10199,6 +10213,23 @@ and
 work on a listener configured this way.
 .BI \-\-ca " file"
 adds mutual TLS \(em a client must present a certificate signed by that CA.
+.PP
+A peer that opens a connection and never finishes the handshake is dropped
+after 30 seconds. Fixed, not configurable, and deliberately not
+.BR \-\-idle\-timeout :
+a connection that did handshake and then went quiet is legitimate on a
+daemon built for long\-living ones, while a peer that has sent nothing the
+record layer accepted has not become a client at all \(em and would
+otherwise hold a slot against
+.B \-\-max\-connections
+for as long as it liked. The clock starts when the handshake does and later
+bytes do not move it, so a peer that dribbles inside an unfinished record is
+dropped on the same schedule as one that sends nothing at all. A
+.B client
+runtime applies the same 30 seconds to a target that accepts its connection
+and then never handshakes, after which
+.B \-\-reconnect
+applies to it like any other lost connection.
 .PP
 A
 .B proxy
