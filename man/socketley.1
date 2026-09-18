@@ -2923,8 +2923,13 @@ one message in, two answered, and the client chooses what the second one
 says. Compliant clients emit none of these shapes.
 .PP
 A request whose header block is still arriving is held until the
-terminating blank line, subject to a 16 KiB header limit and a 10 second
-header deadline; past either the connection is closed.
+terminating blank line, subject to a 16 KiB header limit
+.RB ( "431 Request Header Fields Too Large" )
+and a 10 second header deadline
+.RB ( "408 Request Timeout" ).
+The deadline is answered rather than dropped in silence, the same status the
+proxy sends for the same case: a client that gets a bare close cannot tell a
+deadline from a crash, a firewall or the wrong port.
 .PP
 The deadline is the same one the proxy applies, and for the reason given
 there: it is fixed, is not configurable, and is deliberately independent of

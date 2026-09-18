@@ -859,6 +859,24 @@ static const std::shared_ptr<const std::string>& http_400_response()
     return resp;
 }
 
+// A head that stopped arriving.  Answered rather than dropped in silence,
+// because the proxy answers this exact case with this exact status from its own
+// sweep -- and a client that gets a bare close cannot tell a deadline from a
+// crash, a firewall or the wrong port.  Closing for the same reason as the
+// refusals above: what was in the buffer was measured against a block that
+// never finished, so where the next message starts is precisely what is in
+// doubt.
+static const std::shared_ptr<const std::string>& http_408_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 408 Request Timeout\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "Request Timeout\n");
+    return resp;
+}
+
 // A Transfer-Encoding this server does not implement is 501 rather than 400
 // (RFC 9112 Section 6.1), because the request is well-formed -- and reading a
 // chunked body as one of length zero parses the chunk data as the next
@@ -2616,8 +2634,13 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     {
                         if (now > cconn->header_deadline)
                         {
-                            cconn->closing = true;
-                            shutdown(cfd, SHUT_RD);
+                            // Answered, not dropped: this connection HAS
+                            // spoken HTTP, so there is a protocol to say it in
+                            // -- which is what the proxy does with the same
+                            // status on the same deadline.  refuse_http_request
+                            // sets closing itself.
+                            cconn->awaiting_headers = false;
+                            refuse_http_request(cconn, http_408_response());
                             continue;
                         }
                         heads_left = true;

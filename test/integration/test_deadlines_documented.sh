@@ -92,17 +92,23 @@ else fail "and says the clock is not renewed by later bytes" \
           "a reader would otherwise assume it is an inactivity timeout"; fi
 
 # ─── The server's header deadline ───────────────────────────────────────────
-SRV_PARA=$(grep -B2 -A4 "16 KiB header limit and a $HD second" "$MAN" 2>/dev/null || true)
-if [ -n "$SRV_PARA" ]; then pass
+SRV_PARA=$(awk '/^\.SS Request Framing$/{f=1;next} f&&/^\.SS /{exit} f{print}' "$MAN" 2>/dev/null || true)
+if grep -qE "$HD second[[:space:]]*$|$HD second header deadline" <<<"$SRV_PARA"; then pass
 else fail "the server's request framing names a $HD second header deadline" \
           "the proxy's section has named one since it was written" \
-          "got: $(grep -m1 '16 KiB header limit' "$MAN" || echo '<no line>')"; fi
+          "got: $(grep -m1 '16 KiB header limit' <<<"$SRV_PARA" || echo '<no line>')"; fi
 
 # Both runtimes, same deadline, different detection rate -- stated rather than
 # left to be discovered from a stopwatch.
 if grep -q "between 10 and 40 seconds" "$MAN"; then pass
 else fail "the page states how fast the server notices it" \
           "the deadline is $HD seconds but the sweep runs every 30"; fi
+
+# The deadline is answered, not dropped -- stated because a bare close and a
+# status line are the same event to the slot and different ones to the client.
+if grep -q "408 Request Timeout" <<<"$SRV_PARA"; then pass
+else fail "the server's paragraph names the status the deadline answers with" \
+          "a reader would otherwise expect a silent close"; fi
 
 # ─── The proxy's, which must not have been disturbed ────────────────────────
 if grep -q "and a $HD second header deadline" "$MAN"; then pass

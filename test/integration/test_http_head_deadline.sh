@@ -126,6 +126,17 @@ for _ in range($CAP):
     hold.append(s)
 with open('$TMPD/held', 'w') as f:
     f.write(str(len(hold)))
+# What the first stalled POST peer is told, if anything.  A bare close and a
+# 408 are the same event from the slot's point of view and completely
+# different from the client's, which is where the confusion lands.
+try:
+    hold[0].settimeout(120)
+    data = hold[0].recv(200)
+    with open('$TMPD/answer', 'w') as f:
+        f.write(data.decode('latin-1', 'replace') if data else 'CLOSED-SILENTLY')
+except Exception as e:
+    with open('$TMPD/answer', 'w') as f:
+        f.write('NOTHING: ' + type(e).__name__)
 time.sleep(400)
 " >/dev/null 2>&1 &
 HOLDER=$!
@@ -185,7 +196,22 @@ else fail "a raw server's half-message peers are left alone" \
 if [ "$(served "$POST_P")" = ok ]; then pass
 else fail "and the http server still serves after the sweep ran" "got refused"; fi
 
+# ─── And what the peer was told ─────────────────────────────────────────────
+#
+# The proxy answers 408 to this exact case from its own sweep.  A server that
+# drops in silence leaves a client unable to tell a deadline from a crash, a
+# firewall or the wrong port -- and the manual claims the two runtimes apply
+# "the same rules because they are the same code".
+ANSWER=$(cat "$TMPD/answer" 2>/dev/null || echo "<no reading>")
+if grep -q "408" <<<"$ANSWER"; then pass
+else fail "the stalled peer is told why, not just disconnected" \
+          "got: $(head -c 60 <<<"$ANSWER" | tr -d '\r\n')"; fi
+if grep -qi "Request Timeout" <<<"$ANSWER"; then pass
+else fail "and the status names the reason" \
+          "got: $(head -c 60 <<<"$ANSWER" | tr -d '\r\n')"; fi
+
 echo "  reclaimed: post ${WHEN[post]}, get ${WHEN[get]}; raw untouched at $RAW_AFTER"
+echo "  the stalled peer was told: $(head -c 32 <<<"$ANSWER" | tr -d '\r\n')"
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"
