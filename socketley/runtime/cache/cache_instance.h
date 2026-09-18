@@ -37,6 +37,25 @@ struct client_connection
     static constexpr size_t WRITE_COALESCE_LIMIT = 64 * 1024;
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
+    // How long a command may be half-arrived.  Not a flat figure: a client
+    // writing a large value over a slow link is legitimate and a flat deadline
+    // would cut it, while a peer dribbling to hold a slot delivers nothing and
+    // must not be given the same patience.  So the allowance grows with what
+    // has actually been delivered --
+    //
+    //     allowed = PARTIAL_BASE_SECS + partial.size() / PARTIAL_FLOOR_BPS
+    //
+    // which is a floor on the rate, expressed as time.  A client sustaining
+    // the floor always has PARTIAL_BASE_SECS of slack; one below it falls
+    // behind its own allowance and is dropped; one sending nothing gets the
+    // base and no more.  10 KB/s is under 2.7 kbit/s -- slower than a modem,
+    // and far under anything a real client runs on.
+    //
+    // Measured before this existed: two peers holding a half-command against
+    // --max-connections 2 refused every real client and were never reclaimed.
+    static constexpr uint32_t PARTIAL_BASE_SECS  = 10;
+    static constexpr size_t   PARTIAL_FLOOR_BPS  = 10 * 1024;
+
     int fd;
     int fixed_idx{-1};
     bool direct_fd{false};
@@ -146,6 +165,12 @@ struct client_connection
     // WITH --idle-timeout and lost it in 63 seconds without.  Flat, like the
     // client's, because a handshake is bounded by round trips and not by data.
     std::chrono::steady_clock::time_point handshake_since{};
+    // When the bytes now sitting in `partial` stopped becoming commands.
+    // Unset while nothing is half-arrived; dated from the first read that left
+    // a remainder and re-dated whenever a command completes, because a client
+    // pipelining steadily never empties this buffer and is making progress the
+    // whole time.
+    std::chrono::steady_clock::time_point partial_since{};
 
 
     // What this struct owns that no container releases for it, reached by a
@@ -175,6 +200,9 @@ struct client_connection
         fd = new_fd;
         fixed_idx = -1;
         direct_fd = false;
+        // A slot comes back from the pool for a new peer, and a clock left
+        // running belongs to the last one.
+        partial_since = {};
         partial.clear();
         response_buf.clear();
         write_queue.clear();
@@ -466,6 +494,15 @@ private:
     // whose crossing has just come back can be driven from the reply handler
     // with the same code the read handler uses.
     bool parse_text_lines(client_connection* conn);
+    // Called once after the parse loop, for both protocols, with what `partial`
+    // held before it ran: one place decides whether this connection made
+    // progress, rather than each parser reporting it.
+    void note_partial_progress(client_connection* conn, size_t before);
+    // Creates and arms the sweep chain if it is not already running.  A cache
+    // with neither --idle-timeout nor TLS has no timer at all until a client
+    // leaves a command half-arrived, so this is on demand rather than at
+    // setup(): an idle cache pays for no wakeups it does not need.
+    void arm_idle_sweep_if_needed();
 
     // ─── CROSS-SHARD ROUTING ────────────────────────────────────────────────
     // A pipeline is grouped by owner before anything is sent, so a run crosses
@@ -1100,6 +1137,10 @@ private:
     // no drop.  Measured against bytes rather than against the clock, so a
     // dump that takes longer than the window re-arms instead of being dropped.
     std::unique_ptr<timer_op> m_master_sync_deadline;
+    // Set when a connection is left holding a half-arrived command, cleared by
+    // the sweep that finds none, because the sweep decides whether to re-arm
+    // and a walk it has already finished is the only place that knows.
+    bool m_partials_outstanding{false};
 
     // Start a write if nothing is in flight, moving queued data into out.
     void follower_kick(follower_conn& f);

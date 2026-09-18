@@ -798,18 +798,12 @@ bool cache_instance::setup(event_loop& loop)
         m_journal_write_warned = false;
     }
 
-    // Armed for either question: the idle timeout if one was configured, and
-    // the handshake deadline on a TLS listener whether one was or not.
+    // Armed here for the two questions a listener has from the start: the idle
+    // timeout if one was configured, and the handshake deadline on a TLS
+    // listener whether one was or not.  The third -- a command left
+    // half-arrived -- cannot be known yet and arms the same chain on demand.
     if (m_idle_timeout_cached > 0 || m_tls)
-    {
-        m_idle_sweep_timer = std::make_unique<timer_op>();
-        m_idle_sweep_timer->ts.tv_sec = 30;
-        m_idle_sweep_timer->ts.tv_nsec = 0;
-        m_idle_sweep_timer->req = { this, nullptr, -1, 0, op_timeout };
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
-                                                       &m_idle_sweep_timer->req)))
-            LOG_ERROR("cache: idle sweep timer refused — idle connections will not be reaped");
-    }
+        arm_idle_sweep_if_needed();
 
     return true;
 }
@@ -1279,7 +1273,8 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 const auto hs = std::chrono::seconds(tls_handshake_deadline_secs);
                 // Once for the tick, not once per connection: the attack this
                 // deadline exists for is many peers at once.
-                uint32_t hs_dropped = 0;
+                uint32_t hs_dropped = 0, partial_dropped = 0;
+                bool partials_left = false;
                 for (auto& [cfd, cconn] : m_clients)
                 {
                     // A replication follower is idle by definition, so
@@ -1298,12 +1293,34 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                         ++hs_dropped;
                         continue;
                     }
+                    // A command that arrived in part and stopped.  The
+                    // allowance grows with what was delivered, so a client
+                    // writing a large value keeps ahead of it and one holding
+                    // the socket does not.
+                    if (cconn->partial_since.time_since_epoch().count() != 0)
+                    {
+                        const auto allowed = std::chrono::seconds(
+                            client_connection::PARTIAL_BASE_SECS +
+                            cconn->partial.size() / client_connection::PARTIAL_FLOOR_BPS);
+                        if ((now - cconn->partial_since) > allowed)
+                        {
+                            cconn->closing = true;
+                            shutdown(cfd, SHUT_RD);
+                            ++partial_dropped;
+                            continue;
+                        }
+                        partials_left = true;
+                    }
                     if (sweep_idle && (now - cconn->last_activity) > timeout)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
                     }
                 }
+                // Decided by the walk that just finished rather than kept as a
+                // count, because a connection stops holding one on any read and
+                // nothing would have decremented it.
+                m_partials_outstanding = partials_left;
                 // Nothing is said to a peer dropped this way -- there is no
                 // protocol yet to say it in -- so the log is the only record
                 // that this and not something else closed it.
@@ -1312,6 +1329,13 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                               std::to_string(hs_dropped) + " connection(s) that did not "
                               "finish a TLS handshake within " +
                               std::to_string(tls_handshake_deadline_secs) + "s").c_str());
+                if (partial_dropped > 0)
+                    LOG_WARN(("cache \"" + std::string(get_name()) + "\": dropped " +
+                              std::to_string(partial_dropped) + " connection(s) holding a "
+                              "command that stopped arriving; the allowance is " +
+                              std::to_string(client_connection::PARTIAL_BASE_SECS) +
+                              "s plus one second per " +
+                              std::to_string(client_connection::PARTIAL_FLOOR_BPS) + " bytes delivered").c_str());
 
                 if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&m_idle_sweep_timer->ts,
                                                                &m_idle_sweep_timer->req)))
@@ -1941,6 +1965,50 @@ bool cache_instance::tls_flush(client_connection* conn)
     return true;
 }
 
+// One chain, armed by whichever question needs it first and never twice: the
+// timer existing is what says it is running, since the sweep re-arms itself for
+// as long as the instance lives.
+void cache_instance::arm_idle_sweep_if_needed()
+{
+    if (!m_loop || m_idle_sweep_timer)
+        return;
+
+    auto t = std::make_unique<timer_op>();
+    t->ts.tv_sec  = 30;
+    t->ts.tv_nsec = 0;
+    t->req = { this, nullptr, -1, 0, op_timeout };
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_timeout(&t->ts, &t->req)))
+    {
+        LOG_ERROR("cache: idle sweep timer refused — idle connections and "
+                  "half-arrived commands will not be reaped");
+        return;
+    }
+    m_idle_sweep_timer = std::move(t);
+}
+
+// Whether this connection is still becoming commands, decided once for both
+// protocols rather than by each parser.  A buffer that shrank had a command
+// taken out of it, which is progress however much is left behind; a buffer that
+// did not is a client that has stopped mid-command, and its clock starts.
+void cache_instance::note_partial_progress(client_connection* conn, size_t before)
+{
+    if (conn->partial.empty())
+    {
+        conn->partial_since = {};
+        return;
+    }
+
+    // Re-dated and not merely left running: a client pipelining steadily never
+    // empties this buffer, and a clock that only stopped at empty would drop it
+    // for keeping the runtime busy.
+    if (conn->partial.size() < before || conn->partial_since.time_since_epoch().count() == 0)
+    {
+        conn->partial_since = std::chrono::steady_clock::now();
+        m_partials_outstanding = true;
+        arm_idle_sweep_if_needed();
+    }
+}
+
 // The text line splitter, out of handle_read so a connection whose crossing
 // has come back is driven by the same code, because two drivers for one parser
 // stop matching.
@@ -2021,6 +2089,7 @@ void cache_instance::pump(client_connection* conn)
 
     // Around again only when the parser stopped at MAX_ROUTED_PER_BATCH, so
     // nothing parseable is left behind for a read that may never come.
+    const size_t partial_before = conn->partial.size();
     for (;;)
     {
         const bool cut = conn->resp_mode ? process_resp(conn)
@@ -2029,6 +2098,7 @@ void cache_instance::pump(client_connection* conn)
         if (SOCKETLEY_LIKELY(!cut) || conn->closing)
             break;
     }
+    note_partial_progress(conn, partial_before);
 
     if (SOCKETLEY_UNLIKELY(conn->crossing_bytes >= read_buffer_bytes()))
         pause_read(conn);
