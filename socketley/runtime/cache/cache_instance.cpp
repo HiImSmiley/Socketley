@@ -1792,6 +1792,23 @@ void cache_instance::tls_feed(client_connection* conn, const char* data, size_t 
             // inbound BIO had buffered.
             if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
             {
+                // Said out loud here as well as on the cleartext path.  The
+                // two halves had the same condition and only one of them left
+                // a record, so whether a closed connection could be explained
+                // depended on whether the listener happened to be TLS.
+                //
+                // Once per connection and not once per read: this check sits
+                // inside the ssl_read loop, and the ciphertext for one
+                // oversized command arrives over several completions that each
+                // re-enter it.  Measured before the guard: four lines for one
+                // connection, against one on the cleartext path.
+                if (!conn->closing)
+                {
+                    LOG_WARN(("cache \"" + std::string(get_name()) + "\": a client "
+                              "accumulated more than " + std::to_string(read_buffer_bytes()) +
+                              " bytes without a complete command; its connection is closed")
+                             .c_str());
+                }
                 conn->closing = true;
                 break;
             }
@@ -2155,8 +2172,20 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     {
         // A line that never ends and nothing else, because the pump parses
         // every whole command as it arrives, crossing or no crossing.
-        LOG_WARN("cache: a client sent over 1 MiB without a newline; "
-                 "its connection is closed");
+        // The limit rather than the figure it happened to be compiled with:
+        // --read-buffer moves this, and a message naming 1 MiB on an 8 MiB
+        // runtime sends whoever reads it looking in the wrong place.
+        //
+        // Guarded like its twin in tls_feed(), because a TLS connection walks
+        // BOTH: the decryptor appends and checks, and then this common check
+        // runs on the same buffer.  Measured without the guard: two lines for
+        // one TLS connection and one for a cleartext one.
+        if (!conn->closing)
+        {
+            LOG_WARN(("cache \"" + std::string(get_name()) + "\": a client accumulated "
+                      "more than " + std::to_string(read_buffer_bytes()) +
+                      " bytes without a newline; its connection is closed").c_str());
+        }
         conn->closing = true;
         if (!conn->write_pending)
         {
