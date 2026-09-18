@@ -1288,7 +1288,7 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                     // client yet, so this one does not wait for a timeout
                     // nobody configured.
                     if (cconn->tls_state == tls_conn_handshake &&
-                        (now - cconn->last_activity) > hs)
+                        (now - cconn->handshake_since) > hs)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
@@ -1507,6 +1507,7 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
             return false;
         }
         ptr->tls_state = tls_conn_handshake;
+        ptr->handshake_since = std::chrono::steady_clock::now();
     }
 
     // Initialize rate limiting

@@ -2267,7 +2267,7 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
                         seen++;
                         if (cconn->closing) continue;
                         if (cconn->tls_state == tls_conn_handshake &&
-                            (now - cconn->last_activity) > hs)
+                            (now - cconn->handshake_since) > hs)
                             stalled.push_back(cfd);
                     }
                     for (int cfd : stalled)
@@ -2743,6 +2743,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
                 goto proxy_resubmit_accept;
             }
             ptr->tls_state = tls_conn_handshake;
+            ptr->handshake_since = std::chrono::steady_clock::now();
         }
 
         // Set whether or not --idle-timeout is on, because the handshake

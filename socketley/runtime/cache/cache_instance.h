@@ -138,6 +138,15 @@ struct client_connection
     // The peer's close_notify, remembered rather than acted on, because the
     // read that carries it can carry the last command ahead of it.
     bool tls_peer_closed{false};
+    // When the handshake began, which the deadline reads instead of
+    // last_activity.  last_activity is refreshed on every read -- but only when
+    // --idle-timeout is set, so the deadline silently changed meaning with a
+    // flag that has nothing to do with it: measured, a peer dribbling one byte
+    // every twenty seconds inside an unfinished record held its slot for ever
+    // WITH --idle-timeout and lost it in 63 seconds without.  Flat, like the
+    // client's, because a handshake is bounded by round trips and not by data.
+    std::chrono::steady_clock::time_point handshake_since{};
+
 
     // What this struct owns that no container releases for it, reached by a
     // retired connection whose completion was dropped when the runtime stopped

@@ -2602,7 +2602,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                     // client yet, so this one does not wait for a timeout
                     // nobody configured.
                     if (cconn->tls_state == tls_conn_handshake &&
-                        (now - cconn->last_activity) > hs)
+                        (now - cconn->handshake_since) > hs)
                     {
                         cconn->closing = true;
                         shutdown(cfd, SHUT_RD);
@@ -2915,6 +2915,7 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
             return false;
         }
         ptr->tls_state = tls_conn_handshake;
+        ptr->handshake_since = std::chrono::steady_clock::now();
     }
 
     auto now_tp = std::chrono::steady_clock::now();
