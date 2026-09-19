@@ -1,5 +1,6 @@
 #include "../../shared/socket_tuning.h"
 #include "server_instance.h"
+#include "../../shared/lua_suspend.h"
 #include "../../shared/conn_reachability.h"
 
 // The HTTP header-line helpers, shared rather than copied, because a second
@@ -1967,6 +1968,15 @@ bool server_instance::setup(event_loop& loop)
     m_loop = &loop;
     m_ring_loop = &loop;
 
+#ifndef SOCKETLEY_NO_LUA
+    // What a finished await owes back.  Installed here rather than at the
+    // script's load, because a runtime can be stopped and started again on the
+    // same context and the hold belongs to this run's connections.
+    if (lua())
+        lua()->suspender().set_await_ended(
+            [this](uint64_t ctx) { release_await_hold(ctx); });
+#endif
+
     // Fix this runtime's half of every conn_ref it is about to mint, so every
     // name handed out over one run carries the same owner.
     owner_key();
@@ -1981,6 +1991,7 @@ bool server_instance::setup(event_loop& loop)
         m_idle_sweep_armed     = false;
         m_relay_deadline_armed = false;
         m_accept_backoff_armed = false;
+        m_await_sweep_armed    = false;
         m_udp_recv_armed       = false;
         // Nothing in the ring names any of them any more.
         m_accept_spent.clear();
@@ -2693,6 +2704,30 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (sweep_idle || m_tls || m_headers_outstanding)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
+#ifndef SOCKETLEY_NO_LUA
+            // A handler that stopped on an await and never got its answer.
+            // The same shape as every other deadline here: the wait is given
+            // up on rather than waited out, and the script is told, so
+            // `local v, err = self.cache(...)` returns either way.
+            else if (req == &m_await_sweep_req)
+            {
+                m_await_sweep_armed = false;
+                if (lua())
+                {
+                    auto& sus = lua()->suspender();
+                    const size_t gone = sus.expire(std::chrono::steady_clock::now());
+                    if (gone > 0)
+                        LOG_WARN(("server \"" + std::string(get_name()) + "\": " +
+                                  std::to_string(gone) + " callback(s) gave up waiting for "
+                                  "the linked cache after " +
+                                  std::to_string(cache_await_ms / 1000) + "s").c_str());
+                    // Re-armed from its own firing and only while somebody is
+                    // still waiting, so the chain stops on its own.
+                    if (!sus.idle())
+                        arm_await_sweep();
+                }
+            }
+#endif
             // The relay-hold flag is lowered before the sweep and not after,
             // because the sweep re-arms this very request and clearing
             // afterwards would stop the timer for good.
@@ -4519,6 +4554,49 @@ static inline uint64_t cache_cookie(const server_connection* conn, bool silent)
          | static_cast<uint64_t>(static_cast<uint32_t>(conn->fd));
 }
 
+#ifndef SOCKETLEY_NO_LUA
+// ─── The cookie of a reply a script is waiting for ──────────────────────────
+// A suspended handler is not a connection, so it needs a cookie no connection
+// can produce.  The mark goes where the descriptor goes, beside
+// CACHE_COOKIE_NO_CONN and for the same reason -- a real fd is below MAX_FDS,
+// so neither value can be one.  The generation half is deliberately NOT used:
+// next_io_generation() wraps, so a tag there would collide, quietly and once
+// in four billion connections.
+static constexpr uint64_t AWAIT_COOKIE_MARK = 0xFFFFFFFEull;
+
+static inline uint64_t await_cookie(uint32_t id)
+{
+    return (static_cast<uint64_t>(id) << 32) | AWAIT_COOKIE_MARK;
+}
+
+static inline bool is_await_cookie(uint64_t cookie)
+{
+    return (cookie & 0xFFFFFFFFull) == AWAIT_COOKIE_MARK;
+}
+
+static inline uint32_t await_cookie_id(uint64_t cookie)
+{
+    return static_cast<uint32_t>(cookie >> 32);
+}
+
+// Which connection the callbacks inside this scope are serving.  Saved and
+// restored rather than cleared, because one dispatch can reach another -- a
+// script that answers by routing runs the target's callbacks on this stack.
+class callback_conn_scope
+{
+public:
+    callback_conn_scope(server_instance* s, server_connection* conn) noexcept
+        : m_s(s), m_prev(s->m_callback_conn) { s->m_callback_conn = conn; }
+    ~callback_conn_scope() noexcept { m_s->m_callback_conn = m_prev; }
+    callback_conn_scope(const callback_conn_scope&)            = delete;
+    callback_conn_scope& operator=(const callback_conn_scope&) = delete;
+
+private:
+    server_instance*   m_s;
+    server_connection* m_prev;
+};
+#endif
+
 void server_instance::flush_cache_store()
 {
     if (SOCKETLEY_LIKELY(m_cache_store_batch.empty()))
@@ -4569,9 +4647,109 @@ void server_instance::post_cache_request(server_connection* conn,
         ++conn->cache_pending;
 }
 
+#ifndef SOCKETLEY_NO_LUA
+const char* server_instance::begin_cache_await(lua_State* th, std::string_view cmd)
+{
+    const std::string_view cname = get_cache_name();
+    if (cname.empty())
+        return "no cache is linked to this server (--cache)";
+
+    auto* mgr = get_runtime_manager();
+    if (SOCKETLEY_UNLIKELY(!mgr))
+        return "this runtime has no runtime manager";
+    if (SOCKETLEY_UNLIKELY(!lua()))
+        return "this runtime has no script";
+
+    auto& sus = lua()->suspender();
+    const lua_suspender::id_t id = sus.running_on(th);
+    if (id == 0)
+        return "self.cache may only be called from a callback that can wait";
+
+    // The connection this handler is answering, charged the same way a client's
+    // own `cache get` is: a promised reply, which close_conn() and the FIN path
+    // both defer on.  Without it a peer that half-closes after its request --
+    // which is what every `echo | nc` does -- is gone before the answer exists.
+    server_connection* held = m_callback_conn;
+    if (held)
+    {
+        if (SOCKETLEY_UNLIKELY(held->cache_pending >= MAX_CACHE_PENDING))
+            return "too many answers are already owed to this connection";
+    }
+
+    // Posted before the yield, so a channel that will not take it is a refusal
+    // the script reads rather than a handler stopped for an answer nobody is
+    // going to send.
+    if (!mgr->requests().post(this, await_cookie(id), cname, cmd, request_class::client))
+        return "the request channel is full";
+
+    if (held)
+        ++held->cache_pending;
+
+    sus.note_await(id, cache_await_ms, held ? cache_cookie(held, false) : 0);
+    arm_await_sweep();
+    return nullptr;
+}
+
+void server_instance::release_await_hold(uint64_t ctx)
+{
+    if (ctx == 0 || ctx == CACHE_COOKIE_NO_CONN)
+        return;
+
+    const int      fd  = static_cast<int>(static_cast<int32_t>(ctx & 0xFFFFFFFFull));
+    const uint32_t gen = static_cast<uint32_t>(ctx >> 32);
+    if (fd < 0 || fd >= MAX_FDS)
+        return;
+
+    auto* conn = m_conn_idx[fd];
+    if (!conn || conn->generation != gen)
+        return;   // the connection went anyway, and took its count with it
+
+    if (SOCKETLEY_LIKELY(conn->cache_pending > 0))
+        --conn->cache_pending;
+
+    // The close that was deferred while this answer was owed.
+    if (SOCKETLEY_UNLIKELY(conn->closing) && conn->cache_pending == 0
+        && !conn_ops_pending(conn))
+        close_conn(conn);
+}
+
+void server_instance::arm_await_sweep()
+{
+    if (!m_loop || m_await_sweep_armed)
+        return;
+
+    // A second, not the sweep's thirty: this bounds a wait measured in the ten
+    // seconds a callback gets, and a coarser tick would be most of the budget.
+    m_await_sweep_ts.tv_sec  = 1;
+    m_await_sweep_ts.tv_nsec = 0;
+    m_await_sweep_req = { this, nullptr, -1, 0, op_timeout };
+    m_await_sweep_armed = m_loop->submit_timeout(&m_await_sweep_ts, &m_await_sweep_req);
+}
+#endif
+
 void server_instance::on_request_reply(uint64_t cookie, request_status st,
                                        std::string_view reply)
 {
+#ifndef SOCKETLEY_NO_LUA
+    // First, because an await cookie carries an invocation id where this
+    // function otherwise reads a descriptor, and a small id would resolve to
+    // somebody else's connection.
+    if (is_await_cookie(cookie))
+    {
+        if (!lua())
+            return;
+        // The hold this await took is let go by the suspender's own hook, after
+        // the handler has run on -- so an answer the script writes on the way
+        // out still finds the connection open.
+        auto& sus = lua()->suspender();
+        if (st == request_status::ok)
+            sus.settle_value(await_cookie_id(cookie), reply);
+        else
+            sus.settle_nil(await_cookie_id(cookie), request_status_text(st));
+        return;
+    }
+#endif
+
     const int      fd  = static_cast<int>(static_cast<int32_t>(cookie & 0xFFFFFFFFull));
     const uint32_t gen = static_cast<uint32_t>(cookie >> 32);
 
@@ -4627,6 +4805,13 @@ void server_instance::process_message(server_connection* sender, std::string_vie
     // Rate limit check (per-connection)
     if (sender && !check_rate_limit(sender))
         return;
+
+#ifndef SOCKETLEY_NO_LUA
+    // Whose message every callback below is running for.  One scope over the
+    // whole dispatch rather than one per invoke: the modes call three different
+    // callbacks and a fourth would have been added without this.
+    callback_conn_scope serving(this, sender);
+#endif
 
     // Global rate limit check (across all connections)
     if (!check_global_rate_limit())
@@ -6290,7 +6475,9 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
 
     if (SOCKETLEY_UNLIKELY(client_id < 0 || client_id >= MAX_FDS || !m_conn_idx[client_id])) return false;
     auto* conn = m_conn_idx[client_id];
-    if (SOCKETLEY_UNLIKELY(conn->closing)) return false;
+    // Closing AND owed nothing.  A connection held open for an answer is still
+    // a connection a script may answer; see the queue_send below.
+    if (SOCKETLEY_UNLIKELY(conn->closing && conn->cache_pending == 0)) return false;
 
     std::string buf;
     buf.reserve(msg.size() + 1);
@@ -6300,7 +6487,11 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     // Queued, which is what "sent" means on an async write path here -- and
     // NOT queued is now an answer too, rather than a true for a message that
     // was dropped on the way to closing the connection.
-    return queue_send(conn, shared);
+    //
+    // A connection closing only because an answer is owed is still writable for
+    // that answer: the same sentence the built-in cache reply carries, and what
+    // lets a suspended handler answer a peer that half-closed while it waited.
+    return queue_send(conn, shared, conn->cache_pending > 0);
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)

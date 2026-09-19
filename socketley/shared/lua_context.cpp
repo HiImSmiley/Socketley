@@ -1,5 +1,6 @@
 #include "lua_context.h"
 #include "lua_json.h"
+#include "lua_suspend.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -266,6 +267,8 @@ lua_context::lua_context()
     m_lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
                          sol::lib::math, sol::lib::os, sol::lib::io,
                          sol::lib::package);
+
+    m_suspend = std::make_unique<lua_suspender>();
 
     // This is not a sandbox and says so: `io`, `package` and `base` are open,
     // so a Lua handler runs with the daemon's full privileges, and what stays
@@ -936,6 +939,13 @@ void lua_context::cancel_timers()
     // completion and a surviving lookup would find a pointer with nothing left
     // to say.
     m_timer_map.clear();
+
+    // A handler stopped on an await is let go rather than answered here: this
+    // is the path a runtime takes when it must execute no more script, and
+    // resuming one would run the rest of a callback against a runtime that is
+    // already coming down.  Everywhere else an await ends in an answer.
+    if (m_suspend)
+        m_suspend->forget_all();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -1733,6 +1743,7 @@ void lua_context::register_bindings(runtime_instance* owner)
     // Which runtime every diagnostic from this interpreter belongs to, first,
     // because load_diag is called from everything below.
     m_owner_name = std::string(owner->get_name());
+    m_suspend->attach(&m_lua, m_owner_name);
 
     // Register socketley.log() and management API
     sol::table sk = m_lua.create_table();
@@ -2793,8 +2804,48 @@ void lua_context::register_bindings(runtime_instance* owner)
     m_lua[type_to_string(owner->get_type())] = self;
 }
 
+// self.cache(command) -- the first call a script can make whose answer is not
+// there yet.  Bound as a raw lua_CFunction and not through sol, because sol's
+// wrappers return a value and this one has to yield: the answer arrives later,
+// as this call's own return value, when the linked cache replies.
+//
+// Everything before the yield is POD on purpose.  luaL_checklstring raises by
+// longjmp, which runs no destructor, so nothing here may own memory.
+static int lua_await_cache(lua_State* L)
+{
+    auto* owner = static_cast<runtime_instance*>(lua_touserdata(L, lua_upvalueindex(1)));
+    size_t n = 0;
+    const char* cmd = luaL_checklstring(L, 1, &n);
+
+    const char* why = owner ? owner->begin_cache_await(L, std::string_view(cmd, n))
+                            : "this runtime is gone";
+    if (why)
+    {
+        // Answered inline rather than raised: a script that asks a runtime with
+        // no cache linked has made a mistake worth seeing, and one whose cache
+        // is merely busy has not -- and `nil, reason` is the one shape that
+        // reads the same for both.
+        lua_pushnil(L);
+        lua_pushstring(L, why);
+        return 2;
+    }
+    return lua_yield(L, 0);
+}
+
 void lua_context::register_server_table(runtime_instance* owner, sol::table& self)
 {
+    // Pushed by hand because sol has no form for a function that yields; the
+    // runtime travels as an upvalue, which is how the C function finds it
+    // again without a global.
+    {
+        lua_State* L = m_lua.lua_state();
+        self.push(L);
+        lua_pushlightuserdata(L, owner);
+        lua_pushcclosure(L, &lua_await_cache, 1);
+        lua_setfield(L, -2, "cache");
+        lua_pop(L, 1);
+    }
+
     // broadcast_all() and not broadcast(), which is this process's
     // connection table and under --shards reaches a quarter of the clients
     // while reporting success.

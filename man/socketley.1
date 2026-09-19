@@ -6460,6 +6460,20 @@ A top level that never returns refuses the create with a reason instead of
 blocking the terminal on a command that never answers
 .RE
 .PP
+This budget is time on the loop and not time on the clock, which the two
+callbacks that may wait make visible.
+.B on_message
+and
+.B on_client_message
+run on a coroutine, so a handler stopped in
+.B self.cache
+is not holding the thread and is not spending this: each stretch it actually
+runs gets the budget, and how long it may stay stopped is a separate bound of
+ten seconds with its own answer. See
+.B self.cache
+under
+.BR "Runtime Methods" .
+.PP
 A stopped callback is a callback that raised, so wherever a raise already has a
 defined answer, the deadline gets that answer.
 .B on_auth
@@ -7035,6 +7049,65 @@ self.pending()             -- The client's own form, without an id: a client
 -- how the terminator is spelled on the wire -- passing one through as payload
 -- would end the response while the script was still writing it.
 
+.fi
+.PP
+.nf
+-- A question whose answer is somewhere else (server with --cache)
+self.cache(command)        -- Run one command against the LINKED cache and
+                           -- answer with what it said.  The handler STOPS here
+                           -- and goes on when the reply arrives; the daemon
+                           -- keeps serving meanwhile.  nil plus a reason when
+                           -- the answer is not coming.
+
+-- ─── A handler that waits ───
+-- Every callback used to run to the end in one go, so a script could answer
+-- only out of what it already held.  A server linked to a cache could not read
+-- that cache at all, and the one call that reaches outside the process --
+-- socketley.http -- does it by blocking the event loop for every runtime in the
+-- daemon, which is why its own entry says to use it in on_start and nowhere
+-- else.
+--
+--     function on_client_message(id, msg)
+--         local v, err = self.cache("get " .. msg)
+--         self.send(id, v or ("miss: " .. err))
+--     end
+--
+-- The handler runs on a coroutine.  At the call it suspends, the request goes
+-- to the cache, and the event loop carries on with every other connection and
+-- every other runtime; when the reply lands the handler picks up at the same
+-- line with the answer as that call's return value.  Nothing else in the script
+-- changes, and a handler that never calls it is not affected: a callback that
+-- runs straight through costs the same as it did, measured at 0.158 us against
+-- 0.161 for the plain call it replaced, because the coroutines are pooled.
+--
+-- Where it may be called from: on_message and on_client_message.  Anywhere
+-- else -- a timer, on_http_request, a filter -- answers nil and says so,
+-- because those call sites still expect an answer on the spot.
+--
+-- Three things are guaranteed, and each exists because the shape without it
+-- was reachable:
+--
+--   * It always returns.  A cache that accepts the request and never answers
+--     leaves the handler stopped for ever otherwise -- measured against a
+--     SIGSTOPped cache worker, whose request is parked against a ticket nothing
+--     completes.  After ten seconds the call answers nil, "timeout".
+--
+--   * The connection is still there.  While the handler waits, the connection
+--     it is answering is held open exactly as a client's own `cache get` is:
+--     a promised reply, which the close path defers on.  Without it every
+--     `echo | nc` fails, because the peer half-closes the moment it has sent
+--     its line and the answer does not exist yet.
+--
+--   * It cannot pile up.  4096 stopped callbacks per runtime, and a server that
+--     is already owed as many answers as one connection may have refuses the
+--     call with a reason rather than stopping the handler.
+--
+-- The command is the cache's own text protocol, so the answer is that
+-- protocol's: `get` on a key that is not there answers the string "nil" rather
+-- than a Lua nil, which is the same answer a client reading the port gets.
+.fi
+.PP
+.nf
 -- Upstream actions (server with -u)
 self.upstream_send(conn_id, msg) -- Send to a specific upstream; false means
                                  -- the bytes are not going.  See below.

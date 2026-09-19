@@ -733,6 +733,21 @@ protected:
     void invoke_on_upstream_writable(int conn_id);
     bool wants_on_upstream_writable() const;
 
+public:
+#ifndef SOCKETLEY_NO_LUA
+    // ─── A call a script makes that cannot answer yet ───────────────────────
+    // Post `cmd` to whatever this runtime is linked to and leave the handler on
+    // `th` waiting for the reply.  nullptr means it was posted and the binding
+    // must yield; anything else is the reason it was not, answered to the
+    // script inline as `nil, reason` so an await always returns.
+    //
+    // A literal and not a std::string: the caller is a lua_CFunction, where a
+    // raise unwinds with longjmp and runs no destructor.
+    virtual const char* begin_cache_await(lua_State* /*th*/, std::string_view /*cmd*/)
+    { return "this runtime has no cache linked"; }
+#endif
+protected:
+
     // Global rate limit check (token bucket, shared across all connections)
     bool check_global_rate_limit();
 

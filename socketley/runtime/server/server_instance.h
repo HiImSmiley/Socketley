@@ -557,6 +557,10 @@ struct upstream_connection
     bool has_cached_addr{false};
 };
 
+#ifndef SOCKETLEY_NO_LUA
+class callback_conn_scope;
+#endif
+
 class server_instance : public runtime_instance, public request_origin
 {
 public:
@@ -758,9 +762,43 @@ public:
     void on_request_reply(uint64_t cookie, request_status st,
                           std::string_view reply) override;
 
+#ifndef SOCKETLEY_NO_LUA
+    // ── self.cache(command) from a script ───────────────────────────────────
+    // Post the command and leave the calling handler stopped until the cache
+    // answers; see runtime_instance::begin_cache_await for what the answer
+    // means.
+    const char* begin_cache_await(lua_State* th, std::string_view cmd) override;
+
+    // How long a handler may stay stopped on one await before it is told the
+    // answer is not coming.  Not the callback deadline, which bounds how long a
+    // handler may HOLD the loop: this one bounds how long it may be off it, and
+    // the wait is somebody else's process, so the number is the one the request
+    // path already uses for a peer that has stopped talking.
+    static constexpr uint32_t cache_await_ms = 10000;
+
+    // Come back for handlers whose answer never arrived.  Armed only while at
+    // least one is waiting, so a server whose script never awaits puts no timer
+    // in the ring.
+    void arm_await_sweep();
+
+    // Let go of the connection an await was holding open, and finish the close
+    // it was deferring if that was the last answer owed.
+    void release_await_hold(uint64_t ctx);
+#endif
+
 private:
     proto_state m_wire_protocol{proto_unknown};
     bool        m_wire_protocol_declared{false};
+
+#ifndef SOCKETLEY_NO_LUA
+    friend class callback_conn_scope;
+
+    // Which connection the callback now running is serving, so an await started
+    // inside it knows whose socket to hold open.  Null between callbacks, and
+    // null inside one that is answering nobody -- a tick, or a message routed
+    // here from another runtime, whose connection lives somewhere else.
+    server_connection* m_callback_conn{nullptr};
+#endif
 
     // Ask the linked cache something on behalf of `conn`, where `silent` is
     // the auto-store, which wants no answer and is not charged to the
@@ -1115,6 +1153,12 @@ private:
     io_request m_relay_deadline_req{};
     struct __kernel_timespec m_relay_deadline_ts{};
 
+    // The bound on a callback that stopped on an await.  Its own timer and not
+    // the idle sweep's: that one ticks at 30 seconds, and a handler given ten
+    // would wait three times its budget before anything looked.
+    io_request m_await_sweep_req{};
+    struct __kernel_timespec m_await_sweep_ts{};
+
     // An armed request stays armed across a stop, because a timeout is
     // attached to no fd, and these flags say occupied so a restart does not
     // give the server a second sweep chain.
@@ -1126,6 +1170,7 @@ private:
     // already finished is the only place that knows.
     bool m_headers_outstanding{false};
     bool m_relay_deadline_armed{false};
+    bool m_await_sweep_armed{false};
     bool m_udp_recv_armed{false};
 
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;

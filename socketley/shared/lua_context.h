@@ -58,6 +58,11 @@ namespace lua_tick
 
 class runtime_instance;
 
+// Held by pointer and not by value: lua_suspend.h needs lua_deadline and
+// lua_diag from this file, so including it here would be a cycle.  A call site
+// that starts a callback includes shared/lua_suspend.h itself.
+class lua_suspender;
+
 // How long one Lua callback may hold the event-loop thread, enforced by a
 // count hook that fires every N VM instructions and tests wall-clock time --
 // because instructions do not map to time and a callback blocked in
@@ -153,6 +158,11 @@ public:
     // The runtime this interpreter belongs to, for a diagnostic's prefix,
     // empty before load_script has run.
     const std::string& owner_name() const { return m_owner_name; }
+
+    // The callbacks of this runtime that stopped on an await, and the threads
+    // they stopped on.
+    lua_suspender& suspender() { return *m_suspend; }
+    const lua_suspender& suspender() const { return *m_suspend; }
 
     // Update self.state to reflect current runtime state
     void update_self_state(const char* state_str);
@@ -266,6 +276,13 @@ public:
     guarded_protected on_route()       { return {m_on_route,       "on_route",       m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_master_auth() { return {m_on_master_auth, "on_master_auth", m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_client_message() { return {m_on_client_message, "on_client_message", m_deadline_ms, m_owner_name.c_str()}; }
+
+    // ─── The same two, for the coroutine path ───────────────────────────────
+    // Handed over raw because a suspendable invocation arms a deadline around
+    // each RESUME, and the guarded wrapper arms one around a call that returns
+    // exactly once.
+    sol::protected_function& raw_on_message()        { return m_on_message; }
+    sol::protected_function& raw_on_client_message() { return m_on_client_message; }
     guarded_protected on_writable()   { return {m_on_writable,   "on_writable",   m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_http_body()  { return {m_on_http_body,  "on_http_body",  m_deadline_ms, m_owner_name.c_str()}; }
     guarded_protected on_upstream_writable() { return {m_on_upstream_writable, "on_upstream_writable", m_deadline_ms, m_owner_name.c_str()}; }
@@ -355,6 +372,10 @@ private:
     std::string m_owner_name;
 
     sol::state m_lua;
+
+    // After m_lua, because a suspended thread belongs to that state and the
+    // suspender's destructor unrefs it.
+    std::unique_ptr<lua_suspender> m_suspend;
     sol::protected_function m_on_start;
     sol::protected_function m_on_stop;
     sol::protected_function m_on_message;

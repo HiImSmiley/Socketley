@@ -1,4 +1,5 @@
 #include "runtime_instance.h"
+#include "lua_suspend.h"
 #include "logging.h"
 #include "tls_context.h"
 #include "blocking_write.h"
@@ -770,12 +771,12 @@ void runtime_instance::invoke_on_message(std::string_view msg)
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    sol::protected_function_result r = m_lua->on_message()(msg);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_message error: " << e.what() << std::endl;
-    }
+    // On a coroutine rather than a protected call, so a handler that asks
+    // another runtime something stops itself instead of stopping the daemon.
+    // The suspender reports a raise, here and after any later resume.
+    lua_suspender::id_t id = 0;
+    m_lua->suspender().start(m_lua->raw_on_message(), "on_message",
+                             m_lua->callback_timeout_ms(), id, msg);
 #endif
 }
 
@@ -966,12 +967,9 @@ void runtime_instance::invoke_on_client_message(int client_id, std::string_view 
         return;
 
 #ifndef SOCKETLEY_NO_LUA
-    sol::protected_function_result r = m_lua->on_client_message()(client_id, msg);
-    if (SOCKETLEY_UNLIKELY(!r.valid()))
-    {
-        sol::error e = r;
-        std::cerr << lua_diag::tag(get_name()) << " on_client_message error: " << e.what() << std::endl;
-    }
+    lua_suspender::id_t id = 0;
+    m_lua->suspender().start(m_lua->raw_on_client_message(), "on_client_message",
+                             m_lua->callback_timeout_ms(), id, client_id, msg);
 #endif
 }
 
