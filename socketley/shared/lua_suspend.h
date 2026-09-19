@@ -8,11 +8,23 @@
 // run on a coroutine can stop instead, and the daemon goes on serving while it
 // waits.
 //
-// Two measured facts decide everything here.  A thread a handler stopped on has
-// to be kept off the collector until it is resumed.  And a thread that is still
-// suspended must never be handed to another handler -- reusing one does not
-// fail, it feeds the new handler's arguments into the old handler's pending
-// await, which then answers with a value nobody asked for.
+// Three measured facts decide everything here.
+//
+// A thread a handler stopped on has to be kept off the collector until it is
+// resumed.
+//
+// A thread that is still suspended must never be handed to another handler --
+// reusing one does not fail, it feeds the new handler's arguments into the old
+// handler's pending await, which then answers with a value nobody asked for.
+//
+// And an invocation that does not stop must be charged NOTHING for the
+// possibility that it might.  The first version of this file enrolled every
+// invocation in two hash tables and took it back out again, which cost 0.078 us
+// per callback: an echo server with a script went from 2,471,474 messages a
+// second to 1,777,358, a 29 per cent loss, while the same server with no script
+// was unchanged at 5.6M.  So the tables below are populated by the AWAIT and
+// not by the call, and a handler that never waits touches a vector and nothing
+// else.
 
 #ifndef SOCKETLEY_NO_LUA
 
@@ -54,7 +66,7 @@ public:
 
     // Threads kept for reuse.  A fresh coroutine per call measured 0.524 us
     // against 0.161 for a plain protected call, and a pooled one 0.158 -- so
-    // the pool is what makes running every callback this way free.
+    // the pool is what makes running every callback this way affordable at all.
     static constexpr size_t max_pooled = 64;
 
     lua_suspender() = default;
@@ -70,6 +82,8 @@ public:
     {
         m_lua = lua;
         m_owner_name.assign(owner_name);
+        m_frames.reserve(8);
+        m_pool.reserve(max_pooled);
     }
 
     bool attached() const { return m_lua != nullptr; }
@@ -77,6 +91,10 @@ public:
     // ─── Running a callback so that it MAY stop ─────────────────────────────
     // Answers what became of it.  `out_id` is set only for `suspended`, and is
     // then the handle every later settle names.
+    //
+    // The whole hot path is here: take a thread off the pool, push a frame,
+    // resume.  Nothing is allocated and nothing is hashed unless the handler
+    // actually stops.
     template <class... A>
     outcome start(sol::protected_function& fn, const char* what,
                   uint32_t exec_ms, id_t& out_id, A&&... args)
@@ -85,36 +103,51 @@ public:
         if (!m_lua || !fn.valid())
             return outcome::failed;
 
-        if (m_live.size() >= max_suspended)
-        {
-            // Refused here rather than at the await, because a handler stopped
-            // by a full table would have run half its work first.
-            report_overflow(what);
-            return outcome::failed;
-        }
-
         const auto [th, ref] = acquire();
-        if (!th)
+        if (SOCKETLEY_UNLIKELY(!th))
             return outcome::failed;
+
+        m_frames.push_back(frame{th, ref, what, exec_ms, 0});
 
         fn.push(th);
         (sol::stack::push(th, std::forward<A>(args)), ...);
 
-        const id_t id = enrol(th, ref, what, exec_ms);
-        const outcome o = step(id, static_cast<int>(sizeof...(A)));
-        if (o == outcome::suspended)
-            out_id = id;
-        return o;
+        ++m_stat_started;
+        return run(static_cast<int>(sizeof...(A)), out_id);
     }
 
     // ─── What an awaiting binding needs ─────────────────────────────────────
-    // Which invocation is running on this thread, 0 when the caller is not on
-    // one of ours -- which is how a binding tells "inside a callback that may
-    // wait" from "inside the script's top level".
-    id_t running_on(lua_State* th) const
+    // The handle for the invocation running on this thread, allocating it here
+    // because this is the first moment anybody needs one.  0 means the caller
+    // is not inside a callback that may wait -- the script's top level, or one
+    // of the callbacks still invoked the old way -- or that too many handlers
+    // are already stopped.
+    id_t enrol_await(lua_State* th)
     {
-        const auto it = m_by_thread.find(th);
-        return it == m_by_thread.end() ? 0 : it->second;
+        for (auto it = m_frames.rbegin(); it != m_frames.rend(); ++it)
+        {
+            if (it->th != th)
+                continue;
+            if (it->id == 0)
+            {
+                if (SOCKETLEY_UNLIKELY(m_live.size() >= max_suspended))
+                {
+                    report_overflow(it->what);
+                    return 0;
+                }
+                const id_t id = next_id();
+                record r;
+                r.th      = th;
+                r.ref     = it->ref;
+                r.what    = it->what;
+                r.exec_ms = it->exec_ms;
+                r.armed   = std::chrono::steady_clock::now();
+                m_live.emplace(id, r);
+                it->id = id;
+            }
+            return it->id;
+        }
+        return 0;
     }
 
     // Note that this invocation has posted something and is about to yield, so
@@ -150,7 +183,7 @@ public:
         if (!r)
             return;
         sol::stack::push(r->th, value);
-        step(id, 1);
+        resume(id, 1);
     }
 
     // Every await ends in exactly one settle, including the ones whose answer
@@ -163,7 +196,7 @@ public:
             return;
         lua_pushnil(r->th);
         sol::stack::push(r->th, reason);
-        step(id, 2);
+        resume(id, 2);
     }
 
     // ─── The bound ──────────────────────────────────────────────────────────
@@ -209,7 +242,8 @@ public:
         if (!m_lua)
         {
             m_live.clear();
-            m_by_thread.clear();
+            m_frames.clear();
+            m_pool.clear();
             return;
         }
         lua_State* L = m_lua->lua_state();
@@ -224,9 +258,9 @@ public:
                 luaL_unref(L, LUA_REGISTRYINDEX, r.ref);
         }
         m_live.clear();
-        m_by_thread.clear();
-        for (const int ref : m_pool)
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        m_frames.clear();
+        for (const auto& p : m_pool)
+            luaL_unref(L, LUA_REGISTRYINDEX, p.ref);
         m_pool.clear();
     }
 
@@ -244,32 +278,44 @@ private:
         std::chrono::steady_clock::time_point armed{};
     };
 
+    // One invocation currently on the stack.  A vector and not a map because
+    // this is the hot path: a callback that runs straight through pushes one of
+    // these and pops it, and nothing is hashed.  Depth is 1 except where one
+    // callback's own work reaches another runtime's callbacks.
+    struct frame
+    {
+        lua_State*  th{nullptr};
+        int         ref{LUA_NOREF};
+        const char* what{nullptr};
+        uint32_t    exec_ms{0};
+        id_t        id{0};           // 0 until an await needs a handle
+    };
+
+    // The thread and the registry reference that holds it, kept together so the
+    // hot path never reads the registry back -- lua_rawgeti plus lua_tothread
+    // plus lua_pop, per call, for a pointer we already had.
+    struct pooled
+    {
+        lua_State* th{nullptr};
+        int        ref{LUA_NOREF};
+    };
+
     record* find(id_t id)
     {
         const auto it = m_live.find(id);
         return it == m_live.end() ? nullptr : &it->second;
     }
 
-    // A thread to run one invocation on, from the pool when there is one.  The
-    // pool only ever holds threads that RAN OUT, never ones that stopped.
     std::pair<lua_State*, int> acquire()
     {
-        lua_State* L = m_lua->lua_state();
-        while (!m_pool.empty())
+        if (SOCKETLEY_LIKELY(!m_pool.empty()))
         {
-            const int ref = m_pool.back();
+            const pooled p = m_pool.back();
             m_pool.pop_back();
-            lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-            lua_State* th = lua_tothread(L, -1);
-            lua_pop(L, 1);
-            if (th)
-            {
-                lua_settop(th, 0);
-                return {th, ref};
-            }
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);   // the registry lost it
+            lua_settop(p.th, 0);
+            return {p.th, p.ref};
         }
-
+        lua_State* L = m_lua->lua_state();
         lua_State* th = lua_newthread(L);
         return {th, luaL_ref(L, LUA_REGISTRYINDEX)};   // the ref pops the thread
     }
@@ -278,36 +324,19 @@ private:
     // lua_resume said it was done.
     void release(lua_State* th, int ref, bool completed)
     {
-        lua_State* L = m_lua->lua_state();
-        if (!completed || m_pool.size() >= max_pooled)
+        if (SOCKETLEY_UNLIKELY(!completed || m_pool.size() >= max_pooled))
         {
             if (ref != LUA_NOREF)
-                luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            (void)th;
+                luaL_unref(m_lua->lua_state(), LUA_REGISTRYINDEX, ref);
             return;
         }
         lua_settop(th, 0);
-        m_pool.push_back(ref);
-    }
-
-    id_t enrol(lua_State* th, int ref, const char* what, uint32_t exec_ms)
-    {
-        const id_t id = next_id();
-        record r;
-        r.th      = th;
-        r.ref     = ref;
-        r.what    = what;
-        r.exec_ms = exec_ms;
-        r.armed   = std::chrono::steady_clock::now();
-        m_live.emplace(id, r);
-        m_by_thread[th] = id;
-        ++m_stat_started;
-        return id;
+        m_pool.push_back(pooled{th, ref});
     }
 
     id_t next_id()
     {
-        // Zero is "not on one of ours", so it is never handed out.
+        // Zero is "no handle yet", so it is never handed out.
         do {
             if (++m_seq == 0)
                 m_seq = 1;
@@ -315,65 +344,87 @@ private:
         return m_seq;
     }
 
-    // One resume, and the bookkeeping that follows from what it answered.
-    outcome step(id_t id, int nargs)
+    // Put the stopped invocation back on the stack and carry on from its await.
+    void resume(id_t id, int nargs)
     {
         record* r = find(id);
         if (!r)
-            return outcome::failed;
-
-        lua_State*  th      = r->th;
-        const int   ref     = r->ref;
-        const char* what    = r->what;
-        const uint32_t exec = r->exec_ms;
+            return;
 
         // Read before the resume and released after it: the resume may start a
         // NEW await on the same invocation, and it is the old one that ends
         // here.
         const bool     had_await = r->awaiting;
         const uint64_t ended_ctx = r->ctx;
-
-        // Cleared before the resume so that a handler which returns without
-        // awaiting again is not expired by the budget of the await it just
-        // finished; note_await sets it if the handler stops once more.
-        r->wait_ms  = 0;
         r->awaiting = false;
+        r->wait_ms  = 0;
 
-        int rc;
-        {
-            lua_deadline::scope guard(what, exec, m_owner_name.c_str());
-            // Three arguments and not two: sol's 5.1 compatibility layer
-            // defines lua_resume with the 5.4 signature and drops the caller.
-            rc = lua_resume(th, nullptr, nargs);
-        }
+        m_frames.push_back(frame{r->th, r->ref, r->what, r->exec_ms, id});
+        id_t ignored = 0;
+        run(nargs, ignored);
 
         // After the resume, so a handler answering the peer that half-closed
         // still finds the connection its runtime was holding open for it.
         if (had_await && m_await_ended)
             m_await_ended(ended_ctx);
+    }
+
+    // One resume of whatever frame is on top, and the bookkeeping that follows
+    // from what it answered.
+    outcome run(int nargs, id_t& out_id)
+    {
+        // By value: the resume can push frames of its own and move the vector.
+        const frame started = m_frames.back();
+
+        int rc;
+        {
+            lua_deadline::scope guard(started.what, started.exec_ms,
+                                      m_owner_name.c_str());
+            // Three arguments and not two: sol's 5.1 compatibility layer
+            // defines lua_resume with the 5.4 signature and drops the caller.
+            rc = lua_resume(started.th, nullptr, nargs);
+        }
+
+        const frame done = m_frames.back();   // an await may have given it an id
+        m_frames.pop_back();
 
         if (rc == LUA_YIELD)
         {
+            if (SOCKETLEY_UNLIKELY(done.id == 0))
+            {
+                // The script called coroutine.yield() itself, so nothing is
+                // going to resume it.  Reported and let go rather than pooled:
+                // a suspended thread handed to the next handler answers its
+                // await with the wrong value.
+                std::cerr << lua_diag::tag(m_owner_name) << ' '
+                          << (done.what ? done.what : "callback")
+                          << " yielded without waiting for anything; it will not resume"
+                          << std::endl;
+                release(done.th, done.ref, false);
+                return outcome::failed;
+            }
             ++m_stat_suspended;
+            out_id = done.id;
             return outcome::suspended;
         }
 
         // Read before the record goes, because the error object is on the
         // thread's stack and release() clears it.
         std::string err;
-        if (rc != 0)
+        if (SOCKETLEY_UNLIKELY(rc != 0))
         {
-            const char* msg = lua_tostring(th, -1);
+            const char* msg = lua_tostring(done.th, -1);
             err.assign(msg ? msg : "(no message)");
         }
 
-        m_by_thread.erase(th);
-        m_live.erase(id);
-        release(th, ref, rc == 0);
+        if (done.id != 0)
+            m_live.erase(done.id);
+        release(done.th, done.ref, rc == 0);
 
-        if (rc != 0)
+        if (SOCKETLEY_UNLIKELY(rc != 0))
         {
-            std::cerr << lua_diag::tag(m_owner_name) << ' ' << (what ? what : "callback")
+            std::cerr << lua_diag::tag(m_owner_name) << ' '
+                      << (done.what ? done.what : "callback")
                       << " error: " << err << std::endl;
             return outcome::failed;
         }
@@ -385,18 +436,18 @@ private:
         ++m_stat_refused;
         if (m_stat_refused == 1)
             std::cerr << lua_diag::tag(m_owner_name) << ' ' << (what ? what : "callback")
-                      << " not run: " << max_suspended
+                      << " could not wait: " << max_suspended
                       << " callbacks are already waiting on this runtime" << std::endl;
     }
 
     sol::state* m_lua{nullptr};
     std::string m_owner_name;
 
-    std::unordered_map<id_t, record>      m_live;
-    std::unordered_map<lua_State*, id_t>  m_by_thread;
-    std::vector<int>                      m_pool;
-    std::vector<id_t>                     m_expired;
-    std::function<void(uint64_t)>         m_await_ended;
+    std::vector<frame>               m_frames;
+    std::vector<pooled>              m_pool;
+    std::unordered_map<id_t, record> m_live;
+    std::vector<id_t>                m_expired;
+    std::function<void(uint64_t)>    m_await_ended;
 
     id_t  m_seq{0};
 

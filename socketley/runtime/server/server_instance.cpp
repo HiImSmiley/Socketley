@@ -4660,10 +4660,14 @@ const char* server_instance::begin_cache_await(lua_State* th, std::string_view c
     if (SOCKETLEY_UNLIKELY(!lua()))
         return "this runtime has no script";
 
+    // The handle is allocated here and not when the callback started: an
+    // invocation that never waits must not be charged for the table entry, and
+    // most never do.
     auto& sus = lua()->suspender();
-    const lua_suspender::id_t id = sus.running_on(th);
+    const lua_suspender::id_t id = sus.enrol_await(th);
     if (id == 0)
-        return "self.cache may only be called from a callback that can wait";
+        return "self.cache may only be called from a callback that can wait, "
+               "and not when this runtime already has its fill of waiting ones";
 
     // The connection this handler is answering, charged the same way a client's
     // own `cache get` is: a promised reply, which close_conn() and the FIN path
