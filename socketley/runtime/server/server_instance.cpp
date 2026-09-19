@@ -4946,16 +4946,33 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 buf.reserve(msg.size() + 1);
                 buf.append(msg);
                 buf.push_back('\n');
-                auto relay_msg = std::make_shared<const std::string>(std::move(buf));
 
                 // A message routed here from another runtime has no sender on
                 // this side, so `sender` names nobody and the set is empty:
                 // dropped rather than sent to everyone, because an echo server
                 // handed a message with nobody to echo to has no answer.
-                if ((to & send_to_sender) && sender)
-                    queue_send(sender, relay_msg);
-                if (to & send_to_others)
-                    queue_broadcast(relay_msg, sender ? sender->fd : -1);
+                //
+                // One recipient and nobody to share with is its own case, and
+                // it is the common one: `--send-to sender` is what an echo
+                // server is.  A shared payload buys a fan-out the right to copy
+                // once for N connections; for one connection it buys a second
+                // allocation and an entry the queue may not coalesce, because
+                // appending to a payload others hold would change it for them.
+                // Measured on the no-script path: the allocator was 9.6 per
+                // cent of the worker and push_shared another 3.0.
+                if (to == send_to_sender)
+                {
+                    if (sender)
+                        queue_send(sender, std::move(buf));
+                }
+                else
+                {
+                    auto relay_msg = std::make_shared<const std::string>(std::move(buf));
+                    if ((to & send_to_sender) && sender)
+                        queue_send(sender, relay_msg);
+                    if (to & send_to_others)
+                        queue_broadcast(relay_msg, sender ? sender->fd : -1);
+                }
             }
             break;
         }
@@ -5279,8 +5296,8 @@ server_instance::fanout_count server_instance::queue_broadcast(
 //
 // So it says. false means the bytes are not going anywhere, and the caller can
 // pass that to whoever asked.
-bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
-                              bool even_when_closing)
+bool server_instance::admit_send(server_connection* conn, size_t bytes,
+                                 bool even_when_closing)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop || (conn->closing && !even_when_closing)))
         return false;
@@ -5310,8 +5327,17 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
     // send never comes, because the script has already stopped.  Measured
     // before this line said `queued`: the paced arm delivered 65 of 200 chunks
     // and waited forever for a callback it had itself prevented.
-    if (SOCKETLEY_UNLIKELY(queued + msg->size() >= write_watermark_bytes()))
+    if (SOCKETLEY_UNLIKELY(queued + bytes >= write_watermark_bytes()))
         conn->drain_wanted = true;
+
+    return true;
+}
+
+bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
+                              bool even_when_closing)
+{
+    if (!admit_send(conn, msg->size(), even_when_closing))
+        return false;
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
@@ -5348,6 +5374,43 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         conn->write_queue.push_shared(msg,
             server_connection::WRITE_COALESCE_LIMIT,
             server_connection::MAX_WRITE_BATCH);
+    }
+
+    if (SOCKETLEY_LIKELY(!conn->write_pending))
+        flush_write_queue(conn);
+
+    return true;
+}
+
+// One recipient, bytes the caller owns.  Two things change against the
+// shared_ptr form and both matter on the message path: the control block is
+// not allocated, and the entry can be COALESCED -- a shared payload cannot,
+// because appending to it would change it for everyone else holding it.  The
+// queue's own note on that measured 0.036 TCP segments per delivery against
+// 0.149 on a stream of small messages to one connection.
+bool server_instance::queue_send(server_connection* conn, std::string&& msg,
+                              bool even_when_closing)
+{
+    if (!admit_send(conn, msg.size(), even_when_closing))
+        return false;
+
+    if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
+    {
+        // A frame is built from the payload either way, so the ownership this
+        // form was called for is spent here and the shared path is the same.
+        std::string_view payload(msg);
+        if (!payload.empty() && payload.back() == '\n')
+            payload.remove_suffix(1);
+        conn->write_queue.push_shared(
+            ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
+                                        : ws_frame_binary_shared(payload),
+            server_connection::WRITE_COALESCE_LIMIT,
+            server_connection::MAX_WRITE_BATCH);
+    }
+    else
+    {
+        conn->write_queue.push_coalesced(std::move(msg),
+            server_connection::WRITE_COALESCE_LIMIT);
     }
 
     if (SOCKETLEY_LIKELY(!conn->write_pending))
@@ -6491,7 +6554,6 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     buf.reserve(msg.size() + 1);
     buf.append(msg);
     if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
-    auto shared = std::make_shared<const std::string>(std::move(buf));
     // Queued, which is what "sent" means on an async write path here -- and
     // NOT queued is now an answer too, rather than a true for a message that
     // was dropped on the way to closing the connection.
@@ -6499,7 +6561,11 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     // A connection closing only because an answer is owed is still writable for
     // that answer: the same sentence the built-in cache reply carries, and what
     // lets a suspended handler answer a peer that half-closed while it waited.
-    return queue_send(conn, shared, conn->cache_pending > 0);
+    //
+    // The owning form: this names ONE connection, so there is nobody to share
+    // with and the shared_ptr was buying a second allocation and an entry the
+    // queue could not coalesce.
+    return queue_send(conn, std::move(buf), conn->cache_pending > 0);
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)

@@ -1036,6 +1036,20 @@ private:
     // false costs a caller that ignores it.
     bool queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                  bool even_when_closing = false);
+
+    // The same, for a caller that OWNS its bytes and has exactly one recipient
+    // -- which is every self.send() and every reply to one client.  A
+    // shared_ptr buys a fan-out the right to copy once for N connections; for
+    // one connection it buys a second allocation and a queue entry that cannot
+    // be coalesced, because appending to a payload others hold would change it
+    // for them.  See write_queue.h on the three kinds of entry.
+    bool queue_send(server_connection* conn, std::string&& msg,
+                 bool even_when_closing = false);
+
+    // Whether this connection will take `bytes` more, and the two flags that
+    // follow from the answer.  Extracted because both queue_send forms have to
+    // agree: a bound enforced at one door and not the other is not a bound.
+    bool admit_send(server_connection* conn, size_t bytes, bool even_when_closing);
     void flush_write_queue(server_connection* conn);
 
     // ── TLS record layer ────────────────────────────────────────────────────
