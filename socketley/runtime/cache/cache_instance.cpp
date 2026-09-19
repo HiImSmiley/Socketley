@@ -2876,10 +2876,14 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
     {
         // The parser's own limit, not a second one below it: 64 refused
         // `MSET` with 32 pairs, `DEL` or `MGET` with 65 keys and `ZADD` with
-        // 32 pairs, all of which Redis takes.  16 KiB of stack, uninitialised,
-        // against a cap that made valid commands protocol errors.
+        // 32 pairs, all of which Redis takes.  16 KiB of stack against a cap
+        // that made valid commands protocol errors.
+        //
+        // Uninitialised, which the line this replaced claimed and did not get:
+        // see resp::arg_slots for what declaring the array plainly cost.
         static constexpr int MAX_RESP_ARGS = resp::RESP_MAX_ARRAY_SIZE;
-        std::string_view args[MAX_RESP_ARGS];
+        resp::arg_slots  slots;
+        std::string_view* args = slots.v;
         int    argc     = 0;
         size_t consumed = 0;
         const auto pr = resp::parse_message_views(raw, args, MAX_RESP_ARGS, argc, consumed, read_bulk_limit());
@@ -7640,7 +7644,8 @@ bool cache_instance::process_resp(client_connection* conn)
     // the parser's own RESP_MAX_ARRAY_SIZE rather than a second, smaller cap
     // that turned valid Redis commands into protocol errors.
     static constexpr int MAX_RESP_ARGS = resp::RESP_MAX_ARRAY_SIZE;
-    std::string_view args[MAX_RESP_ARGS];
+    resp::arg_slots  slots;
+    std::string_view* args = slots.v;
     int argc = 0;
     size_t consumed = 0;
     size_t offset = 0;

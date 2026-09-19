@@ -13,6 +13,28 @@ namespace resp {
 
 // Safety limits to prevent resource exhaustion
 constexpr int RESP_MAX_ARRAY_SIZE = 1024;
+
+// ─── Room for one command's arguments, without the zeroing ──────────────────
+// `std::string_view args[RESP_MAX_ARRAY_SIZE]` reads as a bare stack array and
+// is not one: string_view has a default constructor, so declaring it
+// default-constructs all 1024 of them -- sixteen kilobytes memset to use the
+// first thirty-two bytes.
+//
+// Measured on a cache worker serving GETs one at a time, which is what a client
+// without pipelining is: that memset was 3.31 per cent of its CPU, the largest
+// userspace item in the profile.  With 32 commands in flight the same zeroing
+// is spread over 32 of them and reads as 1.54 per cent, which is how it stayed
+// unnoticed -- the earlier comment at the declaration said "16 KiB of stack,
+// uninitialised", and it was neither.
+//
+// The parser fills `argc` of these and nothing reads past it, so they do not
+// need to begin as anything.
+union arg_slots
+{
+    std::string_view v[RESP_MAX_ARRAY_SIZE];
+    arg_slots()  noexcept {}   // constructs nothing, deliberately
+    ~arg_slots() noexcept {}   // and a string_view has nothing to destroy
+};
 // The default, and no longer the only value: a runtime passes its own, derived
 // from --read-buffer.  Kept here because the decoders are free functions that a
 // fuzz target calls with no runtime to ask.
