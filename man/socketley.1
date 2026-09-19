@@ -10026,6 +10026,71 @@ A proxy in
 .B \-\-protocol tcp
 mode is unaffected by any of this: it was already a byte relay and never looked
 at a status line.
+.SS What can stop the event loop
+One thread serves every runtime in a process, so a call that waits stops all of
+them. Six places do, and they are named here rather than left to be found: the
+first of them already carried a warning at its own entry and the other five
+carried none.
+.PP
+Measured where measuring was possible, on a Lua echo server and a static file
+server under load. A share of a worker's CPU is what a cost looks like on a
+healthy machine; what none of these figures say is what the same call costs when
+the disk is busy or the resolver is down, which is the case they matter for.
+.RS
+.IP \(bu 2
+.B socketley.http()
+\(em the whole exchange, per call from a script: name resolution, the connect
+and the transfer, bounded only by the callback's remaining budget. Its own entry
+says to use it in
+.B on_start
+and nowhere else, which is the honest way of saying the capability is not usable
+where it is wanted.
+.IP \(bu 2
+.BR open (2)
+and
+.BR fstat (2)
+in the static file path, per request that is not answered from
+.BR \-\-http\-cache .
+Measured at about 4.8 per cent of the worker \(em 1.7 in the kernel's open path
+and 3.1 in
+.BR statx ,
+which is what glibc turns an
+.B fstat
+into.
+.IP \(bu 2
+.BR getaddrinfo (3)
+on a client's reconnect, a server's upstream, a cache's
+.B \-\-replicate
+and a proxy's setup. Not on any request path \(em the proxy resolves at setup
+for exactly this reason \(em but a reconnect against a resolver that is not
+answering holds the loop for as long as the resolver takes. There is no
+asynchronous form of it in glibc, so this one is a design decision and not a
+repair.
+.IP \(bu 2
+The mutation journal's flush, once per
+.B \-\-persist\-interval
+while anything is buffered. A write to the page cache and nothing more on a
+healthy disk; a write to a full or slow one is the whole interval's worth of
+clients waiting.
+.IP \(bu 2
+The cache's snapshot and its
+.BR fsync ,
+at teardown rather than periodically \(em which is why it is last of the disk
+ones and not first. A stop takes as long as the dump takes.
+.IP \(bu 2
+The state file's write and
+.BR fsync ,
+on a runtime's state changing. Rare, and on the daemon's loop rather than a
+worker's, so what it holds up is every runtime at once.
+.RE
+.PP
+.B "What is NOT on this list, having been suspected and measured."
+A static file server spends 7.3 per cent of its worker in the kernel clearing
+pages, which reads like an allocation churning. It is not: the same server
+answering half a million requests took fourteen minor page faults in total, so
+the pages are the kernel's own, for the 1.7 GB a second it is putting on the
+wire. The malloc and free around each file buffer are served from the heap and
+never reach it.
 .SS Out\-of\-process runtimes
 A runtime of any type runs in its own supervised worker process. There is no
 longer an alternative and no flag to ask for one. What that costs is worth
