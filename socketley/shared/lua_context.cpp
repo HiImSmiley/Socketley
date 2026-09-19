@@ -1,5 +1,6 @@
 #include "lua_context.h"
 #include "lua_json.h"
+#include "coarse_clock.h"
 #include "lua_suspend.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
@@ -80,6 +81,13 @@ namespace lua_deadline
 // dispatch path and the jit library it forbids, not this number.
 static constexpr int hook_count = 10000;
 
+// ── Which clock a callback budget is measured on ────────────────────────────
+// The coarse one, because this is read on the hot path: every outermost
+// callback invocation arms a deadline, so a server whose script answers each
+// message reads the clock twice per message.  See shared/coarse_clock.h for
+// the numbers and for when it is the wrong clock.
+using socketley::coarse_now;
+
 // ── The armed invocation ────────────────────────────────────────────────────
 // Thread-local and not per-interpreter, because the deadline protects one
 // event loop, which makes nesting across interpreters work out on its own.
@@ -134,8 +142,7 @@ scope::scope(const char* what, uint32_t limit_ms, const char* runtime) noexcept
 
     if (m_outermost)
     {
-        t_deadline = std::chrono::steady_clock::now()
-                   + std::chrono::milliseconds(limit_ms);
+        t_deadline = coarse_now() + std::chrono::milliseconds(limit_ms);
         t_what     = what;
         t_runtime  = runtime;
         t_limit_ms = limit_ms;
@@ -180,8 +187,10 @@ long remaining_ms() noexcept
 {
     if (t_depth == 0)
         return -1;
+    // The same clock the deadline was armed on, or the two would disagree by
+    // however far apart they happen to be.
     auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    t_deadline - std::chrono::steady_clock::now()).count();
+                    t_deadline - coarse_now()).count();
     if (left < 0)          return 0;
     if (left > INT_MAX)    return INT_MAX;
     return static_cast<long>(left);
@@ -195,7 +204,7 @@ static void hook(lua_State* L, lua_Debug*)
 {
     if (t_depth == 0)
         return;
-    if (std::chrono::steady_clock::now() < t_deadline)
+    if (coarse_now() < t_deadline)
         return;
 
     const char*    what = t_what ? t_what : "a callback";
