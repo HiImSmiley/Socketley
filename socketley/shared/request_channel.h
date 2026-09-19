@@ -3,6 +3,7 @@
 // queue in order, so an asking side cannot tell "computed here" from "written
 // to a socket".
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -10,6 +11,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "liburing_version.h"   // must precede <liburing.h>; see that file
+#include <liburing.h>
 
 #include "endpoint_table.h"
 #include "event_loop_definitions.h"
@@ -113,7 +117,18 @@ public:
     // Park a request that arrived from outside this channel, so its answer
     // comes through complete_deferred() like any other; 0 when the table is
     // full.
-    uint64_t park(request_origin* origin, uint64_t cookie);
+    //
+    // `sink` is remembered rather than passed through: a target that really
+    // goes can then be answered at the moment it goes, instead of at the
+    // deadline below.
+    uint64_t park(request_origin* origin, uint64_t cookie,
+                  const request_sink* sink);
+
+    // How long a parked request may go unanswered before its origin is told
+    // `dropped`.  Longer than any budget a caller sets on top of it, so the
+    // caller's own answer -- with the caller's own reason -- comes first, and
+    // this one catches what has none.
+    static constexpr uint32_t parked_deadline_secs = 30;
 
     // Take back a ticket park() handed out when the sink would not take the
     // request, because nothing is going to complete it.
@@ -136,12 +151,26 @@ public:
     uint64_t stat_served()    const { return m_stat_served; }
     uint64_t stat_no_target() const { return m_stat_no_target; }
     uint64_t stat_wakeups()   const { return m_stat_wakeups; }
+    // Parked requests answered by something other than their target: the
+    // deadline, a sink that went, or a detach.
+    uint64_t stat_parked_dropped() const { return m_stat_parked_dropped; }
 
 private:
     // A no-op so the loop comes back; post() calls it BEFORE queueing, because
     // an entry nothing returns for is an answer nobody gets.
     bool kick();
     void drain();
+
+    // Come back for parked requests that have waited too long.  Armed only
+    // while something is parked and re-armed from its own firing, so a channel
+    // nobody defers on puts nothing in the ring.
+    void arm_park_sweep();
+
+    // Answer every parked ticket the predicate picks, `dropped`, and say how
+    // many.  Collected before any is answered, because answering runs the
+    // origin's callback and that may park again under the iterator.
+    template <class Pick>
+    size_t drop_parked(Pick pick);
 
     struct entry
     {
@@ -158,13 +187,19 @@ private:
     // change and the fallback is a property of the process, not of the map.
     request_sink* m_default_sink{nullptr};
 
-    // Bounded so a remote that never answers cannot grow this, with no
-    // deadline yet because a parked ticket is swept when its origin goes.
+    // Bounded because a remote that never answers must not grow this, and
+    // swept because bounding it was never enough: a ticket was given up only
+    // when its ORIGIN went, and the origin is the side still waiting.  Measured
+    // against a cache worker under SIGSTOP -- which accepts and never answers,
+    // the one shape a crash does not produce -- a client's `cache get` was
+    // never answered and the connection it was owed on was held open for good.
     static constexpr size_t MAX_PARKED = 4096;
     struct parked_request
     {
-        request_origin* origin{nullptr};
-        uint64_t        cookie{0};
+        request_origin*     origin{nullptr};
+        uint64_t            cookie{0};
+        const request_sink* sink{nullptr};
+        std::chrono::steady_clock::time_point armed{};
     };
     std::unordered_map<uint64_t, parked_request> m_parked;
     uint64_t m_next_ticket{1};
@@ -177,6 +212,11 @@ private:
     size_t      m_bytes{0};
     event_loop* m_loop{nullptr};
     io_request  m_wake{};
+    io_request  m_sweep{};
+    struct __kernel_timespec m_sweep_ts{};
+    bool        m_sweep_armed{false};
+    // Reused, so a sweep of four thousand tickets allocates nothing.
+    std::vector<uint64_t> m_sweep_due;
     // "The ring owes us a wakeup."  Raised only when the submission was really
     // queued and lowered only by its completion, so a failed submit can never
     // leave the queue with nothing coming for it.
@@ -191,4 +231,5 @@ private:
     uint64_t m_stat_wakeups{0};
     uint64_t m_stat_deferred{0};
     uint64_t m_stat_deferred_refused{0};
+    uint64_t m_stat_parked_dropped{0};
 };

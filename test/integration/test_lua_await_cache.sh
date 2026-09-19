@@ -26,7 +26,7 @@ FROZEN=""
 cleanup() {
     # Before the stops: a stopped worker cannot be resumed, and a run that left
     # one SIGSTOPped would leave a process nothing reaps.
-    [ -n "$FROZEN" ] && kill -CONT "$FROZEN" 2>/dev/null
+    [ -n "$FROZEN" ] && kill -CONT "$FROZEN" 2>/dev/null; true
     for r in awsrv awbare awcache; do
         "$BIN" stop "$r"   >/dev/null 2>&1 || true
     done
@@ -131,7 +131,7 @@ else
     # is, which is the only thing that cannot pick the wrong worker.
     CACHE_PID=$("$BIN" stats awcache 2>/dev/null | grep -oP '^pid:\K[0-9]+' | head -1)
     [ -n "$CACHE_PID" ] && FROZEN=$CACHE_PID
-    kill -STOP "$FROZEN" 2>/dev/null
+    kill -STOP "$FROZEN" 2>/dev/null || true
 
     # Timed on when the ANSWER lands and not on when the reader gives up.  The
     # obvious form, `nc -q20`, reports its own linger: the first draft of this
@@ -152,7 +152,7 @@ else
     done
     kill "$ncpid" 2>/dev/null || true
     wait "$ncpid" 2>/dev/null || true
-    kill -CONT "$FROZEN" 2>/dev/null
+    kill -CONT "$FROZEN" 2>/dev/null || true
     FROZEN=""
     got=$(tr -d '\r' < "$outf")
 

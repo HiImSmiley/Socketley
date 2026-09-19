@@ -1202,7 +1202,7 @@ private:
     {
         auto& ch = m_manager.requests();
         const uint64_t cookie = m_next_deferred++;
-        const uint64_t ticket = ch.park(this, cookie);
+        const uint64_t ticket = ch.park(this, cookie, sink);
         if (ticket == 0)
             return false;
         m_deferred.emplace(cookie, deferred_reply{wire_ticket, link_serial});

@@ -28,20 +28,59 @@ request_channel::~request_channel()
 
 void request_channel::attach(event_loop& loop)
 {
-    m_loop = &loop;
-    m_wake = { this, nullptr, -1, 0, op_nop };
+    m_loop  = &loop;
+    m_wake  = { this, nullptr, -1, 0, op_nop };
+    m_sweep = { this, nullptr, -1, 0, op_timeout };
 
     // A wakeup in flight across a detach never reports, so the flag is cleared
     // from owner_inflight(), except when the owner table is full and zero
     // would mean unknown.
     if (loop.owner_inflight(this) == 0 && !loop.owner_table_full())
-        m_wake_armed = false;
+    {
+        m_wake_armed  = false;
+        m_sweep_armed = false;
+    }
 
     loop.register_owner(this);
+
+    // Anything parked from before is waiting again on a ring that can report.
+    arm_park_sweep();
+}
+
+void request_channel::arm_park_sweep()
+{
+    if (!m_loop || m_sweep_armed || m_parked.empty())
+        return;
+
+    // Five seconds against a thirty second deadline: the answer is late either
+    // way, and a finer tick would walk the table six times for nothing.
+    m_sweep_ts.tv_sec  = 5;
+    m_sweep_ts.tv_nsec = 0;
+    m_sweep_armed = m_loop->submit_timeout(&m_sweep_ts, &m_sweep);
+}
+
+template <class Pick>
+size_t request_channel::drop_parked(Pick pick)
+{
+    m_sweep_due.clear();
+    for (const auto& [ticket, p] : m_parked)
+        if (pick(p))
+            m_sweep_due.push_back(ticket);
+
+    for (const uint64_t ticket : m_sweep_due)
+        complete_deferred(ticket, request_status::dropped, {});
+
+    m_stat_parked_dropped += m_sweep_due.size();
+    return m_sweep_due.size();
 }
 
 void request_channel::detach()
 {
+    // Both halves, and for a long time only the first: the queue was drained
+    // here and the parked table was not, so a request that had already reached
+    // its target was the one kind this never answered.
+    drop_parked([](const parked_request&) { return true; });
+
     // Everything queued is answered rather than forgotten, because an origin
     // promised a reply that never comes waits for ever.
     while (!m_queue.empty())
@@ -74,6 +113,16 @@ void request_channel::register_sink(std::string_view name, request_sink* sink)
 
 void request_channel::drop_sink(const request_sink* sink)
 {
+    // Answered now rather than at the deadline: this is the target genuinely
+    // going, and it is the one moment where the answer is known.  NOT done by
+    // clear_sinks(), which rebuilds the whole table on every membership change
+    // and would drop every request in flight each time.
+    const size_t gone = drop_parked(
+        [sink](const parked_request& p) { return p.sink == sink; });
+    if (gone > 0)
+        LOG_WARN(("request channel: " + std::to_string(gone) +
+                  " request(s) dropped because the runtime answering them went away").c_str());
+
     for (auto it = m_sinks.begin(); it != m_sinks.end(); )
     {
         if (it->second == sink)
@@ -178,14 +227,17 @@ void request_channel::complete_deferred(uint64_t ticket, request_status st,
         p.origin->on_request_reply(p.cookie, st, reply);
 }
 
-uint64_t request_channel::park(request_origin* origin, uint64_t cookie)
+uint64_t request_channel::park(request_origin* origin, uint64_t cookie,
+                               const request_sink* sink)
 {
     if (!origin || m_parked.size() >= MAX_PARKED)
         return 0;
     if (!origin_live(origin))
         m_origins.push_back(origin);
     const uint64_t ticket = m_next_ticket++;
-    m_parked.emplace(ticket, parked_request{origin, cookie});
+    m_parked.emplace(ticket, parked_request{origin, cookie, sink,
+                                            std::chrono::steady_clock::now()});
+    arm_park_sweep();
     return ticket;
 }
 
@@ -222,10 +274,33 @@ void request_channel::drop_origin(const request_origin* origin)
     }
 }
 
-void request_channel::on_cqe(struct io_uring_cqe* /*cqe*/)
+void request_channel::on_cqe(struct io_uring_cqe* cqe)
 {
-    // The one submission this handler ever makes, lowered first so a post()
-    // from inside a reply callback arms a fresh wakeup.
+    // Two submissions now, so which one reported has to be asked rather than
+    // assumed -- the wakeup's own handling clears a flag, and clearing the
+    // wrong one leaves the channel believing a wakeup is owed that is not.
+    auto* req = static_cast<io_request*>(io_uring_cqe_get_data(cqe));
+    if (req == &m_sweep)
+    {
+        m_sweep_armed = false;
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto limit = std::chrono::seconds(parked_deadline_secs);
+        const size_t gone = drop_parked([now, limit](const parked_request& p) {
+            return now - p.armed >= limit;
+        });
+        if (gone > 0)
+            LOG_WARN(("request channel: " + std::to_string(gone) +
+                      " request(s) given up on after " +
+                      std::to_string(parked_deadline_secs) +
+                      "s; the runtime they went to took them and did not answer").c_str());
+
+        arm_park_sweep();   // only re-arms while something is still parked
+        return;
+    }
+
+    // The wakeup, lowered first so a post() from inside a reply callback arms
+    // a fresh one.
     m_wake_armed = false;
     drain();
 }
@@ -260,7 +335,7 @@ void request_channel::drain()
             // The sink is on the other side of a socket and cannot fill
             // `reply` before returning, so the request parks against a ticket
             // and nothing here waits.
-            const uint64_t ticket = park(e.origin, e.cookie);
+            const uint64_t ticket = park(e.origin, e.cookie, sink);
             if (ticket == 0)
             {
                 m_stat_deferred_refused++;
