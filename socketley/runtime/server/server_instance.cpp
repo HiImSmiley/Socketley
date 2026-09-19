@@ -1,6 +1,7 @@
 #include "../../shared/socket_tuning.h"
 #include "server_instance.h"
 #include "../../shared/lua_suspend.h"
+#include "../../shared/coarse_clock.h"
 #include "../../shared/conn_reachability.h"
 
 // The HTTP header-line helpers, shared rather than copied, because a second
@@ -2715,7 +2716,10 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (lua())
                 {
                     auto& sus = lua()->suspender();
-                    const size_t gone = sus.expire(std::chrono::steady_clock::now());
+                    // The same clock the record was armed on; see shared/coarse_clock.h
+                    // on why a deadline armed on one and tested on the other is
+                    // wrong by a tick in whichever direction the pair happens to sit.
+                    const size_t gone = sus.expire(socketley::coarse_now());
                     if (gone > 0)
                         LOG_WARN(("server \"" + std::string(get_name()) + "\": " +
                                   std::to_string(gone) + " callback(s) gave up waiting for "

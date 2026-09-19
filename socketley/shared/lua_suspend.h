@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "lua_context.h"
+#include "coarse_clock.h"
 
 // One runtime's suspended callbacks.  Lives beside the Lua state because a
 // thread belongs to the state that made it, and dies with it.
@@ -109,7 +110,13 @@ public:
 
         m_frames.push_back(frame{th, ref, what, exec_ms, 0});
 
-        fn.push(th);
+        // The registry by hand rather than fn.push(th).  sol's push compares
+        // the target state with the reference's own, and a coroutine is a
+        // different lua_State, so it takes the slow arm: push there, then
+        // lua_xmove across.  A thread shares its parent's registry, so one
+        // rawgeti on the thread is the same value with neither step -- measured
+        // at 1.95 per cent of the worker in lua_xmove alone.
+        lua_rawgeti(th, LUA_REGISTRYINDEX, fn.registry_index());
         (sol::stack::push(th, std::forward<A>(args)), ...);
 
         ++m_stat_started;
@@ -141,7 +148,7 @@ public:
                 r.ref     = it->ref;
                 r.what    = it->what;
                 r.exec_ms = it->exec_ms;
-                r.armed   = std::chrono::steady_clock::now();
+                r.armed   = socketley::coarse_now();
                 m_live.emplace(id, r);
                 it->id = id;
             }
@@ -165,7 +172,7 @@ public:
         r->awaiting = true;
         r->ctx      = ctx;
         r->wait_ms  = wait_ms;
-        r->armed    = std::chrono::steady_clock::now();
+        r->armed    = socketley::coarse_now();
     }
 
     // Told once per await, after the handler has run on, so whatever the
@@ -312,7 +319,10 @@ private:
         {
             const pooled p = m_pool.back();
             m_pool.pop_back();
-            lua_settop(p.th, 0);
+            // No lua_settop here: release() clears the stack BEFORE pooling,
+            // which it has to do anyway so a pooled thread holds nothing alive,
+            // and a fresh one from lua_newthread is empty already.  Clearing
+            // again on the way out was the same call twice per invocation.
             return {p.th, p.ref};
         }
         lua_State* L = m_lua->lua_state();
