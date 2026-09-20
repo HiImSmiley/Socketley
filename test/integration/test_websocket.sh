@@ -60,17 +60,45 @@ assert_contains "$WS_RESPONSE" "101 Switching Protocols" "WS upgrade 101"
 assert_contains "$WS_RESPONSE" "Upgrade: websocket" "WS upgrade header"
 assert_contains "$WS_RESPONSE" "Sec-WebSocket-Accept" "WS accept header"
 
-# Test: Plain TCP message works (coexistence)
-# Server accepts raw TCP alongside WebSocket on the same port
-TOTAL=$((TOTAL+1))
-echo "hello-tcp" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
-# If we get here without error, the server accepted the raw TCP connection
-PASS=$((PASS+1))
-
-# Test: A second plain TCP connection also works
-TOTAL=$((TOTAL+1))
-echo "hello-again" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
-PASS=$((PASS+1))
+# Test: Plain TCP coexists with WebSocket on the same port.
+#
+# These two used to read
+#
+#     TOTAL=$((TOTAL+1))
+#     echo "hello-tcp" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
+#     PASS=$((PASS+1))
+#
+# -- the `|| true` swallowed nc's status and PASS rose unconditionally, so both
+# counted themselves green against a port with nothing on it.  Two of this
+# file's six reported assertions could not fail.  What is actually being
+# claimed is that the server ACCEPTED the connection, so that is what is asked:
+# the connection count it reports has to move.
+conns_now() {
+    "$BIN" stats ws_test 2>/dev/null \
+        | sed -n 's/^total_connections:\([0-9][0-9]*\)$/\1/p' | head -1
+}
+BEFORE_CONNS=$(conns_now)
+if [ -n "$BEFORE_CONNS" ]; then
+    echo "hello-tcp" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
+    echo "hello-again" | nc -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
+    sleep 0.4
+    AFTER_CONNS=$(conns_now)
+    TOTAL=$((TOTAL+1))
+    if [ -n "$AFTER_CONNS" ] && [ "$AFTER_CONNS" -ge $((BEFORE_CONNS + 2)) ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  FAIL [two raw TCP connections were accepted]: total connections"
+        echo "        went $BEFORE_CONNS -> ${AFTER_CONNS:-unreported}, wanted at"
+        echo "        least $((BEFORE_CONNS + 2))"
+    fi
+else
+    # Counted as a failure and not skipped: a stats line this test cannot read
+    # is the same blind spot the old version had, and saying so is the point.
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL [two raw TCP connections were accepted]: stats reported no"
+    echo "        connection count to compare against"
+fi
 
 # Test: Server is still running after mixed connections
 OUT=$("$BIN" ps 2>&1) || daemon_required "ps"
