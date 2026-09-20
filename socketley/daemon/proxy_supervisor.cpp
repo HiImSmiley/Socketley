@@ -1,4 +1,5 @@
 #include "proxy_supervisor.h"
+#include "../shared/worker_env.h"
 
 #include "../shared/peer_link.h"
 
@@ -564,6 +565,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // relaying for ever, since the grant that would fix it is suppressed.
     m_granted.clear();
 
+    // Before the fork, because after it only async-signal-safe calls are
+    // legal and this object allocates.
+    const socketley::worker_env child_env(cfg.type == runtime_cache);
+
     const pid_t child = ::fork();
     if (child < 0)
     {
@@ -714,7 +719,9 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
         }
 
         const char* path = m_exec_path.c_str();
-        ::execl(path, path, "proxy-worker", static_cast<char*>(nullptr));
+        char* const argv[] = { const_cast<char*>(path),
+                               const_cast<char*>("proxy-worker"), nullptr };
+        ::execve(path, argv, child_env.envp());
         _exit(127);
     }
 

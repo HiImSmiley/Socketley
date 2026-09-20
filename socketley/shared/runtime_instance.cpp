@@ -1,4 +1,5 @@
 #include "runtime_instance.h"
+#include "worker_env.h"
 #include "lua_suspend.h"
 #include "logging.h"
 #include "tls_context.h"
@@ -179,6 +180,10 @@ bool runtime_instance::start(event_loop& loop)
             if (m_pid > 0)
                 waitpid(m_pid, nullptr, WNOHANG);
 
+            // Before the fork, because after it only async-signal-safe
+            // calls are legal and this object allocates.
+            const socketley::worker_env child_env(get_type() == runtime_cache);
+
             pid_t child = fork();
             if (child < 0)
                 return false;
@@ -196,7 +201,8 @@ bool runtime_instance::start(event_loop& loop)
                     if (devnull > 2) close(devnull);
                 }
                 const char* path = m_exec_path.c_str();
-                execl(path, path, nullptr);
+                char* const argv[] = { const_cast<char*>(path), nullptr };
+                execve(path, argv, child_env.envp());
                 _exit(127);
             }
             m_pid = child;
