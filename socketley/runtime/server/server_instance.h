@@ -1098,8 +1098,10 @@ private:
     void handle_udp_read(struct io_uring_cqe* cqe);
     // Every datagram this server sends leaves through here, so the byte count
     // is taken once instead of at each call site.
-    void udp_send_one(std::string_view msg, const struct sockaddr_in& to);
-    void udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
+    bool udp_send_one(std::string_view msg, const struct sockaddr_in& to);
+    // What it reached and what the socket refused, in the same two numbers a
+    // TCP fan-out answers with.
+    fanout_count udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
     int find_or_add_peer(const struct sockaddr_in& addr);
 
     // The idle sweep's own arm, because setup() has two exits -- the UDP path
@@ -1328,6 +1330,9 @@ private:
     std::vector<std::unique_ptr<udp_recv_state>> m_udp_recv_spent;
     std::vector<udp_peer> m_udp_peers;
     std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
+    // Datagrams the socket refused, counted so the log can be throttled and
+    // still say how many went unsaid.
+    uint64_t m_udp_send_failures{0};
 
     // Per-IP auth failure tracking
     struct auth_ip_record {

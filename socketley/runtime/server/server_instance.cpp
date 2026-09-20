@@ -5339,10 +5339,11 @@ server_instance::fanout_count server_instance::broadcast(std::string_view msg)
 
     if (SOCKETLEY_UNLIKELY(m_udp))
     {
-        // A datagram has no queue to fall behind in, so there is no backlog to
-        // report and the count is left at zero rather than guessed at.
-        udp_broadcast(msg, nullptr);
-        return {};
+        // The socket send buffer IS that queue -- the comment this replaced
+        // said a datagram has no queue to fall behind in.  Answering {0,0} made
+        // a broadcast that reached every peer and one that reached nobody read
+        // identically to the script, so the count is what sendto did.
+        return udp_broadcast(msg, nullptr);
     }
 
     // Build newline-terminated message (single allocation via make_shared)
@@ -6497,18 +6498,37 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
 // The one door every outbound datagram leaves by, so what the socket did with
 // it is counted in one place: the return value was discarded at both call
 // sites and a UDP server reported bytes_out:0 for its whole life.
-void server_instance::udp_send_one(std::string_view msg, const struct sockaddr_in& to)
+bool server_instance::udp_send_one(std::string_view msg, const struct sockaddr_in& to)
 {
     const ssize_t n = sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
                              reinterpret_cast<const struct sockaddr*>(&to), sizeof(to));
     if (SOCKETLEY_LIKELY(n >= 0))
+    {
         m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+        return true;
+    }
+
+    // Throttled on the same rule the ring's own refusals use: the first one
+    // says what happened and a flood does not become the log.  EAGAIN and
+    // ENOBUFS are a full send buffer, EMSGSIZE a payload no peer can ever be
+    // sent -- all three are silent losses without this line.
+    const int err = errno;
+    ++m_udp_send_failures;
+    if (m_udp_send_failures == 1 || (m_udp_send_failures % 1000) == 0)
+        LOG_ERROR(("server \"" + std::string(get_name()) + "\": a datagram of " +
+                   std::to_string(msg.size()) + " bytes was not sent (" +
+                   std::string(std::strerror(err)) + "); " +
+                   std::to_string(m_udp_send_failures) +
+                   " datagram(s) have now been dropped by the socket").c_str());
+    return false;
 }
 
-void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude)
+server_instance::fanout_count server_instance::udp_broadcast(std::string_view msg,
+                                                             const struct sockaddr_in* exclude)
 {
+    fanout_count counted;
     if (m_udp_fd < 0)
-        return;
+        return counted;
 
     for (auto& peer : m_udp_peers)
     {
@@ -6517,8 +6537,12 @@ void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_
             peer.addr.sin_port == exclude->sin_port)
             continue;
 
-        udp_send_one(msg, peer.addr);
+        if (udp_send_one(msg, peer.addr))
+            ++counted.taken;
+        else
+            ++counted.backlogged;
     }
+    return counted;
 }
 
 bool server_instance::disconnect(int client_fd)
