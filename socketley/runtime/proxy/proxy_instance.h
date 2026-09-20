@@ -242,6 +242,16 @@ struct alignas(64) proxy_client_connection
     //
     //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
     //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
+    //     inline but not zero-filled   idle 6.89 KB   upload arm 458-488 MB
+    //
+    // The third of those is the one that settles it.  It changes nothing about
+    // where the buffer lives or how large it is -- only that the struct is
+    // default-initialised, so the pages are not touched until a read uses them
+    // -- and the bounded arm rises by the same ~120 MB as the other two.  So
+    // these kilobytes being PRESENT AND TOUCHED is part of how the withdraw
+    // rule holds under upload pressure, not waste beside it.  The proxy is the
+    // one runtime that keeps std::make_unique for that reason; the cache and
+    // the server use socketley::make_connection.
     //
     // A thousand separate 64 KB blocks interleave with the growing upload
     // buffers and the arena cannot give them back; a smaller buffer takes
@@ -349,6 +359,16 @@ struct alignas(64) proxy_backend_connection
     //
     //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
     //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
+    //     inline but not zero-filled   idle 6.89 KB   upload arm 458-488 MB
+    //
+    // The third of those is the one that settles it.  It changes nothing about
+    // where the buffer lives or how large it is -- only that the struct is
+    // default-initialised, so the pages are not touched until a read uses them
+    // -- and the bounded arm rises by the same ~120 MB as the other two.  So
+    // these kilobytes being PRESENT AND TOUCHED is part of how the withdraw
+    // rule holds under upload pressure, not waste beside it.  The proxy is the
+    // one runtime that keeps std::make_unique for that reason; the cache and
+    // the server use socketley::make_connection.
     //
     // A thousand separate 64 KB blocks interleave with the growing upload
     // buffers and the arena cannot give them back; a smaller buffer takes

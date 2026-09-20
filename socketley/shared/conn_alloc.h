@@ -16,6 +16,12 @@
 // which is filled from index 0 to `count` and passed to the kernel with that
 // same count, so no entry is ever read before it is written.
 //
+// NOT USED BY THE PROXY, and that is measured rather than an oversight: its
+// connection carries 64 KB that the withdraw rule needs present and touched,
+// and leaving them untouched put the bounded upload arm up by ~120 MB at 1,100
+// uploading clients -- the same rise two other ways of saving those kilobytes
+// produced.  proxy_instance.h carries all three figures at the field.
+//
 // SOCKETLEY_POISON_CONN fills the storage with 0xAA instead.  Anything that
 // quietly relied on the old zeroing then reads a large, obviously wrong value
 // rather than a plausible one, which is how this was checked without MSan:
