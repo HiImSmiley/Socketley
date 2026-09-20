@@ -234,22 +234,28 @@ struct alignas(64) proxy_client_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // Sixty-four kilobytes that only a SINGLE-SHOT read writes to, and the
-    // proxy takes that arm only below MULTISHOT_MIN_CLIENTS -- so above the
-    // threshold, which is exactly where a connection count makes memory
-    // matter, every connection carried this and never touched it.  Measured
-    // at 2,000 idle client connections: 69.93 KB apiece.
+    // Sixty-four kilobytes, inline and part of the pooled struct, and BOTH of
+    // those are load-bearing for the memory bound rather than for speed.
+    // Two ways of making an idle connection cheaper were measured and both
+    // were withdrawn, against 1,100 uploading clients where the rule arm
+    // holds 333 to 342 MB:
     //
-    // Taken on the first single-shot arm and never given back while the struct
-    // lives, so no read can be armed on storage that has gone.
-    std::unique_ptr<char[]> read_buf;
-
-    char* ensure_read_buf()
-    {
-        if (!read_buf)
-            read_buf = std::make_unique<char[]>(PROXY_READ_BUF_SIZE);
-        return read_buf.get();
-    }
+    //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
+    //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
+    //
+    // A thousand separate 64 KB blocks interleave with the growing upload
+    // buffers and the arena cannot give them back; a smaller buffer takes
+    // more reads to drain the same upload and `partial` carries the rest.
+    // Only the reserve beside this was safe to remove.
+    //
+    // What makes these kilobytes RESIDENT rather than merely reserved is that
+    // the pool builds every connection with make_unique<T>(), which VALUE-
+    // initializes -- so the whole struct including this array is zero-filled
+    // and touched before a byte arrives.  make_unique_for_overwrite would skip
+    // it, and `int fd;` and four io_request members have no initialiser of
+    // their own and rely on that zeroing, so the swap needs MSan to be honest
+    // and is not made here.
+    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
 
     // The session, for a struct that never reached its release path, safe here
     // because no submission ever named it.
@@ -335,22 +341,28 @@ struct alignas(64) proxy_backend_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // Sixty-four kilobytes that only a SINGLE-SHOT read writes to, and the
-    // proxy takes that arm only below MULTISHOT_MIN_CLIENTS -- so above the
-    // threshold, which is exactly where a connection count makes memory
-    // matter, every connection carried this and never touched it.  Measured
-    // at 2,000 idle client connections: 69.93 KB apiece.
+    // Sixty-four kilobytes, inline and part of the pooled struct, and BOTH of
+    // those are load-bearing for the memory bound rather than for speed.
+    // Two ways of making an idle connection cheaper were measured and both
+    // were withdrawn, against 1,100 uploading clients where the rule arm
+    // holds 333 to 342 MB:
     //
-    // Taken on the first single-shot arm and never given back while the struct
-    // lives, so no read can be armed on storage that has gone.
-    std::unique_ptr<char[]> read_buf;
-
-    char* ensure_read_buf()
-    {
-        if (!read_buf)
-            read_buf = std::make_unique<char[]>(PROXY_READ_BUF_SIZE);
-        return read_buf.get();
-    }
+    //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
+    //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
+    //
+    // A thousand separate 64 KB blocks interleave with the growing upload
+    // buffers and the arena cannot give them back; a smaller buffer takes
+    // more reads to drain the same upload and `partial` carries the rest.
+    // Only the reserve beside this was safe to remove.
+    //
+    // What makes these kilobytes RESIDENT rather than merely reserved is that
+    // the pool builds every connection with make_unique<T>(), which VALUE-
+    // initializes -- so the whole struct including this array is zero-filled
+    // and touched before a byte arrives.  make_unique_for_overwrite would skip
+    // it, and `int fd;` and four io_request members have no initialiser of
+    // their own and rely on that zeroing, so the swap needs MSan to be honest
+    // and is not made here.
+    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
 
     // See proxy_client_connection's destructor.
     ~proxy_backend_connection() { tls_context::free_ssl(ssl); }

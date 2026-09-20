@@ -19,12 +19,14 @@
 # a reserve(8192) -- and came out 22.21 -> 4.92 KB, identical in four passes,
 # with its throughput at 1.0040 across the swap, which is again the instrument.
 #
-# A proxy was the worst of the three: SIXTY-FOUR kilobytes of read_buf, which
-# only a single-shot read writes to and which it takes only BELOW
-# MULTISHOT_MIN_CLIENTS -- so above the threshold, where a connection count is
-# what makes memory matter, every connection carried it untouched -- plus a
-# second 64 KB as a reserve on partial in HTTP mode.  69.93 -> 2.95 KB, and its
-# throughput came out 1.0329 with both directions of the swap agreeing.
+# A proxy keeps its sixty-four kilobytes and the bound here is loose because of
+# it: 69.93 -> 65.93 KB, which is the reserve on partial and nothing else.  Two
+# ways of taking the rest were measured and BOTH were withdrawn, because the
+# same buffer is what holds the bounded upload path down -- 333 to 342 MB at
+# 1,100 uploading clients against 449-452 taken lazily from the heap and
+# 478-492 at a sixteen-kilobyte inline buffer.  So 70 KB here catches a
+# connection cost that doubles and nothing finer; the finer guard is
+# test_proxy_upload_is_bounded.sh, which is the one that found this.
 #
 # The read_buf is the last arm of four -- bundle, multishot, provided-buffer
 # read, and only then a plain read into it -- so with a buffer ring, which is
@@ -55,7 +57,7 @@ P_PRX=$((SL_PORT_BASE+1896))
 CONNS=2000
 BUDGET_KB=5
 BUDGET_SRV_KB=9
-BUDGET_PRX_KB=8
+BUDGET_PRX_KB=70
 
 PASS=0; FAIL=0; TOTAL=0
 ok()    { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
