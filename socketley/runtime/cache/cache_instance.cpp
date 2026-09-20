@@ -1506,9 +1506,20 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
 
     auto conn = pool_acquire(client_fd);
     SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
-    conn->partial.reserve(4096);
-    conn->response_buf.reserve(4096);
-    conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+    // Grown on demand rather than reserved: four kilobytes apiece, charged the
+    // moment a socket is accepted and before it has said anything, is eight of
+    // the fourteen kilobytes an idle connection cost.  A connection that does
+    // work grows into the same capacity on its first command and keeps it,
+    // because clear() does not give it back, so the reserve only ever bought
+    // the first growth -- and bought it for every connection that never has a
+    // first command.
+
+    // Only a start without a buffer ring ever reads into this, so only such a
+    // start pays for it; a pooled connection that once took one keeps it.
+    if (SOCKETLEY_UNLIKELY(!m_use_provided_bufs) && !conn->read_buf)
+        conn->read_buf = std::make_unique<char[]>(client_connection::READ_BUF_BYTES);
+    conn->read_req = { this, conn->read_buf.get(), client_fd,
+                       static_cast<uint32_t>(client_connection::READ_BUF_BYTES), op_read };
     conn->write_req = { this, nullptr, client_fd, 0, op_write };
 
     // Register fd in fixed file table for fget/fput-free I/O
@@ -1647,8 +1658,9 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        if (!queued)
-            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        if (!queued && conn->read_buf)
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(),
+                                                    client_connection::READ_BUF_BYTES, &conn->read_req);
     }
     else
     {
@@ -1659,8 +1671,9 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
             queued = m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        if (!queued)
-            queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        if (!queued && conn->read_buf)
+            queued = m_loop->submit_read(fd, conn->read_buf.get(),
+                                         client_connection::READ_BUF_BYTES, &conn->read_req);
     }
 
     // Leaving the flag set after a refusal is what turns a busy ring into a hung
@@ -2160,9 +2173,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
-                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+                queued = conn->read_buf
+                       && m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(),
+                                                         client_connection::READ_BUF_BYTES, &conn->read_req);
             else
-                queued = m_loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+                queued = conn->read_buf
+                       && m_loop->submit_read(fd, conn->read_buf.get(),
+                                              client_connection::READ_BUF_BYTES, &conn->read_req);
             if (SOCKETLEY_UNLIKELY(!queued))
             {
                 // The fallback is the only read left for this connection; with
@@ -2239,13 +2256,13 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
     else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
-        tls_feed(conn, conn->read_buf, static_cast<size_t>(cqe->res));
+        tls_feed(conn, conn->read_buf.get(), static_cast<size_t>(cqe->res));
         SKL_TRACE_ADD(conn, bytes_read, cqe->res);
         SKL_TRACE_ADD(conn, reads, 1);
     }
     else
     {
-        conn->partial.append(conn->read_buf, cqe->res);
+        conn->partial.append(conn->read_buf.get(), cqe->res);
         SKL_TRACE_ADD(conn, bytes_read, cqe->res);
         SKL_TRACE_ADD(conn, reads, 1);
     }

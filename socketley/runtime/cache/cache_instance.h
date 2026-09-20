@@ -61,7 +61,17 @@ struct client_connection
     bool direct_fd{false};
     io_request read_req;
     io_request write_req;
-    char read_buf[4096];
+
+    // The last resort, and only that.  A read is armed as a bundle, then as
+    // plain multishot, then as a provided-buffer read, and only if the buffer
+    // ring does not exist at all does anything land here -- so with a ring, and
+    // that is every start that gets one, these four kilobytes were carried per
+    // connection and never written to.  Measured: an idle connection cost 8.2
+    // to 14.1 KB against Redis's 1.3, and this was the largest single piece of
+    // it.  Held rather than freed once taken, so no read can ever be armed on
+    // storage that has gone.
+    static constexpr size_t   READ_BUF_BYTES = 4096;
+    std::unique_ptr<char[]>   read_buf;
     std::string partial;
     std::string response_buf;
     // write_queue holds owned strings — no shared_ptr overhead per flush
