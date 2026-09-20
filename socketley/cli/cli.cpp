@@ -525,7 +525,10 @@ int cli_dispatch(int argc, char** argv)
         {
             if (argc < 3)
             {
-                std::cerr << "usage: restart <name> [-i]\n";
+                // From command_usage and not spelled here, because `restart
+                // --help` now answers from there and two copies of one
+                // sentence drift.
+                std::cerr << command_usage::line("restart");
                 return 1;
             }
 

@@ -477,17 +477,18 @@ trusted, so a daemon that was killed outright is reported
 .B dead
 rather than listed as running, and its file is removed once its pid is gone too.
 .TP
-.BI "restart " "name " "[flags]"
+.BI "restart " "name " "[\-i]"
 Stop and start a runtime in one step. The runtime keeps the
 configuration it already has. Equivalent to
 .B stop
 followed by
-.B start
-with the same arguments: the extra flags are handed to
 .BR start ,
-which understands only
-.BR \-i ,
-so they do not reconfigure anything. To restart with a changed setting,
+and it takes the name and
+.B \-i
+and nothing else: every other flag is refused by name, because handing them to
+.B start
+had a flag's VALUE read as a runtime name and that runtime started. To restart
+with a changed setting,
 .B edit
 first:
 .nf

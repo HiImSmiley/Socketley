@@ -126,6 +126,30 @@ OUT=$("$BIN" daemon --bogus 2>&1) || RC=$?
 if [ "$RC" -eq 1 ] && grep -q "unknown daemon flag" <<<"$OUT"; then pass
 else fail "daemon --bogus alone is unchanged" "exit $RC, said: ${OUT:-<nothing>}"; fi
 
+# ─── <verb> --help, still with nothing serving the socket ───────────────────
+#
+# The no-daemon assertion is the point of running this here: the answer used to
+# come from the daemon, so asking `stats --help` forked one whose entire job
+# was to be asked a question it then did not answer.
+for verb in create attach add start stop restart remove owner send edit show \
+            import stats reload reload-lua ls ps ping dashboard cluster; do
+    RC=0
+    OUT=$("$BIN" "$verb" --help 2>&1) || RC=$?
+    if [ "$RC" -eq 0 ] && grep -q "^usage: $verb" <<<"$OUT"; then pass
+    else fail "$verb --help answers with its usage" \
+              "exit $RC, said: ${OUT:-<nothing>}"; fi
+done
+
+# The short form is the same question.
+RC=0
+OUT=$("$BIN" stats -h 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && grep -q "^usage: stats" <<<"$OUT"; then pass
+else fail "-h is the same question as --help" "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+if ! daemon_alive "$SOCKETLEY_SOCKET"; then pass
+else fail "a usage request starts no daemon" \
+          "asking twenty verbs for help left a daemon serving $SOCKETLEY_SOCKET"; fi
+
 # ─── and the documented form still configures a daemon ──────────────────────
 #
 # Load-bearing for the whole block above.
@@ -145,6 +169,30 @@ OUT=$("$BIN" cluster ls 2>&1) || RC=$?
 if [ "$RC" -eq 0 ] && grep -q "cli_input_node" <<<"$OUT"; then pass
 else fail "the name it accepted is the name it holds" \
           "exit $RC, cluster ls said: ${OUT:-<nothing>}"; fi
+
+# ─── the verbs whose --help was intercepted still do their job ──────────────
+#
+# Load-bearing for the block above: a build where `ls` printed its usage and
+# stopped would have passed every assertion up to here.
+"$BIN" create server cli_input_srv -p $((SL_PORT_BASE + 940)) >/dev/null 2>&1 || true
+
+RC=0
+OUT=$("$BIN" ls --name 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && grep -q "cli_input_srv" <<<"$OUT"; then pass
+else fail "ls still lists runtimes" "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+RC=0
+OUT=$("$BIN" ping 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && grep -q "socketley-daemon" <<<"$OUT"; then pass
+else fail "ping still pings" "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# `restart` with nothing after it is the same sentence as `restart --help`, so
+# the two cannot drift -- but it is an error and exits 1.
+RC=0
+OUT=$("$BIN" restart 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && grep -q "^usage: restart" <<<"$OUT"; then pass
+else fail "restart with no name exits 1 with the usage line" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

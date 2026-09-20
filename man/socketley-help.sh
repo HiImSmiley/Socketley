@@ -246,10 +246,10 @@ cli_commands() {
     echo -e "  ${CYAN}echo \"Hello\" | socketley send myserver${NC}  # stdin"
     echo ""
 
-    echo -e "${BOLD}restart <name> [flags]${NC}"
+    echo -e "${BOLD}restart <name> [-i]${NC}"
     echo "  Stop and start a runtime in one step. The runtime keeps the"
-    echo "  configuration it already has: flags are handed to 'start', which"
-    echo "  understands only -i, so they do NOT reconfigure anything."
+    echo "  configuration it already has: it takes the name and -i and nothing"
+    echo "  else, and every other flag is refused by name."
     echo -e "  ${CYAN}socketley restart api${NC}"
     echo -e "  ${CYAN}socketley edit api -p 9001 && socketley restart api${NC}  # new port"
     echo ""
