@@ -695,6 +695,19 @@ void check_instance(server_instance* rt, bool deep)
                    "chain can ever be armed on this request again");
     }
 
+    // The same question of the one ear a UDP server has, which the clause above
+    // excludes because it is a different socket and a different completion.  A
+    // refused recvmsg re-arms from on_loop_turn() and not from a timer, so what
+    // must be true is that one of the two is standing.
+    if (rt->get_state() == runtime_running && rt->m_udp && rt->m_udp_fd >= 0)
+    {
+        RT_FINDING("udp-socket-without-read",
+                   rt->m_udp_recv_armed || rt->m_udp_recv_rearm_due,
+                   "a running UDP server has a bound socket with no read armed on it and "
+                   "nothing owed that would arm one — the port answers, `ps` counts it, and "
+                   "every datagram sent to it is dropped for the life of the runtime");
+    }
+
     // A cache request is owed a reply and the reply is what lowers the count,
     // so a connection carrying one has something that will wake it.  A pooled
     // struct must not: the count goes into the pool with the struct, and the

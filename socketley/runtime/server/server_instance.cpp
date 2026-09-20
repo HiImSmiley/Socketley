@@ -2031,6 +2031,7 @@ bool server_instance::setup(event_loop& loop)
         m_accept_backoff_armed = false;
         m_await_sweep_armed    = false;
         m_udp_recv_armed       = false;
+        m_udp_recv_rearm_due   = false;
         // Nothing in the ring names any of them any more.
         m_accept_spent.clear();
         m_udp_recv_spent.clear();
@@ -3146,6 +3147,13 @@ void server_instance::on_loop_turn()
 {
     if (m_companion)
         m_companion->pump();
+
+    // The one read a UDP server has, when the ring would not take it.  Here
+    // rather than on a timer because the timer needs the submission queue that
+    // just refused, and this runs at the end of the very turn whose poll
+    // drained it.
+    if (SOCKETLEY_UNLIKELY(m_udp_recv_rearm_due) && !m_udp_recv_armed)
+        arm_udp_recv();
 
     // The same shape as the drain dispatch below, and for the same reason: a
     // streamed response that ended with a request already buffered behind it
@@ -6413,16 +6421,29 @@ void server_instance::arm_udp_recv()
     if (!m_loop || m_udp_fd < 0)
     {
         m_udp_recv_armed = false;
+        m_udp_recv_rearm_due = false;
         return;
     }
     m_udp_recv->msg.msg_namelen = sizeof(m_udp_recv->addr);
     m_udp_recv_armed = m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv->msg, &m_udp_recv->req);
+    // A refusal here is the whole ear, because the only things that ask again
+    // are inside the completion of the read that was never armed -- so it is
+    // remembered for on_loop_turn(), which owes the ring nothing and therefore
+    // still works when a full submission queue is what refused.
+    m_udp_recv_rearm_due = !m_udp_recv_armed;
 }
 
 void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
 {
     // Whatever else happens below, the op that produced this is finished.
     m_udp_recv_armed = false;
+
+    // A socket closed under this read completes it with one of these, and
+    // resubmitting would arm a second chain on the descriptor start() opened --
+    // the same four handle_accept() returns on, for the same reason.
+    if (SOCKETLEY_UNLIKELY(cqe->res == -ECANCELED || cqe->res == -EBADF
+                           || cqe->res == -EINVAL || cqe->res == -ENOTSOCK))
+        return;
 
     if (cqe->res <= 0)
     {

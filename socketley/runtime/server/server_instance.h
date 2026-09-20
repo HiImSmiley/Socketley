@@ -1197,6 +1197,9 @@ private:
     bool m_relay_deadline_armed{false};
     bool m_await_sweep_armed{false};
     bool m_udp_recv_armed{false};
+    // A read the ring would not take, retried from on_loop_turn(): every other
+    // re-arm hangs off a completion, and a refused submission produces none.
+    bool m_udp_recv_rearm_due{false};
 
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
