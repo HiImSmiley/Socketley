@@ -48,6 +48,15 @@ static constexpr char WS_CLOSE_FRAME_DATA[4] = {
     static_cast<char>(0xE8)                  // 1000 & 0xFF
 };
 
+// Pre-computed close frame, 1009 message too big -- for a frame this end will
+// not buffer, which is a different thing from a frame that is malformed.
+static constexpr char WS_CLOSE_TOO_BIG_DATA[4] = {
+    static_cast<char>(0x80 | WS_OP_CLOSE),
+    2,
+    static_cast<char>(0x03),                 // 1009 >> 8
+    static_cast<char>(0xF1)                  // 1009 & 0xFF
+};
+
 // Pre-computed close frame, 1002 protocol error -- what RFC 6455 7.4.1 gives
 // for a frame that is not a frame, as against the 1000 above for a goodbye.
 static constexpr char WS_CLOSE_PROTOCOL_ERROR_DATA[4] = {
@@ -685,5 +694,15 @@ inline const std::shared_ptr<const std::string>& ws_frame_close_shared()
 inline const std::shared_ptr<const std::string>& ws_frame_close_protocol_error_shared()
 {
     static const auto frame = std::make_shared<const std::string>(WS_CLOSE_PROTOCOL_ERROR_DATA, 4);
+    return frame;
+}
+
+// And 1009, which RFC 6455 7.4.1 gives for a message too large to process.
+// Not 1002: the peer's frame was well formed and this end simply will not hold
+// it, and a client told "protocol error" concludes its framing is broken and
+// sends the same message again.
+inline const std::shared_ptr<const std::string>& ws_frame_close_too_big_shared()
+{
+    static const auto frame = std::make_shared<const std::string>(WS_CLOSE_TOO_BIG_DATA, 4);
     return frame;
 }

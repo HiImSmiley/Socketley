@@ -4542,6 +4542,32 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
     {
+        // Said rather than done in silence.  What this used to be was
+        // `closing = true` and nothing else: a websocket peer sending a frame
+        // between this limit and WS_MAX_PAYLOAD -- which ws_parse_header
+        // accepts up to sixteen megabytes -- lost its connection with no close
+        // frame, no status and no line in the log.  Measured before this: a
+        // 2 MB frame got an empty answer and a dead socket, where 900 KB was
+        // echoed.
+        //
+        // 1009 and not 1002, because the frame was well formed and this end
+        // simply will not hold it; a peer told "protocol error" concludes its
+        // framing is broken and sends the same message again.
+        // Once per connection: a read already in flight when the first one
+        // tripped this lands afterwards and would say the same thing twice.
+        const bool first_time = !conn->closing;
+        if (first_time && conn->proto == proto_ws)
+        {
+            conn->write_queue.push(ws_frame_close_too_big_shared());
+            if (!conn->write_pending)
+                flush_write_queue(conn);
+        }
+        if (first_time)
+        LOG_WARN(("server \"" + std::string(get_name()) + "\": a client sent "
+                  + std::to_string(conn->partial.size()) + " bytes without a "
+                  "complete message and this runtime holds at most "
+                  + std::to_string(read_buffer_bytes())
+                  + " -- dropped.  --read-buffer moves the limit").c_str());
         conn->closing = true;
         goto submit_next_read;
     }
