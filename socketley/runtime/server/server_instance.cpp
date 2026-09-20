@@ -4021,7 +4021,27 @@ reparse:
                 }
                 else if (frame.opcode == WS_OP_CLOSE)
                 {
-                    conn->write_queue.push(ws_frame_close_shared());
+                    // RFC 6455 5.5.1: the Close sent in answer echoes the code
+                    // it received, so a peer that said 1001 is not told 1000 by
+                    // an end that never read what it said -- with ws_protocol.h
+                    // holding which codes may be repeated and which are
+                    // themselves the protocol error.
+                    const uint16_t code = ws_close_echo_code(payload);
+                    if (const auto* pre = ws_frame_close_pre(code))
+                    {
+                        conn->write_queue.push(*pre);
+                    }
+                    else
+                    {
+                        // Four bytes with one recipient, written into the
+                        // queue's own tail for the same reason as the pong
+                        // above: the shared form would cost two allocations
+                        // and buy nothing.
+                        std::string close_frame;
+                        ws_frame_close_code_into(close_frame, code);
+                        conn->write_queue.push_coalesced(std::move(close_frame),
+                            server_connection::WRITE_COALESCE_LIMIT);
+                    }
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                     conn->closing = true;

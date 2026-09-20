@@ -276,3 +276,125 @@ TEST_CASE("ws_payload_is_utf8 agrees with a scalar decoder at every length")
         }
     }
 }
+
+// ─── Which close code answers which close ───────────────────────────────────
+// The integration test drives a sample of these through a real server; these
+// are the boundaries either side of every range in RFC 6455 7.4.1-7.4.2, which
+// is where an off-by-one would live and where a sample would not find it.
+
+static std::string close_body(uint16_t code, std::string_view reason = {})
+{
+    std::string b;
+    b += static_cast<char>((code >> 8) & 0xFF);
+    b += static_cast<char>(code & 0xFF);
+    b += reason;
+    return b;
+}
+
+TEST_CASE("ws_close_echo_code: a code an endpoint may send comes back")
+{
+    CHECK(ws_close_echo_code(close_body(1000)) == 1000);
+    CHECK(ws_close_echo_code(close_body(1001)) == 1001);
+    CHECK(ws_close_echo_code(close_body(1003)) == 1003);
+    CHECK(ws_close_echo_code(close_body(1007)) == 1007);
+    CHECK(ws_close_echo_code(close_body(1011)) == 1011);
+    // 7.4.2 gives these two ranges to libraries and to private use.
+    CHECK(ws_close_echo_code(close_body(3000)) == 3000);
+    CHECK(ws_close_echo_code(close_body(3999)) == 3999);
+    CHECK(ws_close_echo_code(close_body(4000)) == 4000);
+    CHECK(ws_close_echo_code(close_body(4999)) == 4999);
+}
+
+TEST_CASE("ws_close_echo_code: a reason is read but never repeated")
+{
+    // The reason changes nothing about the answer, and the answer never
+    // carries it -- ws_frame_close_code_into writes two bytes and stops.
+    CHECK(ws_close_echo_code(close_body(1001, "going away")) == 1001);
+    std::string frame;
+    ws_frame_close_code_into(frame, ws_close_echo_code(close_body(1001, "going away")));
+    CHECK(frame.size() == 4);
+    CHECK(static_cast<uint8_t>(frame[1]) == 2);
+}
+
+TEST_CASE("ws_close_echo_code: no body at all is a normal closure")
+{
+    // 1005 is what "there was no code" means and 7.4.1 forbids sending it.
+    CHECK(ws_close_echo_code(std::string_view{}) == 1000);
+}
+
+TEST_CASE("ws_close_echo_code: a body that is not a code is a protocol error")
+{
+    // 5.5.1: "the first two bytes of the body MUST be a 2-byte unsigned integer".
+    CHECK(ws_close_echo_code(std::string_view("\x03", 1)) == 1002);
+}
+
+TEST_CASE("ws_close_echo_code: reserved and undefined codes are refused")
+{
+    // Either side of every boundary in 7.4.1 and 7.4.2.
+    CHECK(ws_close_echo_code(close_body(0))    == 1002);
+    CHECK(ws_close_echo_code(close_body(999))  == 1002);
+    CHECK(ws_close_echo_code(close_body(1004)) == 1002);  // reserved, undefined
+    CHECK(ws_close_echo_code(close_body(1005)) == 1002);  // MUST NOT be sent
+    CHECK(ws_close_echo_code(close_body(1006)) == 1002);  // MUST NOT be sent
+    CHECK(ws_close_echo_code(close_body(1012)) == 1002);  // past what 6455 defines
+    CHECK(ws_close_echo_code(close_body(1015)) == 1002);  // MUST NOT be sent
+    CHECK(ws_close_echo_code(close_body(2999)) == 1002);  // protocol's, undefined
+    CHECK(ws_close_echo_code(close_body(5000)) == 1002);  // past private use
+    CHECK(ws_close_echo_code(close_body(65535)) == 1002);
+}
+
+TEST_CASE("ws_close_echo_code: a reason that is not UTF-8 is 1007")
+{
+    // 5.5.1 makes the reason UTF-8; 8.1 requires failing on one that is not.
+    CHECK(ws_close_echo_code(close_body(1000, std::string_view("\xFF\xFE", 2))) == 1007);
+    // And the check is on the reason only -- the code's own bytes are not text.
+    CHECK(ws_close_echo_code(close_body(1000, "ok")) == 1000);
+}
+
+TEST_CASE("ws_frame_close_pre: the three codes that keep a singleton")
+{
+    // Same object every call, which is what "costs a refcount" means.
+    REQUIRE(ws_frame_close_pre(1000) != nullptr);
+    REQUIRE(ws_frame_close_pre(1002) != nullptr);
+    REQUIRE(ws_frame_close_pre(1009) != nullptr);
+    CHECK(ws_frame_close_pre(1000)->get() == ws_frame_close_pre(1000)->get());
+    CHECK(ws_frame_close_pre(1000)->get() == ws_frame_close_shared().get());
+    CHECK(ws_frame_close_pre(1002)->get() == ws_frame_close_protocol_error_shared().get());
+    CHECK(ws_frame_close_pre(1009)->get() == ws_frame_close_too_big_shared().get());
+    // And a code that has none, which the caller builds instead.
+    CHECK(ws_frame_close_pre(1001) == nullptr);
+    CHECK(ws_frame_close_pre(4999) == nullptr);
+}
+
+TEST_CASE("ws_frame_close_code_into: the bytes match the pre-computed frames")
+{
+    // The two builders must agree, or the singleton path and the built path
+    // would put different frames on the wire for the same decision.
+    for (uint16_t code : {uint16_t(1000), uint16_t(1002), uint16_t(1009)})
+    {
+        std::string built;
+        ws_frame_close_code_into(built, code);
+        CHECK(built == **ws_frame_close_pre(code));
+    }
+    // And a built one parses as the close frame it claims to be.
+    std::string built;
+    ws_frame_close_code_into(built, 4999);
+    ws_frame out;
+    REQUIRE(ws_parse_frame(built.data(), built.size(), out) == ws_parse::ok);
+    CHECK(out.opcode == WS_OP_CLOSE);
+    REQUIRE(out.payload.size() == 2);
+    CHECK(((static_cast<uint8_t>(out.payload[0]) << 8) |
+            static_cast<uint8_t>(out.payload[1])) == 4999);
+}
+
+// Appending into a buffer that already holds a frame must not disturb it --
+// this is the push_coalesced path, where a close shares a queue entry.
+TEST_CASE("ws_frame_close_code_into: appends without touching what is there")
+{
+    std::string buf = ws_frame_text("before");
+    const std::string head = buf;
+    ws_frame_close_code_into(buf, 1001);
+    CHECK(buf.compare(0, head.size(), head) == 0);
+    REQUIRE(buf.size() == head.size() + 4);
+    CHECK(static_cast<uint8_t>(buf[head.size()]) == 0x88);
+}
