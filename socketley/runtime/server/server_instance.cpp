@@ -2888,14 +2888,18 @@ inline void server_instance::submit_conn_read(server_connection* conn)
     bool queued = false;
     if (conn->direct_fd)
     {
+        // Every arm on `!queued` and none on `else`: with `else if`, a
+        // multishot that was attempted and REFUSED skipped the two behind it,
+        // so a busy ring closed a healthy client that a plain read would have
+        // served.  The cache's copy of this chain was fixed; this one was not.
         if (m_recv_bundle)
             queued = m_loop->submit_recv_multishot_bundle_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued && m_use_provided_bufs)
+        if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued)
-            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+        if (!queued && conn->read_buf)
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
     }
     else
     {
@@ -2903,10 +2907,10 @@ inline void server_instance::submit_conn_read(server_connection* conn)
             queued = m_loop->submit_recv_multishot_bundle(conn->fd, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_recv_multishot)
             queued = m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued && m_use_provided_bufs)
+        if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
-        else if (!queued)
-            queued = m_loop->submit_read(conn->fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+        if (!queued && conn->read_buf)
+            queued = m_loop->submit_read(conn->fd, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
     }
 
     // The flag goes up only once the read is queued, because setting it first
@@ -2971,8 +2975,16 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     }
 
     auto conn = pool_acquire(client_fd);
-    conn->partial.reserve(8192);
-    conn->read_req = { this, conn->read_buf, client_fd, server_connection::READ_BUF_SIZE,
+    // Grown on demand: eight kilobytes charged at accept, before the client
+    // has said anything, and clear() keeps whatever a busy connection grows
+    // into anyway -- so the reserve only ever bought the first growth, for
+    // every connection including the ones that never have a first command.
+
+    // Sixteen kilobytes that a start WITH a buffer ring never writes to, which
+    // is every start that gets one; only a start without one pays for them.
+    if (SOCKETLEY_UNLIKELY(!m_use_provided_bufs) && !conn->read_buf)
+        conn->read_buf = std::make_unique<char[]>(server_connection::READ_BUF_SIZE);
+    conn->read_req = { this, conn->read_buf.get(), client_fd, server_connection::READ_BUF_SIZE,
                        op_read, conn->generation };
     conn->write_req = { this, nullptr, client_fd, 0, op_write, conn->generation };
 
@@ -4371,9 +4383,11 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
-                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = conn->read_buf
+                       && m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
             else
-                queued = m_loop->submit_read(fd, conn->read_buf, server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = conn->read_buf
+                       && m_loop->submit_read(fd, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
             if (SOCKETLEY_UNLIKELY(!queued))
             {
                 conn->read_pending = false;
@@ -4425,7 +4439,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     }
     else if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr))
     {
-        tls_feed(conn, conn->read_buf, static_cast<size_t>(cqe->res));
+        tls_feed(conn, conn->read_buf.get(), static_cast<size_t>(cqe->res));
     }
     else
     {
@@ -4437,13 +4451,13 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->partial.empty() && !conn->closing)
         {
             const size_t n = static_cast<size_t>(cqe->res);
-            const size_t used = deliver_body_span(conn, conn->read_buf, n);
+            const size_t used = deliver_body_span(conn, conn->read_buf.get(), n);
             if (used < n)
-                conn->partial.append(conn->read_buf + used, n - used);
+                conn->partial.append(conn->read_buf.get() + used, n - used);
         }
         else
         {
-            conn->partial.append(conn->read_buf, cqe->res);
+            conn->partial.append(conn->read_buf.get(), cqe->res);
         }
     }
 

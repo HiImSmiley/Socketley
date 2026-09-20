@@ -279,8 +279,11 @@ struct alignas(64) server_connection
     // Multicast group memberships (cleaned up on disconnect)
     std::vector<std::string> groups;
 
-    // 16KB read buffer — at the very end to keep hot fields in first cache lines
-    char read_buf[READ_BUF_SIZE];
+    // The last of four arms -- a bundle, plain multishot, a provided-buffer
+    // read, and only then a plain read into this -- so a start with a buffer
+    // ring never writes to it.  Held rather than freed once taken, so no read
+    // can be armed on storage that has gone.
+    std::unique_ptr<char[]> read_buf;
 
     // What a struct owns that no container releases for it, because a
     // connection retired with a file read in flight never reaches

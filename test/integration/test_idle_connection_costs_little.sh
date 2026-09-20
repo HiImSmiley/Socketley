@@ -15,6 +15,10 @@
 # with the arms exchanged, 0.9862 one way and 1.0062 the other, which is the
 # instrument and not the code.
 #
+# A server carried the same shape and worse -- a SIXTEEN kilobyte read_buf and
+# a reserve(8192) -- and came out 22.21 -> 4.92 KB, identical in four passes,
+# with its throughput at 1.0040 across the swap, which is again the instrument.
+#
 # The read_buf is the last arm of four -- bundle, multishot, provided-buffer
 # read, and only then a plain read into it -- so with a buffer ring, which is
 # every start that gets one, it was never written to.  It is now allocated only
@@ -38,8 +42,10 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 daemon_isolate idlecost
 
 P=$((SL_PORT_BASE+1890))
+P_SRV=$((SL_PORT_BASE+1892))
 CONNS=2000
 BUDGET_KB=5
+BUDGET_SRV_KB=9
 
 PASS=0; FAIL=0; TOTAL=0
 ok()    { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -49,9 +55,9 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; 
 HOLDER=""
 cleanup() {
     [ -n "$HOLDER" ] && { { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true; }
-    "$BIN" stop ic >/dev/null 2>&1 || true
+    for n in ic is; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
     sleep 0.3
-    "$BIN" remove ic >/dev/null 2>&1 || true
+    for n in ic is; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -72,9 +78,9 @@ done
 if [ -n "$WORKER" ]; then ok; else bad "the worker was found" "none listening on $P"; fi
 [ -n "$WORKER" ] || { echo; echo "  $PASS/$TOTAL passed"; exit 1; }
 
-rss_kb() { awk '/VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo 0; }
+rss_kb() { awk '/VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
 sleep 1
-BEFORE=$(rss_kb)
+BEFORE=$(rss_kb "$WORKER")
 
 python3 - "127.0.0.1" "$P" "$CONNS" <<'PY' > /tmp/idlecost.$$ 2>&1 &
 import socket, sys, time
@@ -100,7 +106,7 @@ if grep -q "^open $CONNS" "/tmp/idlecost.$$" 2>/dev/null; then ok
 else bad "$CONNS connections were opened" "$(head -2 /tmp/idlecost.$$ 2>/dev/null)"; fi
 
 sleep 3
-AFTER=$(rss_kb)
+AFTER=$(rss_kb "$WORKER")
 PER=$(awk -v a="$BEFORE" -v b="$AFTER" -v n="$CONNS" 'BEGIN{printf "%.2f", (b-a)/n}')
 echo "  RSS $(awk -v x=$BEFORE 'BEGIN{printf "%.1f", x/1024}') -> $(awk -v x=$AFTER 'BEGIN{printf "%.1f", x/1024}') MB over $CONNS idle connections = $PER KB each"
 
@@ -117,6 +123,51 @@ check "and it still answers with them all held" "+PONG" "$REPLY"
 { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true
 HOLDER=""
 rm -f "/tmp/idlecost.$$"
+
+# ─── the same question of a server ──────────────────────────────────────────
+# It carried a SIXTEEN kilobyte read_buf where the cache carried four, and a
+# reserve(8192) beside it: 22.21 KB per connection, measured, against 4.92
+# after.  If the two runtimes ever drift apart, this is the arm that says so.
+create_ok "a server" "$BIN" create server is -p "$P_SRV"
+"$BIN" start is >/dev/null 2>&1 || true
+ready_tcp 127.0.0.1 "$P_SRV" 15 || true
+SWORKER=""
+for p in $(pgrep -x socketley 2>/dev/null); do
+    grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
+    ss -ltnpH "sport = :$P_SRV" 2>/dev/null | grep -q "pid=$p," && { SWORKER=$p; break; }
+done
+if [ -n "$SWORKER" ]; then ok; else bad "the server's worker was found" "none on $P_SRV"; fi
+
+if [ -n "$SWORKER" ]; then
+    sleep 1
+    SBEFORE=$(rss_kb "$SWORKER")
+    python3 - "127.0.0.1" "$P_SRV" "$CONNS" <<'PYS' > /tmp/idlecost.$$ 2>&1 &
+import socket, sys, time
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+socks = []
+try:
+    for _ in range(n):
+        socks.append(socket.create_connection((host, port), 10))
+except Exception as e:
+    print("ERR", e, flush=True); sys.exit(1)
+print("open", len(socks), flush=True)
+time.sleep(60)
+PYS
+    HOLDER=$!
+    for i in $(seq 1 300); do grep -q "^open $CONNS" "/tmp/idlecost.$$" 2>/dev/null && break; sleep 0.1; done
+    if grep -q "^open $CONNS" "/tmp/idlecost.$$" 2>/dev/null; then ok
+    else bad "$CONNS server connections were opened" "$(head -2 /tmp/idlecost.$$ 2>/dev/null)"; fi
+    sleep 3
+    SAFTER=$(rss_kb "$SWORKER")
+    SPER=$(awk -v a="$SBEFORE" -v b="$SAFTER" -v n="$CONNS" 'BEGIN{printf "%.2f", (b-a)/n}')
+    echo "  server RSS $(awk -v x=$SBEFORE 'BEGIN{printf "%.1f", x/1024}') -> $(awk -v x=$SAFTER 'BEGIN{printf "%.1f", x/1024}') MB over $CONNS idle = $SPER KB each"
+    SUNDER=$(awk -v p="$SPER" -v b="$BUDGET_SRV_KB" 'BEGIN{print (p > 0 && p < b) ? "yes" : "no"}')
+    check "each idle server connection costs under ${BUDGET_SRV_KB} KB" "yes" "$SUNDER"
+    { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true
+    HOLDER=""
+    rm -f "/tmp/idlecost.$$"
+fi
+
 echo
 echo "  $PASS/$TOTAL passed"
 [ "$FAIL" -eq 0 ] || exit 1
