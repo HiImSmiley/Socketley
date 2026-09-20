@@ -191,6 +191,8 @@ tls_context::tls_context() = default;
 tls_context::~tls_context()
 {
 #if SOCKETLEY_HAS_TLS
+    if (m_saved_session)
+        SSL_SESSION_free(m_saved_session);
     if (m_ctx)
         SSL_CTX_free(m_ctx);
 #endif
@@ -364,11 +366,12 @@ bool tls_context::init_client(std::string_view ca_path,
     }
     SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION);
 
-    // ── Client-side session caching ──
-    // Enable client-side session cache so reconnections to the same server can
-    // resume the previous session (avoids full handshake).
-    SSL_CTX_set_session_cache_mode(m_ctx, SSL_SESS_CACHE_CLIENT);
-    SSL_CTX_sess_set_cache_size(m_ctx, 1024);
+    // No internal cache on a client, because OpenSSL never reads one: a
+    // ClientHello offers the session the application put on the SSL and
+    // nothing else, so SSL_SESS_CACHE_CLIENT only filed sessions where no
+    // lookup ever went.  Resumption is remember_session() and the
+    // SSL_set_session() in create_ssl_client(), which are that lookup.
+    SSL_CTX_set_session_cache_mode(m_ctx, SSL_SESS_CACHE_OFF);
 
     // Apply common performance options (tickets, modes, fragment size)
     apply_ctx_performance_options(m_ctx);
@@ -528,11 +531,61 @@ SSL* tls_context::create_ssl_client(std::string_view expected_hostname) const
         return nullptr;
     }
 
+    // The session kept from the last connection to this same peer, offered
+    // only on a name match: what the server answers decides whether it is
+    // honoured, and a full handshake is the cost of a miss.
+    if (m_saved_session && m_saved_peer == name)
+    {
+        ERR_clear_error();
+        if (SSL_set_session(ssl, m_saved_session) != 1)
+            log_ssl_errors("session resumption");   // dials on, one handshake dearer
+    }
+
     SSL_set_connect_state(ssl);
     return ssl;
 #else
     (void)expected_hostname;
     return nullptr;
+#endif
+}
+
+void tls_context::remember_session(std::string_view peer_name, SSL* ssl)
+{
+#if SOCKETLEY_HAS_TLS
+    if (!ssl || peer_name.empty())
+        return;
+
+    // A COPY and not a reference to the live one: freeing an SSL whose peer
+    // never exchanged close_notify marks that session not_resumable, and the
+    // next dial would then send a ClientHello with no PSK in it and say
+    // nothing about why.
+    SSL_SESSION* live = SSL_get0_session(ssl);
+    if (!live)
+        return;
+    SSL_SESSION* sess = SSL_SESSION_dup(live);
+    if (!sess)
+    {
+        log_ssl_errors("session copy");
+        return;
+    }
+
+    // What OpenSSL has already marked unusable is not worth keeping.  This is
+    // not a check that the TLS 1.3 ticket has arrived -- a session id alone
+    // makes it answer true -- and a session without one costs exactly the full
+    // handshake it would have cost anyway.
+    if (!SSL_SESSION_is_resumable(sess))
+    {
+        SSL_SESSION_free(sess);
+        return;
+    }
+
+    if (m_saved_session)
+        SSL_SESSION_free(m_saved_session);
+    m_saved_session = sess;
+    m_saved_peer.assign(peer_name);
+#else
+    (void)peer_name;
+    (void)ssl;
 #endif
 }
 
