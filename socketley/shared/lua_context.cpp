@@ -3264,6 +3264,16 @@ void lua_context::register_cache_table(runtime_instance* owner, sol::table& self
         return std::string(owner->lua_cache_mode());
     };
 
+    // Whether THIS process is the one that holds `key`.  Under --shards the
+    // script below runs in all N of them and each acts only on the slice it
+    // owns, so every mutating entry in this table answers a foreign key the
+    // same way it answers a refusal -- and this is how a script tells the two
+    // apart, exactly as cache_mode() does for the readonly case.  Always true
+    // on a cache that is one process, so a script reads the same on either.
+    self["owns"] = [owner](std::string key) -> bool {
+        return owner->lua_cache_owns(key);
+    };
+
     // Strings
     self["get"] = [owner](std::string key) -> std::string {
         return owner->lua_cache_get(key);
