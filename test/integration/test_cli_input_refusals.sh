@@ -68,6 +68,8 @@ fail() {
 
 # Refused: exit 1 and a message that contains WHAT_TO_DO.  Not "exit non-zero":
 # 2 is fatal and would mean the daemon died, which is a different finding.
+state_of() { "$BIN" ls --name --status 2>/dev/null | awk -F'\t' -v n="$1" '$1==n{print $2}'; }
+
 refuses() {
     local label=$1 want=$2; shift 2
     local out rc=0
@@ -233,6 +235,53 @@ for args in "-a" "--all" "-a --json" "-a -s" "-a --name --uptime" \
     if [ "$RC" -eq 0 ] && grep -q "cli_input_srv" <<<"$OUT"; then pass
     else fail "ps $args still answers" "exit $RC, said: ${OUT:-<nothing>}"; fi
 done
+
+# ─── --reconnect, the flag that turned reconnect off ────────────────────────
+#
+# -1 is the stored "disabled" and 0 is "infinite", so a negative count switched
+# off the one thing this flag exists to switch on.  `show` said nothing either
+# way, because a field sitting at its default is not printed -- which is why
+# the assertion below is on the CREATE, not on the field.
+RP=$((SL_PORT_BASE + 950))
+
+refuses "--reconnect -1" "turns reconnection ON" \
+        "$BIN" create client ci_neg -t 127.0.0.1:$((RP + 1)) --reconnect -1
+refuses "--reconnect -5" "turns reconnection ON" \
+        "$BIN" create client ci_neg5 -t 127.0.0.1:$((RP + 2)) --reconnect -5
+refuses "--reconnect with a count no int holds" "out of range" \
+        "$BIN" create client ci_big -t 127.0.0.1:$((RP + 3)) --reconnect 99999999999999
+
+# A refused flag must not leave the runtime behind it: the name has to be free.
+RC=0
+OUT=$("$BIN" ls -s 2>&1) || RC=$?
+if ! grep -qE '^ci_(neg|neg5|big)$' <<<"$OUT"; then pass
+else fail "a refused --reconnect creates nothing" \
+          "ls -s lists: ${OUT:-<nothing>}"; fi
+
+# ─── and every value it DOES take still takes ───────────────────────────────
+#
+# Load-bearing twice over: a build that refused every --reconnect would pass
+# the three above, and the optional value is what makes `--reconnect -s` the
+# flag with no value followed by the autostart flag rather than "-s" as a count.
+rc_field() { "$BIN" show "$1" 2>/dev/null | grep -o '"reconnect": [-0-9]*' | head -1; }
+
+"$BIN" create client ci_bare -t 127.0.0.1:$((RP + 4)) --reconnect >/dev/null 2>&1 || true
+if [ "$(rc_field ci_bare)" = '"reconnect": 0' ]; then pass
+else fail "--reconnect with no value is unlimited" \
+          "show says: $(rc_field ci_bare)"; fi
+
+"$BIN" create client ci_five -t 127.0.0.1:$((RP + 5)) --reconnect 5 >/dev/null 2>&1 || true
+if [ "$(rc_field ci_five)" = '"reconnect": 5' ]; then pass
+else fail "--reconnect 5 is five attempts" "show says: $(rc_field ci_five)"; fi
+
+"$BIN" create client ci_as -t 127.0.0.1:$((RP + 6)) --reconnect -s >/dev/null 2>&1 || true
+if [ "$(rc_field ci_as)" = '"reconnect": 0' ]; then pass
+else fail "--reconnect -s is the flag, then -s" "show says: $(rc_field ci_as)"; fi
+
+# and -s did its own job rather than being eaten as the count.
+if [ "$(state_of ci_as)" != "Created" ] && [ -n "$(state_of ci_as)" ]; then pass
+else fail "-s after a valueless --reconnect still autostarts" \
+          "ci_as is '$(state_of ci_as)'"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

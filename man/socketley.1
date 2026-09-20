@@ -3084,7 +3084,10 @@ is lost. Backoff starts at 1 second and doubles each attempt to a ceiling of
 16 seconds, with up to half a second of jitter \(em the dials of a client whose
 target is gone fall at 1, 2, 4, 8, 16, 16, 16 seconds. Set to 0 for infinite
 attempts (default when flag is given without a value). Set to a positive number
-to limit reconnection attempts.
+to limit reconnection attempts. A negative count is refused: \-1 is what the
+stored field holds for "off", so the flag whose only purpose is to turn
+reconnection on used to turn it off, silently and at exit 0. Reconnection is off
+until the flag is given, which is how it stays off.
 .IP
 A client flag, and refused on a server, a proxy or a cache: it re-dials a
 connection this runtime made, and those three take connections rather than make
