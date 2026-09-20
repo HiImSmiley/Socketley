@@ -184,3 +184,95 @@ TEST_CASE("ws_handshake_response: contains required headers")
     CHECK(resp.find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != std::string::npos);
     CHECK(resp.find("\r\n\r\n") != std::string::npos);
 }
+
+// ws_payload_is_utf8 asks its question of every outbound message, and nearly
+// every one of them is ASCII all the way -- so the ASCII run IS the function
+// in the common case, and it is vectorised.  A SIMD scan that disagrees with
+// the scalar decoder behind it by one byte is a text frame carrying bytes RFC
+// 6455 5.6 forbids, or a binary frame carrying text; neither shows up in a
+// throughput number.  So: every length across the vector boundary, every
+// position of every interesting lead byte, and every valid multi-byte
+// sequence at every offset, all against a scalar reference written out here.
+namespace
+{
+bool utf8_reference(std::string_view p)
+{
+    size_t i = 0;
+    const size_t n = p.size();
+    const auto* b = reinterpret_cast<const unsigned char*>(p.data());
+    while (i < n)
+    {
+        const unsigned char c = b[i];
+        size_t       need;
+        unsigned int cp;
+        if (c < 0x80)      { ++i; continue; }
+        else if (c < 0xC2) return false;
+        else if (c < 0xE0) { need = 1; cp = c & 0x1Fu; }
+        else if (c < 0xF0) { need = 2; cp = c & 0x0Fu; }
+        else if (c < 0xF5) { need = 3; cp = c & 0x07u; }
+        else               return false;
+        if (i + need >= n) return false;
+        for (size_t k = 1; k <= need; ++k)
+        {
+            const unsigned char cc = b[i + k];
+            if ((cc & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (need == 2 && cp < 0x800u)       return false;
+        if (need == 3 && cp < 0x10000u)     return false;
+        if (cp >= 0xD800u && cp <= 0xDFFFu) return false;
+        if (cp > 0x10FFFFu)                 return false;
+        i += need + 1;
+    }
+    return true;
+}
+}
+
+TEST_CASE("ws_payload_is_utf8 agrees with a scalar decoder at every length")
+{
+    // 0x80 and 0xBF are continuations with no lead; 0xC0/0xC1 are overlong
+    // leads; 0xF5 and 0xFF are past U+10FFFF.  0xC2, 0xDF, 0xE0, 0xEF, 0xF0
+    // and 0xF4 are legal leads whose continuations are missing here.
+    const int leads[] = { 0x80, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF,
+                          0xE0, 0xEF, 0xF0, 0xF4, 0xF5, 0xFF };
+
+    for (size_t n = 0; n <= 70; ++n)
+    {
+        std::string a(n, 'a');
+        for (size_t i = 0; i < n; ++i)
+            a[i] = static_cast<char>('a' + (i % 26));
+
+        CHECK(ws_payload_is_utf8(a) == utf8_reference(a));
+
+        for (size_t i = 0; i < n; ++i)
+            for (int v : leads)
+            {
+                std::string c = a;
+                c[i] = static_cast<char>(v);
+                CHECK(ws_payload_is_utf8(c) == utf8_reference(c));
+            }
+
+        // And sequences that are valid, at every offset they fit at: a
+        // two-byte umlaut, a three-byte euro sign, a four-byte emoji.
+        for (size_t i = 0; i + 2 <= n; ++i)
+        {
+            std::string c = a;
+            c[i] = static_cast<char>(0xC3); c[i + 1] = static_cast<char>(0xA4);
+            CHECK(ws_payload_is_utf8(c) == utf8_reference(c));
+        }
+        for (size_t i = 0; i + 3 <= n; ++i)
+        {
+            std::string c = a;
+            c[i] = static_cast<char>(0xE2); c[i + 1] = static_cast<char>(0x82);
+            c[i + 2] = static_cast<char>(0xAC);
+            CHECK(ws_payload_is_utf8(c) == utf8_reference(c));
+        }
+        for (size_t i = 0; i + 4 <= n; ++i)
+        {
+            std::string c = a;
+            c[i] = static_cast<char>(0xF0); c[i + 1] = static_cast<char>(0x9F);
+            c[i + 2] = static_cast<char>(0x98); c[i + 3] = static_cast<char>(0x80);
+            CHECK(ws_payload_is_utf8(c) == utf8_reference(c));
+        }
+    }
+}

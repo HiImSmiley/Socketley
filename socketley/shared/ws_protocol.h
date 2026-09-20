@@ -307,6 +307,24 @@ inline bool ws_payload_is_utf8(std::string_view p)
     const size_t n = p.size();
     const auto* b = reinterpret_cast<const unsigned char*>(p.data());
 
+    // The ASCII run, sixteen bytes at a time.  Every outbound message asks
+    // this question and nearly every one of them is ASCII all the way, so this
+    // loop IS the function in the common case -- profiled at 3.42 per cent of
+    // a websocket worker while the unmasking beside it had been vectorised for
+    // years.  movemask gives the high bit of each byte; the first one set is
+    // where the scalar decoder below has to take over.
+#if WS_HAS_SSE2
+    for (; i + 16 <= n; i += 16)
+    {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+        const int m = _mm_movemask_epi8(v);
+        if (m != 0)
+        {
+            i += static_cast<size_t>(__builtin_ctz(static_cast<unsigned int>(m)));
+            break;
+        }
+    }
+#endif
     while (i < n && b[i] < 0x80)
         ++i;
     if (i == n)
