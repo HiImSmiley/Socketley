@@ -12,6 +12,19 @@
 // are legal and the daemon carries a metrics thread, so a setenv() between
 // fork and exec is a malloc in a child that may hold the allocator's lock.
 //
+// WHAT IT IS WORTH DEPENDS ON THE MACHINE HAVING 2 MB PAGES TO GIVE, and that
+// is measured rather than assumed.  The same A/B, same swap protocol, on one
+// box over one night:
+//
+//     order-9 blocks 716, compaction_proactiveness 20   +17.9%
+//     order-9 blocks  12, compaction_proactiveness  1    +3.2%
+//     the same, after one echo 1 > vm.compact_memory     +5.4%
+//
+// `thp_fault_fallback` stayed at zero throughout, so nothing was refused -- a
+// starved system still gets its huge pages and gets less out of them.  An
+// operator seeing a smaller figure than the commit quotes should look at
+// /proc/buddyinfo before looking here.
+//
 // Only a cache asks for them.  A server serving a cached 10 KB file over 64
 // keep-alive connections measured 0.9994 with them, spread [0.971, 1.077] over
 // six passes -- nothing -- while its idle RSS rose by 0.8 to 3.7 MB.  A cache

@@ -516,6 +516,33 @@ roughly 1/latency of a `write()`, and their latency percentiles were the cost of
 They now complete a round trip per operation, which makes them incomparable with
 what stood here, and they stay out until re-recorded.
 
+### Pipelined throughput, and what it costs to get it
+
+A cache worker profiled at pipeline depth 100 spends **65% of its time in one
+hash-table lookup** and another 2.7% hashing for it. At depth 1 the same lookup
+is 13%, because there the kernel's per-message charge is 86% of the operation —
+which is why work on the cache's own code pays pipelined and almost not at all
+serially.
+
+Measured against the commit this branch started from, GET at `-P 100`, nine
+interleaved passes each way with the arms exchanged, first discarded:
+
+| | GET/s | µs CPU/op |
+|---|---|---|
+| before | 4,415,620 | 0.226 |
+| after | **5,678,045** | **0.176** |
+
+**+24.3%**, eight of eight passes in each direction. Three changes: huge pages
+for the cache's heap (+17.9%), comparing short keys inline instead of calling
+libc (+4.3%), and the per-connection memory work below (+2.9%).
+
+**The huge-page share depends on the machine having 2 MB pages to give.** On a
+box whose `vm.compaction_proactiveness` had been turned down and whose
+`/proc/buddyinfo` showed twelve order-9 blocks, the same A/B read **+3.2%**; at
+716 blocks it read +17.9%. `thp_fault_fallback` was zero throughout — a starved
+system still gets huge pages and gets less out of them. Check `buddyinfo` before
+doubting the figure.
+
 ### Many simultaneous connections
 
 This section used to say that many simultaneous connections are "not
