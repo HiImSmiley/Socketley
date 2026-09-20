@@ -650,6 +650,18 @@ bool cache_instance::setup(event_loop& loop)
     // siblings honoured.
     m_cluster_ports = m_cluster_forced && m_shard_n > 1;
 
+    // Said once, by shard 0, because behind one address a shard relays every
+    // key it does not own and the relay costs more than the answer.
+    if (m_shard_n > 1 && !m_cluster_forced && m_shard_i == 0)
+        LOG_WARN(("cache \"" + std::string(get_name()) + "\": "
+                  + std::to_string(m_shard_n) + " shards share one address, so "
+                  + std::to_string(m_shard_n - 1) + " of every "
+                  + std::to_string(m_shard_n) + " keys reach a shard that does "
+                  "not own them and are relayed to the one that does -- a "
+                  "crossing costs about twice what serving the key does, and at "
+                  "two shards this measured BELOW one shard.  Add --cluster and "
+                  "point a cluster-aware client at it, or use --shards 1").c_str());
+
     if (m_cluster_ports)
     {
         const uint32_t wanted = static_cast<uint32_t>(port) + 1u + m_shard_i;

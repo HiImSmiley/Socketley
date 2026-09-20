@@ -2716,6 +2716,15 @@ _
 .PP
 3.57x at eight shards, with the per-pass ratios spread from 3.18x to 4.26x.
 .PP
+.B "That figure is a server's, and does not transfer to a cache."
+A server's shards are interchangeable, so every one of them answers every
+request. A cache's are not: the shard a connection lands on relays every key it
+does not own, and behind one address that is
+.RI ( N \-1)/ N
+of them. Measured at two shards it comes out BELOW one shard. See
+.B CACHE FLAGS
+for the table.
+.PP
 .B "One shard is exactly one core."
 0.99 of one, at every concurrency tried, while the machine had fifteen more
 sitting idle. That is the whole case for this flag stated as a measurement: a
@@ -3826,6 +3835,45 @@ saving
 .B \-\-cluster
 buys between ports. A caller that picks a node at random still gets correct
 answers \(em the shard crosses to the owner \(em at the crossing's cost.
+.IP
+.B "What that crossing costs, measured."
+One cache, GET at depth 1, the daemon pinned to four cores and twelve
+.B redis-benchmark
+processes on the other twelve; five interleaved passes with the order rotated,
+the first discarded, a clock probe on both ends of the run. Client CPU is
+recorded beside every row because a capped client inverts the sign of a
+comparison before it changes its size.
+.IP
+.RS
+.TS
+l r r r.
+arrangement	throughput	cores	us CPU/op
+_
+1 shard	172,020 GET/s	1.00	5.81
+2 shards, one address	153,832 GET/s	1.91	12.41
+2 shards, slot-routed	238,591 GET/s	1.92	8.06
+4 shards, one address	229,040 GET/s	3.94	17.22
+4 shards, slot-routed	344,169 GET/s	3.75	10.90
+.TE
+.RE
+.IP
+.B "Two shards behind one address serve less than one shard does."
+0.89x, on four passes that agree and whose ranges do not overlap, for 1.9 cores
+instead of 1.0. Half the keys belong to the sibling, and a crossing costs about
+13 us of server CPU where serving a local key costs 5.8 \(em so the second core
+is spent relaying rather than answering. At four shards it turns positive,
+1.31x, and is still a third short of what those same four shards do when the
+client picks the owner.
+.IP
+.B "The ceiling above that is the machine, not this flag."
+Four shards routed by key reach 2.00x. Four independent
+.B redis\-server
+processes on the same four cores, driven the same way, reach 2.09x. Neither
+scales linearly on loopback here, so a cache that must scale wants
+.B \-\-cluster
+and a client that routes \(em and the 3.57x quoted for a server under
+.B SERVER FLAGS
+does not carry over.
 .IP
 Measured against the same cache on TCP with
 .BR \-\-cluster ,
