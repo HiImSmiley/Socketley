@@ -75,6 +75,16 @@ size_t client_instance::get_connection_count() const
     return m_connected ? 1 : 0;
 }
 
+// Beside total_connections and not folded into it: that one counts connections
+// the kernel confirmed, this one counts the dials it took, and the two pulling
+// apart is what a flapping target looks like from here.
+std::string client_instance::stats_lines() const
+{
+    return "dial_attempts:"
+         + std::to_string(m_stat_dial_attempts.load(std::memory_order_relaxed))
+         + "\n";
+}
+
 // Everything a client's socket needs in one place: TCP_NODELAY, and the
 // keepalive every listener in this tree shares -- an idle client never writes,
 // so without it --reconnect's promise is never kept.
@@ -244,7 +254,11 @@ connected:
     // still `Up` after twelve seconds, dialling for ever.  It is reset where a
     // peer has actually answered, in note_established().
 
-    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+    // A dial and not a connection, for the same reason the paragraph above
+    // gives: total_connections is counted where the kernel confirms one, in
+    // note_connected().
+    m_stat_dial_attempts.fetch_add(1, std::memory_order_relaxed);
+    m_conn_counted = false;
     invoke_on_connect(m_conn->fd);
     m_conn->partial.clear();
     m_conn->partial.reserve(65536);
@@ -384,6 +398,12 @@ bool client_instance::write_backlogged() const
 
 void client_instance::on_loop_turn()
 {
+    // A connection that is up and silent is still a connection, and no
+    // completion will ever report one -- so the kernel is asked here, which is
+    // also the last thing that runs before a turn publishes its figures.
+    if (SOCKETLEY_UNLIKELY(m_connected && !m_conn_counted))
+        note_connected();
+
     if (SOCKETLEY_UNLIKELY(m_drain_due))
     {
         m_drain_due = false;
@@ -461,6 +481,28 @@ void client_instance::settle_stale(struct io_uring_cqe* cqe, io_request* req)
     }
 }
 
+// One connection, counted once, where the kernel says there is one.
+//
+// getpeername() is the question an accept() answers on the other side: it
+// fails with ENOTCONN for as long as the handshake is out, and a connect that
+// is refused never reaches a state where it succeeds.  The count used to sit
+// at the dial instead, which a non-blocking connect() answers EINPROGRESS for
+// whenever the target is not already there -- measured against a port nobody
+// held, `connections:0` beside `total_connections:5`.
+void client_instance::note_connected()
+{
+    struct sockaddr_storage peer{};
+    socklen_t len = sizeof(peer);
+    if (m_conn->fd < 0
+        || getpeername(m_conn->fd, reinterpret_cast<struct sockaddr*>(&peer), &len) < 0)
+        return;
+
+    // Per socket, because this runs every turn until it is true and a client
+    // that reconnects all day must count connections and not turns.
+    m_conn_counted = true;
+    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+}
+
 // A completion carrying bytes is the first thing that proves the peer accepted
 // the connection rather than that the kernel accepted the SQE, and it is where
 // the backoff and the --reconnect limit start counting from again.
@@ -509,9 +551,10 @@ bool client_instance::schedule_reconnect()
     if (m_reconnect_pending)
         return true; // Already armed — that IS the clock running
 
-    // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
-    int base_sec = 1 << std::min(m_reconnect_attempt, 4); // 1,2,4,8,16
-    int delay_sec = std::min(base_sec, 30);
+    // Exponential backoff: 1, 2, 4, 8 and then 16 seconds for ever, plus up to
+    // half a second of jitter -- the shift's own cap is the ceiling, and the
+    // std::min(base, 30) that used to stand beside it could never bind.
+    int delay_sec = 1 << std::min(m_reconnect_attempt, 4);
     // Time-based jitter: 0-499ms (avoids thundering herd with deterministic values)
     auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
     int jitter_ms = static_cast<int>((ns ^ (ns >> 17)) % 500);

@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -87,6 +88,10 @@ public:
 
     size_t get_connection_count() const override;
 
+    // One line, dial_attempts, which is what total_connections stopped being
+    // when it started counting connections.
+    std::string stats_lines() const override;
+
     // Lua actions
     bool lua_send(std::string_view msg) override;
 
@@ -135,6 +140,10 @@ private:
     // from the first completion that carries bytes and not from a connect()
     // that answered EINPROGRESS.
     void note_established();
+    // Count this socket in total_connections, once, and only once the kernel
+    // has a peer to name for it -- a dial is an intention and the server
+    // counts at an accept() that really happened.
+    void note_connected();
     // Every descriptor this runtime gives back goes through here, because it
     // reuses one read and one write request across reconnects and the number
     // really does come straight back.
@@ -207,6 +216,14 @@ private:
     // are storage the ring can name.
     int m_reconnect_attempt{0};
     bool m_reconnect_pending{false};
+
+    // Whether the socket now held has already been counted, lowered at every
+    // dial, so a reconnect counts a connection and a re-dial of the same dead
+    // target counts none.
+    bool m_conn_counted{false};
+    // Every dial this client has made, where total_connections used to be, so
+    // the churn a flapping target produces still has a name of its own.
+    std::atomic<uint64_t> m_stat_dial_attempts{0};
 
     // DNS cache (avoids getaddrinfo on every reconnect)
     struct sockaddr_in m_cached_addr{};
