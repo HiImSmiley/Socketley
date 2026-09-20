@@ -140,6 +140,14 @@ public:
     // "long gone", never a signed overflow, and the two interpreters hand them
     // a client's number unchecked.
     bool set_expiry(std::string_view key, int64_t seconds);
+    // EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT are one decision with four
+    // spellings, so it is made here rather than four times over two
+    // interpreters: a deadline that has already passed is a DELETION, and the
+    // answer is about whether the key was there to be given one at all.
+    // Redis's three answers, and it cannot be a bool -- "I deleted it" and "I
+    // armed it" are both 1 to the client and only one of them arms a timer.
+    enum class expire_result { no_such_key, armed, deleted };
+    expire_result expire_in(std::string_view key, int64_t n, bool millis);
     int64_t get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
     bool persist(std::string_view key);
     void check_expiry(std::string_view key);

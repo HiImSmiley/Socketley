@@ -2822,6 +2822,20 @@ std::string cache_instance::execute(std::string_view line)
 }
 
 // Zero-allocation integer append for text-mode responses
+// EXPIREAT names an absolute instant and the store takes a relative one, so
+// the difference is computed here -- saturating, because the subtraction is
+// the client's number minus the clock: `EXPIREAT k -9223372036854775808`
+// overflowed it and the wrap came out POSITIVE, so the key a client asked to
+// delete was given a deadline 292 years out instead.
+static inline int64_t saturating_until(int64_t when, int64_t now)
+{
+    int64_t d = 0;
+    if (SOCKETLEY_UNLIKELY(__builtin_sub_overflow(when, now, &d)))
+        return when > 0 ? std::numeric_limits<int64_t>::max()
+                        : std::numeric_limits<int64_t>::min();
+    return d;
+}
+
 static inline void append_int_nl(std::string& buf, int64_t v)
 {
     char tmp[24];
@@ -5079,6 +5093,19 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 
     auto& rb = conn->response_buf;
 
+    // The RESP interpreter's answered_expire, in this protocol's words.  The
+    // two protocols differ on what EXPIRE answers -- "ok"/"nil" here against
+    // 1/0 there -- and that difference is the man page's, so it is kept.  What
+    // is NOT kept is answering success for a key that was never there.
+    const auto answered_expire = [&](cache_store::expire_result r,
+                                     std::string_view yes, std::string_view no) {
+        if (r == cache_store::expire_result::no_such_key)
+        { rb.append(no.data(), no.size()); return; }
+        if (r == cache_store::expire_result::armed) mark_ttl_keys();
+        rb.append(yes.data(), yes.size());
+        replicate_command(line);
+    };
+
     // The RESP interpreter's answered_incr, in this protocol's words: the
     // store's three answers are the same three here, and the guard that
     // refuses them lives in the store precisely so both doors say so.  Sized
@@ -6180,20 +6207,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("usage: expire key seconds\n", 26);
                 return;
             }
-            int seconds;
-            if (!parse_int_sv(sec_str, seconds) || seconds <= 0)
+            // Zero and negative are not refused: Redis deletes the key and
+            // reports success, and a caller whose TTL arithmetic came out at
+            // zero means "gone now", not "this call was a mistake".
+            int64_t seconds = 0;
+            if (!parse_int_sv(sec_str, seconds))
             {
                 rb.append("error: invalid seconds\n", 23);
                 return;
             }
-            if (m_store.set_expiry(key, seconds))
-            {
-                mark_ttl_keys();
-                rb.append("ok\n", 3);
-                replicate_command(line);   // was not replicated at all
-            }
-            else
-                rb.append("nil\n", 4);
+            answered_expire(m_store.expire_in(key, seconds, false), "ok\n", "nil\n");
             break;
         }
         case fnv1a("ttl"):
@@ -6318,16 +6341,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || ms_str.empty()) { rb.append("usage: pexpire key ms\n", 22); return; }
             int64_t ms = 0;
             {
-                if (!parse_int_sv(ms_str, ms) || ms <= 0) { rb.append("error: invalid ms\n", 18); return; }
+                if (!parse_int_sv(ms_str, ms)) { rb.append("error: invalid ms\n", 18); return; }
             }
-            if (m_store.set_expiry_ms(key, ms))
-            {
-                mark_ttl_keys();
-                rb.append("1\n", 2);
-                replicate_command(line);   // was not replicated at all
-            }
-            else
-                rb.append("0\n", 2);
+            answered_expire(m_store.expire_in(key, ms, true), "1\n", "0\n");
             break;
         }
         case fnv1a("pttl"):
@@ -6346,25 +6362,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (!parse_int_sv(ts_str, unix_s)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
-                int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                int64_t remaining = unix_s - now_s;
                 // Replicated verbatim, because the argument is an absolute
                 // timestamp and the follower arrives at the same expiry
                 // however long the line took.
-                if (remaining <= 0)
-                {
-                    m_store.del(key);
-                    rb.append("1\n", 2);
-                    replicate_command(line);   // was not replicated at all
-                }
-                else if (m_store.set_expiry(key, remaining))
-                {
-                    mark_ttl_keys();
-                    rb.append("1\n", 2);
-                    replicate_command(line);   // was not replicated at all
-                }
-                else rb.append("0\n", 2);
+                answered_expire(m_store.expire_in(key, saturating_until(unix_s, now_s), false),
+                                "1\n", "0\n");
             }
             break;
         }
@@ -6378,24 +6382,12 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 if (!parse_int_sv(ts_str, unix_ms)) { rb.append("error: invalid timestamp\n", 25); return; }
             }
             {
-                int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                int64_t remaining_ms = unix_ms - now_ms;
                 // Verbatim like expireat and, like it once was, this was not
                 // replicated at all.
-                if (remaining_ms <= 0)
-                {
-                    m_store.del(key);
-                    rb.append("1\n", 2);
-                    replicate_command(line);
-                }
-                else if (m_store.set_expiry_ms(key, remaining_ms))
-                {
-                    mark_ttl_keys();
-                    rb.append("1\n", 2);
-                    replicate_command(line);
-                }
-                else rb.append("0\n", 2);
+                answered_expire(m_store.expire_in(key, saturating_until(unix_ms, now_ms), true),
+                                "1\n", "0\n");
             }
             break;
         }
@@ -8124,6 +8116,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
+    // EXPIRE's whole answer, for all four spellings: 0 when there was no key,
+    // 1 when there was -- and the deletion is replicated exactly like the
+    // arming, because a follower that skipped it keeps a key the leader
+    // dropped.  Before, EXPIREAT and PEXPIREAT answered 1 for a key that had
+    // never existed AND replicated that, so a follower was told about a
+    // deadline for nothing.
+    const auto answered_expire = [&](cache_store::expire_result r) {
+        if (r == cache_store::expire_result::no_such_key)
+        { resp::encode_integer_into(rb, 0); return; }
+        if (r == cache_store::expire_result::armed) mark_ttl_keys();
+        repl(args, argc);
+        resp::encode_integer_into(rb, 1);
+    };
+
     // One place turns the store's three answers into a reply, because four
     // commands share them and INCR wording the overflow differently from
     // DECRBY is the split this file has paid for before.  True means the write
@@ -9289,16 +9295,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            int sec = 0;
-            if (!parse_int_sv(args[2], sec) || sec <= 0) { resp::encode_error_into(rb, "invalid seconds"); return; }
-            if (m_store.set_expiry(args[1], sec))
-            {
-                mark_ttl_keys();
-                repl(args, argc);
-                resp::encode_integer_into(rb, 1);
-            }
-            else
-                resp::encode_integer_into(rb, 0);
+            // Zero and negative are not refused: Redis deletes the key and
+            // says 1, and a caller whose TTL arithmetic came out at zero means
+            // "gone now", not "this call was a mistake".
+            int64_t sec = 0;
+            if (!parse_int_sv(args[2], sec)) { resp::encode_error_into(rb, "invalid seconds"); return; }
+            answered_expire(m_store.expire_in(args[1], sec, false));
             break;
         }
         case fnv1a("ttl"):
@@ -9405,15 +9407,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
-            if (!parse_int_sv(args[2], ms) || ms <= 0) { resp::encode_error_into(rb, "invalid expire time"); return; }
-            if (m_store.set_expiry_ms(args[1], ms))
-            {
-                mark_ttl_keys();
-                repl(args, argc);
-                resp::encode_integer_into(rb, 1);
-            }
-            else
-                resp::encode_integer_into(rb, 0);
+            if (!parse_int_sv(args[2], ms)) { resp::encode_error_into(rb, "invalid expire time"); return; }
+            answered_expire(m_store.expire_in(args[1], ms, true));
             break;
         }
         case fnv1a("pttl"):
@@ -9430,13 +9425,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t unix_s = 0;
             if (!parse_int_sv(args[2], unix_s)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
-                int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                int64_t remaining = unix_s - now_s;
-                if (remaining <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
-                else if (m_store.set_expiry(args[1], remaining))
-                { mark_ttl_keys(); repl(args, argc); resp::encode_integer_into(rb, 1); }
-                else resp::encode_integer_into(rb, 0);
+                answered_expire(m_store.expire_in(args[1], saturating_until(unix_s, now_s), false));
             }
             break;
         }
@@ -9447,13 +9438,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t unix_ms = 0;
             if (!parse_int_sv(args[2], unix_ms)) { resp::encode_error_into(rb, "invalid timestamp"); return; }
             {
-                int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                int64_t remaining_ms = unix_ms - now_ms;
-                if (remaining_ms <= 0) { m_store.del(args[1]); repl(args, argc); resp::encode_integer_into(rb, 1); }
-                else if (m_store.set_expiry_ms(args[1], remaining_ms))
-                { mark_ttl_keys(); repl(args, argc); resp::encode_integer_into(rb, 1); }
-                else resp::encode_integer_into(rb, 0);
+                answered_expire(m_store.expire_in(args[1], saturating_until(unix_ms, now_ms), true));
             }
             break;
         }

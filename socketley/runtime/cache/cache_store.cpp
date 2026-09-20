@@ -1105,6 +1105,30 @@ bool cache_store::set_expiry_ms(std::string_view key, int64_t ms)
     return true;
 }
 
+cache_store::expire_result cache_store::expire_in(std::string_view key, int64_t n, bool millis)
+{
+    // An expired key does not exist, so it cannot be given a new deadline --
+    // without this, EXPIRE on a key past its deadline but not yet swept
+    // overwrote the deadline and brought the key back.
+    check_expiry(key);
+    if (!exists(key))
+        return expire_result::no_such_key;
+
+    // Redis deletes rather than refusing, and it is the same command either
+    // way: `EXPIRE k 0` and `EXPIREAT k <yesterday>` differ only in who did
+    // the subtraction.  del() takes the deadline with the value, which is what
+    // keeps m_expiry from holding a name nothing answers to.
+    if (n <= 0)
+    {
+        del(key);
+        return expire_result::deleted;
+    }
+
+    if (millis) set_expiry_ms(key, n);
+    else        set_expiry(key, n);
+    return expire_result::armed;
+}
+
 int64_t cache_store::get_pttl(std::string_view key) const
 {
     if (!exists(key))
