@@ -286,13 +286,28 @@ void client_instance::arm_read()
                         m_conn_generation };
     if (m_use_provided_bufs)
         m_conn->read_pending = m_loop->submit_read_provided(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req);
-    else
+
+    // A refused submission is the ring being momentarily full, not the peer
+    // being gone -- and the arm below is the one the cache and the server fall
+    // back to for exactly that.  Without it a busy ring cost the whole
+    // connection: socket closed, on_disconnect fired, and at least a second of
+    // backoff before the client tried again.  read_buf is already here for the
+    // case where no ring exists at all, and handle_read's own ENOBUFS path
+    // takes this same arm with this same reset.
+    //
+    // The type goes back to op_read first, because leaving it as a
+    // provided-buffer type makes the handler append ring buffer 0's contents
+    // and return a buffer it never took.
+    if (!m_conn->read_pending)
+    {
+        m_conn->read_req.type = op_read;
         m_conn->read_pending = m_loop->submit_read(m_conn->fd, m_conn->read_buf,
                                                   sizeof(m_conn->read_buf), &m_conn->read_req);
+    }
 
-    // Nothing reached the ring, so no completion will arrive for this socket and
-    // nothing would ever wake this client again; it would sit connected and deaf
-    // until the runtime stopped.
+    // Nothing reached the ring at all, so no completion will arrive for this
+    // socket and nothing would ever wake this client again; it would sit
+    // connected and deaf until the runtime stopped.
     if (!m_conn->read_pending)
         drop_connection();
 }
