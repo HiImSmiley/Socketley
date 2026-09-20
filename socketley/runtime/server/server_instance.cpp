@@ -915,6 +915,22 @@ static const std::shared_ptr<const std::string>& http_426_response()
     return resp;
 }
 
+// RFC 6455 4.2.1 makes Sec-WebSocket-Key mandatory and 4.2.2 answers a
+// handshake this end will not complete with an HTTP error, 400 being the one
+// it names.  Named in the body rather than sharing the bare 400 because the
+// one thing wrong with this request is a header the client can add, and a
+// refusal that does not say which is a refusal with nothing to act on.
+static const std::shared_ptr<const std::string>& http_400_ws_key_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 48\r\n"
+        "Connection: close\r\n\r\n"
+        "this WebSocket upgrade has no Sec-WebSocket-Key\n");
+    return resp;
+}
+
 static const std::shared_ptr<const std::string>& http_413_response()
 {
     static const auto resp = std::make_shared<const std::string>(
@@ -3839,12 +3855,12 @@ reparse:
                     {
                         case fnv1a("upgrade"):
                         {
-                            // Value after ": "
-                            size_t val_start = colon + 1;
-                            while (val_start < line.size() && line[val_start] == ' ')
-                                ++val_start;
-                            std::string_view val = line.substr(val_start);
-                            if (fnv1a_lower(val) == fnv1a("websocket"))
+                            // Through the same http_trim_ows the plain-HTTP
+                            // scan below uses, because OWS is SP or HTAB and
+                            // skipping only spaces left "Upgrade: websocket "
+                            // matching nothing at all.
+                            if (fnv1a_lower(http_trim_ows(line.substr(colon + 1)))
+                                == fnv1a("websocket"))
                                 has_upgrade = true;
                             break;
                         }
@@ -3880,11 +3896,14 @@ reparse:
                         }
                         case fnv1a("sec-websocket-key"):
                         {
-                            size_t val_start = colon + 1;
-                            while (val_start < line.size() && line[val_start] == ' ')
-                                ++val_start;
-                            ws_key_pos = line_start + val_start;
-                            ws_key_end = line_end;
+                            // Trimmed for a second reason on top of the one
+                            // above: the nonce is hashed, so whitespace folded
+                            // into it makes this end hash a string the client
+                            // did not and return an accept the client rejects.
+                            const std::string_view kv =
+                                http_trim_ows(line.substr(colon + 1));
+                            ws_key_pos = static_cast<size_t>(kv.data() - hdrs.data());
+                            ws_key_end = ws_key_pos + kv.size();
                             break;
                         }
                         case fnv1a("cookie"):
@@ -3909,7 +3928,12 @@ reparse:
                 line_start = line_end + 2;
             }
 
-            if (!has_upgrade || ws_key_pos == std::string_view::npos)
+            // A nonce this end can hash, which an absent field and a field
+            // whose whole value was whitespace both fail to be.
+            const bool ws_key_present =
+                ws_key_pos != std::string_view::npos && ws_key_end > ws_key_pos;
+
+            if (!has_upgrade)
             {
                 // Not a WebSocket upgrade — treat as HTTP request
                 conn->proto = proto_http;
@@ -3947,6 +3971,21 @@ reparse:
                 if (SOCKETLEY_UNLIKELY(ws_version_seen && !ws_version_13))
                 {
                     refuse_http_request(conn, http_426_response());
+                    return;
+                }
+
+                // Only "no nonce at all" is refused.  A key that is PRESENT
+                // but does not decode to sixteen bytes (RFC 6455 4.1) still
+                // gets 101, because the accept computed for it is correct for
+                // the key that was sent and such a client works end to end
+                // today -- so refusing it would take away a connection that
+                // works, over a rule that protects the client and not this
+                // end.  Missing is the other case: it cannot be completed at
+                // all, and until this it was not refused but served as an
+                // ordinary GET.
+                if (SOCKETLEY_UNLIKELY(!ws_key_present))
+                {
+                    refuse_http_request(conn, http_400_ws_key_response());
                     return;
                 }
 
