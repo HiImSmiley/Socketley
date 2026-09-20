@@ -136,6 +136,9 @@ public:
     const hash_inner* hash_ptr(std::string_view key) const;
 
     // --- TTL / Expiry ---
+    // Both of these saturate: the deadline an absurd TTL means is "never" or
+    // "long gone", never a signed overflow, and the two interpreters hand them
+    // a client's number unchecked.
     bool set_expiry(std::string_view key, int64_t seconds);
     int64_t get_ttl(std::string_view key) const;    // -1 = no ttl, -2 = key not found
     bool persist(std::string_view key);
@@ -257,7 +260,14 @@ public:
                              const scan_filter& filter) const;
 
     // --- Atomic increment ---
-    bool incr(std::string_view key, int64_t delta, int64_t& result);
+    // An increment can be refused for two different reasons and the caller has
+    // to tell them apart, exactly as zincrby's does: a value that is not a
+    // number is about the client's KEY, a sum past int64 is about its
+    // arithmetic, and Redis names the second one separately.  not_an_integer
+    // carries the memory refusal too, as the `false` it replaces did -- folding
+    // that one is an older imprecision and not this enum's.
+    enum class incr_result { ok, not_an_integer, would_overflow };
+    incr_result incr(std::string_view key, int64_t delta, int64_t& result);
 
     // append() sentinels, where npos means the wrong type, because a memory
     // refusal reported as the unchanged length was indistinguishable from a
@@ -348,8 +358,8 @@ public:
 
     // --- Hashes, the field spellings ---
     bool hexists(std::string_view key, std::string_view field) const;
-    bool hincrby(std::string_view key, std::string_view field, int64_t delta,
-                 int64_t& result);
+    incr_result hincrby(std::string_view key, std::string_view field, int64_t delta,
+                        int64_t& result);
     // 1 set, 0 already there, -1 type conflict -- sadd's answers.
     int  hsetnx(std::string_view key, std::string_view field, std::string_view val);
 

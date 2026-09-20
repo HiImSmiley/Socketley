@@ -7,6 +7,7 @@
 #include <random>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
@@ -859,10 +860,17 @@ int64_t cache_store::expire_time(std::string_view key, bool millis) const
     // two clocks measured now.
     const auto now_steady = std::chrono::steady_clock::now();
     const auto now_wall   = std::chrono::system_clock::now();
-    const auto delta      = e->second - now_steady;
-    const auto when       = now_wall + delta;
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        when.time_since_epoch()).count();
+    // Narrowed to milliseconds BEFORE the two clocks are added, because a
+    // saturated deadline is most of int64 in nanoseconds and adding the wall
+    // clock's own nanoseconds to it overflows -- the guard then covers what is
+    // left, answering "never" for a deadline that says never.
+    const auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              e->second - now_steady).count();
+    const auto now_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now_wall.time_since_epoch()).count();
+    int64_t ms = 0;
+    if (__builtin_expect(__builtin_add_overflow(now_ms, delta_ms, &ms), 0))
+        ms = std::numeric_limits<int64_t>::max();
     return millis ? ms : ms / 1000;
 }
 
@@ -975,12 +983,43 @@ const hash_inner* cache_store::hash_ptr(std::string_view key) const
 
 // ─── TTL / Expiry ───
 
+// The deadline an absurd TTL means is "never" or "long gone", not a signed
+// overflow -- the same saturation journal_mutation's deadline_of already does,
+// moved to where the two interpreters actually arrive.  This clock counts
+// nanoseconds, so `seconds(n)` multiplies by a billion: every TTL past ~9.2e9 s
+// (or ~9.2e12 ms) wrapped the deadline into the PAST, and the key a client had
+// just asked to keep longest was deleted on the spot.
+static std::chrono::steady_clock::time_point saturating_deadline(int64_t n, int64_t ticks_per_unit)
+{
+    using clock = std::chrono::steady_clock;
+    int64_t ticks = 0;
+    int64_t at    = 0;
+    const int64_t now = clock::now().time_since_epoch().count();
+    if (__builtin_expect(__builtin_mul_overflow(n, ticks_per_unit, &ticks) ||
+                         __builtin_add_overflow(now, ticks, &at), 0))
+    {
+        // "Never" is the clock's own far end, but "long gone" is one tick ago
+        // rather than time_point::min(): the readers subtract this point from
+        // now(), and min() would only move the overflow into get_pttl() and
+        // expire_time().
+        return n > 0 ? clock::time_point::max()
+                     : clock::time_point(clock::duration(now)) - clock::duration(1);
+    }
+    return clock::time_point(clock::duration(at));
+}
+
+// Ticks of this clock in one second, read off the clock rather than assumed.
+static_assert(std::chrono::steady_clock::duration::period::num == 1,
+              "saturating_deadline computes ticks per second as the period's denominator");
+static constexpr int64_t ticks_per_second = std::chrono::steady_clock::duration::period::den;
+static constexpr int64_t ticks_per_milli  = ticks_per_second / 1000;
+
 bool cache_store::set_expiry(std::string_view key, int64_t seconds)
 {
     if (!exists(key))
         return false;
 
-    auto tp = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    auto tp = saturating_deadline(seconds, ticks_per_second);
     auto it = m_expiry.find(key);
     if (it != m_expiry.end())
         it->second = tp;
@@ -1057,7 +1096,7 @@ bool cache_store::set_expiry_ms(std::string_view key, int64_t ms)
     if (!exists(key))
         return false;
 
-    auto tp = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    auto tp = saturating_deadline(ms, ticks_per_milli);
     auto it = m_expiry.find(key);
     if (it != m_expiry.end())
         it->second = tp;
@@ -1356,7 +1395,7 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
     return 0;  // exhausted all keys
 }
 
-bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
+cache_store::incr_result cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
 {
     check_expiry(key);
 
@@ -1368,12 +1407,18 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
     {
         auto [ptr, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), val);
         if (ec != std::errc{} || ptr != it->second.data() + it->second.size())
-            return false;  // not an integer
+            return incr_result::not_an_integer;
     }
     else if (has_type_conflict_for_string(key))
-        return false;
+        return incr_result::not_an_integer;
 
-    val += delta;
+    // Checked before the sum and not after it, because signed overflow is
+    // undefined and there is no "after" to inspect: two INCRBY INT64_MAX in a
+    // row answered -2, which is a counter a client believes.  incrbyfloat and
+    // zincrby both refuse their own unrepresentable result already; this was
+    // the arithmetic that did not.
+    if (__builtin_expect(__builtin_add_overflow(val, delta, &val), 0))
+        return incr_result::would_overflow;
     result = val;
 
     char buf[24];
@@ -1388,7 +1433,7 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
         const size_t held = stored_string(it->second);
         const size_t want = rewritten_string(it->second, sv.size());
         if (want > held && !check_memory(want - held, key))
-            return false;
+            return incr_result::not_an_integer;
         it = m_data.find(key);   // see set(): named to check_memory, but not trusted here
     }
 
@@ -1401,12 +1446,12 @@ bool cache_store::incr(std::string_view key, int64_t delta, int64_t& result)
     else
     {
         if (!check_memory(stored_string(sv.size()) + new_key_cost(key.size()), key))
-            return false;
+            return incr_result::not_an_integer;
         auto nit = m_data.emplace(std::string(key), std::string(sv)).first;
         track_add(entry_cost(nit->first, nit->second));
     }
     touch_lru(key);
-    return true;
+    return incr_result::ok;
 }
 
 size_t cache_store::append(std::string_view key, std::string_view suffix)
@@ -1940,8 +1985,8 @@ bool cache_store::hexists(std::string_view key, std::string_view field) const
     return it != m_hashes.end() && it->second.count(field) > 0;
 }
 
-bool cache_store::hincrby(std::string_view key, std::string_view field,
-                          int64_t delta, int64_t& result)
+cache_store::incr_result cache_store::hincrby(std::string_view key, std::string_view field,
+                                              int64_t delta, int64_t& result)
 {
     check_expiry(key);
 
@@ -1955,17 +2000,21 @@ bool cache_store::hincrby(std::string_view key, std::string_view field,
             auto [ptr, ec] = std::from_chars(fit->second.data(),
                                              fit->second.data() + fit->second.size(), val);
             if (ec != std::errc{} || ptr != fit->second.data() + fit->second.size())
-                return false;
+                return incr_result::not_an_integer;
         }
     }
 
-    val += delta;
+    // The same guard incr() carries, and refused before the write for the same
+    // reason: the field must be left as it was.
+    if (__builtin_expect(__builtin_add_overflow(val, delta, &val), 0))
+        return incr_result::would_overflow;
     result = val;
 
     char buf[24];
     auto [end, ec2] = std::to_chars(buf, buf + sizeof(buf), val);
     (void)ec2;
-    return hset(key, field, std::string_view(buf, static_cast<size_t>(end - buf)));
+    return hset(key, field, std::string_view(buf, static_cast<size_t>(end - buf)))
+         ? incr_result::ok : incr_result::not_an_integer;
 }
 
 int cache_store::hsetnx(std::string_view key, std::string_view field, std::string_view val)

@@ -850,7 +850,7 @@ TEST_CASE("cache_store new methods")
     SUBCASE("incr creates key")
     {
         int64_t result = 0;
-        CHECK(store.incr("counter", 1, result));
+        CHECK(store.incr("counter", 1, result) == cache_store::incr_result::ok);
         CHECK(result == 1);
         std::string out;
         CHECK(store.get("counter", out));
@@ -861,7 +861,7 @@ TEST_CASE("cache_store new methods")
     {
         store.set("counter", "10");
         int64_t result = 0;
-        CHECK(store.incr("counter", 5, result));
+        CHECK(store.incr("counter", 5, result) == cache_store::incr_result::ok);
         CHECK(result == 15);
     }
 
@@ -869,15 +869,69 @@ TEST_CASE("cache_store new methods")
     {
         store.set("k", "abc");
         int64_t result = 0;
-        CHECK_FALSE(store.incr("k", 1, result));
+        CHECK(store.incr("k", 1, result) == cache_store::incr_result::not_an_integer);
     }
 
     SUBCASE("decr")
     {
         store.set("k", "10");
         int64_t result = 0;
-        CHECK(store.incr("k", -1, result));
+        CHECK(store.incr("k", -1, result) == cache_store::incr_result::ok);
         CHECK(result == 9);
+    }
+
+    // The sum that leaves int64 is refused, and -- the half of it a test that
+    // only reads the return value would miss -- the stored value is the one
+    // that was there before.
+    SUBCASE("incr past INT64_MAX is refused and writes nothing")
+    {
+        store.set("k", "9223372036854775807");
+        int64_t result = 0;
+        CHECK(store.incr("k", 1, result) == cache_store::incr_result::would_overflow);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "9223372036854775807");
+    }
+
+    SUBCASE("incr past INT64_MIN is refused and writes nothing")
+    {
+        store.set("k", "-9223372036854775808");
+        int64_t result = 0;
+        CHECK(store.incr("k", -1, result) == cache_store::incr_result::would_overflow);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "-9223372036854775808");
+    }
+
+    SUBCASE("hincrby past INT64_MAX is refused and leaves the field")
+    {
+        store.hset("h", "f", "9223372036854775807");
+        int64_t result = 0;
+        CHECK(store.hincrby("h", "f", 1, result) == cache_store::incr_result::would_overflow);
+        const std::string* held = store.hget("h", "f");
+        REQUIRE(held != nullptr);
+        CHECK(*held == "9223372036854775807");
+    }
+
+    // The deadline an absurd TTL means is "never", and the two readers agree
+    // with it: an overflow here wrapped into the past and the key was gone on
+    // the next touch.
+    SUBCASE("a TTL past the clock's range saturates rather than wrapping")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", 9223372036854775807LL));
+        CHECK(store.get_pttl("k") > 0);
+        CHECK(store.get_ttl("k") > 0);
+        CHECK(store.expire_time("k", true) > 0);
+        store.check_expiry("k");
+        std::string out;
+        CHECK(store.get("k", out));
+
+        store.set("k2", "v");
+        CHECK(store.set_expiry("k2", 9223372036854775807LL));
+        CHECK(store.get_ttl("k2") > 0);
+        store.check_expiry("k2");
+        CHECK(store.get("k2", out));
     }
 
     SUBCASE("append creates key")

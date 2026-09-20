@@ -5079,6 +5079,26 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
 
     auto& rb = conn->response_buf;
 
+    // The RESP interpreter's answered_incr, in this protocol's words: the
+    // store's three answers are the same three here, and the guard that
+    // refuses them lives in the store precisely so both doors say so.  Sized
+    // from the literals, because a hand count one short eats the newline and
+    // runs the next reply into the back of this one.
+    //
+    // Every caller names the store call on its own line first.  Folded into
+    // the argument list it read `result` before incr() had written it --
+    // argument order is unspecified, gcc chose right-to-left, and every
+    // SUCCESSFUL increment answered 0.
+    const auto answered_incr = [&rb](cache_store::incr_result st, int64_t result) {
+        if (st == cache_store::incr_result::ok) { append_int_nl(rb, result); return true; }
+        static constexpr std::string_view overflowed = "error: increment or decrement would overflow\n";
+        static constexpr std::string_view not_int    = "error: not an integer\n";
+        const std::string_view msg =
+            st == cache_store::incr_result::would_overflow ? overflowed : not_int;
+        rb.append(msg.data(), msg.size());
+        return false;
+    };
+
     // ── MULTI ───────────────────────────────────────────────────────────────
     // Ahead of the dispatch, because between MULTI and EXEC a command is not
     // run at all: it is text on a queue.  EXEC then re-enters this function
@@ -5348,13 +5368,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
             if (args.empty()) { rb.append("usage: incr key\n"); return; }
             int64_t result = 0;
-            if (!m_store.incr(args, 1, result))
-                rb.append("error: not an integer\n", 22);
-            else
-            {
-                append_int_nl(rb, result);
+            const auto st = m_store.incr(args, 1, result);
+            if (answered_incr(st, result))
                 replicate_command(line);
-            }
             break;
         }
         case fnv1a("decr"):
@@ -5362,13 +5378,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (m_mode == cache_mode_readonly) { rb.append("denied: readonly mode\n", 22); return; }
             if (args.empty()) { rb.append("usage: decr key\n"); return; }
             int64_t result = 0;
-            if (!m_store.incr(args, -1, result))
-                rb.append("error: not an integer\n", 22);
-            else
-            {
-                append_int_nl(rb, result);
+            const auto st = m_store.incr(args, -1, result);
+            if (answered_incr(st, result))
                 replicate_command(line);
-            }
             break;
         }
         case fnv1a("incrby"):
@@ -5379,13 +5391,9 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             int64_t delta = 0;
             if (!parse_int_sv(delta_str, delta)) { rb.append("error: invalid delta\n", 21); return; }
             int64_t result = 0;
-            if (!m_store.incr(key, delta, result))
-                rb.append("error: not an integer\n", 22);
-            else
-            {
-                append_int_nl(rb, result);
+            const auto st = m_store.incr(key, delta, result);
+            if (answered_incr(st, result))
                 replicate_command(line);
-            }
             break;
         }
         case fnv1a("decrby"):
@@ -5395,14 +5403,18 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (key.empty() || delta_str.empty()) { rb.append("usage: decrby key delta\n", 24); return; }
             int64_t delta = 0;
             if (!parse_int_sv(delta_str, delta)) { rb.append("error: invalid delta\n", 21); return; }
-            int64_t result = 0;
-            if (!m_store.incr(key, -delta, result))
-                rb.append("error: not an integer\n", 22);
-            else
+            // See the RESP twin: INT64_MIN has no negation, so `-delta` is
+            // undefined before the store is reached at all.
+            if (SOCKETLEY_UNLIKELY(delta == std::numeric_limits<int64_t>::min()))
             {
-                append_int_nl(rb, result);
-                replicate_command(line);
+                static constexpr std::string_view msg = "error: decrement would overflow\n";
+                rb.append(msg.data(), msg.size());
+                return;
             }
+            int64_t result = 0;
+            const auto st = m_store.incr(key, -delta, result);
+            if (answered_incr(st, result))
+                replicate_command(line);
             break;
         }
         case fnv1a("append"):
@@ -6936,9 +6948,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (m_mode == cache_mode_readonly) { rb.append("error: readonly mode\n", 21); return; }
             int64_t d = 0, out = 0;
             if (!parse_int_sv(d_s, d)) { rb.append("error: invalid delta\n", 21); return; }
-            if (!m_store.hincrby(key, f, d, out))
-            { rb.append("error: not an integer\n", 22); return; }
-            rb.append(std::to_string(out)); rb.push_back('\n');
+            const auto hst = m_store.hincrby(key, f, d, out);
+            if (!answered_incr(hst, out)) return;
             replicate_command(line);
             break;
         }
@@ -8113,6 +8124,22 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // Dispatch via case-insensitive FNV-1a — no string allocation
     auto& rb = conn->response_buf;
 
+    // One place turns the store's three answers into a reply, because four
+    // commands share them and INCR wording the overflow differently from
+    // DECRBY is the split this file has paid for before.  True means the write
+    // happened, and is the caller's cue to replicate it.
+    //
+    // Every caller names the store call on its own line first: see the text
+    // twin for what folding it into the argument list cost.
+    const auto answered_incr = [&rb](cache_store::incr_result st, int64_t result) {
+        if (st == cache_store::incr_result::ok)
+        { resp::encode_integer_into(rb, result); return true; }
+        resp::encode_error_into(rb, st == cache_store::incr_result::would_overflow
+            ? "increment or decrement would overflow"
+            : "value is not an integer or out of range");
+        return false;
+    };
+
     // ── MULTI, over RESP ────────────────────────────────────────────────────
     // The same queue the text protocol fills, with the one difference RESP
     // forces: EXEC answers ONE array holding every reply, so the replies are
@@ -8557,10 +8584,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t result = 0;
-            if (!m_store.incr(args[1], 1, result))
-                resp::encode_error_into(rb, "value is not an integer or out of range");
-            else
-            { resp::encode_integer_into(rb, result); repl(args, argc); }
+            const auto st = m_store.incr(args[1], 1, result);
+            if (answered_incr(st, result)) repl(args, argc);
             break;
         }
         case fnv1a("decr"):
@@ -8568,10 +8593,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t result = 0;
-            if (!m_store.incr(args[1], -1, result))
-                resp::encode_error_into(rb, "value is not an integer or out of range");
-            else
-            { resp::encode_integer_into(rb, result); repl(args, argc); }
+            const auto st = m_store.incr(args[1], -1, result);
+            if (answered_incr(st, result)) repl(args, argc);
             break;
         }
         case fnv1a("incrby"):
@@ -8581,10 +8604,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int64_t delta = 0;
             if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
             int64_t result = 0;
-            if (!m_store.incr(args[1], delta, result))
-                resp::encode_error_into(rb, "value is not an integer or out of range");
-            else
-            { resp::encode_integer_into(rb, result); repl(args, argc); }
+            const auto st = m_store.incr(args[1], delta, result);
+            if (answered_incr(st, result)) repl(args, argc);
             break;
         }
         case fnv1a("decrby"):
@@ -8593,11 +8614,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t delta = 0;
             if (!parse_int_sv(args[2], delta)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
+            // The one refusal the store cannot make: INT64_MIN has no negation
+            // in int64, so `-delta` is undefined BEFORE the call and there is
+            // nothing left for incr()'s own guard to inspect.
+            if (SOCKETLEY_UNLIKELY(delta == std::numeric_limits<int64_t>::min()))
+            { resp::encode_error_into(rb, "decrement would overflow"); break; }
             int64_t result = 0;
-            if (!m_store.incr(args[1], -delta, result))
-                resp::encode_error_into(rb, "value is not an integer or out of range");
-            else
-            { resp::encode_integer_into(rb, result); repl(args, argc); }
+            const auto st = m_store.incr(args[1], -delta, result);
+            if (answered_incr(st, result)) repl(args, argc);
             break;
         }
         case fnv1a("append"):
@@ -10007,8 +10031,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (!parse_int_sv(args[3], d))
             { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
             int64_t out = 0;
-            if (m_store.hincrby(args[1], args[2], d, out))
+            const auto hst = m_store.hincrby(args[1], args[2], d, out);
+            if (hst == cache_store::incr_result::ok)
             { resp::encode_integer_into(rb, out); repl(args, argc); }
+            else if (hst == cache_store::incr_result::would_overflow)
+                resp::encode_error_into(rb, "increment or decrement would overflow");
             else resp::encode_error_code_into(rb, "ERR hash value is not an integer");
             break;
         }
