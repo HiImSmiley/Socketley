@@ -9,11 +9,16 @@
 # out whole connections without knowing the key, and the shard that accepted a
 # foreign key relays it to the owner.
 #
-# Measured on this tree: two shards behind one address serve 0.89x of what ONE
-# shard serves, for 1.9 cores instead of 1.0 -- a crossing costs about 13 us of
-# server CPU where answering a local key costs 5.8. The flag is a regression in
-# that arrangement and reads like a scaling feature, so the runtime now names
-# the cost at start.
+# Measured on this tree: two shards behind one address take 1.91 cores and
+# return 1.05x of what ONE shard returns, four take 3.95 and return 1.75x, while
+# the same four slot-routed return 2.80x. Per-operation cost roughly doubles,
+# 4.16 us at one shard against 7.60 at two. The flag reads like a scaling
+# feature and in that arrangement is mostly not one, so the runtime names the
+# cost at start.
+#
+# The size of it depends on how well the crossings batch, and the CLIENT decides
+# that: the same 192 connections as 12x16 give 0.90x where 8x24 give 1.05x. That
+# is why the line names the mechanism and not a ratio.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #

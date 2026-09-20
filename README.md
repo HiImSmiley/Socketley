@@ -153,7 +153,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Cache**:In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
-- **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime. On a **cache** add `--cluster` and point a cluster-aware client at it: behind one address the shard a connection lands on relays every key it does not own, and at two shards that measured *below* one shard — see **Sharding a cache** under Performance
+- **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime. On a **cache** add `--cluster` and point a cluster-aware client at it: behind one address the shard a connection lands on relays every key it does not own, which measured 1.75× for 3.95 cores at four shards against 2.80× slot-routed — see **Sharding a cache** under Performance
 - **Process isolation**:Every runtime is a supervised worker process, so one runtime cannot take the daemon down with it — there is no flag and no in-daemon mode; the whole cross-runtime Lua API works across the boundary
 - **Unix sockets**:`--listen unix:/path` on a listener and `--backend unix:/path` for a proxy's backends
 - **CPU placement**:`--cpus max | 0-3 | 0,1,2,3` says where the I/O may run
@@ -458,40 +458,45 @@ a key belongs to exactly one shard, `SO_REUSEPORT` hands out whole connections
 without knowing the key, and the shard that accepted a foreign key relays it to
 the owner.
 
-Measured 2026-09-20, GET at depth 1, daemon pinned to four cores with twelve
-`redis-benchmark` processes on the other twelve, five interleaved passes with the
-order rotated, first discarded, clock probe on both ends (2.18–2.23 GHz). Client
-CPU beside every row, because a capped client inverts the sign of a comparison
-before it changes its size — at no point did the client exceed 7.2 of its 12
-cores.
+Measured 2026-09-20, daemon pinned to four cores with eight `redis-benchmark`
+processes of 24 connections each on the other twelve, GET at depth 1, six
+interleaved passes with the order rotated, first discarded, clock probe on both
+ends (2.15–2.23 GHz). Client CPU beside every row, because a capped client
+inverts the sign of a comparison before it changes its size — it never passed
+5.8 of its 12 cores.
 
-| arrangement | throughput | server cores | µs server CPU/op |
-|---|---|---|---|
-| 1 shard | 172,020 GET/s | 1.00 | 5.81 |
-| 2 shards, one address | 153,832 GET/s | 1.91 | 12.41 |
-| 2 shards, slot-routed | 238,591 GET/s | 1.92 | 8.06 |
-| 4 shards, one address | 229,040 GET/s | 3.94 | 17.22 |
-| 4 shards, slot-routed | 344,169 GET/s | 3.75 | 10.90 |
+| arrangement | GET/s | × 1 shard | server cores | µs CPU/op |
+|---|---|---|---|---|
+| 1 shard | 240,671 | 1.00 | 1.00 | 4.16 |
+| 2 shards, one address | 251,959 | 1.05 | 1.91 | 7.60 |
+| 4 shards, one address | 421,093 | 1.75 | 3.95 | 9.38 |
+| 4 shards, slot-routed | 673,017 | 2.80 | 3.65 | 5.43 |
 
-**Two shards behind one address serve less than one shard does** — 0.89×, on four
-passes whose ranges do not overlap ([152,051..156,476] against
-[171,230..174,757]), for 1.9 cores instead of 1.0. Half the keys belong to the
-sibling; a crossing costs about **13 µs of server CPU** where serving a local key
-costs 5.8, so the second core is spent relaying rather than answering. At four
-shards it turns positive at 1.31×, still a third short of the same four shards
-with a client that picks the owner.
+**Behind one address the shards buy far less than the cores they take.** Two of
+them take 1.91 cores and return 1.05×; four take 3.95 and return 1.75×. Half the
+keys, then three quarters, belong to a sibling, and the per-operation cost of
+serving them roughly doubles — 4.16 µs at one shard against 7.60 at two and 9.38
+at four. Point a client that picks the owner at the same four shards and they
+return **2.80×** at 5.43 µs, which is most of what the crossings were costing.
 
-**The ceiling above that is the machine, not this flag.** Four shards routed by
-key reach 2.00×. Four independent `redis-server` processes on the same four
-cores, driven the same way, reach 2.09× — so neither scales linearly on loopback
-here, and socketley is ahead of Redis in every row of that control (1.12× / 1.03×
-/ 1.09× at one, two and four active).
+**How well the crossings batch decides the size of this, and the client decides
+that.** The mesh queues a crossing and flushes once per loop turn, so requests
+that arrive together cross together. At the same 192 connections, twelve client
+processes of sixteen connections give the two-shard arm 0.90× where eight of
+twenty-four give it 1.05× — while the one-shard arm reads 235,421 and 240,671,
+unmoved. On a floor of two processes and two rings, one crossing at a time costs
+8.13 µs where thirty-two in a batch cost 282 ns apiece. **A figure for this flag
+is a figure for an arrival pattern**, and the table above is the friendlier of
+the two shapes tried.
+
+**The ceiling above that is the machine, not this flag.** Four independent
+`redis-server` processes on the same four cores, driven the same way, reach
+2.88× where four slot-routed shards reach 2.80× — and socketley is ahead of them
+in absolute throughput at every count tried, 1.12× at one and 1.09× at four.
 
 **What was not established.** The curve above four shards. `redis-benchmark`
 costs two to three times the server's CPU per operation, so on sixteen cores the
-server can never be given more than four or five and still be saturated; an
-earlier arrangement with eight server cores read 7.33 and 7.95 of eight client
-cores at four and eight shards and those rows are withdrawn rather than quoted.
+server can never be given more than four or five and still be saturated.
 Settling it needs a C client of the kind `test/benchmark/floor_*.c` already are.
 
 ### Not re-measured

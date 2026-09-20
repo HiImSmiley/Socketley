@@ -657,10 +657,10 @@ bool cache_instance::setup(event_loop& loop)
                   + std::to_string(m_shard_n) + " shards share one address, so "
                   + std::to_string(m_shard_n - 1) + " of every "
                   + std::to_string(m_shard_n) + " keys reach a shard that does "
-                  "not own them and are relayed to the one that does -- a "
-                  "crossing costs about twice what serving the key does, and at "
-                  "two shards this measured BELOW one shard.  Add --cluster and "
-                  "point a cluster-aware client at it, or use --shards 1").c_str());
+                  "not own them and are relayed to the one that does -- which "
+                  "roughly doubles what an operation costs, so these shards buy "
+                  "far less throughput than the cores they take.  Add --cluster "
+                  "and point a cluster-aware client at it, or use --shards 1").c_str());
 
     if (m_cluster_ports)
     {
