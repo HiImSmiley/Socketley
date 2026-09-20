@@ -1,4 +1,5 @@
 #include "../../shared/socket_tuning.h"
+#include "../../shared/conn_alloc.h"
 #include "server_instance.h"
 #include "../../shared/lua_suspend.h"
 #include "../../shared/coarse_clock.h"
@@ -93,7 +94,7 @@ std::unique_ptr<server_connection> server_instance::pool_acquire(int fd)
     }
     else
     {
-        conn = std::make_unique<server_connection>();
+        conn = socketley::make_connection<server_connection>();
         conn->fd = fd;
     }
     // A new connection is a new identity even when it inherits the struct and
@@ -2008,7 +2009,7 @@ bool server_instance::setup(event_loop& loop)
         uint32_t pool_size = std::max(512u, m_max_conns_cached > 0 ? m_max_conns_cached / 4 : 512u);
         m_conn_pool.reserve(pool_size);
         for (uint32_t i = 0; i < pool_size && i < 2048; i++)
-            m_conn_pool.push_back(std::make_unique<server_connection>());
+            m_conn_pool.push_back(socketley::make_connection<server_connection>());
     }
 
     // ── TLS listener ────────────────────────────────────────────────────────

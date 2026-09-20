@@ -56,7 +56,7 @@ struct client_connection
     static constexpr uint32_t PARTIAL_BASE_SECS  = 10;
     static constexpr size_t   PARTIAL_FLOOR_BPS  = 10 * 1024;
 
-    int fd;
+    int fd{-1};
     int fixed_idx{-1};
     bool direct_fd{false};
     io_request read_req;

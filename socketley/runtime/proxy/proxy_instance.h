@@ -97,7 +97,7 @@ struct alignas(64) proxy_client_connection
     static constexpr size_t MAX_HEADER_SIZE = 16384;
 
     // === HOT fields (CQE dispatch) — first 2 cache lines ===
-    int fd;
+    int fd{-1};
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
@@ -273,7 +273,7 @@ struct alignas(64) proxy_backend_connection
     static constexpr size_t MAX_PARTIAL_SIZE = 1 * 1024 * 1024;
 
     // === HOT fields (CQE dispatch) — first 2 cache lines ===
-    int fd;
+    int fd{-1};
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
@@ -292,7 +292,7 @@ struct alignas(64) proxy_backend_connection
     // stated so a TCP proxy can ask it, since response_started is never set
     // outside HTTP mode.
     bool sent_to_client{false};
-    int client_fd;
+    int client_fd{-1};
     uint32_t write_batch_count{0};
     // Bumped on every reuse and stamped into read_req, because structs and fds
     // are both pooled and a completion that outlives its connection is
@@ -485,7 +485,7 @@ struct async_health_check
 // Connection pool entry for backend reuse
 struct pooled_backend
 {
-    int fd;
+    int fd{-1};
     size_t backend_idx;             // which backend_info this connects to
     // Where this socket actually goes, because a group entry stands for every
     // member at once and a socket filed under it would carry another runtime's

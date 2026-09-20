@@ -1,4 +1,5 @@
 #include "../../shared/socket_tuning.h"
+#include "../../shared/conn_alloc.h"
 #include "cache_instance.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
@@ -256,7 +257,7 @@ std::unique_ptr<client_connection> cache_instance::pool_acquire(int fd)
     }
     else
     {
-        conn = std::make_unique<client_connection>();
+        conn = socketley::make_connection<client_connection>();
         conn->fd = fd;
     }
     return conn;
@@ -512,7 +513,7 @@ bool cache_instance::setup(event_loop& loop)
     {
         m_conn_pool.reserve(CONN_POOL_INIT);
         for (size_t i = 0; i < CONN_POOL_INIT; i++)
-            m_conn_pool.push_back(std::make_unique<client_connection>());
+            m_conn_pool.push_back(socketley::make_connection<client_connection>());
     }
 
     m_loop = &loop;
@@ -2734,7 +2735,7 @@ void cache_instance::serve_payload(std::string_view payload, std::string& out, b
     }
 
     if (!m_request_conn)
-        m_request_conn = std::make_unique<client_connection>();
+        m_request_conn = socketley::make_connection<client_connection>();
 
     struct serving_guard
     {
@@ -3970,7 +3971,7 @@ bool cache_instance::serve_deferred(uint64_t ticket, std::string_view /*target*/
 void cache_instance::run_deferred(uint64_t ticket, std::string_view payload)
 {
     if (!m_request_conn)
-        m_request_conn = std::make_unique<client_connection>();
+        m_request_conn = socketley::make_connection<client_connection>();
 
     auto* conn = m_request_conn.get();
     conn->fd        = -1;
@@ -4335,7 +4336,7 @@ bool cache_instance::serve_shard_batch(std::string_view payload, std::string& ou
         return false;
 
     if (!m_request_conn)
-        m_request_conn = std::make_unique<client_connection>();
+        m_request_conn = socketley::make_connection<client_connection>();
 
     auto* conn = m_request_conn.get();
     conn->fd        = -1;

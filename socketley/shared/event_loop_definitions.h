@@ -292,11 +292,16 @@ constexpr bool is_read_op(op_type t)
 
 struct io_request
 {
-    io_handler* owner;
-    char* buffer;
-    int fd;
-    uint32_t length;
-    op_type type;
+    // Initialisers on every member, so default-initialising one is the same
+    // as value-initialising it.  That is what lets a connection be built
+    // without zero-filling the whole struct -- see socketley::make_connection.
+    // Still an aggregate, so `{ this, buf, fd, len, op }` at the call sites is
+    // unchanged and `generation` keeps its default.
+    io_handler* owner{nullptr};
+    char* buffer{nullptr};
+    int fd{-1};
+    uint32_t length{0};
+    op_type type{};
 
     // Tells a pooled struct's completion from its successor's, which
     // owner_token cannot, and comes from next_io_generation() because a

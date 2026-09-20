@@ -1,4 +1,5 @@
 #include "../../shared/socket_tuning.h"
+#include "../../shared/conn_alloc.h"
 #include "proxy_instance.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/event_loop.h"
@@ -367,7 +368,7 @@ std::unique_ptr<proxy_client_connection> proxy_instance::client_pool_acquire(int
     }
     else
     {
-        conn = std::make_unique<proxy_client_connection>();
+        conn = socketley::make_connection<proxy_client_connection>();
         conn->fd = fd;
         // A fresh struct skips reset(), and zero is what an unstamped request
         // carries — so without this every brand new connection matches one.
@@ -468,7 +469,7 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
     }
     else
     {
-        conn = std::make_unique<proxy_backend_connection>();
+        conn = socketley::make_connection<proxy_backend_connection>();
         conn->fd = fd;
         // A fresh struct skips reset(), and zero is what an unstamped request
         // carries — so without this every brand new connection matches one.
@@ -1899,10 +1900,10 @@ bool proxy_instance::setup(event_loop& loop)
     {
         m_client_pool.reserve(CONN_POOL_INIT);
         for (size_t i = 0; i < CONN_POOL_INIT; i++)
-            m_client_pool.push_back(std::make_unique<proxy_client_connection>());
+            m_client_pool.push_back(socketley::make_connection<proxy_client_connection>());
         m_backend_struct_pool.reserve(CONN_POOL_INIT);
         for (size_t i = 0; i < CONN_POOL_INIT; i++)
-            m_backend_struct_pool.push_back(std::make_unique<proxy_backend_connection>());
+            m_backend_struct_pool.push_back(socketley::make_connection<proxy_backend_connection>());
     }
 
     // Initialize per-backend health and circuit breaker state
