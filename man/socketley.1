@@ -439,6 +439,21 @@ The CPU set in force, in the same spelling
 accepts, with
 .B (not applied)
 appended when the pinning was attempted and refused.
+.TP
+.B dial_attempts
+Client only. The dials this client has made, beside
+.B total_connections
+which counts the ones the kernel found a peer for. A non-blocking connect
+answers EINPROGRESS for every target that is not already there, so a dial is an
+intention and the two figures come apart exactly when a target is flapping or
+gone \(em a client reconnecting all afternoon shows one climbing and the other
+standing still. Every other runtime counts
+.B total_connections
+at something that happened to it: the server and the cache at an
+.BR accept (2),
+the proxy once
+.B on_auth
+has admitted the client.
 .RE
 .IP
 For a runtime running in its own process this describes that process's ring, not
@@ -3064,9 +3079,11 @@ Not available for cache or proxy.
 .TP
 .BI "\-\-reconnect " "[max\-attempts]"
 Enable automatic reconnection with exponential backoff when the connection
-is lost. Backoff starts at 1 second and doubles each attempt up to 30 seconds,
-with random jitter. Set to 0 for infinite attempts (default when flag is given
-without a value). Set to a positive number to limit reconnection attempts.
+is lost. Backoff starts at 1 second and doubles each attempt to a ceiling of
+16 seconds, with up to half a second of jitter \(em the dials of a client whose
+target is gone fall at 1, 2, 4, 8, 16, 16, 16 seconds. Set to 0 for infinite
+attempts (default when flag is given without a value). Set to a positive number
+to limit reconnection attempts.
 .IP
 A client flag, and refused on a server, a proxy or a cache: it re-dials a
 connection this runtime made, and those three take connections rather than make
