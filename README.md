@@ -516,22 +516,51 @@ roughly 1/latency of a `write()`, and their latency percentiles were the cost of
 They now complete a round trip per operation, which makes them incomparable with
 what stood here, and they stay out until re-recorded.
 
-**Known weakness, stated rather than omitted.** Single connections are fast and
-pipelined depth is fast; many *simultaneous* connections are not proportionally
-fast. The cost per connection has grown, and it disappears at one connection and
-dominates at a hundred. How much of that survives the withdrawn rows is itself
-open — it was drawn by comparing aggregate figures that were both write-only, so
-it compared two socket-buffer fill rates rather than two service rates. The
-pipelined tables above are unaffected, since `redis-benchmark` reads its
-replies, and they show the same shape, which is why the weakness is still
-stated. It needs re-establishing on round trips before the figure attached to it
-means anything.
+### Many simultaneous connections
 
-Part of that is the price of correctness: an early build did not release
-registered file slots on teardown, did not cancel operations armed on them,
-leaked descriptors across `exec`, and closed clients without an answer. Some of
-it is probably not. Where it might be, and the experiment that would settle each
-candidate, is written down in `test/benchmark/hotspots.md`.
+This section used to say that many simultaneous connections are "not
+proportionally fast", and said in the same breath that the figure behind it came
+from write-only benchmarks that compared two socket-buffer fill rates rather
+than two service rates. Re-established on round trips, against Redis on the same
+four cores with the same client, it is **the other way round**: the cost per
+operation *falls* as connections are added, because more requests arriving
+together is what lets the loop batch them.
+
+| connections | socketley | µs CPU/op | RSS | Redis 7 | µs CPU/op | RSS |
+|---|---|---|---|---|---|---|
+| 16 | 158,266/s | 6.31 | 38.5 MB | 159,008/s | 6.28 | 29.3 MB |
+| 64 | 223,250/s | 4.47 | 38.5 MB | 183,528/s | 5.44 | 30.4 MB |
+| 256 | 250,970/s | 3.98 | 40.5 MB | 219,728/s | 4.54 | 32.8 MB |
+| 1024 | 253,398/s | 3.89 | 40.5 MB | 220,476/s | 4.48 | 39.8 MB |
+
+Level with Redis at sixteen connections and 14 to 22% ahead from sixty-four up.
+Read the RSS column beside it: over those 1008 further connections socketley
+grows **2.0 MB** where Redis grows **10.5 MB**.
+
+That is recent. An idle connection used to be charged three or four blocks of
+four to sixty-four kilobytes the moment it was accepted and before it had said
+anything — measured, and then taken out where taking it out did not cost
+something else:
+
+| runtime | before | after | |
+|---|---|---|---|
+| cache | 14.10 KB | **2.04 KB** | −85.5% |
+| server | 22.21 KB | **4.92 KB** | −77.8% |
+| proxy | 69.93 KB | 65.93 KB | −5.7% |
+
+The proxy keeps its sixty-four kilobytes on purpose, and that is a measurement
+and not an omission: taking them lazily from the heap made the *bounded* upload
+path hold 113 MB more at 1,100 uploading clients, and a sixteen-kilobyte inline
+buffer made it worse still. The buffer is load-bearing for the memory bound, not
+for speed. `socketley/runtime/proxy/proxy_instance.h` carries both figures at the
+field.
+
+What remains, measured and deliberately not acted on: the pool builds every
+connection with `make_unique<T>()`, which value-initializes, so the whole struct
+is zero-filled and touched before a byte arrives. `make_unique_for_overwrite`
+would skip that at no cost — but `int fd;` and four `io_request` members carry no
+initializer of their own and rely on the zeroing, so the swap wants MSan before
+anyone makes it.
 
 ## Quick Start
 
