@@ -8,6 +8,7 @@
 // Forward declare OpenSSL types to avoid pulling in headers everywhere
 typedef struct ssl_ctx_st SSL_CTX;
 typedef struct ssl_st SSL;
+typedef struct ssl_session_st SSL_SESSION;
 
 // There is deliberately no way back to tls_conn_none: "give up and carry on in
 // cleartext" is the one outcome a TLS transport must never produce.
@@ -82,8 +83,15 @@ public:
     SSL* create_ssl_server() const;
 
     // `expected_hostname` is required rather than a setter, because
-    // SSL_VERIFY_PEER proves only that some trusted CA signed it.
+    // SSL_VERIFY_PEER proves only that some trusted CA signed it.  It is also
+    // what decides whether the session kept by remember_session is offered.
     SSL* create_ssl_client(std::string_view expected_hostname) const;
+
+    // Keep this connection's session so the next dial to the same peer resumes
+    // it.  Called where the connection ends rather than where it is
+    // established, because under TLS 1.3 the ticket that makes a session
+    // resumable arrives after the handshake.
+    void remember_session(std::string_view peer_name, SSL* ssl);
 
     // Accept a TLS handshake on an SSL object
     // Returns: 1 = complete, 0 = want more data, -1 = error
@@ -123,4 +131,11 @@ private:
     SSL* create_ssl() const;
 
     SSL_CTX* m_ctx = nullptr;
+
+    // One session and the name it was taken from.  A resumed handshake carries
+    // no certificate, so nothing re-checks the name create_ssl_client pins --
+    // which makes the name the key, and a session from any other peer one this
+    // context must never offer.
+    SSL_SESSION* m_saved_session = nullptr;
+    std::string  m_saved_peer;
 };

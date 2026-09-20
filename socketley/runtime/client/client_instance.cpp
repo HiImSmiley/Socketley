@@ -441,6 +441,12 @@ void client_instance::tls_release()
 {
     if (m_conn->ssl)
     {
+        // What the socket leaves behind: the context keeps this session so the
+        // next dial resumes instead of paying a second full handshake.  Only
+        // from a connection that reached tls_conn_ready, because a handshake
+        // that never finished verified nobody.
+        if (m_tls && m_conn->tls_state == tls_conn_ready)
+            m_tls->remember_session(m_tls_peer_name, m_conn->ssl);
         tls_context::free_ssl(m_conn->ssl);
         m_conn->ssl = nullptr;
     }
