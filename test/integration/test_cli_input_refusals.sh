@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Integration test: nonsense typed at the CLI is refused, not acknowledged.
+#
+# The contract is three words long -- exit 0 ok, 1 bad input, 2 fatal -- and
+# four commands broke it the same way: they matched nothing, fell out of the
+# bottom of their loop and returned 0.  A silent success on bad input is worse
+# than an error, because the operator goes away believing it happened.
+#
+# ─── daemon --name, with the value forgotten ────────────────────────────────
+#
+#     $ socketley daemon --name
+#     $                                   <- exit 0, not a word
+#     $ socketley ls
+#     ID  NAME  ...                       <- and a daemon is running now
+#
+# `if ((arg == "--name" || arg == "-n") && i + 1 < argc)` with no else, under
+# an ensure_daemon() that had already forked.  The same line with `--bogus`
+# beside it swallowed that too -- while `socketley daemon --bogus` on its own
+# went through parse_daemon_flags and said "unknown daemon flag", exit 1.  The
+# same nonsense, two opposite answers, decided by what happened to stand next
+# to it.
+#
+# ─── ls and ps, with a flag neither of them has ─────────────────────────────
+#
+#     $ socketley ls --grp
+#     ID  NAME  ...                       <- the whole table, exit 0
+#
+# Two switch statements with no default:.  `--grp` is a typo for nothing;
+# `--format` with its value forgotten is a question the table does not answer.
+#
+# ─── --reconnect -1, which turns reconnect off ──────────────────────────────
+#
+# -1 is the stored "disabled", 0 is "infinite", and the flag parsed into an int
+# and took whatever it got.  So the flag whose only purpose is to switch
+# reconnection ON switched it off, silently, at exit 0 -- and `show` then
+# printed no reconnect line at all, because -1 is the default.
+#
+# ─── <verb> --help, for a verb nobody listed ────────────────────────────────
+#
+#     $ socketley stats --help
+#     $                                   <- exit 0, zero bytes
+#
+# command_usage::for_verb knew nine verbs.  Asking any other one for help got
+# silence, or -- worse -- the command itself: `ls --help` listed the runtimes
+# and `ping --help` pinged.
+#
+# Each case asserts the refusal AND the ordinary path it must not have broken.
+
+set -euo pipefail
+
+BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+. "$(dirname "$0")/lib_daemon.sh"
+. "$(dirname "$0")/lib_ports.sh"
+daemon_isolate cliinput
+PASS=0; FAIL=0; TOTAL=0
+
+cleanup() { daemon_stop; }
+trap cleanup EXIT
+
+pass() { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
+fail() {
+    TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1))
+    echo "  FAIL [$1]: $2"
+    local line
+    for line in "${@:3}"; do echo "        $line"; done
+}
+
+# Refused: exit 1 and a message that contains WHAT_TO_DO.  Not "exit non-zero":
+# 2 is fatal and would mean the daemon died, which is a different finding.
+refuses() {
+    local label=$1 want=$2; shift 2
+    local out rc=0
+    out=$("$@" 2>&1) || rc=$?
+    if [ "$rc" -eq 1 ]; then pass
+    else fail "$label exits 1" "got exit $rc, said: ${out:-<nothing>}"; fi
+    if grep -qF "$want" <<<"$out"; then pass
+    else fail "$label says what to do instead" \
+              "wanted to find: $want" \
+              "said: ${out:-<nothing>}"; fi
+}
+
+echo "=== Integration: the CLI refuses what it cannot honour ==="
+
+# ─── daemon --name with no value, BEFORE any daemon exists ──────────────────
+#
+# Order is load-bearing: the defect was that ensure_daemon() had already forked
+# one by the time the argument was looked at, so the assertion is only worth
+# anything on a socket nothing is serving yet.
+if daemon_alive "$SOCKETLEY_SOCKET"; then
+    daemon_bail "a private socket" "something is already serving $SOCKETLEY_SOCKET"
+fi
+
+refuses "daemon --name with no value" "socketley daemon --name <name>" \
+        "$BIN" daemon --name
+
+# The one that matters: the refusal came before the fork, not after it.
+if ! daemon_alive "$SOCKETLEY_SOCKET"; then pass
+else fail "a refused daemon command starts no daemon" \
+          "a daemon is now serving $SOCKETLEY_SOCKET" \
+          "the operator was told the command failed and got a daemon anyway."; fi
+
+refuses "daemon -n with no value" "socketley daemon -n <name>" \
+        "$BIN" daemon -n
+refuses "daemon --cluster with no value" "socketley daemon --cluster <dir>" \
+        "$BIN" daemon --cluster
+
+# A flag typed where its value should be is a forgotten value, not a name: this
+# used to rename the daemon to "--cluster" and drop the directory.
+refuses "daemon --name followed by another flag" "requires a value" \
+        "$BIN" daemon --name --cluster "$SOCKETLEY_TMPD/cl"
+
+# --bogus beside --name got the answer --bogus alone already got.
+refuses "daemon --name x --bogus" "unknown daemon flag: --bogus" \
+        "$BIN" daemon --name x --bogus
+
+# Still nothing serving: none of the four forked a daemon.
+if ! daemon_alive "$SOCKETLEY_SOCKET"; then pass
+else fail "no refused form started a daemon" \
+          "a daemon is serving $SOCKETLEY_SOCKET after four refusals"; fi
+
+# And the form that was always wrong still answers as it did -- without this, a
+# build that refused every `daemon` line would pass everything above.
+RC=0
+OUT=$("$BIN" daemon --bogus 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && grep -q "unknown daemon flag" <<<"$OUT"; then pass
+else fail "daemon --bogus alone is unchanged" "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# ─── and the documented form still configures a daemon ──────────────────────
+#
+# Load-bearing for the whole block above.
+daemon_start "$BIN"
+mkdir -p "$SOCKETLEY_TMPD/cluster"
+
+RC=0
+OUT=$("$BIN" daemon --name cli_input_node --cluster "$SOCKETLEY_TMPD/cluster" 2>&1) || RC=$?
+if [ "$RC" -eq 0 ]; then pass
+else fail "daemon --name <name> --cluster <dir> still works" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# Both took, rather than being accepted and dropped: the name is the one asked
+# for, and cluster mode is on, which is the half `--cluster` was carrying.
+RC=0
+OUT=$("$BIN" cluster ls 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && grep -q "cli_input_node" <<<"$OUT"; then pass
+else fail "the name it accepted is the name it holds" \
+          "exit $RC, cluster ls said: ${OUT:-<nothing>}"; fi
+
+echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
+exit "$FAIL"
