@@ -182,7 +182,13 @@ bool runtime_instance::start(event_loop& loop)
 
             // Before the fork, because after it only async-signal-safe
             // calls are legal and this object allocates.
-            const socketley::worker_env child_env(get_type() == runtime_cache);
+            // The two the child used to setenv() for itself, moved to the
+            // parent: a managed runtime is told it is managed and what it is
+            // called, and a setenv() between fork and exec is the malloc this
+            // class exists to avoid.
+            const socketley::worker_env child_env(
+                get_type() == runtime_cache,
+                { { "SOCKETLEY_MANAGED", "1" }, { "SOCKETLEY_NAME", m_name } });
 
             pid_t child = fork();
             if (child < 0)
@@ -190,8 +196,6 @@ bool runtime_instance::start(event_loop& loop)
             if (child == 0)
             {
                 setsid();
-                setenv("SOCKETLEY_MANAGED", "1", 1);
-                setenv("SOCKETLEY_NAME", m_name.c_str(), 1);
                 int devnull = open("/dev/null", O_RDWR);
                 if (devnull >= 0)
                 {

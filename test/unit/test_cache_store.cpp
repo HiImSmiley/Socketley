@@ -1776,3 +1776,77 @@ TEST_CASE("cache_store scan with more than one predicate")
         CHECK(run(g).empty());
     }
 }
+
+// string_equal compares short keys with overlapping word loads rather than a
+// call into libc, which is worth 3.9 per cent of a pipelined cache and is the
+// one shape of code that can read past a string without any test noticing.
+// Every length from zero to forty, every position of a differing byte, and
+// every mismatched pair of lengths.
+TEST_CASE("string_equal agrees with == at every length and every difference")
+{
+    string_equal eq;
+
+    for (size_t n = 0; n <= 40; ++n)
+    {
+        std::string a(n, 'x');
+        for (size_t i = 0; i < n; ++i)
+            a[i] = static_cast<char>('a' + (i % 26));
+
+        CHECK(eq(std::string_view(a), std::string_view(a)) == true);
+
+        const std::string same = a;
+        CHECK(eq(std::string_view(a), std::string_view(same)) == (a == same));
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            // Two different single-byte edits, because one of them lands on a
+            // byte whose case flip is a no-op for some alphabets.
+            std::string c = a;
+            c[i] = static_cast<char>(c[i] ^ 0x20);
+            CHECK(eq(std::string_view(a), std::string_view(c)) == (a == c));
+
+            std::string d = a;
+            d[i] = static_cast<char>(d[i] ^ 0x01);
+            CHECK(eq(std::string_view(a), std::string_view(d)) == (a == d));
+        }
+
+        for (size_t m = 0; m <= 40; ++m)
+        {
+            if (m == n)
+                continue;
+            const std::string e(m, 'a');
+            CHECK(eq(std::string_view(a), std::string_view(e)) == (a == e));
+        }
+    }
+}
+
+// The same key looked up through a string_view must land on the entry a
+// std::string put there, which is the whole point of the transparent pair and
+// what a hand-written comparison could break without any store test noticing.
+TEST_CASE("a hand-written comparison still finds what the store put there")
+{
+    cache_store store;
+
+    const char* shapes[] = { "", "a", "ab", "abc", "abcd", "abcdefg", "abcdefgh",
+                             "abcdefghi", "k:000000000123", "abcdefghijklmnop",
+                             "abcdefghijklmnopq",
+                             "a-considerably-longer-key-than-sixteen-bytes" };
+    for (const char* s : shapes)
+    {
+        CHECK(store.set(s, std::string("v") + s));
+        std::string out;
+        CHECK(store.get(std::string_view(s), out));
+        CHECK(out == std::string("v") + s);
+    }
+
+    // And a near miss at every one of those lengths is still a miss.
+    for (const char* s : shapes)
+    {
+        std::string near = s;
+        if (near.empty())
+            continue;
+        near.back() = static_cast<char>(near.back() ^ 0x01);
+        std::string out;
+        CHECK_FALSE(store.get(std::string_view(near), out));
+    }
+}

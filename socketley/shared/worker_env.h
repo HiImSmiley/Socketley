@@ -20,8 +20,10 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 extern char** environ;
@@ -37,8 +39,13 @@ class worker_env
 {
 public:
     // `hugepages` is the caller's decision about THIS runtime; the env var is
-    // the operator's veto over all of them.
-    explicit worker_env(bool hugepages)
+    // the operator's veto over all of them.  `extra` are set the way setenv()
+    // with overwrite does -- replacing what the parent had under that name --
+    // and they are here rather than in the child because a setenv() after fork
+    // is a malloc against a lock the child may not own.
+    using var = std::pair<std::string_view, std::string_view>;
+
+    explicit worker_env(bool hugepages, std::initializer_list<var> extra = {})
     {
         const char* off = ::getenv("SOCKETLEY_HUGEPAGE");
         const bool  want = hugepages && !(off && off[0] == '0' && off[1] == '\0');
@@ -47,6 +54,8 @@ public:
         for (char** e = environ; e && *e; ++e)
         {
             std::string_view entry(*e);
+            if (replaced(entry, extra))
+                continue;
             if (want && entry.rfind("GLIBC_TUNABLES=", 0) == 0)
             {
                 tunables_seen = true;
@@ -55,6 +64,9 @@ public:
             }
             m_strings.emplace_back(entry);
         }
+
+        for (const var& v : extra)
+            m_strings.emplace_back(std::string(v.first) + "=" + std::string(v.second));
 
         if (want && !tunables_seen)
             m_strings.emplace_back(std::string("GLIBC_TUNABLES=") + std::string(hugetlb_tunable));
@@ -73,6 +85,20 @@ public:
     char* const* envp() const { return m_pointers.data(); }
 
 private:
+    // Whether an inherited entry is one `extra` is about to write, compared on
+    // the name alone: "FOO=1" and "FOOBAR=2" must not match each other.
+    static bool replaced(std::string_view entry, std::initializer_list<var> extra)
+    {
+        const size_t eq = entry.find('=');
+        if (eq == std::string_view::npos)
+            return false;
+        const std::string_view name = entry.substr(0, eq);
+        for (const var& v : extra)
+            if (v.first == name)
+                return true;
+        return false;
+    }
+
     // An operator who named this tunable themselves meant it, so theirs wins
     // and we add nothing; anything else is appended beside what is there.
     static std::string merged(std::string_view entry)
