@@ -1037,8 +1037,16 @@ private:
     // answer is owed.
     // Answers whether the message was taken; see the definition for what a
     // false costs a caller that ignores it.
+    // `ws_cache`, when given, is where the websocket frame for THIS payload is
+    // kept: a server->client frame carries no per-recipient bit, so one set of
+    // recipients needs one frame.  Null means "build it for this connection
+    // alone", which is what a single send is.  group_send() and multicast()
+    // were calling this per recipient and paying a UTF-8 pass, two allocations
+    // and a full payload copy apiece -- O(N) where queue_broadcast() had long
+    // been O(1).
     bool queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
-                 bool even_when_closing = false);
+                    bool even_when_closing = false,
+                    std::shared_ptr<const std::string>* ws_cache = nullptr);
 
     // The same, for a caller that OWNS its bytes and has exactly one recipient
     // -- which is every self.send() and every reply to one client.  A

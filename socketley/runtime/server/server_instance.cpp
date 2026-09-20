@@ -3944,7 +3944,17 @@ reparse:
                 std::string_view payload(frame.payload_ptr, frame.payload_len);
                 if (frame.opcode == WS_OP_PING)
                 {
-                    conn->write_queue.push(ws_frame_pong_shared(payload));
+                    // At most 127 bytes and exactly one recipient, so the
+                    // shared form bought nothing and cost two allocations --
+                    // make_shared for the control block, resize for the
+                    // characters.  Built into a buffer the queue may still
+                    // grow instead, and the empty pong a browser keepalive
+                    // sends is two bytes, which never leaves the SSO.
+                    std::string pong;
+                    pong.reserve(4 + payload.size());
+                    ws_frame_pong_into(pong, payload);
+                    conn->write_queue.push_coalesced(std::move(pong),
+                        server_connection::WRITE_COALESCE_LIMIT);
                     if (!conn->write_pending)
                         flush_write_queue(conn);
                 }
@@ -5349,13 +5359,26 @@ bool server_instance::admit_send(server_connection* conn, size_t bytes,
 }
 
 bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
-                              bool even_when_closing)
+                              bool even_when_closing,
+                              std::shared_ptr<const std::string>* ws_cache)
 {
     if (!admit_send(conn, msg->size(), even_when_closing))
         return false;
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
+        // A frame already built for this payload, if the caller is walking a
+        // set: the bytes are the same for every websocket in it.
+        if (ws_cache && *ws_cache)
+        {
+            conn->write_queue.push_shared(*ws_cache,
+                server_connection::WRITE_COALESCE_LIMIT,
+                server_connection::MAX_WRITE_BATCH);
+            if (SOCKETLEY_LIKELY(!conn->write_pending))
+                flush_write_queue(conn);
+            return true;
+        }
+
         // Strip trailing newline for WS frame
         std::string_view payload(*msg);
         if (!payload.empty() && payload.back() == '\n')
@@ -5378,9 +5401,13 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         // Nothing that was already conforming moves: every relayed line is
         // valid UTF-8 and still goes out as text, and ws_payload_is_utf8()
         // spends one branch per byte on the ASCII that all of them are.
-        conn->write_queue.push_shared(
-            ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
-                                        : ws_frame_binary_shared(payload),
+        auto frame = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
+                                                 : ws_frame_binary_shared(payload);
+        // Kept for the rest of the set, so the next recipient does not pay the
+        // UTF-8 pass, the two allocations and the copy again.
+        if (ws_cache)
+            *ws_cache = frame;
+        conn->write_queue.push_shared(frame,
             server_connection::WRITE_COALESCE_LIMIT,
             server_connection::MAX_WRITE_BATCH);
     }
@@ -5411,16 +5438,33 @@ bool server_instance::queue_send(server_connection* conn, std::string&& msg,
 
     if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
     {
-        // A frame is built from the payload either way, so the ownership this
-        // form was called for is spent here and the shared path is the same.
+        // A frame has to be BUILT either way -- and that was taken as a reason
+        // to SHARE it, which it is not.  This overload has exactly one
+        // recipient, so a shared entry saves no copy and costs the whole of
+        // what the comment above this function measured: a shared payload
+        // cannot be coalesced, so a stream of small messages to one websocket
+        // built one queue entry apiece where the same stream to a raw socket
+        // built one entry, 0.149 TCP segments per delivery against 0.036.
+        //
+        // ws_frame_text_into writes the header and the payload straight into a
+        // buffer the queue may still grow, which is the same shape the plain
+        // branch below has always had.  Frames are self-delimiting, so two of
+        // them sharing one entry is what the peer reads anyway.
         std::string_view payload(msg);
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
-        conn->write_queue.push_shared(
-            ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
-                                        : ws_frame_binary_shared(payload),
-            server_connection::WRITE_COALESCE_LIMIT,
-            server_connection::MAX_WRITE_BATCH);
+
+        // 14 is what ws_write_header() writes at most: two bytes of header and
+        // an eight-byte length, plus the four a masked frame would carry.
+        std::string frame;
+        frame.reserve(14 + payload.size());
+        if (ws_payload_is_utf8(payload))
+            ws_frame_text_into(frame, payload);
+        else
+            ws_frame_binary_into(frame, payload);
+
+        conn->write_queue.push_coalesced(std::move(frame),
+            server_connection::WRITE_COALESCE_LIMIT);
     }
     else
     {
@@ -6697,8 +6741,11 @@ bool server_instance::write_to_ref(const conn_ref& ref, std::string_view msg)
     buf.reserve(msg.size() + 1);
     buf.append(msg);
     if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
-    auto shared = std::make_shared<const std::string>(std::move(buf));
-    queue_send(conn, shared);
+    // The owning overload: one recipient and a buffer this function already
+    // holds, so wrapping it in a control block bought a second allocation and
+    // an entry the queue may not coalesce.  The same shape queue_send's own
+    // comment describes.
+    queue_send(conn, std::move(buf));
     return true;
 }
 
@@ -6980,13 +7027,15 @@ size_t server_instance::multicast(const std::vector<int>& fds, std::string_view 
     auto shared = std::make_shared<const std::string>(
         msg.empty() || msg.back() != '\n' ? std::string(msg) + "\n"
                                           : std::string(msg));
+    // One frame for every websocket in the list; see queue_send's ws_cache.
+    std::shared_ptr<const std::string> ws_msg;
     size_t sent = 0;
     for (int fd : fds)
     {
         if (fd < 0 || fd >= MAX_FDS) continue;
         auto* conn = m_conn_idx[fd];
         if (!conn || conn->closing) continue;
-        queue_send(conn, shared);
+        queue_send(conn, shared, false, &ws_msg);
         ++sent;
     }
     return sent;
@@ -7093,6 +7142,9 @@ size_t server_instance::group_send(std::string_view group, std::string_view msg)
         buf.push_back('\n');
     auto shared_msg = std::make_shared<const std::string>(std::move(buf));
 
+    // One frame for every websocket in the group, built on the first one that
+    // is a websocket and not at all if none is.
+    std::shared_ptr<const std::string> ws_msg;
     size_t sent = 0;
     for (int fd : it->second)
     {
@@ -7103,7 +7155,7 @@ size_t server_instance::group_send(std::string_view group, std::string_view msg)
             conn->closing = true;
             continue;
         }
-        queue_send(conn, shared_msg);
+        queue_send(conn, shared_msg, false, &ws_msg);
         ++sent;
     }
     return sent;
