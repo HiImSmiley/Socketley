@@ -264,6 +264,10 @@ public:
     // successful append of nothing.
     static constexpr size_t append_wrong_type = std::string::npos;
     static constexpr size_t append_denied     = std::string::npos - 1;
+    // A length no std::string can represent, which is a refusal and not a
+    // memory verdict: setrange() is the only command whose result length is
+    // computed from an argument rather than read off one.
+    static constexpr size_t append_too_long   = std::string::npos - 2;
 
     size_t append(std::string_view key, std::string_view suffix);  // returns new length
     size_t strlen_key(std::string_view key) const;                  // 0 if missing

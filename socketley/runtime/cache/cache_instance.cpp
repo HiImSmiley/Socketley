@@ -6682,6 +6682,15 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             { rb.append("error: invalid offset\n", 22); return; }
             const size_t n = m_store.setrange(key, static_cast<size_t>(off), v);
             if (n == cache_store::append_wrong_type) rb.append("error: type conflict\n", 21);
+            else if (n == cache_store::append_too_long)
+            {
+                // Sized from the literal rather than counted by hand, because
+                // the hand count was one short and ate the newline that keeps
+                // this reply from running into the next one.
+                static constexpr std::string_view too_long =
+                    "error: string exceeds maximum allowed size\n";
+                rb.append(too_long.data(), too_long.size());
+            }
             else if (n == cache_store::append_denied) rb.append("error: out of memory\n", 21);
             else { rb.append(std::to_string(n)); rb.push_back('\n'); replicate_command(line); }
             break;
@@ -9737,6 +9746,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_code_into(rb, "ERR offset is out of range"); break; }
             const size_t n = m_store.setrange(args[1], static_cast<size_t>(off), args[3]);
             if (n == cache_store::append_wrong_type)   resp::encode_error_code_into(rb, "WRONGTYPE");
+            else if (n == cache_store::append_too_long)
+                resp::encode_error_code_into(rb, "ERR string exceeds maximum allowed size");
             else if (n == cache_store::append_denied)  resp::encode_error_into(rb, "out of memory");
             else { resp::encode_integer_into(rb, static_cast<int64_t>(n)); repl(args, argc); }
             break;

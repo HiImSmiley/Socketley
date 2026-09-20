@@ -1519,6 +1519,16 @@ size_t cache_store::setrange(std::string_view key, size_t offset, std::string_vi
     check_expiry(key);
 
     const size_t need = offset + value.size();
+
+    // The offset is a client's number and this is the only place a result
+    // length is computed from one.  Both writes below -- the construction and
+    // the resize -- raise std::length_error above max_size(), nothing between
+    // here and main() catches it, and the worker died: one command, no
+    // password (this cache has no such mechanism), every connection on that
+    // process gone with it.  `offset > need` is the wrap.
+    if (__builtin_expect(offset > need || need > std::string().max_size(), 0))
+        return append_too_long;
+
     auto it = m_data.find(key);
     if (it == m_data.end())
     {
