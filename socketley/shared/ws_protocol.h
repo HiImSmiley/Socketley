@@ -706,3 +706,89 @@ inline const std::shared_ptr<const std::string>& ws_frame_close_too_big_shared()
     static const auto frame = std::make_shared<const std::string>(WS_CLOSE_TOO_BIG_DATA, 4);
     return frame;
 }
+
+// ─── Answering a CLOSE with what the peer said ──────────────────────────────
+
+// Whether a status code is one an endpoint may put on the wire at all, and so
+// one this end may repeat back.
+//
+// RFC 6455 7.4.1 says of 1005, 1006 and 1015 that each "is a reserved value
+// and MUST NOT be set as a status code in a Close control frame by an
+// endpoint", and leaves 1004 with no meaning; 7.4.2 reserves 1000-2999 to the
+// protocol, which has defined only through 1011, and gives 3000-3999 to
+// libraries and 4000-4999 to private use.  So an echo outside this set is this
+// end committing the violation the peer committed.
+inline bool ws_close_code_sendable(uint16_t code)
+{
+    if (code >= 1000 && code <= 1011)
+        return code != 1004 && code != 1005 && code != 1006;
+    return code >= 3000 && code <= 4999;
+}
+
+// The status code to answer a peer's CLOSE with, read off the CLOSE it sent.
+//
+// RFC 6455 5.5.1: "If an endpoint receives a Close frame and did not
+// previously send a Close frame, the endpoint MUST send a Close frame in
+// response.  (When sending a Close frame in response, the endpoint typically
+// echos the status code it received.)"  Each of the three answers that is not
+// that echo is a rule the peer's own frame broke.
+//
+// The reason string is never part of the answer.  The RFC asks for the status
+// code and says nothing about repeating the text, and bytes chosen by the peer
+// and sent back to it are a reflection path bought for nothing -- which is
+// also what keeps every reply four bytes long.
+inline uint16_t ws_close_echo_code(std::string_view payload)
+{
+    // An empty body carries no code, and the one that means "there was none"
+    // is 1005, which 7.4.1 forbids sending -- so normal closure is all that is
+    // left to say.
+    if (payload.empty())
+        return 1000;
+    // RFC 6455 5.5.1: "If there is a body, the first two bytes of the body
+    // MUST be a 2-byte unsigned integer" -- one byte is not half a code, it is
+    // a protocol error, and 7.4.1 gives 1002 for those.
+    if (payload.size() < 2)
+        return 1002;
+    const uint16_t code = static_cast<uint16_t>(
+        (static_cast<unsigned char>(payload[0]) << 8) |
+         static_cast<unsigned char>(payload[1]));
+    if (!ws_close_code_sendable(code))
+        return 1002;
+    // 5.5.1 makes the reason UTF-8, and 8.1 requires failing the connection on
+    // a byte stream that claims to be UTF-8 and is not; 7.4.1 gives 1007 for
+    // data inconsistent with its type, which is the narrower answer than 1002.
+    if (!ws_payload_is_utf8(payload.substr(2)))
+        return 1007;
+    return code;
+}
+
+// Append a close frame carrying `code` into buf.
+//
+// Four bytes, which is why the codes without a pre-computed frame below do not
+// get one: a close has exactly one recipient, so sharing buys nothing, and
+// four characters never leave a std::string's own storage.
+inline void ws_frame_close_code_into(std::string& buf, uint16_t code)
+{
+    const size_t off = buf.size();
+    buf.resize(off + 4);
+    buf[off]     = static_cast<char>(0x80 | WS_OP_CLOSE);
+    buf[off + 1] = 2;
+    buf[off + 2] = static_cast<char>((code >> 8) & 0xFF);
+    buf[off + 3] = static_cast<char>(code & 0xFF);
+}
+
+// The pre-computed frame for `code`, and null for a code that has none.
+//
+// These three are what connections actually end on -- a goodbye, a refusal and
+// a frame too large -- so they keep costing a refcount, and the echo of a
+// rarer code costs the four bytes above instead of an allocation.
+inline const std::shared_ptr<const std::string>* ws_frame_close_pre(uint16_t code)
+{
+    switch (code)
+    {
+        case 1000: return &ws_frame_close_shared();
+        case 1002: return &ws_frame_close_protocol_error_shared();
+        case 1009: return &ws_frame_close_too_big_shared();
+        default:   return nullptr;
+    }
+}
