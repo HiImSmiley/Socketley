@@ -5126,9 +5126,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 // a UDP sender had been receiving its own datagram back since
                 // the mode existed while a TCP one did not.
                 if ((to & send_to_sender) && from && m_udp_fd >= 0)
-                    sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
-                           reinterpret_cast<const struct sockaddr*>(from),
-                           sizeof(*from));
+                    udp_send_one(msg, *from);
                 if (to & send_to_others)
                     udp_broadcast(msg, from);
             }
@@ -6462,6 +6460,10 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
         return;
     }
 
+    // Counted before the peer check, because these bytes arrived whatever the
+    // table decides about their sender.
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
     // Register peer if new; skip processing if peer list is full
     if (find_or_add_peer(m_udp_recv->addr) < 0)
     {
@@ -6492,6 +6494,17 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     arm_udp_recv();
 }
 
+// The one door every outbound datagram leaves by, so what the socket did with
+// it is counted in one place: the return value was discarded at both call
+// sites and a UDP server reported bytes_out:0 for its whole life.
+void server_instance::udp_send_one(std::string_view msg, const struct sockaddr_in& to)
+{
+    const ssize_t n = sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
+                             reinterpret_cast<const struct sockaddr*>(&to), sizeof(to));
+    if (SOCKETLEY_LIKELY(n >= 0))
+        m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+}
+
 void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude)
 {
     if (m_udp_fd < 0)
@@ -6504,8 +6517,7 @@ void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_
             peer.addr.sin_port == exclude->sin_port)
             continue;
 
-        sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
-               reinterpret_cast<const struct sockaddr*>(&peer.addr), sizeof(peer.addr));
+        udp_send_one(msg, peer.addr);
     }
 }
 

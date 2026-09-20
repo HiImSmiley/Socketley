@@ -1096,6 +1096,9 @@ private:
 
     // UDP helpers
     void handle_udp_read(struct io_uring_cqe* cqe);
+    // Every datagram this server sends leaves through here, so the byte count
+    // is taken once instead of at each call site.
+    void udp_send_one(std::string_view msg, const struct sockaddr_in& to);
     void udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
     int find_or_add_peer(const struct sockaddr_in& addr);
 
