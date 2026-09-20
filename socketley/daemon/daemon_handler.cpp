@@ -1721,6 +1721,27 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
+// The refusal `ls` and `ps` share, because both read a set of column names out
+// of a switch and neither had a `default:`: `socketley ls --grp` printed the
+// whole table and exited 0, and so did `--format` with its value forgotten.
+// The usage comes from command_usage so the columns named here and the ones
+// `ls --help` prints cannot be two different lists.
+static std::string listing_arg_refusal(const char* verb, std::string_view arg)
+{
+    std::string out;
+
+    // Not a flag at all: neither verb takes a name, and the operator who typed
+    // one wants the command that does.
+    if (!arg.empty() && arg.front() != '-')
+        out = "unknown argument: " + std::string(arg) + "\n"
+              "  " + verb + " lists every runtime and takes no names.\n"
+              "  For one: socketley show " + std::string(arg) + "\n";
+    else
+        out = "unknown flag: " + std::string(arg) + "\n";
+
+    return out + "  " + command_usage::line(verb);
+}
+
 int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
 {
     std::shared_lock lock(m_manager.mutex);
@@ -1750,21 +1771,30 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
             case fnv1a("--group"):   col_group   = true; break;
-        }
-        // `--format json` is the only spelling there is, so anything else is
-        // refused rather than answered in a format the operator did not ask
-        // for.
-        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
-        {
-            if (pa.hashes[i + 1] == fnv1a("json"))
+
+            // `--format json` is the only spelling there is, so anything else
+            // is refused rather than answered in a format the operator did not
+            // ask for -- and a missing value is refused too, where it used to
+            // be dropped and the table printed.
+            case fnv1a("--format"):
+                if (i + 1 >= pa.count)
+                {
+                    conn->write_buf = "--format requires a value (the only one is json)\n";
+                    return 1;
+                }
+                ++i;
+                if (pa.hashes[i] != fnv1a("json"))
+                {
+                    conn->write_buf = "unknown format: " + std::string(pa.args[i]) +
+                                      " (the only one is json)\n";
+                    return 1;
+                }
                 json_format = true;
-            else
-            {
-                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
-                                  " (the only one is json)\n";
+                break;
+
+            default:
+                conn->write_buf = listing_arg_refusal("ls", pa.args[i]);
                 return 1;
-            }
-            ++i;
         }
     }
 
@@ -1956,21 +1986,27 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--conn"):    col_conn    = true; break;
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
-        }
-        // `--format json` is the only spelling there is, so anything else is
-        // refused rather than answered in a format the operator did not ask
-        // for.
-        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
-        {
-            if (pa.hashes[i + 1] == fnv1a("json"))
+
+            // As in cmd_ls, and for the same two reasons.
+            case fnv1a("--format"):
+                if (i + 1 >= pa.count)
+                {
+                    conn->write_buf = "--format requires a value (the only one is json)\n";
+                    return 1;
+                }
+                ++i;
+                if (pa.hashes[i] != fnv1a("json"))
+                {
+                    conn->write_buf = "unknown format: " + std::string(pa.args[i]) +
+                                      " (the only one is json)\n";
+                    return 1;
+                }
                 json_format = true;
-            else
-            {
-                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
-                                  " (the only one is json)\n";
+                break;
+
+            default:
+                conn->write_buf = listing_arg_refusal("ps", pa.args[i]);
                 return 1;
-            }
-            ++i;
         }
     }
 

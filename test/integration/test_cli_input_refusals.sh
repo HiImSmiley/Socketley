@@ -194,6 +194,46 @@ if [ "$RC" -eq 1 ] && grep -q "^usage: restart" <<<"$OUT"; then pass
 else fail "restart with no name exits 1 with the usage line" \
           "exit $RC, said: ${OUT:-<nothing>}"; fi
 
+# ─── ls and ps: a flag neither of them has ──────────────────────────────────
+#
+# The runtime created above is what makes these assertions worth anything: the
+# defect printed a TABLE at exit 0, and on an empty daemon there is no table to
+# print, so a build with the defect would look identical to a build without.
+refuses "ls with a flag it does not have" "columns:" "$BIN" ls --grp
+refuses "ps with a flag it does not have" "columns:" "$BIN" ps --grp
+
+# A value forgotten is not a question the table answers.
+refuses "ls --format with no value" "the only one is json" "$BIN" ls --format
+refuses "ps --format with no value" "the only one is json" "$BIN" ps --format
+
+# Neither takes a runtime name, and the operator who typed one wants `show`.
+refuses "ls with a runtime name" "socketley show cli_input_srv" \
+        "$BIN" ls cli_input_srv
+
+# The refusal that was already there still reads as itself.
+refuses "ls --format with a format that is not json" "unknown format: yaml" \
+        "$BIN" ls --format yaml
+
+# ─── and every flag they DO have still works ────────────────────────────────
+#
+# Load-bearing: a `default:` one case too high would refuse a real column and
+# every assertion above would still pass.
+for args in "--json" "--format json" "-s" "--silent" "--name --port --status" \
+            "--name --id --type --conn --owner --created --group"; do
+    RC=0
+    OUT=$("$BIN" ls $args 2>&1) || RC=$?
+    if [ "$RC" -eq 0 ] && grep -q "cli_input_srv" <<<"$OUT"; then pass
+    else fail "ls $args still answers" "exit $RC, said: ${OUT:-<nothing>}"; fi
+done
+
+for args in "-a" "--all" "-a --json" "-a -s" "-a --name --uptime" \
+            "-a --name --id --type --port --conn --owner --created"; do
+    RC=0
+    OUT=$("$BIN" ps $args 2>&1) || RC=$?
+    if [ "$RC" -eq 0 ] && grep -q "cli_input_srv" <<<"$OUT"; then pass
+    else fail "ps $args still answers" "exit $RC, said: ${OUT:-<nothing>}"; fi
+done
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"
