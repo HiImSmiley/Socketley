@@ -19,6 +19,13 @@
 # a reserve(8192) -- and came out 22.21 -> 4.92 KB, identical in four passes,
 # with its throughput at 1.0040 across the swap, which is again the instrument.
 #
+# A proxy was the worst of the three: SIXTY-FOUR kilobytes of read_buf, which
+# only a single-shot read writes to and which it takes only BELOW
+# MULTISHOT_MIN_CLIENTS -- so above the threshold, where a connection count is
+# what makes memory matter, every connection carried it untouched -- plus a
+# second 64 KB as a reserve on partial in HTTP mode.  69.93 -> 2.95 KB, and its
+# throughput came out 1.0329 with both directions of the swap agreeing.
+#
 # The read_buf is the last arm of four -- bundle, multishot, provided-buffer
 # read, and only then a plain read into it -- so with a buffer ring, which is
 # every start that gets one, it was never written to.  It is now allocated only
@@ -43,9 +50,12 @@ daemon_isolate idlecost
 
 P=$((SL_PORT_BASE+1890))
 P_SRV=$((SL_PORT_BASE+1892))
+P_BE=$((SL_PORT_BASE+1894))
+P_PRX=$((SL_PORT_BASE+1896))
 CONNS=2000
 BUDGET_KB=5
 BUDGET_SRV_KB=9
+BUDGET_PRX_KB=8
 
 PASS=0; FAIL=0; TOTAL=0
 ok()    { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
@@ -55,9 +65,9 @@ check() { if [ "$2" = "$3" ]; then ok; else bad "$1" "expected '$2', got '$3'"; 
 HOLDER=""
 cleanup() {
     [ -n "$HOLDER" ] && { { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true; }
-    for n in ic is; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
+    for n in ic is ip ib; do "$BIN" stop "$n" >/dev/null 2>&1 || true; done
     sleep 0.3
-    for n in ic is; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
+    for n in ic is ip ib; do "$BIN" remove "$n" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -163,6 +173,49 @@ PYS
     echo "  server RSS $(awk -v x=$SBEFORE 'BEGIN{printf "%.1f", x/1024}') -> $(awk -v x=$SAFTER 'BEGIN{printf "%.1f", x/1024}') MB over $CONNS idle = $SPER KB each"
     SUNDER=$(awk -v p="$SPER" -v b="$BUDGET_SRV_KB" 'BEGIN{print (p > 0 && p < b) ? "yes" : "no"}')
     check "each idle server connection costs under ${BUDGET_SRV_KB} KB" "yes" "$SUNDER"
+    { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true
+    HOLDER=""
+    rm -f "/tmp/idlecost.$$"
+fi
+
+# ─── and a proxy, which carried the most of the three ───────────────────────
+create_ok "a backend" "$BIN" create server ib -p "$P_BE"
+"$BIN" start ib >/dev/null 2>&1 || true
+create_ok "a proxy"   "$BIN" create proxy ip -p "$P_PRX" --backend "127.0.0.1:$P_BE"
+"$BIN" start ip >/dev/null 2>&1 || true
+ready_tcp 127.0.0.1 "$P_PRX" 15 || true
+PWORKER=""
+for p in $(pgrep -x socketley 2>/dev/null); do
+    grep -qz "SOCKETLEY_SOCKET=$SOCKETLEY_SOCKET" "/proc/$p/environ" 2>/dev/null || continue
+    ss -ltnpH "sport = :$P_PRX" 2>/dev/null | grep -q "pid=$p," && { PWORKER=$p; break; }
+done
+if [ -n "$PWORKER" ]; then ok; else bad "the proxy's worker was found" "none on $P_PRX"; fi
+
+if [ -n "$PWORKER" ]; then
+    sleep 1
+    PBEFORE=$(rss_kb "$PWORKER")
+    python3 - "127.0.0.1" "$P_PRX" "$CONNS" <<'PYP' > /tmp/idlecost.$$ 2>&1 &
+import socket, sys, time
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+socks = []
+try:
+    for _ in range(n):
+        socks.append(socket.create_connection((host, port), 10))
+except Exception as e:
+    print("ERR", e, flush=True); sys.exit(1)
+print("open", len(socks), flush=True)
+time.sleep(60)
+PYP
+    HOLDER=$!
+    for i in $(seq 1 300); do grep -q "^open $CONNS" "/tmp/idlecost.$$" 2>/dev/null && break; sleep 0.1; done
+    if grep -q "^open $CONNS" "/tmp/idlecost.$$" 2>/dev/null; then ok
+    else bad "$CONNS proxy connections were opened" "$(head -2 /tmp/idlecost.$$ 2>/dev/null)"; fi
+    sleep 3
+    PAFTER=$(rss_kb "$PWORKER")
+    PPER=$(awk -v a="$PBEFORE" -v b="$PAFTER" -v n="$CONNS" 'BEGIN{printf "%.2f", (b-a)/n}')
+    echo "  proxy  RSS $(awk -v x=$PBEFORE 'BEGIN{printf "%.1f", x/1024}') -> $(awk -v x=$PAFTER 'BEGIN{printf "%.1f", x/1024}') MB over $CONNS idle = $PPER KB each"
+    PUNDER=$(awk -v p="$PPER" -v b="$BUDGET_PRX_KB" 'BEGIN{print (p > 0 && p < b) ? "yes" : "no"}')
+    check "each idle proxy connection costs under ${BUDGET_PRX_KB} KB" "yes" "$PUNDER"
     { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true
     HOLDER=""
     rm -f "/tmp/idlecost.$$"

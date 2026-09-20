@@ -2721,10 +2721,11 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
         m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
 
         auto conn = client_pool_acquire(client_fd);
-        // Only reserve partial buffer for HTTP mode — TCP forwards raw bytes
-        if (m_protocol == protocol_http)
-            conn->partial.reserve(PROXY_READ_BUF_SIZE);
-        conn->read_req = { this, conn->read_buf, client_fd, sizeof(conn->read_buf), op_read };
+        // Grown on demand: sixty-four kilobytes charged at accept, before the
+        // client has sent a byte, and clear() keeps whatever a busy connection
+        // grows into anyway -- so the reserve only ever bought the first
+        // growth, for every connection including those that never ask.
+        conn->read_req = { this, nullptr, client_fd, PROXY_READ_BUF_SIZE, op_read };
         conn->write_req = { this, nullptr, client_fd, 0, op_write };
         conn->splice_in_req = { this, nullptr, client_fd, 0, op_splice };
         conn->splice_out_req = { this, nullptr, client_fd, 0, op_splice };
@@ -2846,7 +2847,7 @@ static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connect
     else if (use_provided_bufs)
         queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
     else
-        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->ensure_read_buf(), PROXY_READ_BUF_SIZE, &conn->read_req);
 
     if (SOCKETLEY_UNLIKELY(!queued))
         conn->read_pending = false;
@@ -2863,7 +2864,7 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
     else if (use_provided_bufs)
         queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
     else
-        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->ensure_read_buf(), PROXY_READ_BUF_SIZE, &conn->read_req);
 
     if (SOCKETLEY_UNLIKELY(!queued))
         conn->read_pending = false;
@@ -2994,8 +2995,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             // type makes the handler append ring buffer 0's contents and
             // return a buffer it never took.
             conn->read_req.type = op_read;
-            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->read_buf,
-                                                        sizeof(conn->read_buf), &conn->read_req)))
+            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->ensure_read_buf(),
+                                                        PROXY_READ_BUF_SIZE, &conn->read_req)))
             {
                 conn->read_pending = false;
                 close_pair(fd, conn->backend_fd);
@@ -3112,7 +3113,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     }
     else
     {
-        read_data = conn->read_buf;
+        read_data = conn->read_buf.get();
     }
 
     // These bytes are ciphertext: tls_feed leaves plaintext in conn->partial
@@ -3659,8 +3660,8 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // type makes the handler append ring buffer 0's contents and
             // return a buffer it never took.
             conn->read_req.type = op_read;
-            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->read_buf,
-                                                        sizeof(conn->read_buf), &conn->read_req)))
+            if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(fd, conn->ensure_read_buf(),
+                                                        PROXY_READ_BUF_SIZE, &conn->read_req)))
             {
                 conn->read_pending = false;
                 close_pair(conn->client_fd, fd);
@@ -3752,7 +3753,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     }
     else
     {
-        data_ptr = conn->read_buf;
+        data_ptr = conn->read_buf.get();
     }
 
     // The mirror of the client leg, flushing what the session owes before
@@ -5681,7 +5682,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             pooled_ssl = nullptr;
         }
         bconn->client_fd = conn->fd;
-        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+        bconn->read_req = { this, nullptr, bfd, PROXY_READ_BUF_SIZE, op_read,
                             bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
         bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
@@ -5784,7 +5785,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
         auto bconn = backend_pool_acquire(bfd);
         bconn->client_fd = conn->fd;
-        bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+        bconn->read_req = { this, nullptr, bfd, PROXY_READ_BUF_SIZE, op_read,
                             bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
         bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };
@@ -7631,7 +7632,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
 
     auto bconn = backend_pool_acquire(bfd);
     bconn->client_fd = conn->fd;
-    bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
+    bconn->read_req = { this, nullptr, bfd, PROXY_READ_BUF_SIZE, op_read,
                         bconn->generation };
     bconn->write_req = { this, nullptr, bfd, 0, op_write };
     bconn->splice_in_req = { this, nullptr, bfd, 0, op_splice };

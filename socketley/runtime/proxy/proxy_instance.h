@@ -234,8 +234,22 @@ struct alignas(64) proxy_client_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // 64KB read buffer — at the END to keep hot fields in first cache lines
-    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
+    // Sixty-four kilobytes that only a SINGLE-SHOT read writes to, and the
+    // proxy takes that arm only below MULTISHOT_MIN_CLIENTS -- so above the
+    // threshold, which is exactly where a connection count makes memory
+    // matter, every connection carried this and never touched it.  Measured
+    // at 2,000 idle client connections: 69.93 KB apiece.
+    //
+    // Taken on the first single-shot arm and never given back while the struct
+    // lives, so no read can be armed on storage that has gone.
+    std::unique_ptr<char[]> read_buf;
+
+    char* ensure_read_buf()
+    {
+        if (!read_buf)
+            read_buf = std::make_unique<char[]>(PROXY_READ_BUF_SIZE);
+        return read_buf.get();
+    }
 
     // The session, for a struct that never reached its release path, safe here
     // because no submission ever named it.
@@ -321,8 +335,22 @@ struct alignas(64) proxy_backend_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // 64KB read buffer — at the END to keep hot fields in first cache lines
-    alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
+    // Sixty-four kilobytes that only a SINGLE-SHOT read writes to, and the
+    // proxy takes that arm only below MULTISHOT_MIN_CLIENTS -- so above the
+    // threshold, which is exactly where a connection count makes memory
+    // matter, every connection carried this and never touched it.  Measured
+    // at 2,000 idle client connections: 69.93 KB apiece.
+    //
+    // Taken on the first single-shot arm and never given back while the struct
+    // lives, so no read can be armed on storage that has gone.
+    std::unique_ptr<char[]> read_buf;
+
+    char* ensure_read_buf()
+    {
+        if (!read_buf)
+            read_buf = std::make_unique<char[]>(PROXY_READ_BUF_SIZE);
+        return read_buf.get();
+    }
 
     // See proxy_client_connection's destructor.
     ~proxy_backend_connection() { tls_context::free_ssl(ssl); }
