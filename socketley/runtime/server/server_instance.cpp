@@ -1650,8 +1650,10 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         lua_req["version"] = req.version;
 
         sol::table lua_headers = lua()->state().create_table();
+        // The views go straight through, because sol2 copies the bytes into the
+        // Lua heap itself and the std::string between them was read by nobody.
         for (const auto& [k, v] : req.headers)
-            lua_headers[std::string(k)] = std::string(v);
+            lua_headers[k] = v;
         lua_req["headers"] = lua_headers;
 
         const bool keep_alive = conn->http_keep_alive;
