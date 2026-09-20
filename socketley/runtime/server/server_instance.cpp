@@ -897,6 +897,24 @@ static const std::shared_ptr<const std::string>& http_501_response()
 
 // Closing too, because the body this refuses is still on its way and would
 // otherwise be read as the next request.
+// RFC 6455 4.2.2: a version this server does not speak MUST be refused with an
+// HTTP error and a Sec-WebSocket-Version naming what it does speak.  Measured
+// before this existed: `Sec-WebSocket-Version: 8` was answered with 101, and
+// the client then sent frames in a framing nobody here parses -- so what it
+// got was a connection that wedged instead of a sentence telling it which
+// version to use.
+static const std::shared_ptr<const std::string>& http_426_response()
+{
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 426 Upgrade Required\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 41\r\n"
+        "Connection: close\r\n\r\n"
+        "this server speaks WebSocket version 13\r\n");
+    return resp;
+}
+
 static const std::shared_ptr<const std::string>& http_413_response()
 {
     static const auto resp = std::make_shared<const std::string>(
@@ -3791,6 +3809,13 @@ reparse:
             bool has_upgrade = false;
             size_t ws_key_pos = std::string_view::npos;
             size_t ws_key_end = std::string_view::npos;
+            // Only "present and not 13" is refused.  A handshake that omits
+            // the field altogether is what this server has always accepted,
+            // and refusing it now would drop clients that work today for a
+            // header no real one leaves out; a version it NAMES and we cannot
+            // speak is the case where saying so is strictly better than 101.
+            bool ws_version_seen = false;
+            bool ws_version_13   = false;
 
             // Walk headers line by line
             size_t line_start = hdrs.find("\r\n"); // skip request line
@@ -3821,6 +3846,36 @@ reparse:
                             std::string_view val = line.substr(val_start);
                             if (fnv1a_lower(val) == fnv1a("websocket"))
                                 has_upgrade = true;
+                            break;
+                        }
+                        case fnv1a("sec-websocket-version"):
+                        {
+                            size_t vs = colon + 1;
+                            while (vs < line.size() && line[vs] == ' ') ++vs;
+                            std::string_view v = line.substr(vs);
+                            ws_version_seen = true;
+                            // A comma-separated list, because a client that
+                            // offers "7, 13" is offering 13 and refusing it
+                            // would be one refusal too many.  Each token
+                            // trimmed on both ends: "13 " and " 13" are the
+                            // same offer.
+                            while (!v.empty())
+                            {
+                                const size_t comma = v.find(',');
+                                std::string_view tok = v.substr(0, comma);
+                                while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+                                    tok.remove_prefix(1);
+                                while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+                                    tok.remove_suffix(1);
+                                if (tok == "13")
+                                {
+                                    ws_version_13 = true;
+                                    break;
+                                }
+                                if (comma == std::string_view::npos)
+                                    break;
+                                v.remove_prefix(comma + 1);
+                            }
                             break;
                         }
                         case fnv1a("sec-websocket-key"):
@@ -3887,6 +3942,12 @@ reparse:
                         refuse_http_request(conn, http_400_response());
                         return;
                     }
+                }
+
+                if (SOCKETLEY_UNLIKELY(ws_version_seen && !ws_version_13))
+                {
+                    refuse_http_request(conn, http_426_response());
+                    return;
                 }
 
                 std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
