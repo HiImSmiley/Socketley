@@ -2169,6 +2169,12 @@ bool server_instance::setup(event_loop& loop)
         // --idle-timeout inert on a UDP server: the flag was accepted, `show`
         // reported it, and no sweep was ever armed to act on it.
         arm_idle_sweep();
+        // The same return and the same shape of defect: --upstream filled
+        // m_upstream_targets and nothing ever dialled them, so `stats` read
+        // upstreams:0/1 for the life of the runtime.  An upstream is a TCP
+        // socket this runtime dials and is no business of the family its own
+        // listener was configured in.
+        start_upstreams();
         return true;
     }
 
@@ -2264,9 +2270,16 @@ bool server_instance::setup(event_loop& loop)
     // zero-copy path, so nothing here has to exist before the first request.
     m_splice_live = 0;
 
-    // Connect to upstreams with nothing to clear, because teardown() either
-    // dropped the previous structs or retired the ones with work still in the
-    // ring.
+    start_upstreams();
+
+    return true;
+}
+
+// Connect to upstreams with nothing to clear, because teardown() either
+// dropped the previous structs or retired the ones with work still in the
+// ring.  Its own function because setup() has two exits and both owe it.
+void server_instance::start_upstreams()
+{
     m_upstream_by_fd.clear();
     m_next_upstream_id = 1;
     for (const auto& target : m_upstream_targets)
@@ -2279,8 +2292,6 @@ bool server_instance::setup(event_loop& loop)
         if (!upstream_try_connect(ptr))
             upstream_schedule_reconnect(ptr);
     }
-
-    return true;
 }
 
 void server_instance::teardown(event_loop& loop)
