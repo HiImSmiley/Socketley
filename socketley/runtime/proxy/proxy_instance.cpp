@@ -2842,13 +2842,26 @@ static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connect
                                    bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
 {
     conn->read_pending = true;
-    bool queued;
+
+    // A ladder rather than a chain of else: the first arm returning false means
+    // the ring was momentarily full, which is not a reason to give up a read the
+    // simpler arms can still take.  As an else-chain this cost close_pair() --
+    // BOTH sockets of a proxied pair -- for one busy turn.
+    bool queued = false;
     if (recv_multishot)
         queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
-    else if (use_provided_bufs)
+    if (!queued && use_provided_bufs)
         queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
-    else
+    if (!queued)
+    {
+        // read_buf is already here -- it is the sixty-four kilobytes this
+        // runtime keeps inline -- and the type has to go back, because
+        // submit_read leaves it alone while the two arms above set it to a
+        // multishot or provided type, and the completion handler reads exactly
+        // that to decide whether the kernel re-arms or this code does.
+        conn->read_req.type = op_read;
         queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    }
 
     if (SOCKETLEY_UNLIKELY(!queued))
         conn->read_pending = false;
@@ -2859,13 +2872,26 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
                                            bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
 {
     conn->read_pending = true;
-    bool queued;
+
+    // A ladder rather than a chain of else: the first arm returning false means
+    // the ring was momentarily full, which is not a reason to give up a read the
+    // simpler arms can still take.  As an else-chain this cost close_pair() --
+    // BOTH sockets of a proxied pair -- for one busy turn.
+    bool queued = false;
     if (recv_multishot)
         queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
-    else if (use_provided_bufs)
+    if (!queued && use_provided_bufs)
         queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
-    else
+    if (!queued)
+    {
+        // read_buf is already here -- it is the sixty-four kilobytes this
+        // runtime keeps inline -- and the type has to go back, because
+        // submit_read leaves it alone while the two arms above set it to a
+        // multishot or provided type, and the completion handler reads exactly
+        // that to decide whether the kernel re-arms or this code does.
+        conn->read_req.type = op_read;
         queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+    }
 
     if (SOCKETLEY_UNLIKELY(!queued))
         conn->read_pending = false;
