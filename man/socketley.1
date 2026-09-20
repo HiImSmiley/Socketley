@@ -4475,7 +4475,11 @@ writes only if the key is absent and
 .B xx
 only if it is there;
 .BR ex " and " px
-set a deadline in seconds or milliseconds.
+set a deadline in seconds or milliseconds. Either must be positive: zero or
+less is refused and NOTHING is written, because a key stored with a deadline
+that came out at zero and no deadline on it is immortal and its owner has been
+told the write worked. An argument that is not a number is refused as one,
+rather than as a syntax error about the word after it.
 .IP
 .B keepttl
 leaves the deadline alone, which a plain

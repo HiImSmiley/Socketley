@@ -8090,7 +8090,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // the key as the value -- so `SET rk rv EX 100` reached the follower as
     // the value "rv EX 100" with no expiry.
     auto repl_set_effect = [&](std::string_view key, std::string_view val,
-                               int ex_sec, int64_t px_ms) {
+                               int64_t ex_sec, int64_t px_ms) {
         if (!mutation_log_wanted()) return;
 
         std::string cmd;
@@ -8101,8 +8101,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         cmd.append(val.data(), val.size());
         replicate_command(cmd);
 
+        // Saturating, because ex_sec is the client's int64 now that SET no
+        // longer shields itself behind an `int` that could not hold one.
+        constexpr int64_t far = std::numeric_limits<int64_t>::max();
         const int64_t ms = px_ms > 0 ? px_ms
-                         : (ex_sec > 0 ? static_cast<int64_t>(ex_sec) * 1000 : 0);
+                         : ex_sec > far / 1000 ? far
+                         : ex_sec > 0 ? ex_sec * 1000 : 0;
         if (ms > 0)
         {
             std::string ttl_cmd = "pexpire ";
@@ -8363,23 +8367,36 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 
             // Slow path: SET with NX/XX/EX/PX/KEEPTTL/GET options
             bool nx = false, xx = false, keepttl = false, want_old = false;
-            int ex_sec = 0;
+            int64_t ex_sec = 0;
             int64_t px_ms = 0;
+            // A deadline of zero or less is refused HERE, before anything is
+            // written, and this is the whole point of it: `SET k v EX 0`
+            // stored the key with NO deadline at all and answered +OK, so a
+            // lock or session key whose TTL had been computed down to zero
+            // became immortal and its owner was told it had worked.  Redis
+            // refuses, and an unreadable number was worth its own word too --
+            // `SET k v EX abc` fell through to "syntax error", which names the
+            // wrong thing.
+            const auto expire_arg = [&](int i, int64_t& out) {
+                if (i + 1 >= argc)
+                { resp::encode_error_into(rb, "syntax error"); return false; }
+                if (!parse_int_sv(args[i+1], out))
+                { resp::encode_error_into(rb, "value is not an integer or out of range"); return false; }
+                if (out <= 0)
+                { resp::encode_error_into(rb, "invalid expire time in 'set' command"); return false; }
+                return true;
+            };
             for (int i = 3; i < argc; i++)
             {
                 switch (fnv1a_lower(args[i]))
                 {
                     case fnv1a("ex"):
-                        if (i + 1 < argc)
-                        {
-                            if (parse_int_sv(args[i+1], ex_sec)) i++;
-                        }
+                        if (!expire_arg(i, ex_sec)) return;
+                        i++;
                         break;
                     case fnv1a("px"):
-                        if (i + 1 < argc)
-                        {
-                            if (parse_int_sv(args[i+1], px_ms)) i++;
-                        }
+                        if (!expire_arg(i, px_ms)) return;
+                        i++;
                         break;
                     case fnv1a("nx"): nx = true; break;
                     case fnv1a("xx"): xx = true; break;
