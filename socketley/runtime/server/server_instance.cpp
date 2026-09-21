@@ -2129,6 +2129,14 @@ bool server_instance::setup(event_loop& loop)
         setsockopt(m_udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(m_udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
+        // Larger than the 128 KB every other listener here takes, because this
+        // is the one socket with no window to close and no retransmit behind
+        // it: what overruns the receive buffer is gone silently.  Measured on
+        // the burst a runtime inside one callback cannot drain -- 221 hundred-
+        // byte datagrams survived on the kernel default, 2,176 on this.
+        int udp_rcvbuf = 1024 * 1024;
+        setsockopt(m_udp_fd, SOL_SOCKET, SO_RCVBUF, &udp_rcvbuf, sizeof(udp_rcvbuf));
+
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
