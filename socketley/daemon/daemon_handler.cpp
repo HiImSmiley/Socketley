@@ -39,6 +39,7 @@
 #include <charconv>
 #include <chrono>
 #include <optional>
+#include <algorithm>
 #include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1166,6 +1167,28 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         }
     }
 
+    const int rc = dispatch_command(conn, pa);
+
+    // The names in the list that named nothing -- see resolve_names.  Written
+    // through cout so the reply guard puts it after whatever the handler
+    // printed, and so it works for a caller with no connection.
+    if (!m_unresolved.empty())
+    {
+        for (const auto& n : m_unresolved)
+            std::cout << "runtime not found: " << n << "\n";
+        std::cout << "  " << pa.args[0] << " ran for the rest of the list and not for "
+                  << (m_unresolved.size() == 1 ? "this name" : "these names")
+                  << ".\n"
+                     "  `socketley ls` lists what is there.\n";
+        m_unresolved.clear();
+        return rc == 0 ? 1 : rc;
+    }
+
+    return rc;
+}
+
+int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa)
+{
     switch (pa.hashes[0])
     {
         case fnv1a("create"):     return cmd_create(conn, pa);
@@ -1469,10 +1492,42 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     return 0;
 }
 
-std::vector<std::string> daemon_handler::resolve_names(const parsed_args& pa, size_t start) const
+std::vector<std::string> daemon_handler::resolve_names(const parsed_args& pa, size_t start)
 {
     std::shared_lock lock(m_manager.mutex);
-    return resolve_names_impl(pa.args, pa.count, m_manager.list(), start);
+    auto names = resolve_names_impl(pa.args, pa.count, m_manager.list(), start);
+
+    // ─── A LIST WITH A TYPO IN IT IS NOT A LIST THAT WORKED ─────────────────
+    // resolve_names_impl skips an argument that names nothing, so `stop a
+    // gibtsnicht` stopped a, said nothing and exited 0 -- and on `remove`, an
+    // operator clearing two runtimes and misspelling one had every reason to
+    // believe both were gone.  Collected here because this is the one function
+    // that turns arguments into names; reported in process_command, which is
+    // the one place that also holds the exit code.
+    m_unresolved.clear();
+
+    // Nothing resolved at all is check_empty_names' case, which already reports
+    // it: recording here too would print the same line twice.
+    if (names.empty())
+        return names;
+
+    for (size_t i = start; i < pa.count; ++i)
+    {
+        const std::string_view arg = pa.args[i];
+        if (arg.empty() || arg[0] == '-')
+            continue;
+
+        // A glob is a query and "no match" is an answer to one, not a typo in
+        // it -- `stop 'api*'` on a box with no api runtimes asked a question
+        // and got the truth.
+        if (arg.find_first_of("*?[") != std::string_view::npos)
+            continue;
+
+        if (std::find(names.begin(), names.end(), arg) == names.end())
+            m_unresolved.emplace_back(arg);
+    }
+
+    return names;
 }
 
 int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)

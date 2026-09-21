@@ -283,6 +283,72 @@ if [ "$(state_of ci_as)" != "Created" ] && [ -n "$(state_of ci_as)" ]; then pass
 else fail "-s after a valueless --reconnect still autostarts" \
           "ci_as is '$(state_of ci_as)'"; fi
 
+# ─── a list of names with a typo in it ──────────────────────────────────────
+#
+# resolve_names skips a name that matches nothing, and check_empty_names only
+# fires when the WHOLE list came back empty, so `stop a gibtsnicht` stopped a,
+# said nothing and exited 0.  On `remove` that is the worst of the set: an
+# operator clearing two runtimes and misspelling one has every reason to
+# believe both are gone.
+NP=$((SL_PORT_BASE + 960))
+"$BIN" create server ci_keep -p $((NP + 1)) -s >/dev/null 2>&1 || true
+"$BIN" create server ci_drop -p $((NP + 2)) >/dev/null 2>&1 || true
+"$BIN" create server ci_also -p $((NP + 3)) >/dev/null 2>&1 || true
+
+refuses "stop with a name that is not there" "runtime not found: ci_nosuch" \
+        "$BIN" stop ci_keep ci_nosuch
+
+# The message has to say that the rest DID happen, or "runtime not found" reads
+# as if the whole command was refused.
+RC=0
+OUT=$("$BIN" remove ci_drop ci_nosuch 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && grep -q "remove ran for the rest of the list" <<<"$OUT"; then pass
+else fail "the refusal says the rest of the list happened" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# And it did happen: the named runtime is gone. This is the half that decides
+# the design -- a refusal that also undid the removal would leave a script
+# whose cleanup names a runtime a failed test never created unable to clean up
+# anything at all.
+if [ -z "$(state_of ci_drop)" ]; then pass
+else fail "the name that resolved was still acted on" \
+          "ci_drop is '$(state_of ci_drop)' -- the typo beside it undid the removal"; fi
+
+# Two typos are two lines, and the closing sentence agrees with itself.
+RC=0
+OUT=$("$BIN" stop ci_keep ci_no1 ci_no2 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && grep -q "ci_no1" <<<"$OUT" && grep -q "ci_no2" <<<"$OUT" \
+   && grep -q "not for these names" <<<"$OUT"; then pass
+else fail "every name that is not there is named" "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# ─── what must NOT have changed ─────────────────────────────────────────────
+#
+# A glob is a query and "no match" is an answer to one, not a typo in it: a
+# script running `stop 'api*'` on a box with no api runtimes asked a question
+# and got the truth.
+RC=0
+OUT=$("$BIN" stop ci_also 'ci_zzz*' 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then pass
+else fail "a glob that matches nothing is not a typo" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# A list where every name is good is still silent at exit 0.
+RC=0
+OUT=$("$BIN" stop ci_keep ci_also 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then pass
+else fail "a list with no typo in it is still silent" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# A list where NOTHING resolved is check_empty_names' case and its message is
+# unchanged: one line, and not the new closing sentence, because nothing was
+# acted on.
+RC=0
+OUT=$("$BIN" stop ci_nosuch 2>&1) || RC=$?
+if [ "$RC" -eq 1 ] && grep -q "runtime not found: ci_nosuch" <<<"$OUT" \
+   && ! grep -q "ran for the rest of the list" <<<"$OUT"; then pass
+else fail "a list where nothing resolved reads as it always did" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"
