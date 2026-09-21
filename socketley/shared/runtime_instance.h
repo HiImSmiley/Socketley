@@ -211,8 +211,36 @@ public:
         // goes straight back to the deep point, which measured +3 per cent where
         // the same streams paced throughout are worth +18.
         const auto now = std::chrono::steady_clock::now();
-        if (total_queued_bytes() >= socketley::write_pacing_budget)
-            m_pacing_hold_until = now + std::chrono::milliseconds(50);
+
+        // The SUM is sampled on an interval; the two lines below it are not.
+        //
+        // total_queued_bytes() walks every connection this runtime holds, and
+        // each step is a pointer into a separate allocation -- a cache miss per
+        // connection.  Measured on a server doing one ping-pong per loop turn,
+        // with every other connection idle and holding nothing at all:
+        //
+        //     open      p50 round trip     worker CPU per request
+        //     1001          26.3 us              26.7 us
+        //     3001          56.7 us              96.7 us
+        //     5001         124.9 us             193.3 us
+        //
+        // and a profile at 5001 put 81.72% of the worker inside this one call.
+        // The answer it was computing five thousand times a second was zero.
+        //
+        // Sampling is safe in the way the walk's own comment already argued:
+        // the value feeds a hold that lasts fifty milliseconds, so an interval
+        // well under that cannot change which side of the budget a runtime
+        // spends its time on -- and "the bound that closes a connection is not
+        // this number", the per-connection watermark still applies every turn.
+        if (now >= m_pacing_sample_due)
+        {
+            m_pacing_sample_due = now + std::chrono::milliseconds(2);
+            if (total_queued_bytes() >= socketley::write_pacing_budget)
+                m_pacing_hold_until = now + std::chrono::milliseconds(50);
+        }
+
+        // Expiry stays per turn: a runtime that has drained must stop pacing on
+        // the turn its hold runs out, not on the next sample.
         m_pacing_backed_up = now < m_pacing_hold_until;
         m_write_watermark = pacing_watermark_for(get_connection_count(),
                                                  m_pacing_backed_up);
@@ -840,6 +868,9 @@ private:
     size_t m_write_watermark = socketley::write_queue_max_bytes / 2;
     // Until when the divided pacing point stays in force; see refresh above.
     std::chrono::steady_clock::time_point m_pacing_hold_until{};
+    // When the O(connections) sum may next be paid for.  Value-initialised, so
+    // the first turn of a runtime's life always samples.
+    std::chrono::steady_clock::time_point m_pacing_sample_due{};
     bool m_pacing_backed_up{false};
 
     // Dividing by the connection count alone was the wrong rule and measured so:
