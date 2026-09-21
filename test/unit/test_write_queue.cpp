@@ -147,3 +147,65 @@ TEST_CASE("the bytes leave whole and in order, in both shapes")
         CHECK(q.bytes() == 0);
     }
 }
+
+// ─── push_coalesced_line ────────────────────────────────────────────────────
+// A payload and its newline, without the caller building the two together
+// first.  The temporary that shape replaces was malloc'd, copied into, copied
+// out of by append_back and freed -- per line, on a path an echo server walks
+// millions of times a second.  So the question these ask is not whether the
+// bytes are right (they are the same bytes) but whether the ENTRY COUNT is:
+// the win is entirely in coalescing, and a version that queued one entry per
+// line would pass a bytes-only check.
+
+TEST_CASE("a line joins the tail instead of queueing behind it")
+{
+    queue_t q;
+    q.push(socketley::write_chunk(std::string("seed\n")));
+    REQUIRE(q.size() == 1);
+
+    for (int i = 0; i < 8; ++i)
+        q.push_coalesced_line("line", LIMIT);
+
+    // One entry still, because every line went into the tail.
+    CHECK(q.size() == 1);
+    CHECK(drain(q) == "seed\nline\nline\nline\nline\nline\nline\nline\nline\n");
+}
+
+TEST_CASE("the newline is the last byte of each line and not of the batch")
+{
+    queue_t q;
+    q.push(socketley::write_chunk(std::string("x")));
+    q.push_coalesced_line("aa", LIMIT);
+    q.push_coalesced_line("", LIMIT);      // an empty line is still a line
+    q.push_coalesced_line("bbb", LIMIT);
+    CHECK(drain(q) == "xaa\n\nbbb\n");
+}
+
+TEST_CASE("a line the tail cannot take queues as its own entry, newline included")
+{
+    queue_t q;
+    // A tail already at the limit cannot grow, which is the case that has to
+    // fall back rather than silently drop the newline.
+    q.push(socketley::write_chunk(std::string(LIMIT, 'T')));
+    REQUIRE(q.size() == 1);
+
+    q.push_coalesced_line("over", LIMIT);
+    CHECK(q.size() == 2);
+
+    const std::string out = drain(q);
+    CHECK(out.size() == LIMIT + 5);
+    CHECK(out.compare(LIMIT, 5, "over\n") == 0);
+}
+
+TEST_CASE("a payload one byte under the limit still leaves room for its newline")
+{
+    // The bound is the payload PLUS the newline, so a payload that fits on its
+    // own and the newline that does not must not be split across two entries
+    // with the byte count still adding up.
+    queue_t q;
+    q.push(socketley::write_chunk(std::string("s")));
+    const size_t room = LIMIT - 1;      // tail holds 1, so `room` payload fits exactly
+    q.push_coalesced_line(std::string(room, 'p'), LIMIT);
+    CHECK(q.size() == 2);               // payload + newline would be one over
+    CHECK(drain(q) == "s" + std::string(room, 'p') + "\n");
+}

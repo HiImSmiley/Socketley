@@ -5180,11 +5180,6 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             }
             else
             {
-                std::string buf;
-                buf.reserve(msg.size() + 1);
-                buf.append(msg);
-                buf.push_back('\n');
-
                 // A message routed here from another runtime has no sender on
                 // this side, so `sender` names nobody and the set is empty:
                 // dropped rather than sent to everyone, because an echo server
@@ -5198,13 +5193,43 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 // appending to a payload others hold would change it for them.
                 // Measured on the no-script path: the allocator was 9.6 per
                 // cent of the worker and push_shared another 3.0.
+                //
+                // And for one raw recipient the line is not built at all: the
+                // queue takes the payload and the newline straight into its
+                // tail, where the temporary was only ever copied out of and
+                // freed.  A websocket still needs the bytes together, because
+                // a frame is built from them.
                 if (to == send_to_sender)
                 {
-                    if (sender)
+                    if (!sender)
+                    {
+                        // nobody to echo to
+                    }
+                    else if (SOCKETLEY_LIKELY(sender->proto != proto_ws))
+                    {
+                        if (admit_send(sender, msg.size() + 1, false))
+                        {
+                            sender->write_queue.push_coalesced_line(
+                                msg, server_connection::WRITE_COALESCE_LIMIT);
+                            if (SOCKETLEY_LIKELY(!sender->write_pending))
+                                flush_write_queue(sender);
+                        }
+                    }
+                    else
+                    {
+                        std::string buf;
+                        buf.reserve(msg.size() + 1);
+                        buf.append(msg);
+                        buf.push_back('\n');
                         queue_send(sender, std::move(buf));
+                    }
                 }
                 else
                 {
+                    std::string buf;
+                    buf.reserve(msg.size() + 1);
+                    buf.append(msg);
+                    buf.push_back('\n');
                     auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                     if ((to & send_to_sender) && sender)
                         queue_send(sender, relay_msg);

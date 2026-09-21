@@ -270,6 +270,33 @@ public:
     // push(std::move(buf)) and routing it through the copying form above would
     // have put an allocation and a copy on the hottest path in the runtime for
     // the sake of one shared implementation.
+    // A payload and the newline that terminates it, without building the two
+    // into a string first.
+    //
+    // The caller's alternative is a temporary whose entire allocation is
+    // thrown away the moment append_back() copies out of it: malloc, one copy
+    // in, one copy out, free -- for a line an echo server sends millions of
+    // times a second.  Profiled on `--send-to sender` at pipeline depth 400,
+    // 64-byte messages: malloc and _int_free together held 4.5 per cent of the
+    // worker and string::append and push_back another 4.3.
+    //
+    // The fallback is the same string the caller would have built, so nothing
+    // changes for a payload the tail cannot take.
+    void push_coalesced_line(std::string_view value, size_t limit)
+    {
+        if (fits_in_tail(value.size() + 1, limit))
+        {
+            append_back(value);
+            append_back(std::string_view("\n", 1));
+            return;
+        }
+        std::string built;
+        built.reserve(value.size() + 1);
+        built.append(value);
+        built.push_back('\n');
+        push(T(std::move(built)));
+    }
+
     void push_coalesced(std::string&& value, size_t limit)
     {
         if (fits_in_tail(value.size(), limit))
