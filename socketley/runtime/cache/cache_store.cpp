@@ -860,10 +860,12 @@ int64_t cache_store::expire_time(std::string_view key, bool millis) const
     // two clocks measured now.
     const auto now_steady = std::chrono::steady_clock::now();
     const auto now_wall   = std::chrono::system_clock::now();
-    // Narrowed to milliseconds BEFORE the two clocks are added, because a
-    // saturated deadline is most of int64 in nanoseconds and adding the wall
-    // clock's own nanoseconds to it overflows -- the guard then covers what is
-    // left, answering "never" for a deadline that says never.
+    // Narrowed to milliseconds BEFORE the two clocks are added: a saturated
+    // deadline is most of int64 in NANOseconds, and adding the wall clock's
+    // own nanoseconds to it left int64 and answered a date in 1734.  The
+    // narrowing is what fixes that; the guard behind it is about the clock's
+    // period, which this file reads rather than assumes -- on a coarser
+    // steady_clock the milliseconds would be most of int64 again.
     const auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               e->second - now_steady).count();
     const auto now_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(

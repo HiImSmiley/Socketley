@@ -913,6 +913,46 @@ TEST_CASE("cache_store new methods")
         CHECK(*held == "9223372036854775807");
     }
 
+    // expire_in is the one decision behind EXPIRE, PEXPIRE, EXPIREAT,
+    // PEXPIREAT and a script's self.expire.  Three answers, and the third is
+    // the one no bool could carry.
+    SUBCASE("expire_in answers about the key, not about the call")
+    {
+        int64_t unused = 0;
+        (void)unused;
+        CHECK(store.expire_in("nosuch", 600, false) == cache_store::expire_result::no_such_key);
+
+        store.set("a", "v");
+        CHECK(store.expire_in("a", 600, false) == cache_store::expire_result::armed);
+        CHECK(store.get_ttl("a") > 0);
+
+        // Zero and below delete, and the deadline goes with the value -- a
+        // name left in m_expiry answers to nothing.
+        store.set("b", "v");
+        CHECK(store.expire_in("b", 0, false) == cache_store::expire_result::deleted);
+        std::string out;
+        CHECK_FALSE(store.get("b", out));
+        CHECK(store.get_pttl("b") == -2);
+
+        store.set("c", "v");
+        CHECK(store.expire_in("c", -1, true) == cache_store::expire_result::deleted);
+        CHECK_FALSE(store.get("c", out));
+    }
+
+    // A key past its deadline that the sweep has not reached yet is not there
+    // to be given a new one: without the check, EXPIRE erased the deadline,
+    // kept the value and the key was back for good.  The deadline is put one
+    // millisecond in the PAST rather than waiting for one to pass, so this
+    // says the same thing on every machine.
+    SUBCASE("expire_in does not revive a key whose deadline has passed")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", -1));
+        CHECK(store.expire_in("k", 600, false) == cache_store::expire_result::no_such_key);
+        std::string out;
+        CHECK_FALSE(store.get("k", out));
+    }
+
     // The deadline an absurd TTL means is "never", and the two readers agree
     // with it: an overflow here wrapped into the past and the key was gone on
     // the next touch.

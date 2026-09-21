@@ -7629,13 +7629,17 @@ bool cache_instance::lua_expire(std::string_view key, int seconds)
 {
     if (m_mode == cache_mode_readonly)
         return false;
-    if (m_store.set_expiry(key, seconds))
-    {
+    // The third door to the same decision, so a script gets what the two
+    // protocols get: zero or less deletes, and a key already past its deadline
+    // is not there to be given a new one.  Both answers are true here, because
+    // this returns "did it do something" and both did.
+    const auto r = m_store.expire_in(key, seconds, false);
+    if (r == cache_store::expire_result::no_such_key)
+        return false;
+    if (r == cache_store::expire_result::armed)
         mark_ttl_keys();
-        log_lua_mutation({"expire", key, std::to_string(seconds)});
-        return true;
-    }
-    return false;
+    log_lua_mutation({"expire", key, std::to_string(seconds)});
+    return true;
 }
 
 int64_t cache_instance::lua_ttl(std::string_view key)
@@ -8369,14 +8373,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             bool nx = false, xx = false, keepttl = false, want_old = false;
             int64_t ex_sec = 0;
             int64_t px_ms = 0;
-            // A deadline of zero or less is refused HERE, before anything is
-            // written, and this is the whole point of it: `SET k v EX 0`
-            // stored the key with NO deadline at all and answered +OK, so a
-            // lock or session key whose TTL had been computed down to zero
-            // became immortal and its owner was told it had worked.  Redis
-            // refuses, and an unreadable number was worth its own word too --
-            // `SET k v EX abc` fell through to "syntax error", which names the
-            // wrong thing.
+            // Judged where it is read and before anything is written, because
+            // `EX 0` stored the key with no deadline at all and said +OK.
+            // The argument gets its own word: a number that will not parse is
+            // not a syntax error about the word after it.
             const auto expire_arg = [&](int i, int64_t& out) {
                 if (i + 1 >= argc)
                 { resp::encode_error_into(rb, "syntax error"); return false; }
