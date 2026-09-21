@@ -4197,6 +4197,16 @@ key it touches is somebody else's.
 .B self.owns(key)
 is how a script asks before it acts, and it is true for every key when the
 cache is one process.
+.IP
+.B self.publish
+is the exception that is not refused.  The message goes to every shard, over
+the same mesh the wire's
+.B PUBLISH
+uses, because a subscriber is not a key and no shard owns it. What is this
+shard's alone is the
+.IR count :
+the siblings report back on a later turn and this call answers on the turn it
+was made.
 .TP
 .B \-\-cluster
 Publish a routable slot map, so that a cluster\-aware client sends each key
@@ -7306,7 +7316,10 @@ self.ttl(key)               -- Get remaining TTL
 self.persist(key)           -- Remove expiry; false in readonly mode
 
 -- Cache: pub/sub
-self.publish(channel, msg)  -- Publish to channel
+-- Under --shards the message reaches every shard's subscribers, but the count
+-- is this shard's own: the siblings answer on a later turn and this call
+-- answers on the turn it was made.
+self.publish(channel, msg)  -- Publish to channel; returns this shard's count
 
 -- Server: connection control
 -- Every mutator below answers `true`, or `false, "reason"`.  They returned

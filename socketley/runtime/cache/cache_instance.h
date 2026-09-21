@@ -352,6 +352,10 @@ public:
     int64_t lua_ttl(std::string_view key);
     bool lua_persist(std::string_view key);
 
+    // self.publish(), which is publish() plus the siblings; see the definition
+    // for why the count it returns is this shard's alone.
+    int lua_publish(std::string_view channel, std::string_view message);
+
     // ── the one place the Lua table asks who owns a key ─────────────────────
     // A script under --shards is a replicated stream: the same program runs in
     // every shard, so it obeys the rule apply_replicated() already states --
@@ -406,7 +410,10 @@ public:
     // -2 is the store's own "no such key", which is what a foreign key is here.
     int64_t lua_cache_ttl(std::string_view key) override { return lua_owns(key) ? lua_ttl(key) : -2; }
     bool lua_cache_persist(std::string_view key) override { return lua_owns(key) && lua_persist(key); }
-    int lua_cache_publish(std::string_view channel, std::string_view message) override { return publish(channel, message); }
+    // publish() is this PROCESS's subscribers plus the cross-runtime half; on
+    // more than one shard that is a quarter of the cache's subscribers, so a
+    // script's publish takes the road the wire's PUBLISH takes as well.
+    int lua_cache_publish(std::string_view channel, std::string_view message) override { return lua_publish(channel, message); }
 
     // Interactive mode: execute a command and return response
     std::string execute(std::string_view line);
@@ -650,6 +657,9 @@ private:
     // subscriber of that channel, and always this one.
     void fan_publish(client_connection* conn, uint32_t h, std::string_view raw,
                      bool resp, std::string_view channel);
+    // The same set of targets with no reply collected, for a publish that has
+    // to answer on the turn it was called.
+    void fan_publish_siblings(std::string_view channel, std::string_view message);
     static void on_channel_presence(void* ctx, std::string_view channel, bool present);
     void        channel_presence(std::string_view channel, bool present);
     // The one bit with no channel name behind it: patterns.
