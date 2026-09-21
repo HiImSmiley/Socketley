@@ -3361,6 +3361,24 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
     }
 
     // Plaintext into partial, where every protocol above reads it from.
+    //
+    // Two shapes of this loop were tried and both measured nothing, on 512 KB
+    // TLS echoes, six runs per arm, interleaved with the order reversed:
+    //
+    //   a 64 KB buffer instead of 16, to cut SSL_read calls from 32 per
+    //   message to 8 -- ERR_clear_error alone is 1.9% of this worker's
+    //   profile and it runs once per call.  Median 164 against 170 MB/s: it
+    //   came out SLOWER, which is what a buffer that no longer fits beside
+    //   the working set does.
+    //
+    //   ssl_read straight into the tail of `partial` through
+    //   resize_and_overwrite, removing one full copy of every message.
+    //   Median 171 against 173 at 512 KB, and 243 against 233 at 64 KB with
+    //   the ranges overlapping.  The copy is sequential and already hot, so
+    //   the prefetcher was paying for it and nobody else was.
+    //
+    // What DID move this path was the allocator, not the copying: see
+    // set_read_buffer() in runtime_instance.cpp.
     char plain[16384];
     for (;;)
     {
