@@ -2133,7 +2133,7 @@ bool server_instance::setup(event_loop& loop)
         // is the one socket with no window to close and no retransmit behind
         // it: what overruns the receive buffer is gone silently.  Measured on
         // the burst a runtime inside one callback cannot drain -- 221 hundred-
-        // byte datagrams survived on the kernel default, 2,176 on this.
+        // byte datagrams survived on the kernel default, 2,184 on this.
         int udp_rcvbuf = 1024 * 1024;
         setsockopt(m_udp_fd, SOL_SOCKET, SO_RCVBUF, &udp_rcvbuf, sizeof(udp_rcvbuf));
 
