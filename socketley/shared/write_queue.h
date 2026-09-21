@@ -278,7 +278,11 @@ public:
     // in, one copy out, free -- for a line an echo server sends millions of
     // times a second.  Profiled on `--send-to sender` at pipeline depth 400,
     // 64-byte messages: malloc and _int_free together held 4.5 per cent of the
-    // worker and string::append and push_back another 4.3.
+    // worker and string::append and push_back another 4.3.  Worth +12.5 per
+    // cent of the message rate, 3.93 to 4.43 M/s, six runs per arm with the
+    // ranges not overlapping -- measured over 2.5 seconds per run after a
+    // warm-up, because a fixed round count finished in 0.16 s and was mostly
+    // timing the ramp.
     //
     // The fallback is the same string the caller would have built, so nothing
     // changes for a payload the tail cannot take.
