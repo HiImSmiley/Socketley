@@ -2233,9 +2233,8 @@ answers whoever spoke and sends the master a copy. There is no
 .B all
 for that reason \(em
 .B sender,others
-already says it, and one behaviour under two spellings is what
-.B \-\-master\-forward
-used to be.
+already says it, and one behaviour under two spellings is the mistake this
+flag was built so as not to repeat.
 .IP
 Unset keeps what the mode has always done:
 .B inout
@@ -2250,9 +2249,7 @@ In
 the flag decides what happens to a NON\-master's message; the master's own
 still reaches everyone else, which is what the mode is.
 .B "\-\-send\-to master"
-is what
-.B \-\-master\-forward
-was, prefix and all \(em the sender's descriptor stays in front of the line so
+forwards prefixed \(em the sender's descriptor stays in front of the line so
 the master can tell two clients apart.
 .B "\-\-send\-to others,master"
 is a moderated room the master reads along with.
