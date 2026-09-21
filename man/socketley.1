@@ -880,7 +880,7 @@ mode	string	"inout", "in", "out", or "master"
 udp	bool	Use UDP instead of TCP \fB(requires restart)\fR
 master_pw	string	Static password for master mode
 send_to	string	"sender", "others", "master", comma separated
-http_dir	string	Static file root, as \fB\-\-http\-dir\fR
+http_dir	string	Static file root, as \fB\-\-http\fR
 http_cache	bool	Hold those files in memory, as \fB\-\-http\-cache\fR
 upstreams	array	Upstream addresses, as \fB\-\-upstream\fR
 .TE
@@ -2194,7 +2194,7 @@ of relay traffic in under 250 ms receives the most recent messages and not the
 whole backlog. The cap is per connection and applies only before classification;
 once a connection is classified, relay traffic goes straight to its write queue
 and the ordinary
-.B \-\-max\-conns
+.B \-\-max\-connections
 and write\-queue limits govern instead.
 .IP
 A connection that speaks HTTP is not in the relay set and receives no relayed
@@ -7939,7 +7939,8 @@ until it is reloaded.
 Returns an array of daemon info tables. Each entry has:
 .nf
 name      string   Daemon name (from \-\-name)
-host      string   Advertised address (from \-\-cluster\-addr)
+host      string   Advertised address, from gethostname(2), falling
+                   back to the daemon name if that call fails
 runtimes  number   Count of runtimes on this daemon
 .fi
 .IP
@@ -10169,7 +10170,7 @@ asynchronous form of it in glibc, so this one is a design decision and not a
 repair.
 .IP \(bu 2
 The mutation journal's flush, once per
-.B \-\-persist\-interval
+.B \-\-persistent\-interval
 while anything is buffered. A write to the page cache and nothing more on a
 healthy disk; a write to a full or slow one is the whole interval's worth of
 clients waiting.
