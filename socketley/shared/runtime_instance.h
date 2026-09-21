@@ -302,6 +302,26 @@ public:
     std::string stats_ring() const;
     virtual std::string stats_lines() const { return {}; }
 
+    // Atomic for the DAEMON's copy of these, not the worker's.
+    //
+    // Both processes hold a runtime_instance and they use these four
+    // differently.  In a worker the loop thread increments them and the same
+    // loop thread reads them for its stats push -- one thread, so the lock
+    // prefix on every fetch_add buys nothing.  In the daemon the main thread
+    // stores the figures a worker reported (daemon_handler.cpp, in the
+    // aggregation) while the metrics endpoint reads them from a thread of its
+    // own -- metrics_endpoint.cpp calls enable_offthread_stats() and means it.
+    // That reader is what the type is for.
+    //
+    // Measured before assuming it mattered: removing the message counter from
+    // the server's per-message path entirely -- the upper bound on any change
+    // here -- is +2.8 per cent at pipeline depth 400, with the arms
+    // overlapping.  Worth knowing, because `lock xadd` against 197 cycles a
+    // message looks arithmetically like ten.
+    //
+    // If it ever is worth it, the change is not to drop `atomic`: exactly one
+    // thread WRITES in either process, so `store(load(relaxed) + 1, relaxed)`
+    // is a plain add with no lock and stays correct for the reader.
     std::atomic<uint64_t> m_stat_total_connections{0};
     std::atomic<uint64_t> m_stat_total_messages{0};
     std::atomic<uint64_t> m_stat_bytes_in{0};
