@@ -65,11 +65,13 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 daemon_isolate shardluakeys
 
-P4=$((SL_PORT_BASE+1080))
-P1=$((SL_PORT_BASE+1100))
-PM=$((SL_PORT_BASE+1120))
-PM1=$((SL_PORT_BASE+1140))
-PO=$((SL_PORT_BASE+1160))
+# 1200-1224, from a block nothing else in this directory uses: each four-shard
+# cache binds base..base+3, so the runtimes are five apart and not four.
+P4=$((SL_PORT_BASE+1200))
+P1=$((SL_PORT_BASE+1205))
+PM=$((SL_PORT_BASE+1210))
+PM1=$((SL_PORT_BASE+1215))
+PO=$((SL_PORT_BASE+1220))
 NAMES="slk4 slk1 slm4 slm1 slo4"
 
 PASS=0; FAIL=0; TOTAL=0

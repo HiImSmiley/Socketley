@@ -52,8 +52,9 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 daemon_isolate shardluapub
 
-P4=$((SL_PORT_BASE+1260))
-P1=$((SL_PORT_BASE+1280))
+# 1225-1234, from the same unused block; a four-shard cache binds base..base+3.
+P4=$((SL_PORT_BASE+1225))
+P1=$((SL_PORT_BASE+1230))
 NAMES="slp4 slp1"
 N=40
 
