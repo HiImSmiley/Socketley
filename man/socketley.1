@@ -1264,7 +1264,26 @@ Set listener port (server, proxy, cache) or target port (client).
 Start immediately after creation.
 .TP
 .B \-\-test
-Dry run. Validate configuration without starting.
+Dry run: the type, the name and every flag are checked, and then nothing is
+kept. No runtime is left in
+.BR ls ,
+no state file is written and the name is free for the
+.B create
+that follows. It used to keep the runtime -- unstarted, unsaved, and holding
+the name until the daemon restarted -- which made the real
+.B create
+answer "runtime already exists", and made
+.B start
+on it bind a port no state file would ever bring back.
+.IP
+It does not bind the port, and a
+.B \-\-lua
+script is loaded \(em which is what validates it, and runs its top level \(em but
+.B on_start
+is not called, because nothing is started. What it answers is whether this
+command line is one
+.B create
+accepts.
 .TP
 .BI "\-\-log " "file"
 Append one line per state transition to

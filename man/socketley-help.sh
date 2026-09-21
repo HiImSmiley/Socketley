@@ -575,7 +575,7 @@ flags_options() {
     echo "├──────────────────┼─────────────────────────────────────────┤"
     echo "│ -p <port>        │ Set port                                │"
     echo "│ -s               │ Start immediately                       │"
-    echo "│ --test           │ Dry run (validate only)                 │"
+    echo "│ --test           │ Validate and keep nothing               │"
     echo "│ --log <file>     │ Log state transitions                   │"
     echo "│ -w <file>        │ Write messages to file                  │"
     echo "│ --lua <script>   │ Attach Lua configuration script         │"

@@ -76,7 +76,7 @@ refuses() {
     out=$("$@" 2>&1) || rc=$?
     if [ "$rc" -eq 1 ]; then pass
     else fail "$label exits 1" "got exit $rc, said: ${out:-<nothing>}"; fi
-    if grep -qF "$want" <<<"$out"; then pass
+    if grep -qF -e "$want" <<<"$out"; then pass
     else fail "$label says what to do instead" \
               "wanted to find: $want" \
               "said: ${out:-<nothing>}"; fi
@@ -348,6 +348,55 @@ if [ "$RC" -eq 1 ] && grep -q "runtime not found: ci_nosuch" <<<"$OUT" \
    && ! grep -q "ran for the rest of the list" <<<"$OUT"; then pass
 else fail "a list where nothing resolved reads as it always did" \
           "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+# ─── --test is a dry run and now keeps nothing ──────────────────────────────
+#
+# try_create() makes the runtime before the first flag is read, and --test
+# skipped only the START and the SAVE.  So a dry run held the name -- the real
+# create after it answered "runtime already exists" -- and what it held was
+# startable: `start` on it bound the port and served, with no state file, so
+# the daemon's next restart dropped a running runtime with no record of it.
+TP=$((SL_PORT_BASE + 970))
+
+RC=0
+OUT=$("$BIN" create server ci_dry -p $((TP + 1)) --test 2>&1) || RC=$?
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then pass
+else fail "a dry run that validates is a silent success" \
+          "exit $RC, said: ${OUT:-<nothing>}"; fi
+
+if [ -z "$(state_of ci_dry)" ]; then pass
+else fail "a dry run keeps nothing" \
+          "ci_dry is in ls as '$(state_of ci_dry)' after --test"; fi
+
+# The consequence that sent people looking: the name has to be free afterwards.
+RC=0
+OUT=$("$BIN" create server ci_dry -p $((TP + 2)) 2>&1) || RC=$?
+if [ "$RC" -eq 0 ]; then pass
+else fail "the real create after a dry run is not refused" \
+          "exit $RC, said: ${OUT:-<nothing>}" \
+          "the dry run held the name until the daemon restarted."; fi
+
+# -s does not survive --test either: a dry run must not start anything.
+"$BIN" create server ci_dry_s -p $((TP + 3)) --test -s >/dev/null 2>&1 || true
+if [ -z "$(state_of ci_dry_s)" ]; then pass
+else fail "--test -s starts nothing and keeps nothing" \
+          "ci_dry_s is '$(state_of ci_dry_s)'"; fi
+
+# ─── and the validating half still validates ────────────────────────────────
+#
+# Load-bearing: a build that deleted the runtime BEFORE parsing the flags would
+# pass everything above and check nothing at all.
+refuses "--test still refuses a flag that is not there" "unknown flag" \
+        "$BIN" create server ci_dry_bad -p $((TP + 4)) --test --bogus-flag
+
+refuses "--test still refuses a flag the type does not take" "--reconnect" \
+        "$BIN" create server ci_dry_rc -p $((TP + 5)) --test --reconnect 3
+
+# and the refused dry runs left nothing either.
+RC=0
+OUT=$("$BIN" ls -s 2>&1) || RC=$?
+if ! grep -qE '^ci_dry_(s|bad|rc)$' <<<"$OUT"; then pass
+else fail "a refused dry run keeps nothing either" "ls -s lists: ${OUT:-<nothing>}"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

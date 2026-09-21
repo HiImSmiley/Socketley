@@ -1489,6 +1489,21 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         }
     }
 
+    // ─── A DRY RUN LEAVES NOTHING BEHIND ────────────────────────────────────
+    // --test skips the start and the save, and skipping the save was the whole
+    // defect: try_create() made the runtime before the first flag was read and
+    // nothing took it away, so a dry run held the name until the daemon
+    // restarted -- and the real `create` that followed answered "runtime
+    // already exists".  Worse, what it left was startable: `start` on it bound
+    // the port and served, with no state file, so the daemon's next restart
+    // dropped a running runtime with no record that it had been there.
+    //
+    // Removed rather than never created, because every flag parser writes into
+    // an instance and there is nothing to validate against without one -- and
+    // this is the form the two refusals above already use.
+    if (instance->get_test_mode())
+        m_manager.remove(name);
+
     return 0;
 }
 
