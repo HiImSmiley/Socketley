@@ -2031,6 +2031,7 @@ bool server_instance::setup(event_loop& loop)
         m_accept_backoff_armed = false;
         m_await_sweep_armed    = false;
         m_udp_recv_armed       = false;
+        m_udp_recv_rearm_due   = false;
         // Nothing in the ring names any of them any more.
         m_accept_spent.clear();
         m_udp_recv_spent.clear();
@@ -2128,6 +2129,14 @@ bool server_instance::setup(event_loop& loop)
         setsockopt(m_udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(m_udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
+        // Larger than the 128 KB every other listener here takes, because this
+        // is the one socket with no window to close and no retransmit behind
+        // it: what overruns the receive buffer is gone silently.  Measured on
+        // the burst a runtime inside one callback cannot drain -- 221 hundred-
+        // byte datagrams survived on the kernel default, 2,184 on this.
+        int udp_rcvbuf = 1024 * 1024;
+        setsockopt(m_udp_fd, SOL_SOCKET, SO_RCVBUF, &udp_rcvbuf, sizeof(udp_rcvbuf));
+
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
@@ -2168,6 +2177,12 @@ bool server_instance::setup(event_loop& loop)
         // --idle-timeout inert on a UDP server: the flag was accepted, `show`
         // reported it, and no sweep was ever armed to act on it.
         arm_idle_sweep();
+        // The same return and the same shape of defect: --upstream filled
+        // m_upstream_targets and nothing ever dialled them, so `stats` read
+        // upstreams:0/1 for the life of the runtime.  An upstream is a TCP
+        // socket this runtime dials and is no business of the family its own
+        // listener was configured in.
+        start_upstreams();
         return true;
     }
 
@@ -2263,9 +2278,60 @@ bool server_instance::setup(event_loop& loop)
     // zero-copy path, so nothing here has to exist before the first request.
     m_splice_live = 0;
 
-    // Connect to upstreams with nothing to clear, because teardown() either
-    // dropped the previous structs or retired the ones with work still in the
-    // ring.
+    start_upstreams();
+
+    return true;
+}
+
+// What start_upstreams() undoes, and the reason both are functions: teardown()
+// has two exits as well, and the pair has to be called from the same number of
+// places or a restart frees a struct the ring still names.
+void server_instance::stop_upstreams(event_loop& loop)
+{
+    // Set false by any withdrawal the ring refused, reported once rather than
+    // per upstream, because they all fail for the same reason and together.
+    bool timers_withdrawn = true;
+
+    for (auto& [cid, uc] : m_upstreams)
+    {
+        if (uc->fd >= 0)
+        {
+            m_upstream_by_fd.erase(uc->fd);
+            shutdown(uc->fd, SHUT_RDWR);
+            close_tracked(uc->fd);
+            uc->fd = -1;
+        }
+        uc->connected = false;
+        // Release write queue refs
+        uc->write_queue.clear();
+        if (!uc->write_pending)
+        {
+            for (size_t j = 0; j < uc->write_batch_count; j++)
+                uc->write_batch[j].clear();
+            uc->write_batch_count = 0;
+        }
+
+        // The reconnect timer is attached to no fd, so its owner stays set and
+        // it is withdrawn only to stop the wait being thirty seconds this
+        // instance spends in the graveyard.
+        if (uc->timeout_pending)
+            timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
+
+        if (uc->read_pending || uc->write_pending || uc->timeout_pending)
+            m_upstream_retired.push_back(std::move(uc));
+    }
+    m_upstreams.clear();
+
+    if (SOCKETLEY_UNLIKELY(!timers_withdrawn))
+        LOG_WARN("server: an upstream reconnect timer could not be withdrawn — this "
+                 "instance stays retired until it fires on its own");
+}
+
+// Connect to upstreams with nothing to clear, because stop_upstreams() either
+// dropped the previous structs or retired the ones with work still in the
+// ring.  Its own function because setup() has two exits and both owe it.
+void server_instance::start_upstreams()
+{
     m_upstream_by_fd.clear();
     m_next_upstream_id = 1;
     for (const auto& target : m_upstream_targets)
@@ -2278,8 +2344,6 @@ bool server_instance::setup(event_loop& loop)
         if (!upstream_try_connect(ptr))
             upstream_schedule_reconnect(ptr);
     }
-
-    return true;
 }
 
 void server_instance::teardown(event_loop& loop)
@@ -2307,6 +2371,12 @@ void server_instance::teardown(event_loop& loop)
         }
         m_udp_peers.clear();
         m_udp_peer_idx.clear();
+        // This exit dials upstreams like the other one, so it gives them up
+        // like the other one.  Without it they stayed in m_upstreams with
+        // reads still in the ring and the next start() freed them under the
+        // kernel -- a heap-use-after-free the fuzz target reported the moment
+        // a UDP server could reach running state.
+        stop_upstreams(loop);
         // Before the return, and this is the other half of arming the sweep on
         // the UDP path at all: this exit never reached the withdrawal below, so
         // the first version of that change left a timeout owed and the fuzz
@@ -2440,41 +2510,7 @@ void server_instance::teardown(event_loop& loop)
         release_conn(std::move(conn));
     m_clients.clear();
 
-    // Set false by any timer withdrawal the ring refused; reported once at the
-    // end rather than per timer, because they all fail for the same reason and
-    // they all fail together.
-    bool timers_withdrawn = true;
-
-    // Tear down upstream connections
-    for (auto& [cid, uc] : m_upstreams)
-    {
-        if (uc->fd >= 0)
-        {
-            m_upstream_by_fd.erase(uc->fd);
-            shutdown(uc->fd, SHUT_RDWR);
-            close_tracked(uc->fd);
-            uc->fd = -1;
-        }
-        uc->connected = false;
-        // Release write queue refs
-        uc->write_queue.clear();
-        if (!uc->write_pending)
-        {
-            for (size_t j = 0; j < uc->write_batch_count; j++)
-                uc->write_batch[j].clear();
-            uc->write_batch_count = 0;
-        }
-
-        // The reconnect timer is attached to no fd, so its owner stays set and
-        // it is withdrawn only to stop the wait being thirty seconds this
-        // instance spends in the graveyard.
-        if (uc->timeout_pending)
-            timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
-
-        if (uc->read_pending || uc->write_pending || uc->timeout_pending)
-            m_upstream_retired.push_back(std::move(uc));
-    }
-    m_upstreams.clear();
+    stop_upstreams(loop);
 
     // Close splice pipe
     // The pipes went with the connections that owned them.
@@ -3146,6 +3182,13 @@ void server_instance::on_loop_turn()
 {
     if (m_companion)
         m_companion->pump();
+
+    // The one read a UDP server has, when the ring would not take it.  Here
+    // rather than on a timer because the timer needs the submission queue that
+    // just refused, and this runs at the end of the very turn whose poll
+    // drained it.
+    if (SOCKETLEY_UNLIKELY(m_udp_recv_rearm_due) && !m_udp_recv_armed)
+        arm_udp_recv();
 
     // The same shape as the drain dispatch below, and for the same reason: a
     // streamed response that ended with a request already buffered behind it
@@ -5107,9 +5150,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 // a UDP sender had been receiving its own datagram back since
                 // the mode existed while a TCP one did not.
                 if ((to & send_to_sender) && from && m_udp_fd >= 0)
-                    sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
-                           reinterpret_cast<const struct sockaddr*>(from),
-                           sizeof(*from));
+                    udp_send_one(msg, *from);
                 if (to & send_to_others)
                     udp_broadcast(msg, from);
             }
@@ -5322,10 +5363,11 @@ server_instance::fanout_count server_instance::broadcast(std::string_view msg)
 
     if (SOCKETLEY_UNLIKELY(m_udp))
     {
-        // A datagram has no queue to fall behind in, so there is no backlog to
-        // report and the count is left at zero rather than guessed at.
-        udp_broadcast(msg, nullptr);
-        return {};
+        // The socket send buffer IS that queue -- the comment this replaced
+        // said a datagram has no queue to fall behind in.  Answering {0,0} made
+        // a broadcast that reached every peer and one that reached nobody read
+        // identically to the script, so the count is what sendto did.
+        return udp_broadcast(msg, nullptr);
     }
 
     // Build newline-terminated message (single allocation via make_shared)
@@ -6413,10 +6455,16 @@ void server_instance::arm_udp_recv()
     if (!m_loop || m_udp_fd < 0)
     {
         m_udp_recv_armed = false;
+        m_udp_recv_rearm_due = false;
         return;
     }
     m_udp_recv->msg.msg_namelen = sizeof(m_udp_recv->addr);
     m_udp_recv_armed = m_loop->submit_recvmsg(m_udp_fd, &m_udp_recv->msg, &m_udp_recv->req);
+    // A refusal here is the whole ear, because the only things that ask again
+    // are inside the completion of the read that was never armed -- so it is
+    // remembered for on_loop_turn(), which owes the ring nothing and therefore
+    // still works when a full submission queue is what refused.
+    m_udp_recv_rearm_due = !m_udp_recv_armed;
 }
 
 void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
@@ -6424,13 +6472,27 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     // Whatever else happens below, the op that produced this is finished.
     m_udp_recv_armed = false;
 
-    if (cqe->res <= 0)
+    // A socket closed under this read completes it with one of these, and
+    // resubmitting would arm a second chain on the descriptor start() opened --
+    // the same four handle_accept() returns on, for the same reason.
+    if (SOCKETLEY_UNLIKELY(cqe->res == -ECANCELED || cqe->res == -EBADF
+                           || cqe->res == -EINVAL || cqe->res == -ENOTSOCK))
+        return;
+
+    if (cqe->res < 0)
     {
         arm_udp_recv();  // Resubmit on error
         return;
     }
 
-    // Register peer if new; skip processing if peer list is full
+    // Counted before the peer check, because these bytes arrived whatever the
+    // table decides about their sender.
+    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+
+    // Register peer if new; skip processing if peer list is full.  Reached on
+    // res == 0 as well: a zero-length datagram is a message its sender sent,
+    // so it enters and refreshes a peer like any other -- 0 is an end of
+    // stream on TCP and a legitimate datagram here.
     if (find_or_add_peer(m_udp_recv->addr) < 0)
     {
         arm_udp_recv();
@@ -6460,10 +6522,40 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     arm_udp_recv();
 }
 
-void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude)
+// The one door every outbound datagram leaves by, so what the socket did with
+// it is counted in one place: the return value was discarded at both call
+// sites and a UDP server reported bytes_out:0 for its whole life.
+bool server_instance::udp_send_one(std::string_view msg, const struct sockaddr_in& to)
 {
+    const ssize_t n = sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
+                             reinterpret_cast<const struct sockaddr*>(&to), sizeof(to));
+    if (SOCKETLEY_LIKELY(n >= 0))
+    {
+        m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+        return true;
+    }
+
+    // Throttled on the same rule the ring's own refusals use: the first one
+    // says what happened and a flood does not become the log.  EAGAIN and
+    // ENOBUFS are a full send buffer, EMSGSIZE a payload no peer can ever be
+    // sent -- all three are silent losses without this line.
+    const int err = errno;
+    ++m_udp_send_failures;
+    if (m_udp_send_failures == 1 || (m_udp_send_failures % 1000) == 0)
+        LOG_ERROR(("server \"" + std::string(get_name()) + "\": a datagram of " +
+                   std::to_string(msg.size()) + " bytes was not sent (" +
+                   std::string(std::strerror(err)) + "); " +
+                   std::to_string(m_udp_send_failures) +
+                   " datagram(s) have now been dropped by the socket").c_str());
+    return false;
+}
+
+server_instance::fanout_count server_instance::udp_broadcast(std::string_view msg,
+                                                             const struct sockaddr_in* exclude)
+{
+    fanout_count counted;
     if (m_udp_fd < 0)
-        return;
+        return counted;
 
     for (auto& peer : m_udp_peers)
     {
@@ -6472,9 +6564,12 @@ void server_instance::udp_broadcast(std::string_view msg, const struct sockaddr_
             peer.addr.sin_port == exclude->sin_port)
             continue;
 
-        sendto(m_udp_fd, msg.data(), msg.size(), MSG_DONTWAIT,
-               reinterpret_cast<const struct sockaddr*>(&peer.addr), sizeof(peer.addr));
+        if (udp_send_one(msg, peer.addr))
+            ++counted.taken;
+        else
+            ++counted.backlogged;
     }
+    return counted;
 }
 
 bool server_instance::disconnect(int client_fd)

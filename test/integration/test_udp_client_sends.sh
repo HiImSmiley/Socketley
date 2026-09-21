@@ -23,6 +23,10 @@
 # readable -- the empty one is not in the total either way, so the number is
 # about what came AFTER it.
 #
+#   AND BOTH BYTE COUNTERS WERE DEAD.  See case C: bytes_in and bytes_out were
+#   never touched on the UDP path at either end, so a UDP server reported 0 and
+#   0 for its whole life while total_messages climbed beside them.
+#
 # (An earlier version of this comment said a Lua script cannot write a file
 # here.  That is the DAEMON CONFIG loader, which opens base, package, table,
 # string and math; a runtime script gets io and package too, and
@@ -49,6 +53,7 @@ bad() {
 
 PA=$((SL_PORT_BASE+1404))
 PB=$((SL_PORT_BASE+1405))
+PC=$((SL_PORT_BASE+1406))
 
 daemon_isolate udpclientsends
 trap 'daemon_stop 2>/dev/null || true' EXIT
@@ -105,7 +110,49 @@ else
         "being read as an end of stream, which ran drop_connection on a healthy socket"
 fi
 
-for n in ucc_a ucs_a ucc_b ucs_b; do
+# ── C. What the two byte counters on a UDP server say ──────────────────────
+# bytes_in and bytes_out were never touched on the UDP path, at either end:
+# handle_udp_read counted the message and not the bytes, and both sendto call
+# sites dropped the return value.  So a UDP server reported bytes_in:0 and
+# bytes_out:0 for its whole life while total_messages climbed beside them --
+# two dead fields in a block that reads as live, feeding `stats`, the
+# Prometheus endpoint, the JSON and the daemon-wide totals.  The TCP arm counts
+# in three places and the CLIENT counts for UDP, which is what makes this an
+# omission rather than a decision.
+#
+# Exact numbers, because "greater than zero" would pass against a counter wired
+# to the wrong end.  Five datagrams of `payload-NN\n`: eleven bytes each on the
+# way in, and the echo is the message with its newline stripped, so ten each on
+# the way out.
+"$BIN" create server ucs_c -p "$PC" --udp --send-to sender -s >/dev/null 2>&1
+sleep 1.2
+
+ECHOED=$(python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1.0); s.bind(('127.0.0.1', 0))
+got = 0
+for i in range(5):
+    s.sendto(('payload-%02d' % i).encode() + b'\n', ('127.0.0.1', $PC))
+    try:
+        s.recv(2048); got += 1
+    except socket.timeout:
+        pass
+print(got); s.close()" 2>/dev/null)
+sleep 0.8
+
+IN_C=$(stat_of ucs_c bytes_in)
+OUT_C=$(stat_of ucs_c bytes_out)
+if [ "${IN_C:-0}" -eq 55 ] && [ "${OUT_C:-0}" -eq 50 ] && [ "${ECHOED:-0}" -eq 5 ]; then
+    ok "a UDP server counts both directions (bytes_in:$IN_C bytes_out:$OUT_C, $ECHOED echoes)"
+else
+    bad "bytes_in and bytes_out are answered on a UDP server" \
+        "stats reads bytes_in:${IN_C:-<none>} of 55 and bytes_out:${OUT_C:-<none>} of 50," \
+        "with ${ECHOED:-<none>} of 5 echoes actually received;" \
+        "0 and 0 with five echoes is the defect -- the datagrams moved and nothing counted them"
+fi
+
+for n in ucc_a ucs_a ucc_b ucs_b ucs_c; do
     "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" remove "$n" >/dev/null 2>&1
 done
 daemon_stop

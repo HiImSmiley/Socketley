@@ -596,7 +596,12 @@ std::unique_ptr<server_instance> make_instance(world& w)
     rt->set_on_connect(cb_on_connect);
     rt->set_on_disconnect(cb_on_disconnect);
     rt->set_on_auth(cb_on_auth);
-    rt->set_master_pw("fuzzpw");
+    // Not on a UDP instance.  config_refusal() refuses --master-pw in any mode
+    // but master, and refuses --udp WITH master, so an instance carrying both
+    // can never start -- which is why m_udp_fd was never once opened in 20,037
+    // inputs while the header claimed UDP was covered.
+    if (!w.udp)
+        rt->set_master_pw("fuzzpw");
     if (g_http_dir)
         rt->set_http_dir(*g_http_dir);
     if (w.tick)
@@ -693,6 +698,19 @@ void check_instance(server_instance* rt, bool deep)
                    "the accept request is marked occupied although the ring owes this owner "
                    "nothing — the completion that would free it is never coming, so no accept "
                    "chain can ever be armed on this request again");
+    }
+
+    // The same question of the one ear a UDP server has, which the clause above
+    // excludes because it is a different socket and a different completion.  A
+    // refused recvmsg re-arms from on_loop_turn() and not from a timer, so what
+    // must be true is that one of the two is standing.
+    if (rt->get_state() == runtime_running && rt->m_udp && rt->m_udp_fd >= 0)
+    {
+        RT_FINDING("udp-socket-without-read",
+                   rt->m_udp_recv_armed || rt->m_udp_recv_rearm_due,
+                   "a running UDP server has a bound socket with no read armed on it and "
+                   "nothing owed that would arm one — the port answers, `ps` counts it, and "
+                   "every datagram sent to it is dropped for the life of the runtime");
     }
 
     // A cache request is owed a reply and the reply is what lowers the count,

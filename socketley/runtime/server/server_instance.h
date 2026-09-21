@@ -1096,13 +1096,25 @@ private:
 
     // UDP helpers
     void handle_udp_read(struct io_uring_cqe* cqe);
-    void udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
+    // Every datagram this server sends leaves through here, so the byte count
+    // is taken once instead of at each call site.
+    bool udp_send_one(std::string_view msg, const struct sockaddr_in& to);
+    // What it reached and what the socket refused, in the same two numbers a
+    // TCP fan-out answers with.
+    fanout_count udp_broadcast(std::string_view msg, const struct sockaddr_in* exclude);
     int find_or_add_peer(const struct sockaddr_in& addr);
 
     // The idle sweep's own arm, because setup() has two exits -- the UDP path
     // returns before the TCP path ever reaches the arm, so --idle-timeout was
     // accepted and did nothing on a UDP server.
     void arm_idle_sweep();
+    // The outbound leg, called from both of those exits for the same reason:
+    // an upstream is a TCP socket this runtime dials and has nothing to do
+    // with the family its own listener was configured in.
+    void start_upstreams();
+    // And its pair, because teardown() has two exits as well: a restart that
+    // ran one without the other freed an upstream the ring still named.
+    void stop_upstreams(event_loop& loop);
     // Starts the clock on a head that arrived in part, and arms the sweep that
     // reads it -- a plain --http server has neither --idle-timeout nor TLS, so
     // without this there is no chain running at all.
@@ -1197,6 +1209,9 @@ private:
     bool m_relay_deadline_armed{false};
     bool m_await_sweep_armed{false};
     bool m_udp_recv_armed{false};
+    // A read the ring would not take, retried from on_loop_turn(): every other
+    // re-arm hangs off a completion, and a refused submission produces none.
+    bool m_udp_recv_rearm_due{false};
 
     std::unordered_map<int, std::unique_ptr<server_connection>> m_clients;
     // O(1) fd→conn lookup for CQE dispatch (non-owning, m_clients owns)
@@ -1318,6 +1333,9 @@ private:
     std::vector<std::unique_ptr<udp_recv_state>> m_udp_recv_spent;
     std::vector<udp_peer> m_udp_peers;
     std::unordered_map<uint64_t, int> m_udp_peer_idx;  // packed IP+port → index in m_udp_peers
+    // Datagrams the socket refused, counted so the log can be throttled and
+    // still say how many went unsaid.
+    uint64_t m_udp_send_failures{0};
 
     // Per-IP auth failure tracking
     struct auth_ip_record {
