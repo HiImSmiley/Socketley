@@ -1,3 +1,5 @@
+#include <malloc.h>
+#include <climits>
 #include "runtime_instance.h"
 #include "worker_env.h"
 #include "lua_suspend.h"
@@ -1108,6 +1110,40 @@ void runtime_instance::set_read_buffer(size_t bytes)
 {
     constexpr size_t floor = 64u * 1024;
     m_read_buffer = bytes < floor ? floor : bytes;
+
+    // And the allocator is told the same bound, in a worker only.
+    //
+    // glibc serves anything over 128 KB with mmap and hands it straight back
+    // to the kernel on free, so a runtime whose messages are larger than that
+    // pays a page fault and a kernel-side zeroing for every one of them.  It
+    // shows in a profile as clear_highpages and try_charge_memcg beside the
+    // memmove, which is how it was found.
+    //
+    // Measured on 512 KB echoes, six runs per arm, interleaved with the order
+    // reversed: TLS 147 -> 174 MB/s, the two ranges not overlapping at all.
+    // Plaintext moved too in an early measurement and then stopped, and the
+    // reason is worth keeping: glibc RAISES its own threshold when it sees a
+    // block of that size freed, so the cleartext path heals itself after a
+    // warm-up.  The TLS path does not, because OpenSSL's own allocations sit
+    // between the frees.  What this line buys is therefore the TLS case and
+    // the first seconds of any other -- not a number that shows up on a
+    // plaintext benchmark left running.
+    //
+    // The bound is this runtime's own read buffer and not a constant, because
+    // that is already the documented ceiling on how large one message may be.
+    // Measured cost: RSS 27,652 KB against 27,664 on a plaintext worker and
+    // 31,204 against 31,368 on a TLS one -- nothing, because the heap only
+    // keeps what a message actually used.
+    //
+    // Worker only: the daemon allocates nothing of this size and would hold
+    // heap it never reuses.
+    if (in_worker_process())
+    {
+        const int want = static_cast<int>(
+            std::min<size_t>(m_read_buffer, static_cast<size_t>(INT_MAX)));
+        mallopt(M_MMAP_THRESHOLD, want);
+        mallopt(M_TRIM_THRESHOLD, want);
+    }
 }
 size_t runtime_instance::get_read_buffer() const { return m_read_buffer; }
 
