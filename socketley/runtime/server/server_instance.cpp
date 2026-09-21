@@ -6463,7 +6463,7 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
                            || cqe->res == -EINVAL || cqe->res == -ENOTSOCK))
         return;
 
-    if (cqe->res <= 0)
+    if (cqe->res < 0)
     {
         arm_udp_recv();  // Resubmit on error
         return;
@@ -6473,7 +6473,10 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
     // table decides about their sender.
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
-    // Register peer if new; skip processing if peer list is full
+    // Register peer if new; skip processing if peer list is full.  Reached on
+    // res == 0 as well: a zero-length datagram is a message its sender sent,
+    // so it enters and refreshes a peer like any other -- 0 is an end of
+    // stream on TCP and a legitimate datagram here.
     if (find_or_add_peer(m_udp_recv->addr) < 0)
     {
         arm_udp_recv();
