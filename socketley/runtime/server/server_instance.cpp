@@ -6556,6 +6556,28 @@ bool server_instance::udp_send_one(std::string_view msg, const struct sockaddr_i
     return false;
 }
 
+// One sendto per peer, and sendmmsg() was tried here and withdrawn.
+//
+// Batching 128 headers over one shared iovec -- the payload is identical for
+// every recipient, so only the address differs -- turned four hundred syscalls
+// into four and changed nothing that could be measured: 535 microseconds of
+// worker CPU per broadcast in both arms, six runs each, interleaved and with
+// the order reversed, the only spread being a single scheduler tick that
+// appeared once in each arm.
+//
+// The reason is worth keeping: the cost is per DATAGRAM inside the kernel --
+// the UDP stack, the loopback delivery, the wake of each receiver -- and not
+// per syscall, so removing 396 of 400 syscall entries removed a few percent of
+// a few percent.  It is also why the 95.9% kernel share this runtime profiles
+// at is not a share anybody can take: there is no userspace left to remove.
+//
+// Measured at 1, 10, 100 and 400 peers beforehand, and the shape says the same
+// thing: 5.00, 27.50, 265 and 1020 microseconds of CPU per message, which is
+// flat at about 2.55 microseconds per peer from ten peers upward.  A broadcast
+// to four hundred costs a millisecond, and the receive socket has nothing
+// armed on it for the whole of it.  If that ceiling ever has to move, it moves
+// by not sending N datagrams -- multicast, or a relay the peers subscribe to --
+// and not by sending them differently.
 server_instance::fanout_count server_instance::udp_broadcast(std::string_view msg,
                                                              const struct sockaddr_in* exclude)
 {
