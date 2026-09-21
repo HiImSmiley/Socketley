@@ -465,6 +465,19 @@ at something that happened to it: the server and the cache at an
 the proxy once
 .B on_auth
 has admitted the client.
+.TP
+.B upstreams
+Server only, and only when
+.B \-u
+was given: how many of the configured upstreams the kernel says are connected,
+over how many were configured. The left number answers the same question
+.B dial_attempts
+separates for a client, and for the same reason \(em it used to be raised one
+line after the non-blocking connect(), so a server whose upstream host was not
+there at all reported
+.B upstreams:1/1
+for twenty-five seconds out of thirty. It is a flapping upstream that makes the
+two numbers differ, and an unreachable one that makes the left stay at zero.
 .RE
 .IP
 For a runtime running in its own process this describes that process's ring, not
