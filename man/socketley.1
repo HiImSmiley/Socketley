@@ -201,6 +201,17 @@ or
 .BR \-\-cluster ,
 which address a daemon that is already running \(em a ring's CPU set is fixed
 when the ring is created, so there would be nothing left for them to change.
+.IP
+Every runtime is its own process and every one of them inherits this set, so
+the set is also how many of them share a core. Measured with fifty idle
+servers beside one doing a ping-pong, the median round trip did not move \(em
+30.2 against 29.4 microseconds \(em while the 99th percentile did: 156.5
+microseconds on six cores against 51.7 on twelve. Idle runtimes are not free
+company, because each still wakes on its own stats interval; what they cost is
+paid by the tail of whichever one is working, and widening the set is the
+lever. The daemon itself stayed under one per cent of a core at fifty
+runtimes, and creating one took the same fourteen milliseconds at five as at
+fifty, so neither of those is the thing to watch.
 .TP
 .BI "daemon \-\-name " "name " "[\-\-cluster " "dir" "]"
 Configure the running daemon for cluster mode. These flags are sent as IPC
