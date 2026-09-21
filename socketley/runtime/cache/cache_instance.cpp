@@ -7658,6 +7658,71 @@ bool cache_instance::lua_persist(std::string_view key)
     return did;
 }
 
+// ─── a script's publish ─────────────────────────────────────────────────────
+// publish() is this process's subscribers and the cross-runtime half, and on N
+// shards that is 1/N of the cache's socket subscribers: the daemon's publish
+// frame does reach every sibling, but a sibling answers it in
+// on_publish_dispatch(), which runs Lua and never looks at a socket.  Measured
+// on four shards with forty subscribers spread over them: self.publish reached
+// 17, the wire's PUBLISH 40.
+//
+// So the message takes the wire's own road for the half publish() cannot do --
+// one mesh frame per sibling that may hold a subscriber, exactly the set
+// fan_publish() picks.  No reply is collected: the frames answer on a later
+// turn and self.publish() answers on this one, which is the same wall the
+// keyspace calls above run into.  That is why the count is this shard's
+// subscribers and not the cache's, and it is the count this call has always
+// returned.
+void cache_instance::fan_publish_siblings(std::string_view channel,
+                                          std::string_view message)
+{
+    auto* mgr = get_runtime_manager();
+    if (!mgr)
+        return;
+
+    // RESP and not the text form, because a message holding a newline or a
+    // space is a message and not two commands.
+    std::string_view args[3] = {"publish", channel, message};
+    std::string      cmd;
+    rebuild_resp(cmd, args, 3);
+
+    std::string frame(shard_batch_resp);
+    shard_frame_append(frame, cmd);
+
+    const auto&    tbl      = shard_stats_table();
+    const bool     filtered = tbl.mapped() && tbl.count() == m_shard_n;
+    const uint32_t bit      = shard_stats::channel_bit(channel);
+
+    for (uint32_t sh = 0; sh < m_shard_n; ++sh)
+    {
+        // This shard was served inline by publish(), above.
+        if (sh == m_shard_i)
+            continue;
+        // A pattern subscriber has no bit of its own, so a shard holding one
+        // is never filtered out -- the same rule fan_publish() states.
+        if (filtered && !tbl.channel_may_have(sh, bit)
+            && !tbl.channel_may_have(sh, shard_stats::pattern_bit))
+            continue;
+
+        // A cookie that is deliberately not in m_posts: on_request_reply()
+        // already drops one it does not know, which is the whole of what
+        // "fire and forget" needs here.
+        if (!mgr->requests().post(this, m_next_cookie++,
+                                  shard_target(get_name(), sh), frame,
+                                  request_class::client))
+            LOG_WARN("cache: a script's publish could not be posted to a "
+                     "sibling shard; its subscribers did not hear it");
+    }
+}
+
+int cache_instance::lua_publish(std::string_view channel, std::string_view message)
+{
+    const int local = publish(channel, message);
+    if (m_shard_n > 1)
+        fan_publish_siblings(channel, message);
+    return local;
+}
+
 uint32_t cache_instance::get_size() const
 {
     return m_store.size();

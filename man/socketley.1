@@ -4165,6 +4165,52 @@ Absolute levels are not comparable between machines or between sessions; the
 ratio within one interleaved sweep is what is claimed. The same pair measured
 again hours later on the same binary read 84,828 and 116,894 \(em every level
 a third higher, the ratio 1.387 against 1.369.
+.IP
+.B "\-\-lua under \-\-shards: the script runs in every shard, and each one keeps its own slice."
+The keyspace calls of the
+.B self.*
+table \(em
+.BR self.set ,
+.BR self.get ,
+.B self.del
+and the seventeen beside them \(em act on the keys
+.I this
+shard owns and answer a key it does not exactly as they answer a refusal:
+.B false
+for the mutating ones, an empty string for
+.B self.get
+and the two pops,
+.B nil
+for
+.BR self.sadd .
+A crossing is not available to them: the value has to be returned on the same
+turn and the mesh answers on a later one.
+.IP
+For a callback that runs in all
+.I N
+processes \(em
+.BR on_start ,
+a timer \(em that is exactly right: the shards partition the work between
+them and the keyspace is written once. For one driven by a connection \(em
+.BR on_miss ,
+.BR on_write ,
+.B on_delete
+\(em the key the callback was handed is always its own, and any
+.I other
+key it touches is somebody else's.
+.B self.owns(key)
+is how a script asks before it acts, and it is true for every key when the
+cache is one process.
+.IP
+.B self.publish
+is the exception that is not refused.  The message goes to every shard, over
+the same mesh the wire's
+.B PUBLISH
+uses, because a subscriber is not a key and no shard owns it. What is this
+shard's alone is the
+.IR count :
+the siblings report back on a later turn and this call answers on the turn it
+was made.
 .TP
 .B \-\-cluster
 Publish a routable slot map, so that a cluster\-aware client sends each key
@@ -7254,6 +7300,12 @@ self.upstreams()                 -- Table of connected upstream conn_ids
 -- the same three names --mode, `show` and the wire protocol use.
 self.cache_mode()   -- Which mode this cache is in
 
+-- Cache: which keys are this process's
+-- Under --shards the script runs in all N workers and the calls below act only
+-- on the slice this one owns, answering a foreign key the way they answer a
+-- refusal.  True for every key when the cache is one process.
+self.owns(key)      -- Does this shard own the key?
+
 -- Cache: strings
 self.get(key)       -- Get string value
 self.set(key, val)  -- Set string value; false in readonly mode
@@ -7287,7 +7339,10 @@ self.ttl(key)               -- Get remaining TTL
 self.persist(key)           -- Remove expiry; false in readonly mode
 
 -- Cache: pub/sub
-self.publish(channel, msg)  -- Publish to channel
+-- Under --shards the message reaches every shard's subscribers, but the count
+-- is this shard's own: the siblings answer on a later turn and this call
+-- answers on the turn it was made.
+self.publish(channel, msg)  -- Publish to channel; returns this shard's count
 
 -- Server: connection control
 -- Every mutator below answers `true`, or `false, "reason"`.  They returned

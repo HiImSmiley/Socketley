@@ -352,16 +352,41 @@ public:
     int64_t lua_ttl(std::string_view key);
     bool lua_persist(std::string_view key);
 
+    // self.publish(), which is publish() plus the siblings; see the definition
+    // for why the count it returns is this shard's alone.
+    int lua_publish(std::string_view channel, std::string_view message);
+
+    // ── the one place the Lua table asks who owns a key ─────────────────────
+    // Every other door into the store asks before it touches it, and says so at
+    // its own line: process_command() and apply_replicated().  This one did
+    // not, and what that cost depends on which callback is running.  on_start
+    // and a timer run in ALL N processes, so each wrote the whole keyspace into
+    // its own slice and KEYS and DBSIZE reported it N times over; on_miss,
+    // on_write and on_delete run in exactly ONE, so a key that shard does not
+    // own went into a slice no read routes to.  The rule is the same for both:
+    // act on the keys this shard owns and leave the rest to the sibling that
+    // owns them.
+    //
+    // Not a crossing: the answer to self.set() is its return value, and a
+    // crossing arrives on a later turn -- see can_cross(), which is why the
+    // wire's own path needs a connection to come back to.
+    bool lua_owns(std::string_view key) const
+    {
+        return m_shard_n <= 1 || cache_shard_of(key, m_shard_n) == m_shard_i;
+    }
+
     // Virtual overrides for Lua API
-    std::string lua_cache_get(std::string_view key) override { return lua_get(key); }
-    bool lua_cache_exists(std::string_view key) override { return lua_exists(key); }
-    bool lua_cache_set(std::string_view key, std::string_view value) override { return lua_set(key, value); }
-    bool lua_cache_del(std::string_view key) override { return lua_del(key); }
-    bool lua_cache_lpush(std::string_view key, std::string_view val) override { return lua_lpush(key, val); }
-    bool lua_cache_rpush(std::string_view key, std::string_view val) override { return lua_rpush(key, val); }
-    std::string lua_cache_lpop(std::string_view key) override { return lua_lpop(key); }
-    std::string lua_cache_rpop(std::string_view key) override { return lua_rpop(key); }
-    int lua_cache_llen(std::string_view key) override { return lua_llen(key); }
+    bool lua_cache_owns(std::string_view key) override { return lua_owns(key); }
+
+    std::string lua_cache_get(std::string_view key) override { return lua_owns(key) ? lua_get(key) : std::string(); }
+    bool lua_cache_exists(std::string_view key) override { return lua_owns(key) && lua_exists(key); }
+    bool lua_cache_set(std::string_view key, std::string_view value) override { return lua_owns(key) && lua_set(key, value); }
+    bool lua_cache_del(std::string_view key) override { return lua_owns(key) && lua_del(key); }
+    bool lua_cache_lpush(std::string_view key, std::string_view val) override { return lua_owns(key) && lua_lpush(key, val); }
+    bool lua_cache_rpush(std::string_view key, std::string_view val) override { return lua_owns(key) && lua_rpush(key, val); }
+    std::string lua_cache_lpop(std::string_view key) override { return lua_owns(key) ? lua_lpop(key) : std::string(); }
+    std::string lua_cache_rpop(std::string_view key) override { return lua_owns(key) ? lua_rpop(key) : std::string(); }
+    int lua_cache_llen(std::string_view key) override { return lua_owns(key) ? lua_llen(key) : 0; }
     // The same three names the wire protocol, `show` and --mode all use, so a
     // script comparing against "readonly" is comparing against one vocabulary.
     std::string_view lua_cache_mode() const override
@@ -374,19 +399,25 @@ public:
         }
     }
 
-    int lua_cache_sadd(std::string_view key, std::string_view member) override { return lua_sadd(key, member); }
-    bool lua_cache_srem(std::string_view key, std::string_view member) override { return lua_srem(key, member); }
-    bool lua_cache_sismember(std::string_view key, std::string_view member) override { return lua_sismember(key, member); }
-    int lua_cache_scard(std::string_view key) override { return lua_scard(key); }
-    bool lua_cache_hset(std::string_view key, std::string_view field, std::string_view val) override { return lua_hset(key, field, val); }
-    std::string lua_cache_hget(std::string_view key, std::string_view field) override { return lua_hget(key, field); }
-    bool lua_cache_hexists(std::string_view key, std::string_view field) override { return lua_hexists(key, field); }
-    bool lua_cache_hdel(std::string_view key, std::string_view field) override { return lua_hdel(key, field); }
-    int lua_cache_hlen(std::string_view key) override { return lua_hlen(key); }
-    bool lua_cache_expire(std::string_view key, int seconds) override { return lua_expire(key, seconds); }
-    int64_t lua_cache_ttl(std::string_view key) override { return lua_ttl(key); }
-    bool lua_cache_persist(std::string_view key) override { return lua_persist(key); }
-    int lua_cache_publish(std::string_view channel, std::string_view message) override { return publish(channel, message); }
+    // A foreign key is -1 and not 0, because -1 is already this call's refusal
+    // and 0 would say "the member was there", which no shard checked.
+    int lua_cache_sadd(std::string_view key, std::string_view member) override { return lua_owns(key) ? lua_sadd(key, member) : -1; }
+    bool lua_cache_srem(std::string_view key, std::string_view member) override { return lua_owns(key) && lua_srem(key, member); }
+    bool lua_cache_sismember(std::string_view key, std::string_view member) override { return lua_owns(key) && lua_sismember(key, member); }
+    int lua_cache_scard(std::string_view key) override { return lua_owns(key) ? lua_scard(key) : 0; }
+    bool lua_cache_hset(std::string_view key, std::string_view field, std::string_view val) override { return lua_owns(key) && lua_hset(key, field, val); }
+    std::string lua_cache_hget(std::string_view key, std::string_view field) override { return lua_owns(key) ? lua_hget(key, field) : std::string(); }
+    bool lua_cache_hexists(std::string_view key, std::string_view field) override { return lua_owns(key) && lua_hexists(key, field); }
+    bool lua_cache_hdel(std::string_view key, std::string_view field) override { return lua_owns(key) && lua_hdel(key, field); }
+    int lua_cache_hlen(std::string_view key) override { return lua_owns(key) ? lua_hlen(key) : 0; }
+    bool lua_cache_expire(std::string_view key, int seconds) override { return lua_owns(key) && lua_expire(key, seconds); }
+    // -2 is the store's own "no such key", which is what a foreign key is here.
+    int64_t lua_cache_ttl(std::string_view key) override { return lua_owns(key) ? lua_ttl(key) : -2; }
+    bool lua_cache_persist(std::string_view key) override { return lua_owns(key) && lua_persist(key); }
+    // publish() is this PROCESS's subscribers plus the cross-runtime half; on
+    // more than one shard that is a quarter of the cache's subscribers, so a
+    // script's publish takes the road the wire's PUBLISH takes as well.
+    int lua_cache_publish(std::string_view channel, std::string_view message) override { return lua_publish(channel, message); }
 
     // Interactive mode: execute a command and return response
     std::string execute(std::string_view line);
@@ -630,6 +661,9 @@ private:
     // subscriber of that channel, and always this one.
     void fan_publish(client_connection* conn, uint32_t h, std::string_view raw,
                      bool resp, std::string_view channel);
+    // The same set of targets with no reply collected, for a publish that has
+    // to answer on the turn it was called.
+    void fan_publish_siblings(std::string_view channel, std::string_view message);
     static void on_channel_presence(void* ctx, std::string_view channel, bool present);
     void        channel_presence(std::string_view channel, bool present);
     // The one bit with no channel name behind it: patterns.

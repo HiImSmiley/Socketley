@@ -650,6 +650,14 @@ public:
     // "denied: readonly mode".  Empty for a runtime that is not a cache.
     virtual std::string_view lua_cache_mode() const { return {}; }
 
+    // The second question of exactly that kind, for the second reason a call
+    // below answers nothing: under --shards this script runs in all N
+    // processes and each one acts only on the keys it owns, so "false" from
+    // self.set means "a sibling did it" as often as it means "refused".
+    // True for every key on a runtime that is one process, which is what makes
+    // a script written against it read the same on either.
+    virtual bool lua_cache_owns(std::string_view /*key*/) { return true; }
+
     virtual std::string lua_cache_get(std::string_view /*key*/) { return ""; }
 
     // The question lua_cache_get() cannot answer.  It returns "" both for a key
