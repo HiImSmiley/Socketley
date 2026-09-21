@@ -477,17 +477,18 @@ trusted, so a daemon that was killed outright is reported
 .B dead
 rather than listed as running, and its file is removed once its pid is gone too.
 .TP
-.BI "restart " "name " "[flags]"
+.BI "restart " "name " "[\-i]"
 Stop and start a runtime in one step. The runtime keeps the
 configuration it already has. Equivalent to
 .B stop
 followed by
-.B start
-with the same arguments: the extra flags are handed to
 .BR start ,
-which understands only
-.BR \-i ,
-so they do not reconfigure anything. To restart with a changed setting,
+and it takes the name and
+.B \-i
+and nothing else: every other flag is refused by name, because handing them to
+.B start
+had a flag's VALUE read as a runtime name and that runtime started. To restart
+with a changed setting,
 .B edit
 first:
 .nf
@@ -1263,7 +1264,26 @@ Set listener port (server, proxy, cache) or target port (client).
 Start immediately after creation.
 .TP
 .B \-\-test
-Dry run. Validate configuration without starting.
+Dry run: the type, the name and every flag are checked, and then nothing is
+kept. No runtime is left in
+.BR ls ,
+no state file is written and the name is free for the
+.B create
+that follows. It used to keep the runtime -- unstarted, unsaved, and holding
+the name until the daemon restarted -- which made the real
+.B create
+answer "runtime already exists", and made
+.B start
+on it bind a port no state file would ever bring back.
+.IP
+It does not bind the port, and a
+.B \-\-lua
+script is loaded \(em which is what validates it, and runs its top level \(em but
+.B on_start
+is not called, because nothing is started. What it answers is whether this
+command line is one
+.B create
+accepts.
 .TP
 .BI "\-\-log " "file"
 Append one line per state transition to
@@ -3083,7 +3103,10 @@ is lost. Backoff starts at 1 second and doubles each attempt to a ceiling of
 16 seconds, with up to half a second of jitter \(em the dials of a client whose
 target is gone fall at 1, 2, 4, 8, 16, 16, 16 seconds. Set to 0 for infinite
 attempts (default when flag is given without a value). Set to a positive number
-to limit reconnection attempts.
+to limit reconnection attempts. A negative count is refused: \-1 is what the
+stored field holds for "off", so the flag whose only purpose is to turn
+reconnection on used to turn it off, silently and at exit 0. Reconnection is off
+until the flag is given, which is how it stays off.
 .IP
 A client flag, and refused on a server, a proxy or a cache: it re-dials a
 connection this runtime made, and those three take connections rather than make

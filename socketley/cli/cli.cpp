@@ -366,12 +366,19 @@ int cli_dispatch(int argc, char** argv)
             if (!has_config)
                 return cli_daemon(argc, argv);
 
-            // Configuration mode talks to a daemon that is already up and
-            // --cpus configures one being started, so it would be read here,
-            // sent nowhere and do nothing.
+            // ─── JUDGED BEFORE A DAEMON EXISTS ──────────────────────────────
+            // The whole command line is read here rather than while sending it
+            // below, because the send loop is downstream of ensure_daemon: a
+            // `--name` with no value matched no `if`, fell through to `return
+            // 0`, and left the operator a silent success and a daemon they had
+            // not asked to start.
             for (int i = 2; i < argc; ++i)
             {
-                std::string_view arg = argv[i];
+                const std::string_view arg = argv[i];
+
+                // Configuration mode talks to a daemon that is already up and
+                // --cpus configures one being started, so it would be read
+                // here, sent nowhere and do nothing.
                 if (arg == "--cpus")
                 {
                     std::cerr << arg << " cannot be combined with --name or --cluster\n"
@@ -380,6 +387,35 @@ int cli_dispatch(int argc, char** argv)
                               << "  Start the daemon with it: socketley daemon " << arg << "\n";
                     return 1;
                 }
+
+                if (arg == "--name" || arg == "-n" || arg == "--cluster")
+                {
+                    // A token that is itself a flag is not the value: it is the
+                    // next flag, typed after one whose value was forgotten, and
+                    // accepting it renames the daemon to "--cluster".
+                    const bool has_value = i + 1 < argc && argv[i + 1][0] != '-';
+                    if (!has_value)
+                    {
+                        const bool dir = arg == "--cluster";
+                        std::cerr << arg << " requires a value\n"
+                                  << "  socketley daemon " << arg << " "
+                                  << (dir ? "<dir>" : "<name>") << "\n"
+                                  << (dir ? "  The directory the cluster publishes into; "
+                                            "every member names the same one.\n"
+                                          : "  The identity this daemon publishes under; "
+                                            "`socketley cluster ls` lists the ones taken.\n");
+                        return 1;
+                    }
+                    ++i;
+                    continue;
+                }
+
+                std::cerr << "unknown daemon flag: " << arg << "\n"
+                          << "  With --name or --cluster this configures a daemon that is "
+                             "already running, and those two are all it takes.\n"
+                          << "  --cpus shapes a daemon being started: socketley daemon "
+                             "--cpus <set>, on its own.\n";
+                return 1;
             }
 
             // The message belongs to ensure_daemon, which has three reasons to
@@ -391,7 +427,7 @@ int cli_dispatch(int argc, char** argv)
             for (int i = 2; i < argc; ++i)
             {
                 std::string_view arg = argv[i];
-                if ((arg == "--name" || arg == "-n") && i + 1 < argc)
+                if (arg == "--name" || arg == "-n")
                 {
                     std::string ipc_cmd = std::string("daemon-name ") + argv[++i];
                     std::string data;
@@ -399,7 +435,7 @@ int cli_dispatch(int argc, char** argv)
                     if (rc < 0) { return ipc_report_failure(rc); }
                     if (rc != 0) { if (!data.empty()) std::cerr << data; return rc; }
                 }
-                else if (arg == "--cluster" && i + 1 < argc)
+                else if (arg == "--cluster")
                 {
                     std::string ipc_cmd = std::string("daemon-cluster ") + argv[++i];
                     std::string data;
@@ -489,7 +525,10 @@ int cli_dispatch(int argc, char** argv)
         {
             if (argc < 3)
             {
-                std::cerr << "usage: restart <name> [-i]\n";
+                // From command_usage and not spelled here, because `restart
+                // --help` now answers from there and two copies of one
+                // sentence drift.
+                std::cerr << command_usage::line("restart");
                 return 1;
             }
 

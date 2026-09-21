@@ -39,6 +39,7 @@
 #include <charconv>
 #include <chrono>
 #include <optional>
+#include <algorithm>
 #include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1166,6 +1167,28 @@ int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
         }
     }
 
+    const int rc = dispatch_command(conn, pa);
+
+    // The names in the list that named nothing -- see resolve_names.  Written
+    // through cout so the reply guard puts it after whatever the handler
+    // printed, and so it works for a caller with no connection.
+    if (!m_unresolved.empty())
+    {
+        for (const auto& n : m_unresolved)
+            std::cout << "runtime not found: " << n << "\n";
+        std::cout << "  " << pa.args[0] << " ran for the rest of the list and not for "
+                  << (m_unresolved.size() == 1 ? "this name" : "these names")
+                  << ".\n"
+                     "  `socketley ls` lists what is there.\n";
+        m_unresolved.clear();
+        return rc == 0 ? 1 : rc;
+    }
+
+    return rc;
+}
+
+int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa)
+{
     switch (pa.hashes[0])
     {
         case fnv1a("create"):     return cmd_create(conn, pa);
@@ -1466,13 +1489,60 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         }
     }
 
+    // ─── A DRY RUN LEAVES NOTHING BEHIND ────────────────────────────────────
+    // --test skips the start and the save, and skipping the save was the whole
+    // defect: try_create() made the runtime before the first flag was read and
+    // nothing took it away, so a dry run held the name until the daemon
+    // restarted -- and the real `create` that followed answered "runtime
+    // already exists".  Worse, what it left was startable: `start` on it bound
+    // the port and served, with no state file, so the daemon's next restart
+    // dropped a running runtime with no record that it had been there.
+    //
+    // Removed rather than never created, because every flag parser writes into
+    // an instance and there is nothing to validate against without one -- and
+    // this is the form the two refusals above already use.
+    if (instance->get_test_mode())
+        m_manager.remove(name);
+
     return 0;
 }
 
-std::vector<std::string> daemon_handler::resolve_names(const parsed_args& pa, size_t start) const
+std::vector<std::string> daemon_handler::resolve_names(const parsed_args& pa, size_t start)
 {
     std::shared_lock lock(m_manager.mutex);
-    return resolve_names_impl(pa.args, pa.count, m_manager.list(), start);
+    auto names = resolve_names_impl(pa.args, pa.count, m_manager.list(), start);
+
+    // ─── A LIST WITH A TYPO IN IT IS NOT A LIST THAT WORKED ─────────────────
+    // resolve_names_impl skips an argument that names nothing, so `stop a
+    // gibtsnicht` stopped a, said nothing and exited 0 -- and on `remove`, an
+    // operator clearing two runtimes and misspelling one had every reason to
+    // believe both were gone.  Collected here because this is the one function
+    // that turns arguments into names; reported in process_command, which is
+    // the one place that also holds the exit code.
+    m_unresolved.clear();
+
+    // Nothing resolved at all is check_empty_names' case, which already reports
+    // it: recording here too would print the same line twice.
+    if (names.empty())
+        return names;
+
+    for (size_t i = start; i < pa.count; ++i)
+    {
+        const std::string_view arg = pa.args[i];
+        if (arg.empty() || arg[0] == '-')
+            continue;
+
+        // A glob is a query and "no match" is an answer to one, not a typo in
+        // it -- `stop 'api*'` on a box with no api runtimes asked a question
+        // and got the truth.
+        if (arg.find_first_of("*?[") != std::string_view::npos)
+            continue;
+
+        if (std::find(names.begin(), names.end(), arg) == names.end())
+            m_unresolved.emplace_back(arg);
+    }
+
+    return names;
 }
 
 int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
@@ -1721,6 +1791,27 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     return 0;
 }
 
+// The refusal `ls` and `ps` share, because both read a set of column names out
+// of a switch and neither had a `default:`: `socketley ls --grp` printed the
+// whole table and exited 0, and so did `--format` with its value forgotten.
+// The usage comes from command_usage so the columns named here and the ones
+// `ls --help` prints cannot be two different lists.
+static std::string listing_arg_refusal(const char* verb, std::string_view arg)
+{
+    std::string out;
+
+    // Not a flag at all: neither verb takes a name, and the operator who typed
+    // one wants the command that does.
+    if (!arg.empty() && arg.front() != '-')
+        out = "unknown argument: " + std::string(arg) + "\n"
+              "  " + verb + " lists every runtime and takes no names.\n"
+              "  For one: socketley show " + std::string(arg) + "\n";
+    else
+        out = "unknown flag: " + std::string(arg) + "\n";
+
+    return out + "  " + command_usage::line(verb);
+}
+
 int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
 {
     std::shared_lock lock(m_manager.mutex);
@@ -1750,21 +1841,30 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
             case fnv1a("--group"):   col_group   = true; break;
-        }
-        // `--format json` is the only spelling there is, so anything else is
-        // refused rather than answered in a format the operator did not ask
-        // for.
-        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
-        {
-            if (pa.hashes[i + 1] == fnv1a("json"))
+
+            // `--format json` is the only spelling there is, so anything else
+            // is refused rather than answered in a format the operator did not
+            // ask for -- and a missing value is refused too, where it used to
+            // be dropped and the table printed.
+            case fnv1a("--format"):
+                if (i + 1 >= pa.count)
+                {
+                    conn->write_buf = "--format requires a value (the only one is json)\n";
+                    return 1;
+                }
+                ++i;
+                if (pa.hashes[i] != fnv1a("json"))
+                {
+                    conn->write_buf = "unknown format: " + std::string(pa.args[i]) +
+                                      " (the only one is json)\n";
+                    return 1;
+                }
                 json_format = true;
-            else
-            {
-                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
-                                  " (the only one is json)\n";
+                break;
+
+            default:
+                conn->write_buf = listing_arg_refusal("ls", pa.args[i]);
                 return 1;
-            }
-            ++i;
         }
     }
 
@@ -1956,21 +2056,27 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
             case fnv1a("--conn"):    col_conn    = true; break;
             case fnv1a("--owner"):   col_owner   = true; break;
             case fnv1a("--created"): col_created = true; break;
-        }
-        // `--format json` is the only spelling there is, so anything else is
-        // refused rather than answered in a format the operator did not ask
-        // for.
-        if (pa.hashes[i] == fnv1a("--format") && i + 1 < pa.count)
-        {
-            if (pa.hashes[i + 1] == fnv1a("json"))
+
+            // As in cmd_ls, and for the same two reasons.
+            case fnv1a("--format"):
+                if (i + 1 >= pa.count)
+                {
+                    conn->write_buf = "--format requires a value (the only one is json)\n";
+                    return 1;
+                }
+                ++i;
+                if (pa.hashes[i] != fnv1a("json"))
+                {
+                    conn->write_buf = "unknown format: " + std::string(pa.args[i]) +
+                                      " (the only one is json)\n";
+                    return 1;
+                }
                 json_format = true;
-            else
-            {
-                conn->write_buf = "unknown format: " + std::string(pa.args[i + 1]) +
-                                  " (the only one is json)\n";
+                break;
+
+            default:
+                conn->write_buf = listing_arg_refusal("ps", pa.args[i]);
                 return 1;
-            }
-            ++i;
         }
     }
 

@@ -118,6 +118,11 @@ private:
         const parsed_args& pa, const char* verb, ipc_connection* conn) const;
 
     int process_command(ipc_connection* conn, std::string_view line);
+
+    // The switch, split out so process_command can read the exit code of the
+    // handler it dispatched to instead of returning it straight through.
+    int dispatch_command(ipc_connection* conn, const parsed_args& pa);
+
     int cmd_create(ipc_connection* conn, const parsed_args& pa);
     int cmd_start(ipc_connection* conn, const parsed_args& pa);
     int cmd_stop(ipc_connection* conn, const parsed_args& pa);
@@ -175,7 +180,15 @@ private:
     // gone.
     std::string cluster_off_reason() const;
 
-    std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1) const;
+    std::vector<std::string> resolve_names(const parsed_args& pa, size_t start = 1);
+
+    // ─── THE NAMES IN THE LIST THAT NAMED NOTHING ───────────────────────────
+    // Filled by resolve_names and reported by process_command, which is the
+    // only pair of places that sees both the list and the exit code -- seven
+    // handlers resolve names and an eighth would forget to ask.  Empty unless
+    // at least one name DID resolve: a list where nothing resolved is
+    // check_empty_names' case and its message is unchanged.
+    std::vector<std::string> m_unresolved;
 
     // Frame one command's reply and submit the single write that carries all
     // of them, split because a packet may hold several commands and only one

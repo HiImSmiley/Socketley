@@ -391,11 +391,40 @@ int parse_common_flags(runtime_instance* instance, const parsed_args& pa,
             int max_attempts = 0; // default: infinite
             if (i + 1 < pa.count)
             {
+                // The value is optional, so only a token that is entirely a
+                // number is one: `--reconnect -s` is this flag with no value
+                // followed by the autostart flag, and has to stay that way.
                 int val = 0;
                 auto sv = std::string_view(pa.args[i + 1]);
                 auto [p, e] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-                if (e == std::errc{} && p == sv.data() + sv.size())
+                const bool numeric = p == sv.data() + sv.size() &&
+                                     (e == std::errc{} || e == std::errc::result_out_of_range);
+                if (numeric)
                 {
+                    // ─── -1 IS THE STORED "OFF" ─────────────────────────────
+                    // m_reconnect defaults to -1 = disabled, so a negative
+                    // count switched off the one thing this flag exists to
+                    // switch on -- silently, at exit 0, and `show` then printed
+                    // no reconnect line at all, because a field at its default
+                    // is not printed.
+                    if (e == std::errc::result_out_of_range)
+                    {
+                        std::cout << "--reconnect value out of range: " << sv << "\n"
+                                     "  Give it no value or 0 for unlimited attempts, "
+                                     "which is what a number that large was asking "
+                                     "for.\n";
+                        return 1;
+                    }
+                    if (val < 0)
+                    {
+                        std::cout << "--reconnect does not take " << sv << "\n"
+                                     "  It is the flag that turns reconnection ON: "
+                                     "give it no value or 0 for unlimited attempts, "
+                                     "or a positive count to stop after that many.\n"
+                                     "  Reconnection is off until the flag is given, "
+                                     "so leaving it out is how it stays off.\n";
+                        return 1;
+                    }
                     max_attempts = val;
                     i++;
                 }
