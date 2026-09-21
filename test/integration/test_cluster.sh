@@ -375,7 +375,12 @@ DAEMON_PIDS+=($RJ_PID2)
 # ownership can be observed, so it is asserted rather than arranged around --
 # on one shared HOME this daemon restored the other two daemons' runtimes onto
 # ports they were already serving and the file still reported 32/32.
-RJ_INV=$(rj ls -a 2>&1 || true)
+# `ls`, not `ls -a`: -a is a ps flag and ls never had one, so this line used
+# to be a full listing with an ignored argument.  Once unknown flags stopped
+# being ignored it became "unknown flag: -a" -- and the three foreign checks
+# below still passed on it, because an error message names no runtime either.
+# That is what the fourth check is for.
+RJ_INV=$(rj ls 2>&1 || true)
 for foreign in "$RT_API1" "$RT_API2" "$RT_GW"; do
     TOTAL=$((TOTAL+1))
     if grep -q "$foreign" <<<"$RJ_INV"; then
