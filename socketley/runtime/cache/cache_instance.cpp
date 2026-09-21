@@ -179,6 +179,27 @@ cache_instance::~cache_instance()
     close_tracked(m_cluster_listen_fd);
 }
 
+// The buffer the plain arms read into, made when an arm first needs one.
+//
+// It used to be made at accept, and taking that away to save an idle
+// connection four kilobytes left the arms reading `&& conn->read_buf` -- which
+// is null on every connection that has a buffer ring, so the last two rungs of
+// the ladder were unreachable exactly when the ring was full and they were the
+// point.  A cache under load then had no read armed at all on that connection
+// and it went deaf: measured under the sanitizer, 2,781 of 3,000 subscribers
+// answered and the rest silent.  The chain above this had already been fixed
+// out of the same shape once, through an `else` rather than a null pointer.
+//
+// Allocating here is a malloc on a path that runs when the ring is full, which
+// is rare and is not the path anybody is optimising; the idle connection that
+// motivated the change still never reaches it.
+static inline char* fallback_read_buf(client_connection* conn)
+{
+    if (!conn->read_buf)
+        conn->read_buf = std::make_unique<char[]>(client_connection::READ_BUF_BYTES);
+    return conn->read_buf.get();
+}
+
 void cache_instance::close_tracked(int fd)
 {
     if (fd < 0)
@@ -1515,8 +1536,9 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
     // the first growth -- and bought it for every connection that never has a
     // first command.
 
-    // Only a start without a buffer ring ever reads into this, so only such a
-    // start pays for it; a pooled connection that once took one keeps it.
+    // Only a start without a buffer ring reads into this AT ACCEPT, so only
+    // such a start pays for it there; every other connection gets it from
+    // fallback_read_buf() the first time an arm actually needs one.
     if (SOCKETLEY_UNLIKELY(!m_use_provided_bufs) && !conn->read_buf)
         conn->read_buf = std::make_unique<char[]>(client_connection::READ_BUF_BYTES);
     conn->read_req = { this, conn->read_buf.get(), client_fd,
@@ -1659,9 +1681,12 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        if (!queued && conn->read_buf)
-            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(),
+        if (!queued)
+        {
+            conn->read_req.type = op_read;
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, fallback_read_buf(conn),
                                                     client_connection::READ_BUF_BYTES, &conn->read_req);
+        }
     }
     else
     {
@@ -1672,9 +1697,12 @@ bool cache_instance::submit_client_read(client_connection* conn, int fd)
             queued = m_loop->submit_recv_multishot(fd, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(fd, BUF_GROUP_ID, &conn->read_req);
-        if (!queued && conn->read_buf)
-            queued = m_loop->submit_read(fd, conn->read_buf.get(),
+        if (!queued)
+        {
+            conn->read_req.type = op_read;
+            queued = m_loop->submit_read(fd, fallback_read_buf(conn),
                                          client_connection::READ_BUF_BYTES, &conn->read_req);
+        }
     }
 
     // Leaving the flag set after a refusal is what turns a busy ring into a hung
@@ -2174,13 +2202,11 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
-                queued = conn->read_buf
-                       && m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(),
-                                                         client_connection::READ_BUF_BYTES, &conn->read_req);
+                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, fallback_read_buf(conn),
+                                                        client_connection::READ_BUF_BYTES, &conn->read_req);
             else
-                queued = conn->read_buf
-                       && m_loop->submit_read(fd, conn->read_buf.get(),
-                                              client_connection::READ_BUF_BYTES, &conn->read_req);
+                queued = m_loop->submit_read(fd, fallback_read_buf(conn),
+                                             client_connection::READ_BUF_BYTES, &conn->read_req);
             if (SOCKETLEY_UNLIKELY(!queued))
             {
                 // The fallback is the only read left for this connection; with
