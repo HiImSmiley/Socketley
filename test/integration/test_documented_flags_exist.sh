@@ -16,24 +16,24 @@
 # pattern stops at the first backslash and reports "--read" missing.  The first
 # draft of this file did exactly that and produced sixteen false alarms.
 #
-# ─── THE FOUR THAT ARE SUPPOSED TO BE ABSENT ────────────────────────────────
-# The page documents four flags precisely BECAUSE they do not exist, so that a
-# reader coming from an older version finds out what happened.  They are named
-# here one by one rather than filtered by a pattern, because a pattern would
-# also swallow the next real drift.
+# ─── THERE IS NO ALLOWLIST, AND THAT IS THE POINT ───────────────────────────
+# The page used to explain four flags precisely BECAUSE they were gone --
+# --rings, --daemon-process, --out-of-process, --in-daemon -- so that a reader
+# on an older version would learn what happened.  The first version of this
+# file let them through by name.  They are now deleted from the page instead:
+# a manual is what a user types from, and a flag that cannot be typed does not
+# belong in it whatever the surrounding sentence says.  What survived the
+# deletion is the behaviour that is still live -- a config file carrying
+# `daemon_process` is refused by name (cli_config.cpp:232) -- because that is
+# a thing the binary still does rather than a thing it no longer has.
+#
+# So every flag the page names must exist.  No exceptions, and adding one is
+# the wrong repair for the next failure.
 set -euo pipefail
 
 MAN="$(dirname "$0")/../../man/socketley.1"
 SRC="$(dirname "$0")/../../socketley"
 PASS=0; FAIL=0; TOTAL=0
-
-# Deliberately documented as gone.  Each names the section that explains it.
-declare -A ABSENT_ON_PURPOSE=(
-    ["--rings"]="documented as removed"
-    ["--daemon-process"]="documented as never having existed"
-    ["--in-daemon"]="documented as never having existed"
-    ["--out-of-process"]="documented as never having existed"
-)
 
 # `--circuit-*` and `--health-*` are the page's own glob notation for a family.
 # The members are documented separately and get checked on their own lines.
@@ -43,8 +43,6 @@ while read -r flag; do
     esac
     TOTAL=$((TOTAL+1))
     if grep -rqF -- "\"$flag\"" "$SRC" 2>/dev/null; then
-        PASS=$((PASS+1))
-    elif [ -n "${ABSENT_ON_PURPOSE[$flag]:-}" ]; then
         PASS=$((PASS+1))
     else
         FAIL=$((FAIL+1))

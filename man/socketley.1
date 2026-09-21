@@ -1682,13 +1682,6 @@ a config written for a sixteen-core machine and deployed on a four-core one
 would otherwise run nowhere near where its author believes, and every
 measurement taken afterwards would be measuring something else.
 .IP
-There is deliberately no
-.B \-\-rings
-to go with this. A ring is a queue between one thread and the kernel, so a count
-of rings is only ever a count of I/O threads wearing a disguise, and two rings on
-one thread are strictly worse than one \(em more submission state to keep, no
-more parallelism. What is left to configure is which CPUs the thread may use.
-.IP
 A ring's CPU set is fixed by the kernel when the ring is created, and a ring
 belongs to a process, not to a runtime: every runtime inside one daemon shares
 that daemon's ring. So this flag states what a runtime requires, and
@@ -3616,22 +3609,13 @@ Every runtime runs in its own supervised worker process. There is no flag for
 this and nothing to configure: it is where a server, a client, a proxy and a
 cache each run.
 .PP
-There used to be one.
-.B \-\-daemon\-process
-kept a runtime inside the daemon, and before it
-.B \-\-out\-of\-process
-and
-.B \-\-in\-daemon
-spelled the same bit two ways. All three are gone, and none is kept as a
-synonym: a flag that no longer changes anything is a flag whose meaning has to
-be looked up to discover it has none. A command line that still carries one is
-refused as an unknown flag rather than accepted and ignored, and a
-configuration file with
+A configuration file with
 .B daemon_process
-in it says which line to delete.
+in it is refused rather than ignored, for either value, and the refusal names
+the line to delete.
 .PP
-What the flag bought back was the reason to keep it, and it is the reason it
-could go. Thirteen Lua calls were refused in a worker; the count is now zero.
+What used to argue for keeping a runtime inside the daemon was the Lua API:
+thirteen calls were refused in a worker, and the count is now zero.
 .RS
 .TP
 .B Reads of the map
