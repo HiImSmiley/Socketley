@@ -43,6 +43,25 @@
 # anything.
 set -euo pipefail
 
+# ─── NOT UNDER A SANITIZER ──────────────────────────────────────────────────
+# Every bound here is bytes of RSS per connection, and a sanitizer build spends
+# bytes of RSS per allocation on purpose: ASan puts a redzone either side of
+# each block and keeps a shadow byte for every eight.  Measured on this file
+# under SOCKETLEY_CONFIG=Sanitize, against the Release numbers the bounds were
+# drawn from:
+#
+#     cache   2.04 KB -> 6.12 KB       bound 5
+#     server  4.92 KB -> 8.16 KB
+#     proxy  65.93 KB -> 83.83 KB      bound 70
+#
+# Loosening the bounds to fit both would leave numbers that guard nothing in
+# either build.  So this measures the allocator it was written about and says
+# so when it is handed a different one.
+if [ "${SOCKETLEY_CONFIG:-}" = "Sanitize" ]; then
+    echo "  SKIP: RSS per connection measures the sanitizer's redzones under Sanitize"
+    exit 0
+fi
+
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_daemon.sh"
 . "$(dirname "$0")/lib_create.sh"
