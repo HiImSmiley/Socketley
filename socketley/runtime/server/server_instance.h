@@ -536,6 +536,12 @@ struct upstream_connection
     bool write_pending{false};
     bool closing{false};
     bool connected{false};
+    // Whether the kernel says the far end accepted, which is a different
+    // question from whether this runtime holds a socket for it -- see
+    // note_upstream_established().  The send paths ask `connected`, because a
+    // write during a handshake belongs in the queue; the stats and the Lua
+    // callback ask this one, because both are claims about the far end.
+    bool established{false};
     // An upstream's write queue fills the same way a client's does, so it
     // carries the same sticky fact: this runtime closed the connection because
     // the producer outran the socket, and not because the peer went away.
@@ -1021,6 +1027,9 @@ private:
     void upstream_flush_write_queue(upstream_connection* uc);
     void invoke_on_upstream(int conn_id, std::string_view data);
     void invoke_on_upstream_connect(int conn_id);
+    void note_upstream_established();
+    // Set by a dial, cleared when every dialled upstream has answered.
+    bool m_upstream_awaiting{false};
     void invoke_on_upstream_disconnect(int conn_id);
 
     void process_message(server_connection* sender, std::string_view msg);

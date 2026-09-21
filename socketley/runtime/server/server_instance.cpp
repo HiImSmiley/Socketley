@@ -1847,7 +1847,7 @@ size_t server_instance::get_connection_count() const
         return m_udp_peers.size();
     size_t upstream_connected = 0;
     for (const auto& [_, uc] : m_upstreams)
-        if (uc->connected) ++upstream_connected;
+        if (uc->established) ++upstream_connected;
     return m_active_fds.size() + m_forwarded.size() + upstream_connected;
 }
 
@@ -2302,6 +2302,7 @@ void server_instance::stop_upstreams(event_loop& loop)
             uc->fd = -1;
         }
         uc->connected = false;
+        uc->established = false;
         // Release write queue refs
         uc->write_queue.clear();
         if (!uc->write_pending)
@@ -3189,6 +3190,11 @@ void server_instance::on_loop_turn()
     // drained it.
     if (SOCKETLEY_UNLIKELY(m_udp_recv_rearm_due) && !m_udp_recv_armed)
         arm_udp_recv();
+
+    // Only while a dial is outstanding, so a server with no upstreams pays one
+    // predictable branch and one with settled ones pays the same.
+    if (SOCKETLEY_UNLIKELY(m_upstream_awaiting))
+        note_upstream_established();
 
     // The same shape as the drain dispatch below, and for the same reason: a
     // streamed response that ended with a request already buffered behind it
@@ -6670,7 +6676,7 @@ std::string server_instance::stats_lines() const
     {
         size_t connected = 0;
         for (const auto& [_, uc] : m_upstreams)
-            if (uc->connected) ++connected;
+            if (uc->established) ++connected;
         out << "upstreams:" << connected << "/" << m_upstream_targets.size() << "\n";
     }
     // The cross-runtime request queue and what it had to throw away, reported
@@ -7523,10 +7529,42 @@ bool server_instance::upstream_try_connect(upstream_connection* uc)
         uc->closing = true;
     }
 
-    // Fire on_upstream_connect callback
-    invoke_on_upstream_connect(uc->conn_id);
+    // The callback does NOT fire here, and neither does `established`.  A
+    // non-blocking connect() answers EINPROGRESS whenever the target is not
+    // already there, so everything below this line used to be told the far end
+    // had accepted before a single packet had crossed -- measured against a
+    // port nobody held, `upstreams:1/1` for twenty-five of thirty seconds.
+    // note_upstream_established() asks the kernel instead.
+    uc->established = false;
+    m_upstream_awaiting = true;
 
     return true;
+}
+
+// The upstream half of the client's note_connected(), and the same question:
+// getpeername() is what an accept() answers on the other side, failing with
+// ENOTCONN for as long as the handshake is out and never succeeding for a
+// connect that was refused.
+void server_instance::note_upstream_established()
+{
+    bool still_waiting = false;
+    for (auto& [_, uc] : m_upstreams)
+    {
+        if (!uc->connected || uc->established || uc->fd < 0)
+            continue;
+
+        struct sockaddr_storage peer{};
+        socklen_t len = sizeof(peer);
+        if (getpeername(uc->fd, reinterpret_cast<struct sockaddr*>(&peer), &len) < 0)
+        {
+            still_waiting = true;      // handshake out, or refused and not yet reaped
+            continue;
+        }
+
+        uc->established = true;
+        invoke_on_upstream_connect(uc->conn_id);
+    }
+    m_upstream_awaiting = still_waiting;
 }
 
 void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
@@ -7569,6 +7607,7 @@ void server_instance::upstream_disconnect(upstream_connection* uc)
 
     bool was_connected = uc->connected;
     uc->connected = false;
+    uc->established = false;
     uc->closing = false;
     uc->read_pending = false;
     uc->write_pending = false;
