@@ -51,6 +51,31 @@ public:
     {
         // Pre-allocate hash buckets to avoid rehashing during the initial
         // load.
+        //
+        // max_load_factor is deliberately left at libstdc++'s 1.0, and the
+        // curve below is why -- measured on pipelined GET at about 173,000
+        // keys, nine passes per arm, interleaved with the order reversed:
+        //
+        //     0.5   0.663    (-34%)   0 of 8 passes favoured it
+        //     1.0   1.000    baseline
+        //     2.0   1.051 / 1.032     7 of 8, then 6 of 8 on a repeat
+        //     4.0   1.034    (+3.4%)  4 of 6, which is nothing
+        //     8.0   0.765    (-24%)   0 of 6
+        //
+        // The shape is the finding, not the peak.  Halving the load factor
+        // DOUBLES the bucket array -- 1.4 MB to 2.8 MB at this key count --
+        // and costs a third of the throughput, while shortening every chain.
+        // So what this table pays for is not collisions: it is whether the
+        // bucket array stays resident.  That is also why a better hash was
+        // measured and refused (wyhash, chi2/df 1.035 against 1.000, 0.975x
+        // throughput): fewer collisions buy nothing when the cost is a miss.
+        //
+        // 2.0 is left unset because the win is 3 to 5 per cent on a path whose
+        // noise floor is 5, it reads -0.5% at depth 1 where the kernel holds
+        // 86% of the time, and the peak moves with the key count -- so it
+        // would be tuning this constant for one table size.  The direction
+        // that does follow from the curve is a more COMPACT table: open
+        // addressing, or smaller nodes, not a cleverer hash.
         m_data.reserve(1024);
     }
 
