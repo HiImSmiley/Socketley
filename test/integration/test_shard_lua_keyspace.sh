@@ -50,6 +50,10 @@
 #
 #   3. The owned subset is neither empty nor all twenty.  Without it assertion 2
 #      passes on a build where the callback never ran, and passes on one shard.
+#      A bound and not an equality, and it cannot flake either way: the slot
+#      map is fixed, so shard 0 owns `trigger` and 6 of m0..m19, and the four
+#      shards hold 6/6/4/4 of them -- none of the four is 0 and none is 20,
+#      whichever shard the trigger lands on.
 #
 #   4. self.owns() partitions the keyspace: summed over the four shards, each of
 #      the twenty keys is owned exactly once.  A binding that answered true

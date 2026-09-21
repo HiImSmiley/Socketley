@@ -357,11 +357,15 @@ public:
     int lua_publish(std::string_view channel, std::string_view message);
 
     // ── the one place the Lua table asks who owns a key ─────────────────────
-    // A script under --shards is a replicated stream: the same program runs in
-    // every shard, so it obeys the rule apply_replicated() already states --
+    // Every other door into the store asks before it touches it, and says so at
+    // its own line: process_command() and apply_replicated().  This one did
+    // not, and what that cost depends on which callback is running.  on_start
+    // and a timer run in ALL N processes, so each wrote the whole keyspace into
+    // its own slice and KEYS and DBSIZE reported it N times over; on_miss,
+    // on_write and on_delete run in exactly ONE, so a key that shard does not
+    // own went into a slice no read routes to.  The rule is the same for both:
     // act on the keys this shard owns and leave the rest to the sibling that
-    // owns them.  Without it each of the N processes wrote the whole keyspace
-    // into its own slice, which KEYS and DBSIZE then reported N times over.
+    // owns them.
     //
     // Not a crossing: the answer to self.set() is its return value, and a
     // crossing arrives on a later turn -- see can_cross(), which is why the
