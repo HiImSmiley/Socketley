@@ -4482,7 +4482,11 @@ writes only if the key is absent and
 .B xx
 only if it is there;
 .BR ex " and " px
-set a deadline in seconds or milliseconds.
+set a deadline in seconds or milliseconds. Either must be positive: zero or
+less is refused and NOTHING is written, because a key stored with a deadline
+that came out at zero and no deadline on it is immortal and its owner has been
+told the write worked. An argument that is not a number is refused as one,
+rather than as a syntax error about the word after it.
 .IP
 .B keepttl
 leaves the deadline alone, which a plain
@@ -5227,7 +5231,11 @@ Throw the queue away.
 .B TTL / Expiry:
 .TP
 .BI "expire " "key seconds"
-Set time-to-live. Returns "ok" or "nil" (key not found).
+Set time-to-live. Returns "ok" or "nil" (key not found). A
+.I seconds
+of zero or less is a deletion, not an error: the key goes and the answer is
+"ok", which is what Redis does and what a caller whose own arithmetic came out
+at zero means.
 .TP
 .BI "ttl " "key"
 Return remaining seconds, -1 (no ttl), or -2 (not found).
@@ -5236,16 +5244,27 @@ Return remaining seconds, -1 (no ttl), or -2 (not found).
 Remove expiry. Returns "ok" or "nil".
 .TP
 .BI "pexpire " "key milliseconds"
-Set millisecond-precision TTL. Returns "1" (set) or "0" (key not found).
+Set millisecond-precision TTL. Returns "1" (set) or "0" (key not found). Zero
+or less deletes, as with
+.BR expire .
 .TP
 .BI "pttl " "key"
 Return remaining TTL in milliseconds, -1 (no ttl), or -2 (not found).
 .TP
 .BI "expireat " "key unix_seconds"
-Set expiry to an absolute Unix timestamp (seconds). Returns "1" or "0".
+Set expiry to an absolute Unix timestamp (seconds). Returns "1", or "0" if
+there is no such key. A timestamp already past deletes the key and answers
+"1".
 .TP
 .BI "pexpireat " "key unix_ms"
-Set expiry to an absolute Unix timestamp in milliseconds. Returns "1" or "0".
+Set expiry to an absolute Unix timestamp in milliseconds. Same answers as
+.BR expireat .
+.PP
+All four saturate rather than refusing: a deadline past the range of the
+clock means "never", and one past its other end means "already gone". Redis
+refuses these with an error instead, which is the one place this family
+answers differently on purpose \(em the number a client sent is honoured as
+far as the clock goes rather than rejected.
 .PP
 .B Pub/Sub:
 .TP

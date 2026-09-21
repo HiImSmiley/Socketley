@@ -850,7 +850,7 @@ TEST_CASE("cache_store new methods")
     SUBCASE("incr creates key")
     {
         int64_t result = 0;
-        CHECK(store.incr("counter", 1, result));
+        CHECK(store.incr("counter", 1, result) == cache_store::incr_result::ok);
         CHECK(result == 1);
         std::string out;
         CHECK(store.get("counter", out));
@@ -861,7 +861,7 @@ TEST_CASE("cache_store new methods")
     {
         store.set("counter", "10");
         int64_t result = 0;
-        CHECK(store.incr("counter", 5, result));
+        CHECK(store.incr("counter", 5, result) == cache_store::incr_result::ok);
         CHECK(result == 15);
     }
 
@@ -869,15 +869,109 @@ TEST_CASE("cache_store new methods")
     {
         store.set("k", "abc");
         int64_t result = 0;
-        CHECK_FALSE(store.incr("k", 1, result));
+        CHECK(store.incr("k", 1, result) == cache_store::incr_result::not_an_integer);
     }
 
     SUBCASE("decr")
     {
         store.set("k", "10");
         int64_t result = 0;
-        CHECK(store.incr("k", -1, result));
+        CHECK(store.incr("k", -1, result) == cache_store::incr_result::ok);
         CHECK(result == 9);
+    }
+
+    // The sum that leaves int64 is refused, and -- the half of it a test that
+    // only reads the return value would miss -- the stored value is the one
+    // that was there before.
+    SUBCASE("incr past INT64_MAX is refused and writes nothing")
+    {
+        store.set("k", "9223372036854775807");
+        int64_t result = 0;
+        CHECK(store.incr("k", 1, result) == cache_store::incr_result::would_overflow);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "9223372036854775807");
+    }
+
+    SUBCASE("incr past INT64_MIN is refused and writes nothing")
+    {
+        store.set("k", "-9223372036854775808");
+        int64_t result = 0;
+        CHECK(store.incr("k", -1, result) == cache_store::incr_result::would_overflow);
+        std::string out;
+        CHECK(store.get("k", out));
+        CHECK(out == "-9223372036854775808");
+    }
+
+    SUBCASE("hincrby past INT64_MAX is refused and leaves the field")
+    {
+        store.hset("h", "f", "9223372036854775807");
+        int64_t result = 0;
+        CHECK(store.hincrby("h", "f", 1, result) == cache_store::incr_result::would_overflow);
+        const std::string* held = store.hget("h", "f");
+        REQUIRE(held != nullptr);
+        CHECK(*held == "9223372036854775807");
+    }
+
+    // expire_in is the one decision behind EXPIRE, PEXPIRE, EXPIREAT,
+    // PEXPIREAT and a script's self.expire.  Three answers, and the third is
+    // the one no bool could carry.
+    SUBCASE("expire_in answers about the key, not about the call")
+    {
+        int64_t unused = 0;
+        (void)unused;
+        CHECK(store.expire_in("nosuch", 600, false) == cache_store::expire_result::no_such_key);
+
+        store.set("a", "v");
+        CHECK(store.expire_in("a", 600, false) == cache_store::expire_result::armed);
+        CHECK(store.get_ttl("a") > 0);
+
+        // Zero and below delete, and the deadline goes with the value -- a
+        // name left in m_expiry answers to nothing.
+        store.set("b", "v");
+        CHECK(store.expire_in("b", 0, false) == cache_store::expire_result::deleted);
+        std::string out;
+        CHECK_FALSE(store.get("b", out));
+        CHECK(store.get_pttl("b") == -2);
+
+        store.set("c", "v");
+        CHECK(store.expire_in("c", -1, true) == cache_store::expire_result::deleted);
+        CHECK_FALSE(store.get("c", out));
+    }
+
+    // A key past its deadline that the sweep has not reached yet is not there
+    // to be given a new one: without the check, EXPIRE erased the deadline,
+    // kept the value and the key was back for good.  The deadline is put one
+    // millisecond in the PAST rather than waiting for one to pass, so this
+    // says the same thing on every machine.
+    SUBCASE("expire_in does not revive a key whose deadline has passed")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", -1));
+        CHECK(store.expire_in("k", 600, false) == cache_store::expire_result::no_such_key);
+        std::string out;
+        CHECK_FALSE(store.get("k", out));
+    }
+
+    // The deadline an absurd TTL means is "never", and the two readers agree
+    // with it: an overflow here wrapped into the past and the key was gone on
+    // the next touch.
+    SUBCASE("a TTL past the clock's range saturates rather than wrapping")
+    {
+        store.set("k", "v");
+        CHECK(store.set_expiry_ms("k", 9223372036854775807LL));
+        CHECK(store.get_pttl("k") > 0);
+        CHECK(store.get_ttl("k") > 0);
+        CHECK(store.expire_time("k", true) > 0);
+        store.check_expiry("k");
+        std::string out;
+        CHECK(store.get("k", out));
+
+        store.set("k2", "v");
+        CHECK(store.set_expiry("k2", 9223372036854775807LL));
+        CHECK(store.get_ttl("k2") > 0);
+        store.check_expiry("k2");
+        CHECK(store.get("k2", out));
     }
 
     SUBCASE("append creates key")

@@ -1346,18 +1346,31 @@ bool run_step(world& w, const step& s)
                 numeric = false;
             }
 
+            // The model's own sum, computed the way the store has to compute
+            // it: `cur + delta` is undefined when it leaves int64, so the
+            // model cannot form it and then ask whether it fits.
+            int64_t    sum      = 0;
+            const bool sum_fits = !__builtin_add_overflow(static_cast<int64_t>(cur), delta, &sum);
+
             int64_t result = 0;
-            const bool ok = w.store.incr(k, delta, result);
+            const auto st  = w.store.incr(k, delta, result);
+            const bool ok  = (st == cache_store::incr_result::ok);
             wrote_ok = ok;
             if (ok)
             {
                 CACHE_CHECK(!conflict, "incr() wrote to a key that is not a string");
                 CACHE_CHECK(numeric, "incr() accepted a value that is not an integer");
-                CACHE_CHECK(result == static_cast<int64_t>(cur) + delta, "incr() produced the wrong sum");
+                CACHE_CHECK(sum_fits, "incr() wrote a sum int64 cannot hold");
+                CACHE_CHECK(result == sum, "incr() produced the wrong sum");
                 char buf[32];
                 std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(result));
                 e.type = T_STRING;
                 e.str  = buf;
+            }
+            else if (st == cache_store::incr_result::would_overflow)
+            {
+                CACHE_CHECK(numeric && !sum_fits,
+                            "incr() called a sum an overflow when the model's own sum fits");
             }
             else
             {
