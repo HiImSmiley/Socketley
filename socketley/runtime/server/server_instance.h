@@ -1112,6 +1112,9 @@ private:
     // an upstream is a TCP socket this runtime dials and has nothing to do
     // with the family its own listener was configured in.
     void start_upstreams();
+    // And its pair, because teardown() has two exits as well: a restart that
+    // ran one without the other freed an upstream the ring still named.
+    void stop_upstreams(event_loop& loop);
     // Starts the clock on a head that arrived in part, and arms the sweep that
     // reads it -- a plain --http server has neither --idle-timeout nor TLS, so
     // without this there is no chain running at all.

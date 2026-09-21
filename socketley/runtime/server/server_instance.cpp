@@ -2283,7 +2283,51 @@ bool server_instance::setup(event_loop& loop)
     return true;
 }
 
-// Connect to upstreams with nothing to clear, because teardown() either
+// What start_upstreams() undoes, and the reason both are functions: teardown()
+// has two exits as well, and the pair has to be called from the same number of
+// places or a restart frees a struct the ring still names.
+void server_instance::stop_upstreams(event_loop& loop)
+{
+    // Set false by any withdrawal the ring refused, reported once rather than
+    // per upstream, because they all fail for the same reason and together.
+    bool timers_withdrawn = true;
+
+    for (auto& [cid, uc] : m_upstreams)
+    {
+        if (uc->fd >= 0)
+        {
+            m_upstream_by_fd.erase(uc->fd);
+            shutdown(uc->fd, SHUT_RDWR);
+            close_tracked(uc->fd);
+            uc->fd = -1;
+        }
+        uc->connected = false;
+        // Release write queue refs
+        uc->write_queue.clear();
+        if (!uc->write_pending)
+        {
+            for (size_t j = 0; j < uc->write_batch_count; j++)
+                uc->write_batch[j].clear();
+            uc->write_batch_count = 0;
+        }
+
+        // The reconnect timer is attached to no fd, so its owner stays set and
+        // it is withdrawn only to stop the wait being thirty seconds this
+        // instance spends in the graveyard.
+        if (uc->timeout_pending)
+            timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
+
+        if (uc->read_pending || uc->write_pending || uc->timeout_pending)
+            m_upstream_retired.push_back(std::move(uc));
+    }
+    m_upstreams.clear();
+
+    if (SOCKETLEY_UNLIKELY(!timers_withdrawn))
+        LOG_WARN("server: an upstream reconnect timer could not be withdrawn — this "
+                 "instance stays retired until it fires on its own");
+}
+
+// Connect to upstreams with nothing to clear, because stop_upstreams() either
 // dropped the previous structs or retired the ones with work still in the
 // ring.  Its own function because setup() has two exits and both owe it.
 void server_instance::start_upstreams()
@@ -2327,6 +2371,12 @@ void server_instance::teardown(event_loop& loop)
         }
         m_udp_peers.clear();
         m_udp_peer_idx.clear();
+        // This exit dials upstreams like the other one, so it gives them up
+        // like the other one.  Without it they stayed in m_upstreams with
+        // reads still in the ring and the next start() freed them under the
+        // kernel -- a heap-use-after-free the fuzz target reported the moment
+        // a UDP server could reach running state.
+        stop_upstreams(loop);
         // Before the return, and this is the other half of arming the sweep on
         // the UDP path at all: this exit never reached the withdrawal below, so
         // the first version of that change left a timeout owed and the fuzz
@@ -2460,41 +2510,7 @@ void server_instance::teardown(event_loop& loop)
         release_conn(std::move(conn));
     m_clients.clear();
 
-    // Set false by any timer withdrawal the ring refused; reported once at the
-    // end rather than per timer, because they all fail for the same reason and
-    // they all fail together.
-    bool timers_withdrawn = true;
-
-    // Tear down upstream connections
-    for (auto& [cid, uc] : m_upstreams)
-    {
-        if (uc->fd >= 0)
-        {
-            m_upstream_by_fd.erase(uc->fd);
-            shutdown(uc->fd, SHUT_RDWR);
-            close_tracked(uc->fd);
-            uc->fd = -1;
-        }
-        uc->connected = false;
-        // Release write queue refs
-        uc->write_queue.clear();
-        if (!uc->write_pending)
-        {
-            for (size_t j = 0; j < uc->write_batch_count; j++)
-                uc->write_batch[j].clear();
-            uc->write_batch_count = 0;
-        }
-
-        // The reconnect timer is attached to no fd, so its owner stays set and
-        // it is withdrawn only to stop the wait being thirty seconds this
-        // instance spends in the graveyard.
-        if (uc->timeout_pending)
-            timers_withdrawn &= loop.submit_timeout_remove(&uc->timeout_req);
-
-        if (uc->read_pending || uc->write_pending || uc->timeout_pending)
-            m_upstream_retired.push_back(std::move(uc));
-    }
-    m_upstreams.clear();
+    stop_upstreams(loop);
 
     // Close splice pipe
     // The pipes went with the connections that owned them.

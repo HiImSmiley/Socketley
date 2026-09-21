@@ -1179,6 +1179,7 @@ local function fuzz_target_settings()
     filter "configurations:Release"
         defines { "NDEBUG" }
         optimize "Full"
+        symbols "On"
     filter {}
 
     filter "configurations:Sanitize"

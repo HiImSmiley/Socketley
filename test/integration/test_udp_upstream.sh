@@ -131,6 +131,24 @@ else
         "relay:from-a-datagram; self.upstream_broadcast() had no upstream to broadcast to"
 fi
 
+# And the leg survives a restart.  This is not what proves the teardown side
+# right -- an upstream struct left in m_upstreams with a read still in the ring
+# is a heap-use-after-free the next start() commits, and nothing out here can
+# see that; fuzz_server_ops is what reports it.  What this covers is the
+# ordinary half: a UDP server that has been stopped and started again still has
+# its upstream.
+"$BIN" stop udpup >/dev/null 2>&1
+sleep 0.5
+"$BIN" start udpup >/dev/null 2>&1
+sleep 2
+AGAIN=$(ups_of udpup)
+if [ "${AGAIN:-}" = "1/1" ]; then
+    ok "and it still has one after a stop and a start (${AGAIN})"
+else
+    bad "a restarted UDP server dials its upstream again" \
+        "stats reads upstreams:${AGAIN:-<none>} after a restart, was ${GOT:-<none>} before it"
+fi
+
 for n in udpup tcpup; do
     "$BIN" stop "$n" >/dev/null 2>&1; "$BIN" remove "$n" >/dev/null 2>&1
 done

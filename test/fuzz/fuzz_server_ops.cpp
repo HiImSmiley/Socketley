@@ -596,7 +596,12 @@ std::unique_ptr<server_instance> make_instance(world& w)
     rt->set_on_connect(cb_on_connect);
     rt->set_on_disconnect(cb_on_disconnect);
     rt->set_on_auth(cb_on_auth);
-    rt->set_master_pw("fuzzpw");
+    // Not on a UDP instance.  config_refusal() refuses --master-pw in any mode
+    // but master, and refuses --udp WITH master, so an instance carrying both
+    // can never start -- which is why m_udp_fd was never once opened in 20,037
+    // inputs while the header claimed UDP was covered.
+    if (!w.udp)
+        rt->set_master_pw("fuzzpw");
     if (g_http_dir)
         rt->set_http_dir(*g_http_dir);
     if (w.tick)
