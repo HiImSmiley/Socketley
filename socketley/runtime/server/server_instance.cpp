@@ -73,6 +73,25 @@ server_instance::~server_instance()
     if (m_http_root_fd >= 0) { ::close(m_http_root_fd); m_http_root_fd = -1; }
 }
 
+// The buffer the plain arms read into, made when an arm first needs one.
+//
+// Same defect and same repair as the cache's copy of this function: read_buf
+// stopped being allocated at accept so an idle connection would not pay four
+// kilobytes for it, and the arms below were left reading `&& conn->read_buf`.
+// That pointer is null on every connection that has a buffer ring, so the last
+// rung of the ladder was unreachable exactly when the ring was full and it was
+// the point -- nothing armed, and the connection reads no more.  The chain
+// above was fixed out of the same shape once through an `else`; this came back
+// through a null pointer, in a commit about memory.
+//
+// The idle connection still never reaches this, because it never fails an arm.
+static inline char* fallback_read_buf(server_connection* conn)
+{
+    if (!conn->read_buf)
+        conn->read_buf = std::make_unique<char[]>(server_connection::READ_BUF_SIZE);
+    return conn->read_buf.get();
+}
+
 void server_instance::close_tracked(int fd)
 {
     if (fd < 0)
@@ -2972,8 +2991,11 @@ inline void server_instance::submit_conn_read(server_connection* conn)
             queued = m_loop->submit_recv_multishot_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided_fixed_file(conn->fixed_idx, BUF_GROUP_ID, &conn->read_req);
-        if (!queued && conn->read_buf)
-            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
+        if (!queued)
+        {
+            conn->read_req.type = op_read;
+            queued = m_loop->submit_read_fixed_file(conn->fixed_idx, fallback_read_buf(conn), server_connection::READ_BUF_SIZE, &conn->read_req);
+        }
     }
     else
     {
@@ -2983,8 +3005,11 @@ inline void server_instance::submit_conn_read(server_connection* conn)
             queued = m_loop->submit_recv_multishot(conn->fd, BUF_GROUP_ID, &conn->read_req);
         if (!queued && m_use_provided_bufs)
             queued = m_loop->submit_read_provided(conn->fd, BUF_GROUP_ID, &conn->read_req);
-        if (!queued && conn->read_buf)
-            queued = m_loop->submit_read(conn->fd, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
+        if (!queued)
+        {
+            conn->read_req.type = op_read;
+            queued = m_loop->submit_read(conn->fd, fallback_read_buf(conn), server_connection::READ_BUF_SIZE, &conn->read_req);
+        }
     }
 
     // The flag goes up only once the read is queued, because setting it first
@@ -4583,11 +4608,9 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
             conn->read_req.type = op_read;
             bool queued;
             if (conn->direct_fd)
-                queued = conn->read_buf
-                       && m_loop->submit_read_fixed_file(conn->fixed_idx, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = m_loop->submit_read_fixed_file(conn->fixed_idx, fallback_read_buf(conn), server_connection::READ_BUF_SIZE, &conn->read_req);
             else
-                queued = conn->read_buf
-                       && m_loop->submit_read(fd, conn->read_buf.get(), server_connection::READ_BUF_SIZE, &conn->read_req);
+                queued = m_loop->submit_read(fd, fallback_read_buf(conn), server_connection::READ_BUF_SIZE, &conn->read_req);
             if (SOCKETLEY_UNLIKELY(!queued))
             {
                 conn->read_pending = false;
