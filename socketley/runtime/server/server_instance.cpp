@@ -7663,9 +7663,15 @@ void server_instance::upstream_schedule_reconnect(upstream_connection* uc)
     if (!m_loop || uc->timeout_pending)
         return;
 
-    // Exponential backoff: min(1s * 2^attempt, 30s) with jitter
-    int base_sec = 1 << std::min(uc->reconnect_attempt, 4); // 1,2,4,8,16
-    int delay_sec = std::min(base_sec, 30);
+    // Exponential backoff, 1, 2, 4, 8 and then 16 seconds, with up to half a
+    // second of jitter.  SIXTEEN and not thirty: the shift is capped at four,
+    // so base_sec never passes 16 and the std::min against 30 that used to sit
+    // here could not fire.  The same dead pair stood in the client until it
+    // was measured -- dials at 1, 2, 4, 8.1, 16.2, 32.7, 49.1 seconds, which
+    // is 16 from the fifth on -- and the comment is corrected rather than the
+    // code, because a thirty-second ceiling buys nothing sixteen does not and
+    // costs fourteen more seconds of outage after the target comes back.
+    int delay_sec = 1 << std::min(uc->reconnect_attempt, 4);
     int jitter_ms = (uc->reconnect_attempt * 137) % 500;
 
     // The address that just failed us goes with the attempt.  has_cached_addr

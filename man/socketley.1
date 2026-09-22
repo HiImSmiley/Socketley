@@ -2597,7 +2597,7 @@ client asked for.
 .TQ
 .BI "\-\-upstream " "host:port"
 Add an outbound upstream connection. The server connects to the specified
-host:port on startup and auto-reconnects with exponential backoff (1s\(en30s)
+host:port on startup and auto-reconnects with exponential backoff (1s\(en16s)
 if the connection drops. Multiple \-u flags may be specified, or multiple
 addresses separated by semicolons (e.g. \-u "feed:9000;cache:6379").
 Each upstream gets a stable 1-based conn_id for use in Lua callbacks.

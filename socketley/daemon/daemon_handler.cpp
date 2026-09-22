@@ -3372,10 +3372,16 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
         if (result == -1)
         {
+            // Cache flags `create` takes and `edit` does not, so the answer
+            // names `import` instead of reading as a typo.  --mode is in here
+            // because it is the one a reader reaches for first: the page
+            // documents `--mode readonly` on a cache, and asking edit for it
+            // answered "unknown flag: --mode" -- which says the flag does not
+            // exist rather than that this command cannot change it.
             static constexpr uint32_t cache_only[] = {
                 fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
                 fnv1a("--replicate"), fnv1a("--resp"), fnv1a("--cluster"),
-                fnv1a("--persistent-interval"),
+                fnv1a("--persistent-interval"), fnv1a("--mode"),
             };
             bool is_cache_flag = false;
             for (uint32_t h : cache_only)

@@ -2013,7 +2013,7 @@ example_upstream_hub() {
     echo "# Type a message -> forwarded to upstream"
     echo "# Upstream replies -> forwarded to all clients"
     echo ""
-    echo "# Kill upstream -> auto-reconnects with exponential backoff (1s-30s)"
+    echo "# Kill upstream -> auto-reconnects with exponential backoff (1s-16s)"
     echo "# Restart upstream -> on_upstream_connect fires again"
     echo ""
     echo "# Lua callbacks: on_upstream(id, data), on_upstream_connect(id), on_upstream_disconnect(id)"
