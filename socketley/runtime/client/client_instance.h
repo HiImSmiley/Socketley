@@ -248,4 +248,8 @@ private:
     static constexpr uint32_t BUF_COUNT = 8;
     static constexpr uint32_t BUF_SIZE = 65536;
     bool m_use_provided_bufs{false};
+
+    // The kernel re-arming the recv instead of this client doing it per
+    // message; off wherever the ring or SOCKETLEY_RECV_MULTISHOT says so.
+    bool m_recv_multishot{false};
 };

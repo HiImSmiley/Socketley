@@ -298,7 +298,13 @@ void client_instance::arm_read()
 
     m_conn->read_req = { this, m_conn->read_buf, m_conn->fd, sizeof(m_conn->read_buf), op_read,
                         m_conn_generation };
-    if (m_use_provided_bufs)
+    // One submission for a stream of messages rather than one per message.
+    // Measured on a server's read path, which has the same shape, driven by a
+    // single pipelined connection: 7 of 7 interleaved passes with the order
+    // rotated, spread [1.024, 1.051] against a noise floor of [0.998, 0.999].
+    if (m_recv_multishot)
+        m_conn->read_pending = m_loop->submit_recv_multishot(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req);
+    if (!m_conn->read_pending && m_use_provided_bufs)
         m_conn->read_pending = m_loop->submit_read_provided(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req);
 
     // A refused submission is the ring being momentarily full, not the peer
@@ -669,6 +675,8 @@ bool client_instance::setup(event_loop& loop)
     }
 
     m_use_provided_bufs = loop.setup_buf_ring(BUF_GROUP_ID, BUF_COUNT, BUF_SIZE);
+    // Needs the ring, because a multishot recv selects its buffer from one.
+    m_recv_multishot = m_use_provided_bufs && loop.recv_multishot_enabled();
 
     if (!try_connect())
     {
@@ -760,6 +768,7 @@ void client_instance::on_cqe(struct io_uring_cqe* cqe)
     {
         case op_read:
         case op_read_provided:
+        case op_recv_multishot:
             handle_read(cqe);
             break;
         case op_write:
@@ -775,9 +784,17 @@ void client_instance::on_cqe(struct io_uring_cqe* cqe)
 
 void client_instance::handle_read(struct io_uring_cqe* cqe)
 {
-    m_conn->read_pending = false;
+    // A multishot arm still standing is NOT a re-arm this client owes: the
+    // kernel delivers again without being asked, and clearing the flag here
+    // would let arm_read() put a second recv on the same socket and the same
+    // buffer.  arm_read() at the bottom of this function then declines on its
+    // own, which is how one path serves both.
+    const bool multishot = is_multishot_recv_op(m_conn->read_req.type);
+    const bool more      = multishot && (cqe->flags & IORING_CQE_F_MORE);
+    if (!more)
+        m_conn->read_pending = false;
 
-    bool is_provided = (m_conn->read_req.type == op_read_provided);
+    bool is_provided = (m_conn->read_req.type == op_read_provided || multishot);
 
     // res == 0 is an end of stream on TCP and a legitimate empty datagram on
     // UDP, and testing `<= 0` before the m_udp branch below made the second
@@ -796,6 +813,12 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         // ENOBUFS: buffer pool exhausted — fall back to regular read
         if (is_provided && cqe->res == -ENOBUFS)
         {
+            // The kernel ends a multishot recv it cannot find a buffer for, so
+            // MORE is expected to be clear here; asserted rather than assumed
+            // because arming a second read while the first still stands splits
+            // the stream between two arms and neither sees a whole message.
+            if (more)
+                return;
             m_conn->read_pending = true;
             // Reset the request type, because leaving it as a provided-buffer
             // type makes the handler append ring buffer 0's contents and
