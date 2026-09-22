@@ -241,9 +241,18 @@ private:
     // place it is known.
     std::string m_tls_peer_name;
 
-    // Sized for the one connection a client has: 65536 x 8 measured 42 M msg/s
-    // against 4096 x 64's 24.9 M in the same 256 KB, because four large
-    // buffers stay in cache where sixty-four small ones do not.
+    // Sized for the one connection a client has.  Measured, 64-byte lines, a
+    // blaster filling the socket: 4096 x 64 carried 24.9 M msg/s in 256 KB and
+    // 65536 x 8 carried 42.3 M in 512 KB, because a few large buffers stay in
+    // cache where sixty-four small ones do not.
+    //
+    // 65536 x 4 measured 42.5 M in 256 KB -- the same, for half the memory --
+    // and 8 was taken because at most one buffer was ever in flight, which
+    // made the other seven margin.  That premise went with the multishot arm:
+    // the kernel now fills the next one while this one is being parsed, so the
+    // margin is working set.  Which of the two is better under multishot has
+    // not been measured, and the old sentence claimed 8 and 256 KB together,
+    // which was never a row in the table.
     static constexpr uint16_t BUF_GROUP_ID = 4;
     static constexpr uint32_t BUF_COUNT = 8;
     static constexpr uint32_t BUF_SIZE = 65536;

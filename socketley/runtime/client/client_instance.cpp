@@ -971,10 +971,15 @@ resubmit:
 }
 
 // The two read_pending guards defer a teardown to an armed read, which
-// conn_reachability.h refuses, and are left alone because the read is
-// single-shot and armed on the descriptor -- 109 resets reproduced no
-// stranding, which is a weaker measurement than the other two and is named as
-// one.
+// conn_reachability.h refuses.  They were left alone on the read being
+// single-shot; it is multishot now, so that premise is gone and this is what
+// replaced it.  read_pending is true in both designs whenever this function
+// runs -- the only window where a single-shot read clears it is inside
+// handle_read, and no completion interleaves on one thread -- and the teardown
+// a closing connection depends on is in handle_read's tail, which asks about
+// write_pending rather than read_pending.  Measured under the shape the
+// single-shot commit predicted would strand: a peer that RSTs every dial, 45
+// seconds, 37 dials on each arm and the runtime answering the daemon on both.
 void client_instance::handle_write(struct io_uring_cqe* cqe)
 {
     m_conn->write_pending = false;
