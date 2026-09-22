@@ -81,21 +81,22 @@ daemon_start "$BIN"
 
 # ── The HTTP target is NOT a socketley server, and that is a finding ────────
 #
-# socketley.http sends `GET <path> HTTP/1.0` with `Connection: close` and then
-# reads until the peer closes — it does not stop at Content-Length.  socketley's
-# own --http file server never closes: measured against it, an HTTP/1.0 request
-# carrying `Connection: close` gets its 103 bytes of complete response and the
-# socket is still open two seconds later, and so are HTTP/1.1 with and without
-# the header.  The two together mean a script cannot fetch from this project's
-# own HTTP server: socketley.http returns `ok=false status=0 error=response
-# timed out` with an empty body, for a response that arrived in full.  Reported
-# separately; it is a product defect and not this file's to work around by
-# weakening an assertion.
+# Both halves of that are fixed, and this paragraph is kept because the reason
+# for the Python origin below is now smaller than it was.
 #
-# So the target here is a server that closes, which is what makes the four
-# assertions below about socketley.http rather than about that.  It answers 200
-# with a known body for /probe.txt and 404 for anything else, one request per
-# connection, HTTP/1.0.
+# It used to read: socketley.http reads until the peer closes and socketley's
+# own --http server never closes, so a script could not fetch from this
+# project's own HTTP server -- `ok=false status=0 error=response timed out` for
+# a response that had arrived in full.  Both were true when it was written.
+# 7c60742c gave the server the client's Connection header eleven days later,
+# and it closes now; socketley.http stops at Content-Length now as well.
+# Re-measured against the --http server: HTTP/1.0 with and without the header
+# and HTTP/1.1 with it all get their bytes and a close, and the fetch answers
+# `ok=true status=200` with the file's contents.
+#
+# The target here stays a server that closes, and now only because it answers a
+# known body for /probe.txt and 404 for anything else, which is what makes the
+# four assertions below about socketley.http rather than about a file server.
 cat > "$SOCKETLEY_TMPD/httpd.py" <<'PYEOF'
 import os, socket, sys, threading, time
 port, stop_path = int(sys.argv[1]), sys.argv[2]

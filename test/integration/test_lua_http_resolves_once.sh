@@ -10,10 +10,11 @@
 # only direct observation available: a timing argument would be measuring this
 # machine's stub cache, and `localhost` never reaches a resolver at all.
 #
-# The origin is Python and not this project's own --http server, because
-# socketley.http reads until the peer closes and that server never does --
-# measured and reported as a product defect by test_lua_globals.sh.  A target
-# that closes per request is what keeps this file about the resolver.
+# The origin is Python because it counts requests, which is half of what this
+# file reads.  An earlier version of this comment gave a different reason --
+# that socketley.http could not fetch from this project's own --http server --
+# which was copied from test_lua_globals.sh without being checked and had not
+# been true since 7c60742c.  Re-measured: it fetches from it.
 #
 # ─── WHAT IT ASSERTS ────────────────────────────────────────────────────────
 #
