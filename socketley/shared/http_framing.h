@@ -667,14 +667,20 @@ inline bool http_response_frame_complete(const http_response_framing& st)
     // next.
     if (!st.headers_parsed || st.unknown)
         return false;
+    // No body to wait for, and asked BEFORE the coding because a response to
+    // HEAD carries its GET's headers -- Transfer-Encoding among them -- and
+    // none of its bytes, so a chunked HEAD reply that is already whole would
+    // otherwise be waited on for a terminating chunk that RFC 9112 Section 6.3
+    // forbids the server to send.  Measured through a pool: 10 chunked HEADs
+    // cost 9 backend connections, the same as before the method was passed in
+    // at all.  A 304 may quote them the same way (RFC 9112 Section 6.1).
+    if (st.no_body)
+        return true;
     // A chunked response is not tracked to its terminating chunk and any other
     // coding runs to connection close, so Content-Length is inoperative either
     // way (RFC 9112 Section 6.1).
     if (st.chunked || st.transfer_encoding)
         return false;
-    // 204/304: the framing rules say there is no body to wait for.
-    if (st.no_body)
-        return true;
     // Everything else is over only once a declared length has run out, so a
     // response framed by connection close correctly fails here.
     return st.has_content_length && st.body_remaining == 0;

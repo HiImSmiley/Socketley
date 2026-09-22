@@ -458,7 +458,19 @@ void proxy_instance::client_pool_release(std::unique_ptr<proxy_client_connection
     m_client_pool.push_back(std::move(conn));
 }
 
-std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(int fd)
+// The client this backend answers for, taken here rather than assigned by each
+// of the three callers, because two facts travel together: which client to
+// write to, and whether that client asked something whose answer carries no
+// body.
+//
+// A HEAD reply quotes the length its GET would have had and sends none of the
+// bytes, and nothing on the wire says so -- the header scan learns 204 and 304
+// from the status line and cannot learn this.  Without it, body_remaining
+// never reaches zero, http_response_frame_complete() never says yes, and the
+// socket is closed instead of pooled.  Measured through a pool against a
+// keep-alive backend: 10 GETs cost 1 backend connection and 10 HEADs cost 9.
+std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(
+    int fd, const proxy_client_connection* cconn)
 {
     std::unique_ptr<proxy_backend_connection> conn;
     if (SOCKETLEY_LIKELY(!m_backend_struct_pool.empty()))
@@ -475,6 +487,11 @@ std::unique_ptr<proxy_backend_connection> proxy_instance::backend_pool_acquire(i
         // carries — so without this every brand new connection matches one.
         conn->generation = next_io_generation();
     }
+    conn->client_fd = cconn ? cconn->fd : -1;
+    // Only ever set, never cleared, so a HEAD answered 204 agrees with itself
+    // when the header scan reaches the same conclusion by its own road.
+    if (cconn && cconn->method == "HEAD")
+        conn->http_frame.no_body = true;
     return conn;
 }
 
@@ -5696,7 +5713,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
 
         conn->backend_fd = bfd;
 
-        auto bconn = backend_pool_acquire(bfd);
+        auto bconn = backend_pool_acquire(bfd, conn);
         // The session before anything else looks at the struct, as an
         // assignment rather than an overwrite -- and tls_conn_ready rather
         // than handshake, because this connection finished its handshake
@@ -5708,7 +5725,6 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             bconn->tls_state = tls_conn_ready;
             pooled_ssl = nullptr;
         }
-        bconn->client_fd = conn->fd;
         bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
                             bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
@@ -5810,8 +5826,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         // Instant connect success — set up backend inline (same as handle_connect)
         conn->backend_fd = bfd;
 
-        auto bconn = backend_pool_acquire(bfd);
-        bconn->client_fd = conn->fd;
+        auto bconn = backend_pool_acquire(bfd, conn);
         bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
                             bconn->generation };
         bconn->write_req = { this, nullptr, bfd, 0, op_write };
@@ -7657,8 +7672,7 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
 
     conn->backend_fd = bfd;
 
-    auto bconn = backend_pool_acquire(bfd);
-    bconn->client_fd = conn->fd;
+    auto bconn = backend_pool_acquire(bfd, conn);
     bconn->read_req = { this, bconn->read_buf, bfd, sizeof(bconn->read_buf), op_read,
                         bconn->generation };
     bconn->write_req = { this, nullptr, bfd, 0, op_write };

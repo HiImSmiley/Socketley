@@ -1231,7 +1231,8 @@ private:
     // Hand a connection struct back for reuse or retire it when the ring still
     // owes a completion, in the one place every close path goes through.
     void client_pool_release(std::unique_ptr<proxy_client_connection> conn);
-    std::unique_ptr<proxy_backend_connection> backend_pool_acquire(int fd);
+    std::unique_ptr<proxy_backend_connection> backend_pool_acquire(
+        int fd, const proxy_client_connection* cconn);
     void backend_pool_release(std::unique_ptr<proxy_backend_connection> conn);
 
     // Cached config to avoid virtual calls on hot path
