@@ -494,6 +494,9 @@ public:
     // Stats
     std::string stats_lines() const override;
     uint64_t m_stat_commands{0};
+    // Commands whose arguments a follower could not have re-split the way this
+    // leader meant them -- see the faithfulness check in process_resp_command.
+    uint64_t m_repl_unfaithful{0};
     uint64_t m_stat_get_hits{0};
     uint64_t m_stat_get_misses{0};
     uint64_t m_stat_keys_expired{0};

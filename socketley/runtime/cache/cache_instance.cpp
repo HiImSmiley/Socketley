@@ -8169,9 +8169,54 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     m_stat_commands++;
     m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
 
+    // ─── WHAT A FOLLOWER CAN PUT BACK TOGETHER ──────────────────────────────
+    // Both consumers of a replicated record -- a follower's link and this
+    // cache's own journal replay -- hand the line to the text interpreter,
+    // which splits on spaces and lets the LAST argument absorb whatever is
+    // left.  So every argument but the last has to be free of spaces, or what
+    // arrives is a different command with the same bytes.
+    //
+    // Measured, leader and follower side by side after `SET "a b" v`:
+    //
+    //     GET 'a b'   leader v        follower (nothing)
+    //     GET 'a'     leader nothing  follower "b v"
+    //     DBSIZE      4               4
+    //
+    // The follower did not lose a key: it INVENTED one, under a name no client
+    // ever wrote, holding bytes no client ever stored there -- and the counts
+    // match on both sides, so nothing looks wrong from outside.  A later read
+    // of `a` against the follower answers "b v" and is believed.
+    //
+    // Not emitting it is the smaller wrong.  The leader keeps the key, the
+    // follower does not have it, and the line below says so; a divergence you
+    // can see beats one that answers.
+    //
+    // The complete repair is a record that carries its own field lengths, and
+    // that is a wire format between a leader and a follower that may be
+    // different builds -- not a thing to change quietly.  The text path does
+    // not need it: there the client typed the line and the follower splits it
+    // exactly as this leader did.
+    auto repl_faithful = [](std::string_view* a, int n) {
+        for (int i = 0; i + 1 < n; i++)
+            if (a[i].find(' ') != std::string_view::npos) return false;
+        return true;
+    };
+    auto repl_refuse = [&](std::string_view key) {
+        ++m_repl_unfaithful;
+        if (m_repl_unfaithful == 1 || (m_repl_unfaithful % 1000) == 0)
+            LOG_ERROR(("cache \"" + std::string(get_name()) + "\": a key with a "
+                       "space in it cannot be written to the replication log or "
+                       "the journal, because both are re-split on spaces -- \""
+                       + std::string(key) + "\" is on this cache and will not be "
+                       "on a follower; " + std::to_string(m_repl_unfaithful)
+                       + " command(s) have now been held back").c_str());
+    };
+
     // Helper: build text command from RESP args for replication
     auto repl = [&](std::string_view* a, int n) {
         if (!mutation_log_wanted()) return;
+        if (SOCKETLEY_UNLIKELY(!repl_faithful(a, n)))
+        { repl_refuse(n > 1 ? a[1] : std::string_view{}); return; }
         std::string cmd;
         for (int i = 0; i < n; i++) {
             if (i > 0) cmd += ' ';
@@ -8187,6 +8232,10 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     auto repl_set_effect = [&](std::string_view key, std::string_view val,
                                int64_t ex_sec, int64_t px_ms) {
         if (!mutation_log_wanted()) return;
+        // The key is not the last field here, so a space in it moves the
+        // boundary the follower reads -- same rule, stated at the second door.
+        if (SOCKETLEY_UNLIKELY(key.find(' ') != std::string_view::npos))
+        { repl_refuse(key); return; }
 
         std::string cmd;
         cmd.reserve(5 + key.size() + val.size());
