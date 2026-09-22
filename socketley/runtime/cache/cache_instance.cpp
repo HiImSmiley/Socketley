@@ -4936,6 +4936,87 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         }
     }
 
+    // ─── EVERY KEY ON ONE SHARD, FOR THE COMMANDS THAT NAME SEVERAL ─────────
+    // RENAME, COPY, SMOVE and the set algebra read or write more than one key
+    // and cannot be split across shards.  The RESP path has routed them since
+    // route_all_keys_one_shard(); this one never did, because cache_classify()
+    // does not name them and an unnamed command reads `unknown` -- which is
+    // served here, out of this shard's slice.
+    //
+    // Measured on two shards with --cluster, `rename k2 k1` sent as text to
+    // the shard that owns k2 while k1 belongs to the other:
+    //
+    //     the command answered            ok
+    //     the owning shard, get k1        (nothing)
+    //     this shard, get k1              MOVED ... :26602
+    //
+    // The value was written into this shard under a name every router sends
+    // somewhere else, so it was reachable from no port at all -- and the client
+    // was told the rename had happened.
+    if (SOCKETLEY_UNLIKELY(m_shard_n > 1 && cache_needs_one_shard(h)))
+    {
+        // SMOVE's third argument is a member and not a key; every other verb
+        // in the set names keys all the way down, destination included.
+        const int key_cap = (h == fnv1a("smove")) ? 2 : 0;   // 0 = to the end
+
+        // One token, and what is left after it: the same split the
+        // interpreter below performs, written here because its own helper is a
+        // lambda inside another function.
+        const auto peel = [](std::string_view a)
+            -> std::pair<std::string_view, std::string_view> {
+            while (!a.empty() && a.front() == ' ') a.remove_prefix(1);
+            const size_t sp = a.find(' ');
+            if (sp == std::string_view::npos) return { a, {} };
+            return { a.substr(0, sp), a.substr(sp + 1) };
+        };
+
+        std::string_view rest = parts.args, first;
+        uint32_t owner = 0; int seen = 0; bool split = false;
+        while (!rest.empty() && (key_cap == 0 || seen < key_cap))
+        {
+            auto [k, r] = peel(rest);
+            rest = r;
+            if (k.empty()) break;
+            const uint32_t o = cache_shard_of(k, m_shard_n);
+            if (seen == 0) { owner = o; first = k; }
+            else if (o != owner) { split = true; break; }
+            ++seen;
+        }
+
+        if (split)
+        {
+            run_in_reply_order(conn, [&] {
+                emit_unrouted(conn, parts.cmd, false,
+                              "names keys that do not all belong to one shard, "
+                              "and it cannot be split across them");
+            });
+            return;
+        }
+        if (seen > 0 && owner != m_shard_i)
+        {
+            // Same two answers the single-key case gives, for the same
+            // reasons: correct the map on a per-shard port, cross otherwise.
+            if (conn->cluster_port)
+            {
+                run_in_reply_order(conn, [&] { emit_moved(conn, first, owner, false); });
+                return;
+            }
+            if (SOCKETLEY_UNLIKELY(!can_cross(conn)))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "names keys another shard owns, and this path "
+                                  "cannot wait for it");
+                });
+                return;
+            }
+            const uint32_t slot = slot_open(conn, false, cache_merge::single, 1);
+            route_part(conn, owner, slot, 0, line, false);
+            return;
+        }
+        // Every key here: the interpreter below is the right one.
+    }
+
     switch (cache_classify_text(h))
     {
         case cache_cmd_class::single_key:
