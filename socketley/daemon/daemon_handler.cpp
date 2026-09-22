@@ -6182,6 +6182,42 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
     switch (verdict)
     {
         case proxy_supervisor::startup::serving:
+        {
+            // ─── EVERY SHARD THAT WAS FORKED, WHICH IS NOT EVERY SHARD ──────
+            // The loop above asks it->second, the supervisors that exist.  A
+            // fork that fails on the third of eight leaves the first two
+            // serving, breaks out of the spawn loop and marks the runtime
+            // failed -- and all of that was invisible here, because two
+            // supervisors answering "serving" is a clean verdict.  `start`
+            // returned 0 with nothing on the terminal, `ls` read Failed, and
+            // the state file kept was_running:true, so the next daemon start
+            // tried the same partial runtime again.
+            //
+            // The full failure has been reported since the top of this
+            // function; this is the half of it that had nobody.
+            if (auto* inst = m_manager.get(name))
+            {
+                const uint32_t want = inst->get_shards();
+                if (want > 1 && it->second.size() < want)
+                {
+                    out += "runtime ";
+                    out += name;
+                    out += " could not start: only ";
+                    out += std::to_string(it->second.size());
+                    out += " of ";
+                    out += std::to_string(want);
+                    out += " shards were started (the reason is in the daemon "
+                           "log); the ones that came up are taken down on the "
+                           "next reconcile\n";
+
+                    // Same reasoning as the refused branch: a runtime that did
+                    // not come up whole must not be restored as running.
+                    if (m_persistence)
+                        m_persistence->set_was_running(name, false);
+                    return 1;
+                }
+            }
+
             // The child is listening, so it becomes a group member here rather
             // than on the health tick, with the flag consumed from every shard
             // and one publish for however many reported it.
@@ -6194,6 +6230,7 @@ int daemon_handler::await_worker_startup(std::string_view name, std::string& out
                     m_manager.publish_endpoints();
             }
             return 0;
+        }
 
         case proxy_supervisor::startup::refused:
         {
