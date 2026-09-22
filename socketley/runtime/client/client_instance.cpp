@@ -1151,10 +1151,15 @@ bool client_instance::lua_send(std::string_view msg)
             if (m_write_queue.bytes() + msg.size()
                 >= write_watermark_bytes())
                 m_drain_wanted = true;
-            std::string out(msg.data(), msg.size());
-            if (out.empty() || out.back() != '\n')
-                out.push_back('\n');
-            m_write_queue.push_coalesced(std::move(out), WRITE_COALESCE_LIMIT);
+            // The string that was built only to be thrown away: when the
+            // tail takes the bytes, push_coalesced appends them and discards
+            // what it was handed, so a copy per send bought a newline.  The
+            // terminator is still only added when the caller left one off,
+            // which push_coalesced_line cannot decide for itself.
+            if (!msg.empty() && msg.back() == '\n')
+                m_write_queue.push_coalesced(msg, WRITE_COALESCE_LIMIT);
+            else
+                m_write_queue.push_coalesced_line(msg, WRITE_COALESCE_LIMIT);
         }
         // Nothing else will come back for this message on its own, so the
         // record layer is driven from here or the line sits in the queue.
