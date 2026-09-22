@@ -247,12 +247,19 @@ private:
     // cache where sixty-four small ones do not.
     //
     // 65536 x 4 measured 42.5 M in 256 KB -- the same, for half the memory --
-    // and 8 was taken because at most one buffer was ever in flight, which
-    // made the other seven margin.  That premise went with the multishot arm:
-    // the kernel now fills the next one while this one is being parsed, so the
-    // margin is working set.  Which of the two is better under multishot has
-    // not been measured, and the old sentence claimed 8 and 256 KB together,
-    // which was never a row in the table.
+    // and 8 was taken because at most one buffer was ever in flight, which made
+    // the other seven margin.  The multishot arm took that premise away: the
+    // kernel fills the next buffer while this one is being parsed, so several
+    // are in flight and the margin is working set.
+    //
+    // Measured again under it, two binaries differing in this constant alone,
+    // arms interleaved and the order rotated: 4 against 8 came out [0.986,
+    // 1.027] once a pass where the 8 arm dropped to 2.03 G/s is set aside,
+    // against a noise floor of [0.968, 1.026] from running 8 against itself.
+    // The same as before, in other words, so 8 stays -- there is no throughput
+    // reason to move and the reason to hold is the one that changed: whether
+    // four is enough headroom before ENOBUFS sends this client down the plain
+    // read path is not something the throughput figure would show.
     static constexpr uint16_t BUF_GROUP_ID = 4;
     static constexpr uint32_t BUF_COUNT = 8;
     static constexpr uint32_t BUF_SIZE = 65536;
