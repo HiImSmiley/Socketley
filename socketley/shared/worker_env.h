@@ -30,7 +30,20 @@
 // six passes -- nothing -- while its idle RSS rose by 0.8 to 3.7 MB.  A cache
 // is the one runtime whose hot path walks a keyed structure larger than the
 // TLB covers, which is what a huge page is for.
+//
+// The resolver is here for the same reason and not the same measurement.
+// glibc reads RES_OPTIONS once, on the first name the process looks up, and
+// never again -- so a process cannot usefully set its own, and a setenv placed
+// one line too late is silently nothing.  Its default is five seconds twice:
+// against a nameserver that drops packets rather than refusing, one
+// getaddrinfo held its caller for 10,010 ms, and that caller is the event loop
+// with the control socket armed on it, so `stop` and `stats` go unread for the
+// whole wait.  A client re-resolves on every reconnect once its cached address
+// stops accepting, which is the container case the client documents.
+// `timeout:1 attempts:2` measured 2,002 ms for the same lookup; `timeout:2
+// attempts:1` measures the same 2,002 ms and does not survive a lost packet.
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -47,6 +60,10 @@ namespace socketley
 // The tunable glibc reads at startup, which is why it can only be set by
 // whoever spawns the process and never by the process itself.
 inline constexpr std::string_view hugetlb_tunable = "glibc.malloc.hugetlb=1";
+
+// The same for the resolver, read on the first lookup instead of at startup,
+// which comes to the same thing for anyone trying to set it from inside.
+inline constexpr std::string_view resolver_bound = "timeout:1 attempts:2";
 
 class worker_env
 {
@@ -80,6 +97,14 @@ public:
 
         for (const var& v : extra)
             m_strings.emplace_back(std::string(v.first) + "=" + std::string(v.second));
+
+        // After `extra` and over the whole list, so an operator's RES_OPTIONS
+        // and a caller's both win -- the rule the tunable follows, expressed
+        // once rather than branched twice.
+        if (std::none_of(m_strings.begin(), m_strings.end(),
+                         [](const std::string& e)
+                         { return e.rfind("RES_OPTIONS=", 0) == 0; }))
+            m_strings.emplace_back(std::string("RES_OPTIONS=") + std::string(resolver_bound));
 
         if (want && !tunables_seen)
             m_strings.emplace_back(std::string("GLIBC_TUNABLES=") + std::string(hugetlb_tunable));
