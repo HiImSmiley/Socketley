@@ -91,6 +91,17 @@ def serve(c):
                       b"5\r\nCHUNK\r\n0\r\n\r\n")
             return                      # closes: chunked is read until close here
 
+        if path.startswith("/twolengths"):
+            # RFC 9112 Section 6.3: two Content-Lengths that disagree make the
+            # message unrecoverable.  The socket stays open, so a reader that
+            # framed on either number would answer from it and a reader that
+            # refuses to frame waits -- which is the difference this endpoint
+            # is here to show.
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                      b"Content-Length: 99\r\n\r\nAAAAABBBBBCCCCCDDDDD")
+            time.sleep(20)
+            return
+
         if path.startswith("/nolength"):
             c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nNO-LENGTH-BODY")
             return                      # closes, which is its only framing
@@ -147,6 +158,9 @@ function on_start()
     say("NOLEN", socketley.http({ url = "http://127.0.0.1:$ORIGIN/nolength", timeout_ms = 4000 }))
     say("HEAD",  socketley.http({ url = "http://127.0.0.1:$ORIGIN/keepopen", timeout_ms = 4000,
                                   method = "HEAD" }))
+    -- Shorter, because the right answer here is to wait: it is the one call in
+    -- this file that must NOT be framed.
+    say("TWOLEN", socketley.http({ url = "http://127.0.0.1:$ORIGIN/twolengths", timeout_ms = 1200 }))
     socketley.log("CLEN DONE")
 end
 LUAEOF
@@ -168,9 +182,10 @@ line_for() { grep -oE "CLEN $1 .*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1; }
 
 L_LEN=$(line_for LEN); L_CHUNK=$(line_for CHUNK)
 L_NOLEN=$(line_for NOLEN); L_HEAD=$(line_for HEAD)
+L_TWOLEN=$(line_for TWOLEN)
 
 echo "  ${ELAPSED_MS} ms for four calls with a 4000 ms deadline each"
-for l in "$L_LEN" "$L_CHUNK" "$L_NOLEN" "$L_HEAD"; do echo "    ${l:-<nothing logged>}"; done
+for l in "$L_LEN" "$L_CHUNK" "$L_NOLEN" "$L_HEAD" "$L_TWOLEN"; do echo "    ${l:-<nothing logged>}"; done
 
 if grep -q "CLEN DONE" "$SOCKETLEY_DLOG" 2>/dev/null; then ok
 else bad "the script ran all four calls" "no DONE line in the daemon log" \
@@ -202,11 +217,22 @@ case "$L_HEAD" in
            "so waiting for that many bytes waits for the whole deadline" ;;
 esac
 
-# One deadline's worth of slack: four calls that all stopped at their framing
-# cannot have spent four deadlines.
+# Two lengths that disagree are not a length.  A reader that picked either
+# would answer 5 bytes or wait for 99 of 20; the only safe answer is that this
+# message cannot be framed, which leaves reading until a close that is not
+# coming -- so the deadline is the right outcome here and an early body is not.
+case "$L_TWOLEN" in
+    *"ok=false"*) ok ;;
+    *) bad "two disagreeing Content-Lengths are not framed" "${L_TWOLEN:-nothing logged}" \
+           "an answer here means one of the two numbers was picked, and RFC 9112" \
+           "Section 6.3 says the message is unrecoverable rather than ambiguous" ;;
+esac
+
+# One deadline's worth of slack: four calls that stopped at their framing plus
+# one that is meant to wait 1200 ms cannot have spent four deadlines.
 if [ "$ELAPSED_MS" -lt 8000 ]; then ok
-else bad "the four calls did not each wait out their deadline" \
-         "${ELAPSED_MS} ms for four calls of 4000 ms" \
+else bad "the framed calls did not each wait out their deadline" \
+         "${ELAPSED_MS} ms for four calls of 4000 ms and one of 1200 ms" \
          "at least two of them are waiting for a close that is not coming"; fi
 
 echo

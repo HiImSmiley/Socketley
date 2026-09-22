@@ -1,6 +1,7 @@
 #include "lua_context.h"
 #include <strings.h>
 #include "resolve_cache.h"
+#include "http_framing.h"
 #include "lua_json.h"
 #include "coarse_clock.h"
 #include "lua_suspend.h"
@@ -975,86 +976,6 @@ void lua_context::update_self_state(const char* state_str)
 
 using http_clock = std::chrono::steady_clock;
 
-// Whether what has arrived is already the whole response.
-//
-// Without this the only end-of-response signal is the peer closing, which has
-// two costs: a compliant server's FIN is one more wait after the last byte,
-// and a server that keeps the connection open despite `Connection: close` is
-// answered "response timed out" for a body that arrived in full.
-//
-// It does NOT yet make a truncated response an error.  Knowing the body is
-// complete is what this answers; reporting that it is not would change what
-// callers get today for a short read, and that is a decision of its own -- it
-// is worth taking, because over TLS with SSL_OP_IGNORE_UNEXPECTED_EOF a
-// truncation is currently indistinguishable from a complete answer, which the
-// comment beside that option says in as many words.
-//
-// No usable length means the old rule, read until close -- which is what
-// carries Transfer-Encoding: chunked and an HTTP/1.0 response with no length,
-// neither of which this tries to frame.
-static bool http_response_complete(const std::string& r, bool head_request)
-{
-    const size_t end = r.find("\r\n\r\n");
-    if (end == std::string::npos)
-        return false;
-    const size_t body_at = end + 4;
-
-    // A HEAD reply carries the length its GET would have and no body behind
-    // it, so waiting for one spends the whole deadline; 204 and 304 are
-    // defined the same way.
-    if (head_request)
-        return true;
-    {
-        const size_t sp = r.find(' ');
-        if (sp != std::string::npos && sp + 4 <= end)
-        {
-            const std::string_view code(r.data() + sp + 1, 3);
-            if (code == "204" || code == "304")
-                return true;
-        }
-    }
-
-    const std::string_view head(r.data(), end);
-
-    // At the start of a header line and not inside another header's value,
-    // which is what tells Content-Length from X-Original-Content-Length.
-    auto at_line_start = [&](size_t i) { return i == 0 || head[i - 1] == '\n'; };
-
-    // Chunked wins over any length, and framing it is not attempted here.
-    for (size_t i = 0; i + 17 <= head.size(); ++i)
-    {
-        if (!at_line_start(i) || strncasecmp(head.data() + i, "transfer-encoding", 17) != 0)
-            continue;
-        const size_t eol = head.find("\r\n", i);
-        const std::string_view v =
-            head.substr(i, (eol == std::string_view::npos ? head.size() : eol) - i);
-        for (size_t k = 0; k + 7 <= v.size(); ++k)
-            if (strncasecmp(v.data() + k, "chunked", 7) == 0)
-                return false;
-    }
-
-    for (size_t i = 0; i + 15 <= head.size(); ++i)
-    {
-        if (!at_line_start(i) || strncasecmp(head.data() + i, "content-length:", 15) != 0)
-            continue;
-        size_t j = i + 15;
-        while (j < head.size() && (head[j] == ' ' || head[j] == '\t'))
-            ++j;
-        unsigned long long len = 0;
-        size_t digits = 0;
-        while (j < head.size() && head[j] >= '0' && head[j] <= '9')
-        {
-            if (len > (~0ULL) / 10)
-                return false;                 // absurd, so the old rule stands
-            len = len * 10 + static_cast<unsigned long long>(head[j] - '0');
-            ++j; ++digits;
-        }
-        if (digits == 0)
-            return false;
-        return r.size() - body_at >= len;
-    }
-    return false;
-}
 
 // How long a resolved address is reused before asking again.  A ceiling and
 // not a promise: a connect that fails drops the entry at once, so this only
@@ -1449,6 +1370,21 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     std::string response;
     std::string xfer_err;
 
+    // The framing decision is http_framing.h's, which the proxy already reads
+    // its backends with and which fuzz_http_response drives.  The first
+    // version of this was a parser of its own written here -- it missed
+    // "Content-Length : 5", took the first of two that disagree where RFC 9112
+    // Section 6.3 says the message is unrecoverable, and framed no chunked
+    // body at all.  Every one of those is a question this header had already
+    // answered.
+    //
+    // A HEAD reply quotes the length its GET would have had and sends no body,
+    // and nothing on the wire says so -- the scanner learns 204 and 304 from
+    // the status line and cannot learn this -- so it is set here.  It is only
+    // ever set, never cleared, so a 204 answer to a HEAD agrees with itself.
+    http_response_framing frame{};
+    frame.no_body = is_head;
+
 #ifndef SOCKETLEY_NO_HTTPS
     if (is_https) {
         SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
@@ -1560,7 +1496,12 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
                         xfer_err = "response exceeds 8MB limit"; break;
                     }
                     response.append(buf, static_cast<size_t>(n));
-                    if (http_response_complete(response, is_head))
+                    http_response_scan_chunk(frame, std::string_view(buf, static_cast<size_t>(n)));
+                    // A response whose length this header cannot establish --
+                    // chunked, any other transfer coding, or two lengths that
+                    // disagree -- is never complete here, which leaves the old
+                    // rule of reading until the peer closes.
+                    if (http_response_frame_complete(frame))
                         break;
                     continue;
                 }
@@ -1615,7 +1556,12 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
                         xfer_err = "response exceeds 8MB limit"; break;
                     }
                     response.append(buf, static_cast<size_t>(n));
-                    if (http_response_complete(response, is_head))
+                    http_response_scan_chunk(frame, std::string_view(buf, static_cast<size_t>(n)));
+                    // A response whose length this header cannot establish --
+                    // chunked, any other transfer coding, or two lengths that
+                    // disagree -- is never complete here, which leaves the old
+                    // rule of reading until the peer closes.
+                    if (http_response_frame_complete(frame))
                         break;
                     continue;
                 }
