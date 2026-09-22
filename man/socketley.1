@@ -9122,18 +9122,6 @@ Read at daemon startup; all are optional. The first selects which daemon this
 is. The rest are tuning knobs whose defaults suit a general-purpose deployment
 and only need changing for an unusual workload.
 .TP
-.B SOCKETLEY_CACHE_BUF_SIZE
-Bytes per cache read buffer. Default suits ordinary key/value traffic; raise it
-only for a workload whose values routinely exceed it.
-.TP
-.B SOCKETLEY_CACHE_BUF_COUNT
-How many of those buffers a cache keeps.
-.TP
-.B SOCKETLEY_CACHE_TTL_SWEEP_MS
-How often a cache walks its expiry table, in milliseconds. Lower means expired
-keys disappear sooner and the sweep runs more often; the sweep is on the event
-loop thread, so it is not free.
-.TP
 .B SOCKETLEY_SOCKET
 Which daemon you are, or which one you are talking to. Overrides the default
 lookup
@@ -9179,65 +9167,6 @@ the daemon runs unpinned with a warning; it is never rounded up to
 says the same thing on the command line and wins when both are given. There the
 same impossible set is refused outright and the daemon does not start, because a
 flag typed for this one run is a requirement rather than an inherited default.
-.TP
-.B SOCKETLEY_CACHE_TTL_SWEEP_MS
-How often a cache walks its expiry table, in milliseconds. Lower means expired
-keys disappear sooner and the sweep runs more often; the sweep is on the event
-loop thread, so it is not free.
-.TP
-.B SOCKETLEY_SOCKET
-Which daemon you are, or which one you are talking to. Overrides the default
-lookup
-.RB ( /run/socketley/socketley.sock
-when installed and privileged, otherwise
-.BR /tmp/socketley.sock ).
-.IP
-No workload calls for setting it. A deployed node \(em a container or a host \(em has
-a filesystem namespace to itself, so one daemon on the default path is the whole
-arrangement, and that is what the systemd unit ships. Clustering does not use
-this variable either: members publish themselves into a shared directory and
-reach each other over network addresses, never over socket paths. See
-.BR "CLUSTER MODE" .
-.IP
-What it is for is running several daemons inside
-.I one
-namespace, which is the development and test situation and nothing else. Two
-checkouts on one workstation, or two test runs at once, are otherwise the same
-daemon: whichever process binds the default path first owns it, and every later
-one silently talks to that process instead of starting its own. Anything that
-starts a daemon on the default path is claiming the identity the real daemon
-runs under, so the test suite gives every test a socket of its own.
-.IP
-It selects the state directory as well as the socket, and it has to. Several
-daemons in one namespace reading one state directory are not several daemons:
-each restores everything in it at startup, including the others' runtimes, onto
-ports the others are already serving, and each
-.B remove
-deletes a state file a daemon that is still running it depends on. See
-.BR "WHERE STATE LIVES" .
-.TP
-.B SOCKETLEY_CPUS=\fImax\fR|\fI0\-3\fR|\fI0,1,2,3\fR
-The set of CPUs the daemon's I/O thread may run on. Default
-.BR max ,
-which applies no pinning at all rather than a mask of the CPUs that happen to be
-online now.
-.IP
-A CPU this machine does not have, or a set that comes out empty, is refused and
-the daemon runs unpinned with a warning; it is never rounded up to
-.BR max .
-.IP
-.BI "socketley daemon \-\-cpus " set
-says the same thing on the command line and wins when both are given. There the
-same impossible set is refused outright and the daemon does not start, because a
-flag typed for this one run is a requirement rather than an inherited default.
-.TP
-.B SOCKETLEY_CACHE_TTL_SWEEP_MS
-Interval between periodic sweeps for expired cache keys, in milliseconds.
-Default
-.BR 500 .
-This never affects correctness: an expired key is not served no matter when the
-sweep runs, because every read path checks the expiry itself. It controls only
-how quickly keys that are never accessed again release their memory.
 .TP
 .B SOCKETLEY_CACHE_BUF_SIZE
 Size in bytes of each buffer in a cache runtime's io_uring provided-buffer ring.
@@ -9255,6 +9184,14 @@ Number of buffers in that ring. Default
 Together with the size this bounds how much concurrent traffic the runtime can
 absorb before the pool runs dry and reads fall back to a slower per-read path;
 the pool costs count times size of memory per cache runtime.
+.TP
+.B SOCKETLEY_CACHE_TTL_SWEEP_MS
+Interval between periodic sweeps for expired cache keys, in milliseconds.
+Default
+.BR 500 .
+This never affects correctness: an expired key is not served no matter when the
+sweep runs, because every read path checks the expiry itself. It controls only
+how quickly keys that are never accessed again release their memory.
 .TP
 .B SOCKETLEY_LUA_TIMEOUT_MS
 How long one Lua callback invocation may hold the event\-loop thread, in
@@ -9325,6 +9262,99 @@ hook \(em the kernel moves those bytes without the script ever seeing them.
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by
 default. Trades CPU for lower receive latency on busy links.
+.TP
+.B SOCKETLEY_HUGEPAGE
+Set to
+.B 0
+to stop cache workers asking glibc for transparent huge pages. On by default and
+only a cache asks: its hot path walks a keyed structure larger than the TLB
+covers, which is what a huge page is for, and a server measured no gain for the
+extra resident memory. The tunable is read by glibc at process startup, so the
+daemon puts it in the worker's environment at exec \(em a running process cannot
+ask for itself.
+.TP
+.B SOCKETLEY_RECV_MULTISHOT
+Set to
+.B 0
+to arm one read at a time instead of a multishot receive. On wherever the kernel
+supports it. A multishot arm is one submission for a stream of messages instead
+of one per message; the switch exists so the two can be measured against each
+other on one binary.
+.TP
+.B SOCKETLEY_RECV_BUNDLE
+Set to
+.B 0
+to stop packing several provided buffers into one receive
+.RB ( IORING_RECVSEND_BUNDLE ).
+On where the kernel supports it, which is probed once rather than assumed, and
+it falls back to the plain multishot arm wherever the flag is refused.
+.IP
+Both of these read
+.B only
+the exact string
+.BR 0 .
+.B SOCKETLEY_RECV_MULTISHOT=off
+leaves multishot on, which is the opposite of what it looks like. The
+.BI SOCKETLEY_NO_ *
+switches below take the other rule: any value except
+.B 0
+turns the thing off.
+.TP
+.B SOCKETLEY_NO_SHARD_MESH
+Any value but
+.B 0
+stops shards linking to each other directly; they relay through the daemon
+instead. The daemon logs that it is off at startup. It is the measurement
+control for the mesh, so the two paths differ in the route alone and not in the
+build.
+.TP
+.B SOCKETLEY_NO_PEER_LINKS
+Any value but
+.B 0
+stops runtimes opening direct links to their peers, for the same reason and read
+the same way.
+.TP
+.B SOCKETLEY_NO_COMPANION
+Any value but
+.B 0
+stops a unix\-socket listener being placed beside a port.
+.TP
+.B RES_OPTIONS
+Not read by socketley \(em passed to glibc's resolver, and set for worker
+processes when you have not set one yourself. The default is
+.BR "timeout:1 attempts:2" .
+.IP
+It is set because
+.BR getaddrinfo (3)
+blocks the thread that calls it, and in a worker that thread is the event loop
+with the daemon's control socket armed on the same ring: while a lookup waits,
+.B stop
+and
+.B stats
+go unanswered. glibc's own default is five seconds twice, which against a
+nameserver that drops packets measured 10.0\ s for one lookup \(em and a client
+re\-resolves on every reconnect once its cached address stops accepting. One
+second twice has the same ceiling as two seconds once and still retries a lost
+packet.
+.IP
+Set it yourself and yours is used unchanged, for the daemon and every worker.
+Raise it if a slow but working nameserver is being given up on; the cost of
+giving up is one more reconnect round, not a failed runtime.
+.TP
+.B EDITOR ", " VISUAL
+Which editor
+.B socketley edit
+opens when given no flags.
+.B VISUAL
+is tried first.
+.TP
+.B TMPDIR
+Where that editor's temporary file is written. It holds the runtime's entire
+configuration while it is open \(em for a cache that includes
+.BR master_pw ,
+so point this at a directory of your own if
+.I /tmp
+is shared. The file is created 0600 and removed when the editor exits.
 .TP
 .B SOCKETLEY_CONFIG
 Path to the daemon configuration file.
