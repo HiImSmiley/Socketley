@@ -31,7 +31,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ports.sh"
 daemon_isolate idlecost
-PORT=$((SL_PORT_BASE+220))
+PORT=$((SL_PORT_BASE+530))
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() { "$BIN" stop ic 2>/dev/null || true; "$BIN" remove ic 2>/dev/null || true; daemon_stop; }

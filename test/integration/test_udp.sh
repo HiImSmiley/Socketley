@@ -59,11 +59,49 @@ OUT=$("$BIN" ls 2>&1) || daemon_required "ls"
 assert_contains "$OUT" "udp_test" "UDP server in ls"
 assert_contains "$OUT" "udp_client" "UDP client in ls"
 
-# Test: Send a UDP datagram to the server
+# ─── THE DATAGRAM, ASKED OF THE SERVER AND NOT OF nc ────────────────────────
+# This used to be `echo ... | nc -u ... || true` followed by an unconditional
+# PASS, under the comment "If we get here without error, the send succeeded".
+# A local UDP send does not fail -- the kernel takes the datagram whether
+# anything is listening or not -- and the `|| true` swallowed it if it did.  So
+# the assertion could not fail, which AGENTS.md names as not being coverage:
+# every one of the six UDP defects found in this tree could have shipped past
+# it.  What the server counted is the thing only the server can answer.
+stat_of() { "$BIN" stats "$1" 2>/dev/null | awk -F: -v k="$2" '$1 == k { print $2; exit }'; }
+
+MSG_BEFORE=$(stat_of udp_test total_messages); MSG_BEFORE=${MSG_BEFORE:-0}
+IN_BEFORE=$(stat_of udp_test bytes_in);        IN_BEFORE=${IN_BEFORE:-0}
+
+# Three, so a server that answered one by accident still has to have counted.
+for _ in 1 2 3; do
+    echo "hello-udp" | nc -u -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
+done
+sleep 1
+
+MSG_AFTER=$(stat_of udp_test total_messages); MSG_AFTER=${MSG_AFTER:-0}
+IN_AFTER=$(stat_of udp_test bytes_in);        IN_AFTER=${IN_AFTER:-0}
+
 TOTAL=$((TOTAL+1))
-echo "hello-udp" | nc -u -q 1 127.0.0.1 "$PORT" 2>/dev/null || true
-# If we get here without error, the send succeeded
-PASS=$((PASS+1))
+if [ "$((MSG_AFTER - MSG_BEFORE))" -eq 3 ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [three datagrams are three messages]: total_messages went" \
+         "$MSG_BEFORE -> $MSG_AFTER; the datagrams left this box, so what is" \
+         "missing is the server having read them"
+fi
+
+# bytes_in beside it, because a count that moves while the bytes do not is a
+# server delivering empty reads -- and bytes_in read 0 for the life of every
+# UDP server until it was fixed, with total_messages climbing beside it.
+TOTAL=$((TOTAL+1))
+if [ "$((IN_AFTER - IN_BEFORE))" -ge 30 ]; then
+    PASS=$((PASS+1))
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL [the bytes are counted too]: bytes_in went $IN_BEFORE -> $IN_AFTER," \
+         "and three ten-byte datagrams are thirty"
+fi
 
 # Test: Server still running after receiving datagram
 OUT=$("$BIN" ps 2>&1) || daemon_required "ps"

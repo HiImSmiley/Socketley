@@ -32,7 +32,7 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 . "$(dirname "$0")/lib_create.sh"
 . "$(dirname "$0")/lib_ports.sh"
 daemon_isolate replinvent
-LP=$((SL_PORT_BASE+230)); FP=$((SL_PORT_BASE+231))
+LP=$((SL_PORT_BASE+550)); FP=$((SL_PORT_BASE+231))
 PASS=0; FAIL=0; TOTAL=0
 
 cleanup() {
