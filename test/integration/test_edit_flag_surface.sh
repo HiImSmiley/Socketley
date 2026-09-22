@@ -23,9 +23,11 @@
 # adds a row here on the next run and cannot be forgotten.
 #
 # The assertion is REACHABILITY, not effect: for each (type, flag) the CLI must
-# answer `unknown flag` exactly when the source says that parser does not have
-# it. A flag with a missing value answers "--x requires a value", a boolean flag
-# succeeds — both mean reachable, which is all that is being claimed.
+# give the answer the source says it should, and there are three of them. A flag
+# with a missing value answers "--x requires a value" and a boolean flag
+# succeeds — both mean reachable, which is all that is being claimed. A cache
+# flag `edit` cannot apply is refused by name and pointed at `import`. Anything
+# else is `unknown flag`. What is asserted is that each type gets its own.
 #
 # It is worth being plain about the limit. Nothing here proves a flag DOES
 # anything: every assertion below would stay green if the body of every case
@@ -98,6 +100,34 @@ fi
 COUNT=$(printf '%s\n' "$SURFACE" | grep -c .)
 echo "  $COUNT edit flags across $(printf '%s\n' "$SURFACE" | awk '{print $2}' | sort -u | wc -l) parsers"
 
+# ── the third answer, read out of the handler ───────────────────────────────
+#
+# There are three answers, not two.  A flag `create` takes on a cache and
+# `edit` cannot change is refused by name -- "--x cannot be changed with
+# `edit`", pointing at `import` -- because "unknown flag" reads as a typo and
+# sends the operator looking for a spelling that does not exist.  The list
+# lives in daemon_handler.cpp and is read from there for the same reason the
+# surface is: a flag added to it must add a row here, not need one written.
+HANDLER="$HERE/../../socketley/daemon/daemon_handler.cpp"
+CACHE_ONLY_SRC=$(python3 - "$HANDLER" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+m = re.search(r'cache_only\[\]\s*=\s*\{(.*?)\}', src, re.S)
+for f in re.findall(r'fnv1a\("(-[^"]+)"\)', m.group(1) if m else ''):
+    print(f)
+PY
+)
+
+# An empty list would make every assertion below it pass by having nothing to
+# check, which is the failure mode a test cannot report about itself.
+if [ -z "$CACHE_ONLY_SRC" ]; then
+    bad "the refusal list was read at all" "no flags extracted from daemon_handler.cpp" \
+        "the extractor keys off 'cache_only[] = {' and 'fnv1a(\"-...\")'"
+else
+    ok
+fi
+echo "  $(printf '%s\n' "$CACHE_ONLY_SRC" | grep -c .) cache flags edit refuses by name"
+
 # ── layer 1: the docs, which need no daemon ─────────────────────────────────
 #
 # A flag the operator cannot look up is a flag they will not use.  Both
@@ -160,7 +190,13 @@ CHECKED=0
 # be unknown to a client on the strength of the server's row.  That was this
 # file's own first bug, and it is the same shape as the defect it exists to
 # catch: a conclusion about a flag drawn from one parser when several have it.
-FLAGS=$(printf '%s\n' "$SURFACE" | awk '{print $1}' | sort -u)
+#
+# The rows are the edit surface UNION the refusal list, because most of that
+# list is create-only -- --maxmemory, --eviction, --resp and four others are in
+# no edit parser at all, so a loop driven by the edit surface alone never asks
+# about them.  Before this they were covered by one hand-written check for
+# --resp further down, and the other six by nothing.
+FLAGS=$(printf '%s\n%s\n' "$SURFACE" "$CACHE_ONLY_SRC" | awk '{print $1}' | grep . | sort -u)
 while read -r flag; do
     parsers=$(printf '%s\n' "$SURFACE" | awk -v f="$flag" '$1 == f {print $2}' | sort -u)
     for t in server client proxy cache; do
@@ -171,11 +207,18 @@ while read -r flag; do
                 want=reachable
             fi
         done
+        # Only a cache gets the refusal, and only where no parser answered
+        # first: the same two conditions the handler tests, in the same order.
+        if [ "$want" = unknown ] && [ "$t" = cache ] \
+           && grep -qxF -- "$flag" <<<"$CACHE_ONLY_SRC"; then
+            want=refused
+        fi
 
         out=$("$BIN" edit "efs_$t" "$flag" 2>&1 | head -1)
         case "$out" in
-            "unknown flag:"*) got=unknown   ;;
-            *)                got=reachable ;;
+            "unknown flag:"*)           got=unknown   ;;
+            *"cannot be changed with"*) got=refused   ;;
+            *)                          got=reachable ;;
         esac
         CHECKED=$((CHECKED+1))
 
@@ -187,7 +230,7 @@ while read -r flag; do
 done <<< "$FLAGS"
 
 if [ -z "$MISMATCH" ]; then ok; else
-    bad "every flag is reachable from exactly the types its parser serves" \
+    bad "every flag is reachable, refused or unknown for exactly the right types" \
         "$CHECKED combinations checked" "$MISMATCH"
 fi
 
@@ -206,6 +249,10 @@ fi
 # cache-only flag must not be silently accepted by a command that cannot apply
 # it.  If a cache edit parser is ever added, this goes red again and should be
 # deleted along with this paragraph.
+#
+# The loop above now reaches --resp too, so what is left here that it does not
+# do is the second sentence of the refusal: that it names the way out.  A
+# refusal without one is `unknown flag` with extra words.
 CACHE_ONLY=$("$BIN" edit efs_cache --resp 2>&1 | head -1)
 CACHE_ALL=$("$BIN" edit efs_cache --resp 2>&1 || true)
 case "$CACHE_ONLY" in
