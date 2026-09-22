@@ -9356,6 +9356,34 @@ so point this at a directory of your own if
 .I /tmp
 is shared. The file is created 0600 and removed when the editor exits.
 .TP
+.B SOCKETLEY_DNS_CACHE_MS
+How long
+.B socketley.http()
+reuses a resolved address before asking the resolver again, in milliseconds.
+Default
+.BR 60000 .
+.B 0
+disables reuse and makes every call resolve, which is what it did before.
+.IP
+It is a ceiling and not a promise. A connect to the cached address that is
+refused, or that times out, drops the entry at once \(em so an endpoint that
+moved is followed on the next call, and this only decides how long one that
+moved
+.I without
+refusing stays wrong, which is the case where something else answers on the old
+address.
+.IP
+Worth knowing why it exists:
+.BR getaddrinfo (3)
+blocks the thread that calls it, glibc caches nothing of its own, and in a
+worker that thread is the event loop. Every other resolver in this daemon is
+bounded by something \(em a client and a server re-resolve at most once per
+second of reconnect backoff, a proxy once per thirty-second sweep, the rest run
+once at start.
+.B socketley.http()
+was the exception: it resolved on every call, and neither the call's own
+deadline nor the callback budget covers a resolver.
+.TP
 .B SOCKETLEY_CONFIG
 Path to the daemon configuration file.
 .SH FILES

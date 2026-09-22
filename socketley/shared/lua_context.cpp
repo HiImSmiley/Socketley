@@ -1,4 +1,5 @@
 #include "lua_context.h"
+#include "resolve_cache.h"
 #include "lua_json.h"
 #include "coarse_clock.h"
 #include "lua_suspend.h"
@@ -973,6 +974,31 @@ void lua_context::update_self_state(const char* state_str)
 
 using http_clock = std::chrono::steady_clock;
 
+// How long a resolved address is reused before asking again.  A ceiling and
+// not a promise: a connect that fails drops the entry at once, so this only
+// decides how long an endpoint that moved WITHOUT refusing stays wrong -- the
+// case where something else answers on the old address.  libcurl's own DNS
+// cache defaults to the same minute.
+inline constexpr std::chrono::milliseconds http_resolve_default{60000};
+
+// Read once, because neither the environment nor this process's mind changes
+// under it, and 0 is a real answer: it disables the cache, which is also the
+// A/B switch -- one binary, one workload, only the reuse differing.
+static std::chrono::milliseconds http_resolve_lifetime()
+{
+    static const std::chrono::milliseconds ms = [] {
+        const char* e = ::getenv("SOCKETLEY_DNS_CACHE_MS");
+        if (!e || !*e)
+            return http_resolve_default;
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0' || v < 0)
+            return http_resolve_default;
+        return std::chrono::milliseconds{v};
+    }();
+    return ms;
+}
+
 // Milliseconds left before `deadline`, never negative.
 static int http_ms_left(http_clock::time_point deadline)
 {
@@ -1207,29 +1233,70 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         host_header = (host.find(':') != std::string::npos) ? "[" + host + "]" : host;
     }
 
-    // DNS resolve
-    struct addrinfo hints{}, *addrs = nullptr;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
     char port_buf[8];
     auto port_res = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
     *port_res.ptr = '\0';
-    if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs) {
-        result["error"] = "DNS resolution failed for: " + host;
-        return result;
+
+    // Resolved once per host:port and then reused, because this call used to
+    // ask on every request -- the one resolver in this tree with no bound at
+    // all, on the thread the event loop runs on, and the note above this
+    // function admits neither the deadline nor the callback budget reaches it.
+    //
+    // thread_local rather than a file-scope object: nothing here takes a lock,
+    // and a cache two threads could reach would be a race rather than a
+    // saving.  One Lua VM runs on one thread, so this is one cache per VM.
+    thread_local socketley::resolve_cache dns_cache(http_resolve_lifetime());
+    const bool reuse = http_resolve_lifetime().count() > 0;
+
+    std::string dns_key;
+    dns_key.reserve(host.size() + 8);
+    dns_key.append(host);
+    dns_key.push_back(':');
+    dns_key.append(port_buf);
+
+    socketley::resolve_cache::entry peer;
+    if (!reuse || !dns_cache.get(dns_key, peer))
+    {
+        struct addrinfo hints{}, *addrs = nullptr;
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host.c_str(), port_buf, &hints, &addrs) != 0 || !addrs) {
+            result["error"] = "DNS resolution failed for: " + host;
+            return result;
+        }
+        // The first entry and nothing else, which is all this function has
+        // ever used out of the list -- and the length is checked before the
+        // copy rather than trusted, since it decides how much is written.
+        const bool fits = addrs->ai_addrlen <= sizeof(peer.addr);
+        if (fits)
+        {
+            std::memcpy(&peer.addr, addrs->ai_addr, addrs->ai_addrlen);
+            peer.len    = addrs->ai_addrlen;
+            peer.family = addrs->ai_family;
+        }
+        freeaddrinfo(addrs);
+        if (!fits) {
+            result["error"] = "DNS returned an address too large for: " + host;
+            return result;
+        }
+        if (reuse)
+            dns_cache.put(dns_key, peer);
     }
 
     // Non-blocking socket plus poll() and not SO_SNDTIMEO, which does not
     // bound connect() on Linux at all, and the socket stays non-blocking so
     // every later wait goes through the same deadline.
-    int sock = ::socket(addrs->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (sock < 0) { freeaddrinfo(addrs); result["error"] = "socket() failed"; return result; }
+    int sock = ::socket(peer.family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (sock < 0) { result["error"] = "socket() failed"; return result; }
 
-    if (::connect(sock, addrs->ai_addr, addrs->ai_addrlen) != 0)
+    if (::connect(sock, reinterpret_cast<const sockaddr*>(&peer.addr), peer.len) != 0)
     {
         if (errno != EINPROGRESS)
         {
-            freeaddrinfo(addrs); ::close(sock);
+            // An address that will not take a connection is not one to keep,
+            // so the next call asks again instead of waiting out the lifetime.
+            dns_cache.drop(dns_key);
+            ::close(sock);
             result["error"] = std::string("connect() failed: ") + std::strerror(errno);
             return result;
         }
@@ -1247,14 +1314,16 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         }
         if (ready != 1 || so_err != 0)
         {
-            freeaddrinfo(addrs); ::close(sock);
+            // Including the timeout: a cached address that stopped answering
+            // is exactly the endpoint that moved, which is what this drops for.
+            dns_cache.drop(dns_key);
+            ::close(sock);
             result["error"] = (ready == 0)
                 ? std::string("connect timed out after ") + std::to_string(timeout_ms) + "ms"
                 : std::string("connect() failed: ") + std::strerror(so_err ? so_err : errno);
             return result;
         }
     }
-    freeaddrinfo(addrs);
 
     // Build HTTP/1.0 request
     std::string req;
