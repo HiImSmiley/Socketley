@@ -1735,6 +1735,12 @@ bool proxy_instance::setup(event_loop& loop)
                       "certificate could not be loaded");
             return false;
         }
+        // It never calls remember_session(), which the client does on every
+        // dial: a pooled backend does not handshake often enough for a
+        // resumption to save anything.  Measured at the backend, which has no
+        // reason to flatter this end: 40 requests to one https:// backend cost
+        // 1 handshake, and the one it costs is the one a fresh process cannot
+        // resume anyway, since the session cache lives in this process.
         m_backend_tls = std::move(ctx);
     }
 

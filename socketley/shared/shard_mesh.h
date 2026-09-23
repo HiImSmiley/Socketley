@@ -394,6 +394,12 @@ private:
     bool        m_dead{false};
 
     // What a standing recv writes into, one at a time and named by m_req.
+    // 64 KiB was measured against this and is the same: a cache sharded two
+    // ways, 64 KiB values crossing, three passes each -- 248/230/197 us a GET
+    // at 16 KiB against 242/165/266 at 64 KiB, spread wider than the
+    // difference.  That quarters the reads AND the submissions for the same
+    // bytes, so it bounds a multishot recv here as well; the crossing's cost
+    // is the hop, not the read.
     char        m_rbuf[16 * 1024];
     std::string m_in;
 
