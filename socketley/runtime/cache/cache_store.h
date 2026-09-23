@@ -311,6 +311,14 @@ public:
     // memory verdict: setrange() is the only command whose result length is
     // computed from an argument rather than read off one.
     static constexpr size_t append_too_long   = std::string::npos - 2;
+    // The largest string one SETRANGE may build.  The guard used to compare
+    // against std::string::max_size(), about 4.6e18, which is what the type
+    // can represent and not what a machine can hold -- so every length between
+    // the two was accepted and the allocation behind it ended the worker,
+    // there being no catch for std::bad_alloc anywhere between cache_store and
+    // main().  512 MiB is the ceiling Redis puts on one string, and this cache
+    // answers INFO with that dialect.
+    static constexpr size_t setrange_max_bytes = 512u * 1024 * 1024;
 
     size_t append(std::string_view key, std::string_view suffix);  // returns new length
     size_t strlen_key(std::string_view key) const;                  // 0 if missing

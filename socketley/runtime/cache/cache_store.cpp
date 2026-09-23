@@ -1597,7 +1597,13 @@ size_t cache_store::setrange(std::string_view key, size_t offset, std::string_vi
     // here and main() catches it, and the worker died: one command, no
     // password (this cache has no such mechanism), every connection on that
     // process gone with it.  `offset > need` is the wrap.
-    if (__builtin_expect(offset > need || need > std::string().max_size(), 0))
+    //
+    // max_size() was the wrong ceiling for the same sentence: it bounds what
+    // the type can represent, so a length the type accepts and the machine
+    // cannot raised std::bad_alloc instead of std::length_error and ended the
+    // worker exactly as before.  Measured: `SETRANGE k 1000000000000000 x` on
+    // an idle cache closed the connection and left the port refusing.
+    if (__builtin_expect(offset > need || need > setrange_max_bytes, 0))
         return append_too_long;
 
     auto it = m_data.find(key);
