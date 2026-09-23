@@ -4265,7 +4265,15 @@ reparse:
         // here rather than at submit_next_read, which a multishot recv walks
         // past.
         if (SOCKETLEY_UNLIKELY(conn->file_read_pending || conn->splice_pending ||
-                               conn->splice_in_pending || conn->splice_out_pending))
+                               conn->splice_in_pending || conn->splice_out_pending ||
+                               // The fifth arm, added later than this list and
+                               // not added to it.  conn_ops_pending() carries
+                               // it and says why: the streamed file's read
+                               // writes into this struct's own buffer, so a
+                               // second request starting while it is armed
+                               // re-arms the kernel into the buffer the first
+                               // one is still being served out of.
+                               conn->stream_pending))
             return;
 
         // Wait for complete headers

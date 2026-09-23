@@ -59,6 +59,11 @@ SMALL=$((4 * 1024 * 1024))      # an eighth, served by a runtime of its own
 WWW="$WORK/www"; mkdir -p "$WWW"
 head -c "$SIZE" /dev/urandom > "$WWW/big.bin"
 head -c "$SMALL" /dev/urandom > "$WWW/small.bin"
+# Two more, each over HTTP_STREAM_MIN so both take the streaming arm, and
+# different from each other so a crossed or smeared body is visible rather
+# than merely short.
+head -c $((1536 * 1024)) /dev/urandom > "$WWW/pipe_a.bin"
+head -c $((1536 * 1024)) /dev/urandom > "$WWW/pipe_b.bin"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -subj "/CN=localhost" \
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || true
@@ -201,6 +206,94 @@ else fail "a Range request is answered with that slice" \
           "code $CODE, $(wc -c < "$WORK/slice" 2>/dev/null || echo 0) bytes, expected 206 and 65536" \
           "-- the slice's start becomes the read's offset, and a sender that ignored" \
           "it would answer 206 with the beginning of the file"; fi
+
+# ── 6. two PIPELINED requests, both on the streaming arm ────────────────────
+# Phase 4 sends its second request only after the first answer is whole, which
+# is what curl does; this one puts both in a single write, so the second is
+# parsed while the first is still streaming.  That is the state parse_partial
+# guards against -- and its guard names file_read_pending, splice_pending,
+# splice_in_pending and splice_out_pending, but not stream_pending, which is
+# the flag this arm sets.  conn_ops_pending() lists it, and says why: "The
+# streamed file's read writes into this struct's own buffer, so a reuse while
+# it is armed is the kernel writing into the next client's connection."
+PIPE=$(python3 - "$((P+1))" "$WWW" <<'PYEOF'
+import hashlib, socket, ssl, sys
+port, www = int(sys.argv[1]), sys.argv[2]
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+_got = [0]
+
+def read_one(sock, buf):
+    while b"\r\n\r\n" not in buf:
+        d = sock.recv(65536)
+        if not d:
+            raise EOFError("closed inside the header block")
+        _got[0] += len(d)
+        buf += d
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    status = head.split(b"\r\n")[0].decode("latin1")
+    clen = None
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            clen = int(line.split(b":", 1)[1])
+    if clen is None:
+        raise ValueError("no Content-Length in: " + status)
+    while len(rest) < clen:
+        d = sock.recv(1 << 20)
+        if not d:
+            raise EOFError("closed after %d of %d body bytes" % (len(rest), clen))
+        _got[0] += len(d)
+        rest += d
+    return status, rest[:clen], rest[clen:]
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+try:
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), 15),
+                        server_hostname="localhost")
+    s.settimeout(60)
+    # One write, both requests: the second is in `partial` before the first
+    # has been answered.
+    s.sendall(b"GET /pipe_a.bin HTTP/1.1\r\nHost: x\r\n\r\n"
+              b"GET /pipe_b.bin HTTP/1.1\r\nHost: x\r\n\r\n")
+    st1, body1, over = read_one(s, b"")
+    st2, body2, _    = read_one(s, over)
+    s.close()
+    print("first=%s" % ("ok" if hashlib.sha256(body1).hexdigest() == digest(www + "/pipe_a.bin") else "WRONG"))
+    print("second=%s" % ("ok" if hashlib.sha256(body2).hexdigest() == digest(www + "/pipe_b.bin") else "WRONG"))
+    print("status1=%s status2=%s bytes1=%d bytes2=%d" % (st1, st2, len(body1), len(body2)))
+except Exception as e:
+    print("first=ERROR")
+    print("second=ERROR")
+    print("why=%s: %s" % (type(e).__name__, e))
+    try:
+        print("diag: got %d bytes before it stopped" % _got[0])
+    except Exception:
+        pass
+PYEOF
+)
+echo "  pipelined: $(echo "$PIPE" | tr '\n' ' ')"
+
+case "$PIPE" in
+    *"first=ok"*) pass ;;
+    *) fail "the first of two pipelined streamed files arrives whole" \
+            "$(echo "$PIPE" | tr '\n' ' ')" \
+            "-- the second request is parsed while this one's read is armed, and" \
+            "stream_file_begin() overwrites stream_fd and re-arms into the same" \
+            "stream_buf the kernel is still writing into" ;;
+esac
+case "$PIPE" in
+    *"second=ok"*) pass ;;
+    *) fail "and so does the second" \
+            "$(echo "$PIPE" | tr '\n' ' ')" ;;
+esac
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ] || exit 1
