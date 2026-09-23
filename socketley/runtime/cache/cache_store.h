@@ -561,8 +561,8 @@ private:
     static constexpr size_t list_elem_overhead    = 32;
     static constexpr size_t set_elem_overhead     = 64;
     static constexpr size_t hash_field_overhead   = 74;
-    // A member sits in two containers: an unordered_map node and a red-black
-    // node in the ordered view, whose pair also carries a copy of the name.
+    // A member sits in two containers: an unordered_map node and a skiplist
+    // node in the ordered view, whose entry also carries a copy of the name.
     static constexpr size_t zset_member_overhead  = 74 + 64;
 
     // Longest string libstdc++ keeps inside the string object, derived rather

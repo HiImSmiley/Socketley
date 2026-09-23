@@ -86,11 +86,14 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
     if (it == m_zsets.end())
         it = m_zsets.emplace(std::string(key), zset_inner{}).first;
 
-    const size_t before = entry_cost(it->first, it->second);
     it->second.score.emplace(std::string(member), score);
     it->second.order.emplace(score, std::string(member));
     ++m_zset_members;
-    track_add(entry_cost(it->first, it->second) - before);
+    // The delta and not two full walks: entry_cost() sums every member, so
+    // every zadd was O(n) in the set's size and filling one was O(n squared).
+    // The number is the same one those two walks produced -- a member costs
+    // its name twice, because the ordered view holds a copy.
+    track_add(2 * stored_string(member.size()));
     touch_lru(key);
     return 1;
 }
@@ -105,11 +108,11 @@ bool cache_store::zrem(std::string_view key, std::string_view member)
     if (sit == it->second.score.end())
         return false;
 
-    const size_t before = entry_cost(it->first, it->second);
     it->second.order.erase({sit->second, sit->first});
     it->second.score.erase(sit);
     --m_zset_members;
-    track_sub(before - entry_cost(it->first, it->second));
+    // The same delta zadd charges, for the same reason.
+    track_sub(2 * stored_string(member.size()));
 
     // An empty sorted set is not a key, the way an empty list is not one here.
     if (it->second.empty())
