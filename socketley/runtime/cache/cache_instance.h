@@ -105,6 +105,10 @@ struct client_connection
     bool                     multi_broken{false};
     std::vector<std::string> multi_queue;
     size_t                   multi_bytes{0};
+    // Set only while EXEC replays what it queued.  in_multi is already false
+    // by then -- EXEC clears it before the loop -- so a command that must
+    // behave differently inside a transaction has nothing else to read.
+    bool                     in_exec{false};
     // Enough for a batch worth queueing and small enough that a client cannot
     // park unbounded memory on a connection by never sending EXEC.
     static constexpr size_t  MULTI_MAX_BYTES = 8u << 20;
@@ -223,6 +227,7 @@ struct client_connection
         closing = false;
         cluster_port = false;
         in_multi = false;
+        in_exec = false;
         multi_broken = false;
         multi_queue.clear();
         multi_bytes = 0;

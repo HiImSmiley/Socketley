@@ -5340,8 +5340,10 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("error: transaction discarded\n", 29);
                 return;
             }
+            conn->in_exec = true;
             for (const auto& q : queued)
                 process_command_local(conn, q);
+            conn->in_exec = false;
             rb.append("end\n", 4);
             return;
         }
@@ -6956,6 +6958,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                     return;
                 }
             }
+            // The same refusal the RESP arm gives, in this protocol's word for
+            // a pop that came back with nothing.
+            if (SOCKETLEY_UNLIKELY(conn->in_exec))
+            {
+                rb.append("nil\n", 4);
+                break;
+            }
             {
                 // block_pop() reads args[1..argc-2] as keys, so the same shape
                 // is handed to it rather than a second parking path.
@@ -8520,6 +8529,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             // dispatch below writes to.
             std::string body;
             size_t at = 0;
+            conn->in_exec = true;
             for (size_t i = 0; i < queued.size(); ++i)
             {
                 std::string held;
@@ -8529,6 +8539,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 body.append(rb);
                 rb.swap(held);
             }
+            conn->in_exec = false;
             resp::encode_array_header_into(rb, static_cast<int>(queued.size()));
             rb.append(body);
             return;
@@ -10142,6 +10153,19 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     goto blpop_done;
                 }
             }
+            // Inside EXEC it must not wait, for two reasons that are both
+            // fatal on their own.  The reply array is counted before the
+            // replies are produced, so a command that writes nothing leaves
+            // the client reading N-1 elements under an N header; and the
+            // waiter would be a second one on this descriptor, which
+            // m_wait_fd holds one of and drop_blocked() looks up by fd alone.
+            // Redis answers a blocking pop in a transaction as its
+            // non-blocking twin, which on an empty list is a null array.
+            if (SOCKETLEY_UNLIKELY(conn->in_exec))
+            {
+                rb.append("*-1\r\n", 5);
+                break;
+            }
             // Nothing to take, so the caller waits and this command answers on
             // a later turn -- the only one in this file that does.
             block_pop(conn, args, argc, from_head);
@@ -10872,6 +10896,16 @@ void cache_instance::drop_blocked(int fd)
 bool cache_instance::block_pop(client_connection* conn, std::string_view* args,
                                int argc, bool from_head)
 {
+    // One waiter per descriptor, stated here because m_wait_fd holds one entry
+    // per fd and drop_blocked() forgets exactly that one: a second parked here
+    // would overwrite the index and orphan the first in m_blocked and
+    // m_wait_key, where a zero deadline means sweep_blocked() never reaches it
+    // either.  The callers make this impossible -- a blocked connection stops
+    // being read, and EXEC answers rather than parking -- so this is the
+    // invariant restated where it is relied upon, not a path.
+    if (SOCKETLEY_UNLIKELY(conn->blocked))
+        return false;
+
     // The last argument is the timeout, so there is at least one key before it.
     double secs = 0;
     if (!parse_double_sv(args[argc - 1], secs) || secs < 0)
