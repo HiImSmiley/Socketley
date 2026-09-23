@@ -191,7 +191,7 @@ int cli_dispatch(int argc, char** argv)
         {
             const auto paths = socketley_paths::resolve();
 
-            struct entry { std::string sock; long pid; };
+            struct entry { std::string sock; long pid; std::filesystem::path file; };
             std::vector<entry> found;
 
             std::error_code ec;
@@ -204,8 +204,15 @@ int cli_dispatch(int argc, char** argv)
                 std::string sock;
                 if (!std::getline(f, sock) || sock.empty())
                     continue;
-                found.push_back({sock, std::strtol(e.path().stem().c_str(),
-                                                   nullptr, 10)});
+                // The whole stem or nothing, the rule parse_uint32 states:
+                // strtol took the digits in front of a typo, and the removal
+                // below then rebuilt a name that was another file's.
+                const std::string stem = e.path().stem().string();
+                char*       end = nullptr;
+                const long  pid = std::strtol(stem.c_str(), &end, 10);
+                if (end == stem.c_str() || *end != '\0')
+                    continue;
+                found.push_back({sock, pid, e.path()});
             }
 
             std::sort(found.begin(), found.end(),
@@ -233,21 +240,25 @@ int cli_dispatch(int argc, char** argv)
                     case socketley::daemon_identity::predates_ping: status = "up";      break;
                     case socketley::daemon_identity::foreign:       status = "foreign"; break;
                     case socketley::daemon_identity::absent:        status = "dead";    break;
-                    default:                                        status = "busy";    break;
+                    // EACCES is a daemon that is up and will not let this uid
+                    // in, which `default:` reported as one that is merely slow;
+                    // named rather than defaulted so -Wswitch catches the next
+                    // member the enum gains.
+                    case socketley::daemon_identity::forbidden:     status = "denied";  break;
+                    case socketley::daemon_identity::mute:          status = "busy";    break;
                 }
 
-                // The one this CLI would talk to, because "which daemon am I
-                // configuring" is the question underneath the list.
                 // Removed only when both say so, because a daemon still
                 // restoring runtimes answers nothing and is not gone.
                 if (st == socketley::daemon_identity::absent && f.pid > 0 &&
                     ::kill(static_cast<pid_t>(f.pid), 0) < 0 && errno == ESRCH)
                 {
                     std::error_code rec;
-                    std::filesystem::remove(
-                        paths.daemons_dir / (std::to_string(f.pid) + ".daemon"), rec);
+                    std::filesystem::remove(f.file, rec);
                 }
 
+                // The one this CLI would talk to, because "which daemon am I
+                // configuring" is the question underneath the list.
                 const bool current = (f.sock == daemon_handler::socket_path);
 
                 std::cout << (current ? "* " : "  ");
@@ -474,17 +485,33 @@ int cli_dispatch(int argc, char** argv)
                 help_script = "/usr/share/socketley/socketley-help.sh";
             if (access(help_script.c_str(), R_OK) != 0)
             {
-                std::cerr << "help script not found\n";
-                return 1;
+                // Fatal and not bad input: `help` takes no input to get
+                // wrong, and a missing script is this installation's fault.
+                std::cout << "help script not found\n";
+                return 2;
             }
             {
                 pid_t pid = fork();
-                if (pid < 0) return -1;
+                if (pid < 0)
+                {
+                    std::cout << "could not run " << help_script << "\n";
+                    return 2;
+                }
                 if (pid == 0) { execlp("bash", "bash", help_script.c_str(), nullptr); _exit(127); }
 
                 int status = 0;
-                if (waitpid(pid, &status, 0) < 0) return -1;
-                return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                if (waitpid(pid, &status, 0) < 0)
+                {
+                    std::cout << "could not wait for " << help_script << "\n";
+                    return 2;
+                }
+                // Mapped and not passed through, because this process exits 0,
+                // 1 or 2: with no bash on PATH the child's _exit(127) reached
+                // the shell as 127, in silence.
+                if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                    return 0;
+                std::cout << "could not run " << help_script << "\n";
+                return 2;
             }
         }
 
@@ -560,7 +587,10 @@ int cli_dispatch(int argc, char** argv)
             }
             if (rc != 0)
             {
-                if (!stop_data.empty()) std::cerr << stop_data;
+                // The stream cli_forward uses and the start half below uses:
+                // `stop nosuch` named the runtime and `restart nosuch` said
+                // nothing at all, on the same refusal from the same daemon.
+                if (!stop_data.empty()) std::cout << stop_data;
                 return rc;
             }
 

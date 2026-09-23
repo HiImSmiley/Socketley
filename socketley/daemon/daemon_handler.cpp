@@ -4388,8 +4388,21 @@ int daemon_handler::cmd_add(ipc_connection* conn, const parsed_args& pa)
 
     for (size_t i = 2; i < pa.count; ++i)
     {
-        if ((pa.args[i] == "--name" || pa.args[i] == "-n") && i + 1 < pa.count)
+        if (pa.args[i] == "--name" || pa.args[i] == "-n")
+        {
+            // A token that is itself a flag is not the value: it is the next
+            // flag, typed after one whose value was forgotten -- the rule
+            // `daemon --name` applies in cli.cpp for the same reason.  Without
+            // this the guard fell through to "unknown flag: --name", which
+            // says the flag does not exist rather than that its value is
+            // missing, and `--name -s` blamed the name and dropped the -s.
+            if (i + 1 >= pa.count || pa.args[i + 1].starts_with('-'))
+            {
+                conn->write_buf = std::string(pa.args[i]) + " requires a value\n";
+                return 1;
+            }
             name = std::string(pa.args[++i]);
+        }
         else if (pa.args[i] == "-s")
             autostart = true;
         else

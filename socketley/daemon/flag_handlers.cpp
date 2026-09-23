@@ -15,7 +15,7 @@
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
 
-// Three flags that describe inbound traffic are refused on a client, which
+// Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
 // implemented them -- and giving each a meaning on a client is a feature to
 // design rather than a gap to plug.
@@ -851,7 +851,10 @@ int parse_proxy_flags(proxy_instance* proxy, const parsed_args& pa, size_t& i,
             size_t comma;
             while ((comma = backend_str.find(',', start)) != std::string_view::npos)
             {
-                proxy->add_backend(backend_str.substr(start, comma - start));
+                // An empty component is a doubled comma and not a backend,
+                // which is the rule --upstream's own loop already applies.
+                if (comma > start)
+                    proxy->add_backend(backend_str.substr(start, comma - start));
                 start = comma + 1;
             }
             if (start < backend_str.size())

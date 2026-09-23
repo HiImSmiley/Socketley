@@ -63,6 +63,19 @@ refuses "--owner with nothing after it is refused" 1 "requires a value" \
 refuses "--pid with nothing after it is refused" 1 "requires a value" \
         "$BIN" attach server ax_pidless $((P+2)) --pid
 
+refuses "add --name with nothing after it is refused" 1 "requires a value" \
+        "$BIN" add /bin/true --name
+refuses "add -n with nothing after it is refused" 1 "requires a value" \
+        "$BIN" add /bin/true -n
+# The other half of the same rule: a token that is itself a flag is the next
+# flag, not the value.  This used to blame the name -- "invalid runtime name:
+# -s" -- and drop the -s.
+refuses "add --name followed by another flag is refused" 1 "requires a value" \
+        "$BIN" add /bin/true --name -s
+if "$BIN" ls --name 2>/dev/null | grep -qx -- '-s'; then
+    fail "and no runtime named after the dropped flag is left behind" "-s exists"
+else pass; fi
+
 refuses "attach answers a bad name with 1, not 2" 1 "invalid runtime name" \
         "$BIN" attach server 'ax..bad' $((P+3))
 refuses "add answers a bad name with 1, not 2" 1 "invalid runtime name" \
