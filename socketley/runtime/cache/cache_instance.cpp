@@ -526,7 +526,11 @@ bool cache_instance::setup(event_loop& loop)
     // hands what it cannot free to retire(); what can go is whatever the loop
     // confirms is finished with, which is the only thing that releases a
     // dropped completion's storage.
-    if (!m_retired.empty() && loop.owner_inflight(this) == 0)
+    // The rider event_loop.h puts on owner_inflight(): once the owner table
+    // has run out and handlers share one identity, a zero from it proves
+    // nothing, and this storage holds the io_request the ring still names.
+    if (!m_retired.empty() && loop.owner_inflight(this) == 0 &&
+        !loop.owner_table_full())
         m_retired.clear();
 
     // Pre-allocate connection pool
@@ -8315,6 +8319,41 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         replicate_command(cmd);
     };
 
+    // One record per unit, for the reason the comment below gives about SET:
+    // the follower and the journal both read a text command, and its splitter
+    // takes everything after the fixed fields as the last one.  So `LPUSH k a
+    // b c` came back as the single element "a b c", and `ZREM z m1 m2` removed
+    // nothing at all.  DEL and MSET have always emitted one record per unit
+    // and so has dump_commands; these are the commands that had not caught up.
+    //
+    // `mid` is the field between the key and the last one -- a hash's field --
+    // and is left empty by a command that has none; a caller that HAS one must
+    // not pass it empty, because the reader would then take the last field for
+    // it.
+    auto repl_unit = [&](std::string_view verb, std::string_view key,
+                         std::string_view mid, std::string_view last) {
+        if (!mutation_log_wanted()) return;
+        // Only the last field survives a space, because everything before it
+        // is what the reader splits on -- repl_set_effect's rule, at a third
+        // door.
+        if (SOCKETLEY_UNLIKELY(key.find(' ') != std::string_view::npos ||
+                               mid.find(' ') != std::string_view::npos))
+        { repl_refuse(key); return; }
+        std::string cmd;
+        cmd.reserve(verb.size() + key.size() + mid.size() + last.size() + 3);
+        cmd.append(verb);
+        cmd.push_back(' ');
+        cmd.append(key.data(), key.size());
+        if (!mid.empty())
+        {
+            cmd.push_back(' ');
+            cmd.append(mid.data(), mid.size());
+        }
+        cmd.push_back(' ');
+        cmd.append(last.data(), last.size());
+        replicate_command(cmd);
+    };
+
     // SET replicates its effect rather than its command, because repl() joins
     // arguments with spaces and the text interpreter takes everything after
     // the key as the value -- so `SET rk rv EX 100` reached the follower as
@@ -9024,17 +9063,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     m_store.check_expiry(args[1]);
                     if (!m_store.lpush(args[1], args[i]))
                     {
+                        // A refusal after the first element is the store out of
+                        // room, and what has been logged stands rather than
+                        // being taken back.
                         resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
+                repl_unit("lpush", args[1], {}, args[i]);
             }
             // The length INCLUDING what was just pushed, and only then the
             // waiters: a client blocked on this key takes an element, and a
             // reply counted after that would report a queue shorter than the
             // one the caller filled.
             resp::encode_integer_into(rb, m_store.llen(args[1]));
-            repl(args, argc);
             // N elements can free N waiters, so this runs until nobody is left
             // for this key or the list is empty again.
             while (wake_one_waiter(args[1])) {}
@@ -9051,17 +9093,20 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     m_store.check_expiry(args[1]);
                     if (!m_store.rpush(args[1], args[i]))
                     {
+                        // A refusal after the first element is the store out of
+                        // room, and what has been logged stands rather than
+                        // being taken back.
                         resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
+                repl_unit("rpush", args[1], {}, args[i]);
             }
             // The length INCLUDING what was just pushed, and only then the
             // waiters: a client blocked on this key takes an element, and a
             // reply counted after that would report a queue shorter than the
             // one the caller filled.
             resp::encode_integer_into(rb, m_store.llen(args[1]));
-            repl(args, argc);
             // N elements can free N waiters, so this runs until nobody is left
             // for this key or the list is empty again.
             while (wake_one_waiter(args[1])) {}
@@ -9204,8 +9249,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             m_store.check_expiry(args[1]);
             int zgone = 0;
             for (int i = 2; i < argc; i++)
-                if (m_store.zrem(args[1], args[i])) zgone++;
-            if (zgone > 0) repl(args, argc);
+                if (m_store.zrem(args[1], args[i]))
+                {
+                    zgone++;
+                    repl_unit("zrem", args[1], {}, args[i]);
+                }
             resp::encode_integer_into(rb, zgone);
             break;
         }
@@ -9310,11 +9358,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 {
                     m_store.check_expiry(args[1]);
                     r = m_store.sadd(args[1], args[i]);
+                    // A refusal after the first member is the store out of
+                    // room, and what has been logged stands.
                     if (r < 0) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
                 }
                 added += r;
+                if (r > 0)
+                    repl_unit("sadd", args[1], {}, args[i]);
             }
-            if (added > 0) repl(args, argc);
             resp::encode_integer_into(rb, added);
             break;
         }
@@ -9325,8 +9376,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int removed = 0;
             for (int i = 2; i < argc; i++)
-                if (m_store.srem(args[1], args[i])) removed++;
-            if (removed > 0) repl(args, argc);
+                if (m_store.srem(args[1], args[i]))
+                {
+                    removed++;
+                    repl_unit("srem", args[1], {}, args[i]);
+                }
             resp::encode_integer_into(rb, removed);
             break;
         }
@@ -9517,8 +9571,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     }
                 }
                 added++;
+                // An empty field would be read as the value by a reader that
+                // splits on spaces, so it goes the way a key with a space in it
+                // goes rather than as a record that means something else.
+                if (SOCKETLEY_UNLIKELY(args[i].empty()))
+                    { if (mutation_log_wanted()) repl_refuse(args[1]); continue; }
+                repl_unit("hset", args[1], args[i], args[i + 1]);
             }
-            repl(args, argc);
             resp::encode_integer_into(rb, added);
             break;
         }
@@ -9540,8 +9599,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int removed = 0;
             for (int i = 2; i < argc; i++)
-                if (m_store.hdel(args[1], args[i])) removed++;
-            if (removed > 0) repl(args, argc);
+                if (m_store.hdel(args[1], args[i]))
+                {
+                    removed++;
+                    repl_unit("hdel", args[1], {}, args[i]);
+                }
             resp::encode_integer_into(rb, removed);
             break;
         }
