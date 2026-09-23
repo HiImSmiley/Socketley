@@ -3930,6 +3930,12 @@ reparse:
         // same as in the plain HTTP branch below.
         conn->awaiting_headers = false;
 
+        // Down here too, and not only in the plain HTTP branch below: an
+        // upgrade is always a GET, so the refusals in this arm were cutting
+        // their own bodies off for a HEAD the client sent before them on this
+        // connection, under the Content-Length that says the body is there.
+        conn->http_head = false;
+
         // Single-pass header scan: find Upgrade + Sec-WebSocket-Key without allocation
         {
             std::string_view hdrs(conn->partial.data(), hdr_end + 4);
@@ -7251,6 +7257,10 @@ void server_instance::arm_header_deadline(server_connection* conn)
     conn->awaiting_headers = true;
     conn->header_deadline = std::chrono::steady_clock::now() +
                             std::chrono::seconds(http_header_deadline_secs);
+    // Both callers are a head with no request line parsed out of it yet, so
+    // the 408 the sweep answers owes a body whatever the LAST request on this
+    // connection was -- and that is the one thing it cannot be asked.
+    conn->http_head = false;
     m_headers_outstanding = true;
     arm_idle_sweep();
 }
