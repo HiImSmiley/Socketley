@@ -224,6 +224,17 @@ void metrics_endpoint::serve_loop()
                         m_cached_json_runtimes.clear();
                         m_cache_time = now;
                     }
+                    // The branch both JSON endpoints have and this one did
+                    // not: the three share one cache and one clock, and each
+                    // refresh empties the other two.  A dashboard poll inside
+                    // the TTL therefore left this serving 200 OK with
+                    // Content-Length: 0 -- a scrape Prometheus records as
+                    // successful, with every socketley_ series missing from
+                    // that sample.
+                    else if (m_cached_metrics.empty())
+                    {
+                        m_cached_metrics = build_metrics();
+                    }
                     send_http_response(client_fd, "text/plain; version=0.0.4; charset=utf-8", m_cached_metrics);
                 }
                 else if (path == "/api/overview")

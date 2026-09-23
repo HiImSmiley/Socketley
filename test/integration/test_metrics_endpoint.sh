@@ -158,6 +158,60 @@ DASH=$(get /)
 if grep -q "200 OK" <<<"$DASH" && grep -qi "html" <<<"$DASH"; then ok
 else bad "GET / serves the dashboard" "got: $(head -1 <<<"$DASH")"; fi
 
+# ── Three endpoints, one cache ─────────────────────────────────────────────
+# /metrics, /api/overview and /api/runtimes share m_cached_* and one
+# m_cache_time, and each refresh empties the other two.  Both JSON endpoints
+# carry an `else if (…empty())` that rebuilds what a sibling cleared; /metrics
+# did not, so a dashboard poll inside the 1s TTL left it answering 200 OK with
+# Content-Length: 0 -- a scrape Prometheus records as successful with every
+# series missing.
+#
+# Both requests are issued from one process rather than two `nc` spawns, so the
+# gap is microseconds and the second is inside the TTL on any build.  A pair
+# that straddled the TTL would refresh and pass while measuring nothing.
+# The clearing happens ONLY on the refresh branch, so the pair has to begin
+# with one.  Without this wait the assertions above have just refreshed, the
+# overview takes its `else if` arm instead, clears nothing, and the check below
+# passes against a build that still has the defect -- measured: 13/13 green
+# before this line was here.
+sleep 1.2
+PAIR=$(python3 - "$MPORT" <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+def fetch(path):
+    s = socket.create_connection(("127.0.0.1", port), 8); s.settimeout(8)
+    s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % path).encode())
+    out = b""
+    while True:
+        try: d = s.recv(65536)
+        except Exception: break
+        if not d: break
+        out += d
+    s.close()
+    return out.decode("latin1", "replace")
+first = fetch("/api/overview")
+second = fetch("/metrics")
+body = second.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in second else ""
+print("overview_ok=%s" % ("200 OK" in first.split("\r\n")[0]))
+print("metrics_status=%s" % second.split("\r\n")[0].strip())
+print("metrics_body_bytes=%d" % len(body))
+print("has_series=%s" % ("socketley_runtimes_total" in body))
+PYEOF
+)
+echo "  after a dashboard poll: $(echo "$PAIR" | tr '\n' ' ')"
+
+case "$PAIR" in
+    *"overview_ok=True"*) ok ;;
+    *) bad "the dashboard endpoint answers, so it did refresh the shared cache" \
+           "$(echo "$PAIR" | tr '\n' ' ')" ;;
+esac
+
+case "$PAIR" in
+    *"has_series=True"*) ok ;;
+    *) bad "/metrics still carries its series right after a dashboard poll" \
+           "$(echo "$PAIR" | tr '\n' ' ')" ;;
+esac
+
 echo ""
 echo "  passed: $PASS / $TOTAL"
 [ "$FAIL" -eq 0 ]
