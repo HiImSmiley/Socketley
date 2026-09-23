@@ -1,5 +1,6 @@
 #include "state_persistence.h"
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include "runtime_instance.h"
 #include "../runtime/server/server_instance.h"
@@ -99,9 +100,53 @@ std::string json_unescape(std::string_view s)
             {
                 case '"':  out += '"';  break;
                 case '\\': out += '\\'; break;
+                case '/':  out += '/';  break;
                 case 'n':  out += '\n'; break;
                 case 'r':  out += '\r'; break;
                 case 't':  out += '\t'; break;
+                case 'b':  out += '\b'; break;
+                case 'f':  out += '\f'; break;
+                case 'u':
+                {
+                    // json_escape writes \u00xx for every byte below 0x20, and
+                    // nothing here read it back: `--log $'a\001b.log'` came out
+                    // of a daemon restart as the seven literal characters
+                    // a\u0001b, so the daemon held one path and the file named
+                    // another.
+                    unsigned cp = 0;
+                    bool hex_ok = (i + 4 < s.size());
+                    for (size_t d = 0; hex_ok && d < 4; ++d)
+                    {
+                        const char h = s[i + 1 + d];
+                        cp <<= 4;
+                        if      (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+                        else hex_ok = false;
+                    }
+                    // Kept verbatim when it is not four hex digits, which is
+                    // what this function does for every escape it does not
+                    // know.
+                    if (!hex_ok) { out += '\\'; out += 'u'; break; }
+                    i += 4;
+                    // A surrogate half on its own is not a codepoint, and
+                    // U+FFFD is the answer lua_json.h's decoder gives it.
+                    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+                    if (cp < 0x80)
+                        out += static_cast<char>(cp);
+                    else if (cp < 0x800)
+                    {
+                        out += static_cast<char>(0xC0 | (cp >> 6));
+                        out += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    else
+                    {
+                        out += static_cast<char>(0xE0 | (cp >> 12));
+                        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                        out += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
                 default:   out += '\\'; out += s[i]; break;
             }
         }
@@ -783,7 +828,13 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
     auto append_double_field = [&](const char* key, double val) {
         // Use snprintf for doubles to match ostringstream default formatting
         char buf[64];
-        int n = snprintf(buf, sizeof(buf), "%g", val);
+        // %g writes `inf`, which is not a JSON token and is what
+        // `--rate-limit inf` put in this file: parse_double accepts an
+        // infinity on purpose, so the value is kept as the largest number this
+        // format can say rather than written as one nothing can read.
+        int n = snprintf(buf, sizeof(buf), "%g",
+                         std::isfinite(val) ? val
+                                            : std::numeric_limits<double>::max());
         j += "    \"";
         j += key;
         j += "\": ";
