@@ -157,3 +157,4 @@ else fail "the leader counts its followers" \
           "got: $(grep -m1 'connected_slaves' <<<"$INFO_LEADER" || echo '<no line>')"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] || exit 1

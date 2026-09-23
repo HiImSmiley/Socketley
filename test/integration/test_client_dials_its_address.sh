@@ -149,3 +149,4 @@ else fail "the client reached the server it named" \
           "the server reports no connection while the client reports being up"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+[ "$FAIL" -eq 0 ] || exit 1
