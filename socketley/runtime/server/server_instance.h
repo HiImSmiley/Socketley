@@ -1101,6 +1101,12 @@ private:
     // reference.
     std::unique_ptr<tls_context> m_tls;
     void submit_conn_read(server_connection* conn);
+    // True when `conn` is still there to be used.  submit_conn_read() reports a
+    // refused submission on the connection itself and leaves nothing in the
+    // ring to notice it later, so the teardown is owed at the call -- and a
+    // connection that cannot be read sits in m_clients against
+    // --max-connections until the runtime stops.
+    bool arm_conn_read(server_connection* conn);
     void release_fixed_slot(server_connection* conn);
 
     // UDP helpers

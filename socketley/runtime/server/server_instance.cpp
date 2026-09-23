@@ -3023,6 +3023,20 @@ inline void server_instance::submit_conn_read(server_connection* conn)
     conn->read_pending = true;
 }
 
+// See the declaration: the refusal is recorded on the connection and there is
+// nothing left in the ring to carry it to finish_unreachable_conn().
+bool server_instance::arm_conn_read(server_connection* conn)
+{
+    submit_conn_read(conn);
+    if (SOCKETLEY_LIKELY(!conn->closing))
+        return true;
+    // Otherwise whichever operation is outstanding owns the teardown, which is
+    // the same division close_conn()'s own precondition states.
+    if (!conn_ops_pending(conn))
+        close_conn(conn);
+    return false;
+}
+
 inline void server_instance::release_fixed_slot(server_connection* conn)
 {
     // m_ring_loop, not m_loop: a retired connection can become releasable while
@@ -3200,7 +3214,10 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
 
     invoke_on_connect(client_fd);
 
-    submit_conn_read(ptr);
+    // With on_disconnect, unlike the three refusals above: this client got its
+    // on_connect one line up.
+    if (SOCKETLEY_UNLIKELY(!arm_conn_read(ptr)))
+        return false;
     return true;
 }
 
@@ -3565,8 +3582,8 @@ void server_instance::handle_file_stream(struct io_uring_cqe* cqe, server_connec
     else
     {
         conn->proto = proto_unknown;
-        if (!conn->read_pending)
-            submit_conn_read(conn);
+        if (!conn->read_pending && !arm_conn_read(conn))
+            return;
         // Last statement, for the reason the splice arm gives: parse_partial()
         // can start the next response on this connection.
         parse_partial(conn);
@@ -4763,12 +4780,7 @@ submit_next_read:
         // Don't resubmit socket read while async file read is in progress
         if (!conn->read_pending && !conn->file_read_pending)
         {
-            submit_conn_read(conn);
-            // A read that could not be queued marks the connection closing
-            // with nothing in flight to notice it later, so without this it
-            // sits here until the runtime stops.
-            if (SOCKETLEY_UNLIKELY(conn->closing && !conn_ops_pending(conn)))
-                close_conn(conn);
+            arm_conn_read(conn);
         }
     }
     else if (conn->closing && !conn_ops_pending(conn))
@@ -6279,8 +6291,8 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
         else
         {
             conn->proto = proto_unknown;
-            if (!conn->read_pending)
-                submit_conn_read(conn);
+            if (!conn->read_pending && !arm_conn_read(conn))
+                return;
             // The error arm owes the same drain as the success arm, because
             // the invariant is about the connection rather than the outcome --
             // phrased as "every arm that finishes a response drains", an
@@ -6389,8 +6401,8 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     {
         conn->proto = proto_unknown;
         // Resubmit socket read for next HTTP request
-        if (!conn->read_pending)
-            submit_conn_read(conn);
+        if (!conn->read_pending && !arm_conn_read(conn))
+            return;
         // Last statement, reachable here only by a client that pipelines, but
         // the same rule all the same.
         parse_partial(conn);
@@ -6517,8 +6529,8 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
     else
     {
         conn->proto = proto_unknown;
-        if (!conn->read_pending)
-            submit_conn_read(conn);
+        if (!conn->read_pending && !arm_conn_read(conn))
+            return;
 
         // Last statement, because parse_partial() can arm the next splice on
         // this connection and anything after it would operate on the next
