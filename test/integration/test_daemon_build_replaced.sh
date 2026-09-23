@@ -68,10 +68,17 @@ if [ -z "$ERR" ]; then ok; else
 fi
 
 OUT_BEFORE=$("$RUNDIR/socketley" version 2>/dev/null)
-if [ "$OUT_BEFORE" = "$("$BIN" version 2>/dev/null)" ]; then ok; else
-    bad "stdout is the version number and nothing else" \
-        "got [$OUT_BEFORE]"
-fi
+# Against the shape and not against `$BIN version`, which is the same file
+# copied: a line of noise on stdout would have appeared on both sides of that
+# comparison and it would still have been equal.
+case "$OUT_BEFORE" in
+    *[!0-9.]*|"") bad "stdout is the version number and nothing else" \
+                      "got [$OUT_BEFORE]" ;;
+    *) if [ "$(printf '%s\n' "$OUT_BEFORE" | wc -l)" = 1 ]; then ok; else
+           bad "stdout is the version number and nothing else" \
+               "$(printf '%s\n' "$OUT_BEFORE" | wc -l) lines: [$OUT_BEFORE]"
+       fi ;;
+esac
 
 # ─── 2. the rebuild ──────────────────────────────────────────────────────────
 # A new file renamed over the path the daemon is executing, so the daemon keeps

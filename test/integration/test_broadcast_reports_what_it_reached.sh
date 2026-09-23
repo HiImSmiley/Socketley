@@ -81,6 +81,11 @@ trap cleanup EXIT
 
 cat > "$LUA" <<'LUAEOF'
 local CHUNK = string.rep("y", 65536)
+local ids = {}
+
+function on_connect(id)
+    ids[#ids + 1] = id
+end
 
 function on_client_message(id, msg)
     if msg == "one" then
@@ -93,12 +98,21 @@ function on_client_message(id, msg)
     elseif msg == "fill" then
         -- Broadcast until somebody falls behind, then one more round so the
         -- count after the drop can be compared with the count at the drop.
-        local at_drop, after, rounds = nil, nil, 0
+        local at_drop, after, rounds, why = nil, nil, 0, ""
         for _ = 1, 400 do
             local taken, behind = self.broadcast(CHUNK)
             rounds = rounds + 1
             if behind and behind > 0 and not at_drop then
                 at_drop = taken .. "/" .. behind
+                -- The cross-door assertion, made in the same turn as the drop
+                -- rather than from a later message: closed_for_backlog is read
+                -- off the connection, and the connection is reaped.
+                for _, cid in ipairs(ids) do
+                    local okay, reason = self.send(cid, "probe")
+                    if not okay then
+                        why = why .. "[" .. tostring(reason) .. "]"
+                    end
+                end
             elseif at_drop and not after then
                 after = taken .. "/" .. behind
                 break
@@ -107,14 +121,7 @@ function on_client_message(id, msg)
         socketley.log("BC fill rounds=" .. rounds
             .. " at_drop=" .. tostring(at_drop)
             .. " after=" .. tostring(after))
-
-    elseif msg == "why" then
-        -- The cross-door assertion: the id that the BROADCAST dropped must get
-        -- the backlog sentence from self.send, not the peer's one.
-        local target = tonumber(self.get_data(id, "target") or "") or -1
-        local okay, reason = self.send(target, "probe")
-        socketley.log("BC why ok=" .. tostring(okay)
-            .. " reason=[" .. tostring(reason) .. "]")
+        socketley.log("BC why reasons=" .. why)
     end
 end
 LUAEOF
@@ -206,19 +213,17 @@ check "the round after reports nobody behind" "0" "${AFTER##*/}"
 # ─── 4. The refusal at the other door names the backlog ─────────────────────
 # A build that counted correctly but did not set closed_for_backlog would pass
 # everything above and still tell the script the peer hung up.
-if grep -q "was closed because more was queued" "$SOCKETLEY_DLOG"; then
-    ok
-else
-    R=$(grep -o 'BC why .*' "$SOCKETLEY_DLOG" | tail -1) || true
-    # Not every run reaches the `why` branch, so the assertion is made on the
-    # runtime's own refusal text rather than requiring that round to have run.
-    case "$R" in
-        *"more was queued"*) ok ;;
-        "") ok ;;   # branch not exercised; nothing to contradict
-        *) bad "a client dropped by broadcast gets the backlog sentence" \
-               "got $R -- closed_for_backlog is set at the send door and not here" ;;
-    esac
-fi
+# The empty answer used to be counted a pass here, under a comment saying the
+# branch was not always reached -- and nothing in this file ever sent "why",
+# so it was never reached at all and this assertion was unconditional.
+R=$(grep -o 'BC why .*' "$SOCKETLEY_DLOG" | tail -1) || true
+case "$R" in
+    *"more was queued"*) ok ;;
+    *) bad "a client dropped by broadcast gets the backlog sentence" \
+           "got [${R:-<no BC why line>}] -- the probe runs in the same turn as" \
+           "the drop, so a peer-worded reason here is closed_for_backlog being" \
+           "set at the send door and not at the broadcast one" ;;
+esac
 
 # ─── 5. The runtime is still serving both readers ───────────────────────────
 check "the runtime survived it" "Up" \

@@ -135,16 +135,22 @@ t0=$(date +%s%N)
 taskset -c 1 "$CLIENT" "$P" 20 "$BURSTS" 2000 /big.txt MARKER-BIG || rc_txt=$?
 echo "    elapsed $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 
+rc_html=0
 echo -n "  2 MiB HTML     (read path, control): "
 t0=$(date +%s%N)
-taskset -c 1 "$CLIENT" "$P" 20 "$CTRL_BURSTS" 2000 /big.html MARKER-BIG || true
+taskset -c 1 "$CLIENT" "$P" 20 "$CTRL_BURSTS" 2000 /big.html MARKER-BIG || rc_html=$?
 echo "    elapsed $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 
-if [ "$rc_txt" -ne 0 ]; then
-    echo "  FAIL: the splice path went silent on an open keep-alive connection."
+# The control's status used to be thrown away with `|| true` while the failure
+# message below told the reader to look at it, so nobody could.
+if [ "$rc_txt" -ne 0 ] || [ "$rc_html" -ne 0 ]; then
+    echo "  FAIL: a 2 MiB response went silent on an open keep-alive connection."
     echo "        stall>0 means the server stopped talking with the connection still up."
-    echo "        If the control above is ALSO non-zero the cause is not the splice"
-    echo "        window and this file is pointing at the wrong thing."
+    echo "        splice rc=$rc_txt, read-path control rc=$rc_html."
+    if [ "$rc_html" -ne 0 ]; then
+        echo "        The control stalled too, so the cause is not the splice window"
+        echo "        and this file is pointing at the wrong thing."
+    fi
     exit 1
 fi
 echo "--- 2/2 passed ---"

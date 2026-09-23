@@ -7743,6 +7743,19 @@ timeout per operation. Name resolution is the exception: it runs before
 the deadline is armed and has no bound of its own. A response is refused
 once it exceeds 8 MB rather than buffered without limit.
 .PP
+A response that declares a
+.B Content-Length
+and then ends before reaching it is refused too, with the shortfall named in
+.BR error ,
+because nothing else in the answer would say so: the close that cut it short is
+the same close that frames a response carrying no length at all, and over
+HTTPS the
+.B close_notify
+that would tell those two apart is one many servers omit and this client
+accepts the absence of. Only a declared length can be fallen short of \(em a
+chunked response, or one with no length, is read until the close either way and
+comes back as before.
+.PP
 HTTPS uses OpenSSL and validates the peer. The certificate chain is
 verified against the system CA store, and the certificate must have been
 issued to the host in the URL \(em a host name is matched against the

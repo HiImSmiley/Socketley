@@ -194,8 +194,8 @@ inline void ws_unmask_payload(char* payload, size_t len, uint32_t mask32)
 
 // ─── SHA-1 for WS accept key (EVP API, no deprecated calls) ───
 
-// Compute Sec-WebSocket-Accept from a client key, handling up to 88 bytes
-// though RFC 6455 keys are always 24.
+// Compute Sec-WebSocket-Accept from a client key, handling up to 92 bytes on
+// the stack though RFC 6455 keys are always 24.
 inline std::string ws_accept_key(std::string_view client_key)
 {
     // Stack fast path (covers all valid WS keys: 24 + 36 = 60 bytes)

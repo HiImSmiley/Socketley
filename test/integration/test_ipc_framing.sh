@@ -113,11 +113,44 @@ else fail "an ordinary command still works" "ls exited $RC"; fi
 #
 # `echo hi | socketley send x` must not deliver "hi\n".  Only the trailing one
 # goes; the ones inside are the message.
-printf 'trailing\n' | "$BIN" fr_cache set k_tail >/dev/null 2>&1 || true
-"$BIN" fr_cache set k_tail "$(printf 'trailing\n')" >/dev/null 2>&1 || true
-if [ "$("$BIN" fr_cache get k_tail 2>/dev/null)" = "trailing" ]; then pass
+# Read off a connected client, because `send` to a server broadcasts to its
+# clients and that is the only place the delivered bytes can be counted.  What
+# stood here piped into `fr_cache set k_tail` -- three words, so argc>=3 and
+# cli_runtime_action never reads stdin -- and then overwrote the key from argv,
+# where the shell's own $(...) had already eaten the newline: the assertion was
+# about a value no pipe had touched.
+#
+# Two newlines and not one, because broadcast() terminates every message it
+# sends with a newline: a single one stripped and then re-added is the same
+# bytes as one never stripped, so only the second can be seen from out here.
+TAIL=$(python3 - "$P" "$BIN" <<'PYEOF'
+import socket, subprocess, sys, time
+port, binary = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(("127.0.0.1", port), 5)
+s.settimeout(4)
+time.sleep(0.4)
+subprocess.run([binary, "send", "fr_victim"], input=b"trailing\n\n",
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+got = b""
+end = time.time() + 4
+while time.time() < end:
+    try:
+        d = s.recv(4096)
+    except Exception:
+        break
+    if not d:
+        break
+    got += d
+    # Whatever arrived, give the newline that must not be there a moment to
+    # follow it rather than reporting the first read.
+    s.settimeout(0.5)
+s.close()
+print(got.decode("latin1", "replace").replace("\n", "\\n"))
+PYEOF
+)
+if [ "$TAIL" = 'trailing\n' ]; then pass
 else fail "a trailing newline is not part of the value" \
-          "got '$("$BIN" fr_cache get k_tail 2>/dev/null | tr '\n' '|')'"; fi
+          "the client received [$TAIL], wanted [trailing\\n]"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi

@@ -76,9 +76,14 @@ echo "=== Integration: shard-to-shard links ==="
 command -v redis-cli >/dev/null 2>&1 || { echo "  SKIP: redis-cli required"; exit 0; }
 
 daemon_start "$BIN"
-if ! "$BIN" create cache meshc -p "$PORT" --shards 4 --resp -s >/dev/null 2>&1; then
-    echo "  SKIP: this build refuses --shards on a cache."
-    exit 0
+# Refused rather than skipped: shards_config_refusal() allows --shards on every
+# listening type and refuses only a client, so a build that says no here is the
+# regression this file exists to catch -- and exit 0 would have reported it as a
+# pass.
+if ! OUT=$("$BIN" create cache meshc -p "$PORT" --shards 4 --resp -s 2>&1); then
+    bad "a cache takes --shards" "${OUT:-<silent refusal>}"
+    echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
+    exit 1
 fi
 for i in $(seq 1 80); do
     redis-cli -p "$PORT" PING 2>/dev/null | grep -q PONG && break; sleep 0.25

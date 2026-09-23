@@ -488,6 +488,11 @@ assert_has "...and the error names the address, not the chain" \
     "got: $BADIP"
 TOTAL=$((TOTAL+1))
 case "$BADIP" in
+    # An empty answer matched neither arm and was counted a pass: the ask
+    # timing out proved nothing about which check refused the certificate.
+    "")
+        FAIL=$((FAIL+1))
+        echo "  FAIL [...and it is the name that failed, not the trust]: nothing came back" ;;
     *"self signed"*)
         FAIL=$((FAIL+1))
         echo "  FAIL [...and it is the name that failed, not the trust]: $BADIP"
