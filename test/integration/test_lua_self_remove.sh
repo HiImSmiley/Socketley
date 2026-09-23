@@ -198,8 +198,10 @@ fi
 # The three assertions are kept because what they measure is unchanged: the
 # call is answered, the frame that made it runs on, and the runtime really is
 # gone.  A build that got any of those wrong would still be wrong.
+NEW_T0=$(date +%s%N)
 "$BIN" create server selfrm_new -p "$NEW_PORT" --lua "$NEW_LUA" -s \
     >/dev/null 2>&1 || true
+NEW_MS=$(( ($(date +%s%N) - NEW_T0) / 1000000 ))
 
 # Three assertions, and the first two exist so the third cannot pass on a build
 # where nothing ran.  A script that was never loaded would satisfy "the daemon
@@ -227,6 +229,19 @@ if survived; then pass; else
          "under the live safe_script_file frame of the very context that asked" \
          "for it.  Measured with the guard deleted: SIGSEGV, then a fresh" \
          "daemon auto-started by the next CLI command."
+fi
+
+# And it has to come back rather than sleeping out the startup bound.  The
+# worker's own socketley.remove retires the supervisor from inside the wait,
+# leaving no socket, no child and no placeholder -- so nothing the wait is
+# watching can change, and await_startup used to go on polling in 20ms slices
+# until worker_startup_bound expired.  The two waits beside it already answer
+# on that condition: "waiting out the deadline for a corpse is the difference
+# between a refusal and a hang."
+if [ "$NEW_MS" -lt 1500 ]; then pass; else
+    fail "the create returns when the worker is gone, not at the startup bound" \
+         "create -s took ${NEW_MS} ms" \
+         "worker_startup_bound is 2000ms, and the answer was already decided"
 fi
 
 # The removal has to have happened, not merely not crashed: deferring the free

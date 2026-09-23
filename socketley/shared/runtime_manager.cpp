@@ -137,6 +137,15 @@ void runtime_manager::replica_note(std::string_view op, std::string_view name,
         }
         else if (op == "create")
         {
+            // Rebuilt and not re-tagged when the type has moved, for
+            // install_replica's reason: get_type() is fixed at construction,
+            // and this note arrives before the push that would correct it.
+            if (it != runtimes.end() && it->second->get_type() != e.type)
+            {
+                dropped = std::move(it->second);
+                runtimes.erase(it);
+                it = runtimes.end();
+            }
             if (it == runtimes.end())
                 it = runtimes.emplace(
                     std::string(name),

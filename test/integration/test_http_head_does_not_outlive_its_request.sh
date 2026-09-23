@@ -71,7 +71,10 @@ probe() {  # probe FIRST_OR_EMPTY SECOND [nobody]
 import socket, sys
 port, first, second, nobody = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 s = socket.create_connection(("127.0.0.1", port), 10)
-s.settimeout(45)
+# 120s, because the header deadline is ten seconds and the sweep that reads it
+# runs on a thirty-second timer of its own: the worst case is forty, and
+# test_http_head_deadline.sh holds its own connection open for the same reason.
+s.settimeout(120)
 f = s.makefile("rb")
 
 def one(expect_body):

@@ -741,6 +741,10 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     // that no longer exists.
     m_worker_state      = runtime_created;
     m_worker_state_seen = false;
+    // The third of the family, left set by the previous child: it is what
+    // decides whether the sentence naming worker_main() is produced, so a
+    // replacement that is not a worker binary said nothing about why.
+    m_saw_worker_frame  = false;
 
     const int fl = ::fcntl(m_control_fd, F_GETFL, 0);
     if (fl >= 0)
@@ -1052,6 +1056,11 @@ void proxy_supervisor::shutdown()
 
 void proxy_supervisor::poll()
 {
+    // Retried here because nothing else would: on_cqe re-arms the map socket
+    // from a completion that a refused submission never produces, and this
+    // drain is the only thing the health tick calls.
+    arm_map_poll();
+
     if (m_control_fd < 0)
         return;
 
@@ -1143,6 +1152,13 @@ proxy_supervisor::await_startup(std::chrono::milliseconds bound)
         {
             // No socket left to wait on: the child is gone or never had one,
             // and the only thing that can still change is the reap above.
+            // With no child either there is nothing for it to reap, so this
+            // answers now rather than sleeping out the bound -- which is what
+            // await_direct and await_routes already do, in the sentence one of
+            // them puts on it: "waiting out the deadline for a corpse is the
+            // difference between a refusal and a hang".
+            if (m_pid <= 0)
+                return startup::pending;
             struct timespec ts{0, static_cast<long>(slice) * 1000000L};
             if (::nanosleep(&ts, nullptr) < 0) {}
         }

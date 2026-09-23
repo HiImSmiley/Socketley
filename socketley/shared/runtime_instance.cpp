@@ -108,6 +108,9 @@ void runtime_instance::fire_tick(int res)
                   "run again for this runtime");
         tick_handler* dead = m_tick;
         m_tick = nullptr;
+        // The arm site says why and so does on_cqe's own teardown; this was
+        // the third of the three and the one that did not.
+        m_event_loop->deregister_owner(dead);
         delete dead;
     }
 }
