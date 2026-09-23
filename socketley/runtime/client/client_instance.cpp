@@ -259,10 +259,16 @@ connected:
     // note_connected().
     m_stat_dial_attempts.fetch_add(1, std::memory_order_relaxed);
     m_conn_counted = false;
-    invoke_on_connect(m_conn->fd);
     m_conn->partial.clear();
     m_conn->partial.reserve(65536);
+    // Before the callback and not after it, because on_connect sends and
+    // lua_send refuses on `closing` -- which drop_connection() never lowers.
+    // The first reconnect after a failed write therefore ran the callback with
+    // the dead socket's flag still up, queued nothing, and answered the script
+    // "not connected" on a connection that was up; one line later it was false
+    // and every later send worked.
     m_conn->closing = false;
+    invoke_on_connect(m_conn->fd);
 
     // The session goes on the socket before anything is read from it, and a
     // failure costs the socket -- there is deliberately no path from a refused
@@ -1154,7 +1160,15 @@ bool client_instance::lua_send(std::string_view msg)
     // Queued when a write is in flight, or always on a TLS connection, because
     // tls_flush is the only thing allowed to put a record on the wire and an
     // SSL asked to write mid-handshake answers WANT_READ.
-    if (m_conn->ssl || m_conn->write_pending || m_conn->closing)
+    //
+    // Asked of m_tls and not of m_conn->ssl: the two disagree for exactly one
+    // window, between try_connect() reaching `connected:` and start_tls()
+    // creating the SSL, and on_connect runs inside it.  A script sending from
+    // there took the plain arm and put its payload on the wire in the clear,
+    // ahead of the ClientHello -- which the peer reads as a record content
+    // type of 'S' and aborts, so the handshake never completed either.
+    // tls_flush() already holds what is queued until the handshake is done.
+    if (m_tls || m_conn->ssl || m_conn->write_pending || m_conn->closing)
     {
         if (!m_conn->closing)
         {
