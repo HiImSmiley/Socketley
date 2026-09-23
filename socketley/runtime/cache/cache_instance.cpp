@@ -9145,18 +9145,54 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly)
             { resp::encode_error_into(rb, "readonly mode"); return; }
-            int zadded = 0;
+            // Every score parsed before any pair is stored, the way zincrby
+            // below does it and the way every other numeric mutator here does:
+            // the refusal used to land after earlier pairs were already in and
+            // jumped over the repl() nine lines down, so those members stayed
+            // on this leader and no follower was ever told.
+            std::vector<double> zscores;
+            zscores.reserve(static_cast<size_t>((argc - 2) / 2));
             for (int i = 2; i + 1 < argc; i += 2)
             {
                 double zsc = 0.0;
                 if (!parse_double_sv(args[i], zsc))
                 { resp::encode_error_into(rb, "value is not a valid float"); return; }
-                const int zn = m_store.zadd(args[1], zsc, args[i + 1]);
+                zscores.push_back(zsc);
+            }
+            // The key is not the last field of a `zadd` record, so a space in
+            // it moves the boundary the follower splits on -- the same rule
+            // repl_set_effect states at the other door.
+            bool zlog = mutation_log_wanted();
+            if (SOCKETLEY_UNLIKELY(zlog &&
+                                   args[1].find(' ') != std::string_view::npos))
+            { repl_refuse(args[1]); zlog = false; }
+            int zadded = 0;
+            for (size_t zi = 0; zi < zscores.size(); ++zi)
+            {
+                const int i = 2 + static_cast<int>(zi) * 2;
+                const int zn = m_store.zadd(args[1], zscores[zi], args[i + 1]);
+                // A refusal this late is the store out of room, and whatever
+                // was logged below stands rather than diverging.
                 if (zn < 0)
                 { resp::encode_error_code_into(rb, wrongtype_msg); return; }
                 zadded += zn;
+                // One pair per record, like DEL and MSET and like
+                // dump_commands, because the text interpreter takes the whole
+                // remainder as the member: `ZADD z 1 a 2 b` reached a follower
+                // as the single member "a 2 b" scored 1.
+                if (zlog)
+                {
+                    std::string one;
+                    one.reserve(8 + args[1].size() + args[i + 1].size());
+                    one += "zadd ";
+                    one.append(args[1].data(), args[1].size());
+                    one += ' ';
+                    one += score_text(zscores[zi]);
+                    one += ' ';
+                    one.append(args[i + 1].data(), args[i + 1].size());
+                    replicate_command(one);
+                }
             }
-            repl(args, argc);
             resp::encode_integer_into(rb, zadded);
             break;
         }
