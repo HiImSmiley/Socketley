@@ -19,6 +19,10 @@
 #                            HTTP/1.0 response without one has
 #   HEAD                     ends at the headers, because the length it quotes
 #                            is the body a GET would have had
+#   a length and a short     an error, because the length is a promise and this
+#   body                     one was broken -- the only truncation a reader can
+#                            be certain of, since every other framing here ends
+#                            at the close and has no number to fall short of
 #
 # The last is the one a careless fix breaks: a HEAD reply says
 # Content-Length: 4096 and sends nothing, so waiting for 4096 bytes waits for
@@ -102,6 +106,13 @@ def serve(c):
             time.sleep(20)
             return
 
+        if path.startswith("/short"):
+            # Forty declared, ten sent, then a close: the shape a reader that
+            # stops at the close and never looks at what it was promised
+            # reports as a complete two-hundred.
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\nSHORT-BODY")
+            return
+
         if path.startswith("/nolength"):
             c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nNO-LENGTH-BODY")
             return                      # closes, which is its only framing
@@ -156,6 +167,7 @@ function on_start()
     say("LEN",   socketley.http({ url = "http://127.0.0.1:$ORIGIN/keepopen", timeout_ms = 4000 }))
     say("CHUNK", socketley.http({ url = "http://127.0.0.1:$ORIGIN/chunked",  timeout_ms = 4000 }))
     say("NOLEN", socketley.http({ url = "http://127.0.0.1:$ORIGIN/nolength", timeout_ms = 4000 }))
+    say("SHORT", socketley.http({ url = "http://127.0.0.1:$ORIGIN/short",    timeout_ms = 4000 }))
     say("HEAD",  socketley.http({ url = "http://127.0.0.1:$ORIGIN/keepopen", timeout_ms = 4000,
                                   method = "HEAD" }))
     -- Shorter, because the right answer here is to wait: it is the one call in
@@ -165,8 +177,8 @@ function on_start()
 end
 LUAEOF
 
-# Timed from outside: four calls that each waited out a 4s deadline would take
-# sixteen seconds, and four that stop at their framing take almost none.  The
+# Timed from outside: five calls that each waited out a 4s deadline would take
+# twenty seconds, and five that stop at their framing take almost none.  The
 # assertion is on the answers; this is what makes a regression legible.
 T0=$(date +%s%N)
 "$BIN" create server clen_caller -p "$CALLER" --lua "$SOCKETLEY_TMPD/probe.lua" >/dev/null 2>&1
@@ -182,13 +194,13 @@ line_for() { grep -oE "CLEN $1 .*" "$SOCKETLEY_DLOG" 2>/dev/null | tail -1; }
 
 L_LEN=$(line_for LEN); L_CHUNK=$(line_for CHUNK)
 L_NOLEN=$(line_for NOLEN); L_HEAD=$(line_for HEAD)
-L_TWOLEN=$(line_for TWOLEN)
+L_TWOLEN=$(line_for TWOLEN); L_SHORT=$(line_for SHORT)
 
-echo "  ${ELAPSED_MS} ms for four calls with a 4000 ms deadline each"
-for l in "$L_LEN" "$L_CHUNK" "$L_NOLEN" "$L_HEAD" "$L_TWOLEN"; do echo "    ${l:-<nothing logged>}"; done
+echo "  ${ELAPSED_MS} ms for five calls with a 4000 ms deadline each"
+for l in "$L_LEN" "$L_CHUNK" "$L_NOLEN" "$L_HEAD" "$L_TWOLEN" "$L_SHORT"; do echo "    ${l:-<nothing logged>}"; done
 
 if grep -q "CLEN DONE" "$SOCKETLEY_DLOG" 2>/dev/null; then ok
-else bad "the script ran all four calls" "no DONE line in the daemon log" \
+else bad "the script ran all six calls" "no DONE line in the daemon log" \
          "every assertion below is void"; fi
 
 case "$L_LEN" in
@@ -228,11 +240,25 @@ case "$L_TWOLEN" in
            "Section 6.3 says the message is unrecoverable rather than ambiguous" ;;
 esac
 
+# The one truncation this can be sure of: the peer named a length and closed
+# before reaching it.  A short body handed back under ok=true is worse than an
+# error, because the script has no second signal to check -- the close that
+# ended it is the same close that ends a correctly framed HTTP/1.0 response,
+# and over TLS the close_notify that would have told them apart is one
+# SSL_OP_IGNORE_UNEXPECTED_EOF accepts the absence of on purpose.
+case "$L_SHORT" in
+    *"ok=false"*"short of its Content-Length"*) ok ;;
+    *) bad "a body that stops short of its Content-Length is an error" \
+           "${L_SHORT:-nothing logged}" \
+           "the origin declared 40 bytes, sent 10, and closed; ok=true here" \
+           "hands the script ten bytes with nothing to distinguish them from forty" ;;
+esac
+
 # One deadline's worth of slack: four calls that stopped at their framing plus
 # one that is meant to wait 1200 ms cannot have spent four deadlines.
 if [ "$ELAPSED_MS" -lt 8000 ]; then ok
 else bad "the framed calls did not each wait out their deadline" \
-         "${ELAPSED_MS} ms for four calls of 4000 ms and one of 1200 ms" \
+         "${ELAPSED_MS} ms for five calls of 4000 ms and one of 1200 ms" \
          "at least two of them are waiting for a close that is not coming"; fi
 
 echo

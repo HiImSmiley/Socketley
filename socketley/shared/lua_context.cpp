@@ -1402,8 +1402,10 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
         }
 #if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
         // HTTP/1.0 with Connection: close, tolerating the missing close_notify
-        // a great many servers omit, at the cost that a truncated response is
-        // indistinguishable from a complete one.
+        // a great many servers omit, at the cost that TLS can no longer tell a
+        // truncated response from a complete one -- which is why the framing
+        // below counts the Content-Length down instead, and why a response
+        // that declared no length remains unjudgeable here.
         SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
 
@@ -1576,6 +1578,25 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
             }
         }
         ::close(sock);
+    }
+
+    // Both read loops have two exits and only one of them means the answer is
+    // whole: a peer that named a length and closed before reaching it ends the
+    // loop exactly as the length running out does.  It is reported rather than
+    // handed back as a short body because nothing else in the answer would say
+    // so -- the close that ended it is the same close that frames a correct
+    // HTTP/1.0 response, and over TLS the close_notify that would have told
+    // the two apart is one SSL_OP_IGNORE_UNEXPECTED_EOF accepts the absence of
+    // on purpose.  Only a declared length can be fallen short of, which is the
+    // whole of the condition: http_scan_header_lines refuses a header block
+    // carrying a transfer coding beside its Content-Length, and
+    // http_response_frame_complete() already answers yes for a HEAD or a 204
+    // that quotes one and sends nothing.
+    if (xfer_err.empty() && frame.has_content_length &&
+        !http_response_frame_complete(frame))
+    {
+        xfer_err = "the response stopped " + std::to_string(frame.body_remaining)
+                 + " bytes short of its Content-Length";
     }
 
     if (!xfer_err.empty()) { result["error"] = xfer_err; return result; }
