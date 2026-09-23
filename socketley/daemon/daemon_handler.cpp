@@ -6787,14 +6787,35 @@ int daemon_handler::cmd_daemon_cluster(ipc_connection* conn, const parsed_args& 
 
     std::string cluster_dir(pa.args[1]);
 
+    // Read before start_cluster(), which opens with stop_cluster() and so
+    // unpublishes from whatever this daemon is in now.
+    const std::string old_dir = m_owned_cluster
+        ? std::string(m_owned_cluster->get_cluster_dir()) : std::string();
+
     // A flag that cannot be honoured is refused with the reason named, loudly
     // enough to survive the exit code, and accepting --cluster while running
     // without it is never on offer.
     if (!start_cluster(m_daemon_name, cluster_dir))
     {
-        conn->write_buf = "cluster mode not enabled: " + m_cluster_error + "\n"
+        const std::string why = m_cluster_error;
+
+        // Put back the way a refused `daemon --name` puts the old name back,
+        // and for the sentence that refusal carries: the membership this
+        // daemon already held was never in dispute.
+        if (!old_dir.empty() && start_cluster(m_daemon_name, old_dir))
+        {
+            conn->write_buf = "cluster mode not enabled: " + why + "\n"
+                "  nothing was published into " + cluster_dir +
+                "; this daemon is still a member of " + old_dir + ".\n";
+            return 1;
+        }
+
+        conn->write_buf = "cluster mode not enabled: " + why + "\n"
             "  this daemon keeps serving, but it publishes nothing into "
             + cluster_dir + " and no peer can see it.\n";
+        if (!old_dir.empty())
+            conn->write_buf += "  and " + old_dir + " could not be reclaimed "
+                               "either: " + m_cluster_error + "\n";
         return 1;
     }
 
