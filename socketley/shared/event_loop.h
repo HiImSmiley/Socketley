@@ -36,9 +36,9 @@ public:
     ~event_loop();
 
     // ── Ring policy ─────────────────────────────────────────────────────────
-    // Both take effect at init() and only there, because io_uring fixes a
-    // ring's flags at creation, and calling either marks the choice explicit
-    // so a flag beats the environment.
+    // Takes effect at init() and only there, because io_uring fixes a ring's
+    // flags at creation, and calling it marks the choice explicit so a flag
+    // beats the environment.
     void set_cpus(const cpu_set_spec& cpus);
 
     bool init();

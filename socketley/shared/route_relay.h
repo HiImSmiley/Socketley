@@ -19,7 +19,9 @@ struct sink
 {
     virtual ~sink() = default;
 
-    // data, close, write, drop and broadcast; nothing is answered.
+    // open, data, close, write, drop and broadcast; nothing is answered, and
+    // open arrives here as well as at open() because a sink may send it down
+    // the connection's own path.
     virtual void post(std::string_view to, std::string_view from,
                       worker_proto::route_op op, const conn_ref& ref,
                       std::string_view payload) = 0;

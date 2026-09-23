@@ -73,6 +73,11 @@ void event_loop::shutdown_ring()
     // unmapped submission queue, because get_sqe() is the single door they all
     // go through.
     m_ring_open = false;
+    // Whatever was queued dies with the ring and the registrations with it, so
+    // nothing left standing says a submission or a file table is still there.
+    m_pending_submissions  = 0;
+    m_files_registered     = false;
+    m_registered_file_count = 0;
     io_uring_queue_exit(&m_ring);
 
     // Descriptors close_fd() was holding because the ring named them, swept
@@ -886,7 +891,8 @@ bool event_loop::init()
 
     }   // end NO_SQARRAY retry loop
 
-    // Priority 3: Plain mode
+    // Priority 2: plain mode, once SINGLE_ISSUER with and without NO_SQARRAY
+    // has been refused.
     if (!initialized)
     {
         if (io_uring_queue_init(m_queue_depth, &m_ring, 0) < 0)
@@ -954,7 +960,10 @@ bool event_loop::init()
 
 void event_loop::flush()
 {
-    if (m_pending_submissions > 0)
+    // The ring test get_sqe() makes, because this is the one submission-side
+    // entry that does not go through it and io_uring_submit() on a torn-down
+    // ring dereferences an unmapped queue.
+    if (m_ring_open && m_pending_submissions > 0)
     {
         io_uring_submit(&m_ring);
         m_pending_submissions = 0;
@@ -2047,12 +2056,21 @@ void event_loop::free_fixed_file_slot(uint32_t idx)
     uint32_t w = idx / 64;
     uint32_t bit = idx % 64;
 
+    // The completion in hand is discounted exactly as close_fd() and
+    // fd_inflight() discount it, because releasing the slot the handler's own
+    // completion was delivered for is every direct-descriptor teardown here --
+    // and counting it put a cancel round trip on all of them.
+    const uint32_t t = IO_TARGET_FIXED | idx;
+    uint32_t armed = m_fixed_armed[idx];
+    if (m_cqe_target  == t && armed > 0) --armed;
+    if (m_cqe_target2 == t && armed > 0) --armed;
+
     // With something still armed the cancel goes first and the unregister is
     // deferred, because a cancel naming a fixed index is matched when the SQE
     // is consumed while register_files_update() takes effect at once --
     // measured as "fixed cancel idx=0 -> res=-9" with the recv still armed
     // afterwards.
-    if (m_fixed_armed[idx] > 0)
+    if (armed > 0)
     {
         submit_cancel_fixed(idx);
         m_fixed_free_deferred[w]  |= (1ULL << bit);
