@@ -7913,25 +7913,54 @@ void proxy_instance::response_deadline_sweep()
         if (conn->closing)
             continue;
 
-        // Half-sent request, which cannot coincide with waiting on a backend,
-        // so the order between the two arms is only about which is cheaper to
-        // test.
+        // The two CAN coincide, which the order here used to deny.
+        // bound_pipelined_hold() arms the header deadline immediately before
+        // connect_to_backend() arms the response one -- the comment at that
+        // call says why it has to be there -- and that is the commonest
+        // pipelining shape of all: both requests in the first read of a fresh
+        // connection.  Testing this arm first and continuing while it was
+        // unexpired meant --backend-timeout and the circuit breaker were never
+        // reached for a client that pipelines: the backend could accept and
+        // then say nothing, and at ten seconds the client got 408 Request
+        // Timeout for a request it had sent in full, with nothing charged to
+        // the backend that did not answer.
         if (conn->awaiting_headers)
         {
-            if (now < conn->header_deadline)
+            if (now >= conn->header_deadline)
             {
-                still_waiting = true;
+                conn->awaiting_headers = false;
+                // Dropped for the same reason the malformed-request path drops
+                // them: the error carries Connection: close, and bytes still
+                // sitting in `partial` must not be picked up as a fresh request
+                // behind it.
+                conn->partial.clear();
+                // Through the guard every other self-answer in this runtime
+                // goes through, and this one did not.  clear_response_deadline()
+                // lowers awaiting_response when a backend starts answering and
+                // leaves this deadline armed, so a response that takes longer
+                // than the header bound -- a large file, an SSE stream, or any
+                // chunked reply, which http_response_frame_complete() never
+                // calls finished -- arrived here with its own bytes already on
+                // the client's wire.  A status line behind them lands at an
+                // offset that is not a message boundary.
+                if (client_answerable(conn))
+                {
+                    send_error(conn, "408 Request Timeout", "Request Timeout\n");
+                    continue;
+                }
+                // Torn down by hand, the way the 413 at the read ceiling is:
+                // send_error() queues a write and the write's completion is
+                // what drives the close, so a refusal with nothing to write
+                // would leave the pair up until the backend happened to say
+                // something -- and a backend that has stopped saying anything
+                // is the case this deadline is here for.
+                close_pair(cfd, conn->backend_fd, close_reason::force);
                 continue;
             }
-
-            conn->awaiting_headers = false;
-            // Dropped for the same reason the malformed-request path drops
-            // them: the error carries Connection: close, and bytes still
-            // sitting in `partial` must not be picked up as a fresh request
-            // behind it.
-            conn->partial.clear();
-            send_error(conn, "408 Request Timeout", "Request Timeout\n");
-            continue;
+            still_waiting = true;
+            // Falls through rather than continuing, because the response
+            // deadline below belongs to the other peer and is shorter than
+            // this one by default.
         }
 
         if (!conn->awaiting_response)

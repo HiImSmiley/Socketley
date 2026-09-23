@@ -185,10 +185,18 @@ ready_tcp 127.0.0.1 "$STREAM_BE" 8 || { echo "  SKIP: the streaming backend neve
 
 daemon_start "$BIN"
 
+# --backend-timeout well above the backends' five-second hold, because both of
+# them are exactly what the default two seconds is documented to notice: "a
+# backend which accepts connections and then stops answering".  The flood is
+# made of pipelined requests, and while the header deadline masked the response
+# one a run at the default reached the cap; unmasked it is answered 504 at two
+# seconds and the number measured is the deadline rather than the cap.
 create_ok "hold proxy created" "$BIN" create proxy px_hold \
-    -p "$HOLD_PX" --backend "127.0.0.1:$HOLD_BE" --protocol http
+    -p "$HOLD_PX" --backend "127.0.0.1:$HOLD_BE" --protocol http \
+    --backend-timeout 30
 create_ok "stream proxy created" "$BIN" create proxy px_stream \
-    -p "$STREAM_PX" --backend "127.0.0.1:$STREAM_BE" --protocol http
+    -p "$STREAM_PX" --backend "127.0.0.1:$STREAM_BE" --protocol http \
+    --backend-timeout 30
 "$BIN" start px_hold   >/dev/null 2>&1 || true
 "$BIN" start px_stream >/dev/null 2>&1 || true
 ready_tcp 127.0.0.1 "$HOLD_PX" 8   || echo "  note: px_hold never listened"
