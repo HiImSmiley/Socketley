@@ -64,6 +64,14 @@ public:
 
     ~shard_link() override
     {
+        // The owner slot attach() claimed, given back here because nothing
+        // else gave it back at all: register_owner() re-uses a slot only once
+        // its token is cleared, and MAX_OWNERS is 1024, so a peer restart --
+        // which retires one link and attaches another -- cost one of them
+        // permanently.  Safe with completions still in the ring: the token
+        // goes now and the slot stays claimed until they have drained.
+        if (m_loop)
+            m_loop->deregister_owner(this);
         if (m_fd >= 0 && !m_loop)
             ::close(m_fd);
     }
@@ -399,7 +407,9 @@ private:
     // at 16 KiB against 242/165/266 at 64 KiB, spread wider than the
     // difference.  That quarters the reads AND the submissions for the same
     // bytes, so it bounds a multishot recv here as well; the crossing's cost
-    // is the hop, not the read.
+    // is the hop, not the read.  Measured at one request in flight per
+    // connection, which is where a per-turn quantum would show worst: with
+    // many queued, one read already drains many frames.
     char        m_rbuf[16 * 1024];
     std::string m_in;
 

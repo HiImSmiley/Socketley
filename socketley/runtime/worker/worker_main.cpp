@@ -342,13 +342,15 @@ public:
 
                 // The same two states per link, because a standing recv is
                 // ended by a peer's frame and only a submission get_sqe()
-                // refused needs a clamp.
-                for (const auto& link : m_mesh_links)
-                    if (link->needs_wake())
-                    {
+                // refused needs a clamp.  Through for_each_link(), because the
+                // pump below uses it and a clamp that walked the mesh alone
+                // slept up to thirty seconds on a peer link the same refusal
+                // had left unarmed -- and a one-shard worker has no mesh at
+                // all, so the walk was over nothing.
+                for_each_link([&](shard_link& link) {
+                    if (link.needs_wake())
                         wait_ms = std::min(wait_ms, ctl_fallback_ms);
-                        break;
-                    }
+                });
 
                 // The turn did something exactly when the ring delivered
                 // something, taken here rather than inferred from a counter,
@@ -562,10 +564,17 @@ private:
         // Recorded here and not at the call sites, so the per-turn check below
         // and the start/stop/config reports cannot disagree about what the
         // daemon has been told.
-        m_last_sent_state = m_rt ? m_rt->get_state() : runtime_created;
+        const runtime_state s = m_rt ? m_rt->get_state() : runtime_created;
         std::string payload;
-        payload.push_back(static_cast<char>(static_cast<uint8_t>(m_last_sent_state)));
-        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload))) {}
+        payload.push_back(static_cast<char>(static_cast<uint8_t>(s)));
+        if (!m_writer.write(worker_proto::frame(worker_proto::frame_type::state, payload)))
+            return;
+
+        // Committed after the write and not before, exactly as push_stats does
+        // it and for a worse reason: the per-turn check re-sends only while
+        // this disagrees with the runtime, so a refused frame left the daemon
+        // printing Up for a runtime that had failed and never asked again.
+        m_last_sent_state = s;
     }
 
     // True when nothing remains to publish, false only for a frame the writer
