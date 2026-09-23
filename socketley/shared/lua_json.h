@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -71,7 +72,10 @@ inline int array_length(const sol::table& t)
         if (kv.first.get_type() != sol::type::number)
             return 0;
         const double d = kv.first.as<double>();
-        if (d < 1 || d != static_cast<double>(static_cast<int64_t>(d)))
+        // The magnitude is tested before the cast, because converting a double
+        // that int64 cannot hold is undefined and `t[1/0] = 1` is a key LuaJIT
+        // accepts.
+        if (d < 1 || d > 1e15 || d != static_cast<double>(static_cast<int64_t>(d)))
             return 0;
         if (d > highest) highest = d;
         ++count;
@@ -96,12 +100,29 @@ inline bool json_encode_value(std::string& out, const sol::object& val,
             break;
         case sol::type::number:
         {
-            double d = val.as<double>();
-            auto i = static_cast<int64_t>(d);
-            if (d == i && d >= -1e15 && d <= 1e15)
+            const double d = val.as<double>();
+
+            // JSON has no spelling for either, and %.14g writes `inf` or `nan`
+            // -- which the decoder twenty lines below refuses, so the two
+            // halves of one pair disagreed about their own grammar and the
+            // script was handed a string it could not have parsed back.
+            if (!std::isfinite(d))
+            {
+                char spelled[32];
+                snprintf(spelled, sizeof(spelled), "%.14g", d);
+                err = std::string("the number ") + spelled +
+                      " has no JSON spelling: a document can hold neither an "
+                      "infinity nor a NaN";
+                return false;
+            }
+
+            // The range before the cast, for the reason array_length gives.
+            if (d >= -1e15 && d <= 1e15 &&
+                d == static_cast<double>(static_cast<int64_t>(d)))
             {
                 char buf[24];
-                auto r = std::to_chars(buf, buf + sizeof(buf), i);
+                auto r = std::to_chars(buf, buf + sizeof(buf),
+                                       static_cast<int64_t>(d));
                 out.append(buf, static_cast<size_t>(r.ptr - buf));
             }
             else

@@ -336,6 +336,66 @@ else fail "array order survives the key sort" \
           "$(grep -o 'ARRAY_ORDER_BROKEN.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
           "an array's order is part of the value; only object keys may be sorted."; fi
 
+# ─── A number JSON cannot spell ─────────────────────────────────────────────
+#
+# %.14g writes `inf`, `-inf` and `nan`, none of which is a JSON token, so the
+# encoder produced a document its own decoder refuses -- and the script was
+# handed a string, so `if not s then` did not fire and the bytes went to the
+# client.  The cast that decides the integer form also ran BEFORE its range
+# test, which is undefined for any magnitude past int64 and is not covered by
+# -fsanitize=undefined on gcc.
+cat > "$SCRIPTS/nonfinite.lua" <<'LUA'
+function on_start()
+  local vals  = { 1/0, -1/0, 0/0 }
+  local names = { "inf", "-inf", "nan" }
+  local refused, emitted = 0, {}
+  for i, v in ipairs(vals) do
+    local s, why = socketley.json_encode({ x = v })
+    if not s and why then
+      refused = refused + 1
+    else
+      emitted[#emitted + 1] = names[i] .. "=" .. tostring(s)
+      -- The policy-independent half: whatever comes back has to be a document
+      -- this build's own decoder reads.
+      local back = socketley.json_decode(s)
+      if not back then socketley.log("NONFINITE_UNPARSEABLE " .. tostring(s)) end
+    end
+  end
+  socketley.log("NONFINITE_REFUSED " .. refused .. "/3")
+  if #emitted > 0 then
+    socketley.log("NONFINITE_EMITTED " .. table.concat(emitted, " | "))
+  end
+
+  -- The control: an ordinary enormous double is finite and must still encode
+  -- and still round trip.  A fix that refused everything past 1e15 would pass
+  -- every assertion above and fail this one.
+  local big = socketley.json_encode({ x = 1e300 })
+  local back = big and socketley.json_decode(big)
+  if back and back.x == 1e300 then socketley.log("BIG_OK " .. big)
+  else socketley.log("BIG_BROKEN " .. tostring(big)) end
+end
+LUA
+run_script jsonnonfinite $((P + 8)) "$SCRIPTS/nonfinite.lua"
+
+if said "NONFINITE_REFUSED 3/3"; then pass
+else fail "an infinity or a NaN is refused rather than written" \
+          "$(grep -o 'NONFINITE_REFUSED [0-9/]*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "$(grep -o 'NONFINITE_EMITTED.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "JSON has no token for either, so the script was handed a string and" \
+          "sent bytes no consumer can parse."; fi
+
+if said "NONFINITE_UNPARSEABLE"; then
+    fail "json_encode never produces what json_decode refuses" \
+         "$(grep -o 'NONFINITE_UNPARSEABLE.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+         "the two halves of one pair disagreed about their own grammar."
+else pass; fi
+
+if said "BIG_OK"; then pass
+else fail "a large finite double still encodes and round-trips" \
+          "$(grep -o 'BIG_BROKEN.*' "$SOCKETLEY_DLOG" 2>/dev/null | tail -1)" \
+          "1e300 is an ordinary number; refusing it means the guard is on" \
+          "magnitude rather than on finiteness."; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 if [ "$FAIL" -eq 0 ]; then echo "  OK"; else echo "  FAILED"; fi
 exit "$FAIL"
