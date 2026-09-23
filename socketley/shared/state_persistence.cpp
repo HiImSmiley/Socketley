@@ -323,11 +323,21 @@ std::string json_get_string(const std::string& json, std::string_view key)
             json.compare(pos + 1, key.size(), key.data(), key.size()) == 0 &&
             json[pos + 1 + key.size()] == '"')
         {
-            // Found the key — skip past closing quote
-            size_t after_key = pos + 1 + key.size() + 1;
-
-            size_t colon = json.find(':', after_key);
-            if (colon == std::string::npos) break;
+            // A key is followed by a colon -- the same sentence json_has_key
+            // and json_collect_keys carry, and the one place that did not ask.
+            // find(':', after_key) took the next colon ANYWHERE ahead, so a
+            // VALUE spelling the key matched and returned the following
+            // field's value: format_json_pretty writes "name" first, so a
+            // runtime named `target` read its own id as its target, one named
+            // `was_running` lost auto-restart, one named `port` restored with
+            // none.  valid_name allows every one of those.
+            const size_t after_key = pos + 1 + key.size() + 1;
+            const size_t colon = json.find_first_not_of(" \t\n\r", after_key);
+            if (colon == std::string::npos || json[colon] != ':')
+            {
+                pos++;          // a value that reads like a key; keep looking
+                continue;
+            }
 
             // Skip whitespace
             size_t vpos = json.find_first_not_of(" \t\n\r", colon + 1);
