@@ -1413,6 +1413,8 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    std::string start_refusal;
+
     if (autostart && !instance->get_test_mode())
     {
         std::string refusal;
@@ -1429,17 +1431,34 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
             // worse than none, which is what this path always did.
             if (!refusal.empty())
             {
-                std::cout << refusal;
-                return 1;
+                // Carried past the save rather than printed here, because the
+                // one save in this function is below and returning left
+                // exactly what the --test block further down was written to
+                // stop: a runtime that `ls` lists and `start` will bind, with
+                // no state file, dropped without a word at the next restart.
+                start_refusal = std::move(refusal);
+                // Nothing started, so the reconcile and the worker wait below
+                // have nothing to wait for.
+                autostart = false;
             }
-            std::cout << "could not start runtime\n";
-            m_manager.remove(name);
-            return 2;
+            else
+            {
+                std::cout << "could not start runtime\n";
+                m_manager.remove(name);
+                return 2;
+            }
         }
     }
 
     if (m_persistence && !instance->get_test_mode() && !instance->is_lua_created())
         m_persistence->save_runtime(instance);
+
+    // After the save, which is what it was carried this far for.
+    if (!start_refusal.empty())
+    {
+        std::cout << start_refusal;
+        return 1;
+    }
 
     // After the save, because the supervisor describes the child with the same
     // runtime_config the state file holds and reads it back off the instance.
@@ -4399,11 +4418,21 @@ int daemon_handler::cmd_add(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    // Create a server-type placeholder
-    if (!m_manager.create(runtime_server, name))
+    // Create a server-type placeholder, with the reason told apart from the
+    // outcome as cmd_create does: `--name a..b` is bad input and exits 1.
+    switch (m_manager.try_create(runtime_server, name))
     {
-        conn->write_buf = "could not create runtime\n";
-        return 2;
+        case runtime_manager::create_result::ok:
+            break;
+        case runtime_manager::create_result::invalid_name:
+            conn->write_buf = "invalid runtime name: " + name + "\n";
+            return 1;
+        case runtime_manager::create_result::name_taken:
+            conn->write_buf = "runtime already exists: " + name + "\n";
+            return 1;
+        case runtime_manager::create_result::internal:
+            conn->write_buf = "could not create runtime\n";
+            return 2;
     }
 
     auto* inst = m_manager.get(name);
@@ -4498,6 +4527,20 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
                 return 1;
             }
         }
+        else
+        {
+            // The branch cmd_add's own loop has and this one did not: an
+            // unknown flag, and --pid or --owner typed with nothing after it,
+            // fell out of the chain and the command went on to exit 0 -- so
+            // `attach server x 80 --pid` made a runtime with pid 0, which is
+            // the very thing the --pid check above was added to prevent.
+            const bool needs_value = pa.args[i] == "--pid"
+                                  || pa.args[i] == "--owner" || pa.args[i] == "-o";
+            conn->write_buf = std::string(pa.args[i])
+                            + (needs_value ? " requires a value\n"
+                                           : " is not an attach flag\n");
+            return 1;
+        }
     }
 
     // Check for name collision — allow re-attach of managed runtimes
@@ -4517,10 +4560,22 @@ int daemon_handler::cmd_attach(ipc_connection* conn, const parsed_args& pa)
         return 1;
     }
 
-    if (!m_manager.create(type, name))
+    // The reason told apart from the outcome, the way cmd_create does it: a
+    // name this daemon will not spell is bad input and exits 1, and exiting 2
+    // for it told a script the daemon had broken.
+    switch (m_manager.try_create(type, name))
     {
-        conn->write_buf = "internal error: could not create runtime\n";
-        return 2;
+        case runtime_manager::create_result::ok:
+            break;
+        case runtime_manager::create_result::invalid_name:
+            conn->write_buf = "invalid runtime name: " + std::string(name) + "\n";
+            return 1;
+        case runtime_manager::create_result::name_taken:
+            conn->write_buf = "runtime already exists: " + std::string(name) + "\n";
+            return 1;
+        case runtime_manager::create_result::internal:
+            conn->write_buf = "internal error: could not create runtime\n";
+            return 2;
     }
 
     auto* inst = m_manager.get(name);
