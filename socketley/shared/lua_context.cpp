@@ -2342,9 +2342,26 @@ void lua_context::register_bindings(runtime_instance* owner)
                                      "message could not be handed to it");
         }
         if (inst->get_type() == runtime_server)
-            inst->broadcast(msg);
-        else
-            inst->lua_send(msg);
+        {
+            // What the broadcast did, because self.broadcast was given this
+            // contract at the other door under a comment saying why: checking
+            // at one and not the other teaches a script author the check is
+            // not there.
+            const auto c = inst->broadcast(msg);
+            // Nobody connected is ordinary; every client dropped is not.
+            if (c.taken == 0 && c.backlogged > 0)
+                return api_why(q(name) + " dropped the message for all "
+                               + std::to_string(c.backlogged)
+                               + " of its connections, which are behind on "
+                                 "their writes");
+            return api_yes();
+        }
+        // Whether the message was written or queued: a client that is not
+        // connected, is --mode in, or has a full write queue answers no to all
+        // three and was reported here as a delivery.
+        if (!inst->lua_send(msg))
+            return api_why(q(name) + " had no connection to write or queue "
+                                     "the message on");
         return api_yes();
     };
 
