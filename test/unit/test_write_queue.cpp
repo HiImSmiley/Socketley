@@ -103,6 +103,49 @@ TEST_CASE("a payload at the coalescing limit is not copied")
     CHECK(q.size() == BATCH + 2);
 }
 
+// A tail seeded at the payload's own size doubled its way to the limit, copying
+// everything it held at each step -- 7.6% of a relaying worker was that copy and
+// most of its malloc was the steps.  The address not moving is the proof that
+// nothing was copied.
+TEST_CASE("a seeded tail takes the backlog it joined without moving")
+{
+    queue_t q;
+    fill_to_batch(q);
+    const size_t backlog = q.bytes();
+
+    q.push_shared(shared_of(200, 's'), LIMIT, BATCH);
+    REQUIRE(q.back().owns());
+    const char* at = q.back().data();
+
+    size_t taken = 200;
+    while (taken + 200 <= backlog)
+    {
+        q.push_shared(shared_of(200, 't'), LIMIT, BATCH);
+        taken += 200;
+    }
+    CHECK(q.size() == BATCH + 1);
+    CHECK(q.back().size() == taken);
+    CHECK(q.back().data() == at);
+}
+
+// And the other half, which is what keeps the reservation from being a leak: it
+// follows the bytes the queue is charged for, so a connection that is keeping up
+// gets a string its own size and none is ever larger than the limit.
+TEST_CASE("a seed is sized by the backlog, never past the limit")
+{
+    constexpr size_t small = 4096;
+    socketley::byte_counted_queue<std::string> q;
+
+    q.push_coalesced(std::string_view(std::string(3000, 'a')), small);
+    CHECK(q.back().capacity() < small);
+
+    const size_t backlog = q.bytes();
+    q.push_coalesced(std::string_view(std::string(2000, 'b')), small);
+    REQUIRE(q.size() == 2);
+    CHECK(q.back().capacity() >= backlog);
+    CHECK(q.back().capacity() < 2 * small);
+}
+
 TEST_CASE("one byte under the limit is still seeded, one byte over is not")
 {
     queue_t under;

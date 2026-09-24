@@ -3,6 +3,7 @@
 // Bounded by the memory it holds rather than the entries, each charged a fixed
 // overhead so empty messages are bounded too.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -219,7 +220,7 @@ public:
             append_back(value);
             return;
         }
-        push(T(std::string(value)));
+        push(T(seed(value, limit)));
     }
 
     // A payload several connections are sending, which is the same decision
@@ -262,7 +263,7 @@ public:
             push(T(value));
             return;
         }
-        push(T(std::string(*value)));
+        push(T(seed(*value, limit)));
     }
 
     // The same decision for a caller that owns the bytes, which is not a
@@ -356,6 +357,17 @@ public:
     }
 
 private:
+    // A new tail is sized for the backlog it joins, because a connection that
+    // far behind is about to take that much again and a string grown by
+    // doubling copies everything it holds at every step.
+    std::string seed(std::string_view first, size_t limit) const
+    {
+        std::string s;
+        s.reserve(std::min(limit, std::max(first.size(), m_bytes)));
+        s.append(first);
+        return s;
+    }
+
     bool fits_in_tail(size_t n, size_t limit) const
     {
         return !m_queue.empty() && write_queue_can_grow(m_queue.back()) &&
