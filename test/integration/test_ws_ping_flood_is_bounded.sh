@@ -23,6 +23,18 @@
 # however small the first figure is -- and a new client must still be served.
 set -uo pipefail
 
+# ─── NOT UNDER A SANITIZER ──────────────────────────────────────────────────
+# The bound is RSS, and ASan keeps freed blocks in a quarantine of up to 256 MB
+# on purpose, so a flood that allocates and frees reads as growth there: 75 MB
+# over the first half under Sanitize against 27 and +0 in Release on the same
+# tree, the same ratio the defect itself showed (193 against 76).  The rule
+# test_idle_connection_costs_little.sh states: measure the allocator the bound
+# was drawn from, and say so when handed another.
+if [ "${SOCKETLEY_CONFIG:-}" = "Sanitize" ]; then
+    echo "  SKIP: RSS under a flood measures ASan's quarantine under Sanitize"
+    exit 0
+fi
+
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 HERE=$(cd "$(dirname "$0")" && pwd)
