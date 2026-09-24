@@ -373,8 +373,8 @@ private:
     // Ring entries to try before sleeping; 32 covers the 92% of eligible
     // turns whose completion arrives within 2.2 of them.
     static constexpr uint32_t SPIN_BUDGET = 32;
-    // Turns of spinning a single batch buys; bounded so traffic that stops
-    // leaves at most this many extra ring entries behind it.
+    // Turns of spinning a batch or a successful spin buys; bounded so traffic
+    // that stops leaves at most this many extra ring entries behind it.
     static constexpr uint32_t BUSY_CREDIT = 64;
     uint32_t m_busy_credit{0};
     // The credit after a turn that found nothing: a batch refills it and a

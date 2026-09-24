@@ -1164,7 +1164,12 @@ uint32_t event_loop::poll_completions(int timeout_ms)
             if (enter_get_events() < 0)
                 break;
             if (io_uring_peek_cqe(&m_ring, &cqe) == 0 && cqe)
+            {
+                // A spin that found work is the phase still being busy, even
+                // when every turn of it drains one completion.
+                m_busy_credit = BUSY_CREDIT;
                 break;
+            }
             cqe = nullptr;
         }
 
