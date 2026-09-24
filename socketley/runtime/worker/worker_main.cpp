@@ -24,6 +24,7 @@
 #include "../../shared/endpoint_table.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
+#include "../../shared/exit_bound.h"
 #include "../../shared/lua_context.h"
 #include "../../shared/runtime_config_apply.h"
 #include "../../shared/route_relay.h"
@@ -96,6 +97,14 @@ volatile sig_atomic_t g_term_requested = 0;
 // five seconds because that is already the supervisor's escalation -- what the
 // alarm changes is who enforces it when the daemon is what died.
 constexpr unsigned worker_term_grace_sec = 5;
+
+// Re-armed only once a stop has been asked for, so a dump outside an exit
+// arms nothing.
+void worker_widen_exit_bound(unsigned seconds)
+{
+    if (g_term_requested)
+        ::alarm(seconds);
+}
 
 extern "C" void worker_on_term(int)
 {
@@ -286,6 +295,7 @@ public:
                                           // return so the loop can see the flag
             if (::sigaction(SIGTERM, &sa, nullptr) < 0) {}
         }
+        socketley::widen_exit_bound = worker_widen_exit_bound;
 
         // No ring yet, because io_uring fixes a ring's flags at creation and
         // the config frame is the only thing that tells a worker anything --

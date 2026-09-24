@@ -3,6 +3,7 @@
 #include "cache_instance.h"
 #include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
+#include "../../shared/exit_bound.h"
 #include "../../shared/dial_address.h"
 #include "../../shared/ipc_framing.h"
 #include "../../shared/trace.h"
@@ -848,6 +849,11 @@ bool cache_instance::setup(event_loop& loop)
 
 void cache_instance::teardown(event_loop& /*loop*/)
 {
+    // A dump is the one exit step that grows with the data, so it widens the
+    // bound a stopping worker is held to instead of being killed inside it.
+    if (!m_persistent_path.empty() && socketley::widen_exit_bound)
+        socketley::widen_exit_bound(socketley::dump_exit_bound_sec);
+
     // This shard's own slice into its own file, atomically, and never the bare
     // path, because a dump has to say what split it holds.
     const bool dumped = save_shard_dump();

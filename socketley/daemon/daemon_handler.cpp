@@ -24,6 +24,7 @@
 #include "../shared/worker_protocol.h"
 #include <shared_mutex>
 #include "../shared/runtime_config_apply.h"
+#include "../shared/exit_bound.h"
 #include "../shared/appending_file.h"
 #include "../shared/ipc_framing.h"
 #include "../shared/shard_target.h"
@@ -5645,11 +5646,17 @@ void daemon_handler::reconcile_proxy_workers()
 
     const auto retire_one = [this](std::unique_ptr<proxy_supervisor> sup)
     {
+        // Read before shutdown(), which is the last moment the placeholder is
+        // certainly this supervisor's runtime.
+        const auto* ph = sup->placeholder();
+        const bool dumps = ph && ph->get_type() == runtime_cache &&
+            !static_cast<const cache_instance*>(ph)->get_persistent().empty();
         sup->shutdown();
         // shutdown() reaps only a child that was already gone, so this is the
         // last moment anything knows the pid.
         if (const pid_t p = sup->release_pid(); p > 0)
-            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false});
+            m_orphan_workers.push_back({p, std::chrono::steady_clock::now(), false,
+                std::chrono::seconds(dumps ? socketley::dump_exit_bound_sec : 5)});
 
         const uint32_t tok = sup->retire();
         m_retired_handlers.push_back({std::move(sup), tok});
@@ -6361,11 +6368,7 @@ void daemon_handler::reap_orphan_workers()
     if (m_orphan_workers.empty())
         return;
 
-    // Long enough for a worker to cancel its ring and close its connections,
-    // short enough that a daemon stopping runtimes in a loop does not
-    // accumulate them.
-    constexpr auto kill_after = std::chrono::seconds(5);
-    const auto     now        = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
 
     for (auto it = m_orphan_workers.begin(); it != m_orphan_workers.end();)
     {
@@ -6379,7 +6382,7 @@ void daemon_handler::reap_orphan_workers()
             continue;
         }
 
-        if (!it->killed && now - it->signalled_at > kill_after)
+        if (!it->killed && now - it->signalled_at > it->grace)
         {
             const std::string note = "worker " + std::to_string(it->pid) +
                                      " did not exit on SIGTERM; killing it";

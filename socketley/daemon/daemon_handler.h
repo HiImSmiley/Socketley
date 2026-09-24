@@ -319,6 +319,9 @@ private:
         pid_t                                 pid;
         std::chrono::steady_clock::time_point signalled_at;
         bool                                  killed{false};
+        // How long before SIGKILL: five seconds, or the dump's own bound for a
+        // cache that writes one on its way out.
+        std::chrono::seconds                  grace{5};
     };
     std::vector<orphan_worker> m_orphan_workers;
 
