@@ -2443,6 +2443,21 @@ void cache_store::dump_commands(std::string& buf) const
 
 static constexpr char MAGIC_V2[4] = {'S', 'K', 'V', '2'};
 
+// An expiry flag of 1 is the remaining time at the save, which is what every
+// dump before this one wrote; 2 is the deadline in wall-clock milliseconds.
+static constexpr uint8_t expiry_absolute = 2;
+
+static int64_t expiry_left_ms(uint8_t flag, int64_t v, int64_t wall_now_ms)
+{
+    return flag == expiry_absolute ? v - wall_now_ms : v;
+}
+
+static int64_t wall_clock_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 // Append-only: an older build reads a dump it does not know the types in,
 // which is why a new one goes on the end and never in the middle.
 enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3,
@@ -2513,7 +2528,7 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     size_t total_size = prefix.size() + 4;  // caller's header, then MAGIC_V2
 
     auto entry_overhead = [&](std::string_view key) -> size_t {
-        // type(1) + key_len(4) + key + expiry_flag(1) [+ remaining_ms(8)]
+        // type(1) + key_len(4) + key + expiry_flag(1) [+ deadline_ms(8)]
         size_t sz = 1 + 4 + key.size() + 1;
         auto eit = m_expiry.find(key);
         if (eit != m_expiry.end()) sz += 8;
@@ -2578,6 +2593,7 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
 
     char* p = static_cast<char*>(map);
     auto now = std::chrono::steady_clock::now();
+    const int64_t wall_now_ms = wall_clock_ms();
 
     auto emit = [&](const void* src, size_t n) { std::memcpy(p, src, n); p += n; };
     auto emit_u8  = [&](uint8_t v)  { *p++ = static_cast<char>(v); };
@@ -2602,11 +2618,11 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
         }
         else
         {
-            emit_u8(1);
-            int64_t remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                eit->second - now).count();
-            if (remaining_ms < 0) remaining_ms = 0;
-            emit_i64(remaining_ms);
+            // A wall-clock deadline, because a remaining time restored a week
+            // later grants the whole of it again.
+            emit_u8(expiry_absolute);
+            emit_i64(wall_now_ms + std::chrono::duration_cast<std::chrono::milliseconds>(
+                eit->second - now).count());
         }
     };
 
@@ -2768,6 +2784,7 @@ bool cache_store::load_v2(const char* data, size_t size)
     flush_all();
 
     auto now = std::chrono::steady_clock::now();
+    const int64_t wall_now_ms = wall_clock_ms();
     const char* p = data;
     const char* end = data + size;
 
@@ -2803,16 +2820,18 @@ bool cache_store::load_v2(const char* data, size_t size)
         return true;
     };
 
-    auto read_expiry = [&](const std::string& key) {
+    // False on a short read, and `expired` set for a deadline already past, so
+    // every type is dropped alike rather than restored with no deadline at all.
+    auto read_expiry = [&](const std::string& key, bool& expired) -> bool {
         uint8_t has = 0;
-        if (!read_u8(has)) return;
-        if (has)
-        {
-            int64_t remaining_ms = 0;
-            if (!read_i64(remaining_ms)) return;
-            if (remaining_ms > 0)
-                m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
-        }
+        if (!read_u8(has)) return false;
+        if (has == 0) return true;
+        int64_t v = 0;
+        if (!read_i64(v)) return false;
+        const int64_t left = expiry_left_ms(has, v, wall_now_ms);
+        if (left > 0) m_expiry[key] = now + std::chrono::milliseconds(left);
+        else          expired = true;
+        return true;
     };
 
     while (p < end)
@@ -2831,17 +2850,7 @@ bool cache_store::load_v2(const char* data, size_t size)
             {
                 std::string value;
                 if (!read_string(value)) return false;
-                uint8_t has = 0;
-                if (!read_u8(has)) return false;
-                if (has)
-                {
-                    int64_t remaining_ms = 0;
-                    if (!read_i64(remaining_ms)) return false;
-                    if (remaining_ms > 0)
-                        m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
-                    else
-                        expired = true;
-                }
+                if (!read_expiry(key, expired)) return false;
                 if (!expired)
                     adopt_loaded_string(std::move(key), std::move(value));
                 break;
@@ -2857,8 +2866,8 @@ bool cache_store::load_v2(const char* data, size_t size)
                     if (!read_string(elem)) return false;
                     deq.push_back(std::move(elem));
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_list(std::move(key), std::move(deq));
                 break;
             }
@@ -2873,8 +2882,8 @@ bool cache_store::load_v2(const char* data, size_t size)
                     if (!read_string(member)) return false;
                     s.insert(std::move(member));
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_set(std::move(key), std::move(s));
                 break;
             }
@@ -2890,8 +2899,8 @@ bool cache_store::load_v2(const char* data, size_t size)
                     if (!read_string(val)) return false;
                     h[std::move(field)] = std::move(val);
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
@@ -2910,8 +2919,8 @@ bool cache_store::load_v2(const char* data, size_t size)
                     z.order.emplace(sc, member);
                     z.score.emplace(std::move(member), sc);
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_zset(std::move(key), std::move(z));
                 break;
             }
@@ -2940,6 +2949,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
     m_lru_map.clear();
 
     auto now = std::chrono::steady_clock::now();
+    const int64_t wall_now_ms = wall_clock_ms();
 
     auto read_string = [&](std::string& out) -> bool {
         uint32_t len = 0;
@@ -2953,16 +2963,19 @@ bool cache_store::load_v2_stream(std::ifstream& file)
         return file.good() || file.eof();
     };
 
-    auto read_expiry = [&](const std::string& key) {
+    // The same rule as load_v2's, over a stream.
+    auto read_expiry = [&](const std::string& key, bool& expired) -> bool {
         uint8_t has = 0;
         file.read(reinterpret_cast<char*>(&has), 1);
-        if (has)
-        {
-            int64_t remaining_ms = 0;
-            file.read(reinterpret_cast<char*>(&remaining_ms), sizeof(remaining_ms));
-            if (remaining_ms > 0)
-                m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
-        }
+        if (!file) return false;
+        if (has == 0) return true;
+        int64_t v = 0;
+        file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        if (!file) return false;
+        const int64_t left = expiry_left_ms(has, v, wall_now_ms);
+        if (left > 0) m_expiry[key] = now + std::chrono::milliseconds(left);
+        else          expired = true;
+        return true;
     };
 
     while (file)
@@ -2982,17 +2995,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
             {
                 std::string value;
                 if (!read_string(value)) return false;
-                uint8_t has = 0;
-                file.read(reinterpret_cast<char*>(&has), 1);
-                if (has)
-                {
-                    int64_t remaining_ms = 0;
-                    file.read(reinterpret_cast<char*>(&remaining_ms), sizeof(remaining_ms));
-                    if (remaining_ms > 0)
-                        m_expiry[key] = now + std::chrono::milliseconds(remaining_ms);
-                    else
-                        expired = true;
-                }
+                if (!read_expiry(key, expired)) return false;
                 if (!expired)
                     adopt_loaded_string(std::move(key), std::move(value));
                 break;
@@ -3009,8 +3012,8 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     if (!read_string(elem)) return false;
                     deq.push_back(std::move(elem));
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_list(std::move(key), std::move(deq));
                 break;
             }
@@ -3026,8 +3029,8 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     if (!read_string(member)) return false;
                     s.insert(std::move(member));
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_set(std::move(key), std::move(s));
                 break;
             }
@@ -3044,8 +3047,8 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     if (!read_string(val)) return false;
                     h[std::move(field)] = std::move(val);
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_hash(std::move(key), std::move(h));
                 break;
             }
@@ -3065,8 +3068,8 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     z.order.emplace(sc, member);
                     z.score.emplace(std::move(member), sc);
                 }
-                read_expiry(key);
-                if (!m_expiry.count(key) || m_expiry[key] > now)
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
                     adopt_loaded_zset(std::move(key), std::move(z));
                 break;
             }
