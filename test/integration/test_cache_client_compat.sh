@@ -188,6 +188,20 @@ ok "$(redis-cli -p "$SP" dbsize 2>/dev/null)" "0" "and none of its writes ran ou
 ok "$(printf 'MULTI\nPING\nEXEC\n' | redis-cli -p "$SP" 2>/dev/null | tr '\n' ' ')" "OK QUEUED PONG " \
    "a transaction naming no key still runs on a sharded cache"
 
+# ── one script cannot change what the next one runs ─────────────────────────
+ev() { redis-cli -p "$P" eval "$1" 0 2>&1 | head -1; }
+for tamper in "redis.call = function() return 'x' end" "redis = nil" \
+              "string.rep = function() return 'x' end" \
+              "getmetatable('').__index.upper = function() return 'x' end" \
+              "rawset(string, 'rep', function() return 'x' end)"; do
+    case "$(ev "$tamper")" in *rror*|ERR*) ok y y "refused: $tamper" ;;
+        *) ok "$(ev "$tamper")" "an error" "refused: $tamper" ;; esac
+done
+ok "$(ev "return redis.call('ping')")" "PONG" "redis.call still works for the next script"
+ok "$(ev "return string.rep('a', 3)")" "aaa" "and string.rep"
+ok "$(ev "return ('a'):upper()")" "A" "and the string methods"
+ok "$(ev "return table.concat({'a','b'}, '-') .. math.floor(2.5)")" "a-b2" "and table and math"
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
 exit "$FAIL"

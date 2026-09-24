@@ -381,16 +381,40 @@ void cache_script_engine::ensure_state()
     //
     // getfenv and setfenv are already nil in this sandbox, and load, loadstring
     // and require with them, so there is no second way to name it.
+    //
+    // And the names that already exist are locked too, which the metatable
+    // alone did not do: `redis.call = f` or `redis = nil` in one script held
+    // for every later script from every client, so the globals move into a
+    // backing table behind __index, the libraries behind read-only proxies,
+    // the string metatable behind __metatable, and rawset out of reach.
     m_lua.script(
         "local g = _G\n"
-        "rawset(g, \"_G\", nil)\n"          // no name for the table any more
-        "local mt = {}\n"
-        "mt.__newindex = function(_, n, _)\n"
-        "  error(\"Script attempted to create global variable '\" ..\n"
-        "        tostring(n) .. \"'\", 2)\n"
+        "local rawset, pairs, ipairs, setmetatable, getmetatable, type =\n"
+        "      rawset, pairs, ipairs, setmetatable, getmetatable, type\n"
+        "local function ro(t)\n"
+        "  return setmetatable({}, { __index = t, __metatable = false,\n"
+        "    __newindex = function() error('Attempt to modify a readonly table', 2) end })\n"
         "end\n"
-        "mt.__metatable = false\n"           // and the lid cannot be lifted
-        "setmetatable(g, mt)\n");
+        "getmetatable('').__metatable = false\n"
+        "local backing = {}\n"
+        "for k, v in pairs(g) do backing[k] = v end\n"
+        "for _, n in ipairs({ 'string', 'table', 'math', 'redis' }) do\n"
+        "  if type(backing[n]) == 'table' then backing[n] = ro(backing[n]) end\n"
+        "end\n"
+        "backing.server = backing.redis\n"
+        "backing.rawset = nil\n"
+        "backing._G = nil\n"
+        "local names = {}\n"
+        "for k in pairs(g) do names[#names + 1] = k end\n"
+        "for _, k in ipairs(names) do rawset(g, k, nil) end\n"
+        "setmetatable(g, { __index = backing, __metatable = false,\n"
+        "  __newindex = function(_, n)\n"
+        "    if backing[n] ~= nil then\n"
+        "      error(\"Attempt to modify a readonly table: '\" .. tostring(n) .. \"'\", 2)\n"
+        "    end\n"
+        "    error(\"Script attempted to create global variable '\" ..\n"
+        "          tostring(n) .. \"'\", 2)\n"
+        "  end })\n");
 }
 
 bool cache_script_engine::eval(std::string_view body,
