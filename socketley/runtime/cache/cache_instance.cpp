@@ -11353,15 +11353,22 @@ void cache_instance::follower_kick(follower_conn& f)
         return;
 
     // Safe to touch `out` only now that nothing is in flight.
-    if (f.out.empty() && !f.queued.empty())
-        f.out.swap(f.queued);
+    if (f.out_off == f.out.size())
+    {
+        f.out.clear();
+        f.out_off = 0;
+        if (!f.queued.empty())
+            f.out.swap(f.queued);
+    }
     if (f.out.empty())
         return;
 
-    f.in_flight = f.out.size();
+    // Bounded per write, because the length field is 32 bits and a dump is not.
+    constexpr size_t max_write = size_t{1} << 30;
+    f.in_flight = std::min(f.out.size() - f.out_off, max_write);
     f.write_req = { this, nullptr, f.fd, static_cast<uint32_t>(f.in_flight), op_write };
     f.write_pending = true;
-    if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(f.fd, f.out.data(),
+    if (SOCKETLEY_UNLIKELY(!m_loop->submit_write(f.fd, f.out.data() + f.out_off,
                                                  static_cast<uint32_t>(f.in_flight), &f.write_req)))
     {
         // Nothing restarts the stream after this, so the follower is dropped
@@ -11381,7 +11388,7 @@ bool cache_instance::follower_write(follower_conn& f, std::string_view data)
 
     f.queued.append(data.data(), data.size());
 
-    if (f.backlog() > MAX_FOLLOWER_PENDING)
+    if (f.backlog() > MAX_FOLLOWER_PENDING + f.sync_left)
     {
         std::cerr << "[cache] follower too far behind ("
                   << f.backlog() << " bytes queued), dropping\n";
@@ -11411,7 +11418,8 @@ void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_co
 
     // A short write is normal; only the acknowledged prefix may be dropped.
     size_t written = std::min(static_cast<size_t>(cqe->res), f.in_flight);
-    f.out.erase(0, written);
+    f.out_off += written;
+    f.sync_left -= std::min(f.sync_left, written);
     f.in_flight = 0;
 
     follower_kick(f);
@@ -11634,6 +11642,7 @@ bool cache_instance::send_full_dump(follower_conn& f)
     // link was down is exactly the case that leaves the follower full.
     // Queued rather than written synchronously, because a dataset exceeds the
     // socket buffer and the follower may be a runtime inside this very daemon.
+    f.sync_left = f.backlog() + buf.size();
     return follower_write(f, buf);
 }
 

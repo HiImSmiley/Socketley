@@ -1128,18 +1128,24 @@ private:
         // Two buffers, because the kernel reads directly out of `out` for the
         // duration of a write and appending could reallocate it under the
         // operation.
-        std::string out;            // kernel owns out[0..in_flight) while writing
+        std::string out;            // kernel owns out[out_off..out_off+in_flight) while writing
         std::string queued;         // produced since the current write started
+        // Advanced rather than erased, because a dump is written in many short
+        // writes and erasing the front of it after each one is quadratic.
+        size_t out_off{0};
         size_t in_flight{0};
+        // Bytes of the full dump not yet taken by the kernel, which the lag cap
+        // is measured above, because the dump is the dataset and not lag.
+        size_t sync_left{0};
         io_request write_req{};
         bool write_pending{false};
         bool dead{false};
 
-        size_t backlog() const { return out.size() + queued.size(); }
+        size_t backlog() const { return out.size() - out_off + queued.size(); }
     };
-    // Cap on buffered-but-unsent replication data per follower, past which it
-    // is dropped, because an explicit disconnect is recoverable and a
-    // corrupted command stream is not.
+    // Cap on buffered-but-unsent replication data per follower beyond its full
+    // dump, past which it is dropped, because an explicit disconnect is
+    // recoverable and a corrupted command stream is not.
     static constexpr size_t MAX_FOLLOWER_PENDING = 8 * 1024 * 1024;
 
     // unique_ptr because the kernel holds a pointer to each write_req for the
