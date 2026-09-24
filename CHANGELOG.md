@@ -5,6 +5,39 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **A cache serves only this machine unless told otherwise.** A TCP peer whose
+  address is not loopback is answered `-DENIED` and closed. A cache has no
+  password and answers every client with everything it holds, so reaching one
+  from the network is now something to say: create it with `--public`, or give
+  its listener mutual TLS (`--tls --ca`). A follower on another host needs its
+  leader to be public. Unix-socket peers are unaffected.
+- A relative path in a flag the daemon opens (`--lua`, `--log`, `-w`,
+  `--persistent`, `--http`, the TLS files, `--listen unix:`) is resolved against
+  the directory the command was typed in, not the daemon's.
+- A proxied HTTP request carries `X-Forwarded-For`, `-Proto` and `-Host`.
+- The daemon ignores SIGHUP; rotate `--log` and `-w` files with `copytruncate`.
+- The packaged unit reads home directories (`ProtectHome=read-only`), so a
+  script or certificate kept there can be used.
+
+### Fixed
+
+- The proxy finds the end of a chunked response, so the next keep-alive request
+  is served at once instead of after the 10 s header deadline, and the end of a
+  chunked request body, so a request pipelined behind one is checked like any
+  other instead of reaching the backend raw.
+- A follower can join a leader holding more than 8 MiB.
+- A dump restores a TTL as the deadline it was, not as the time that was left.
+- A write accepted after a torn journal tail survives the next crash.
+- `EVAL` refuses precompiled bytecode.
+- Twelve cache answers Redis clients depend on, among them a bare
+  `UNSUBSCRIBE`, the subscription count, `HSET`'s count, `READONLY`, and
+  `FLUSHALL` and `MULTI` on a sharded cache.
+- A stopping persistent cache is given time to finish its dump.
+
 ## [1.1.0] - 2026-08-27
 
 Six months of work since v1.0.9, across 581 commits. The headline is that a
