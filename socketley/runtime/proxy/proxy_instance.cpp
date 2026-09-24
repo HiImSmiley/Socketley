@@ -262,6 +262,7 @@ void proxy_client_connection::reset(int new_fd)
     header_parsed = false;
     response_started = false;
     client_conn_close = false;
+    wr_shutdown = false;
     backend_fd = -1;
     write_batch_count = 0;
     read_req = {};
@@ -3965,7 +3966,9 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
 
     // Forward to client
     const bool lent = forward_to_client(conn, {data_ptr, forward_len},
-                                        lendable_buf(is_provided, buf_id, forward_len));
+                                        lendable_buf(is_provided, buf_id, forward_len),
+                                        m_protocol == protocol_http && !conn->splice_active &&
+                                        backend_response_complete(conn));
 
     // The response framing decides both whether the socket may be pooled and
     // how much of this chunk the client may see, which were one question all
@@ -6585,6 +6588,29 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
     }
 }
 
+// ─── WE SEND THE FIN, NOT THE CLIENT ────────────────────────────────────────
+// The server's rule (maybe_shutdown_write) for the same reason: a closing
+// client waited for its armed read to come back before the close sent a FIN,
+// the client read its answer and closed first, and its ephemeral port took the
+// TIME-WAIT.  shutdown() and not close(), once nothing is owed, so the FIN
+// cannot overtake the payload.
+void proxy_instance::shutdown_client_write(proxy_client_connection* conn)
+{
+    if (!conn->closing || conn->wr_shutdown || conn->fd < 0 || !conn->read_pending)
+        return;
+
+    // A TLS connection owes a close_notify record first.
+    if (conn->ssl != nullptr)
+        return;
+
+    if (conn->write_pending || !conn->write_queue.empty() ||
+        conn->splice_in_pending || conn->splice_out_pending)
+        return;
+
+    conn->wr_shutdown = true;
+    if (shutdown(conn->fd, SHUT_WR) < 0) {}
+}
+
 void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reason)
 {
     // This checks rather than decides, because close_pair cannot tell a polite
@@ -6779,7 +6805,11 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     !flush_client_write_queue(conn))
                     defer_c = false;
                 else
+                {
                     shutdown(client_fd, SHUT_RD);
+                    if (!peer_splicing_into_client)
+                        shutdown_client_write(conn);
+                }
 
                 // Same rule as the two backend blocks above, with the peer's
                 // splice counted in: it names this descriptor and its
@@ -8765,8 +8795,48 @@ void proxy_instance::refuse_response(proxy_backend_connection* bconn,
     bconn->closing = true;
 }
 
+// ─── THE LAST BYTES AND THE FIN IN ONE TURN ─────────────────────────────────
+// A client that asked to close reads its answer and closes first unless our FIN
+// is already behind the data, and a FIN sent from the write's completion is a
+// batch too late once the loop is serving others: at 32 connection-per-request
+// clients 80% of the TIME-WAITs landed on the clients' ephemeral ports, the
+// same on the --http server, whose completion-time shutdown wins only at one
+// client.  So the final bytes of a response nobody queued ahead of go out by a
+// direct send() and the shutdown follows in the same turn; whatever the socket
+// does not take is queued as before and the FIN waits for it.
+bool proxy_instance::send_final_and_fin(proxy_client_connection* cconn, std::string_view data)
+{
+    if (cconn->write_pending || !cconn->write_queue.empty() || cconn->ssl != nullptr ||
+        cconn->splice_in_pending || cconn->splice_out_pending || cconn->fd < 0 ||
+        cconn->wr_shutdown || !(cconn->client_conn_close || cconn->client_eof))
+        return false;
+
+    size_t off = 0;
+    while (off < data.size())
+    {
+        // MSG_MORE holds the bytes for the shutdown below, so the FIN rides in
+        // the same segment and the client cannot read the answer without it.
+        const ssize_t n = ::send(cconn->fd, data.data() + off, data.size() - off,
+                                 MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
+        if (n > 0) { off += static_cast<size_t>(n); continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (off < data.size())
+    {
+        cconn->write_queue.emplace(std::string(data.substr(off)));
+        if (!flush_client_write_queue(cconn))
+            cconn->closing = true;
+        return true;
+    }
+
+    cconn->wr_shutdown = true;
+    if (shutdown(cconn->fd, SHUT_WR) < 0) {}
+    return true;
+}
+
 bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::string_view data,
-                                       int lent_buf)
+                                       int lent_buf, bool last)
 {
     if (SOCKETLEY_UNLIKELY(!m_loop))
         return false;
@@ -8849,6 +8919,13 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     if (SOCKETLEY_UNLIKELY(cconn->write_queue.bytes() >= write_buffer_bytes()))
     {
         cconn->closing = true;
+        return false;
+    }
+
+    const std::string_view out = hook_modified ? std::string_view(hook_storage) : data;
+    if (last && send_final_and_fin(cconn, out))
+    {
+        m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
         return false;
     }
 
@@ -9363,6 +9440,8 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         close_pair(fd, conn->backend_fd);
         return;
     }
+    else
+        shutdown_client_write(conn);
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&

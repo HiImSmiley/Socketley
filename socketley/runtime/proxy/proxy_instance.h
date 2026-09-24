@@ -112,6 +112,8 @@ struct alignas(64) proxy_client_connection
     bool header_parsed{false};
     bool response_started{false};
     bool client_conn_close{false};  // client sent Connection: close
+    // Our FIN is out, sent before the armed read comes back so the client is not the one to close.
+    bool wr_shutdown{false};
     int backend_fd{-1};
     uint32_t write_batch_count{0};
     io_request read_req;
@@ -720,6 +722,7 @@ private:
     // pair, withdrawing a claim rather than a guard, so a path added later
     // inherits the assertion instead of having to remember it.
     enum class close_reason { normal, force };
+    void shutdown_client_write(proxy_client_connection* conn);
     void close_pair(int client_fd, int backend_fd,
                     close_reason reason = close_reason::normal);
     inline void close_pair_close_backend(int backend_fd,
@@ -808,7 +811,8 @@ private:
     bool forward_to_backend(proxy_client_connection* conn, std::string_view data,
                             int lent_buf = -1);
     bool forward_to_client(proxy_backend_connection* conn, std::string_view data,
-                           int lent_buf = -1);
+                           int lent_buf = -1, bool last = false);
+    bool send_final_and_fin(proxy_client_connection* cconn, std::string_view data);
 
     // Mark both sides of a pair whose response an on_proxy_response hook
     // refused, because handle_backend_read is gated on the backend's flag and
