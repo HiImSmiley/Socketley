@@ -37,9 +37,8 @@
 #   not in a Lua table at file scope, which each shard has its own copy of.
 #   Step [3/4] below shows both halves.
 #
-#   self.route is still refused in a worker, sharded or not: it hands a live
-#   client to another runtime and runs that runtime's on_connect on this
-#   thread's stack, and there is no channel for that between two processes.
+#   self.route works from a shard as from any worker: the shard that accepted
+#   the client keeps the socket and relays, and the target answers.
 #
 # WHAT IT COSTS:
 #   Throughput bought with cores, not with efficiency.  Measured on this tree,
@@ -126,17 +125,27 @@ socketley create server chat -p 9111 --shards 4 --lua /tmp/sharded-server-demo.l
 socketley remove chat >/dev/null 2>&1 || true
 
 echo ""
-echo "[4/4] Two combinations that are refused rather than ignored:"
+echo "[4/4] Two combinations that used to be refused, and what they do now:"
 echo ""
-echo "  \$ socketley create server s --shards 4 --listen unix:/tmp/s.sock"
-socketley create server s --shards 4 --listen unix:/tmp/s.sock || true
-echo "     (SO_REUSEPORT shares a port; a unix socket is a path, and N"
-echo "      processes would unlink each other's node)"
+echo "  \$ socketley create server s --shards 4 --listen unix:/tmp/s.sock -s"
+socketley create server s --shards 4 --listen unix:/tmp/s.sock -s || true
+sleep 0.5
+echo "     (a unix socket is a path, not a port, so each shard binds a node"
+echo "      of its own and a caller picks any of them)"
+ls -1 /tmp/s#*.sock 2>/dev/null | sed 's/^/       /' || true
+socketley remove s >/dev/null 2>&1 || true
 echo ""
-echo "  \$ socketley create cache c -p 9113 --shards 4"
-socketley create cache c -p 9113 --shards 4 || true
-echo "     (N shards would be N separate stores behind one port, so a SET"
-echo "      lands in one process and a later GET asks another)"
+echo "  \$ socketley create cache c -p 9113 --shards 4 -s"
+socketley create cache c -p 9113 --shards 4 -s || true
+for _ in $(seq 1 40); do
+    printf 'set k v\n' | nc -q1 127.0.0.1 9113 2>/dev/null | grep -q ok && break
+    sleep 0.25
+done
+echo "     (one keyspace: each shard owns a slice, and a key another shard owns"
+echo "      is fetched from it, so a GET on a new connection finds the SET)"
+printf 'get k\n' | nc -q1 127.0.0.1 9113 2>/dev/null | sed 's/^/       get k -> /' || true
+socketley remove c >/dev/null 2>&1 || true
+echo "     See ../cache/sharded-cache.sh."
 
 rm -f /tmp/sharded-server-demo.lua
 

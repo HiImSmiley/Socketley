@@ -15,8 +15,11 @@ A high-performance Linux daemon and CLI that manages network runtimes (servers, 
 >   to its backends, with the backend handshake reused rather than repeated per
 >   request
 >
-> `--ca` adds mutual TLS on a listener; `--cert`/`--key` are the certificate a
-> client or proxy presents when a peer asks for one.
+> `--cert`/`--key` are the certificate a server, cache or proxy listener serves,
+> and the one a client presents when its peer asks for one. `--ca` is mutual TLS
+> on a server or cache listener, and the trust store for the peer a client or
+> proxy dials. A proxy's own listener takes mutual TLS from `--client-ca`, and
+> presents `--client-cert`/`--client-key` to a backend that asks for one.
 >
 > **The one thing with no handshake behind it is a datagram socket.** `--tls`
 > with `--udp` would be DTLS, which is not implemented, and it is refused.
@@ -31,8 +34,9 @@ A high-performance Linux daemon and CLI that manages network runtimes (servers, 
 > you were told was encrypted is a breach.
 
 ```bash
-socketley create server secure -p 9443 --tls --cert server.pem --key server-key.pem -s
-curl --cacert server.pem https://localhost:9443/
+mkdir -p www && echo hello > www/hello.txt
+socketley create server secure -p 9443 --tls --cert server.pem --key server-key.pem --http www -s
+curl --cacert server.pem https://localhost:9443/hello.txt
 ```
 
 ## About Me and the Project
@@ -592,7 +596,10 @@ anyone makes it.
 ## Quick Start
 
 After installing — via `scripts/install-from-source.sh`, `install.sh` or
-`dpkg -i` — the daemon runs as a systemd service, so there is no manual startup:
+`dpkg -i` — the daemon runs as a systemd service, so there is no manual startup.
+Only root and members of the `socketley` group reach it; anyone else silently
+gets a private daemon of their own, so join the group with
+`sudo usermod -aG socketley $USER` and log in again:
 
 ```bash
 # Create and start a server
@@ -619,22 +626,29 @@ socketley stats myapp
 ## CLI Reference
 
 ```
+socketley daemon                          # start the daemon (systemd does this when installed)
 socketley create <type> <name> [flags]    # types: server, client, proxy, cache
+socketley add <path> [--name <n>] [-s]    # register and manage an external SDK binary
 socketley attach <type> <name> <port>     # register an external process as a runtime
 socketley start <name|pattern>... [-i]    # start runtime(s), -i for interactive
 socketley stop <name|pattern>...          # stop runtime(s)
 socketley remove <name|pattern>...        # remove runtime(s)
 socketley send <name> [message]           # send/broadcast message
 socketley stats <name|pattern>...         # show runtime statistics
+socketley restart <name> [-i]             # stop and start, keeping the configuration
 socketley reload <name|pattern>...        # restart runtime
 socketley reload-lua <name|pattern>...    # hot-reload Lua script
 socketley show <name|pattern>...          # print JSON config
 socketley edit <name> [flags]             # modify runtime config
+socketley import <name> [json]            # update config from JSON (stdin if omitted)
 socketley owner <name>                    # show parent/children/policy
 socketley ls                              # list all runtimes
 socketley ps                              # list running runtimes
 socketley --lua <file.lua>                # run Lua orchestration script
 socketley cluster ls|ps|group|show|stats|watch  # multi-daemon cluster inspection
+socketley dashboard                       # print the web dashboard URL
+socketley ping                            # ask the daemon to identify itself
+socketley version                         # print the version; needs no daemon
 ```
 
 Glob patterns supported: `socketley stop "api-*"` stops all runtimes matching `api-*`.
@@ -703,6 +717,9 @@ end
 ```bash
 socketley create server echo -p 9000 --lua example.lua -s
 ```
+
+A relative path is resolved where you run the command, and the packaged daemon
+runs as user `socketley`, which must be able to read the file.
 
 ## Cache: DB Backend
 

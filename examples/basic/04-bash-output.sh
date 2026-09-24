@@ -49,7 +49,8 @@ socketley create server demo-echo -p 9005 -bpt -s
 
 echo ""
 echo "Send messages with: echo 'hello' | nc localhost 9005"
-echo "Watch daemon stdout for formatted output."
+echo "Watch the daemon's output for the formatted lines: journalctl -u socketley -f"
+echo "under systemd, or the terminal a development daemon was started from."
 echo ""
 echo "Press Ctrl+C to stop, then run:"
 echo "  socketley stop demo-echo"

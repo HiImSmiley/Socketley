@@ -44,14 +44,12 @@ socketley create server tracker -p 9000 --lua callbacks-connect.lua -s
 
 ### The configuration interpreter is smaller than the daemon's
 
-It opens `base`, `package` and `table`, and nothing else.
+It opens `base`, `package`, `table`, `string` and `math`, and nothing else.
 
 - No `os`. `os.execute("mkdir -p /tmp/logs")` is not a sandbox refusal but
   `attempt to index global 'os' (a nil value)`: the file is refused whole,
   exit 1, and not one runtime is created. Make directories from the shell.
-- No `string`, so `string.format` and the method form `path:match(...)` are
-  unavailable. `..` and `tostring()` are core and still work.
-- No `math`, no `io`.
+- No `io`.
 
 ### A handler is not sandboxed
 
@@ -250,8 +248,8 @@ self.clients(), self.multicast(ids, msg), self.disconnect(id)
 self.peer_ip(id), self.ws_headers(id)
 self.set_data(id, k, v), self.get_data(id, k)
 self.join_group(id, g), self.leave_group(id, g), self.group_send(g, msg)
-self.route(id, target)      -- refused in a worker, permanently: it moves a
-                            -- connection, not a name.  See below.
+self.route(id, target)      -- works in a worker: this server keeps the
+                            -- socket and relays.  See below.
 self.unroute(id), self.get_route(id)
 self.owner_send(id, msg), self.owner_broadcast(msg)
 

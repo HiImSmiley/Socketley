@@ -36,11 +36,8 @@ echo ""
 
 # Build — requires libsocketley_sdk.a
 echo "[1/6] Building chat-server..."
-g++ -std=c++17 -O2 \
-    -I"${ROOT_DIR}/include/linux" \
-    "${SCRIPT_DIR}/chat-server.cpp" \
-    -L"${ROOT_DIR}/bin/Release" -lsocketley_sdk -luring -lssl -lcrypto \
-    -o /tmp/chat-server
+SDK_FLAGS=$("${ROOT_DIR}/sdk/socketley-config" --cflags --libs) || { echo "$SDK_FLAGS"; exit 1; }
+g++ -std=c++17 -O2 "${SCRIPT_DIR}/chat-server.cpp" $SDK_FLAGS -o /tmp/chat-server
 echo "      Built /tmp/chat-server"
 
 # Register and start

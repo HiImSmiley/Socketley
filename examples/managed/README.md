@@ -83,8 +83,8 @@ from any client are broadcast to all others. Much simpler than raw POSIX —
 the wrapper handles io_uring, signals, and the event loop automatically.
 
 ```bash
-g++ -std=c++17 -O2 -I../../include/linux chat-server.cpp \
-    -L../../bin/Release -lsocketley_sdk -luring -lssl -lcrypto -o chat-server
+g++ -std=c++17 -O2 chat-server.cpp \
+    $(../../sdk/socketley-config --cflags --libs) -o chat-server
 ```
 
 ### 04 - Managed Chat
@@ -101,8 +101,8 @@ Per-connection message counter using the `socketley::server` wrapper with
 `set_data`/`get_data` for per-connection metadata.
 
 ```bash
-g++ -std=c++17 -O2 -I../../include/linux counter-server.cpp \
-    -L../../bin/Release -lsocketley_sdk -luring -lssl -lcrypto -o counter-server
+g++ -std=c++17 -O2 counter-server.cpp \
+    $(../../sdk/socketley-config --cflags --libs) -o counter-server
 ```
 
 ### 05 - Managed Counter

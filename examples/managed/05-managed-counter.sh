@@ -35,11 +35,8 @@ echo ""
 
 # Build
 echo "[1/5] Building counter-server..."
-g++ -std=c++17 -O2 \
-    -I"${ROOT_DIR}/include/linux" \
-    "${SCRIPT_DIR}/counter-server.cpp" \
-    -L"${ROOT_DIR}/bin/Release" -lsocketley_sdk -luring -lssl -lcrypto \
-    -o /tmp/counter-server
+SDK_FLAGS=$("${ROOT_DIR}/sdk/socketley-config" --cflags --libs) || { echo "$SDK_FLAGS"; exit 1; }
+g++ -std=c++17 -O2 "${SCRIPT_DIR}/counter-server.cpp" $SDK_FLAGS -o /tmp/counter-server
 echo "      Built /tmp/counter-server"
 
 # Register and start

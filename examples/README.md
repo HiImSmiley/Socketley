@@ -49,10 +49,10 @@ examples/
 
 ### Server
 - `sharded-server.sh` - `--shards N` on a server: N worker processes on one
-  port through `SO_REUSEPORT`, still one runtime. Only without `--lua`, and
-  the example shows what is refused and why
+  port through `SO_REUSEPORT`, still one runtime, with or without `--lua`;
+  shows what crosses a shard boundary and what stays per shard
 - `tls-server.sh` - TLS on a server listener, plus mutual TLS; also shows what
-  is refused (TLS on a cache, and any incomplete key pair)
+  is refused (any incomplete key pair)
 - `auth-token.lua`, `auth-ip-allowlist.lua` - connection authorisation
 - `rate-limit.lua`, `session-ids.lua`, `websocket-session.lua` - per-connection state
 - `upstream-hub.lua`, `service-discovery.lua` - upstream and discovery patterns
@@ -77,6 +77,7 @@ examples/
 ### Cache
 - `basic-cache.sh` - In-memory key-value store
 - `persistent-cache.sh` - Cache with file persistence
+- `tls-cache.sh` - TLS on a cache listener, RESP and the line protocol over it, and mutual TLS with `--ca`
 - `cache-integration.lua` + `cache-integration-handler.lua` - A cache as shared
   state, reached by a server's clients over `--cache`
 - `sharded-cache.sh` - `--shards N` on a cache: N worker processes on one port,

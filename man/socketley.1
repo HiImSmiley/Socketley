@@ -111,7 +111,7 @@ is a high-performance Linux daemon and CLI that manages network runtimes
 (servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
-.B "TLS terminates on a server listener, on both of a proxy's legs, and on a client's dial."
+.B "TLS terminates on a server or cache listener, on both of a proxy's legs, and on a client's dial."
 A
 .B server
 runtime encrypts its own listening port with
@@ -182,6 +182,12 @@ Creates IPC socket at /run/socketley/socketley.sock (system install) or
 /tmp/socketley.sock (development mode).
 On startup, restores persisted runtime configurations. Runtimes that were
 running when the daemon last stopped are auto-started.
+.PP
+The daemon ignores
+.BR SIGHUP ,
+so a closed terminal or a stray
+.B kill \-HUP
+leaves it running.
 .PP
 Takes
 .BI \-\-cpus " set"
@@ -1394,6 +1400,14 @@ reported once, at
 .BR ERROR ,
 and then not again \(em a runtime under load would otherwise put one line in
 the log per message through it.
+.IP
+The files written by
+.B \-w
+and
+.B \-\-log
+are held open once written, so a file renamed away keeps receiving the lines;
+rotate them with logrotate's
+.BR copytruncate .
 .TP
 .BI "\-\-lua " "script"
 Attach Lua configuration script with callbacks. A script that does not load
@@ -2319,6 +2333,11 @@ Peers are auto-registered on first datagram. Each datagram is one message
 (no line-parsing). Broadcast sends to all known peers via sendto().
 Not available for cache or proxy.
 .IP
+.B "An exposed UDP server can reflect traffic."
+With no Lua handler every datagram is relayed to every other peer that has sent
+one, and a peer is learned from a source address, which a sender can forge; keep
+such a server on a trusted network or give it a Lua handler that decides.
+.IP
 Refused with
 .BR "\-\-mode master" ,
 which this page called incompatible for a long time while nothing enforced it.
@@ -2723,22 +2742,18 @@ cross-connection state in a
 runtime, which every shard reaches, rather than in a Lua table at file scope,
 which each shard has its own copy of.
 .PP
-.B "self.route is still refused in a worker."
-Sharded or not. Routing hands a live client to another runtime, which answers it
-while this server keeps the socket and relays the bytes; that reaches into the
-other runtime's tables and runs its
-.B on_connect
-on this thread's stack, and there is no channel for it between two processes.
-Nothing about
+.B "self.route works from a shard."
+Routing hands a live client to another runtime, which answers it while this
+shard keeps the socket and relays the bytes; the target is reached across the
+process boundary as from any worker, so
 .B \-\-shards
-changes that in either direction \(em an unsharded server in a worker refuses it
-too.
+changes nothing about it. A routed client belongs to the shard that accepted it,
+like every other connection.
 .B unroute,
 .B get_route
 and
 .B owner_send
-are not refused: they read this runtime's own tables, which in a worker are
-empty because nothing was ever routed in.
+read this shard's own tables.
 .PP
 .B "What it bought, measured."
 One server runtime in
@@ -9899,7 +9914,7 @@ cache(uint16_t port)
 // Config
 persistent(path)   max_memory(bytes)   eviction(policy)
 resp()             mode(m)
-tls(cert, key)     // NOT IMPLEMENTED - refused, no handshake here
+tls(cert, key)
 max_connections(n) idle_timeout(s)     replicate(target)
 lua(path)          group(g)
 

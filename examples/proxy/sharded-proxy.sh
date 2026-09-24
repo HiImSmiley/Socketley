@@ -12,7 +12,7 @@
 #   ./sharded-proxy.sh
 #
 # FLAGS DEMONSTRATED:
-#   --shards N       Serve this proxy from N worker processes (proxy only)
+#   --shards N       Serve this proxy from N worker processes
 #
 # WHEN TO REACH FOR IT:
 #   Only when a proxy is saturated -- one worker pinned at 100% of a core with
@@ -24,9 +24,10 @@
 #   It is not automatic, and it is not offered wherever the declaration cannot
 #   be made.  Sharding is correct exactly when nothing is shared between
 #   connections, and nothing can detect that -- so the operator declares it and
-#   owns it.  A cache refuses it outright: N shards would be N separate stores
-#   behind one port, and a GET on a new connection would miss data that was
-#   stored.  A client refuses it outright: it has no listening socket to share.
+#   owns it.  A cache shards differently: each shard owns a slice of one
+#   keyspace and fetches a key it does not own from the shard that does (see
+#   ../cache/sharded-cache.sh).  A client refuses it outright: it has no
+#   listening socket to share.
 #   A server may shard with or without --lua: connections(), broadcast(),
 #   clients() and send(id) all cross a shard boundary now.  What does not is
 #   per-connection state -- on_connect for a client fires only in the shard

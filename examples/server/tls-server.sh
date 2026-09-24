@@ -11,18 +11,18 @@
 # serves https:// and wss:// as well as the line protocol.
 #
 # WHAT IS *NOT* ENCRYPTED
-#   A cache's listener and a server's own --upstream connections have no
-#   handshake behind them, and the flags for those are refused rather than
-#   stored -- see the bottom of this script.  Nothing here ever falls back to
-#   cleartext: a configuration that cannot be honoured fails the runtime.
-#   A *proxy* has a handshake on both of its legs (examples/proxy/tls-proxy.sh)
-#   and a *client* dials one (examples/server-client/tls-client.sh).
+#   A server's own --upstream connections are not dialled over TLS, and a
+#   configuration asking for that fails the runtime rather than connecting in
+#   cleartext.  Nothing here ever falls back to cleartext.  A *cache* listener
+#   takes the same flags (examples/cache/tls-cache.sh), a *proxy* has a
+#   handshake on both of its legs (examples/proxy/tls-proxy.sh) and a *client*
+#   dials one (examples/server-client/tls-client.sh).
 #
 # USAGE:
 #   ./tls-server.sh
 #
 # FLAGS DEMONSTRATED:
-#   --tls           Terminate TLS on this listener (server and proxy)
+#   --tls           Terminate TLS on this listener (server, cache and proxy)
 #   --cert <file>   PEM certificate; a chain is fine
 #   --key <file>    Its PEM private key
 #   --ca <file>     Client CA -> mutual TLS: clients must present a
@@ -121,13 +121,10 @@ echo ""
 echo "  socketley create server oops -p 9445 --cert server.pem --key server-key.pem"
 echo "      # --cert: needs --tls as well"
 echo ""
-echo "  socketley create cache  oops -p 9445 --tls --cert ... --key ..."
-echo "      # TLS transport is not implemented for this runtime"
-echo ""
-echo "Neither a proxy nor a client is on that list any more: a proxy terminates"
-echo "TLS on its own listener and dials one to its backends, and a client dials"
-echo "one to its target.  See examples/proxy/tls-proxy.sh and"
-echo "examples/server-client/tls-client.sh."
+echo "No runtime type is on that list: a cache terminates TLS on its listener,"
+echo "a proxy on its own listener and to its backends, and a client dials one to"
+echo "its target.  See examples/cache/tls-cache.sh, examples/proxy/tls-proxy.sh"
+echo "and examples/server-client/tls-client.sh."
 echo ""
 echo "And a certificate that cannot be loaded, or a key that does not match it,"
 echo "puts the runtime in the 'failed' state without ever binding the port."
