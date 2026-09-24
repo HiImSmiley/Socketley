@@ -207,24 +207,38 @@ sleep 0.5
 STATE=$("$BIN" ps -a 2>/dev/null | awk '$2=="sl_srv2" { print $7 }')
 check "the runtime still starts" "Up" "$STATE"
 
-# ─── 7b. A relative path is refused, at every door ─────────────────────────
+# ─── 7b. A relative path is the caller's, and only the CLI knows the caller ──
 # Found by a test that passes `--log 'C:\'` as a JSON-escaping fixture: once
 # --log opened the file it was given, that left a file called C:\ in the
-# repository root.  A relative path resolves against the DAEMON's working
-# directory, which is wherever it was started and "/" under systemd.
-refuses_relative() {   # label -- then the command
-    local label=$1; shift
-    local out
-    out=$("$@" 2>&1) && { bad "$label" "accepted, output '$out'"; return; }
-    case "$out" in
-        *"needs an absolute path"*) ok ;;
-        *) bad "$label" "refused for the wrong reason: '$out'" ;;
-    esac
-}
-refuses_relative "create --log app.log" \
-    "$BIN" create server sl_rel -p "$((P_SRV+6))" --log app.log
-refuses_relative "edit --log app.log"   "$BIN" edit sl_srv --log app.log
-refuses_relative "edit -w rx.log"       "$BIN" edit sl_srv -w rx.log
+# repository root, because a relative path resolved against the DAEMON's
+# working directory, "/" under systemd.  The CLI now makes it absolute against
+# the directory it was typed in, and a command that reaches the daemon any
+# other way -- the SDK, a raw socket -- has no such directory and is refused.
+REL="$SOCKETLEY_TMPD/rel"; mkdir -p "$REL"
+ABS_BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+field() { "$BIN" show "$1" 2>/dev/null | sed -n "s/.*\"$2\": \"\([^\"]*\)\".*/\1/p" | head -1; }
+(cd "$REL" && "$ABS_BIN" create server sl_rel -p "$((P_SRV+6))" --log app.log >/dev/null 2>&1)
+NAMES="$NAMES sl_rel"
+check "create --log app.log is the caller's app.log" "$REL/app.log" "$(field sl_rel log_file)"
+(cd "$REL" && "$ABS_BIN" edit sl_srv -w rx.log >/dev/null 2>&1)
+check "edit -w rx.log is the caller's rx.log" "$REL/rx.log" "$(field sl_srv write_file)"
+
+RAW=$(python3 - "$SOCKETLEY_SOCKET" "$((P_SRV+7))" <<'PYEOF'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
+s.sendall(("create server sl_raw -p %s --log app.log\n" % sys.argv[2]).encode())
+out = b""
+while b"\0" not in out[1:]:
+    b = s.recv(4096)
+    if not b: break
+    out += b
+print(out[1:].split(b"\0")[0].decode("latin1").strip())
+PYEOF
+)
+case "$RAW" in
+    *"needs an absolute path"*) ok ;;
+    *) bad "a relative --log that did not come through the CLI is refused" "the daemon answered '$RAW'" ;;
+esac
 
 # ─── 8. The state names are the same ones every other surface prints ────────
 # state_to_string() had four copies -- lua_context, cluster_discovery,

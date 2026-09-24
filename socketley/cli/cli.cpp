@@ -679,13 +679,46 @@ int cli_dispatch(int argc, char** argv)
     }
 }
 
+// A relative path in a flag the daemon opens, made absolute against the
+// caller's directory, because the daemon resolves it against its own -- which
+// is "/" under systemd -- and `--lua example.lua` loaded /example.lua.
+static std::string caller_path(std::string_view flag, std::string_view value)
+{
+    static constexpr std::string_view path_flags[] = {
+        "--lua", "--log", "-w", "--persistent", "--http",
+        "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key",
+    };
+    std::string_view prefix;
+    bool is_path = false;
+    for (std::string_view f : path_flags)
+        if (flag == f) { is_path = true; break; }
+    if (!is_path && flag == "--listen" && value.starts_with("unix:"))
+    {
+        is_path = true;
+        prefix  = "unix:";
+    }
+    const std::string_view path = value.substr(prefix.size());
+    if (!is_path || path.empty() || path.front() == '/')
+        return std::string(value);
+    std::error_code ec;
+    const std::filesystem::path abs = std::filesystem::absolute(path, ec);
+    if (ec)
+        return std::string(value);
+    return std::string(prefix) + abs.lexically_normal().string();
+}
+
 int cli_forward(int argc, char** argv)
 {
+    const std::string_view verb = argc > 1 ? argv[1] : "";
+    const bool opens_files = verb == "create" || verb == "edit" || verb == "add";
     std::string command;
     for (int i = 1; i < argc; ++i)
     {
         if (i > 1) command += ' ';
-        command += argv[i];
+        if (opens_files && i > 2)
+            command += caller_path(argv[i - 1], argv[i]);
+        else
+            command += argv[i];
     }
 
     std::string data;
