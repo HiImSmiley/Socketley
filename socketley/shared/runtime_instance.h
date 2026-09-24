@@ -203,14 +203,14 @@ public:
     // remember, and a value one turn stale paces on the previous turn's numbers,
     // which is microseconds old and never unsafe: the bound that closes a
     // connection is not this number.
-    void refresh_pacing_watermark()
+    // `now` is the caller's, because the worker reads the clock once a turn.
+    void refresh_pacing_watermark(std::chrono::steady_clock::time_point now)
     {
         // Sticky for a while after the budget is exceeded, because the total is
         // sampled once a turn and the queues drain between turns: tested on the
         // instant, a runtime at 64 streams reads "not backed up" most turns and
         // goes straight back to the deep point, which measured +3 per cent where
         // the same streams paced throughout are worth +18.
-        const auto now = std::chrono::steady_clock::now();
 
         // The SUM is sampled on an interval; the two lines below it are not.
         //

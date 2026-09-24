@@ -305,6 +305,11 @@ public:
 
         auto last_stats = std::chrono::steady_clock::now();
 
+        // The one clock read a turn, taken after the drain and carried into the
+        // next turn's wait, because three reads a turn were 3% of a worker
+        // answering one connection.
+        auto now = last_stats;
+
         // The publish is on-change now rather than a heartbeat, because the
         // counters live in shared memory and an idle worker's turn that
         // delivered no completion cannot have produced anything worth saying
@@ -320,11 +325,10 @@ public:
             // covering exactly the two states where no arm stands: a
             // submission the ring refused, and an arm whose mask predates what
             // is now being waited for.
-            const auto turn_now = std::chrono::steady_clock::now();
             int wait_ms = idle_wait_ms;
             if (stats_dirty)
             {
-                const auto since = turn_now - last_stats;
+                const auto since = now - last_stats;
                 wait_ms = 0;
                 if (since < stats_interval)
                     wait_ms = static_cast<int>(
@@ -390,6 +394,8 @@ public:
                 stats_dirty = true;
             }
 
+            now = std::chrono::steady_clock::now();
+
             // Whatever the socket would not take last turn, because a reply
             // sitting here is somebody's answer.
             m_writer.flush();
@@ -425,7 +431,7 @@ public:
                 // Before the runtime's own turn, because the pacing point is
                 // derived from the live connection count and this is the one
                 // place that runs every turn for every runtime type.
-                m_rt->refresh_pacing_watermark();
+                m_rt->refresh_pacing_watermark(now);
                 m_rt->on_loop_turn();
             }
 
@@ -437,7 +443,6 @@ public:
             if (m_rt && m_rt->get_state() != m_last_sent_state)
                 send_state();
 
-            const auto now = std::chrono::steady_clock::now();
             if (stats_dirty && now - last_stats >= stats_interval)
             {
                 // The safety pump is gone with the poll it was watching,
