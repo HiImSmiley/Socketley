@@ -164,6 +164,9 @@ struct ref_view
     size_t   length{0};
     size_t   headers_end{0};           // offset just past the blank line
     bool     says_close{false};        // Connection carries the token "close"
+    bool     coded{false};             // a Transfer-Encoding is present
+    bool     chunked{false};           // ... and chunked is its final coding
+    size_t   chunk_end{std::string_view::npos};  // where that chunked body ends
 
     // Why the framing has no single reading.  Kept as a pair of string
     // literals rather than an enum so each cause reports and suppresses under
@@ -375,16 +378,33 @@ ref_view read_one_block(std::string_view sv, size_t from)
             // Any transfer coding at all makes Content-Length inoperative
             // (RFC 9112 Section 6.1): if the final coding is chunked the body
             // is framed by chunk sizes, and if it is not, a response body runs
-            // to connection close.  Either way a length taken from
-            // Content-Length is not where this response ends.
-            if (!val.empty())
+            // to connection close.  Codings are read left to right across every
+            // Transfer-Encoding line, and one after chunked is no framing.
+            size_t pos = 0;
+            for (;;)
             {
-                mark(r, "pool-te",
-                     "the response carries a Transfer-Encoding, which makes Content-Length "
-                     "inoperative (RFC 9112 Section 6.1) — chunked frames the body by chunk "
-                     "sizes and any other coding leaves it running to connection close — and "
-                     "the parser framed it by Content-Length and declared the socket poolable");
-                return r;
+                const size_t comma = val.find(',', pos);
+                std::string_view item = val.substr(pos, (comma == std::string_view::npos)
+                                                        ? std::string_view::npos : comma - pos);
+                const size_t semi = item.find(';');
+                if (semi != std::string_view::npos) item = item.substr(0, semi);
+                item = trim(item);
+                if (!item.empty())
+                {
+                    r.coded = true;
+                    if (r.chunked)
+                    {
+                        mark(r, "pool-te-after-chunked",
+                             "a coding follows chunked, so the chunk sizes do not frame the "
+                             "body and the socket was still declared poolable");
+                        return r;
+                    }
+                    if (ieq(item, "chunked"))
+                        r.chunked = true;
+                }
+                if (comma == std::string_view::npos)
+                    break;
+                pos = comma + 1;
             }
         }
         else if (ieq(name, "connection"))
@@ -403,12 +423,94 @@ ref_view read_one_block(std::string_view sv, size_t from)
              "somewhere else entirely");
         return r;
     }
+    if (cl_count > 0 && r.coded)
+    {
+        mark(r, "pool-te",
+             "the response carries both a Transfer-Encoding and a Content-Length, the "
+             "shape RFC 9112 Section 6.3 says must be treated as an error, and the socket "
+             "was still declared poolable");
+        return r;
+    }
     if (cl_count > 0)
     {
         r.has_length = true;
         r.length     = cl_value;
     }
     return r;
+}
+
+// Where a chunked body starting at `from` ends, or npos when it has not ended
+// in these bytes or cannot be read one way only.  Written from RFC 9112
+// Section 7.1 and not from the decoder: a line is CRLF-terminated with no other
+// CR or LF in it, a size is hex digits then optional whitespace then optional
+// extensions, a chunk's data is followed by exactly CRLF, and the trailer
+// section runs to an empty line.
+size_t reference_chunked_end(std::string_view sv, size_t from, ref_view& r)
+{
+    auto line_at = [&](size_t at, std::string_view& line) -> bool {
+        const size_t nl = sv.find("\r\n", at);
+        if (nl == std::string_view::npos)
+            return false;
+        line = sv.substr(at, nl - at);
+        return true;
+    };
+    auto bare_eol = [](std::string_view l) {
+        return l.find('\r') != std::string_view::npos || l.find('\n') != std::string_view::npos;
+    };
+
+    size_t p = from;
+    for (;;)
+    {
+        std::string_view line;
+        if (!line_at(p, line))
+            return std::string_view::npos;
+        if (bare_eol(line))
+        {
+            mark(r, "pool-chunk-eol",
+                 "a chunk-size line carries a bare CR or LF, so a lenient reader ends it "
+                 "somewhere else, and the socket was still declared poolable");
+            return std::string_view::npos;
+        }
+        size_t i = 0, size = 0;
+        bool   any = false;
+        for (; i < line.size(); i++)
+        {
+            const char c = line[i];
+            int d;
+            if (c >= '0' && c <= '9')      d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else break;
+            if (size > (SIZE_MAX - static_cast<size_t>(d)) / 16)
+                return std::string_view::npos;
+            size = size * 16 + static_cast<size_t>(d);
+            any = true;
+        }
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (!any || (i < line.size() && line[i] != ';'))
+            return std::string_view::npos;
+        p += line.size() + 2;
+
+        if (size == 0)
+        {
+            for (;;)
+            {
+                std::string_view t;
+                if (!line_at(p, t))
+                    return std::string_view::npos;
+                if (bare_eol(t))
+                    return std::string_view::npos;
+                p += t.size() + 2;
+                if (t.empty())
+                    return p;
+            }
+        }
+        if (sv.size() - p < size + 2)
+            return std::string_view::npos;
+        if (sv[p + size] != '\r' || sv[p + size + 1] != '\n')
+            return std::string_view::npos;
+        p += size + 2;
+    }
 }
 
 // Follow interim 1xx responses to the real one, the way the parser's own reset
@@ -427,6 +529,8 @@ ref_view reference_frame(std::string_view sv)
             from = r.headers_end;               // 1xx has no body; the next block starts here
             continue;
         }
+        if (r.chunked && r.status_readable && r.code != 204 && r.code != 304)
+            r.chunk_end = reference_chunked_end(sv, r.headers_end, r);
         return r;
     }
     ref_view r;
@@ -445,6 +549,10 @@ size_t reference_boundary(const ref_view& r)
         return std::string_view::npos;
     if (r.code == 204 || r.code == 304)
         return r.headers_end;                   // no body, whatever the headers claim
+    if (r.chunked)
+        return r.chunk_end;
+    if (r.coded)
+        return std::string_view::npos;          // another coding runs to close
     if (r.has_length)
         return r.headers_end + r.length;
     return std::string_view::npos;              // close-delimited: no boundary short of EOF

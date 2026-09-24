@@ -285,6 +285,7 @@ void proxy_client_connection::reset(int new_fd)
     declared_body_chunked = false;
     body_remaining = 0;
     body_unbounded = false;
+    req_chunk = {};
     last_activity = {};
     retries_remaining = 0;
     backend_idx = 0;
@@ -3440,6 +3441,32 @@ void proxy_instance::begin_tunnel(proxy_client_connection* cconn)
     }
 }
 
+// How many bytes at the front of `in` belong to the chunked request body in
+// progress, false when its framing is broken; an unfinished size line stays
+// where it is and is walked again once the rest of it arrives.
+static bool take_chunked_body(proxy_client_connection* conn, std::string_view in, size_t& take)
+{
+    std::string_view rest = in;
+    for (;;)
+    {
+        std::string_view piece;
+        switch (http_chunked_next(conn->req_chunk, rest, piece))
+        {
+        case chunk_step::payload:
+            continue;
+        case chunk_step::done:
+            conn->body_unbounded = false;
+            [[fallthrough]];
+        case chunk_step::need_more:
+            take = in.size() - rest.size();
+            return true;
+        case chunk_step::bad:
+            take = 0;
+            return false;
+        }
+    }
+}
+
 // A request pipelined behind one in flight waits for that exchange to end, and
 // a backend whose header block straddles a read boundary never ends it -- so
 // the same 408 bound a half-arrived request gets, because holding is only safe
@@ -3474,8 +3501,12 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
     }
     else if (!conn->header_parsed)
     {
-        // Slowloris / oversized header protection
-        if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_HEADER_SIZE))
+        // Slowloris / oversized header protection, asked of the head alone,
+        // because a body arriving in the same read is not header bytes.
+        if (SOCKETLEY_UNLIKELY(conn->partial.size() > proxy_client_connection::MAX_HEADER_SIZE) &&
+            std::string_view(conn->partial)
+                .substr(0, proxy_client_connection::MAX_HEADER_SIZE)
+                .find("\r\n\r\n") == std::string_view::npos)
         {
             send_error(conn, "431 Request Header Fields Too Large", "Header Too Large\n");
             return;
@@ -3550,6 +3581,13 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
 
         // Rewrite request before connect — save for forwarding
         std::string rewritten = rewrite_http_request(conn, new_path);
+        if (SOCKETLEY_UNLIKELY(conn->req_chunk.st == http_chunked_decoder::phase::broken))
+        {
+            // Nothing has reached a backend yet, so the refusal is whole.
+            conn->partial.clear();
+            send_error(conn, "400 Bad Request", "Bad Request\n");
+            return;
+        }
         conn->saved_request = std::move(rewritten);
 
         // Before the connect, because an asynchronous one returns out of this
@@ -3593,13 +3631,23 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         // Only the body may go out here, because forwarding the whole buffer
         // is the same hole rewrite_http_request had: bytes nothing has parsed
         // reaching a backend that parses them.
-        const size_t n = conn->body_unbounded
-            ? conn->partial.size()
-            : std::min(conn->body_remaining, conn->partial.size());
+        size_t n = std::min(conn->body_remaining, conn->partial.size());
+        const bool chunked = conn->body_unbounded;
+        if (chunked && !take_chunked_body(conn, conn->partial, n))
+        {
+            // The backend holds part of a body whose framing just broke, so
+            // neither socket is at a boundary any more and both go.
+            conn->partial.clear();
+            if (client_answerable(conn))
+                send_error(conn, "400 Bad Request", "Bad Request\n");
+            else
+                close_pair(fd, conn->backend_fd, close_reason::force);
+            return;
+        }
         if (n > 0)
         {
             forward_to_backend(conn, std::string_view(conn->partial.data(), n));
-            if (!conn->body_unbounded)
+            if (!chunked)
                 conn->body_remaining -= n;
             conn->partial.erase(0, n);
         }
@@ -4203,6 +4251,7 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     }
 
     bool host_written = false;
+    bool client_keep_alive = false;
     size_t h_pos = 0;
     while (h_pos < headers_section.size())
     {
@@ -4217,9 +4266,14 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
         if (header_name_equals(hdr_line, "connection", 10))
         {
             const auto colon = hdr_line.find(':');
-            if (colon != std::string_view::npos &&
-                http_list_has_token(http_trim_ows(hdr_line.substr(colon + 1)), "close", 5))
-                conn->client_conn_close = true;
+            if (colon != std::string_view::npos)
+            {
+                const std::string_view v = http_trim_ows(hdr_line.substr(colon + 1));
+                if (http_list_has_token(v, "close", 5))
+                    conn->client_conn_close = true;
+                if (http_list_has_token(v, "keep-alive", 10))
+                    client_keep_alive = true;
+            }
         }
 
         // Skip hop-by-hop headers, except the two that make up an upgrade
@@ -4306,6 +4360,11 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     if (!host_written)
         append_backend_host_header(result, conn);
 
+    // HTTP/1.0 closes after every answer unless it asked otherwise, and the
+    // backend is always asked for keep-alive, so the proxy has to remember.
+    if (conn->version == "HTTP/1.0" && !client_keep_alive)
+        conn->client_conn_close = true;
+
     // What the chain asked for, once each and after the client's own block,
     // with name and value validated where they were taken from Lua.
     for (const auto& [n, v] : conn->filter_headers)
@@ -4332,12 +4391,13 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     size_t body_len;
     if (conn->declared_body_chunked)
     {
-        // Except for chunked, where there is no length to compute, so the body
-        // streams on -- bounding it would mean guessing where it ends and
-        // truncating a legitimate upload.
-        body_len = body_section.size();
+        // Chunked has no length up front, so its end is found by walking the
+        // chunk sizes; a broken walk is left in req_chunk for the caller.
+        conn->req_chunk = {};
         conn->body_unbounded = true;
         conn->body_remaining = 0;
+        if (!take_chunked_body(conn, body_section, body_len))
+            body_len = 0;
     }
     else
     {
@@ -6413,6 +6473,10 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
         return false;
     if (!cconn)
         return false;
+    // The backend is still owed the rest of a request body, so the next
+    // borrower's request would be read as that body.
+    if (cconn->body_unbounded || cconn->body_remaining > 0)
+        return false;
     // The key is read off the client, so the client has to be this socket's
     // own -- cheap, and it makes the key's provenance a checked fact rather
     // than a caller's promise.
@@ -6929,7 +6993,10 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     // the connection ends here -- asked once of the client connection, because
     // answering it at the detach instead cost a backend connection per
     // request.
-    if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->client_conn_close) &&
+    // A body still owed has no end this proxy can find once the answer is
+    // out, and reading what follows it as a request is a guess.
+    const bool body_owing = cconn->body_unbounded || cconn->body_remaining > 0;
+    if (SOCKETLEY_UNLIKELY(cconn->client_eof || cconn->client_conn_close || body_owing) &&
         cconn->fd >= 0)
     {
         cconn->closing = true;
@@ -6954,16 +7021,11 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->filter_headers.clear();
     cconn->filter_removed_headers.clear();
 
-    // The answer arrived before the client finished its body, so what is
-    // buffered is the tail of that body rather than a request, and is dropped
-    // as unclassifiable.
-    const bool body_owing = cconn->body_unbounded || cconn->body_remaining > 0;
     cconn->declared_body_len = 0;
     cconn->declared_body_chunked = false;
     cconn->body_remaining = 0;
     cconn->body_unbounded = false;
-    if (body_owing)
-        cconn->partial.clear();
+    cconn->req_chunk = {};
     cconn->saved_request.clear();
 
     // conn->partial is deliberately not cleared, because the pipelined request
@@ -7942,11 +8004,10 @@ void proxy_instance::response_deadline_sweep()
                 // goes through, and this one did not.  clear_response_deadline()
                 // lowers awaiting_response when a backend starts answering and
                 // leaves this deadline armed, so a response that takes longer
-                // than the header bound -- a large file, an SSE stream, or any
-                // chunked reply, which http_response_frame_complete() never
-                // calls finished -- arrived here with its own bytes already on
-                // the client's wire.  A status line behind them lands at an
-                // offset that is not a message boundary.
+                // than the header bound -- a large file, an SSE stream, or a
+                // chunked reply still between its chunks -- arrived here with
+                // its own bytes already on the client's wire.  A status line
+                // behind them lands at an offset that is not a message boundary.
                 if (client_answerable(conn))
                 {
                     send_error(conn, "408 Request Timeout", "Request Timeout\n");

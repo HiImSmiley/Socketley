@@ -1500,7 +1500,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
                     response.append(buf, static_cast<size_t>(n));
                     http_response_scan_chunk(frame, std::string_view(buf, static_cast<size_t>(n)));
                     // A response whose length this header cannot establish --
-                    // chunked, any other transfer coding, or two lengths that
+                    // a transfer coding other than chunked, or two lengths that
                     // disagree -- is never complete here, which leaves the old
                     // rule of reading until the peer closes.
                     if (http_response_frame_complete(frame))
@@ -1560,7 +1560,7 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
                     response.append(buf, static_cast<size_t>(n));
                     http_response_scan_chunk(frame, std::string_view(buf, static_cast<size_t>(n)));
                     // A response whose length this header cannot establish --
-                    // chunked, any other transfer coding, or two lengths that
+                    // a transfer coding other than chunked, or two lengths that
                     // disagree -- is never complete here, which leaves the old
                     // rule of reading until the peer closes.
                     if (http_response_frame_complete(frame))
@@ -1626,8 +1626,30 @@ static sol::table socketley_http_call(sol::state& lua, sol::table opts)
     }
 
     auto body_start = response.find("\r\n\r\n");
+    std::string body_out = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
+
+    // A chunked answer is handed over as its payload, because the chunk sizes
+    // are framing and a script decoding JSON would otherwise read them as the
+    // first bytes of the document.
+    if (frame.chunked && !frame.no_body && frame.headers_parsed)
+    {
+        http_chunked_decoder dec{};
+        std::string_view in(body_out);
+        std::string payload;
+        chunk_step step;
+        std::string_view piece;
+        while ((step = http_chunked_next(dec, in, piece)) == chunk_step::payload)
+            payload.append(piece.data(), piece.size());
+        if (step != chunk_step::done)
+        {
+            result["error"] = "the chunked response ended before its last chunk";
+            return result;
+        }
+        body_out.swap(payload);
+    }
+
     result["status"] = status;
-    result["body"]   = (body_start != std::string::npos) ? response.substr(body_start + 4) : "";
+    result["body"]   = std::move(body_out);
     result["ok"]     = (status >= 200 && status < 300);
     return result;
 }

@@ -160,9 +160,10 @@ struct alignas(64) proxy_client_connection
     // How much of the current request's body is still to be forwarded, because
     // forwarding everything past the header terminator sent a pipelined second
     // request to the backend without passing a single framing check -- with
-    // body_unbounded the chunked case, which streams on.
+    // body_unbounded the chunked case, walked by req_chunk to its last chunk.
     size_t body_remaining{0};
     bool body_unbounded{false};
+    http_chunked_decoder req_chunk{};
 
     // Request headers a filter set on the request now being parsed, per
     // request rather than per connection, or the second request on a

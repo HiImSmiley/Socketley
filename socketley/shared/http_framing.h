@@ -9,6 +9,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <system_error>
 
@@ -164,6 +165,48 @@ inline bool http_eol_framing_ok(std::string_view bytes, bool complete)
     return true;
 }
 
+// One transfer coding list, left to right, carrying `chunked_seen` across
+// several Transfer-Encoding lines because "chunked" then "gzip" is the same
+// unframeable message as "chunked, gzip".
+inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen,
+                               bool* other_seen = nullptr)
+{
+    size_t pos = 0;
+    for (;;)
+    {
+        const auto comma = val.find(',', pos);
+        const size_t end = (comma == std::string_view::npos) ? val.size() : comma;
+        std::string_view coding = val.substr(pos, end - pos);
+
+        if (const auto semi = coding.find(';'); semi != std::string_view::npos)
+            coding = coding.substr(0, semi);
+        coding = http_trim_ows(coding);
+
+        if (!coding.empty())
+        {
+            // Anything at all after the chunked coding — including a second
+            // chunked, which RFC 9112 Section 6.1 forbids outright — means the
+            // body is not framed by chunk sizes the way it claims to be.
+            if (chunked_seen)
+                return false;
+            if (http_token_equals(coding, "chunked", 7))
+                chunked_seen = true;
+            else if (other_seen)
+                // "gzip, chunked" is framable -- chunked is the final coding,
+                // so the chunk sizes do delimit it -- and the bytes inside are
+                // still compressed.  A recipient that takes the framing off and
+                // hands them on as the body has handed on gzip and called it
+                // the body, so whether anything BUT chunked is present has to
+                // be knowable separately from whether the message is framed.
+                *other_seen = true;
+        }
+
+        if (comma == std::string_view::npos)
+            return true;
+        pos = comma + 1;
+    }
+}
+
 // What one header block says about the framing of its own message, gathered
 // for every block including the interim 1xx ones, whose shape still matters
 // even where their values do not.
@@ -245,10 +288,16 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
         }
         else if (http_token_equals(name, "transfer-encoding", 17))
         {
+            // Chunked frames the body only as the final coding, and anything
+            // after it leaves a length two recipients can read two ways.
             if (!val.empty())
             {
                 out.transfer_encoding = true;
-                out.chunked = http_list_has_token(val, "chunked", 7);
+                if (SOCKETLEY_UNLIKELY(!http_te_codings_ok(val, out.chunked)))
+                {
+                    out.ok = false;
+                    return out;
+                }
             }
         }
         else if (http_token_equals(name, "connection", 10))
@@ -257,6 +306,10 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
                 out.conn_close = true;
         }
     }
+    // A length beside a transfer coding is the shape request smuggling is made
+    // of (RFC 9112 Section 6.3), and no reading of it is safe to pool on.
+    if (SOCKETLEY_UNLIKELY(out.transfer_encoding && out.has_content_length))
+        out.ok = false;
     return out;
 }
 
@@ -267,48 +320,6 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
 // ─── WHAT IT DELIBERATELY DOES NOT DO ───────────────────────────────────────
 // It decides the framing and nothing else: it collects no headers, judges no
 // connection reuse, and reads no body.
-
-// One transfer coding list, left to right, carrying `chunked_seen` across
-// several Transfer-Encoding lines because "chunked" then "gzip" is the same
-// unframeable message as "chunked, gzip".
-inline bool http_te_codings_ok(std::string_view val, bool& chunked_seen,
-                               bool* other_seen = nullptr)
-{
-    size_t pos = 0;
-    for (;;)
-    {
-        const auto comma = val.find(',', pos);
-        const size_t end = (comma == std::string_view::npos) ? val.size() : comma;
-        std::string_view coding = val.substr(pos, end - pos);
-
-        if (const auto semi = coding.find(';'); semi != std::string_view::npos)
-            coding = coding.substr(0, semi);
-        coding = http_trim_ows(coding);
-
-        if (!coding.empty())
-        {
-            // Anything at all after the chunked coding — including a second
-            // chunked, which RFC 9112 Section 6.1 forbids outright — means the
-            // body is not framed by chunk sizes the way it claims to be.
-            if (chunked_seen)
-                return false;
-            if (http_token_equals(coding, "chunked", 7))
-                chunked_seen = true;
-            else if (other_seen)
-                // "gzip, chunked" is framable -- chunked is the final coding,
-                // so the chunk sizes do delimit it -- and the bytes inside are
-                // still compressed.  A recipient that takes the framing off and
-                // hands them on as the body has handed on gzip and called it
-                // the body, so whether anything BUT chunked is present has to
-                // be knowable separately from whether the message is framed.
-                *other_seen = true;
-        }
-
-        if (comma == std::string_view::npos)
-            return true;
-        pos = comma + 1;
-    }
-}
 
 // The framing a request header block declares about itself, where `ok ==
 // false` means no recipient may act on this message and every field below is
@@ -427,6 +438,193 @@ inline http_request_framing_scan http_scan_request_headers(std::string_view head
     return out;
 }
 
+// ─── Decoding a chunked body, one read at a time ────────────────────────────
+// Used in three places: a server delivering a chunked request body to a script,
+// a proxy finding where a chunked request body ends so the bytes behind it are
+// parsed as the next request rather than relayed, and the response scan below
+// finding where a chunked answer ends so the client's next request is served.
+//
+// Stepping rather than one-shot, because a read can carry a size line, a
+// payload run, the CRLF after it and the start of the next size line, and the
+// caller needs each payload run separately.  `in` is advanced past everything
+// consumed so the caller knows exactly how much to erase.
+
+enum class chunk_step
+{
+    need_more,   // nothing more can be decided from what is here
+    payload,     // `out` names bytes of the body, already consumed from `in`
+    done,        // the terminating 0-chunk and its trailers are complete
+    bad,         // not chunked framing, and the stream cannot be resynchronised
+};
+
+struct http_chunked_decoder
+{
+    enum class phase : uint8_t { size, data, data_crlf, trailer, finished, broken };
+    phase  st{phase::size};
+    size_t chunk_left{0};
+    // A size line is a handful of hex digits and maybe an extension; anything
+    // beyond this is a peer filling memory one byte at a time with a line it
+    // never terminates.  Kept small because 16 hex digits already exceeds what
+    // size_t can hold.
+    static constexpr size_t MAX_SIZE_LINE = 256;
+    // Trailers are headers, and the same reasoning bounds them.
+    static constexpr size_t MAX_TRAILER_BYTES = 8192;
+    size_t trailer_seen{0};
+};
+
+// Hex, strict: `from_chars` with base 16 would also take a leading '+', and a
+// chunk size is not allowed one.
+inline bool http_chunk_hex(std::string_view s, size_t& out)
+{
+    if (s.empty()) return false;
+    size_t v = 0;
+    for (char c : s)
+    {
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        // Overflow refused rather than wrapped: a wrapped size is a short read
+        // that then reads the next chunk's header as payload.
+        if (v > (SIZE_MAX - static_cast<size_t>(d)) / 16) return false;
+        v = v * 16 + static_cast<size_t>(d);
+    }
+    out = v;
+    return true;
+}
+
+inline chunk_step http_chunked_next(http_chunked_decoder& d, std::string_view& in,
+                             std::string_view& out)
+{
+    out = std::string_view();
+    for (;;)
+    {
+        switch (d.st)
+        {
+        case http_chunked_decoder::phase::broken:
+            return chunk_step::bad;
+        case http_chunked_decoder::phase::finished:
+            return chunk_step::done;
+
+        case http_chunked_decoder::phase::size:
+        {
+            const size_t nl = in.find("\r\n");
+            if (nl == std::string_view::npos)
+            {
+                // A line that never ends is refused rather than waited on.
+                if (in.size() > http_chunked_decoder::MAX_SIZE_LINE)
+                {
+                    d.st = http_chunked_decoder::phase::broken;
+                    return chunk_step::bad;
+                }
+                return chunk_step::need_more;
+            }
+            // A bare CR or LF inside the line is a line end to a lenient peer
+            // and not to this reader, so the two would disagree about where
+            // the body ends.
+            if (nl > http_chunked_decoder::MAX_SIZE_LINE ||
+                in.substr(0, nl).find_first_of("\r\n") != std::string_view::npos)
+            {
+                d.st = http_chunked_decoder::phase::broken;
+                return chunk_step::bad;
+            }
+            // An extension is legal and carries no meaning here, so the size is
+            // whatever precedes the first ';'.
+            std::string_view line = in.substr(0, nl);
+            const size_t semi = line.find(';');
+            if (semi != std::string_view::npos) line = line.substr(0, semi);
+            // Trailing spaces are tolerated by RFC 9112 for the size, leading
+            // ones are not part of the grammar and would let " 5" mean 5.
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
+                line.remove_suffix(1);
+
+            size_t sz = 0;
+            if (!http_chunk_hex(line, sz))
+            {
+                d.st = http_chunked_decoder::phase::broken;
+                return chunk_step::bad;
+            }
+            in.remove_prefix(nl + 2);
+            if (sz == 0)
+            {
+                d.st = http_chunked_decoder::phase::trailer;
+                d.trailer_seen = 0;
+                continue;
+            }
+            d.chunk_left = sz;
+            d.st = http_chunked_decoder::phase::data;
+            continue;
+        }
+
+        case http_chunked_decoder::phase::data:
+        {
+            if (in.empty()) return chunk_step::need_more;
+            const size_t n = in.size() < d.chunk_left ? in.size() : d.chunk_left;
+            out = in.substr(0, n);
+            in.remove_prefix(n);
+            d.chunk_left -= n;
+            if (d.chunk_left == 0)
+                d.st = http_chunked_decoder::phase::data_crlf;
+            // Returned even when the chunk is not finished: the caller wants
+            // every byte as it lands, which is the whole reason for this.
+            return chunk_step::payload;
+        }
+
+        case http_chunked_decoder::phase::data_crlf:
+        {
+            if (in.size() < 2) return chunk_step::need_more;
+            if (in[0] != '\r' || in[1] != '\n')
+            {
+                // The declared length and the framing disagree, so nothing
+                // after this point can be trusted to be payload.
+                d.st = http_chunked_decoder::phase::broken;
+                return chunk_step::bad;
+            }
+            in.remove_prefix(2);
+            d.st = http_chunked_decoder::phase::size;
+            continue;
+        }
+
+        case http_chunked_decoder::phase::trailer:
+        {
+            // Either an immediate CRLF -- no trailers -- or header lines until
+            // an empty one.
+            for (;;)
+            {
+                const size_t nl = in.find("\r\n");
+                if (nl == std::string_view::npos)
+                {
+                    if (in.size() + d.trailer_seen > http_chunked_decoder::MAX_TRAILER_BYTES)
+                    {
+                        d.st = http_chunked_decoder::phase::broken;
+                        return chunk_step::bad;
+                    }
+                    return chunk_step::need_more;
+                }
+                d.trailer_seen += nl + 2;
+                if (d.trailer_seen > http_chunked_decoder::MAX_TRAILER_BYTES ||
+                    in.substr(0, nl).find_first_of("\r\n") != std::string_view::npos)
+                {
+                    d.st = http_chunked_decoder::phase::broken;
+                    return chunk_step::bad;
+                }
+                const bool empty_line = (nl == 0);
+                in.remove_prefix(nl + 2);
+                if (empty_line)
+                {
+                    d.st = http_chunked_decoder::phase::finished;
+                    return chunk_step::done;
+                }
+                // A trailer line is discarded: nothing downstream reads them,
+                // and inventing headers from them after the request has been
+                // dispatched is how a trailer becomes a request smuggling.
+            }
+        }
+        }
+    }
+}
+
 // ─── response framing state ─────────────────────────────────────────────────
 // One of these per backend connection, written only by
 // http_response_scan_chunk() and read only by http_response_frame_complete()
@@ -450,8 +648,7 @@ struct http_response_framing
     // boundary.
     uint8_t interim_blocks{0};
 
-    // At least one byte of this response has been forwarded, so the header
-    // scan may not run again and read body bytes as a status line.
+    // At least one byte of this response has arrived.
     bool response_bytes_seen{false};
 
     // The length of this response could not be established with certainty, and
@@ -472,14 +669,76 @@ struct http_response_framing
     // protocol with no message boundaries, and the flag is never cleared
     // because there is no way back.
     bool switched_protocols{false};
+
+    // A chunked body walked to its terminating chunk, which is the only way a
+    // chunked response ends on a socket that stays open.
+    http_chunked_decoder chunk_dec{};
+    bool chunk_done{false};
+
+    // Bytes of an unfinished header block, or of an unfinished chunk-size or
+    // trailer line, kept for the next read because both are framing that a
+    // read boundary may cut anywhere -- and a scan that gave up there left the
+    // client's next request waiting on an answer nobody could call finished.
+    std::string carry;
 };
 
-// Fold `avail` body bytes into the countdown and report how many arrived past
-// the end of the answer, since a byte nobody asked for both puts a stranger's
-// data on the client's wire and leaves the socket at an offset no next request
-// can start from.
-inline void http_response_consume_body(http_response_framing& st, size_t avail)
+// The most an unfinished head may hold, the request side's own bound.
+inline constexpr size_t http_response_head_max = 16 * 1024;
+
+// Walk chunked body bytes, keeping only an unfinished line for the next read.
+inline void http_response_walk_chunked(http_response_framing& st, std::string_view in)
 {
+    std::string joined;
+    if (!st.carry.empty())
+    {
+        joined.swap(st.carry);
+        joined.append(in.data(), in.size());
+        in = joined;
+    }
+    if (SOCKETLEY_UNLIKELY(st.chunk_done))
+    {
+        st.overrun = true;
+        st.excess_in_chunk = in.size();
+        return;
+    }
+    for (;;)
+    {
+        std::string_view out;
+        switch (http_chunked_next(st.chunk_dec, in, out))
+        {
+        case chunk_step::payload:
+            continue;
+        case chunk_step::need_more:
+            st.carry.assign(in.data(), in.size());
+            return;
+        case chunk_step::done:
+            st.chunk_done = true;
+            if (!in.empty())
+            {
+                st.overrun = true;
+                st.excess_in_chunk = in.size();
+            }
+            return;
+        case chunk_step::bad:
+            st.unknown = true;
+            return;
+        }
+    }
+}
+
+// Fold body bytes into the framing and report how many arrived past the end of
+// the answer, since a byte nobody asked for both puts a stranger's data on the
+// client's wire and leaves the socket at an offset no next request can start
+// from.
+inline void http_response_consume_body(http_response_framing& st, std::string_view body)
+{
+    const size_t avail = body.size();
+    if (st.chunked && !st.no_body)
+    {
+        http_response_walk_chunked(st, body);
+        return;
+    }
+
     const bool bounded = st.no_body ||
                          (st.has_content_length && !st.chunked && !st.transfer_encoding);
     const size_t left = st.no_body ? 0
@@ -500,7 +759,7 @@ inline void http_response_consume_body(http_response_framing& st, size_t avail)
 inline void http_response_scan_chunk(http_response_framing& st, std::string_view chunk)
 {
     // Per chunk and not per response, cleared here rather than at each of the
-    // five returns, because a stale value would truncate a sound forward.
+    // returns, because a stale value would truncate a sound forward.
     st.excess_in_chunk = 0;
 
     // The connection switched protocols, so these bytes are not HTTP and must
@@ -509,51 +768,50 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
     if (SOCKETLEY_UNLIKELY(st.switched_protocols))
         return;
 
-    // Past the header block: nothing left to read, only a length to count down.
+    // Once the length cannot be told, nothing later can make it tellable.
+    if (SOCKETLEY_UNLIKELY(st.unknown))
+        return;
+
+    // Past the header block: only the body's own framing is left to follow.
     if (st.headers_parsed)
     {
-        http_response_consume_body(st, chunk.size());
+        http_response_consume_body(st, chunk);
         return;
     }
 
-    // Only the first chunk of a response can be scanned this way, because a
-    // header block split across two reads makes the second one match inside
-    // the body.
-    if (SOCKETLEY_UNLIKELY(st.response_bytes_seen))
-    {
-        st.unknown = true;
-        return;
-    }
     st.response_bytes_seen = true;
+
+    // An unfinished block from the last read is scanned as one with this one,
+    // and the excess arithmetic below still holds, because a block that ends
+    // here ends inside `chunk` and so does everything behind it.
+    std::string joined;
+    std::string_view view = chunk;
+    if (!st.carry.empty())
+    {
+        joined.swap(st.carry);
+        joined.append(chunk.data(), chunk.size());
+        view = joined;
+    }
 
     // Interim 1xx responses have no body and the real response follows
     // immediately behind them, often in the same read, so this walks forward
-    // through the chunk.
+    // through the bytes.
     size_t base = 0;
     for (;;)
     {
-        const std::string_view rest = chunk.substr(base);
+        const std::string_view rest = view.substr(base);
         const auto hdr_end = rest.find("\r\n\r\n");
 
         if (hdr_end == std::string_view::npos)
         {
-            // No complete header block, which from the start of the chunk is
-            // the ordinary split block and costs one un-pooled socket.
-            if (base == 0)
-                return;
-
-            // Behind an interim block the next read carries a continuation
-            // rather than a beginning, so response_bytes_seen stays set and
-            // the answer is that this cannot be told.
-            if (!rest.empty())
+            // The block is cut by the read boundary, so it waits for the next
+            // read, bounded the way a request head is.
+            if (SOCKETLEY_UNLIKELY(rest.size() > http_response_head_max))
             {
                 st.unknown = true;
                 return;
             }
-
-            // Unless the interim block ended exactly on the read boundary,
-            // when the next chunk really is the response's first.
-            st.response_bytes_seen = false;
+            st.carry.assign(rest.data(), rest.size());
             return;
         }
 
@@ -642,12 +900,10 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
         st.chunked            = h.chunked;
         st.conn_close         = h.conn_close;
 
-        // Deduct body bytes already in this chunk and notice when there are
-        // more than the response had room for, which is what a backend
-        // flushing an answer and the head of the next produces.
-        const size_t body_start = base + hdr_end + 4;
-        const size_t body_in_chunk = (chunk.size() > body_start) ? chunk.size() - body_start : 0;
-        http_response_consume_body(st, body_in_chunk);
+        // Deduct body bytes already here and notice when there are more than
+        // the response had room for, which is what a backend flushing an
+        // answer and the head of the next produces.
+        http_response_consume_body(st, view.substr(base + hdr_end + 4));
         return;
     }
 }
@@ -676,10 +932,12 @@ inline bool http_response_frame_complete(const http_response_framing& st)
     // at all.  A 304 may quote them the same way (RFC 9112 Section 6.1).
     if (st.no_body)
         return true;
-    // A chunked response is not tracked to its terminating chunk and any other
-    // coding runs to connection close, so Content-Length is inoperative either
-    // way (RFC 9112 Section 6.1).
-    if (st.chunked || st.transfer_encoding)
+    // A chunked response ends at its terminating chunk and any other coding
+    // runs to connection close, so Content-Length is inoperative either way
+    // (RFC 9112 Section 6.1).
+    if (st.chunked)
+        return st.chunk_done;
+    if (st.transfer_encoding)
         return false;
     // Everything else is over only once a declared length has run out, so a
     // response framed by connection close correctly fails here.
@@ -774,187 +1032,4 @@ inline http_range http_parse_range(std::string_view v, size_t total)
     if (r.last >= total) r.last = total - 1;            // clamped, per 14.1.1
     r.usable = true;
     return r;
-}
-
-// ─── Decoding a chunked request body, one read at a time ────────────────────
-// The proxy forwards a chunked body without understanding it -- "bounding it
-// would mean guessing where it ends and truncating a legitimate upload" -- and
-// that is enough to hand the framing to a backend that will parse it.  A server
-// delivering the body to a script has to take the framing off, so this is the
-// one piece the proxy could not lend.
-//
-// Stepping rather than one-shot, because a read can carry a size line, a
-// payload run, the CRLF after it and the start of the next size line, and the
-// caller needs each payload run separately.  `in` is advanced past everything
-// consumed so the caller knows exactly how much to erase.
-
-enum class chunk_step
-{
-    need_more,   // nothing more can be decided from what is here
-    payload,     // `out` names bytes of the body, already consumed from `in`
-    done,        // the terminating 0-chunk and its trailers are complete
-    bad,         // not chunked framing, and the stream cannot be resynchronised
-};
-
-struct http_chunked_decoder
-{
-    enum class phase : uint8_t { size, data, data_crlf, trailer, finished, broken };
-    phase  st{phase::size};
-    size_t chunk_left{0};
-    // A size line is a handful of hex digits and maybe an extension; anything
-    // beyond this is a peer filling memory one byte at a time with a line it
-    // never terminates.  Kept small because 16 hex digits already exceeds what
-    // size_t can hold.
-    static constexpr size_t MAX_SIZE_LINE = 256;
-    // Trailers are headers, and the same reasoning bounds them.
-    static constexpr size_t MAX_TRAILER_BYTES = 8192;
-    size_t trailer_seen{0};
-};
-
-// Hex, strict: `from_chars` with base 16 would also take a leading '+', and a
-// chunk size is not allowed one.
-inline bool http_chunk_hex(std::string_view s, size_t& out)
-{
-    if (s.empty()) return false;
-    size_t v = 0;
-    for (char c : s)
-    {
-        int d;
-        if (c >= '0' && c <= '9') d = c - '0';
-        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-        else return false;
-        // Overflow refused rather than wrapped: a wrapped size is a short read
-        // that then reads the next chunk's header as payload.
-        if (v > (SIZE_MAX - static_cast<size_t>(d)) / 16) return false;
-        v = v * 16 + static_cast<size_t>(d);
-    }
-    out = v;
-    return true;
-}
-
-inline chunk_step http_chunked_next(http_chunked_decoder& d, std::string_view& in,
-                             std::string_view& out)
-{
-    out = std::string_view();
-    for (;;)
-    {
-        switch (d.st)
-        {
-        case http_chunked_decoder::phase::broken:
-            return chunk_step::bad;
-        case http_chunked_decoder::phase::finished:
-            return chunk_step::done;
-
-        case http_chunked_decoder::phase::size:
-        {
-            const size_t nl = in.find("\r\n");
-            if (nl == std::string_view::npos)
-            {
-                // A line that never ends is refused rather than waited on.
-                if (in.size() > http_chunked_decoder::MAX_SIZE_LINE)
-                {
-                    d.st = http_chunked_decoder::phase::broken;
-                    return chunk_step::bad;
-                }
-                return chunk_step::need_more;
-            }
-            if (nl > http_chunked_decoder::MAX_SIZE_LINE)
-            {
-                d.st = http_chunked_decoder::phase::broken;
-                return chunk_step::bad;
-            }
-            // An extension is legal and carries no meaning here, so the size is
-            // whatever precedes the first ';'.
-            std::string_view line = in.substr(0, nl);
-            const size_t semi = line.find(';');
-            if (semi != std::string_view::npos) line = line.substr(0, semi);
-            // Trailing spaces are tolerated by RFC 9112 for the size, leading
-            // ones are not part of the grammar and would let " 5" mean 5.
-            while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
-                line.remove_suffix(1);
-
-            size_t sz = 0;
-            if (!http_chunk_hex(line, sz))
-            {
-                d.st = http_chunked_decoder::phase::broken;
-                return chunk_step::bad;
-            }
-            in.remove_prefix(nl + 2);
-            if (sz == 0)
-            {
-                d.st = http_chunked_decoder::phase::trailer;
-                d.trailer_seen = 0;
-                continue;
-            }
-            d.chunk_left = sz;
-            d.st = http_chunked_decoder::phase::data;
-            continue;
-        }
-
-        case http_chunked_decoder::phase::data:
-        {
-            if (in.empty()) return chunk_step::need_more;
-            const size_t n = in.size() < d.chunk_left ? in.size() : d.chunk_left;
-            out = in.substr(0, n);
-            in.remove_prefix(n);
-            d.chunk_left -= n;
-            if (d.chunk_left == 0)
-                d.st = http_chunked_decoder::phase::data_crlf;
-            // Returned even when the chunk is not finished: the caller wants
-            // every byte as it lands, which is the whole reason for this.
-            return chunk_step::payload;
-        }
-
-        case http_chunked_decoder::phase::data_crlf:
-        {
-            if (in.size() < 2) return chunk_step::need_more;
-            if (in[0] != '\r' || in[1] != '\n')
-            {
-                // The declared length and the framing disagree, so nothing
-                // after this point can be trusted to be payload.
-                d.st = http_chunked_decoder::phase::broken;
-                return chunk_step::bad;
-            }
-            in.remove_prefix(2);
-            d.st = http_chunked_decoder::phase::size;
-            continue;
-        }
-
-        case http_chunked_decoder::phase::trailer:
-        {
-            // Either an immediate CRLF -- no trailers -- or header lines until
-            // an empty one.
-            for (;;)
-            {
-                const size_t nl = in.find("\r\n");
-                if (nl == std::string_view::npos)
-                {
-                    if (in.size() + d.trailer_seen > http_chunked_decoder::MAX_TRAILER_BYTES)
-                    {
-                        d.st = http_chunked_decoder::phase::broken;
-                        return chunk_step::bad;
-                    }
-                    return chunk_step::need_more;
-                }
-                d.trailer_seen += nl + 2;
-                if (d.trailer_seen > http_chunked_decoder::MAX_TRAILER_BYTES)
-                {
-                    d.st = http_chunked_decoder::phase::broken;
-                    return chunk_step::bad;
-                }
-                const bool empty_line = (nl == 0);
-                in.remove_prefix(nl + 2);
-                if (empty_line)
-                {
-                    d.st = http_chunked_decoder::phase::finished;
-                    return chunk_step::done;
-                }
-                // A trailer line is discarded: nothing downstream reads them,
-                // and inventing headers from them after the request has been
-                // dispatched is how a trailer becomes a request smuggling.
-            }
-        }
-        }
-    }
 }
