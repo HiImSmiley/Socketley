@@ -908,6 +908,44 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
     }
 }
 
+// A response head answering a client that asked to close, with the backend's
+// Connection and Keep-Alive fields replaced by `Connection: close`, because a
+// pooled backend says keep-alive and RFC 9112 9.6 has the closing side say
+// close; `head` ends with its blank line and the body is not the caller's
+// concern here.
+inline std::string http_head_saying_close(std::string_view head)
+{
+    auto name_is = [](std::string_view line, std::string_view name) {
+        if (line.size() <= name.size() || line[name.size()] != ':')
+            return false;
+        for (size_t i = 0; i < name.size(); ++i)
+            if ((line[i] | 0x20) != name[i])
+                return false;
+        return true;
+    };
+    std::string out;
+    out.reserve(head.size() + 19);
+    size_t pos = 0;
+    while (pos < head.size())
+    {
+        size_t eol = head.find("\r\n", pos);
+        if (eol == std::string_view::npos)
+            eol = head.size();
+        const std::string_view line = head.substr(pos, eol - pos);
+        const size_t next = eol + 2 <= head.size() ? eol + 2 : head.size();
+        if (line.empty())
+        {
+            out.append("Connection: close\r\n\r\n");
+            out.append(head.substr(next));
+            return out;
+        }
+        if (!(pos > 0 && (name_is(line, "connection") || name_is(line, "keep-alive"))))
+            out.append(head.substr(pos, next - pos));
+        pos = next;
+    }
+    return out;
+}
+
 // Has this backend delivered a response whose end this proxy can point at,
 // asked by both halves of the pooling decision so no teardown path reaches the
 // pool without asking.

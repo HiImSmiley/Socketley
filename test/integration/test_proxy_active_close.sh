@@ -126,5 +126,32 @@ KEPT=$(timeout 30 python3 "$WORK/keep.py" "$P" /pc/small.txt 600 || echo 0)
 if [ "$KEPT" = "2" ]; then pass
 else fail "a keep-alive connection is kept" "$KEPT of 2 requests on one connection answered"; fi
 
+# ── 5. and the answer says so ───────────────────────────────────────────────
+# RFC 9112 9.6: the side that closes says close.  The pooled backend answers
+# keep-alive, which the proxy passed through to a client it was about to close;
+# a keep-alive client must still be told keep-alive.
+conn_hdr() {   # Connection value to send, or "" -> the response's Connection value
+    python3 - "$P" "$1" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5); s.settimeout(5)
+extra = ("Connection: %s\r\n" % sys.argv[2]) if sys.argv[2] else ""
+s.sendall(("GET /pc/small.txt HTTP/1.1\r\nHost: t\r\n%s\r\n" % extra).encode())
+d = b""
+while b"\r\n\r\n" not in d:
+    b = s.recv(65536)
+    if not b: break
+    d += b
+v = [l.split(b":", 1)[1].strip().decode().lower() for l in d.split(b"\r\n\r\n")[0].split(b"\r\n")[1:]
+     if l.lower().startswith(b"connection:")]
+print(",".join(v) or "none")
+PY
+}
+H=$(conn_hdr close || echo error)
+if [ "$H" = "close" ]; then pass
+else fail "a client that asked to close is told close" "the response said Connection: $H"; fi
+H=$(conn_hdr "" || echo error)
+if [ "$H" = "keep-alive" ]; then pass
+else fail "a keep-alive client is still told keep-alive" "the response said Connection: $H"; fi
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]

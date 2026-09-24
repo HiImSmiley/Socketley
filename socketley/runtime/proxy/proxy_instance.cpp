@@ -3958,6 +3958,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // client's wire that answer no outstanding request, and those are dropped.
     const bool framed_before  = conn->http_frame.headers_parsed;
     const bool tunnel_before  = conn->http_frame.switched_protocols;
+    const bool first_bytes    = !conn->http_frame.response_bytes_seen;
     size_t forward_len = data_len;
     if (m_protocol == protocol_http)
     {
@@ -3967,11 +3968,34 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             forward_len = data_len - excess;
     }
 
+    // A client that asked to close is told close, where a pooled backend says
+    // keep-alive -- when the whole final head came in this first read, which it
+    // does for any head that fits one; a split one is forwarded as it came.
+    std::string closing_head;
+    if (m_protocol == protocol_http && first_bytes && conn->http_frame.headers_parsed &&
+        conn->http_frame.interim_blocks == 0 && !conn->http_frame.switched_protocols &&
+        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        const auto& ce = m_conn_idx[conn->client_fd];
+        if (ce.side == conn_client && (ce.client->client_conn_close || ce.client->client_eof))
+        {
+            const std::string_view chunk{data_ptr, forward_len};
+            const size_t end = chunk.find("\r\n\r\n");
+            if (end != std::string_view::npos)
+            {
+                closing_head = http_head_saying_close(chunk.substr(0, end + 4));
+                closing_head.append(chunk.substr(end + 4));
+            }
+        }
+    }
+
     // Forward to client
-    const bool lent = forward_to_client(conn, {data_ptr, forward_len},
-                                        lendable_buf(is_provided, buf_id, forward_len),
-                                        m_protocol == protocol_http && !conn->splice_active &&
-                                        backend_response_complete(conn));
+    const bool response_ends = m_protocol == protocol_http && !conn->splice_active &&
+                               backend_response_complete(conn);
+    const bool lent = closing_head.empty()
+        ? forward_to_client(conn, {data_ptr, forward_len},
+                            lendable_buf(is_provided, buf_id, forward_len), response_ends)
+        : forward_to_client(conn, closing_head, -1, response_ends);
 
     // The response framing decides both whether the socket may be pooled and
     // how much of this chunk the client may see, which were one question all
