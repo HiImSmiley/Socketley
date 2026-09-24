@@ -3652,6 +3652,9 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
             if (!chunked)
                 conn->body_remaining -= n;
             conn->partial.erase(0, n);
+            // saved_request holds the head and the first read's body only, so
+            // a retry from here would send a second backend a truncated body.
+            conn->retries_remaining = 0;
         }
         // Whatever is still buffered is the next request, which waits for this
         // one's response and is then parsed from the top.
