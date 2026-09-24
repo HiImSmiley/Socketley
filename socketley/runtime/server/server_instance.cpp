@@ -1672,6 +1672,11 @@ void server_instance::queue_http_response(server_connection* conn,
         if (hdr_end != std::string::npos && hdr_end + 4 < resp->size())
             resp = std::make_shared<const std::string>(resp->data(), hdr_end + 4);
     }
+    // Through admit_send like every other write, because a client pipelining
+    // requests and reading nothing was answered into a queue with no bound --
+    // and allowed while closing, since a refusal marks that after queueing.
+    if (!admit_send(conn, resp->size(), true))
+        return;
     if (ends_exchange && !conn->http_keep_alive && send_final_and_fin(conn, *resp))
         return;
     conn->write_queue.push(std::move(resp));
