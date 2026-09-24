@@ -434,7 +434,10 @@ bool cache_script_engine::eval(std::string_view body,
     {
         // Named so a compile error points at "user_script" the way Redis's
         // does, rather than at the script's own first line quoted back.
-        sol::load_result lr = m_lua.load(std::string(body), "@user_script");
+        // Text only, because LuaJIT runs bytecode unverified and a crafted
+        // chunk from any client that can reach the port is native code.
+        sol::load_result lr = m_lua.load(std::string(body), "@user_script",
+                                         sol::load_mode::text);
         if (!lr.valid())
         {
             sol::error e = lr;
