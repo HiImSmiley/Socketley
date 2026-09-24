@@ -286,6 +286,7 @@ void proxy_client_connection::reset(int new_fd)
     body_remaining = 0;
     body_unbounded = false;
     req_chunk = {};
+    peer_addr.clear();
     last_activity = {};
     retries_remaining = 0;
     backend_idx = 0;
@@ -4252,6 +4253,8 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
 
     bool host_written = false;
     bool client_keep_alive = false;
+    std::string prior_forwarded_for;
+    std::string_view client_host;
     size_t h_pos = 0;
     while (h_pos < headers_section.size())
     {
@@ -4334,9 +4337,34 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
             }
         }
 
+        // The forwarding headers are this proxy's to write: a client's own
+        // X-Forwarded-For is kept as the start of the chain, and anything it
+        // says about the scheme or the host is replaced by what is true here.
+        if (header_name_equals(hdr_line, "x-forwarded-for", 15))
+        {
+            const auto colon = hdr_line.find(':');
+            const std::string_view v = (colon == std::string_view::npos)
+                ? std::string_view{} : http_trim_ows(hdr_line.substr(colon + 1));
+            if (!v.empty())
+            {
+                if (!prior_forwarded_for.empty()) prior_forwarded_for += ", ";
+                prior_forwarded_for.append(v.data(), v.size());
+            }
+            h_pos = nl + 2;
+            continue;
+        }
+        if (header_name_equals(hdr_line, "x-forwarded-proto", 17) ||
+            header_name_equals(hdr_line, "x-forwarded-host", 16))
+        {
+            h_pos = nl + 2;
+            continue;
+        }
+
         // Rewrite Host header to backend address
         if (header_name_equals(hdr_line, "host", 4))
         {
+            if (const auto colon = hdr_line.find(':'); colon != std::string_view::npos)
+                client_host = http_trim_ows(hdr_line.substr(colon + 1));
             if (!append_backend_host_header(result, conn))
             {
                 result += hdr_line;
@@ -4359,6 +4387,35 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // Add Host if not present
     if (!host_written)
         append_backend_host_header(result, conn);
+
+    // Host names the backend, so what the client asked for, who asked and over
+    // what travel in the headers nginx and every framework read them from --
+    // unless a filter set one of them, which is the script's to decide.
+    auto filter_set = [&](const char* lower, size_t len) {
+        for (const auto& [n, v] : conn->filter_headers)
+            if (http_token_equals(n, lower, len)) return true;
+        return false;
+    };
+    if (conn->peer_addr.empty() && conn->fd >= 0)
+        conn->peer_addr = peer_ip(conn->fd);
+    if (!filter_set("x-forwarded-for", 15) &&
+        (!prior_forwarded_for.empty() || !conn->peer_addr.empty()))
+    {
+        result += "X-Forwarded-For: ";
+        result += prior_forwarded_for;
+        if (!prior_forwarded_for.empty() && !conn->peer_addr.empty())
+            result += ", ";
+        result += conn->peer_addr;
+        result += "\r\n";
+    }
+    if (!filter_set("x-forwarded-proto", 17))
+        result += get_tls() ? "X-Forwarded-Proto: https\r\n" : "X-Forwarded-Proto: http\r\n";
+    if (!client_host.empty() && !filter_set("x-forwarded-host", 16))
+    {
+        result += "X-Forwarded-Host: ";
+        result.append(client_host.data(), client_host.size());
+        result += "\r\n";
+    }
 
     // HTTP/1.0 closes after every answer unless it asked otherwise, and the
     // backend is always asked for keep-alive, so the proxy has to remember.

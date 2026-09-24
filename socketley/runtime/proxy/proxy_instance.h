@@ -165,6 +165,10 @@ struct alignas(64) proxy_client_connection
     bool body_unbounded{false};
     http_chunked_decoder req_chunk{};
 
+    // The client's address as X-Forwarded-For names it, looked up on the
+    // connection's first request and kept for the rest.
+    std::string peer_addr;
+
     // Request headers a filter set on the request now being parsed, per
     // request rather than per connection, or the second request on a
     // keep-alive socket would carry the first one's identity.
