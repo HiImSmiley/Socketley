@@ -252,6 +252,25 @@ TEST_CASE("cache_store TTL")
     {
         CHECK_FALSE(store.set_expiry("nokey", 100));
     }
+
+    // The single-probe form TTL and PTTL answer from has to say what the two
+    // calls it replaced said, including removing a key whose deadline passed.
+    SUBCASE("expire_then_pttl answers as check_expiry then get_pttl")
+    {
+        CHECK(store.expire_then_pttl("nokey") == -2);
+        store.set("plain", "v");
+        CHECK(store.expire_then_pttl("plain") == -1);
+        store.set("k", "v");
+        REQUIRE(store.set_expiry("k", 100));
+        const int64_t ms = store.expire_then_pttl("k");
+        CHECK(ms > 99000);
+        CHECK(ms <= 100000);
+        store.set("gone", "v");
+        REQUIRE(store.set_expiry_ms("gone", 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CHECK(store.expire_then_pttl("gone") == -2);
+        CHECK_FALSE(store.exists("gone"));
+    }
 }
 
 TEST_CASE("cache_store eviction")

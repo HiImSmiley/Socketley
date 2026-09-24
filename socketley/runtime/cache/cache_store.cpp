@@ -1152,6 +1152,33 @@ int64_t cache_store::get_pttl(std::string_view key) const
     return remaining.count();
 }
 
+// TTL asked check_expiry() and then get_ttl(), which probed the expiry map
+// twice and the keyspace once and read the clock twice, on the one command a
+// client polls.
+int64_t cache_store::expire_then_pttl(std::string_view key)
+{
+    if (!m_expiry.empty())
+    {
+        auto it = m_expiry.find(key);
+        if (it != m_expiry.end())
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= it->second)
+            {
+                m_expiry.erase(it);
+                drop_lru(key);
+                drop_value(key);
+                return -2;
+            }
+            if (!exists(key))
+                return -2;
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                it->second - now).count();
+        }
+    }
+    return exists(key) ? -1 : -2;
+}
+
 bool cache_store::setnx(std::string_view key, std::string_view value)
 {
     check_expiry(key);

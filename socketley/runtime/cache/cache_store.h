@@ -184,6 +184,8 @@ public:
     // --- Millisecond-precision TTL ---
     bool set_expiry_ms(std::string_view key, int64_t ms);
     int64_t get_pttl(std::string_view key) const;  // ms; -1=no ttl, -2=not found
+    // get_pttl() after check_expiry(), in one probe of the expiry map.
+    int64_t expire_then_pttl(std::string_view key);
 
     // --- Set if not exists ---
     bool setnx(std::string_view key, std::string_view value);

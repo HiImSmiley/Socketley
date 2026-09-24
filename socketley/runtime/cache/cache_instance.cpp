@@ -6416,9 +6416,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         }
         case fnv1a("ttl"):
         {
-            if (m_has_ttl_keys) m_store.check_expiry(args);
-            int64_t ttl = m_store.get_ttl(args);
-            append_int_nl(rb, ttl);
+            const int64_t ms = m_store.expire_then_pttl(args);
+            append_int_nl(rb, ms < 0 ? ms : (ms + 500) / 1000);
             break;
         }
         case fnv1a("persist"):
@@ -6543,8 +6542,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         }
         case fnv1a("pttl"):
         {
-            if (m_has_ttl_keys) m_store.check_expiry(args);
-            append_int_nl(rb, m_store.get_pttl(args));
+            append_int_nl(rb, m_store.expire_then_pttl(args));
             break;
         }
         case fnv1a("expireat"):
@@ -9822,8 +9820,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("ttl"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.get_ttl(args[1]));
+            const int64_t ms = m_store.expire_then_pttl(args[1]);
+            resp::encode_integer_into(rb, ms < 0 ? ms : (ms + 500) / 1000);
             break;
         }
         case fnv1a("persist"):
@@ -9930,8 +9928,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("pttl"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            resp::encode_integer_into(rb, m_store.get_pttl(args[1]));
+            resp::encode_integer_into(rb, m_store.expire_then_pttl(args[1]));
             break;
         }
         case fnv1a("expireat"):
