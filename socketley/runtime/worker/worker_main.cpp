@@ -829,6 +829,8 @@ private:
             m_done      = true;
             return;
         }
+        logger::g_prefix = cfg.type_name + " '" + cfg.name + "'" +
+            (cfg.shards > 1 ? " shard " + std::to_string(cfg.shard_index) : std::string{}) + ": ";
         m_owned = std::move(inst);
         m_rt    = m_owned.get();
         m_proxy = (cfg.type == runtime_proxy)

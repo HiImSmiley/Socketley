@@ -643,6 +643,25 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
         return 1;
     }
 
+    // As soon as the loop can hear them, because a restore can take seconds
+    // and a SIGTERM inside it took the default action: no teardown at all.
+    g_signal_write_fd = loop.get_signal_write_fd();
+
+    // Ignore SIGPIPE — broken pipe errors are handled via io_uring CQE results (-EPIPE)
+    signal(SIGPIPE, SIG_IGN);
+
+    // Ignored rather than a stop, because the one thing that sends it to a
+    // service is log rotation, and a postrotate `kill -HUP` stopped every
+    // runtime on the host; the files are held open, so copytruncate rotates.
+    signal(SIGHUP, SIG_IGN);
+
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     // Give the cross-runtime request channel its ring before any runtime is
     // restored, because a server with --cache posts on its first message and
     // that message can arrive inside restore.
@@ -715,19 +734,6 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // daemon logged "daemon started" with every restored out-of-process
     // runtime reading `Up` and no process behind it for up to two seconds.
     handler.start_restored_workers();
-
-    g_signal_write_fd = loop.get_signal_write_fd();
-
-    // Ignore SIGPIPE — broken pipe errors are handled via io_uring CQE results (-EPIPE)
-    signal(SIGPIPE, SIG_IGN);
-
-    struct sigaction sa{};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-    sigaction(SIGHUP, &sa, nullptr);
 
     // After the socket is served and before the loop, so an entry exists only
     // for a daemon that is actually answering.

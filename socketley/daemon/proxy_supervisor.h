@@ -390,6 +390,11 @@ private:
     void   apply_stats(const std::string& payload);
     void   ingest(const std::string& buf);
 
+    // "runtime 'name' shard N: ", the start of every line this class logs
+    // about its worker, because the daemon supervises many and a crash that
+    // names none of them sends the operator matching timestamps by hand.
+    std::string who() const;
+
     // Deliberately a runtime_instance and nothing narrower, because everything
     // this class does is the same work whatever kind of runtime is on the
     // other side.

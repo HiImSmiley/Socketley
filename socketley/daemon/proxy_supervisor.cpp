@@ -1460,7 +1460,7 @@ void proxy_supervisor::ingest(const std::string&)
                     m_placeholder &&
                     m_placeholder->get_state() != runtime_failed)
                 {
-                    LOG_ERROR("worker reported its runtime failed");
+                    LOG_ERROR((who() + "the worker reported its runtime failed").c_str());
                     m_placeholder->mark_failed();
                     m_state_changed = true;   // collected by check_managed_health
                 }
@@ -1628,7 +1628,19 @@ void proxy_supervisor::check_wedged()
     else
         snprintf(msg, sizeof(msg), "worker pid %d is answering again",
                  static_cast<int>(m_pid));
-    LOG_WARN(msg);
+    LOG_WARN((who() + msg).c_str());
+}
+
+std::string proxy_supervisor::who() const
+{
+    std::string w = "runtime '";
+    if (m_placeholder)
+        w.append(m_placeholder->get_name());
+    w += '\'';
+    if (m_placeholder && m_placeholder->get_shards() > 1)
+        w += " shard " + std::to_string(m_shard_index);
+    w += ": ";
+    return w;
 }
 
 bool proxy_supervisor::check_liveness()
@@ -1661,12 +1673,12 @@ bool proxy_supervisor::check_liveness()
                      m_exec_path.c_str(), WEXITSTATUS(status));
         else if (WIFSIGNALED(status))
             snprintf(msg, sizeof(msg),
-                     "worker %s was killed by signal %d",
-                     m_exec_path.c_str(), WTERMSIG(status));
+                     "worker %s was killed by signal %d (%s)",
+                     m_exec_path.c_str(), WTERMSIG(status), strsignal(WTERMSIG(status)));
         else
             snprintf(msg, sizeof(msg), "worker %s exited unexpectedly",
                      m_exec_path.c_str());
-        LOG_WARN(msg);
+        LOG_WARN((who() + msg).c_str());
     }
 
     // A child that died without ever answering a frame never read the config
@@ -1683,7 +1695,7 @@ bool proxy_supervisor::check_liveness()
     // where the operator can see it.
     if (WIFEXITED(status) && WEXITSTATUS(status) == worker_proto::exit_config_refused)
     {
-        LOG_ERROR("proxy worker refused its configuration; not restarting it");
+        LOG_ERROR((who() + "the worker refused its configuration; not restarting it").c_str());
         if (m_placeholder)
             m_placeholder->mark_failed();
         return true;
@@ -1704,7 +1716,7 @@ bool proxy_supervisor::check_liveness()
 
     if (++m_restarts > restart_burst_limit)
     {
-        LOG_ERROR("proxy worker restarted too often, leaving it failed");
+        LOG_ERROR((who() + "the worker restarted too often, leaving it failed").c_str());
         if (m_placeholder)
             m_placeholder->mark_failed();
         return true;

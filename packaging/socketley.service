@@ -17,7 +17,10 @@ ConfigurationDirectory=socketley
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+# Read-only rather than hidden, because scripts, certificates and static
+# roots are commonly kept in a home directory and --lua, --cert and --http
+# name them there; nothing under /home is ever written.
+ProtectHome=read-only
 ReadWritePaths=/var/lib/socketley /run/socketley
 
 # User

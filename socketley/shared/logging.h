@@ -5,6 +5,7 @@
 #include <ctime>
 #include <chrono>
 #include <mutex>
+#include <string>
 
 enum log_level : uint8_t
 {
@@ -54,6 +55,10 @@ struct logger
 {
     static inline log_level g_level = log_info;
 
+    // Who is speaking, set once by a worker, because every worker shares the
+    // daemon's stderr and a line that names no runtime names nothing.
+    static inline std::string g_prefix;
+
     static void log(log_level level, const char* msg)
     {
         if (level < g_level)
@@ -76,8 +81,8 @@ struct logger
 
         static std::mutex mtx;
         std::lock_guard<std::mutex> lock(mtx);
-        std::fprintf(stderr, "[%02d:%02d:%02d] [%s] %s\n",
-            tm.tm_hour, tm.tm_min, tm.tm_sec, tag, msg);
+        std::fprintf(stderr, "[%02d:%02d:%02d] [%s] %s%s\n",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, tag, g_prefix.c_str(), msg);
     }
 };
 
