@@ -1499,11 +1499,45 @@ void cache_instance::inv_check_reachable(int fd, const char* where)
 }
 #endif
 
+// Whether the peer on `fd` is this machine, where a unix socket always is.
+static bool peer_is_local(int fd)
+{
+    sockaddr_storage ss{};
+    socklen_t len = sizeof(ss);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0)
+        return false;
+    if (ss.ss_family == AF_UNIX)
+        return true;
+    if (ss.ss_family == AF_INET)
+        return (ntohl(reinterpret_cast<const sockaddr_in*>(&ss)->sin_addr.s_addr) >> 24) == 127;
+    if (ss.ss_family == AF_INET6)
+    {
+        const in6_addr& a = reinterpret_cast<const sockaddr_in6*>(&ss)->sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(&a) ||
+               (IN6_IS_ADDR_V4MAPPED(&a) && a.s6_addr[12] == 127);
+    }
+    return false;
+}
+
 bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_unix)
 {
     // Reject fds beyond our O(1) lookup table — they'd become zombie connections
     if (client_fd >= MAX_FDS)
     {
+        close_tracked(client_fd);
+        return false;
+    }
+
+    // Protected mode: the one door every accepted connection comes through,
+    // answered in a line both protocols read as an error, before a byte of
+    // the peer's is.
+    if ((!from_unix || from_cluster) && !m_admits_remote && !peer_is_local(client_fd))
+    {
+        static constexpr std::string_view denied =
+            "-DENIED this cache serves only this machine: it has no password, "
+            "so a peer on the network is refused unless the runtime is created "
+            "with --public or with mutual TLS (--tls --ca)\r\n";
+        if (::send(client_fd, denied.data(), denied.size(), MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {}
         close_tracked(client_fd);
         return false;
     }
@@ -11408,6 +11442,16 @@ eviction_policy cache_instance::get_eviction() const
 void cache_instance::set_cluster(bool enabled)
 {
     m_cluster_forced = enabled;
+}
+
+void cache_instance::set_public(bool enabled)
+{
+    m_public = enabled;
+}
+
+bool cache_instance::get_public() const
+{
+    return m_public;
 }
 
 bool cache_instance::get_cluster() const

@@ -143,6 +143,9 @@ struct runtime_config
     std::string replicate_target;
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
+    // --public, false for every state file written before it existed, which
+    // is the protected default those caches start under.
+    bool cache_public = false;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

@@ -477,6 +477,7 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Default port: 9000                                             ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Flags: --persistent file, --mode readonly|readwrite|admin,     ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}        --persistent-interval 5m, --shards N, --cluster         ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}        --public: serve other machines (default: this one only) ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} Example: socketley create cache store --persistent data.bin -s ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}                                                                 ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC} --shards N: N worker processes on one port. A key belongs to   ${CYAN}│${NC}"

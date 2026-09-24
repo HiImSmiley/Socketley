@@ -61,6 +61,33 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
         prx.set_mesh_client_key(cfg.mesh_client_key);
 }
 
+void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool by_presence)
+{
+    // By value a zero or an empty field is the default, which a fresh object
+    // already holds; by presence the document's own key set decides.
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("persistent_path", !cfg.persistent_path.empty()))
+        cache.set_persistent(cfg.persistent_path);
+    if (asked("persistent_interval", cfg.persistent_interval > 0))
+        cache.set_persist_interval(cfg.persistent_interval);
+    if (asked("cache_mode", true))
+        cache.set_mode(static_cast<cache_mode>(cfg.cache_mode));
+    if (asked("resp_forced", cfg.resp_forced))
+        cache.set_resp_forced(cfg.resp_forced);
+    if (asked("cluster", cfg.cluster))
+        cache.set_cluster(cfg.cluster);
+    if (asked("replicate_target", !cfg.replicate_target.empty()))
+        cache.set_replicate_target(cfg.replicate_target);
+    if (asked("max_memory", cfg.max_memory > 0))
+        cache.set_max_memory(cfg.max_memory);
+    if (asked("eviction", true))
+        cache.set_eviction(static_cast<eviction_policy>(cfg.eviction));
+    if (asked("public", cfg.cache_public))
+        cache.set_public(cfg.cache_public);
+}
+
 void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
 {
     // Guarded the way the worker's own list was, because a setter called with
@@ -198,20 +225,8 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
             break;
 
         case runtime_cache:
-        {
-            auto& cache = static_cast<cache_instance&>(rt);
-            if (!cfg.persistent_path.empty())
-                cache.set_persistent(cfg.persistent_path);
-            cache.set_persist_interval(cfg.persistent_interval);
-            cache.set_mode(static_cast<cache_mode>(cfg.cache_mode));
-            cache.set_resp_forced(cfg.resp_forced);
-            cache.set_cluster(cfg.cluster);
-            if (!cfg.replicate_target.empty())
-                cache.set_replicate_target(cfg.replicate_target);
-            if (cfg.max_memory > 0) cache.set_max_memory(cfg.max_memory);
-            cache.set_eviction(static_cast<eviction_policy>(cfg.eviction));
+            apply_cache_config(static_cast<cache_instance&>(rt), cfg);
             break;
-        }
     }
 
     // Unconditional because it is a no-op for the built-ins, and a registered

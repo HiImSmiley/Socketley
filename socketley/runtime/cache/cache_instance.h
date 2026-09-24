@@ -309,6 +309,9 @@ public:
         m_idle_timeout_cached = get_idle_timeout();
         m_max_conns_cached    = get_max_connections();
         m_rate_limit_cached   = get_rate_limit();
+        // A client certificate the listener demands is a credential, so mutual
+        // TLS opens the cache the way --public does.
+        m_admits_remote       = m_public || (get_tls() && !get_ca_path().empty());
     }
 
     // What setup() will bind, answered without binding it; see the base class.
@@ -481,6 +484,13 @@ public:
     // reached at all.
     void set_cluster(bool enabled);
     bool get_cluster() const;
+
+    // --public: a peer that is not on this machine is served, where by default
+    // it is refused, because this cache has no password and answers every
+    // client with everything it holds -- so reaching it from the network is
+    // something to say, the way Redis's protected mode makes you say it.
+    void set_public(bool enabled);
+    bool get_public() const;
 
     // Pub/Sub
     int publish(std::string_view channel, std::string_view message);
@@ -1066,6 +1076,9 @@ private:
     // port.
     bool m_cluster_forced{false};
     bool m_cluster_ports{false};
+    bool m_public{false};
+    // Whether a TCP peer on another machine is served, fixed at setup().
+    bool m_admits_remote{false};
     // The port the operator configured, from which every shard's own port is
     // derived, kept because get_port() is not inline and the answer has to be
     // identical in every shard.

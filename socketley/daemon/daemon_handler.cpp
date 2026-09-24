@@ -3401,6 +3401,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 fnv1a("--maxmemory"), fnv1a("--eviction"), fnv1a("--persistent"),
                 fnv1a("--replicate"), fnv1a("--resp"), fnv1a("--cluster"),
                 fnv1a("--persistent-interval"), fnv1a("--mode"),
+                fnv1a("--public"),
             };
             bool is_cache_flag = false;
             for (uint32_t h : cache_only)
@@ -4023,16 +4024,8 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         }
         case runtime_cache:
         {
-            auto* cache = static_cast<cache_instance*>(instance);
-            if (has("persistent_path"))  cache->set_persistent(cfg.persistent_path);
-            if (has("persistent_interval"))
-                cache->set_persist_interval(cfg.persistent_interval);
-            if (has("cache_mode"))       cache->set_mode(static_cast<cache_mode>(cfg.cache_mode));
-            if (has("resp_forced"))      cache->set_resp_forced(cfg.resp_forced);
-            if (has("cluster"))          cache->set_cluster(cfg.cluster);
-            if (has("replicate_target")) cache->set_replicate_target(cfg.replicate_target);
-            if (has("max_memory"))       cache->set_max_memory(cfg.max_memory);
-            if (has("eviction"))         cache->set_eviction(static_cast<eviction_policy>(cfg.eviction));
+            apply_cache_config(*static_cast<cache_instance*>(instance), cfg,
+                               /*by_presence=*/true);
             break;
         }
         default:

@@ -1187,6 +1187,9 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
         case fnv1a("--cluster"):
             cache->set_cluster(true);
             return 0;
+        case fnv1a("--public"):
+            cache->set_public(true);
+            return 0;
         case fnv1a("--replicate"):
         {
             if (i + 1 >= pa.count)

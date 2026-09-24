@@ -5,6 +5,7 @@
 
 #include <string>
 
+class cache_instance;
 class proxy_instance;
 class runtime_instance;
 struct runtime_config;
@@ -21,6 +22,12 @@ struct runtime_config;
 // tenth mesh field added to a copy of this list is a field one of the two doors
 // would not apply.
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
+                        bool by_presence = false);
+
+// A cache's own fields, with `by_presence` meaning what it means for the
+// proxy -- one list, because restore and import each kept a copy of it and
+// --public reached neither.
+void apply_cache_config(cache_instance& cache, const runtime_config& cfg,
                         bool by_presence = false);
 
 // The fields every type has; not the ring settings, and not --lua, whose

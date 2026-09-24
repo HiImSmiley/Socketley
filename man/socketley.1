@@ -4251,6 +4251,22 @@ shard's alone is the
 the siblings report back on a later turn and this call answers on the turn it
 was made.
 .TP
+.B \-\-public
+Serve peers on other machines.  A cache has no password and answers every
+client with everything it holds, so by default it serves only this machine:
+a TCP peer whose address is not loopback is answered
+.B \-DENIED
+and closed before a byte of its is read.  This is Redis's protected mode, for
+the reason Redis has it.
+.B \-\-public
+lifts it, and so does mutual TLS
+.RB ( \-\-tls " " \-\-ca ),
+where the client certificate is the credential.  A follower on another host
+needs its leader to be public for the same reason.  Set at
+.BR create ;
+a running cache takes it through
+.BR import .
+.TP
 .B \-\-cluster
 Publish a routable slot map, so that a cluster\-aware client sends each key
 straight to the shard that owns it and no crossing happens at all. Off by
