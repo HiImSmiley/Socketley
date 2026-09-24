@@ -332,7 +332,17 @@ refuse_cli() {
 }
 
 LONG="/tmp/$(python3 -c "print('z' * 120)").sock"
-refuse_cli ul_rel   "must be absolute"      --listen "unix:relative.sock"
+# A relative path is the caller's, resolved by the CLI against the directory
+# the command was typed in -- so it binds there, and is not refused.
+REL_DIR="$(mktemp -d)"
+ABS_BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+(cd "$REL_DIR" && "$ABS_BIN" create server ul_rel --listen "unix:relative.sock" -s >/dev/null 2>&1)
+for _ in $(seq 1 50); do [ -S "$REL_DIR/relative.sock" ] && break; sleep 0.1; done
+if [ -S "$REL_DIR/relative.sock" ]; then pass
+else fail "a relative unix: path binds beside the caller" \
+          "no socket at $REL_DIR/relative.sock"; fi
+"$BIN" remove ul_rel >/dev/null 2>&1 || true
+rm -rf "$REL_DIR"
 refuse_cli ul_empty "no socket path"        --listen "unix:"
 refuse_cli ul_tcp2  "a TCP port is -p"      --listen "127.0.0.1:9000"
 refuse_cli ul_long  "would be truncated"    --listen "unix:$LONG"
