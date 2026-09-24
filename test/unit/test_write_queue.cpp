@@ -146,6 +146,36 @@ TEST_CASE("a seed is sized by the backlog, never past the limit")
     CHECK(q.back().capacity() < 2 * small);
 }
 
+// A queue that empties on every send seeds each tail at one message and grew it
+// by doubling for the rest of the flight -- 11.8% of a cache fanning out to 50
+// subscribers.  Past the regrow bound the tail stays where it is and the next
+// entry starts at the backlog, so nothing already queued is copied again.
+TEST_CASE("a full tail past the regrow bound is followed, not copied")
+{
+    socketley::byte_counted_queue<std::string> q;
+    const size_t big = socketley::write_queue_regrow_max + 904;
+    q.push_coalesced(std::string_view(std::string(big, 'a')), LIMIT);
+    REQUIRE(q.size() == 1);
+    const char* at = q.front().data();
+    const size_t backlog = q.bytes();
+
+    q.push_coalesced(std::string_view(std::string(q.back().capacity() - big + 1, 'b')), LIMIT);
+    CHECK(q.size() == 2);
+    CHECK(q.front().data() == at);
+    CHECK(q.front().size() == big);
+    CHECK(q.back().capacity() >= backlog);
+}
+
+// Below it a tail still grows, because a few kilobytes are cheaper to copy than
+// to send as another entry, and three-byte replies are what coalescing is for.
+TEST_CASE("a small full tail still takes the next payload")
+{
+    socketley::byte_counted_queue<std::string> q;
+    q.push_coalesced(std::string_view(std::string(100, 'a')), LIMIT);
+    q.push_coalesced(std::string_view(std::string(q.back().capacity() - 100 + 1, 'b')), LIMIT);
+    CHECK(q.size() == 1);
+}
+
 TEST_CASE("one byte under the limit is still seeded, one byte over is not")
 {
     queue_t under;

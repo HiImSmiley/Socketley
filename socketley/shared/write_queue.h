@@ -43,6 +43,10 @@ inline constexpr size_t write_pacing_budget = 8u * 1024 * 1024;
 // message.
 inline constexpr size_t write_pacing_floor = 64u * 1024;
 
+// The largest tail still grown in place once it is full, because past it a
+// reallocation copies more than a new entry costs the kernel.
+inline constexpr size_t write_queue_regrow_max = 4u * 1024;
+
 inline size_t write_queue_size_of(const std::string& s)
 {
     return s.size() + write_queue_entry_overhead;
@@ -151,6 +155,7 @@ public:
     // not: those bytes are in somebody else's queue, or somebody else's pool.
     bool owns() const { return !m_shared && !m_borrowed.data; }
     void append(std::string_view extra) { m_owned.append(extra); }
+    size_t room() const { return owns() ? m_owned.capacity() - m_owned.size() : 0; }
 
     void clear() { m_owned.clear(); m_shared.reset(); give_back(); }
 
@@ -177,6 +182,9 @@ inline size_t write_queue_size_of(const write_chunk& c)
 // through its own overload rather than by being special-cased here.
 inline bool write_queue_can_grow(const std::string&) { return true; }
 inline bool write_queue_can_grow(const write_chunk& c) { return c.owns(); }
+
+inline size_t write_queue_room_of(const std::string& s) { return s.capacity() - s.size(); }
+inline size_t write_queue_room_of(const write_chunk& c) { return c.room(); }
 
 template <typename T>
 class byte_counted_queue
@@ -295,9 +303,7 @@ public:
             append_back(std::string_view("\n", 1));
             return;
         }
-        std::string built;
-        built.reserve(value.size() + 1);
-        built.append(value);
+        std::string built = seed(value, limit, 1);
         built.push_back('\n');
         push(T(std::move(built)));
     }
@@ -360,18 +366,21 @@ private:
     // A new tail is sized for the backlog it joins, because a connection that
     // far behind is about to take that much again and a string grown by
     // doubling copies everything it holds at every step.
-    std::string seed(std::string_view first, size_t limit) const
+    std::string seed(std::string_view first, size_t limit, size_t extra = 0) const
     {
         std::string s;
-        s.reserve(std::min(limit, std::max(first.size(), m_bytes)));
+        s.reserve(std::max(first.size() + extra, std::min(limit, m_bytes)));
         s.append(first);
         return s;
     }
 
     bool fits_in_tail(size_t n, size_t limit) const
     {
-        return !m_queue.empty() && write_queue_can_grow(m_queue.back()) &&
-               m_queue.back().size() + n <= limit;
+        if (m_queue.empty() || !write_queue_can_grow(m_queue.back()))
+            return false;
+        const T& tail = m_queue.back();
+        return tail.size() + n <= limit &&
+               (n <= write_queue_room_of(tail) || tail.size() < write_queue_regrow_max);
     }
 
     void charge_back(size_t n) noexcept
