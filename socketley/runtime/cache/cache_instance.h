@@ -537,7 +537,11 @@ private:
     void run_request_lines(client_connection* conn, std::string_view payload);
     bool process_resp(client_connection* conn);
     void process_resp_command(client_connection* conn, std::string_view* args, int argc);
+    int  first_foreign_key(std::string_view* args, int from, int n, int step) const;
+    int  resp_first_foreign_key(uint32_t h, std::string_view* args, int argc) const;
     void process_resp_command_local(client_connection* conn, std::string_view* args, int argc);
+    void resp_unsubscribe(client_connection* conn, std::string_view* args, int argc,
+                          bool patterns, std::string& rb);
 
     // The text line splitter, lifted out of handle_read so that a connection
     // whose crossing has just come back can be driven from the reply handler

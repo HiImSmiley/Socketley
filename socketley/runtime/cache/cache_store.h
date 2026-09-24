@@ -154,7 +154,9 @@ public:
     void flush_all();
 
     // --- Hashes ---
-    bool hset(std::string_view key, std::string_view field, std::string_view val);
+    // `created` is told whether the field is new, which is what HSET counts.
+    bool hset(std::string_view key, std::string_view field, std::string_view val,
+              bool* created = nullptr);
     const std::string* hget(std::string_view key, std::string_view field) const;
     bool hdel(std::string_view key, std::string_view field);
     int hlen(std::string_view key) const;
@@ -487,16 +489,22 @@ public:
     void dump_commands(std::string& buf) const;
 
     // --- Pub/Sub ---
-    void subscribe(int fd, std::string_view channel);
-    void unsubscribe(int fd, std::string_view channel);
+    // Each says whether the subscription set changed, because the count a
+    // client is answered with must not move for a repeat or a stranger.
+    bool subscribe(int fd, std::string_view channel);
+    bool unsubscribe(int fd, std::string_view channel);
     void unsubscribe_all(int fd);
 
     // Pattern subscriptions, kept apart from the exact ones because they are
     // matched and not looked up: every publish walks this map, and nothing
     // walks the other.
-    void psubscribe(int fd, std::string_view pattern);
-    void punsubscribe(int fd, std::string_view pattern);
+    bool psubscribe(int fd, std::string_view pattern);
+    bool punsubscribe(int fd, std::string_view pattern);
     void punsubscribe_all(int fd);
+
+    // What `fd` holds in one of the two maps, for an UNSUBSCRIBE that names
+    // nothing and so means all of them.
+    std::vector<std::string> subscriptions_of(int fd, bool patterns) const;
     bool has_patterns() const { return !m_patterns.empty(); }
     const channel_map& patterns() const { return m_patterns; }
 

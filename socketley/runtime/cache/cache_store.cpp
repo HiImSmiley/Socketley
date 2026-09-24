@@ -881,8 +881,10 @@ int64_t cache_store::expire_time(std::string_view key, bool millis) const
 
 // ─── Hashes ───
 
-bool cache_store::hset(std::string_view key, std::string_view field, std::string_view val)
+bool cache_store::hset(std::string_view key, std::string_view field, std::string_view val,
+                       bool* created)
 {
+    if (created) *created = false;
     auto it = m_hashes.find(key);
     if (it != m_hashes.end())
     {
@@ -911,6 +913,7 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
                 return false;
             auto nfit = it->second.emplace(std::string(field), std::string(val)).first;
             ++m_hash_fields;
+            if (created) *created = true;
             track_add(stored_string(nfit->first) + stored_string(nfit->second));
         }
         touch_lru(key);
@@ -927,6 +930,7 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     auto nit = m_hashes.emplace(std::string(key), hash_inner{}).first;
     nit->second.emplace(std::string(field), std::string(val));
     ++m_hash_fields;
+    if (created) *created = true;
     track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
     return true;
@@ -3326,43 +3330,54 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
 
 // ─── Pub/Sub ───
 
-void cache_store::subscribe(int fd, std::string_view channel)
+bool cache_store::subscribe(int fd, std::string_view channel)
 {
     const auto [it, fresh] = m_channels.try_emplace(std::string(channel));
-    it->second.insert(fd);
+    const bool added = it->second.insert(fd).second;
     if (fresh && m_chan_observer)
         m_chan_observer(m_chan_observer_ctx, it->first, true);
+    return added;
 }
 
-void cache_store::unsubscribe(int fd, std::string_view channel)
+bool cache_store::unsubscribe(int fd, std::string_view channel)
 {
     auto it = m_channels.find(channel);
-    if (it != m_channels.end())
+    if (it == m_channels.end())
+        return false;
+    const bool removed = it->second.erase(fd) > 0;
+    if (it->second.empty())
     {
-        it->second.erase(fd);
-        if (it->second.empty())
-        {
-            if (m_chan_observer)
-                m_chan_observer(m_chan_observer_ctx, it->first, false);
-            m_channels.erase(it);
-        }
+        if (m_chan_observer)
+            m_chan_observer(m_chan_observer_ctx, it->first, false);
+        m_channels.erase(it);
     }
+    return removed;
 }
 
 // A pattern has no bit to look up, so these are walked and matched on every
 // publish -- which is why they are a separate map: the exact channels stay a
 // hash lookup and pay nothing for a feature they are not using.
-void cache_store::psubscribe(int fd, std::string_view pattern)
+bool cache_store::psubscribe(int fd, std::string_view pattern)
 {
-    m_patterns[std::string(pattern)].insert(fd);
+    return m_patterns[std::string(pattern)].insert(fd).second;
 }
 
-void cache_store::punsubscribe(int fd, std::string_view pattern)
+bool cache_store::punsubscribe(int fd, std::string_view pattern)
 {
     auto it = m_patterns.find(pattern);
-    if (it == m_patterns.end()) return;
-    it->second.erase(fd);
+    if (it == m_patterns.end()) return false;
+    const bool removed = it->second.erase(fd) > 0;
     if (it->second.empty()) m_patterns.erase(it);
+    return removed;
+}
+
+std::vector<std::string> cache_store::subscriptions_of(int fd, bool patterns) const
+{
+    std::vector<std::string> out;
+    for (const auto& [name, fds] : patterns ? m_patterns : m_channels)
+        if (fds.count(fd))
+            out.push_back(name);
+    return out;
 }
 
 void cache_store::punsubscribe_all(int fd)

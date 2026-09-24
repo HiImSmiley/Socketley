@@ -2623,6 +2623,35 @@ static void sub_confirm(std::string& rb, std::string_view verb,
     resp::encode_integer_into(rb, static_cast<int64_t>(count));
 }
 
+// Both UNSUBSCRIBE verbs, where naming nothing means everything held -- the
+// form a client sends to leave subscriber mode -- and holding nothing is still
+// answered, with a nil name, because the client waits for a reply either way.
+void cache_instance::resp_unsubscribe(client_connection* conn, std::string_view* args,
+                                      int argc, bool patterns, std::string& rb)
+{
+    const std::string_view verb = patterns ? "punsubscribe" : "unsubscribe";
+    auto one = [&](std::string_view name) {
+        const bool gone = patterns ? m_store.punsubscribe(conn->fd, name)
+                                   : m_store.unsubscribe(conn->fd, name);
+        if (gone && conn->sub_count) --conn->sub_count;
+        sub_confirm(rb, verb, name, conn->sub_count);
+    };
+    if (argc >= 2)
+    {
+        for (int i = 1; i < argc; i++) one(args[i]);
+        return;
+    }
+    const auto held = m_store.subscriptions_of(conn->fd, patterns);
+    for (const auto& name : held) one(name);
+    if (held.empty())
+    {
+        resp::encode_array_header_into(rb, 3);
+        resp::encode_bulk_into(rb, verb);
+        rb.append("$-1\r\n", 5);
+        resp::encode_integer_into(rb, static_cast<int64_t>(conn->sub_count));
+    }
+}
+
 // A score bound as ZRANGEBYSCORE spells it: a bare number is inclusive, a
 // leading "(" makes it exclusive, and -inf/+inf are the open ends.
 // A scan's predicates, accumulated as its options are parsed.
@@ -8052,6 +8081,58 @@ bool cache_instance::process_resp(client_connection* conn)
 
 // The same question asked once for the other interpreter, which is two sites
 // deciding routing against the sixty-odd handlers behind them.
+// The index of the first key among every `step`th of args[from..from+n) that
+// this shard does not own, or -1 when it owns them all.
+int cache_instance::first_foreign_key(std::string_view* args, int from, int n, int step) const
+{
+    for (int i = from; i < from + n; i += step)
+        if (!args[i].empty() && cache_shard_of(args[i], m_shard_n) != m_shard_i)
+            return i;
+    return -1;
+}
+
+// -1 when this shard can run the command by itself, the index of a key it does
+// not own, or -2 for a command that reaches every shard and so none alone.
+int cache_instance::resp_first_foreign_key(uint32_t h, std::string_view* args, int argc) const
+{
+    if (h == fnv1a("eval") || h == fnv1a("evalsha"))
+    {
+        int64_t nkeys = 0;
+        if (argc >= 3 && parse_int_sv(args[2], nkeys) && nkeys > 0 && nkeys <= argc - 3)
+            return first_foreign_key(args, 3, static_cast<int>(nkeys), 1);
+        return -1;
+    }
+    if (cache_needs_one_shard(h) && argc >= 2)
+    {
+        const bool two = h == fnv1a("smove") || h == fnv1a("rename") ||
+                         h == fnv1a("renamenx") || h == fnv1a("copy");
+        return first_foreign_key(args, 1, two ? std::min(2, argc - 1) : argc - 1, 1);
+    }
+    switch (cache_classify_resp(h, argc))
+    {
+        case cache_cmd_class::connection:
+        case cache_cmd_class::unknown:
+            return -1;
+        case cache_cmd_class::single_key:
+            return argc >= 2 ? first_foreign_key(args, 1, 1, 1) : -1;
+        case cache_cmd_class::multi_key:
+            if (h == fnv1a("mset") || h == fnv1a("msetnx"))
+                return first_foreign_key(args, 1, argc - 1, 2);
+            if (h == fnv1a("del") || h == fnv1a("unlink") || h == fnv1a("exists") ||
+                h == fnv1a("touch") || h == fnv1a("mget"))
+                return first_foreign_key(args, 1, argc - 1, 1);
+            return -2;
+        case cache_cmd_class::cursor_scan:
+            return scan_cursor_owner(argc >= 2 ? args[1] : std::string_view{}) == m_shard_i
+                ? -1 : -2;
+        case cache_cmd_class::keyspace:
+        case cache_cmd_class::fanout:
+        case cache_cmd_class::stateful:
+            return -2;
+    }
+    return -2;
+}
+
 void cache_instance::process_resp_command(client_connection* conn,
                                           std::string_view* args, int argc)
 {
@@ -8062,6 +8143,35 @@ void cache_instance::process_resp_command(client_connection* conn,
     }
 
     const uint32_t h = fnv1a_lower(args[0]);
+
+    // A transaction is queued and replayed by this shard alone, so inside one
+    // -- and in the WATCH that guards it -- a command this shard cannot run by
+    // itself is refused and the transaction with it, where routing it ran it
+    // at once, outside the transaction, and answered it in the wrong place.
+    const bool txn_verb = h == fnv1a("multi") || h == fnv1a("exec") ||
+                          h == fnv1a("discard") || h == fnv1a("unwatch") ||
+                          h == fnv1a("reset") || h == fnv1a("quit");
+    if (SOCKETLEY_UNLIKELY((conn->in_multi && !txn_verb) || h == fnv1a("watch")))
+    {
+        const int away = (h == fnv1a("watch"))
+            ? first_foreign_key(args, 1, argc - 1, 1)
+            : resp_first_foreign_key(h, args, argc);
+        if (away != -1)
+        {
+            if (conn->in_multi) conn->multi_broken = true;
+            run_in_reply_order(conn, [&] {
+                if (conn->cluster_port && away >= 0)
+                    emit_moved(conn, args[away], cache_shard_of(args[away], m_shard_n), true);
+                else
+                    resp::encode_error_code_into(conn->response_buf,
+                        "CROSSSLOT a transaction on a sharded cache may only "
+                        "name keys of the shard it runs on");
+            });
+            return;
+        }
+        run_in_reply_order(conn, [&] { process_resp_command_local(conn, args, argc); });
+        return;
+    }
 
     // A client on the per-shard port is asking this node, so DBSIZE, KEYS,
     // SCAN and FLUSH answer for it alone, while a publish still fans out and a
@@ -8523,7 +8633,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             }
             if (broken)
             {
-                resp::encode_error_into(rb, "EXECABORT Transaction discarded because of previous errors.");
+                resp::encode_error_code_into(rb, "EXECABORT Transaction discarded because of previous errors.");
                 return;
             }
 
@@ -8568,7 +8678,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                                               qconsumed, read_bulk_limit()) != resp::parse_result::ok
                     || qargc <= 0)
                 {
-                    resp::encode_error_into(
+                    resp::encode_error_code_into(
                         rb, "EXECABORT Transaction discarded because of previous errors.");
                     return;
                 }
@@ -8628,7 +8738,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     {
                         auto t = m_store.type(args[1]);
                         if (t == "none" || t == "string")
-                            resp::encode_error_into(rb,
+                            resp::encode_error_code_into(rb,
                                 "OOM command not allowed when used memory > 'maxmemory'");
                         else
                             resp::encode_error_code_into(rb, wrongtype_msg);
@@ -8939,7 +9049,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (newlen == cache_store::append_wrong_type)
                 resp::encode_error_code_into(rb, wrongtype_msg);
             else if (newlen == cache_store::append_denied)
-                resp::encode_error_into(rb, "OOM command not allowed when used memory > 'maxmemory'");
+                resp::encode_error_code_into(rb, "OOM command not allowed when used memory > 'maxmemory'");
             else
             { resp::encode_integer_into(rb, static_cast<int64_t>(newlen)); repl(args, argc); }
             break;
@@ -9556,8 +9666,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_integer_into(rb, r);
             break;
         }
+        // HMSET is HSET answered +OK, and the two names differ in length, so
+        // one body serves both and its type check and replication with it.
+        case fnv1a("hmset"):
         case fnv1a("hset"):
         {
+            const bool answer_ok = args[0].size() == 5;
             if (argc < 4 || (argc - 2) % 2 != 0)
             {
                 resp::encode_error_into(rb, "wrong number of arguments");
@@ -9567,23 +9681,24 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             int added = 0;
             for (int i = 2; i + 1 < argc; i += 2)
             {
-                if (!m_store.hset(args[1], args[i], args[i+1]))
+                bool created = false;
+                if (!m_store.hset(args[1], args[i], args[i+1], &created))
                 {
                     m_store.check_expiry(args[1]);
-                    if (!m_store.hset(args[1], args[i], args[i+1]))
+                    if (!m_store.hset(args[1], args[i], args[i+1], &created))
                     {
                         // Same as SET: a memory refusal is not a type conflict,
                         // and overwriting a field can now be refused for room.
                         auto t = m_store.type(args[1]);
                         if (t == "none" || t == "hash")
-                            resp::encode_error_into(rb,
+                            resp::encode_error_code_into(rb,
                                 "OOM command not allowed when used memory > 'maxmemory'");
                         else
                             resp::encode_error_code_into(rb, wrongtype_msg);
                         return;
                     }
                 }
-                added++;
+                added += created;
                 // An empty field would be read as the value by a reader that
                 // splits on spaces, so it goes the way a key with a space in it
                 // goes rather than as a record that means something else.
@@ -9591,7 +9706,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     { if (mutation_log_wanted()) repl_refuse(args[1]); continue; }
                 repl_unit("hset", args[1], args[i], args[i + 1]);
             }
-            resp::encode_integer_into(rb, added);
+            if (answer_ok) resp::encode_ok_into(rb);
+            else           resp::encode_integer_into(rb, added);
             break;
         }
         case fnv1a("hget"):
@@ -9923,11 +10039,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             for (int i = 1; i < argc; i++)
             {
-                m_store.subscribe(conn->fd, args[i]);
+                if (m_store.subscribe(conn->fd, args[i])) ++conn->sub_count;
                 // The confirmation Redis sends and a client library waits for:
                 // it counts down from this number to know its own subscribe
                 // batch is complete, and +OK gives it nothing to count.
-                sub_confirm(rb, "subscribe", args[i], ++conn->sub_count);
+                sub_confirm(rb, "subscribe", args[i], conn->sub_count);
             }
             break;
         }
@@ -9937,8 +10053,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             const bool first = !m_store.has_patterns();
             for (int i = 1; i < argc; i++)
             {
-                m_store.psubscribe(conn->fd, args[i]);
-                sub_confirm(rb, "psubscribe", args[i], ++conn->sub_count);
+                if (m_store.psubscribe(conn->fd, args[i])) ++conn->sub_count;
+                sub_confirm(rb, "psubscribe", args[i], conn->sub_count);
             }
             // A shard that has gained its first pattern can no longer be
             // skipped by the channel filter, and this is how the publishing
@@ -9948,26 +10064,14 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         }
         case fnv1a("punsubscribe"):
         {
-            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            for (int i = 1; i < argc; i++)
-            {
-                m_store.punsubscribe(conn->fd, args[i]);
-                if (conn->sub_count) --conn->sub_count;
-                sub_confirm(rb, "punsubscribe", args[i], conn->sub_count);
-            }
+            resp_unsubscribe(conn, args, argc, true, rb);
             if (!m_store.has_patterns() && m_shard_n > 1)
                 channel_presence_bit(shard_stats::pattern_bit, false);
             break;
         }
         case fnv1a("unsubscribe"):
         {
-            if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            for (int i = 1; i < argc; i++)
-            {
-                m_store.unsubscribe(conn->fd, args[i]);
-                if (conn->sub_count) --conn->sub_count;
-                sub_confirm(rb, "unsubscribe", args[i], conn->sub_count);
-            }
+            resp_unsubscribe(conn, args, argc, false, rb);
             break;
         }
         case fnv1a("publish"):
@@ -10026,6 +10130,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_ok_into(rb);
             break;
         }
+        // What a cluster client sends on every connection it opens, answered
+        // because every shard serves reads and has no redirect to pre-empt.
+        case fnv1a("readonly"):
+        case fnv1a("readwrite"):
+        case fnv1a("asking"):
+            resp::encode_ok_into(rb);
+            break;
         // A cache with no password answers AUTH the way Redis does, which is
         // an error naming the reason rather than a silent success.
         case fnv1a("auth"):
@@ -10407,17 +10518,6 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (rc < 0) { resp::encode_error_code_into(rb, "WRONGTYPE"); break; }
             resp::encode_integer_into(rb, rc);
             if (rc == 1) repl(args, argc);
-            break;
-        }
-        case fnv1a("hmset"):
-        {
-            if (argc < 4 || (argc - 2) % 2 != 0)
-            { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
-            for (int i = 2; i + 1 < argc; i += 2)
-                m_store.hset(args[1], args[i], args[i + 1]);
-            resp::encode_ok_into(rb);
-            repl(args, argc);
             break;
         }
         case fnv1a("hmget"):

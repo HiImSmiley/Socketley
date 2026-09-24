@@ -160,6 +160,7 @@ constexpr cache_merge cache_merge_for(uint32_t h)
             return cache_merge::sum;     // the RESP spellings, counted
         case fnv1a("keys"):   return cache_merge::key_list;
         case fnv1a("flush"):  case fnv1a("load"):
+        case fnv1a("flushall"): case fnv1a("flushdb"):
             return cache_merge::all_ok;
 
         case fnv1a("dbsize"): case fnv1a("size"):
@@ -256,6 +257,9 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         // they fan out -- with `all_ok`, because a partial flush must be
         // visible as a failure rather than averaged into a number.
         case fnv1a("flush"):      case fnv1a("load"):
+        // The RESP spellings of the same thing, which ran on whichever shard
+        // the connection landed on and left the others' keys standing.
+        case fnv1a("flushall"):   case fnv1a("flushdb"):
             return cache_cmd_class::keyspace;
 
         case fnv1a("publish"):
@@ -276,6 +280,8 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         // Every field is derived from the shard count and base port, which
         // each shard holds, so whoever has the socket answers for the map.
         case fnv1a("cluster"):
+        case fnv1a("readonly"):   case fnv1a("readwrite"):
+        case fnv1a("asking"):
             return cache_cmd_class::connection;
 
         case fnv1a("replicate"):
@@ -327,6 +333,8 @@ constexpr bool cache_is_read_only(uint32_t h)
         case fnv1a("command"):    case fnv1a("cluster"):
         case fnv1a("select"):     case fnv1a("hello"):
         case fnv1a("client"):     case fnv1a("auth"):
+        case fnv1a("readonly"):   case fnv1a("readwrite"):
+        case fnv1a("asking"):
         // publish changes no key; subscribe records a descriptor.
         case fnv1a("publish"):    case fnv1a("subscribe"):
         case fnv1a("unsubscribe"):
