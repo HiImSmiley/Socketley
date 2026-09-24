@@ -2609,9 +2609,17 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     int fd_raw = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd_raw < 0) return false;
 
-    if (ftruncate(fd_raw, static_cast<off_t>(total_size)) < 0)
+    // Blocks reserved, not a sparse file: a store into a mapping the disk has
+    // no room behind raises SIGBUS rather than an error, so a full disk ended
+    // the worker in the middle of a stop instead of failing the dump.
+    // ftruncate stays the fallback only where fallocate is not supported.
+    int rc = ::fallocate(fd_raw, 0, 0, static_cast<off_t>(total_size));
+    if (rc != 0 && (errno == EOPNOTSUPP || errno == ENOSYS))
+        rc = ftruncate(fd_raw, static_cast<off_t>(total_size));
+    if (rc != 0)
     {
         close(fd_raw);
+        unlink(tmp_path.c_str());
         return false;
     }
 
