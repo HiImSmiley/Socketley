@@ -1704,13 +1704,10 @@ bool cache_store::incrbyfloat(std::string_view key, double delta, double& result
 
     result = val;
 
-    // Redis prints a float with up to seventeen significant digits and no
-    // trailing zeros, which is what round-trips through strtod.
-    char buf[40];
-    int n = std::snprintf(buf, sizeof(buf), "%.17g", val);
-    if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf))
+    const std::string txt = cache_float_text(val);
+    if (txt.empty())
         return false;
-    return set(key, std::string_view(buf, static_cast<size_t>(n)));
+    return set(key, txt);
 }
 
 bool cache_store::getdel(std::string_view key, std::string& out)

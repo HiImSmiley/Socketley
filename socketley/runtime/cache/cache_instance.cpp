@@ -4,6 +4,8 @@
 #include "../../shared/conn_reachability.h"
 #include "../../shared/blocking_write.h"
 #include "../../shared/exit_bound.h"
+#include "resp_command_table.h"
+#include <random>
 #include "../../shared/dial_address.h"
 #include "../../shared/ipc_framing.h"
 #include "../../shared/trace.h"
@@ -2654,6 +2656,21 @@ static constexpr std::string_view wrongtype_msg =
 // verb, the channel or pattern, and how many this connection now holds.  A
 // client counts down from that number to know when its own batch is done, and
 // +OK -- which is what this used to send -- gives it nothing to count.
+// LIMIT offset count over a range already in order, a negative count meaning
+// the rest of it, as Redis reads it.
+static void apply_zlimit(std::vector<std::pair<std::string_view, double>>& v,
+                         int64_t off, int64_t cnt)
+{
+    if (off < 0 || static_cast<uint64_t>(off) >= v.size())
+    {
+        v.clear();
+        return;
+    }
+    v.erase(v.begin(), v.begin() + off);
+    if (cnt >= 0 && static_cast<uint64_t>(cnt) < v.size())
+        v.resize(static_cast<size_t>(cnt));
+}
+
 static void sub_confirm(std::string& rb, std::string_view verb,
                         std::string_view name, uint32_t count)
 {
@@ -2661,6 +2678,113 @@ static void sub_confirm(std::string& rb, std::string_view verb,
     resp::encode_bulk_into(rb, verb);
     resp::encode_bulk_into(rb, name);
     resp::encode_integer_into(rb, static_cast<int64_t>(count));
+}
+
+// The whole string or nothing, for every width the commands below store into.
+// It was here, correct, and called five times: the other twenty-four sites
+// spelled from_chars by hand and none of them compared the end pointer, so
+// `EXPIRE k 5x` was five seconds and `INCRBY k 3q` was three.
+template <typename T>
+static bool parse_int_sv(std::string_view sv, T& out)
+{
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
+    return ec == std::errc{} && ptr == sv.data() + sv.size();
+}
+
+// The count forms of LPOP, RPOP, SPOP and SRANDMEMBER, which answer an array
+// where the plain forms answer one element, and were read as the plain forms --
+// so a client that asked for several got one bulk reply it could not parse.
+// Each removal is replicated as its own record, the way SPOP's already was.
+void cache_instance::resp_pop_count(client_connection* /*conn*/, std::string_view* args,
+                                    int argc, bool left, std::string& rb)
+{
+    int64_t count = 0;
+    if (argc > 3 || !parse_int_sv(args[2], count) || count < 0)
+    { resp::encode_error_into(rb, "value is out of range, must be positive"); return; }
+    std::vector<std::string> popped;
+    std::string val;
+    while (static_cast<int64_t>(popped.size()) < count &&
+           (left ? m_store.lpop(args[1], val) : m_store.rpop(args[1], val)))
+    {
+        popped.push_back(std::move(val));
+        // The key is the record's last field, which the reader takes whole.
+        if (mutation_log_wanted())
+        {
+            std::string cmd = left ? "lpop " : "rpop ";
+            cmd.append(args[1].data(), args[1].size());
+            replicate_command(cmd);
+        }
+    }
+    if (popped.empty() && count > 0)
+    {
+        if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
+            resp::encode_error_code_into(rb, wrongtype_msg);
+        else
+            rb.append("*-1\r\n", 5);
+        return;
+    }
+    resp::encode_array_header_into(rb, static_cast<int>(popped.size()));
+    for (const auto& v : popped) resp::encode_bulk_into(rb, v);
+}
+
+void cache_instance::resp_spop_count(std::string_view* args, int argc, std::string& rb)
+{
+    int64_t count = 0;
+    if (argc > 3 || !parse_int_sv(args[2], count) || count < 0)
+    { resp::encode_error_into(rb, "value is out of range, must be positive"); return; }
+    std::vector<std::string> popped;
+    std::string member;
+    while (static_cast<int64_t>(popped.size()) < count && m_store.spop(args[1], member))
+    {
+        if (mutation_log_wanted())
+        {
+            std::string cmd = "srem ";
+            cmd.append(args[1].data(), args[1].size());
+            cmd += ' '; cmd += member;
+            replicate_command(cmd);
+        }
+        popped.push_back(std::move(member));
+    }
+    if (popped.empty() && SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 't')))
+    { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+    resp::encode_array_header_into(rb, static_cast<int>(popped.size()));
+    for (const auto& v : popped) resp::encode_bulk_into(rb, v);
+}
+
+// Positive: that many distinct members at most; negative: exactly that many,
+// repeats allowed -- Redis's two readings of the one argument.
+void cache_instance::resp_srandmember_count(std::string_view* args, int argc, std::string& rb)
+{
+    int64_t count = 0;
+    if (argc > 3 || !parse_int_sv(args[2], count))
+    { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
+    if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+    const auto* set = m_store.set_ptr(args[1]);
+    if (!set || set->empty() || count == 0)
+    {
+        if (!set && SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 't')))
+        { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+        resp::encode_array_header_into(rb, 0);
+        return;
+    }
+    std::vector<std::string_view> all;
+    all.reserve(set->size());
+    for (const auto& m : *set) all.emplace_back(m);
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    if (count > 0)
+    {
+        const size_t n = std::min(all.size(), static_cast<size_t>(count));
+        for (size_t i = 0; i < n; ++i)
+            std::swap(all[i], all[i + rng() % (all.size() - i)]);
+        resp::encode_array_header_into(rb, static_cast<int>(n));
+        for (size_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, all[i]);
+        return;
+    }
+    const uint64_t n = count == INT64_MIN ? uint64_t{1} << 62 : static_cast<uint64_t>(-count);
+    if (n > (1u << 20))
+    { resp::encode_error_into(rb, "value is out of range"); return; }
+    resp::encode_array_header_into(rb, static_cast<int>(n));
+    for (uint64_t i = 0; i < n; ++i) resp::encode_bulk_into(rb, all[rng() % all.size()]);
 }
 
 // Both UNSUBSCRIBE verbs, where naming nothing means everything held -- the
@@ -2786,16 +2910,6 @@ static void append_score(std::string& rb, double sc)
     rb.append("\n", 1);
 }
 
-// The whole string or nothing, for every width the commands below store into.
-// It was here, correct, and called five times: the other twenty-four sites
-// spelled from_chars by hand and none of them compared the end pointer, so
-// `EXPIRE k 5x` was five seconds and `INCRBY k 3q` was three.
-template <typename T>
-static bool parse_int_sv(std::string_view sv, T& out)
-{
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
-    return ec == std::errc{} && ptr == sv.data() + sv.size();
-}
 
 // A request payload is a command stream and not one command, which is what
 // would arrive on this cache's own port -- batched because one entry per
@@ -6901,7 +7015,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             double d = 0, out = 0;
             if (!parse_double_sv(d_s, d)) { rb.append("error: not a float\n", 19); return; }
             if (!m_store.incrbyfloat(key, d, out)) { rb.append("error: not a float\n", 19); return; }
-            const std::string txt = score_text(out);
+            const std::string txt = cache_float_text(out);
             rb.append(txt); rb.push_back('\n');
             // The result and not the command, for the reason the RESP spelling
             // gives: two builds may round the same addition differently.
@@ -8560,12 +8674,59 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     // dropped.  Before, EXPIREAT and PEXPIREAT answered 1 for a key that had
     // never existed AND replicated that, so a follower was told about a
     // deadline for nothing.
+    // The record carries no NX/XX/GT/LT, because the leader has decided and
+    // the follower is only told the outcome.
     const auto answered_expire = [&](cache_store::expire_result r) {
         if (r == cache_store::expire_result::no_such_key)
         { resp::encode_integer_into(rb, 0); return; }
         if (r == cache_store::expire_result::armed) mark_ttl_keys();
-        repl(args, argc);
+        repl(args, argc < 3 ? argc : 3);
         resp::encode_integer_into(rb, 1);
+    };
+
+    // EXPIRE's NX, XX, GT and LT, which were read past and so always set:
+    // `EXPIRE k 10 NX` replaced the TTL it was told to leave alone.  1 is go,
+    // 0 is a refusal to answer 0 for, -1 an error already answered; a key with
+    // no TTL is an infinite one, so GT never moves it and LT always does.
+    const auto expire_condition = [&](int64_t new_rel_ms) -> int {
+        bool nx = false, xx = false, gt = false, lt = false;
+        for (int i = 3; i < argc; ++i)
+        {
+            const uint32_t o = fnv1a_lower(args[i]);
+            if      (o == fnv1a("nx")) nx = true;
+            else if (o == fnv1a("xx")) xx = true;
+            else if (o == fnv1a("gt")) gt = true;
+            else if (o == fnv1a("lt")) lt = true;
+            else
+            {
+                resp::encode_error_into(rb, "Unsupported option " + std::string(args[i]));
+                return -1;
+            }
+        }
+        if ((nx && (xx || gt || lt)) || (gt && lt))
+        {
+            resp::encode_error_into(rb, "NX and XX, GT or LT options at the same time "
+                                        "are not compatible");
+            return -1;
+        }
+        if (!(nx || xx || gt || lt))
+            return 1;
+        if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+        const int64_t cur = m_store.get_pttl(args[1]);
+        if (cur == -2) return 1;                    // expire_in answers the missing key
+        if (nx && cur != -1) return 0;
+        if (xx && cur == -1) return 0;
+        if (gt && (cur == -1 || new_rel_ms <= cur)) return 0;
+        if (lt && cur != -1 && new_rel_ms >= cur) return 0;
+        return 1;
+    };
+    const auto ms_of = [](int64_t sec) {
+        return sec > INT64_MAX / 1000 ? INT64_MAX : sec < INT64_MIN / 1000 ? INT64_MIN : sec * 1000;
+    };
+    const auto expire_gated = [&](int64_t new_rel_ms) {
+        const int c = expire_condition(new_rel_ms);
+        if (c == 0) resp::encode_integer_into(rb, 0);
+        return c == 1;
     };
 
     // One place turns the store's three answers into a reply, because four
@@ -9278,8 +9439,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            if (argc >= 3)
+            {
+                resp_pop_count(conn, args, argc, true, rb);
+                break;
+            }
             std::string val;
-            if (m_store.lpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
+            if (m_store.lpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, 2); }
             else resp::encode_null_into(rb);
             break;
         }
@@ -9288,8 +9454,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
+            if (argc >= 3)
+            {
+                resp_pop_count(conn, args, argc, false, rb);
+                break;
+            }
             std::string val;
-            if (m_store.rpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, argc); }
+            if (m_store.rpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, 2); }
             else resp::encode_null_into(rb);
             break;
         }
@@ -9347,7 +9518,26 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         // an even remainder rather than a minimum.
         case fnv1a("zadd"):
         {
-            if (argc < 4 || ((argc - 2) % 2) != 0)
+            // NX, XX, GT, LT and CH ahead of the pairs, which were counted as
+            // pairs: `ZADD z NX 1 a` answered wrong-number-of-arguments and
+            // `ZADD z GT CH 1 a` "not a valid float".
+            bool znx = false, zxx = false, zgt = false, zlt = false, zch = false;
+            int zfirst = 2;
+            for (; zfirst < argc; ++zfirst)
+            {
+                const uint32_t o = fnv1a_lower(args[zfirst]);
+                if      (o == fnv1a("nx")) znx = true;
+                else if (o == fnv1a("xx")) zxx = true;
+                else if (o == fnv1a("gt")) zgt = true;
+                else if (o == fnv1a("lt")) zlt = true;
+                else if (o == fnv1a("ch")) zch = true;
+                else if (o == fnv1a("incr"))
+                { resp::encode_error_into(rb, "ZADD INCR is not supported by this cache; use ZINCRBY"); return; }
+                else break;
+            }
+            if ((znx && zxx) || (zgt && zlt) || (znx && (zgt || zlt)))
+            { resp::encode_error_into(rb, "GT, LT, and/or NX options at the same time are not compatible"); return; }
+            if (argc - zfirst < 2 || ((argc - zfirst) % 2) != 0)
             { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly)
             { resp::encode_error_into(rb, "readonly mode"); return; }
@@ -9357,8 +9547,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             // jumped over the repl() nine lines down, so those members stayed
             // on this leader and no follower was ever told.
             std::vector<double> zscores;
-            zscores.reserve(static_cast<size_t>((argc - 2) / 2));
-            for (int i = 2; i + 1 < argc; i += 2)
+            zscores.reserve(static_cast<size_t>((argc - zfirst) / 2));
+            for (int i = zfirst; i + 1 < argc; i += 2)
             {
                 double zsc = 0.0;
                 if (!parse_double_sv(args[i], zsc))
@@ -9372,16 +9562,23 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (SOCKETLEY_UNLIKELY(zlog &&
                                    args[1].find(' ') != std::string_view::npos))
             { repl_refuse(args[1]); zlog = false; }
+            if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int zadded = 0;
             for (size_t zi = 0; zi < zscores.size(); ++zi)
             {
-                const int i = 2 + static_cast<int>(zi) * 2;
+                const int i = zfirst + static_cast<int>(zi) * 2;
+                double zcur = 0.0;
+                const bool zhad = m_store.zscore(args[1], args[i + 1], zcur);
+                if ((znx && zhad) || (zxx && !zhad) ||
+                    (zhad && zgt && !(zscores[zi] > zcur)) ||
+                    (zhad && zlt && !(zscores[zi] < zcur)))
+                    continue;
                 const int zn = m_store.zadd(args[1], zscores[zi], args[i + 1]);
                 // A refusal this late is the store out of room, and whatever
                 // was logged below stands rather than diverging.
                 if (zn < 0)
                 { resp::encode_error_code_into(rb, wrongtype_msg); return; }
-                zadded += zn;
+                zadded += (zch && zhad && zcur != zscores[zi]) ? 1 : zn;
                 // One pair per record, like DEL and MSET and like
                 // dump_commands, because the text interpreter takes the whole
                 // remainder as the member: `ZADD z 1 a 2 b` reached a follower
@@ -9461,13 +9658,50 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("zrevrange"):
         {
             if (argc < 4) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            int64_t zstart = 0, zstop = 0;
-            if (!parse_int_sv(args[2], zstart) || !parse_int_sv(args[3], zstop))
-            { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
-            const bool zwith = argc > 4 && fnv1a_lower(args[4]) == fnv1a("withscores");
+            // Every option parsed or refused, because the ones this read past
+            // -- REV, BYSCORE, LIMIT -- came back as an ascending rank range
+            // with no error, which is wrong data a client cannot tell apart.
+            const bool plain = fnv1a_lower(args[0]) == fnv1a("zrange");
+            bool zwith = false, zrev = !plain, byscore = false, limited = false;
+            int64_t off = 0, cnt = -1;
+            for (int i = 4; i < argc; ++i)
+            {
+                const uint32_t o = fnv1a_lower(args[i]);
+                if (o == fnv1a("withscores")) zwith = true;
+                else if (plain && o == fnv1a("rev")) zrev = true;
+                else if (plain && o == fnv1a("byscore")) byscore = true;
+                else if (plain && o == fnv1a("limit") && i + 2 < argc &&
+                         parse_int_sv(args[i + 1], off) && parse_int_sv(args[i + 2], cnt))
+                { limited = true; i += 2; }
+                else if (plain && o == fnv1a("bylex"))
+                { resp::encode_error_into(rb, "BYLEX is not supported by this cache"); return; }
+                else { resp::encode_error_into(rb, "syntax error"); return; }
+            }
+            if (limited && !byscore)
+            {
+                resp::encode_error_into(rb, "syntax error, LIMIT is only supported in "
+                                            "combination with either BYSCORE or BYLEX");
+                return;
+            }
             m_store.check_expiry(args[1]);
             std::vector<std::pair<std::string_view, double>> zitems;
-            m_store.zrange(args[1], zstart, zstop, zitems, fnv1a_lower(args[0]) == fnv1a("zrevrange"));
+            if (byscore)
+            {
+                // REV names the range from its high end, as Redis spells it.
+                double lo = 0, hi = 0; bool lo_in = true, hi_in = true;
+                if (!parse_score_bound(zrev ? args[3] : args[2], lo, lo_in)
+                 || !parse_score_bound(zrev ? args[2] : args[3], hi, hi_in))
+                { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
+                m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, zrev, zitems);
+                apply_zlimit(zitems, off, cnt);
+            }
+            else
+            {
+                int64_t zstart = 0, zstop = 0;
+                if (!parse_int_sv(args[2], zstart) || !parse_int_sv(args[3], zstop))
+                { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
+                m_store.zrange(args[1], zstart, zstop, zitems, zrev);
+            }
             resp::encode_array_header_into(rb, static_cast<int>(zitems.size())
                                              * (zwith ? 2 : 1));
             for (const auto& [zm, zsc] : zitems)
@@ -9814,6 +10048,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             // "gone now", not "this call was a mistake".
             int64_t sec = 0;
             if (!parse_int_sv(args[2], sec)) { resp::encode_error_into(rb, "invalid seconds"); return; }
+            if (!expire_gated(ms_of(sec))) break;
             answered_expire(m_store.expire_in(args[1], sec, false));
             break;
         }
@@ -9922,6 +10157,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             int64_t ms = 0;
             if (!parse_int_sv(args[2], ms)) { resp::encode_error_into(rb, "invalid expire time"); return; }
+            if (!expire_gated(ms)) break;
             answered_expire(m_store.expire_in(args[1], ms, true));
             break;
         }
@@ -9940,7 +10176,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                answered_expire(m_store.expire_in(args[1], saturating_until(unix_s, now_s), false));
+                const int64_t rel_s = saturating_until(unix_s, now_s);
+                if (!expire_gated(ms_of(rel_s))) break;
+                answered_expire(m_store.expire_in(args[1], rel_s, false));
             }
             break;
         }
@@ -9953,7 +10191,9 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             {
                 const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
-                answered_expire(m_store.expire_in(args[1], saturating_until(unix_ms, now_ms), true));
+                const int64_t rel_ms = saturating_until(unix_ms, now_ms);
+                if (!expire_gated(rel_ms)) break;
+                answered_expire(m_store.expire_in(args[1], rel_ms, true));
             }
             break;
         }
@@ -10201,10 +10441,61 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         }
         case fnv1a("command"):
         {
-            // A client asks COMMAND to learn arity and flags; this cache keeps
-            // no such table, and an empty reply says that rather than inventing
-            // one.  COUNT is answered the same way for the same reason.
-            resp::encode_array_header_into(rb, 0);
+            // The table is resp_command_table.h's; COUNT, LIST and INFO read it,
+            // and DOCS answers an empty map, which says "no docs" in RESP2.
+            auto entry = [&](const resp_command_info& c) {
+                resp::encode_array_header_into(rb, 6);
+                resp::encode_bulk_into(rb, c.name);
+                resp::encode_integer_into(rb, c.arity);
+                int nflags = 0;
+                for (std::string_view f = c.flags; !f.empty(); )
+                {
+                    const size_t sp = f.find(' ');
+                    ++nflags;
+                    f = (sp == std::string_view::npos) ? std::string_view{} : f.substr(sp + 1);
+                }
+                resp::encode_array_header_into(rb, nflags);
+                for (std::string_view f = c.flags; !f.empty(); )
+                {
+                    const size_t sp = f.find(' ');
+                    rb.push_back('+');
+                    rb.append(f.substr(0, sp));
+                    rb.append("\r\n", 2);
+                    f = (sp == std::string_view::npos) ? std::string_view{} : f.substr(sp + 1);
+                }
+                resp::encode_integer_into(rb, c.first_key);
+                resp::encode_integer_into(rb, c.last_key);
+                resp::encode_integer_into(rb, c.step);
+            };
+            const uint32_t sub = argc >= 2 ? fnv1a_lower(args[1]) : 0;
+            if (argc < 2)
+            {
+                resp::encode_array_header_into(rb, static_cast<int>(std::size(resp_command_table)));
+                for (const auto& c : resp_command_table) entry(c);
+            }
+            else if (sub == fnv1a("count"))
+                resp::encode_integer_into(rb, static_cast<int64_t>(std::size(resp_command_table)));
+            else if (sub == fnv1a("list"))
+            {
+                resp::encode_array_header_into(rb, static_cast<int>(std::size(resp_command_table)));
+                for (const auto& c : resp_command_table) resp::encode_bulk_into(rb, c.name);
+            }
+            else if (sub == fnv1a("info"))
+            {
+                resp::encode_array_header_into(rb, argc - 2);
+                for (int i = 2; i < argc; ++i)
+                {
+                    const resp_command_info* hit = nullptr;
+                    for (const auto& c : resp_command_table)
+                        if (fnv1a_lower(args[i]) == fnv1a(c.name)) { hit = &c; break; }
+                    if (hit) entry(*hit);
+                    else     rb.append("*-1\r\n", 5);
+                }
+            }
+            else if (sub == fnv1a("docs"))
+                resp::encode_array_header_into(rb, 0);
+            else
+                resp::encode_error_into(rb, "unknown subcommand for COMMAND");
             break;
         }
         // Only the two fields a client actually reads back are answered, and
@@ -10283,7 +10574,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             double out = 0;
             if (!m_store.incrbyfloat(args[1], d, out))
             { resp::encode_error_code_into(rb, "ERR value is not a valid float"); break; }
-            const std::string txt = score_text(out);
+            const std::string txt = cache_float_text(out);
             resp::encode_bulk_into(rb, txt);
             repl_set_effect(args[1], txt, 0, 0);
             break;
@@ -10492,6 +10783,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
+            if (argc >= 3)
+            {
+                resp_spop_count(args, argc, rb);
+                break;
+            }
             std::string member;
             if (m_store.spop(args[1], member))
             {
@@ -10510,6 +10806,11 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("srandmember"):
         {
             if (argc < 2) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
+            if (argc >= 3)
+            {
+                resp_srandmember_count(args, argc, rb);
+                break;
+            }
             std::string member;
             if (m_store.srandmember(args[1], member)) resp::encode_bulk_into(rb, member);
             else resp::encode_null_into(rb);
@@ -10754,10 +11055,19 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
              || !parse_score_bound(rev ? args[2] : args[3], hi, hi_in))
             { resp::encode_error_code_into(rb, "ERR min or max is not a float"); break; }
             bool withscores = false;
+            int64_t off = 0, cnt = -1;
             for (int i = 4; i < argc; ++i)
-                if (fnv1a_lower(args[i]) == fnv1a("withscores")) withscores = true;
+            {
+                const uint32_t o = fnv1a_lower(args[i]);
+                if (o == fnv1a("withscores")) withscores = true;
+                else if (o == fnv1a("limit") && i + 2 < argc &&
+                         parse_int_sv(args[i + 1], off) && parse_int_sv(args[i + 2], cnt))
+                    i += 2;
+                else { resp::encode_error_into(rb, "syntax error"); return; }
+            }
             std::vector<std::pair<std::string_view, double>> out;
             m_store.zrangebyscore(args[1], lo, hi, lo_in, hi_in, rev, out);
+            apply_zlimit(out, off, cnt);
             resp::encode_array_header_into(rb,
                 static_cast<int>(out.size()) * (withscores ? 2 : 1));
             for (const auto& [m, sc] : out)

@@ -105,6 +105,63 @@ case "$(resp "HMSET str f v")" in
 esac
 ok "$(redis-cli -p "$P" get str 2>/dev/null)" "v" "and the string is untouched"
 
+# ── sorted-set range options ────────────────────────────────────────────────
+# REV, BYSCORE and LIMIT were read past and answered as an ascending rank
+# range, which is wrong data with no error; BYLEX is refused rather than faked.
+resp "ZADD z 1 a 2 b 3 c" >/dev/null
+zr() { redis-cli -p "$P" "$@" 2>&1 | tr '\n' ' ' | sed 's/ $//'; }
+ok "$(zr zrange z 0 -1 rev)" "c b a" "ZRANGE ... REV walks from the top"
+ok "$(zr zrange z 1 2 byscore)" "a b" "ZRANGE ... BYSCORE takes scores, not ranks"
+ok "$(zr zrange z 3 1 byscore rev limit 0 2)" "c b" "ZRANGE ... BYSCORE REV LIMIT"
+ok "$(zr zrangebyscore z -inf +inf limit 1 1)" "b" "ZRANGEBYSCORE ... LIMIT offset count"
+ok "$(zr zrangebyscore z -inf +inf withscores limit 0 1)" "a 1" "ZRANGEBYSCORE ... WITHSCORES LIMIT"
+case "$(zr zrange z 0 -1 bylex)" in *ERR*) ok y y "ZRANGE ... BYLEX is refused, not faked" ;;
+    *) ok "$(zr zrange z 0 -1 bylex)" "an error" "ZRANGE BYLEX" ;; esac
+case "$(zr zrange z 0 -1 limit 0 1)" in *ERR*) ok y y "LIMIT without BYSCORE is a syntax error, as in Redis" ;;
+    *) ok "$(zr zrange z 0 -1 limit 0 1)" "an error" "ZRANGE LIMIT without BYSCORE" ;; esac
+ok "$(zr zrange z 0 -1 withscores)" "a 1 b 2 c 3" "a plain ZRANGE ... WITHSCORES is unchanged"
+
+# ── ZADD options ────────────────────────────────────────────────────────────
+resp "ZADD zo 5 a" >/dev/null
+ok "$(resp "ZADD zo NX 9 a 1 b")" ':1|' "ZADD NX adds the new member and leaves the old"
+ok "$(zr zscore zo a)" "5" "so a keeps its score"
+ok "$(resp "ZADD zo XX 7 a 3 c")" ':0|' "ZADD XX updates and adds nothing"
+ok "$(zr zscore zo a) $(zr zscore zo c)" "7 " "a is updated, c was never added"
+ok "$(resp "ZADD zo GT CH 6 a 8 b")" ':1|' "ZADD GT CH counts only the member it raised"
+ok "$(zr zscore zo a) $(zr zscore zo b)" "7 8" "a was not lowered, b was raised"
+ok "$(resp "ZADD zo LT 2 a")" ':0|' "ZADD LT answers the added count"
+ok "$(zr zscore zo a)" "2" "and lowered a"
+case "$(resp "ZADD zo NX XX 1 a")" in -ERR*) ok y y "NX with XX is refused" ;;
+    *) ok "$(resp "ZADD zo NX XX 1 a")" "an error" "ZADD NX XX" ;; esac
+
+# ── the count forms ─────────────────────────────────────────────────────────
+resp "RPUSH l a b c d" >/dev/null
+ok "$(zr lpop l 2)" "a b" "LPOP key count pops that many, as an array"
+ok "$(zr rpop l 5)" "d c" "RPOP key count stops at what there is"
+ok "$(resp "LPOP nolist 2")" '*-1|' "LPOP of a missing key with a count is a nil array"
+resp "SADD s x y z" >/dev/null
+ok "$(redis-cli -p "$P" spop s 2 2>/dev/null | wc -l | tr -d ' ')" "2" "SPOP key count removes that many"
+ok "$(redis-cli -p "$P" scard s 2>/dev/null)" "1" "and they are gone"
+resp "SADD r x y z" >/dev/null
+ok "$(redis-cli -p "$P" srandmember r 5 2>/dev/null | sort -u | wc -l | tr -d ' ')" "3" "SRANDMEMBER key 5 gives every member once"
+ok "$(redis-cli -p "$P" srandmember r -5 2>/dev/null | wc -l | tr -d ' ')" "5" "SRANDMEMBER key -5 gives five, repeats allowed"
+
+# ── EXPIRE conditions ───────────────────────────────────────────────────────
+resp "SET e1 v" "SET e2 v" "EXPIRE e2 100" >/dev/null
+ok "$(resp "EXPIRE e2 10 NX")" ':0|' "EXPIRE ... NX leaves an existing TTL alone"
+ok "$(zr ttl e2 | awk '{print ($1 > 50) ? "kept" : $1}')" "kept" "and the TTL is still the old one"
+ok "$(resp "EXPIRE e1 10 XX")" ':0|' "EXPIRE ... XX does not arm a key with no TTL"
+ok "$(resp "EXPIRE e2 50 GT")" ':0|' "EXPIRE ... GT does not shorten"
+ok "$(resp "EXPIRE e2 500 GT")" ':1|' "EXPIRE ... GT lengthens"
+ok "$(resp "EXPIRE e1 10 LT")" ':1|' "EXPIRE ... LT arms a key with no TTL, which is infinite"
+case "$(resp "EXPIRE e1 10 NX XX")" in -ERR*) ok y y "NX with XX is refused" ;;
+    *) ok "$(resp "EXPIRE e1 10 NX XX")" "an error" "NX with XX" ;; esac
+
+# ── INCRBYFLOAT's text ──────────────────────────────────────────────────────
+ok "$(zr incrbyfloat f1 0.1)" "0.1" "INCRBYFLOAT 0.1 answers 0.1, not 0.10000000000000001"
+ok "$(zr get f1)" "0.1" "and stores the same text"
+ok "$(zr incrbyfloat f2 1e20)" "100000000000000000000" "a large result is written out, not in exponent form"
+
 # ── cluster handshake ───────────────────────────────────────────────────────
 ok "$(resp "READONLY")"  '+OK|' "READONLY is answered"
 ok "$(resp "READWRITE")" '+OK|' "READWRITE is answered"

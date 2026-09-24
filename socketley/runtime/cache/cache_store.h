@@ -1,4 +1,5 @@
 #pragma once
+#include <charconv>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -43,6 +44,18 @@ enum eviction_policy : uint8_t
     evict_allkeys_lru    = 1,
     evict_allkeys_random = 2
 };
+
+// INCRBYFLOAT's text, stored and answered alike: the shortest digits that read
+// back as the same double, never in exponent form, as Redis writes it -- where
+// %.17g stored 0.1 as 0.10000000000000001 and 1e20 as 1e+20.
+inline std::string cache_float_text(double v)
+{
+    char buf[400];
+    const auto r = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::fixed);
+    if (r.ec != std::errc{})
+        return {};
+    return std::string(buf, r.ptr);
+}
 
 class cache_store
 {
