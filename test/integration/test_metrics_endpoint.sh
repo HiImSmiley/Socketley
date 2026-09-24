@@ -73,7 +73,7 @@ config = {
 LUA
 
 get() {  # path -> raw response
-    printf 'GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' "$1" \
+    printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$1" \
         | timeout 8 nc 127.0.0.1 "$MPORT" 2>/dev/null || true
 }
 metric() {  # name -> value, or empty
@@ -180,7 +180,7 @@ import socket, sys
 port = int(sys.argv[1])
 def fetch(path):
     s = socket.create_connection(("127.0.0.1", port), 8); s.settimeout(8)
-    s.sendall(("GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" % path).encode())
+    s.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % path).encode())
     out = b""
     while True:
         try: d = s.recv(65536)
@@ -211,6 +211,26 @@ case "$PAIR" in
     *) bad "/metrics still carries its series right after a dashboard poll" \
            "$(echo "$PAIR" | tr '\n' ' ')" ;;
 esac
+
+# ── a page rebound to 127.0.0.1 is not this machine's client ────────────────
+# The endpoint listens on loopback, but a browser page whose name was rebound
+# to 127.0.0.1 reaches it as its own origin; only a Host that names this
+# machine is served, and no response invites another origin to read it.
+host_get() {  # host -> status line
+    printf 'GET /api/overview HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$1" \
+        | timeout 8 nc 127.0.0.1 "$MPORT" 2>/dev/null | head -1 | tr -d '\r' || true
+}
+for h in "evil.example" "127.0.0.1.evil.example:$MPORT"; do
+    case "$(host_get "$h")" in *" 403 "*) ok ;;
+        *) bad "a request for Host: $h is refused" "got '$(host_get "$h")'" ;; esac
+done
+for h in "localhost:$MPORT" "127.0.0.1:$MPORT" "[::1]:$MPORT"; do
+    case "$(host_get "$h")" in *" 200 "*) ok ;;
+        *) bad "a request for Host: $h is served" "got '$(host_get "$h")'" ;; esac
+done
+if get /api/overview | grep -qi '^Access-Control-Allow-Origin'; then
+    bad "no response carries Access-Control-Allow-Origin" "it does"
+else ok; fi
 
 echo ""
 echo "  passed: $PASS / $TOTAL"

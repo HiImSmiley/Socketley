@@ -78,7 +78,7 @@ ready_tcp 127.0.0.1 "$P" >/dev/null 2>&1 || true
 # Publishing is off until something asks, and one-way once on, so a single
 # scrape is what arms the loop this file is about. Without it nothing ticks and
 # the assertions below are vacuous.
-SCRAPE=$(printf 'GET /api/runtimes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+SCRAPE=$(printf 'GET /api/runtimes HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' \
          | timeout 8 nc 127.0.0.1 "$MPORT" 2>/dev/null | head -1)
 case "$SCRAPE" in *"200 OK"*) ok ;;
     *) bad "the metrics endpoint is up, so publishing is on" \

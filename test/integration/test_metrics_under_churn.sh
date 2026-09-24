@@ -82,7 +82,7 @@ LUA
 daemon_start "$BIN"
 
 scrape() {   # -> the status line, or empty
-    printf 'GET /api/runtimes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+    printf 'GET /api/runtimes HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' \
         | timeout 8 nc 127.0.0.1 "$MPORT" 2>/dev/null | head -1
 }
 
@@ -101,7 +101,7 @@ if [[ "$BEFORE" == *"200 OK"* ]]; then ok; else
 # rather than being asked once between rounds.
 for _ in 1 2 3 4; do
     ( while :; do
-        printf 'GET /api/runtimes HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+        printf 'GET /api/runtimes HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' \
             | timeout 3 nc 127.0.0.1 "$MPORT" >/dev/null 2>&1
       done ) & SCRAPERS="$SCRAPERS $!"
 done

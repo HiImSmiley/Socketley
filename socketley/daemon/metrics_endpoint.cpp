@@ -142,7 +142,7 @@ static void send_http_response(int fd, std::string_view content_type, std::strin
     response.reserve(body.size() + 256);
     response += "HTTP/1.1 200 OK\r\nContent-Type: ";
     response += content_type;
-    response += "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ";
+    response += "\r\nConnection: close\r\nContent-Length: ";
     char len_buf[24];
     auto [end, ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body.size());
     response.append(len_buf, end - len_buf);
@@ -151,6 +151,35 @@ static void send_http_response(int fd, std::string_view content_type, std::strin
     // Content-Length promises the whole body, so a short write here leaves the
     // scraper waiting for bytes that are never coming.
     socketley::write_all(fd, response.data(), response.size());
+}
+
+// Whether the request's Host names this machine, which a loopback listener's
+// honest clients always do and a DNS-rebound page never can; no Host at all is
+// an HTTP/1.0 scraper and is served.
+static bool host_is_loopback(const char* req)
+{
+    const char* h = ::strcasestr(req, "\r\nhost:");
+    if (!h)
+        return true;
+    h += 7;
+    while (*h == ' ' || *h == '\t') ++h;
+    const char* end = h;
+    while (*end && *end != '\r' && *end != '\n') ++end;
+    std::string_view v(h, static_cast<size_t>(end - h));
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+    if (!v.empty() && v.front() == '[')
+    {
+        const size_t close = v.find(']');
+        return close != std::string_view::npos && v.substr(1, close - 1) == "::1";
+    }
+    if (const size_t colon = v.rfind(':'); colon != std::string_view::npos)
+        v = v.substr(0, colon);
+    if (v == "localhost")
+        return true;
+    // Numeric only, or "127.0.0.1.attacker.example" would pass as loopback.
+    in_addr a{};
+    return ::inet_pton(AF_INET, std::string(v).c_str(), &a) == 1 &&
+           (ntohl(a.s_addr) >> 24) == 127;
 }
 
 static void send_http_404(int fd)
@@ -214,7 +243,17 @@ void metrics_endpoint::serve_loop()
         {
             buf[n] = '\0';
 
-            if (std::strncmp(buf, "GET ", 4) == 0)
+            if (std::strncmp(buf, "GET ", 4) == 0 && !host_is_loopback(buf))
+            {
+                // A page whose name was rebound to 127.0.0.1 reaches this port
+                // as its own origin and reads runtime names, ports and paths,
+                // so only a request that asked for this machine by name is
+                // served.
+                static constexpr std::string_view refused =
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                socketley::write_all(client_fd, refused.data(), refused.size());
+            }
+            else if (std::strncmp(buf, "GET ", 4) == 0)
             {
                 // Extract path
                 const char* path_start = buf + 4;
