@@ -20,6 +20,7 @@
 #include <vector>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/eventfd.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -82,7 +83,7 @@ bool metrics_endpoint::start(uint16_t port)
     }
 
     // Accepted sockets do not inherit O_NONBLOCK on Linux, so the read() and
-    // write_all() below stay the plain blocking calls they always were.
+    // write_all() below block, each bounded by the timeouts serve_loop sets.
 
     m_wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (m_wake_fd < 0)
@@ -195,6 +196,17 @@ void metrics_endpoint::serve_loop()
                                 &client_len, SOCK_CLOEXEC);
         if (client_fd < 0)
             continue;
+
+        // Bounded both ways, because this thread serves one connection at a
+        // time and a peer that connects and says nothing held every scrape,
+        // and stop() with them.
+        const struct timeval io_bound{2, 0};
+        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &io_bound, sizeof(io_bound)) < 0 ||
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &io_bound, sizeof(io_bound)) < 0)
+        {
+            close(client_fd);
+            continue;
+        }
 
         char buf[2048];
         ssize_t n = read(client_fd, buf, sizeof(buf) - 1);

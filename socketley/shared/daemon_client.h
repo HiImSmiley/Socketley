@@ -30,7 +30,12 @@ enum class daemon_identity
 
     // A build older than `ping`, treated as a daemon so an upgrade does not
     // lock the operator out.
-    predates_ping
+    predates_ping,
+
+    // Held by a process of another user -- neither this one, root, nor the
+    // packaged daemon's account -- so nothing is sent: /tmp is shared, and
+    // whoever binds the path first would otherwise read every command.
+    stranger
 };
 
 // What a daemon says about itself when it is asked.

@@ -116,6 +116,13 @@ static bool ensure_daemon(char* /*argv0*/)
                          "a path you own.\n";
             return false;
 
+        case socketley::daemon_identity::stranger:
+            std::cerr << "the daemon socket at " << daemon_handler::socket_path
+                      << " is held by a process of another user\n"
+                      << "  Nothing was sent to it. Point SOCKETLEY_SOCKET at a "
+                         "path you own.\n";
+            return false;
+
         case socketley::daemon_identity::absent:
             break;   // the path is free — including when a stale file is on it
     }
@@ -246,6 +253,7 @@ int cli_dispatch(int argc, char** argv)
                     // member the enum gains.
                     case socketley::daemon_identity::forbidden:     status = "denied";  break;
                     case socketley::daemon_identity::mute:          status = "busy";    break;
+                    case socketley::daemon_identity::stranger:      status = "other";   break;
                 }
 
                 // Removed only when both say so, because a daemon still
@@ -318,6 +326,11 @@ int cli_dispatch(int argc, char** argv)
                     std::cerr << "the socket at " << daemon_handler::socket_path
                               << " belongs to another user and this one may not "
                                  "open it\n";
+                    break;
+
+                case socketley::daemon_identity::stranger:
+                    std::cerr << "the socket at " << daemon_handler::socket_path
+                              << " is held by a process of another user\n";
                     break;
 
                 // Nothing there, or there and busy, neither of which is worth

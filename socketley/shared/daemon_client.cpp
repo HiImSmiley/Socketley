@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -47,6 +48,15 @@ bool self_exe_identity(std::string& raw_path, uint64_t& dev, uint64_t& ino)
     return true;
 }
 
+// This user, root, or the account the packaged daemon runs as.
+static bool peer_trusted(uid_t uid)
+{
+    if (uid == ::geteuid() || uid == 0)
+        return true;
+    const struct passwd* pw = ::getpwnam("socketley");
+    return pw && pw->pw_uid == uid;
+}
+
 daemon_identity daemon_probe(const char*   socket_path,
                              daemon_ident* out,
                              int           timeout_ms)
@@ -71,6 +81,15 @@ daemon_identity daemon_probe(const char*   socket_path,
         if (err == EACCES || err == EPERM)
             return daemon_identity::forbidden;
         return daemon_identity::absent;
+    }
+
+    // Asked before a byte is written, because the probe itself is a command.
+    struct ucred cr{};
+    socklen_t    cr_len = sizeof(cr);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cr_len) == 0 && !peer_trusted(cr.uid))
+    {
+        close(fd);
+        return daemon_identity::stranger;
     }
 
     // Both directions, because a peer that accepts and never reads would block
