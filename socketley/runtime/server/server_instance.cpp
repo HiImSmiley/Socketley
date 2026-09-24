@@ -4306,23 +4306,28 @@ reparse:
                     // holding which codes may be repeated and which are
                     // themselves the protocol error.
                     const uint16_t code = ws_close_echo_code(payload);
-                    if (const auto* pre = ws_frame_close_pre(code))
-                    {
-                        conn->write_queue.push(*pre);
-                    }
-                    else
-                    {
-                        // Four bytes with one recipient, written into the
-                        // queue's own tail for the same reason as the pong
-                        // above: the shared form would cost two allocations
-                        // and buy nothing.
-                        std::string close_frame;
+                    const auto* pre = ws_frame_close_pre(code);
+                    // Four bytes with one recipient, written into the queue's
+                    // own tail for the same reason as the pong above: the
+                    // shared form would cost two allocations and buy nothing.
+                    std::string close_frame;
+                    if (!pre)
                         ws_frame_close_code_into(close_frame, code);
-                        conn->write_queue.push_coalesced(std::move(close_frame),
-                            server_connection::WRITE_COALESCE_LIMIT);
+                    // RFC 6455 7.1.1 has the server close the TCP connection
+                    // first, so the frame and our FIN leave together when
+                    // nothing is queued ahead of them -- the reason and the
+                    // measurement are send_final_and_fin()'s.
+                    if (!send_final_and_fin(conn, pre ? std::string_view(**pre)
+                                                      : std::string_view(close_frame)))
+                    {
+                        if (pre)
+                            conn->write_queue.push(*pre);
+                        else
+                            conn->write_queue.push_coalesced(std::move(close_frame),
+                                server_connection::WRITE_COALESCE_LIMIT);
+                        if (!conn->write_pending)
+                            flush_write_queue(conn);
                     }
-                    if (!conn->write_pending)
-                        flush_write_queue(conn);
                     conn->closing = true;
                 }
                 if (conn->closing)
