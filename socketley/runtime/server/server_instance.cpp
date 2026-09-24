@@ -1446,7 +1446,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
                     rng.usable
                         ? build_http_206_headers(ct, rng.first, rng.last, fsize,
                                                  conn->http_keep_alive)
-                        : build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+                        : build_http_headers_only(ct, fsize, conn->http_keep_alive)),
+                    /*ends_exchange=*/false);
                 return;
             }
         }
@@ -1466,7 +1467,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
                 rng.usable
                     ? build_http_206_headers(ct, rng.first, rng.last, fsize,
                                              conn->http_keep_alive)
-                    : build_http_headers_only(ct, fsize, conn->http_keep_alive)));
+                    : build_http_headers_only(ct, fsize, conn->http_keep_alive)),
+                /*ends_exchange=*/false);
             if (SOCKETLEY_UNLIKELY(!stream_file_begin(conn, ffd, send_first, send_len)))
             {
                 // The headers promised a length that is now not coming.
@@ -1622,8 +1624,47 @@ static const char* lua_value_type_name(lua_context& lc, const sol::object& v)
 
 // The one place an HTTP response enters the write queue, so a HEAD is cut to
 // its header block here rather than at each of the seventeen emitters.
+// ─── THE LAST BYTES AND THE FIN IN ONE TURN ─────────────────────────────────
+// maybe_shutdown_write() sends the FIN from the write's completion, which wins
+// the race with one client and loses it with many: at 32 connection-per-request
+// clients 78% of the TIME-WAITs were the clients', and their port searches set
+// the rate.  So a whole answer to a client that is closing, with nothing queued
+// ahead of it, goes by a direct send() with MSG_MORE and the shutdown follows,
+// the FIN riding in the data's own segment -- what the socket does not take is
+// queued and the FIN is left to the completion as before.
+bool server_instance::send_final_and_fin(server_connection* conn, std::string_view data)
+{
+    if (conn->fd < 0 || conn->ssl != nullptr || conn->wr_shutdown || conn->write_pending ||
+        conn_has_output(conn) || conn->cache_pending > 0 ||
+        conn->splice_pending || conn->splice_in_pending || conn->splice_out_pending)
+        return false;
+
+    size_t off = 0;
+    while (off < data.size())
+    {
+        const ssize_t n = ::send(conn->fd, data.data() + off, data.size() - off,
+                                 MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
+        if (n > 0) { off += static_cast<size_t>(n); continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    m_stat_bytes_out.fetch_add(off, std::memory_order_relaxed);
+    if (off < data.size())
+    {
+        conn->write_queue.push(std::make_shared<const std::string>(data.substr(off)));
+        if (!conn->write_pending)
+            flush_write_queue(conn);
+        return true;
+    }
+
+    conn->wr_shutdown = true;
+    if (shutdown(conn->fd, SHUT_WR) < 0) {}
+    return true;
+}
+
 void server_instance::queue_http_response(server_connection* conn,
-                                          std::shared_ptr<const std::string> resp)
+                                          std::shared_ptr<const std::string> resp,
+                                          bool ends_exchange)
 {
     if (SOCKETLEY_UNLIKELY(conn->http_head))
     {
@@ -1631,6 +1672,8 @@ void server_instance::queue_http_response(server_connection* conn,
         if (hdr_end != std::string::npos && hdr_end + 4 < resp->size())
             resp = std::make_shared<const std::string>(resp->data(), hdr_end + 4);
     }
+    if (ends_exchange && !conn->http_keep_alive && send_final_and_fin(conn, *resp))
+        return;
     conn->write_queue.push(std::move(resp));
     if (!conn->write_pending)
         flush_write_queue(conn);
@@ -1644,7 +1687,8 @@ void server_instance::refuse_http_request(server_connection* conn,
     // what is in doubt.
     conn->partial.clear();
 
-    queue_http_response(conn, resp);
+    // Its teardown runs from the write's completion, which a direct send skips.
+    queue_http_response(conn, resp, /*ends_exchange=*/false);
 
     // Unconditional, and not conditioned on http_keep_alive the way the 404
     // path is: keep-alive means "the next request starts where this one ends",
@@ -6426,6 +6470,9 @@ void server_instance::handle_file_read(struct io_uring_cqe* cqe, io_request* req
     if (!conn->http_keep_alive)
     {
         conn->closing = true;
+        // An answer sent directly leaves no write completion to end this.
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
     }
     else
     {

@@ -61,6 +61,9 @@ P=$((SL_PORT_BASE + 1590))
 
 mkdir -p "$WORK/www"
 printf '<h1>hello</h1>' > "$WORK/www/index.html"
+# For the race below, which needs a body whose served length is the file's --
+# index.html's carries an injected script.
+head -c 600 /dev/zero | tr '\0' r > "$WORK/www/race.txt"
 
 "$BIN" create server hcached -p $((P+1)) --http "$WORK/www" --http-cache -s >/dev/null 2>&1 || true
 "$BIN" create server hdisk   -p $((P+2)) --http "$WORK/www"              -s >/dev/null 2>&1 || true
@@ -283,6 +286,39 @@ r=$(probe $((P+1)) 1.1 "CLOSE")
 if [ "$(field "$r" conn)" = "close" ]; then pass
 else fail "the close token is matched case-insensitively" \
           "'CLOSE' gave conn='$(field "$r" conn)'"; fi
+
+# ─── THE RACE, AGAINST A CLIENT THAT DOES NOT WAIT ─────────────────────────
+#
+# Everything above reads the answer at Python's pace, so the FIN sent from the
+# write's completion always arrived first -- and at 32 concurrent C clients it
+# did not: 78% of the TIME-WAITs were the clients', at 17.3k requests/s where
+# 60.2k were possible.  This client closes the moment the body is in, sequential
+# so the count is exact, with TIME-WAIT counted per 4-tuple from its own ports
+# because rows another test or run left on the port expire in the middle of it.
+if gcc -O2 -o "$WORK/close" "$HERE/lib_close_race.c" 2>/dev/null; then
+    body_len=600
+    for spec in "cached|$((P+1))" "disk|$((P+2))"; do
+        mode=${spec%%|*}; port=${spec##*|}
+        N=200
+        whole=$(timeout 120 "$WORK/close" "$port" /race.txt "$N" "$body_len" 2>"$WORK/ports.$mode" || echo 0)
+        sleep 0.5
+        read -r srv cli < <(ss -tan state time-wait 2>/dev/null | awk -v p="$port" -v f="$WORK/ports.$mode" '
+            BEGIN { while ((getline l < f) > 0) mine[l] = 1 }
+            NR > 1 { n = split($3, a, ":"); lp = a[n]; n = split($4, b, ":"); rp = b[n]
+                     if (lp == p && (rp in mine)) s++
+                     if (rp == p && (lp in mine)) c++ }
+            END { printf "%d %d\n", s, c }')
+        if [ "$whole" = "$N" ]; then pass
+        else fail "$mode: a fast closing client gets every body whole" "$whole of $N"; fi
+        if [ "$srv" -ge $((N * 9 / 10)) ] && [ "$cli" -le $((N / 10)) ]; then pass
+        else fail "$mode: the server wins the close race against a fast client" \
+                  "TIME-WAIT on the server's port $srv, on the client's $cli, for $N exchanges" \
+                  "-- a FIN sent a turn after the data loses to a client that closes" \
+                  "as soon as the body is in, and its ephemeral port pays"; fi
+    done
+else
+    echo "  SKIP: no C compiler for the race section"
+fi
 
 echo
 echo "  passed: $PASS / $TOTAL"

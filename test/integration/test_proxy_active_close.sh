@@ -61,50 +61,7 @@ fi
 # soon as it has the body: a Python client reads and closes slowly enough that
 # the late FIN still arrives first, and the assertion passed on the tree it was
 # written against.
-cat > "$WORK/close.c" <<'C'
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
-int main(int argc, char **argv)
-{
-    int port = atoi(argv[1]), n = atoi(argv[3]); long want = atol(argv[4]);
-    char req[256];
-    int rl = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", argv[2]);
-    static char buf[1 << 20];
-    int whole = 0;
-    for (int i = 0; i < n; i++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in a = {0};
-        a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(0x7f000001);
-        if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0 || write(fd, req, rl) != rl) { close(fd); continue; }
-        struct sockaddr_in me; socklen_t ml = sizeof me;
-        if (getsockname(fd, (struct sockaddr *)&me, &ml) == 0) fprintf(stderr, "%d\n", ntohs(me.sin_port));
-        long got = 0, body = -1; size_t hl = 0; char head[4096];
-        for (;;) {
-            ssize_t r = read(fd, buf, sizeof buf);
-            if (r <= 0) break;
-            if (body < 0) {
-                size_t take = (size_t)r < sizeof head - hl - 1 ? (size_t)r : sizeof head - hl - 1;
-                memcpy(head + hl, buf, take); hl += take; head[hl] = 0;
-                char *e = strstr(head, "\r\n\r\n");
-                if (!e) continue;
-                body = (long)hl - (long)(e + 4 - head) + ((long)r - (long)take);
-            } else body += r;
-            if (body >= want) break;
-        }
-        got = body;
-        close(fd);
-        if (got == want) whole++;
-    }
-    printf("%d\n", whole);
-    return 0;
-}
-C
-if ! gcc -O2 -o "$WORK/close" "$WORK/close.c" 2>"$WORK/cc.log"; then
+if ! gcc -O2 -o "$WORK/close" "$HERE/lib_close_race.c" 2>"$WORK/cc.log"; then
     echo "  SKIP: no C compiler"; cat "$WORK/cc.log"; echo "  Results: 0/0 passed (0 failed)"; exit 0
 fi
 
