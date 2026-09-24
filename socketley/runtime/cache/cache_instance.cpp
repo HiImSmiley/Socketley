@@ -2110,6 +2110,19 @@ bool cache_instance::parse_text_lines(client_connection* conn)
 
         scan_from = pos + 1;
 
+        // The RESP loop's 1 MiB flush, because one read of `get k` lines
+        // against a large value otherwise answered hundreds of copies of it
+        // before the write-queue cap was consulted at all.
+        if (SOCKETLEY_UNLIKELY(conn->response_buf.size() > (1 << 20)))
+        {
+            if (SOCKETLEY_UNLIKELY(!flush_responses(conn)))
+            {
+                conn->closing = true;
+                break;
+            }
+            conn->response_buf.reserve(4096);
+        }
+
         // REPLICATE takes effect on the line that carried it, so answering the
         // rest of the batch would put a second writer on the socket the dump
         // is going out on.

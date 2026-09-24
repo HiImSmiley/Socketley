@@ -4167,6 +4167,12 @@ reparse:
                     // characters.  Built into a buffer the queue may still
                     // grow instead, and the empty pong a browser keepalive
                     // sends is two bytes, which never leaves the SSO.
+                    //
+                    // Through admit_send like every other write, because a peer
+                    // that pings and never reads otherwise grew this queue by a
+                    // byte for every byte it sent.
+                    if (!admit_send(conn, 4 + payload.size(), false))
+                        break;
                     std::string pong;
                     pong.reserve(4 + payload.size());
                     ws_frame_pong_into(pong, payload);

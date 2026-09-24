@@ -110,6 +110,31 @@ else fail "the cache still serves everyone else" \
           "PING after the greedy client did not answer PONG -- dropping that one" \
           "connection is right, and taking the runtime with it is not"; fi
 
+# ── 2b. the same through the text protocol ──────────────────────────────────
+# Its line loop had no 1 MiB flush at all, so one read of `get big` lines was
+# answered in full before the write-queue bound was ever consulted.
+cat > "$WORK/greedy_text.py" <<'PY'
+import socket, sys, time
+port, n, hold = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+s = socket.create_connection(("127.0.0.1", port), 5)
+s.sendall(b"get big\n" * n)
+time.sleep(hold)
+s.close()
+PY
+BASE=$(rss)
+python3 "$WORK/greedy_text.py" $((P+1)) "$N" 3 >/dev/null 2>&1 &
+GP=$!
+PEAK=$BASE
+for _ in $(seq 1 40); do sleep 0.1; r=$(rss); [ "${r:-0}" -gt "$PEAK" ] && PEAK=$r; done
+wait "$GP" 2>/dev/null || true
+ADDED=$(( (PEAK - BASE) / 1024 ))
+if [ "$ADDED" -lt "$ALLOW" ]; then
+    echo "  $N pipelined text gets asked for $ASKED MB and added $ADDED MB"
+    pass
+else fail "the text protocol is bounded the same way" \
+          "the worker added $ADDED MB for $ASKED MB asked, against $ALLOW MB" \
+          "-- a line loop with no mid-batch flush answers the whole read first"; fi
+
 # ── 3. a client that pipelines AND reads gets every byte ────────────────────
 cat > "$WORK/polite.py" <<'PY'
 import socket, sys
