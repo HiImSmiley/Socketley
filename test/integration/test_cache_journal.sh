@@ -82,6 +82,19 @@ kill_workers() {
     return 1
 }
 
+# Stop every worker, append a torn frame head to the journal, then kill them,
+# so the next start is the first process to see the tear.
+tear_and_kill() {
+    local pids p
+    pids=$("$BIN" stats jc 2>/dev/null | awk -F: '/^pid:/ {print $2}' | tr ',' ' ')
+    [ -n "$pids" ] || return 1
+    for p in $pids; do
+        grep -qa 'socketley' "/proc/$p/cmdline" 2>/dev/null && kill -STOP "$p" 2>/dev/null
+    done
+    printf '\x40\x00\x00\x00\xde\xad\xbe\xefjunk' >> "$DUMP.journal"
+    kill_workers
+}
+
 # Bring jc back after a kill, whether or not the daemon revived it itself.
 revive() {
     wait_up && return 0
@@ -175,17 +188,34 @@ fi
 # ── 4. A torn tail ──────────────────────────────────────────────────────────
 redis-cli -p "$PORT" SET jtail kept >/dev/null 2>&1
 sleep 2                       # flushed
-kill_workers || bad "kill 2" "no worker pid to kill"
 # A frame head claiming 64 bytes with 4 bytes of payload: what a crash
-# mid-write leaves.
-printf '\x40\x00\x00\x00\xde\xad\xbe\xefjunk' >> "$DUMP.journal"
+# mid-write leaves -- appended while the worker is stopped and before it dies,
+# because the daemon restarts a killed worker at once and garbage appended after
+# that lands in the middle of a live journal, which is not the case under test.
+tear_and_kill || bad "kill 2" "no worker pid to kill"
 revive || bad "torn restart" "cache refused a journal with a torn tail"
 GOT=$(count_keys)
 V=$(redis-cli -p "$PORT" GET jtail 2>/dev/null)
-if [ "$GOT" = "$KEYS" ] && [ "$V" = "kept" ]; then
+if [ "$GOT" = "$KEYS" ] && [ "$V" = "kept" ] && grep -q 'ended mid-record' "$SOCKETLEY_DLOG"; then
     ok "a torn tail is dropped, the complete records in front of it are not"
 else
     bad "torn tail" "$GOT of $KEYS keys, GET jtail = $V"
+fi
+
+# A write accepted after that recovery must survive the next crash, which it
+# cannot if it was appended behind the garbage the replay stops at.
+redis-cli -p "$PORT" SET jafter written >/dev/null 2>&1
+sleep 2                       # flushed
+JB=$(stat -c%s "$DUMP.journal" 2>/dev/null)
+kill_workers || bad "kill 2b" "no worker pid to kill"
+revive || bad "second torn restart" "cache never came back"
+V=$(redis-cli -p "$PORT" GET jafter 2>/dev/null)
+if [ "$V" = "written" ]; then
+    ok "a write after a torn-tail recovery survives the next crash"
+else
+    bad "write behind a torn tail" "GET jafter = '$V' after the second kill -9" \
+        "it was journaled behind the garbage, where replay stops (journal $JB bytes)" \
+        "$(grep -iE 'journal|replay|torn' "$SOCKETLEY_DLOG" 2>/dev/null | tail -4)"
 fi
 
 # ── 5. Truncation behind the snapshot ───────────────────────────────────────

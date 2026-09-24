@@ -3480,9 +3480,9 @@ bool cache_instance::journal_recover()
                      .c_str());
     }
 
-    // Left as it stands rather than truncated, because the dump on disk does
-    // not hold what was just replayed; new writes append behind the old tail,
-    // and a second crash replays both from the same base.
+    // Left as it stands rather than cut to its head, because the dump on disk
+    // does not hold what was just replayed; new writes append behind the last
+    // complete record, and a second crash replays both from the same base.
     if (!m_journal.open_append(own, own_head))
     {
         LOG_ERROR(("cache: could not open the journal at " + own).c_str());

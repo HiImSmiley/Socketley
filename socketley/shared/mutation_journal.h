@@ -173,6 +173,16 @@ public:
                 ::close(fd);
                 return false;
             }
+            // A torn tail is cut here, because replay stops at the first bad
+            // frame and a record appended behind it could never be read back.
+            replay_stats st;
+            walk(data, off, nullptr, st);
+            if (st.torn &&
+                ::ftruncate(fd, static_cast<off_t>(data.size() - st.dropped_bytes)) != 0)
+            {
+                ::close(fd);
+                return false;
+            }
         }
 
         m_fd = fd;
