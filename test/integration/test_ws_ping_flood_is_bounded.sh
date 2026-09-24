@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# Integration test: a WebSocket peer that pings and never reads is closed at
-# the write bound instead of growing the worker.
+# Integration test: a WebSocket peer that pings and never reads costs the
+# worker a bounded amount, however much it sends.
 #
 # ─── WHY ────────────────────────────────────────────────────────────────────
 #
 # Every other write the server makes goes through admit_send(), which closes a
 # connection whose queue has reached --write-buffer.  The pong did not: it was
 # pushed onto the queue directly, so a client sending masked pings and reading
-# nothing grew the worker by roughly a byte for every byte it sent, for as long
-# as it cared to, and took every other connection on the runtime down with it
-# when the kernel ran out of patience.
+# nothing grew the worker by roughly a byte for every byte it sent.
+#
+# And "closes" was only a flag.  The connection waited for a write the peer
+# would never drain, while the multishot recv went on filling `partial` with
+# everything it sent -- so bounding the pong alone moved the sixty megabytes
+# from the write side to the read side.  A connection on its way out now takes
+# nothing more in, and what it had queued still drains to a peer that reads.
 #
 # ─── WHAT KEEPS IT HONEST ───────────────────────────────────────────────────
 #
-# The flood is sixty megabytes, far past the eight the bound allows, so the
-# growth is measured against an allowance a quarter of what the defect adds;
-# the connection has to be closed, which a build that merely stopped answering
-# pings would not do; and a second client must still be served afterwards.
+# The flood is 120 MB in two halves.  The first is held to an allowance well
+# under what the defect adds, and the second must cost nothing more at all --
+# the property itself, which a connection still reading into `partial` fails
+# however small the first figure is -- and a new client must still be served.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -45,7 +49,7 @@ rss() { awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo 0; }
 
 cat > "$SOCKETLEY_TMPD/flood.py" <<'PYEOF'
 import base64, os, socket, struct, sys, time
-port, total = int(sys.argv[1]), int(sys.argv[2])
+port, total, marker = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 s = socket.create_connection(("127.0.0.1", port), timeout=5)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
 key = base64.b64encode(os.urandom(16)).decode()
@@ -63,9 +67,14 @@ batch = ping * 512
 sent = 0
 s.settimeout(10)
 try:
+    halfway = False
     while sent < total:
         s.sendall(batch)
         sent += len(batch)
+        if not halfway and sent >= total // 2:
+            halfway = True
+            open(marker, "w").write("half")
+            time.sleep(1)
     print("open %d" % sent)
 except (BrokenPipeError, ConnectionResetError, socket.timeout) as e:
     print("closed %d" % sent)
@@ -73,23 +82,32 @@ time.sleep(0.5)
 PYEOF
 
 BASE=$(rss)
-python3 "$SOCKETLEY_TMPD/flood.py" "$P" $((60 * 1024 * 1024)) >"$SOCKETLEY_TMPD/flood.out" 2>&1 &
+MARK="$SOCKETLEY_TMPD/half"
+python3 "$SOCKETLEY_TMPD/flood.py" "$P" $((120 * 1024 * 1024)) "$MARK" >"$SOCKETLEY_TMPD/flood.out" 2>&1 &
 FP=$!
-PEAK=$BASE
-while kill -0 "$FP" 2>/dev/null; do r=$(rss); [ "${r:-0}" -gt "$PEAK" ] && PEAK=$r; sleep 0.1; done
+PEAK=$BASE; HALF=""
+while kill -0 "$FP" 2>/dev/null; do
+    r=$(rss); [ "${r:-0}" -gt "$PEAK" ] && PEAK=$r
+    [ -z "$HALF" ] && [ -e "$MARK" ] && HALF=$PEAK
+    sleep 0.1
+done
 wait "$FP" 2>/dev/null
 OUT=$(cat "$SOCKETLEY_TMPD/flood.out")
+FIRST=$(( (${HALF:-$PEAK} - BASE) / 1024 ))
 ADDED=$(( (PEAK - BASE) / 1024 ))
-echo "  flood: $OUT, worker grew $ADDED MB"
+echo "  flood: $OUT, worker grew $FIRST MB over the first 60 MB and $ADDED MB over all 120"
 
-if [ "$ADDED" -lt 15 ]; then pass "sixty megabytes of pings cost the worker $ADDED MB"
-else fail "the pong queue is bounded" "the worker grew $ADDED MB against an allowance of 15" \
+if [ "$FIRST" -lt 40 ]; then pass "sixty megabytes of pings cost the worker $FIRST MB"
+else fail "the pong queue is bounded" "the worker grew $FIRST MB over 60 MB of pings" \
           "-- a pong pushed past admit_send() queues one for every ping read"; fi
 
-case "$OUT" in
-    closed*) pass "the flooding connection was closed" ;;
-    *) fail "the flooding connection was closed" "the client saw: $OUT" ;;
-esac
+# The property itself: once the connection is past its bound, what it sends
+# costs nothing more, which a dropped connection still reading into `partial`
+# fails however small the first figure is.
+if [ $((ADDED - FIRST)) -lt 5 ]; then pass "the second sixty megabytes cost nothing more ($((ADDED - FIRST)) MB)"
+else fail "memory does not follow what the peer sends" \
+          "the worker grew another $((ADDED - FIRST)) MB over the second 60 MB" \
+          "-- a connection dropped at its bound kept reading into partial"; fi
 
 if python3 - "$P" <<'PYEOF'
 import base64, os, socket, sys

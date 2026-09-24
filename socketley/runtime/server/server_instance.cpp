@@ -4668,6 +4668,17 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         conn->last_activity = std::chrono::steady_clock::now();
     m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
 
+    // A connection on its way out takes nothing more in, because a multishot
+    // recv stays armed after `closing` is set and went on filling `partial`
+    // with everything the peer sent -- sixty megabytes of pings, held for a
+    // client that had been dropped at the eight-megabyte write bound.
+    if (SOCKETLEY_UNLIKELY(conn->closing))
+    {
+        if (is_provided)
+            m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [](char*, uint32_t) {});
+        goto submit_next_read;
+    }
+
     // On a TLS connection these bytes are ciphertext and tls_feed is what puts
     // plaintext into partial; everything below this point reads exactly the
     // same buffer it always did and knows nothing about TLS.
@@ -5551,8 +5562,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
             // broadcast dropped answers the script's next self.send() with
             // "there is no open connection" -- the peer's sentence for the
             // runtime's decision.  One flag, both entrances.
-            conn->closed_for_backlog = true;
-            conn->closing = true;
+            abandon_for_backlog(conn);
             ++counted.backlogged;
             continue;
         }
@@ -5615,6 +5625,15 @@ server_instance::fanout_count server_instance::queue_broadcast(
 //
 // So it says. false means the bytes are not going anywhere, and the caller can
 // pass that to whoever asked.
+// A peer let go of because it outran its write bound, in one place for the
+// send and the broadcast doors -- the queue it already has still drains, and
+// handle_read takes nothing more from it.
+void server_instance::abandon_for_backlog(server_connection* conn)
+{
+    conn->closed_for_backlog = true;
+    conn->closing = true;
+}
+
 bool server_instance::admit_send(server_connection* conn, size_t bytes,
                                  bool even_when_closing)
 {
@@ -5629,8 +5648,7 @@ bool server_instance::admit_send(server_connection* conn, size_t bytes,
         // outran the socket is a different thing from a peer that hung up, and
         // the answer a script acts on is different too -- one is "slow down",
         // the other is "it is gone".
-        conn->closed_for_backlog = true;
-        conn->closing = true;
+        abandon_for_backlog(conn);
         return false;
     }
 

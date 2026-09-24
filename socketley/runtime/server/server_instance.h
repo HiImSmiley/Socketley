@@ -1069,6 +1069,7 @@ private:
     // Whether this connection will take `bytes` more, and the two flags that
     // follow from the answer.  Extracted because both queue_send forms have to
     // agree: a bound enforced at one door and not the other is not a bound.
+    void abandon_for_backlog(server_connection* conn);
     bool admit_send(server_connection* conn, size_t bytes, bool even_when_closing);
     void flush_write_queue(server_connection* conn);
 
