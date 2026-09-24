@@ -61,7 +61,9 @@ for k in k1 k2 k3 k4 k5 k6 k7 k8 k9 k10; do
     else [ -z "$B" ] && B=$k; fi
 done
 echo "  shard0 owns '$A' and '$A2', shard1 owns '$B'"
-[ -n "$A" ] && [ -n "$A2" ] && [ -n "$B" ] || { echo "  SKIP: could not find the three keys this needs"; exit 0; }
+# The hash is fixed and ten names always split, so a map that does not is a
+# cache that stopped answering KEYSLOT rather than a reason to skip.
+[ -n "$A" ] && [ -n "$A2" ] && [ -n "$B" ] || { echo "  FAIL: the slot map did not split ten keys across two shards"; exit 1; }
 
 redis-cli -p $((P+1)) set "$A" wert >/dev/null
 
