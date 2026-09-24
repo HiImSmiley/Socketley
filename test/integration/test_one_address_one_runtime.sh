@@ -138,7 +138,7 @@ heard_by() {   # name
 # A restart that keeps this test's isolation, because daemon_stop deletes the
 # state directory the planted file lives in, and the log is truncated so
 # daemon_start does not match the previous run's "daemon started".
-daemon_restart() {
+daemon_kill() {
     if [ -n "${SOCKETLEY_DPID:-}" ]; then
         for c in $(pgrep -P "$SOCKETLEY_DPID" 2>/dev/null); do
             kill -9 "$c" 2>/dev/null || true
@@ -148,6 +148,8 @@ daemon_restart() {
     fi
     for _ in $(seq 1 50); do [ -S "$SOCKETLEY_SOCKET" ] || break; sleep 0.1; done
     rm -f "$SOCKETLEY_SOCKET"
+}
+daemon_boot() {
     : > "$SOCKETLEY_DLOG"
     daemon_start "$BIN"
 }
@@ -270,7 +272,16 @@ ready_tcp 127.0.0.1 "$P_BOOT" >/dev/null 2>&1 || true
 
 # was_running is set on the one that started; the other is forced on disk, so
 # the restore has a pair to bring back and no command handler in the way.
+# The state files are written by the daemon's writer thread after the command
+# has answered, so the file is waited for, and planted with the daemon down --
+# a write still queued would otherwise land on top of it, and inside the full
+# suite the file was not there yet at all.
 STATE_DIR=$(sed -n 's/.*state directory: \(.*\)$/\1/p' "$SOCKETLEY_DLOG" | tail -1)
+for _ in $(seq 1 100); do
+    grep -lq '"name": *"oa_b2"' "$STATE_DIR"/*.json 2>/dev/null && break
+    sleep 0.05
+done
+daemon_kill
 PLANTED=0
 for f in "$STATE_DIR"/*.json; do
     [ -f "$f" ] || continue
@@ -285,7 +296,7 @@ PYEOF
 done
 check "the second runtime was planted as running" "1" "$PLANTED"
 
-daemon_restart
+daemon_boot
 
 # One of the two comes back and the other does not, and the daemon says which
 # and why -- rather than both coming back and splitting the port.

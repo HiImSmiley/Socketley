@@ -180,6 +180,17 @@ ready_tcp 127.0.0.1 "$P_RST" >/dev/null 2>&1 || true
 await_lines "$LR" 2 || true
 check "before the reboot" "created,running" "$(states "$LR")"
 
+# was_running reaches the state file from the daemon's writer thread after the
+# start has answered, and the restart below is a kill -9 -- so it waits for the
+# file to say so, or inside the full suite the restore found a runtime that had
+# never been recorded as running and only recreated it.
+STATE_DIR=$(sed -n 's/.*state directory: \(.*\)$/\1/p' "$SOCKETLEY_DLOG" | tail -1)
+for _ in $(seq 1 100); do
+    grep -l '"name": *"sl_rst"' "$STATE_DIR"/*.json 2>/dev/null \
+        | xargs -r grep -lq '"was_running": *true' 2>/dev/null && break
+    sleep 0.05
+done
+
 daemon_restart
 if await_lines "$LR" 4; then ok; else
     bad "the restore appends" "$(states "$LR")"; fi
