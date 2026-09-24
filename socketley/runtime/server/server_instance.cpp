@@ -974,6 +974,27 @@ static const std::shared_ptr<const std::string>& http_500_response()
     return resp;
 }
 
+// A path with a segment that starts with a dot -- .env, .git/config,
+// .htpasswd -- which is where a site's secrets sit beside its pages, so none is
+// served; .well-known is the one such directory meant for the public.
+static bool http_hidden_path(std::string_view path)
+{
+    size_t i = 0;
+    while (i < path.size())
+    {
+        while (i < path.size() && path[i] == '/') ++i;
+        const size_t end = path.find('/', i);
+        const std::string_view seg = path.substr(i, end == std::string_view::npos
+                                                        ? std::string_view::npos : end - i);
+        if (!seg.empty() && seg.front() == '.' && seg != ".well-known")
+            return true;
+        if (end == std::string_view::npos)
+            break;
+        i = end;
+    }
+    return false;
+}
+
 void server_instance::rebuild_http_cache()
 {
     m_http_cache.clear();
@@ -994,11 +1015,48 @@ void server_instance::rebuild_http_cache()
         if (!entry.is_regular_file())
             continue;
 
-        // Compute URL path relative to base dir
-        auto rel = fs::relative(entry.path(), m_http_base, ec);
-        if (ec)
+        // Lexically, because fs::relative() resolves links and filed every one
+        // under its target's name, so no link was ever served by its own.
+        const auto rel = entry.path().lexically_relative(m_http_base);
+        if (rel.empty())
             continue;
         std::string url_path = "/" + rel.string();
+        if (http_hidden_path(url_path))
+            continue;
+
+        // A link is followed exactly where disk mode follows it, by asking the
+        // same openat2(RESOLVE_BENEATH) -- where a symlink to /etc/shadow was
+        // read into memory here and served -- with the canonical prefix test
+        // kept for a kernel without it.
+        {
+            bool beneath = false;
+            bool asked = false;
+            if (m_http_root_fd >= 0)
+            {
+                struct open_how how{};
+                how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
+                how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+                const long r = ::syscall(__NR_openat2, m_http_root_fd, rel.c_str(),
+                                         &how, sizeof(how));
+                if (r >= 0)
+                {
+                    ::close(static_cast<int>(r));
+                    beneath = asked = true;
+                }
+                else if (errno != ENOSYS)
+                    asked = true;
+            }
+            if (!asked)
+            {
+                std::error_code cec;
+                const fs::path real = fs::canonical(entry.path(), cec);
+                const auto mism = std::mismatch(m_http_base.begin(), m_http_base.end(),
+                                                real.begin(), real.end());
+                beneath = !cec && mism.first == m_http_base.end();
+            }
+            if (!beneath)
+                continue;
+        }
 
         // Read file content
         std::ifstream f(entry.path(), std::ios::binary);
@@ -1168,6 +1226,16 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
     auto qpos = url_path.find('?');
     if (qpos != std::string::npos)
         url_path = url_path.substr(0, qpos);
+
+    if (http_hidden_path(url_path))
+    {
+        queue_http_response(conn, http_404_response(conn->http_keep_alive));
+        if (!conn->http_keep_alive)
+            conn->closing = true;
+        else
+            conn->proto = proto_unknown;
+        return;
+    }
 
     if (m_http_cache_enabled && !m_http_cache.empty())
     {
