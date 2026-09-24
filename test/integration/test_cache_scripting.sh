@@ -193,8 +193,9 @@ want "and redis.call still reaches the store" "+OK" \
 # and it did -- rawset(_G,"sneak",1) stored and the next script read it back.
 # table.insert(_G, x) is the same hole by number.  Every route needs a
 # REFERENCE to the globals table, so the name is taken away as well, and these
-# three now fail on the argument rather than on the permission.
-want "rawset cannot reach the globals" "table expected" \
+# now fail on the argument rather than on the permission -- rawset on its own
+# name, since the sandbox that locks the library tables took it away too.
+want "rawset cannot reach the globals" "nil value" \
   '[["EVAL","rawset(_G, \"sneak\", 1) return 1","0"]]'
 want "nor can table.insert" "table expected" \
   '[["EVAL","table.insert(_G, \"x\") return 1","0"]]'
