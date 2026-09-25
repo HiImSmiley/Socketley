@@ -342,6 +342,7 @@ void proxy_backend_connection::reset(int new_fd)
     recv_withdrawing = false;
     sent_to_client = false;
     drained_reads = 0;
+    send_retries = 0;
     pool_abandoned = false;
     pool_backend_idx = 0;
     pool_host.clear();
@@ -2293,7 +2294,13 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_health_cqe(cqe, req);
             break;
         case op_timeout:
-            if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
+            if (req->fd >= 0 && req->fd < MAX_FDS &&
+                m_conn_idx[req->fd].side == conn_backend &&
+                req == &m_conn_idx[req->fd].backend->write_req)
+            {
+                retry_backend_send(m_conn_idx[req->fd].backend, cqe->res);
+            }
+            else if (m_idle_sweep_timer && req == &m_idle_sweep_timer->req)
             {
                 // This link of the chain has spoken; nothing is owed on it now.
                 m_idle_sweep_armed = false;
@@ -9426,6 +9433,65 @@ bool proxy_instance::flush_backend_write_queue(proxy_backend_connection* conn)
     return true;
 }
 
+template <typename Conn>
+bool proxy_instance::submit_write_batch(Conn* conn)
+{
+    conn->write_pending = true;
+    bool queued;
+    if (conn->write_batch_count == 1)
+    {
+        conn->write_req.type = op_write;
+        queued = m_loop->submit_write(conn->fd,
+            static_cast<const char*>(conn->write_iovs[0].iov_base),
+            static_cast<uint32_t>(conn->write_iovs[0].iov_len),
+            &conn->write_req);
+    }
+    else
+    {
+        conn->write_req.type = op_writev;
+        queued = m_loop->submit_writev(conn->fd, conn->write_iovs, conn->write_batch_count,
+                                       &conn->write_req);
+    }
+    if (SOCKETLEY_UNLIKELY(!queued))
+        conn->write_pending = false;
+    return queued;
+}
+
+bool proxy_instance::defer_backend_send(proxy_backend_connection* conn)
+{
+    // 2 ms doubling to 128, inside the 2-202 ms sk_stream_wait_memory waits.
+    static __kernel_timespec waits[] = {
+        {0, 2'000'000}, {0, 4'000'000}, {0, 8'000'000}, {0, 16'000'000},
+        {0, 32'000'000}, {0, 64'000'000}, {0, 128'000'000},
+    };
+    if (!m_loop || conn->write_batch_count == 0)
+        return false;
+
+    auto* wait = &waits[std::min<size_t>(conn->send_retries, std::size(waits) - 1)];
+    if (conn->send_retries < UINT8_MAX)
+        conn->send_retries++;
+
+    // Typed a timer so the batch stays owned, the teardown still defers on
+    // write_pending, and the progress ledger does not charge the wait.
+    conn->write_req.type = op_timeout;
+    conn->write_pending = true;
+    if (SOCKETLEY_LIKELY(m_loop->submit_timeout(wait, &conn->write_req)))
+        return true;
+    conn->write_pending = false;
+    return false;
+}
+
+void proxy_instance::retry_backend_send(proxy_backend_connection* conn, int res)
+{
+    conn->write_pending = false;
+    if (SOCKETLEY_LIKELY(res == -ETIME) && submit_write_batch(conn))
+        return;
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
+    close_pair(conn->client_fd, conn->fd);
+}
+
 void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* req)
 {
     int fd = req->fd;
@@ -9485,29 +9551,10 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
             }
             conn->write_batch_count = new_count;
 
-            conn->write_pending = true;
-            bool queued;
-            if (new_count == 1)
-            {
-                conn->write_req.type = op_write;
-                queued = m_loop->submit_write(conn->fd,
-                    static_cast<const char*>(conn->write_iovs[0].iov_base),
-                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
-                    &conn->write_req);
-            }
-            else
-            {
-                conn->write_req.type = op_writev;
-                queued = m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
-            }
-            if (SOCKETLEY_UNLIKELY(!queued))
-            {
-                // The remainder of a short write cannot be handed over,
-                // because leaving write_pending set strands the connection
-                // mid-message.
-                conn->write_pending = false;
+            // The remainder of a short write cannot be handed over, because
+            // leaving write_pending set strands the connection mid-message.
+            if (SOCKETLEY_UNLIKELY(!submit_write_batch(conn)))
                 close_pair(conn->fd, conn->backend_fd);
-            }
             return;
         }
     }
@@ -9566,12 +9613,15 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
 
     if (SOCKETLEY_UNLIKELY(cqe->res <= 0))
     {
+        if (cqe->res == -EAGAIN && defer_backend_send(conn))
+            return;
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
             conn->write_batch[i].clear();
         conn->write_batch_count = 0;
         close_pair(conn->client_fd, fd);
         return;
     }
+    conn->send_retries = 0;
 
     // Short write handling: resubmit remaining bytes
     if (conn->write_batch_count > 0)
@@ -9612,29 +9662,10 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
             }
             conn->write_batch_count = new_count;
 
-            conn->write_pending = true;
-            bool queued;
-            if (new_count == 1)
-            {
-                conn->write_req.type = op_write;
-                queued = m_loop->submit_write(conn->fd,
-                    static_cast<const char*>(conn->write_iovs[0].iov_base),
-                    static_cast<uint32_t>(conn->write_iovs[0].iov_len),
-                    &conn->write_req);
-            }
-            else
-            {
-                conn->write_req.type = op_writev;
-                queued = m_loop->submit_writev(conn->fd, conn->write_iovs, new_count, &conn->write_req);
-            }
-            if (SOCKETLEY_UNLIKELY(!queued))
-            {
-                // The remainder of a short write cannot be handed over,
-                // because leaving write_pending set strands the connection
-                // mid-message.
-                conn->write_pending = false;
+            // The remainder of a short write cannot be handed over, because
+            // leaving write_pending set strands the connection mid-message.
+            if (SOCKETLEY_UNLIKELY(!submit_write_batch(conn)))
                 close_pair(conn->client_fd, conn->fd);
-            }
             return;
         }
     }

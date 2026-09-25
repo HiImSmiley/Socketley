@@ -298,6 +298,8 @@ struct alignas(64) proxy_backend_connection
     bool closing{false};
     // Consecutive reads that drained the socket, which is what earns multishot.
     uint8_t drained_reads{0};
+    // Sends refused for memory in a row, which sets how long the next one waits.
+    uint8_t send_retries{0};
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
@@ -633,6 +635,11 @@ private:
     void handle_backend_read(struct io_uring_cqe* cqe, io_request* req);
     void handle_client_write(struct io_uring_cqe* cqe, io_request* req);
     void handle_backend_write(struct io_uring_cqe* cqe, io_request* req);
+    // A backend socket is non-blocking for its connect, so a send the kernel
+    // refuses under TCP memory pressure comes back as -EAGAIN instead of
+    // waiting; this waits in its place and offers the same batch again.
+    bool defer_backend_send(proxy_backend_connection* conn);
+    void retry_backend_send(proxy_backend_connection* conn, int res);
     void handle_splice(struct io_uring_cqe* cqe, io_request* req);
     void handle_connect(struct io_uring_cqe* cqe, io_request* req);
     // The abort watch armed in connect_to_backend has reported, tearing the
@@ -858,6 +865,8 @@ private:
     // False means the submission did not reach the ring, exactly as the two
     // flush functions above report it.
     template <typename Conn> bool tls_flush(Conn* conn);
+    // Hands what write_batch holds to the ring, false when nothing reached it.
+    template <typename Conn> bool submit_write_batch(Conn* conn);
     // A TLS connection can owe the wire bytes with an empty write queue, which
     // is how a handshake stalls one round short and how an alert is dropped on
     // the way to a teardown.

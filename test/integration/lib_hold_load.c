@@ -5,6 +5,8 @@
 // lib_hold_load down <port> <conns>         : each conn connects and never reads, holds 4 s
 // lib_hold_load sink <port>                 : accept and never read (backend for `up`)
 // lib_hold_load src  <port> <bytes>         : accept and send <bytes> per conn (backend for `down`)
+// lib_hold_load whole <port> <conns> <bytes> : `up`, then half-close and wait for EOF; reports on stderr
+// lib_hold_load drain <port> <quiet> <out>   : never read for <quiet> s, then count each conn to EOF into <out>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -14,6 +16,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <poll.h>
+#include <time.h>
 #include <unistd.h>
 static int port; static long bytes;
 static int dial(void) {
@@ -39,6 +43,41 @@ static void *mix(void *x) {
     outcome[idx] = bytes - left;
     sleep(4); close(fd); return 0;
 }
+static void *whole(void *x) {
+    long idx = (long)x; int fd = dial(); if (fd < 0) { errs[idx] = 1; return 0; }
+    struct timeval tv = {60, 0}; setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static char b[65536]; long left = bytes;
+    while (left > 0) { ssize_t w = write(fd, b, left < (long)sizeof b ? left : (long)sizeof b); if (w <= 0) { errs[idx] = 1; break; } left -= w; }
+    outcome[idx] = bytes - left;
+    if (shutdown(fd, SHUT_WR) < 0) errs[idx] = 1;
+    char r[256]; ssize_t n;
+    while ((n = read(fd, r, sizeof r)) > 0) {}
+    if (n < 0) errs[idx] = 1;
+    close(fd); return 0;
+}
+static int drain(int s, int quiet, const char *out) {
+    static int fds[8192]; static long got[8192]; int n = 0, live = 0;
+    struct pollfd *p = calloc(8193, sizeof *p);
+    time_t t0 = time(0);
+    for (;;) {
+        int draining = time(0) - t0 >= quiet, m = 0;
+        p[m].fd = s; p[m].events = POLLIN; m++;
+        if (draining) for (int i = 0; i < n; i++) { p[m].fd = fds[i]; p[m].events = POLLIN; m++; }
+        if (poll(p, m, 200) < 0) break;
+        if (p[0].revents & POLLIN) { int c = accept(s, 0, 0); if (c >= 0 && n < 8192) { fds[n++] = c; live++; } }
+        for (int i = 1; i < m; i++) {
+            if (!p[i].revents) continue;
+            int k = i - 1; static char b[262144];
+            ssize_t r = read(fds[k], b, sizeof b);
+            if (r > 0) got[k] += r; else { close(fds[k]); fds[k] = -1; live--; }
+        }
+        if (draining && n > 0 && live == 0) break;
+        if (time(0) - t0 > quiet + 120) break;
+    }
+    FILE *f = fopen(out, "w"); for (int i = 0; i < n; i++) fprintf(f, "%ld\n", got[i]); fclose(f);
+    return 0;
+}
 static void *down(void *x) { (void)x; int fd = dial(); if (fd < 0) return 0; sleep(4); close(fd); return 0; }
 static void *src_one(void *x) {
     int fd = (int)(long)x; static char b[65536]; long left = bytes;
@@ -55,11 +94,13 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     port = atoi(argv[2]);
     if (!strcmp(argv[1], "sink")) { int s = listen_on(port); for (;;) { if (accept(s, 0, 0) < 0) break; } return 0; }
+    if (!strcmp(argv[1], "drain")) return drain(listen_on(port), atoi(argv[3]), argv[4]);
     if (!strcmp(argv[1], "src")) { bytes = atol(argv[3]); int s = listen_on(port); for (;;) { int c = accept(s, 0, 0); if (c < 0) break; pthread_t t; pthread_create(&t, 0, src_one, (void *)(long)c); pthread_detach(t); } return 0; }
     int n = atoi(argv[3]); if (argc > 4) bytes = atol(argv[4]);
     pthread_t *t = malloc(sizeof(pthread_t) * n);
-    for (int i = 0; i < n; i++) pthread_create(&t[i], 0, !strcmp(argv[1], "up") ? up : !strcmp(argv[1], "mix") ? mix : down, (void *)(long)i);
+    for (int i = 0; i < n; i++) pthread_create(&t[i], 0, !strcmp(argv[1], "up") ? up : !strcmp(argv[1], "mix") ? mix : !strcmp(argv[1], "whole") ? whole : down, (void *)(long)i);
     for (int i = 0; i < n; i++) pthread_join(t[i], 0);
+    if (!strcmp(argv[1], "whole")) { int full = 0, err = 0; for (int i = 0; i < n; i++) { full += outcome[i] == bytes; err += errs[i]; } fprintf(stderr, "%d %d\n", full, err); }
     if (!strcmp(argv[1], "mix")) { int full = 0, err = 0; for (int i = 0; i < n; i++) { full += outcome[i] == bytes; err += errs[i]; } fprintf(stderr, "mix: %d of %d wrote everything, %d saw an error\n", full, n, err); }
     return 0;
 }
