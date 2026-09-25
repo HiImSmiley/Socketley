@@ -133,6 +133,12 @@ struct client_connection
     // and closing would throw away an answer the client is reading.
     bool peer_gone{false};
 
+    // The answer that ends a closing connection has left and its FIN with it,
+    // and what the client is still sending is read and discarded until its own
+    // EOF, so the close does not reset the answer out of its receive queue.
+    bool wr_shutdown{false};
+    size_t drained_bytes{0};
+
     // RESP protocol mode (auto-detected or forced)
     bool resp_mode{false};
     bool resp_detected{false};  // true once first byte examined
@@ -235,6 +241,8 @@ struct client_connection
         crossing_bytes = 0;
         read_paused = false;
         peer_gone = false;
+        wr_shutdown = false;
+        drained_bytes = 0;
         resp_mode = false;
         resp_detected = false;
         is_follower = false;
@@ -940,6 +948,11 @@ private:
     // handshake failed is the peer's only diagnosis and a multishot recv stays
     // armed until the socket moves.
     void tls_close_when_read_is_all(client_connection* conn, int fd);
+    // A closing cleartext connection whose answer has left sends its FIN and
+    // keeps reading, so the close waits for the client's EOF.
+    void drain_before_close(client_connection* conn, int fd);
+    // How much a draining connection may still send before it is closed anyway.
+    static constexpr size_t DRAIN_LIMIT_BYTES = 64 * 1024 * 1024;
 
     // Arm the read that fits the configured mode, false when nothing reached
     // the ring, with read_pending left clear so no one waits on it.

@@ -15,6 +15,7 @@ struct owed
     bool splice_out{false};
     bool connect{false};      // or the poll standing in for one
     bool promised_reply{false};   // one reply per request, back into this loop
+    bool drain{false};            // our FIN is out and the peer's EOF ends the read
 
     // Only the peer or the socket can end this, so it is never owed.
     bool read{false};
@@ -23,7 +24,7 @@ struct owed
 inline constexpr bool ring_will_report(const owed& o)
 {
     return o.write || o.file_read || o.splice_in || o.splice_out ||
-           o.connect || o.promised_reply;
+           o.connect || o.promised_reply || o.drain;
 }
 
 enum class verdict : uint8_t

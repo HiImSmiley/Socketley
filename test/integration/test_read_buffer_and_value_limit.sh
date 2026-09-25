@@ -40,31 +40,15 @@
 # the largest single value inside it is half, which leaves room for the framing
 # around it. The default reproduces both old numbers exactly.
 #
-# ─── ONE THING THIS DOES NOT FIX, MEASURED ──────────────────────────────────
+# ─── THE REFUSAL ARRIVES HOWEVER FAR PAST THE LIMIT ─────────────────────────
 #
-# The refusal is written and the connection closed, and a client still sending
-# when that happens gets an RST -- Linux discards the queued response. So how
-# far past the limit the client is decides whether it reads the reason:
-#
-#      600 KB -> the named refusal
-#      800 KB -> the named refusal
-#     1024 KB -> the named refusal
-#     2048 KB -> the named refusal
-#     4096 KB -> RST, the message is lost
-#
-# Delivered for overshoots up to about two megabytes, which covers a value that
-# has grown past the limit, and lost for one eight times the cap.
-#
-# And that boundary moves with the load. The same 150 kB overshoot that reads the
-# refusal standalone lost it inside the suite, which is what turned this file red
-# once: the server answers and closes while the client is still writing, and
-# under load the close wins the race. So the assertions below take RST as a
-# third outcome and test what the refusal SAYS rather than that it arrives. Closing that
-# needs a drain-before-close in the cache's read path -- the server has
-# maybe_shutdown_write() for this and the cache has nothing -- and that is a
-# change of its own rather than a line here. The knob is the practical answer
-# meanwhile: a deployment that needs 4 MB values raises the bound and never
-# reaches the refusal.
+# The refusal used to be written and the connection closed at once, and a
+# client still sending got an RST that Linux uses to discard the queued answer:
+# read at 600 KB to 2 MB of overshoot, lost at 4 MB, and lost at 150 kB inside
+# the suite once load moved the race.  The cache now sends its FIN behind the
+# answer and reads the rest out of the way until the client's own EOF, the
+# server's maybe_shutdown_write() -- so every case below expects the refusal,
+# and RST is a failure.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -128,6 +112,14 @@ ready_tcp 127.0.0.1 "$P_BIG" >/dev/null 2>&1 || true
 # ─── 1. At the limit, and past it ───────────────────────────────────────────
 check "a value at the limit is stored" "+OK" "$(resp "$P_DEF" 524288)"
 
+# Eight times the limit, which lost the refusal to an RST every time.
+RFAR=$(resp "$P_DEF" 4194304)
+case "$RFAR" in
+    *"larger than this cache accepts"*) ok ;;
+    *) bad "a value eight times the limit still reads the refusal" "got '$RFAR'" \
+           "-- RST is the close resetting the answer out of the client's queue" ;;
+esac
+
 R=$(resp "$P_DEF" 614400)
 case "$R" in
     *"larger than this cache accepts"*) ok ;;
@@ -168,7 +160,6 @@ check "and takes 3 MB"                "+OK" "$(resp "$P_BIG" 3145728)"
 RB=$(resp "$P_BIG" 5242880)
 case "$RB" in
     *4194304*) ok ;;
-    RST) ok ;;   # far enough past that the reply cannot be read; see the header
     *524288*) bad "the large cache names its own limit" \
                   "it named 524288, the old constant, so the refusal is not" \
                   "reading this runtime's bound" ;;
@@ -199,17 +190,9 @@ check "the record moved" "2097152" "$(f rb_big)"
 # the code was right and the arithmetic here was not.
 RL=$(resp "$P_BIG" 1000000)
 check "a value inside the new bound is stored" "+OK" "$RL"
-# RST is accepted here for the reason the header gives, and the suite is what
-# taught it: standalone this overshoot reads the refusal, and inside the suite
-# the same 150 kB of overshoot loses it -- the server answers and closes while
-# the client is still sending, and under load the close wins. So the assertion
-# is "not the OLD number", which is what a build that cached the derived limit
-# would answer, and RST is the documented third outcome rather than a pass
-# dressed up as one.
 RL2=$(resp "$P_BIG" 1200000)
 case "$RL2" in
     *"larger than this cache accepts"*1048576*) ok ;;
-    RST) ok ;;
     *524288*|*4194304*)
         bad "and one past it is refused with the NEW number" \
             "got '$RL2' -- that is a limit from before the edit, so the derived" \

@@ -1478,6 +1478,10 @@ socketley::reach::owed cache_instance::conn_owed(const client_connection* conn) 
     // A crossing answers through the request channel on a later turn, which
     // is what keeps a connection with its read withdrawn reachable.
     o.promised_reply = !conn->batches.empty();
+    // The read a drain holds open ends at the client's EOF, which is what it
+    // exists to wait for; the byte bound ends it otherwise.
+    o.drain = conn->wr_shutdown && conn->read_pending &&
+              conn->drained_bytes <= DRAIN_LIMIT_BYTES;
     return o;
 }
 
@@ -1963,6 +1967,16 @@ void cache_instance::tls_close_when_read_is_all(client_connection* conn, int fd)
     shutdown(fd, SHUT_RDWR);
 }
 
+void cache_instance::drain_before_close(client_connection* conn, int fd)
+{
+    if (!conn->closing || conn->ssl != nullptr || conn->wr_shutdown || fd < 0)
+        return;
+    if (conn->write_pending || conn_has_output(conn) || !conn->read_pending)
+        return;
+    conn->wr_shutdown = true;
+    if (shutdown(fd, SHUT_WR) < 0) {}
+}
+
 bool cache_instance::conn_has_output(const client_connection* conn) const
 {
     if (!conn->write_queue.empty())
@@ -2313,6 +2327,30 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    // Nothing a closing connection sends is parsed, and appending it only grew
+    // `partial` toward the overflow close that reset the answer away.
+    if (SOCKETLEY_UNLIKELY(conn->closing && conn->ssl == nullptr))
+    {
+        if (is_provided)
+            m_loop->return_cqe_buf(cqe, req);
+        conn->drained_bytes += static_cast<size_t>(cqe->res);
+        if (conn->drained_bytes > DRAIN_LIMIT_BYTES)
+        {
+            if (!conn->write_pending)
+                close_client(conn, fd, "drain-limit");
+            return;
+        }
+        if (!conn->read_pending && m_loop &&
+            SOCKETLEY_UNLIKELY(!submit_client_read(conn, fd)))
+        {
+            if (!conn->write_pending)
+                close_client(conn, fd, "read-submit-failed");
+            return;
+        }
+        drain_before_close(conn, fd);
+        return;
+    }
+
     // Only update last_activity when idle timeout is configured (avoids clock_gettime syscall)
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
@@ -2425,6 +2463,12 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
+    // Kept reading, for drain_before_close(); a refused read falls through to
+    // the close below as it always did.
+    if (conn->closing && conn->ssl == nullptr && !conn->read_pending && !conn->read_paused &&
+        m_loop && conn->drained_bytes <= DRAIN_LIMIT_BYTES)
+        submit_client_read(conn, fd);
+
     // Closing with nothing left in flight, because every teardown used to run
     // out of a completion handler and a refused submission makes "the
     // completion never existed" the ordinary case.
@@ -2455,6 +2499,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // Closing with the read as the only thing outstanding, which nothing will
     // complete unless the socket is moved.
     tls_close_when_read_is_all(conn, fd);
+    drain_before_close(conn, fd);
 }
 
 void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
@@ -2598,6 +2643,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
             // The alert this write just carried was the last thing owed; the
             // read is all that is left and no one is going to complete it.
             tls_close_when_read_is_all(conn, fd);
+            drain_before_close(conn, fd);
         }
     }
 }
