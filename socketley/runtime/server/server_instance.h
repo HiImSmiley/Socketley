@@ -1319,7 +1319,9 @@ private:
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 1;
-    static constexpr uint32_t BUF_COUNT = 1024;
+    // A ring turns through every buffer it has, so this is 4 MiB resident once
+    // traffic has cycled it, the cache's footprint.
+    static constexpr uint32_t BUF_COUNT = 256;
     static constexpr uint32_t BUF_SIZE = 16384;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};

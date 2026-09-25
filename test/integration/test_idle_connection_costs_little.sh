@@ -75,6 +75,7 @@ P_PRX=$((SL_PORT_BASE+1896))
 CONNS=2000
 BUDGET_KB=5
 BUDGET_SRV_KB=9
+BUDGET_SRV_SAID_KB=9
 BUDGET_PRX_KB=12
 
 PASS=0; FAIL=0; TOTAL=0
@@ -158,7 +159,8 @@ rm -f "/tmp/idlecost.$$"
 # It carried a SIXTEEN kilobyte read_buf where the cache carried four, and a
 # reserve(8192) beside it: 22.21 KB per connection, measured, against 4.92
 # after.  If the two runtimes ever drift apart, this is the arm that says so.
-create_ok "a server" "$BIN" create server is -p "$P_SRV"
+# --mode in, so the line each connection says below goes nowhere else.
+create_ok "a server" "$BIN" create server is -p "$P_SRV" --mode in
 "$BIN" start is >/dev/null 2>&1 || true
 ready_tcp 127.0.0.1 "$P_SRV" 15 || true
 SWORKER=""
@@ -181,6 +183,10 @@ try:
 except Exception as e:
     print("ERR", e, flush=True); sys.exit(1)
 print("open", len(socks), flush=True)
+time.sleep(5)
+for s in socks:
+    s.sendall(b"x\n")
+print("said", len(socks), flush=True)
 time.sleep(60)
 PYS
     HOLDER=$!
@@ -193,6 +199,18 @@ PYS
     echo "  server RSS $(awk -v x=$SBEFORE 'BEGIN{printf "%.1f", x/1024}') -> $(awk -v x=$SAFTER 'BEGIN{printf "%.1f", x/1024}') MB over $CONNS idle = $SPER KB each"
     SUNDER=$(awk -v p="$SPER" -v b="$BUDGET_SRV_KB" 'BEGIN{print (p > 0 && p < b) ? "yes" : "no"}')
     check "each idle server connection costs under ${BUDGET_SRV_KB} KB" "yes" "$SUNDER"
+
+    # A connection that has said one line has drawn a buffer from the receive
+    # ring, and a ring turns through every buffer it has, so what this charges
+    # is the ring's footprint spread over the connections: 1024 x 16 KiB came
+    # to 12.6 KB each here, 256 of them to 6.5.
+    for i in $(seq 1 100); do grep -q "^said $CONNS" "/tmp/idlecost.$$" 2>/dev/null && break; sleep 0.1; done
+    sleep 2
+    SSAID=$(rss_kb "$SWORKER")
+    SAIDPER=$(awk -v a="$SBEFORE" -v b="$SSAID" -v n="$CONNS" 'BEGIN{printf "%.2f", (b-a)/n}')
+    echo "  server RSS -> $(awk -v x=$SSAID 'BEGIN{printf "%.1f", x/1024}') MB once each has said a line = $SAIDPER KB each"
+    SAIDUNDER=$(awk -v p="$SAIDPER" -v b="$BUDGET_SRV_SAID_KB" 'BEGIN{print (p > 0 && p < b) ? "yes" : "no"}')
+    check "each server connection that has said a line costs under ${BUDGET_SRV_SAID_KB} KB" "yes" "$SAIDUNDER"
     { kill -9 "$HOLDER" 2>/dev/null; wait "$HOLDER"; } 2>/dev/null || true
     HOLDER=""
     rm -f "/tmp/idlecost.$$"
