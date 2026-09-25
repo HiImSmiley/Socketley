@@ -130,6 +130,14 @@ CACHE_PIPE_MIN_OPS=${CACHE_PIPE_MIN_OPS:-200000}
 # The cap is memory, not time: the store holds everything a run writes into it,
 # and 2M list entries is about 130 MB.
 CACHE_PIPE_MAX_OPS=${CACHE_PIPE_MAX_OPS:-4000000}
+
+# The write bound of the caches the pipelined rows run against.  nc writes the
+# whole command file and reads the replies at its own pace, so at the op counts
+# above the cache owed it more than the default 8 MiB and closed it as a client
+# that stopped reading -- which is the product's rule and not the benchmark's
+# question: LPOP at 4,000,000 ops collected 1,362,437 replies and read as 0 in
+# every suite run from 2026-09-04 on.  With this, all 4,000,000 in 223 ms.
+CACHE_PIPE_WRITE_BUFFER=${CACHE_PIPE_WRITE_BUFFER:-256M}
 CACHE_PIPE_RUNS=${CACHE_PIPE_RUNS:-5}
 # The harness's share of a window, above which the figure is refused.  This is
 # the one hard gate, and it is about the instrument rather than about noise: a
@@ -742,7 +750,7 @@ test_large_values() {
 
     ensure_clean
     wait_for_port_free $CACHE_PORT
-    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --write-buffer "$CACHE_PIPE_WRITE_BUFFER" -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
@@ -790,7 +798,7 @@ test_list_throughput() {
 
     ensure_clean
     wait_for_port_free $CACHE_PORT
-    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --write-buffer "$CACHE_PIPE_WRITE_BUFFER" -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
@@ -818,7 +826,7 @@ test_set_ds_throughput() {
 
     ensure_clean
     wait_for_port_free $CACHE_PORT
-    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --write-buffer "$CACHE_PIPE_WRITE_BUFFER" -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
@@ -847,7 +855,7 @@ test_hash_throughput() {
 
     ensure_clean
     wait_for_port_free $CACHE_PORT
-    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --write-buffer "$CACHE_PIPE_WRITE_BUFFER" -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
@@ -871,7 +879,7 @@ test_ttl_throughput() {
 
     ensure_clean
     wait_for_port_free $CACHE_PORT
-    socketley_cmd create cache bench_cache -p $CACHE_PORT -s
+    socketley_cmd create cache bench_cache -p $CACHE_PORT --write-buffer "$CACHE_PIPE_WRITE_BUFFER" -s
     wait_for_port $CACHE_PORT || { log_error "Cache failed to start"; ensure_clean; return 1; }
     sleep 0.5
 
