@@ -279,12 +279,87 @@ check_leaked_daemons() {
     return 0
 }
 
+# ─── Side by side, then alone ───────────────────────────────────────────────
+# Most files bring their own daemon, HOME and port window, and spend their
+# time waiting on timeouts with fifteen cores idle -- run one after another the
+# pair of suites took three hours.  So those run as many at a time as there are
+# free port windows, the slowest first, and each claims a window of its own
+# rather than inheriting this run's; a file that shares the suite's daemon, or
+# says `# suite: quiet` because it measures time, CPU or the machine's memory,
+# runs alone afterwards exactly as before.  Every file's output is printed in
+# glob order once the parallel pass is over, and counted the same way.
+. "$SCRIPT_DIR/lib_suite.sh"
+PAR_LIST=$(mktemp); SERIAL_LIST=$(mktemp); RESDIR=$(mktemp -d)
 for script in "$SCRIPT_DIR"/integration/test_*.sh; do
     [ -f "$script" ] || continue
-    name=$(basename "$script" .sh)
-    run_test "$name" bash "$script"
-    check_leaked_daemons "$name"
+    if suite_wants_serial "$script"; then echo "$script" >> "$SERIAL_LIST"
+    else echo "$script" >> "$PAR_LIST"; fi
 done
+PAR="${SUITE_PAR:-$(suite_free_windows)}"
+[ "$PAR" -gt "$(nproc)" ] && PAR=$(nproc)
+# Marks every process of this run, so a daemon a parallel file leaked can be
+# found without the window it claimed.
+export SOCKETLEY_SUITE_RUN="$SUITE_HOME"
+
+run_one_parallel() {   # file -> its log, exit code and seconds in RESDIR
+    local f=$1 name t0 rc tries=0
+    name=$(basename "$f")
+    t0=$(date +%s)
+    while :; do
+        ( unset SL_PORT_BASE; timeout 900 bash "$f" ) >"$RESDIR/$name.log" 2>&1
+        rc=$?
+        # A window taken by a file that is still tearing down is a wait, not a
+        # failure -- counted as one, it emptied the whole list in seconds.
+        if [ "$rc" = 2 ] && grep -q 'no free 2000-port window' "$RESDIR/$name.log" &&
+           [ "$tries" -lt 300 ]; then
+            tries=$((tries + 1)); sleep 1; continue
+        fi
+        break
+    done
+    echo "$rc" > "$RESDIR/$name.rc"
+    echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.secs"
+}
+export -f run_one_parallel
+export RESDIR
+
+if [ "$PAR" -gt 1 ]; then
+    echo "  ($(wc -l < "$PAR_LIST") files $PAR at a time, $(wc -l < "$SERIAL_LIST") alone after them)"
+    echo ""
+    suite_longest_first "$PAR_LIST" | xargs -d '\n' -n1 -P"$PAR" bash -c 'run_one_parallel "$1"' _
+    # A file red beside others and green alone is load, not this tree -- but it
+    # is named at the end, because a race that load exposes is still a race.
+    ALONE_ONLY=""
+    while IFS= read -r script; do
+        name=$(basename "$script")
+        cat "$RESDIR/$name.log" 2>/dev/null
+        if [ "$(cat "$RESDIR/$name.rc" 2>/dev/null)" = 0 ]; then PASS=$((PASS+1)); echo ""; continue; fi
+        echo "  -- red beside $PAR others; run again alone:"
+        if bash "$script" 2>&1; then PASS=$((PASS+1)); ALONE_ONLY="$ALONE_ONLY $name"
+        else FAIL=$((FAIL+1)); fi
+        echo ""
+    done < "$PAR_LIST"
+    # What a parallel file left running, found by this run's mark.
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "/proc/$p/exe" -ef "$SYS_BIN" ] || continue
+        { tr '\0' '\n' <"/proc/$p/environ"; } 2>/dev/null \
+            | grep -x "SOCKETLEY_SUITE_RUN=$SUITE_HOME" >/dev/null || continue
+        echo "WARNING: a parallel file left pid $p running; killed"
+        kill -9 "$p" 2>/dev/null || true
+    done
+else
+    cat "$PAR_LIST" >> "$SERIAL_LIST"
+fi
+
+while IFS= read -r script; do
+    name=$(basename "$script" .sh)
+    t0=$(date +%s)
+    run_test "$name" bash "$script"
+    echo $(( $(date +%s) - t0 )) > "$RESDIR/$name.sh.secs"
+    check_leaked_daemons "$name"
+done < <(sort "$SERIAL_LIST")
+suite_save_durations "$RESDIR"
+rm -rf "$PAR_LIST" "$SERIAL_LIST" "$RESDIR"
 
 if [ -n "$LEAKED_FILES" ]; then
     echo "─── files that left a daemon running ──────────────────────────────"
@@ -305,6 +380,14 @@ if [ -e "$SOCKETLEY_SOCKET" ]; then
     echo "         Every file here is supposed to isolate before its first CLI"
     echo "         command; one of them did not, and shared a daemon with"
     echo "         whichever files ran around it."
+    echo ""
+fi
+
+if [ -n "${ALONE_ONLY:-}" ]; then
+    echo "─── green only when run alone ─────────────────────────────────────"
+    for f in $ALONE_ONLY; do echo "    $f"; done
+    echo "    Each failed beside the parallel pass and passed on its own.  Counted"
+    echo "    as passed; read each one's first log above before calling it load."
     echo ""
 fi
 

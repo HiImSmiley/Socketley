@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- how much of a UDP burst a reading server takes is how much
+# CPU it gets; beside nine other files it took 4,507 of 20,000.
 # Integration test: how far ahead of a UDP server a burst may get.
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────

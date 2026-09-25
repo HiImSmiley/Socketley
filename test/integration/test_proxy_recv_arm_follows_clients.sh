@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: quiet -- over a thousand connections and a rate compared across arms.
 # Integration test: which recv arm a proxy uses, and what the choice is worth
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────

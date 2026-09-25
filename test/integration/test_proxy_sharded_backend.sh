@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- a health check with a threshold of one takes a shard out on
+# the first probe that load makes slow.
 # Integration test: what a proxy owes a sharded backend, beyond reaching it.
 #
 # ─── WHAT THIS EXISTS TO CATCH ─────────────────────────────────────────────

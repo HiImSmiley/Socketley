@@ -19,16 +19,12 @@
 # half rather than half an hour.  That is the whole point: the full suite stays
 # what you run before a merge, and this is what you run while you work.
 #
-# ─── WHY -P6 AND NOT MORE ───────────────────────────────────────────────────
+# ─── HOW MANY AT ONCE ───────────────────────────────────────────────────────
 #
-# Measured, not chosen.  Above six, lib_ports.sh runs out:
-#
-#     -P12   78s   8 files died with "FATAL: no free 2000-port window"
-#
-# and it bought nothing anyway -- 78s against 80s.  Six 2000-port windows are
-# what fits below ip_local_port_range, and the windows cannot simply be made
-# narrower: the tests really do use them, with the largest offset per file
-# running to 1932 and a median of 706.
+# As many as lib_ports.sh has free windows, counted at the start, because a job
+# past that fails in a second and xargs hands its slot the next file, which
+# fails the same way: at -P12 with ten free windows 279 of 280 files died with
+# "no free 2000-port window".  A file that still meets one waits for it.
 #
 # ─── MEMBERSHIP IS DERIVED, NEVER LISTED ────────────────────────────────────
 #
@@ -86,7 +82,8 @@ INT="$SCRIPT_DIR/integration"
 SOCKETLEY_CONFIG="${SOCKETLEY_CONFIG:-Release}"
 BIN_DIR="${SOCKETLEY_BIN_DIR:-$ROOT/bin/$SOCKETLEY_CONFIG}"
 BIN="${BIN:-$BIN_DIR/socketley}"
-PAR="${SUITE_PAR:-6}"
+. "$SCRIPT_DIR/lib_suite.sh"
+PAR="${SUITE_PAR:-$(suite_free_windows)}"
 LIST_ONLY=""
 
 while getopts ":P:lh" opt; do
@@ -146,12 +143,7 @@ classify() {   # classify <file> -> prints the groups it belongs to, one per lin
     printf '%s\n' $hit | sort -u
 }
 
-wants_quiet() {   # a file that measures time or CPU, or that shares the daemon
-    local f="$1"
-    grep -q '^# suite: quiet' "$f" && return 0
-    grep -q 'daemon_isolate' "$f" || return 0
-    return 1
-}
+wants_quiet() { suite_wants_serial "$1"; }
 
 # ─── Selection ──────────────────────────────────────────────────────────────
 
@@ -206,9 +198,18 @@ LOGDIR="$(mktemp -d)"
 export LOGDIR BIN SOCKETLEY_CONFIG
 one() {
     local f="$1" name; name="$(basename "$f")"
-    ( unset SL_PORT_BASE
-      BIN="$BIN" timeout 600 bash "$f" >"$LOGDIR/${name}.log" 2>&1 )
-    local rc=$?
+    local rc tries=0
+    while :; do
+        ( unset SL_PORT_BASE
+          BIN="$BIN" timeout 600 bash "$f" >"$LOGDIR/${name}.log" 2>&1 )
+        rc=$?
+        # A window still held by a file tearing down is a wait, not a failure.
+        if [ "$rc" = 2 ] && grep -q 'no free 2000-port window' "$LOGDIR/${name}.log" &&
+           [ "$tries" -lt 300 ]; then
+            tries=$((tries + 1)); sleep 1; continue
+        fi
+        break
+    done
     if [ $rc -eq 0 ]; then printf '  ok    %s\n' "$name"
     else printf '  FAIL  %s  (exit %d, log: %s)\n' "$name" "$rc" "$LOGDIR/${name}.log"; fi
     return $rc

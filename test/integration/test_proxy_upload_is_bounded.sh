@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- 1,100 uploads push the machine past tcp_mem, which every
+# other test running beside it would feel.
 # Integration test: what a proxy holds when its clients upload faster than the
 # backend takes it
 #

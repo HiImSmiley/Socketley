@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: quiet -- puts the whole machine under TCP memory pressure on purpose.
 # Integration test: a TCP proxy's send to its backend waits out TCP memory
 # pressure instead of dropping the pair
 #

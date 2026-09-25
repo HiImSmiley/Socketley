@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# suite: quiet -- compares two arms' RSS under an upload that load beside it
+# would reshape.
 # Integration test: a TCP relay arms multishot only for connections that
 # exchange messages, and a stream keeps what single-shot holds
 #
