@@ -970,9 +970,10 @@ private:
     size_t m_rr_index = 0;
     std::mt19937 m_rng{std::random_device{}()};
 
-    // Provided buffer ring — 64KB buffers for high throughput
+    // Provided buffer ring, 4 MiB like the cache's and the server's, because a
+    // ring turns through every buffer and is resident in full once it has.
     static constexpr uint16_t BUF_GROUP_ID = 2;
-    static constexpr uint32_t BUF_COUNT = 512;
+    static constexpr uint32_t BUF_COUNT = 64;
     // Decoupled from PROXY_READ_BUF_SIZE deliberately, because that also sizes
     // a per-connection buffer and tying the ring to it makes any buffer-size
     // experiment two experiments at once.
@@ -1032,9 +1033,10 @@ private:
     // number for that day: this one is worth re-taking after anything that
     // touches on_loop_turn or the read path.
     //
-    // NOT the buffer ring.  BUF_COUNT is 512 and the crossover sits just above
-    // it, which looks like a mechanism and is not: at 768 connections multishot
-    // leads by 11.96%, 15.01% and 15.89% with the ring at 256, 512 and 1024, and
+    // NOT the buffer ring.  BUF_COUNT was 512 when this was measured and the
+    // crossover sat just above it, which looked like a mechanism and was not:
+    // at 768 connections multishot leads by 11.96%, 15.01% and 15.89% with
+    // the ring at 256, 512 and 1024, and
     // at 384 connections single-shot still leads with a ring of 256.  The
     // crossover does not track the ring, so this stays a measured number rather
     // than a derived one.
