@@ -1,6 +1,7 @@
 // Load shapes for measuring what a proxy holds, driven by a test that samples
 // the worker's RSS while this runs; every client write gives up after 10 s.
-// lib_hold_load up   <port> <conns> <bytes> : each conn sends <bytes> as fast as it can, never reads, holds 4 s
+// lib_hold_load up   <port> <conns> <bytes> : each conn sends <bytes> as fast as it can, never reads, holds 4 s;
+//                                             prints the connections opened and the bytes sent
 // lib_hold_load mix  <port> <conns> <bytes> : twenty 64-byte writes 5 ms apart first, then the same
 // lib_hold_load down <port> <conns>         : each conn connects and never reads, holds 4 s
 // lib_hold_load sink <port>                 : accept and never read (backend for `up`)
@@ -27,13 +28,15 @@ static int dial(void) {
     struct timeval tv = {10, 0}; setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     return fd;
 }
+static long outcome[4096]; static int errs[4096], opened[4096];
 static void *up(void *x) {
-    (void)x; int fd = dial(); if (fd < 0) return 0;
+    long idx = (long)x; int fd = dial(); if (fd < 0) return 0;
+    opened[idx] = 1;
     static char b[65536]; long left = bytes;
     while (left > 0) { ssize_t w = write(fd, b, left < (long)sizeof b ? left : (long)sizeof b); if (w <= 0) break; left -= w; }
+    outcome[idx] = bytes - left;
     sleep(4); close(fd); return 0;
 }
-static long outcome[4096]; static int errs[4096];
 static void *mix(void *x) {
     long idx = (long)x; int fd = dial(); if (fd < 0) return 0;
     char small[64] = {0};
@@ -100,6 +103,7 @@ int main(int argc, char **argv) {
     pthread_t *t = malloc(sizeof(pthread_t) * n);
     for (int i = 0; i < n; i++) pthread_create(&t[i], 0, !strcmp(argv[1], "up") ? up : !strcmp(argv[1], "mix") ? mix : !strcmp(argv[1], "whole") ? whole : down, (void *)(long)i);
     for (int i = 0; i < n; i++) pthread_join(t[i], 0);
+    if (!strcmp(argv[1], "up")) { int o = 0; long sent = 0; for (int i = 0; i < n; i++) { o += opened[i]; sent += outcome[i]; } printf("%d\n%ld\n", o, sent); }
     if (!strcmp(argv[1], "whole")) { int full = 0, err = 0; for (int i = 0; i < n; i++) { full += outcome[i] == bytes; err += errs[i]; } fprintf(stderr, "%d %d\n", full, err); }
     if (!strcmp(argv[1], "mix")) { int full = 0, err = 0; for (int i = 0; i < n; i++) { full += outcome[i] == bytes; err += errs[i]; } fprintf(stderr, "mix: %d of %d wrote everything, %d saw an error\n", full, n, err); }
     return 0;

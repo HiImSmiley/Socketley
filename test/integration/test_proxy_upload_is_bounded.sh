@@ -19,9 +19,10 @@
 #
 #   * the armed client reads not being taken back, which above
 #     MULTISHOT_MIN_CLIENTS is the only thing that bounds the upload -- the rule
-#     arms multishot on purpose at that count, so backpressure declines nothing
-#   * a pinned arm that is not pinned, so the ratio is not one configuration
-#     compared with itself
+#     arms multishot on purpose at that count, so the rule is held to what a
+#     single-shot arm holds, which declines at the bottom of every read
+#   * a reference arm that is not single-shot, so the comparison is not one
+#     configuration with itself
 #   * more clients than the threshold, or the row is about the other arm
 #   * and the one thing a megabyte figure cannot see: that withdrawing a read
 #     mid-body does not LOSE any of it.  A cancelled multishot recv can have data
@@ -61,14 +62,13 @@ elif nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null 2>&1; then SANITIZED="
 echo "=== Integration: an upload through a proxy is bounded by its backend ==="
 
 MANY=1100              # above MULTISHOT_MIN_CLIENTS, or the rule arms single-shot
-PER=1048576            # and what each of them sends, so the pinned arm is bounded
-                       # by 1100 MiB rather than by how long the row runs
+PER=1048576            # and what each of them sends, so the row is bounded by
+                       # 1100 MiB rather than by how long it runs
 FEW=8                  # the integrity row: few enough to check every byte
 FEW_BYTES=4194304
-RATIO_MAX=60           # per cent: the rule must hold under 60% of the pinned arm.
-                       # Measured 390 MB against 5,350 -- 7% -- with a C client;
-                       # a Python one pushes far less, so this is the margin and
-                       # not the finding.
+# The reference is single-shot, which declines at the bottom of every read, and
+# not multishot pinned on: since decline_armed_read() a pinned arm is bounded
+# too, and the old ratio against it read 55-68% across a 60% line on one binary.
 BPORT=$((SL_PORT_BASE + 1752))
 PPORT=$((SL_PORT_BASE + 1751))
 
@@ -126,47 +126,11 @@ with open(sys.argv[3], "w") as f:
         f.write("%d\n" % v)
 PY
 
-# N connections that each push PER bytes and then sit there.  Non-blocking, so a
-# connection the proxy has stopped reading does not stall the others.
-cat >"$WORK/up.py" <<'PY'
-import socket, sys, selectors, time
-port, n, per, hold = (int(sys.argv[1]), int(sys.argv[2]),
-                      int(sys.argv[3]), float(sys.argv[4]))
-chunk = b"u" * 65536
-sel = selectors.DefaultSelector()
-socks, left = [], {}
-for i in range(n):
-    try:
-        s = socket.create_connection(("127.0.0.1", port), 10)
-    except OSError:
-        continue
-    s.setblocking(False)
-    socks.append(s); left[s.fileno()] = per
-    sel.register(s, selectors.EVENT_WRITE, s)
-print(len(socks), flush=True)
-end = time.time() + hold
-while time.time() < end and sel.get_map():
-    for key, _ in sel.select(timeout=0.5):
-        fd = key.fileobj.fileno()
-        want = min(len(chunk), left[fd])
-        if want <= 0:
-            sel.unregister(key.fileobj); continue
-        try:
-            w = key.fileobj.send(chunk[:want])
-        except OSError:
-            try: sel.unregister(key.fileobj)
-            except (KeyError, ValueError): pass
-            continue
-        left[fd] -= w
-        if left[fd] <= 0:
-            try: sel.unregister(key.fileobj)
-            except (KeyError, ValueError): pass
-print(sum(per - v for v in left.values()), flush=True)
-time.sleep(1)
-for s in socks:
-    try: s.close()
-    except OSError: pass
-PY
+# N connections that each push PER bytes and then sit there, in C because a
+# Python uploader pushes too little to fill what the proxy would hold.
+if ! gcc -O2 -pthread -o "$WORK/load" "$HERE/lib_hold_load.c" 2>"$WORK/cc.log"; then
+    echo "  SKIP: no C compiler"; cat "$WORK/cc.log"; echo "  Results: 0/0 passed (0 failed)"; exit 0
+fi
 
 start_backend(){   # quiet_seconds counts_file
     python3 "$WORK/sink.py" "$BPORT" "$1" "$2" >"$WORK/be.log" 2>&1 &
@@ -200,7 +164,7 @@ run_arm(){   # tag clients per hold   (the pin is the caller's)
               awk -F= '/^SOCKETLEY_RECV_MULTISHOT=/{print $2}')
     ARM_CARRIED="${carried:-absent}"
     base=$(awk '/^VmRSS/{print $2}' "/proc/$WORKER/status" 2>/dev/null || echo 0)
-    python3 "$WORK/up.py" "$PPORT" "$clients" "$per" "$hold" >"$WORK/up.$tag" 2>&1 &
+    "$WORK/load" up "$PPORT" "$clients" "$per" >"$WORK/up.$tag" 2>/dev/null &
     up=$!
     local peak=$base
     for i in $(seq 1 $(( (${hold%.*} + 8) * 10 )) ); do
@@ -228,45 +192,41 @@ for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sle
 if [ "$CARRIED_RULE" = absent ]; then pass
 else fail "the unpinned arm carries no pin" \
           "the worker for the rule arm carries MULTISHOT='$CARRIED_RULE'" \
-          "-- the ratio below would compare one pinned arm with another"; fi
+          "-- the comparison below would be one pinned arm with another"; fi
 
-# ── 2. the same storm with the arm pinned on ────────────────────────────────
-start_backend 30 "$WORK/counts.pin"
-export SOCKETLEY_RECV_MULTISHOT=1
-run_arm pinned "$MANY" "$PER" 12
-HELD_PIN=$HELD; OPENED_PIN=$ARM_OPENED; CARRIED_PIN=$ARM_CARRIED
-echo "  arm pinned on: $OPENED_PIN uploading clients, worker held ${HELD_PIN} MB (MULTISHOT=$CARRIED_PIN)"
+# ── 2. the same storm on a single-shot arm ──────────────────────────────────
+start_backend 30 "$WORK/counts.single"
+export SOCKETLEY_RECV_MULTISHOT=0
+run_arm single "$MANY" "$PER" 12
+HELD_SINGLE=$HELD; OPENED_SINGLE=$ARM_OPENED; CARRIED_SINGLE=$ARM_CARRIED
+echo "  single-shot:   $OPENED_SINGLE uploading clients, worker held ${HELD_SINGLE} MB (MULTISHOT=$CARRIED_SINGLE)"
 daemon_stop; stop_backend
 unset SOCKETLEY_RECV_MULTISHOT
 for i in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PPORT " || break; sleep 0.1; done
 
-if [ "$CARRIED_PIN" = 1 ]; then pass
-else fail "the pinned arm carries the pin" \
-          "the worker for the pinned arm carries MULTISHOT='$CARRIED_PIN', not 1"; fi
+if [ "$CARRIED_SINGLE" = 0 ]; then pass
+else fail "the single-shot arm carries the pin" \
+          "the worker for the single-shot arm carries MULTISHOT='$CARRIED_SINGLE', not 0"; fi
 
-if [ "${OPENED_RULE:-0}" -gt 768 ] && [ "${OPENED_PIN:-0}" -gt 768 ]; then pass
+if [ "${OPENED_RULE:-0}" -gt 768 ] && [ "${OPENED_SINGLE:-0}" -gt 768 ]; then pass
 else fail "both storms are above the threshold" \
-          "opened $OPENED_RULE and $OPENED_PIN, and the threshold is 768" \
+          "opened $OPENED_RULE and $OPENED_SINGLE, and the threshold is 768" \
           "-- below it the rule arms single-shot and the row is about nothing"; fi
 
-# ── 3. the ratio ────────────────────────────────────────────────────────────
+# ── 3. the rule holds what single-shot holds ────────────────────────────────
 if [ -n "$SANITIZED" ]; then
     not_asserted "the rule bounds what an upload can make the proxy hold" \
-        "held ${HELD_RULE} MB against ${HELD_PIN} MB; RSS under $SANITIZED measures the allocator's quarantine"
-elif [ "${HELD_PIN:-0}" -le 0 ]; then
+        "held ${HELD_RULE} MB against ${HELD_SINGLE} MB; RSS under $SANITIZED measures the allocator's quarantine"
+elif [ "${HELD_SINGLE:-0}" -le 0 ]; then
     fail "the rule bounds what an upload can make the proxy hold" \
-         "the pinned arm held ${HELD_PIN} MB, so there is no ratio to take" \
+         "the single-shot arm held ${HELD_SINGLE} MB, so there is nothing to compare with" \
          "-- the clients did not make the proxy hold anything, so the storm or the" \
          "   backend is wrong rather than the proxy"
-else
-    echo "  ratio: rule/pinned = $(( HELD_RULE * 100 / HELD_PIN ))%, must be under ${RATIO_MAX}%"
-    if [ $(( HELD_RULE * 100 )) -lt $(( HELD_PIN * RATIO_MAX )) ]; then pass
-    else fail "the rule bounds what an upload can make the proxy hold" \
-              "the rule held ${HELD_RULE} MB against the pinned arm's ${HELD_PIN} MB," \
-              "which is $(( HELD_RULE * 100 / HELD_PIN ))% where it must be under ${RATIO_MAX}%" \
-              "-- above MULTISHOT_MIN_CLIENTS the read is armed multishot on purpose," \
-              "   so withdraw_armed_client_reads() is the only thing bounding this"; fi
-fi
+elif [ "$HELD_RULE" -le $(( HELD_SINGLE * 3 / 2 )) ]; then pass
+else fail "the rule bounds what an upload can make the proxy hold" \
+          "the rule held ${HELD_RULE} MB against single-shot's ${HELD_SINGLE} MB" \
+          "-- above MULTISHOT_MIN_CLIENTS the read is armed multishot on purpose," \
+          "   so taking armed reads back is the only thing bounding this"; fi
 
 # ── 4. and not one byte of it is lost on the way ────────────────────────────
 # The withdrawal cancels a read that may already have data completions queued
