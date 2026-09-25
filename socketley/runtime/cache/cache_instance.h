@@ -1256,13 +1256,10 @@ private:
 
     // Provided buffer ring
     static constexpr uint16_t BUF_GROUP_ID = 3;
-    // 4096 is kept under protest rather than confirmed: measured across buffer
-    // size, bundling and allocator, 1 KB is a real penalty, bundling's
-    // clearest win is 2 KB, and bundle-on rises monotonically to 16 KB -- but
-    // each step is inside a 14% self-noise band, and the allocator did not
-    // matter.
-    static constexpr uint32_t BUF_COUNT = 512;
-    static constexpr uint32_t BUF_SIZE = 4096;
+    // What a ring costs is its footprint against the core's cache, not its
+    // buffer size, so it holds 4 MiB in large buffers.
+    static constexpr uint32_t BUF_COUNT = 64;
+    static constexpr uint32_t BUF_SIZE = 65536;
     bool m_use_provided_bufs{false};
     bool m_recv_multishot{false};
     // Bundled multishot recv, one completion per burst instead of one per

@@ -4438,24 +4438,24 @@ So what is left for an operator is the value size itself. In one run at sixteen
 clients: 64 bytes costs 4.4 us of CPU per operation, 4 KiB costs 4.8, 64 KiB
 costs 11.4 and 256 KiB costs 40.8. No setting closes that gap.
 .IP
-.B The receive ring's buffers are 4 KiB and larger is worse.
-They are 64 KiB on a proxy and 16 KiB on a server, and the temptation is to
-raise them here so a large value arrives in fewer pieces. Measured on one binary
-with only
-.B SOCKETLEY_CACHE_BUF_SIZE
-differing, 4 KiB against 64 KiB:
+.B The receive ring is sixty\(hyfour buffers of 64 KiB, and its footprint is what counts.
+A provided\(hybuffer ring is touched in rotation, so what it costs is count times
+size against the core's cache rather than the size of one buffer. The ring was
+512 buffers of 4 KiB, and raising only the size \(em to a 32 MiB ring \(em cost
+4.5% at 64 byte values and 24.5% at 256 KiB. Holding the footprint near the
+core's cache instead, measured on one binary with only the two variables
+differing, seven interleaved passes, 4 KiB x 512 against 64 KiB x 64:
 .IP
 .nf
-  64 B values     \(mi4.5%
-  64 KiB values  \(mi14.5%
-  256 KiB values \(mi24.5%,  40.8 \(-> 57.0 us of CPU per operation
+  SET, 16 deep, 1 KiB values, 50 clients     +22.4%
+  SET, 16 deep, 1 KiB values, 1000 clients   +24.5%
+  SET, 16 deep, 4 KiB values                  +9.8%
+  small values, 64 KiB and 256 KiB values     within 1.5%
 .fi
 .IP
-SET carries all of it and GET is unchanged, and resident size doubles. A
-provided\(hybuffer ring is charged for the size of a buffer and not for the bytes
-put in it, so a protocol whose commands are usually small wants small buffers,
-and the sixty\(hyfour of them a large value consumes are cheaper than four that
-are mostly empty. The knob exists to be measured, and it has been.
+The same size in 128 buffers, an 8 MiB ring, lost 12% at 256 KiB values, and
+32 of them ran dry under 1000 pipelining clients. The knob exists to be
+measured, and it has been.
 .PP
 .B A read of a key held as another type answers \-WRONGTYPE over RESP.
 .B get
@@ -9215,16 +9215,14 @@ flag typed for this one run is a requirement rather than an inherited default.
 .B SOCKETLEY_CACHE_BUF_SIZE
 Size in bytes of each buffer in a cache runtime's io_uring provided-buffer ring.
 Default
-.BR 4096 .
-Larger buffers let one read completion carry more commands, but a read that
-returns less than a full buffer still consumes the whole one, so the waste per
-partial read grows with the size. Measured on the dev VM, raising this to 16384
-cost 31% at 1 KB values and 8% at 4 KB values \(em the default is where it belongs
-unless a specific workload shows otherwise.
+.BR 65536 .
+Larger buffers let one read completion carry more commands, and what the ring
+costs is its footprint, count times size, against the core's cache \(em see
+the section on the receive ring for what was measured.
 .TP
 .B SOCKETLEY_CACHE_BUF_COUNT
 Number of buffers in that ring. Default
-.BR 512 .
+.BR 64 .
 Together with the size this bounds how much concurrent traffic the runtime can
 absorb before the pool runs dry and reads fall back to a slower per-read path;
 the pool costs count times size of memory per cache runtime.
