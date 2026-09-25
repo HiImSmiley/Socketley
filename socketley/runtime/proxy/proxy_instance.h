@@ -82,6 +82,9 @@ struct resolved_backend
 // 64 KB read buffer, because the bottleneck is the number of read syscalls and
 // a larger buffer amortises each one over more data.
 static constexpr size_t PROXY_READ_BUF_SIZE = 65536;
+// How much of a request a retry can resend: past it the body has gone to one
+// backend and cannot be sent again whole.
+static constexpr size_t RETRY_KEEP_BYTES = 64 * 1024;
 
 // How long a client may take to finish a header block once it has started one,
 // deliberately not a flag and not tied to --idle-timeout, whose default of 0

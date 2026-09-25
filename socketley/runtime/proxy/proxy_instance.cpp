@@ -3719,12 +3719,16 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         if (n > 0)
         {
             forward_to_backend(conn, std::string_view(conn->partial.data(), n));
+            // A retry resends saved_request, so a small body goes onto it as it
+            // is forwarded and only a larger one gives the retry up.
+            if (conn->retries_remaining > 0 && !conn->saved_request.empty() &&
+                conn->saved_request.size() + n <= RETRY_KEEP_BYTES)
+                conn->saved_request.append(conn->partial.data(), n);
+            else
+                conn->retries_remaining = 0;
             if (!chunked)
                 conn->body_remaining -= n;
             conn->partial.erase(0, n);
-            // saved_request holds the head and the first read's body only, so
-            // a retry from here would send a second backend a truncated body.
-            conn->retries_remaining = 0;
         }
         // Whatever is still buffered is the next request, which waits for this
         // one's response and is then parsed from the top.
