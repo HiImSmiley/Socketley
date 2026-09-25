@@ -42,7 +42,7 @@ fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "
 echo "=== Integration: a TCP relay's multishot arm is earned by exchanges ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 SANITIZED=""
-nm -C "$BIN" 2>/dev/null | grep -q '__asan_' && SANITIZED=1
+nm -C "$BIN" 2>/dev/null | grep '__asan_' >/dev/null && SANITIZED=1
 
 P=$((SL_PORT_BASE + 113)); BP=$((P + 1))
 
