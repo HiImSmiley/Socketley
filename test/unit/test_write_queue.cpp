@@ -282,3 +282,67 @@ TEST_CASE("a payload one byte under the limit still leaves room for its newline"
     CHECK(q.size() == 2);               // payload + newline would be one over
     CHECK(drain(q) == "s" + std::string(room, 'p') + "\n");
 }
+
+// ─── push_slice ─────────────────────────────────────────────────────────────
+// A broadcast is written once into a segment and every recipient's queue holds
+// a slice of it; the claim these check is that a recipient behind a busy
+// channel holds ONE entry per run of broadcasts and no copy of any of them.
+
+TEST_CASE("a slice that follows the tail grows it instead of queueing")
+{
+    queue_t q;
+    auto seg = std::make_shared<std::string>();
+    seg->reserve(1024);
+    seg->append("aaaa"); seg->append("bbbbbb"); seg->append("cc");
+    std::shared_ptr<const std::string> s = seg;
+
+    q.push_slice(s, 0, 4);
+    const char* at = q.back().data();
+    q.push_slice(s, 4, 6);
+    q.push_slice(s, 10, 2);
+    CHECK(q.size() == 1);
+    CHECK(q.back().data() == at);                   // the segment's own bytes, not a copy
+    CHECK(q.bytes() == 12 + socketley::write_queue_entry_overhead);
+    CHECK(drain(q) == "aaaabbbbbbcc");
+}
+
+TEST_CASE("a slice that does not follow, or is of another segment, is its own entry")
+{
+    queue_t q;
+    auto a = std::make_shared<std::string>("0123456789");
+    auto b = std::make_shared<std::string>("abcdefghij");
+    std::shared_ptr<const std::string> sa = a, sb = b;
+
+    q.push_slice(sa, 0, 3);
+    q.push_slice(sa, 5, 2);                        // a gap: bytes 3..4 belong to nobody here
+    q.push_slice(sb, 7, 3);                        // the right offset, the wrong segment
+    CHECK(q.size() == 3);
+    CHECK(drain(q) == "012" "56" "hij");
+}
+
+TEST_CASE("slices interleave with a connection's own bytes in the order pushed")
+{
+    queue_t q;
+    auto seg = std::make_shared<std::string>("BCAST1BCAST2");
+    std::shared_ptr<const std::string> s = seg;
+
+    q.push_slice(s, 0, 6);
+    q.push(socketley::write_chunk(std::string("own-reply")));
+    q.push_slice(s, 6, 6);                          // follows the segment, not the tail
+    CHECK(q.size() == 3);
+    CHECK(drain(q) == "BCAST1own-replyBCAST2");
+}
+
+TEST_CASE("a slice survives being copied and moved, and keeps its segment alive")
+{
+    auto seg = std::make_shared<std::string>("hello, world");
+    std::shared_ptr<const std::string> s = seg;
+    socketley::write_chunk c(s, 7, 5);
+    socketley::write_chunk copy(c);
+    socketley::write_chunk moved(std::move(c));
+    seg.reset(); s.reset();                          // the chunks are the only owners now
+    CHECK(copy.view() == "world");
+    CHECK(moved.view() == "world");
+    CHECK_FALSE(moved.owns());                       // never appended to: the bytes are shared
+    CHECK(moved.continues_at(nullptr, 12) == false);
+}

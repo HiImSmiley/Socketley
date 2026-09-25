@@ -1041,6 +1041,12 @@ private:
     // this ever needed before.
     // Answers what it reached; see fanout_count.  A broadcast drops a client
     // whose queue is full exactly as a send does, and nothing counted it.
+    // Where a broadcast is written once for all its recipients, whose queues
+    // hold slices of it -- grown in place and replaced when full, never moved.
+    std::shared_ptr<std::string> m_bcast_seg;
+    std::shared_ptr<std::string> m_bcast_ws_seg;
+    static constexpr size_t BCAST_SEGMENT_BYTES = 64 * 1024;
+    uint32_t place_broadcast(std::shared_ptr<std::string>& seg, std::string_view bytes);
     fanout_count queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
                          int exclude_fd2 = -1);
     void remove_active_fd(int fd);

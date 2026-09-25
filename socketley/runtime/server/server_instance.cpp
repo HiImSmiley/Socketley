@@ -5646,6 +5646,9 @@ server_instance::fanout_count server_instance::queue_broadcast(
         return counted;
 
     std::shared_ptr<const std::string> ws_msg; // Lazy WS frame creation
+    // Placed at the first recipient that takes each form, once for all of them.
+    std::shared_ptr<const std::string> seg, ws_seg;
+    uint32_t off = 0, ws_off = 0;
 
     // Iterate over flat active_fds vector (cache-friendly, no hash overhead)
     for (size_t i = 0; i < m_active_fds.size(); i++)
@@ -5711,29 +5714,41 @@ server_instance::fanout_count server_instance::queue_broadcast(
                 // question is about the payload and not about the recipient.
                 ws_msg = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
                                                       : ws_frame_binary_shared(payload);
+                ws_off = place_broadcast(m_bcast_ws_seg, *ws_msg);
+                ws_seg = m_bcast_ws_seg;
             }
-            conn->write_queue.push_shared(ws_msg,
-                server_connection::WRITE_COALESCE_LIMIT,
-                server_connection::MAX_WRITE_BATCH);
+            conn->write_queue.push_slice(ws_seg, ws_off, static_cast<uint32_t>(ws_msg->size()));
             if (!conn->write_pending)
                 flush_write_queue(conn);
         }
         else
         {
-            // push_shared and not push: below MAX_WRITE_BATCH queued entries
-            // this is the same refcount it always was, and above it -- where
-            // the queue no longer empties in one submission -- the payload is
-            // copied into the tail instead, which is what turns entries back
-            // into bytes.  See write_queue.h for why the threshold is there.
-            conn->write_queue.push_shared(msg,
-                server_connection::WRITE_COALESCE_LIMIT,
-                server_connection::MAX_WRITE_BATCH);
+            // One copy for every recipient, and a recipient whose queue still
+            // ends at the previous broadcast takes this one by growing that slice.
+            if (!seg)
+            {
+                off = place_broadcast(m_bcast_seg, *msg);
+                seg = m_bcast_seg;
+            }
+            conn->write_queue.push_slice(seg, off, static_cast<uint32_t>(msg->size()));
             if (!conn->write_pending)
                 flush_write_queue(conn);
         }
     }
 
     return counted;
+}
+
+uint32_t server_instance::place_broadcast(std::shared_ptr<std::string>& seg, std::string_view bytes)
+{
+    if (!seg || seg->capacity() - seg->size() < bytes.size())
+    {
+        seg = std::make_shared<std::string>();
+        seg->reserve(std::max(BCAST_SEGMENT_BYTES, bytes.size()));
+    }
+    const auto off = static_cast<uint32_t>(seg->size());
+    seg->append(bytes);
+    return off;
 }
 
 // ─── Whether the message was taken ──────────────────────────────────────────

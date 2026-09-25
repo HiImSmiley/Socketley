@@ -96,14 +96,19 @@ public:
     write_chunk(std::string s) : m_owned(std::move(s)) {}
     write_chunk(std::shared_ptr<const std::string> p) : m_shared(std::move(p)) {}
     write_chunk(borrowed_bytes b) : m_borrowed(b) {}
+    // A slice of a segment several connections send from, which a broadcast
+    // grows in place rather than copying into every queue.
+    // Held as a loan with nobody to give it back to, the segment kept alive by
+    // the reference beside it.
+    write_chunk(std::shared_ptr<const std::string> seg, uint32_t off, uint32_t len)
+        : m_shared(std::move(seg)), m_borrowed{ m_shared->data() + off, len, nullptr, nullptr, 0 } {}
     ~write_chunk() { give_back(); }
 
     // A copy of a loan is bytes this copy owns, so one buffer is never given
     // back twice.
     write_chunk(const write_chunk& o)
-        : m_owned(o.m_borrowed.data ? std::string(o.m_borrowed.data, o.m_borrowed.size)
-                                    : o.m_owned),
-          m_shared(o.m_shared)
+        : m_owned(o.is_loan() ? std::string(o.m_borrowed.data, o.m_borrowed.size) : o.m_owned),
+          m_shared(o.m_shared), m_borrowed(o.is_slice() ? o.m_borrowed : borrowed_bytes{})
     {
     }
     write_chunk& operator=(const write_chunk& o)
@@ -111,9 +116,9 @@ public:
         if (this != &o)
         {
             give_back();
-            m_owned  = o.m_borrowed.data ? std::string(o.m_borrowed.data, o.m_borrowed.size)
-                                         : o.m_owned;
+            m_owned  = o.is_loan() ? std::string(o.m_borrowed.data, o.m_borrowed.size) : o.m_owned;
             m_shared = o.m_shared;
+            m_borrowed = o.is_slice() ? o.m_borrowed : borrowed_bytes{};
         }
         return *this;
     }
@@ -159,7 +164,19 @@ public:
 
     void clear() { m_owned.clear(); m_shared.reset(); give_back(); }
 
+    // Whether the bytes at `off` in `seg` follow this slice's last byte, so
+    // the slice can take them by growing.
+    bool continues_at(const std::string* seg, uint32_t off) const
+    {
+        return is_slice() && m_shared.get() == seg &&
+               m_borrowed.data + m_borrowed.size == seg->data() + off;
+    }
+    void grow_slice(uint32_t len) { m_borrowed.size += len; }
+
 private:
+    bool is_slice() const { return m_borrowed.data && !m_borrowed.give_back; }
+    bool is_loan() const { return m_borrowed.data && m_borrowed.give_back; }
+
     void give_back()
     {
         if (m_borrowed.give_back)
@@ -229,6 +246,20 @@ public:
             return;
         }
         push(T(seed(value, limit)));
+    }
+
+    // Bytes of a broadcast segment, taken by the tail slice when they follow
+    // it -- a subscriber behind a busy channel then holds one entry per flush
+    // and no copy at all.
+    void push_slice(const std::shared_ptr<const std::string>& seg, uint32_t off, uint32_t len)
+    {
+        if (!m_queue.empty() && m_queue.back().continues_at(seg.get(), off))
+        {
+            m_queue.back().grow_slice(len);
+            m_bytes += len;
+            return;
+        }
+        push(T(seg, off, len));
     }
 
     // A payload several connections are sending, which is the same decision
