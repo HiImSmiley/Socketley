@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test: a TCP relay arms multishot only for connections that
-# exchange small messages, and a stream keeps what single-shot holds
+# exchange messages, and a stream keeps what single-shot holds
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -10,8 +10,10 @@
 # multishot.  Arming every TCP connection bought that and gave up the reason
 # single-shot was kept -- a multishot recv drains the socket into the queue
 # before any decline lands, so 16 uploads into a backend that does not read held
-# 60-69 MB against 25.  A connection now earns multishot after a run of small
-# reads and loses it at the first large one, so a stream never has it.
+# 60-69 MB against 25.  A connection now earns multishot after a run of reads
+# that each drained the socket, and loses it at the first that filled its
+# buffer or left more behind, so a stream -- which is what fills a socket --
+# never has it.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
@@ -37,7 +39,7 @@ trap cleanup EXIT
 pass(){ TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "${@:3}"; do echo "        $l"; done; }
 
-echo "=== Integration: a TCP relay's multishot arm is earned by small exchanges ==="
+echo "=== Integration: a TCP relay's multishot arm is earned by exchanges ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 SANITIZED=""
 nm -C "$BIN" 2>/dev/null | grep -q '__asan_' && SANITIZED=1

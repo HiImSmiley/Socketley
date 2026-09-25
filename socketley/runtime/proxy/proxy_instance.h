@@ -101,8 +101,8 @@ struct alignas(64) proxy_client_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    // Consecutive reads under a few kilobytes, which is what earns multishot.
-    uint8_t small_reads{0};
+    // Consecutive reads that drained the socket, which is what earns multishot.
+    uint8_t drained_reads{0};
     // A multishot read taken back because the backend it feeds is over the
     // pacing point: set when the cancel is submitted, cleared by the -ECANCELED
     // that ends it or by any other completion that ends it first.  The backend
@@ -296,8 +296,8 @@ struct alignas(64) proxy_backend_connection
     bool read_pending{false};
     bool write_pending{false};
     bool closing{false};
-    // Consecutive reads under a few kilobytes, which is what earns multishot.
-    uint8_t small_reads{0};
+    // Consecutive reads that drained the socket, which is what earns multishot.
+    uint8_t drained_reads{0};
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
@@ -609,7 +609,7 @@ public:
     // decides multishot is asked in one place rather than at twenty call sites.
     bool arm_read(int fd, proxy_client_connection* conn);
     bool arm_read(int fd, proxy_backend_connection* conn);
-    bool earned_multishot(uint8_t small_reads) const;
+    bool earned_multishot(uint8_t drained_reads) const;
     void decline_armed_read(proxy_client_connection* conn);
     void decline_armed_read(proxy_backend_connection* conn);
 
@@ -1150,9 +1150,9 @@ private:
     // disagreeing: what they owe each other is that the withdrawal must not take
     // back a read nothing re-arms, which is liveness and not a shared threshold.
     static constexpr size_t MULTISHOT_MIN_CLIENTS = 768;
-    // Consecutive small reads after which a TCP relay's connection is armed
+    // Consecutive draining reads after which a TCP relay's connection is armed
     // multishot below that count, see earned_multishot().
-    static constexpr uint8_t MULTISHOT_SMALL_READS = 8;
+    static constexpr uint8_t MULTISHOT_DRAINED_READS = 8;
     // The kernel can do IORING_OP_SPLICE, which says nothing about whether
     // this proxy uses it.
     bool m_splice_supported{false};

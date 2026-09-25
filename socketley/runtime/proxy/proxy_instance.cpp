@@ -263,7 +263,7 @@ void proxy_client_connection::reset(int new_fd)
     response_started = false;
     client_conn_close = false;
     wr_shutdown = false;
-    small_reads = 0;
+    drained_reads = 0;
     backend_fd = -1;
     write_batch_count = 0;
     read_req = {};
@@ -341,7 +341,7 @@ void proxy_backend_connection::reset(int new_fd)
     pool_draining = false;
     recv_withdrawing = false;
     sent_to_client = false;
-    small_reads = 0;
+    drained_reads = 0;
     pool_abandoned = false;
     pool_backend_idx = 0;
     pool_host.clear();
@@ -1065,38 +1065,44 @@ bool proxy_instance::backend_backpressured(const proxy_client_connection* conn) 
 // withdrawal below asks per connection and the two have to agree.
 bool proxy_instance::arm_read(int fd, proxy_client_connection* conn)
 {
-    return submit_read_op(m_loop, fd, conn, m_recv_multishot || earned_multishot(conn->small_reads),
+    return submit_read_op(m_loop, fd, conn, m_recv_multishot || earned_multishot(conn->drained_reads),
                           m_use_provided_bufs, BUF_GROUP_ID);
 }
 
 bool proxy_instance::arm_read(int fd, proxy_backend_connection* conn)
 {
     return submit_read_op_backend(m_loop, fd, conn,
-                                  m_recv_multishot || earned_multishot(conn->small_reads),
+                                  m_recv_multishot || earned_multishot(conn->drained_reads),
                                   m_use_provided_bufs, BUF_GROUP_ID);
 }
 
 // Below MULTISHOT_MIN_CLIENTS a TCP relay's connection is armed multishot once it
-// has shown it exchanges small messages, which is where the re-arm is the cost
-// -- measured on 64-byte round trips through 32 connections, the same binary
-// with the arm toggled: +9.5% rate, -10.2% CPU per round trip.  A stream never
-// qualifies and keeps the single-shot arm and the hold that goes with it, where
-// arming every connection held 60-69 MB at 16 slow peers against 25.
-bool proxy_instance::earned_multishot(uint8_t small_reads) const
+// has shown it exchanges messages rather than streams them, which is where the
+// re-arm is the cost -- measured on round trips, the same binary with the arm
+// toggled: -10.2% CPU at 64 bytes through 32 connections, -3.9% at 16 KiB
+// through one.  A stream never qualifies and keeps the single-shot arm and the
+// hold that goes with it, where arming every connection held 60-69 MB at 16
+// slow peers against 25.
+bool proxy_instance::earned_multishot(uint8_t drained_reads) const
 {
-    return m_protocol == protocol_tcp && small_reads >= MULTISHOT_SMALL_READS &&
+    return m_protocol == protocol_tcp && drained_reads >= MULTISHOT_DRAINED_READS &&
            m_recv_multishot_supported &&
            !pacing_backed_up();
 }
 
-// A read under a few kilobytes extends the run, and anything larger is a stream
-// and ends it, which also ends the multishot arm at its next re-arm.
-static inline void note_read_size(uint8_t& small_reads, int res)
+// A read that left the socket empty without filling its buffer is one message
+// taken whole, and it extends the run; one that filled the buffer or left more
+// behind is a stream and ends it, which also ends the multishot arm at its next
+// re-arm.  Asked of the socket rather than the size, because what a multishot
+// read overshoots by is what the socket holds, so a producer slow enough to
+// keep it drained has nothing to overshoot with.
+static inline void note_read(uint8_t& drained_reads, const struct io_uring_cqe* cqe)
 {
-    if (res > 0 && res < 4096)
-        small_reads = static_cast<uint8_t>(small_reads < 255 ? small_reads + 1 : 255);
+    if (cqe->res > 0 && cqe->res < static_cast<int>(PROXY_READ_BUF_SIZE) &&
+        !(cqe->flags & IORING_CQE_F_SOCK_NONEMPTY))
+        drained_reads = static_cast<uint8_t>(drained_reads < 255 ? drained_reads + 1 : 255);
     else
-        small_reads = 0;
+        drained_reads = 0;
 }
 
 // The decline a single-shot read makes at its re-arm, made for an armed
@@ -1111,7 +1117,7 @@ void proxy_instance::decline_armed_read(proxy_client_connection* conn)
         !is_multishot_recv_op(conn->read_req.type) ||
         !client_read_armable(conn) || !backend_backpressured(conn))
         return;
-    conn->small_reads = 0;
+    conn->drained_reads = 0;
     if (m_loop->submit_cancel_request(&conn->read_req))
         conn->recv_withdrawing = true;
 }
@@ -1122,7 +1128,7 @@ void proxy_instance::decline_armed_read(proxy_backend_connection* conn)
         !is_multishot_recv_op(conn->read_req.type) ||
         !backend_read_armable(conn) || !client_backpressured(conn))
         return;
-    conn->small_reads = 0;
+    conn->drained_reads = 0;
     if (m_loop->submit_cancel_request(&conn->read_req))
         conn->recv_withdrawing = true;
 }
@@ -3370,7 +3376,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             return;
         }
 
-        note_read_size(conn->small_reads, cqe->res);
+        note_read(conn->drained_reads, cqe);
         std::string_view data(read_data, data_len);
         const bool lent = forward_to_backend(conn, data,
                                              lendable_buf(is_provided, buf_id, data_len));
@@ -3995,7 +4001,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
     // retry before the request went out -- with the plain fact recorded for
     // both protocols.
     conn->sent_to_client = true;
-    note_read_size(conn->small_reads, cqe->res);
+    note_read(conn->drained_reads, cqe);
 
     if (m_protocol == protocol_http && conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
     {
