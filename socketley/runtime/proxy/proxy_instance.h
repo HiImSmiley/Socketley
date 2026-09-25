@@ -243,37 +243,8 @@ struct alignas(64) proxy_client_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // Sixty-four kilobytes, inline and part of the pooled struct, and BOTH of
-    // those are load-bearing for the memory bound rather than for speed.
-    // Two ways of making an idle connection cheaper were measured and both
-    // were withdrawn, against 1,100 uploading clients where the rule arm
-    // holds 333 to 342 MB:
-    //
-    //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
-    //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
-    //     inline but not zero-filled   idle 6.89 KB   upload arm 458-488 MB
-    //
-    // The third of those is the one that settles it.  It changes nothing about
-    // where the buffer lives or how large it is -- only that the struct is
-    // default-initialised, so the pages are not touched until a read uses them
-    // -- and the bounded arm rises by the same ~120 MB as the other two.  So
-    // these kilobytes being PRESENT AND TOUCHED is part of how the withdraw
-    // rule holds under upload pressure, not waste beside it.  The proxy is the
-    // one runtime that keeps std::make_unique for that reason; the cache and
-    // the server use socketley::make_connection.
-    //
-    // A thousand separate 64 KB blocks interleave with the growing upload
-    // buffers and the arena cannot give them back; a smaller buffer takes
-    // more reads to drain the same upload and `partial` carries the rest.
-    // Only the reserve beside this was safe to remove.
-    //
-    // What makes these kilobytes RESIDENT rather than merely reserved is that
-    // the pool builds every connection with make_unique<T>(), which VALUE-
-    // initializes -- so the whole struct including this array is zero-filled
-    // and touched before a byte arrives.  make_unique_for_overwrite would skip
-    // it, and `int fd;` and four io_request members have no initialiser of
-    // their own and rely on that zeroing, so the swap needs MSan to be honest
-    // and is not made here.
+    // Inline and built by make_connection, so these pages are touched by the
+    // reads that use them and an idle connection never pays for them.
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
 
     // The session, for a struct that never reached its release path, safe here
@@ -364,37 +335,7 @@ struct alignas(64) proxy_backend_connection
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
 
-    // Sixty-four kilobytes, inline and part of the pooled struct, and BOTH of
-    // those are load-bearing for the memory bound rather than for speed.
-    // Two ways of making an idle connection cheaper were measured and both
-    // were withdrawn, against 1,100 uploading clients where the rule arm
-    // holds 333 to 342 MB:
-    //
-    //     taken lazily from the heap   idle 2.95 KB   upload arm 449-452 MB
-    //     inline but 16 KB             idle 18.70 KB  upload arm 478-492 MB
-    //     inline but not zero-filled   idle 6.89 KB   upload arm 458-488 MB
-    //
-    // The third of those is the one that settles it.  It changes nothing about
-    // where the buffer lives or how large it is -- only that the struct is
-    // default-initialised, so the pages are not touched until a read uses them
-    // -- and the bounded arm rises by the same ~120 MB as the other two.  So
-    // these kilobytes being PRESENT AND TOUCHED is part of how the withdraw
-    // rule holds under upload pressure, not waste beside it.  The proxy is the
-    // one runtime that keeps std::make_unique for that reason; the cache and
-    // the server use socketley::make_connection.
-    //
-    // A thousand separate 64 KB blocks interleave with the growing upload
-    // buffers and the arena cannot give them back; a smaller buffer takes
-    // more reads to drain the same upload and `partial` carries the rest.
-    // Only the reserve beside this was safe to remove.
-    //
-    // What makes these kilobytes RESIDENT rather than merely reserved is that
-    // the pool builds every connection with make_unique<T>(), which VALUE-
-    // initializes -- so the whole struct including this array is zero-filled
-    // and touched before a byte arrives.  make_unique_for_overwrite would skip
-    // it, and `int fd;` and four io_request members have no initialiser of
-    // their own and rely on that zeroing, so the swap needs MSan to be honest
-    // and is not made here.
+    // See proxy_client_connection::read_buf.
     alignas(64) char read_buf[PROXY_READ_BUF_SIZE];
 
     // See proxy_client_connection's destructor.

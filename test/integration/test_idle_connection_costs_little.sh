@@ -19,14 +19,14 @@
 # a reserve(8192) -- and came out 22.21 -> 4.92 KB, identical in four passes,
 # with its throughput at 1.0040 across the swap, which is again the instrument.
 #
-# A proxy keeps its sixty-four kilobytes and the bound here is loose because of
-# it: 69.93 -> 65.93 KB, which is the reserve on partial and nothing else.  Two
-# ways of taking the rest were measured and BOTH were withdrawn, because the
-# same buffer is what holds the bounded upload path down -- 333 to 342 MB at
-# 1,100 uploading clients against 449-452 taken lazily from the heap and
-# 478-492 at a sixteen-kilobyte inline buffer.  So 70 KB here catches a
-# connection cost that doubles and nothing finer; the finer guard is
-# test_proxy_upload_is_bounded.sh, which is the one that found this.
+# A proxy kept its sixty-four kilobyte read buffer zero-filled at allocation,
+# so every pooled struct was resident before a byte arrived: 65.99 -> 6.89 KB
+# once it is built by make_connection and the pages are touched by the reads
+# that use them.  It was held back twice on test_proxy_upload_is_bounded.sh
+# reading 120 MB more with the change, which was the upload flood's own pairs
+# being cut by -EAGAIN under TCP memory pressure and freeing their buffers at
+# random -- with that fixed the change holds less there, not more.  12 KB
+# catches the zero-fill coming back and cannot fail on 6.89 drifting.
 #
 # The read_buf is the last arm of four -- bundle, multishot, provided-buffer
 # read, and only then a plain read into it -- so with a buffer ring, which is
@@ -52,7 +52,6 @@ set -euo pipefail
 #
 #     cache   2.04 KB -> 6.12 KB       bound 5
 #     server  4.92 KB -> 8.16 KB
-#     proxy  65.93 KB -> 83.83 KB      bound 70
 #
 # Loosening the bounds to fit both would leave numbers that guard nothing in
 # either build.  So this measures the allocator it was written about and says
@@ -76,7 +75,7 @@ P_PRX=$((SL_PORT_BASE+1896))
 CONNS=2000
 BUDGET_KB=5
 BUDGET_SRV_KB=9
-BUDGET_PRX_KB=70
+BUDGET_PRX_KB=12
 
 PASS=0; FAIL=0; TOTAL=0
 ok()    { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
