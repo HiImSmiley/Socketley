@@ -71,12 +71,14 @@
 #   bash test/benchmark/bench_proxy_matrix.sh                    # single
 #   PROXY_MATRIX_MODE=sharded bash test/benchmark/bench_proxy_matrix.sh
 #   PROXY_MATRIX_ROWS='TCP-64|tcp|serial|1|64' bash ...          # one row
+#   PROXY_MATRIX_VS=nginx bash test/benchmark/bench_proxy_matrix.sh  # against nginx
 set -uo pipefail
 
 source "$(dirname "$0")/utils.sh"
 source "$(dirname "$0")/lib_paired.sh"
 
 MODE=${PROXY_MATRIX_MODE:-single}          # single | sharded
+RIVAL=${PROXY_MATRIX_VS:-haproxy}          # haproxy | nginx
 PAIRS=${PROXY_MATRIX_PAIRS:-5}
 RUN_MS=${PROXY_MATRIX_RUN_MS:-1500}
 OPS_CAP=100000000
@@ -197,11 +199,15 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM   # see setup_cleanup_trap in utils.sh
 
-if ! command -v haproxy >/dev/null 2>&1; then
-    log_error "haproxy is not installed — there is nothing to compare against"
+if ! command -v "$RIVAL" >/dev/null 2>&1; then
+    log_error "$RIVAL is not installed — there is nothing to compare against"
     exit 0
 fi
-HA_VERSION=$(haproxy -v 2>&1 | head -1 | sed 's/[",]/ /g')
+case "$RIVAL" in
+    haproxy) HA_VERSION=$(haproxy -v 2>&1 | head -1 | sed 's/[",]/ /g') ;;
+    nginx)   HA_VERSION=$(nginx -v 2>&1 | head -1) ;;
+    *)       log_error "PROXY_MATRIX_VS=$RIVAL: haproxy or nginx"; exit 1 ;;
+esac
 
 # A run that starts on a busy box is not salvageable, so it does not start.
 #
@@ -348,6 +354,7 @@ arm_measure() {
 
 # ─── Run ────────────────────────────────────────────────────────────────────
 
+log_info "against $HA_VERSION"
 log_info "$PAIRS pairs per row, ${RUN_MS} ms per run, order alternating"
 log_info "box load with nothing of ours running: $(box_load_cores) cores (pairs above $QUIET_CORES are discarded)"
 echo ""
@@ -417,10 +424,10 @@ per_core() {   # a b apx bpx -> ratio of (rate/cores)
                  printf "%.2f", (a / x) / (b / y) }'
 }
 
-S_LABEL="socketley"; H_LABEL="haproxy"
-[ "$MODE" = "sharded" ] && { S_LABEL="skl x$SHARDS"; H_LABEL="hap x$SHARDS"; }
+S_LABEL="socketley"; H_LABEL="$RIVAL"
+[ "$MODE" = "sharded" ] && { S_LABEL="skl x$SHARDS"; H_LABEL="${RIVAL:0:3} x$SHARDS"; }
 printf '\n  %-11s %10s %10s %8s %8s %7s %8s %8s %7s %7s  %s\n' \
-    shape "$S_LABEL" "$H_LABEL" ratio /core '±95%' sk_cores hap_cores be_cores cli_cores verdict
+    shape "$S_LABEL" "$H_LABEL" ratio /core '±95%' sk_cores "${RIVAL:0:3}_cores" be_cores cli_cores verdict
 printf '  %s\n' "$(printf '%.0s─' {1..127})"
 sort -t'|' -k6 -g "$WORK/rows.txt" | while IFS='|' read -r name fix shape a b ratio ci apx bpx be cli kept v; do
     note=$(awk -v x="$ratio" -v m="$MED" -v v="$v" \
