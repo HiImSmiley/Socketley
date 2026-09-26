@@ -14,14 +14,14 @@
 #include <functional>
 #include <chrono>
 #include "field_map.h"
-#include "string_ring.h"
+#include "seg_list.h"
 #include "key_table.h"
 #include "zskiplist.h"
 
 #include "../../shared/transparent_string.h"
 
 using string_map = key_table<std::string>;
-using list_inner = string_ring;
+using list_inner = seg_list;
 using list_map = key_table<list_inner>;
 using set_inner = key_set;
 using set_map = key_table<set_inner>;

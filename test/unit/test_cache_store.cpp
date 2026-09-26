@@ -2288,15 +2288,15 @@ TEST_CASE("zset_inner agrees with a model, small and after the skiplist takes ov
     }
 }
 
-TEST_CASE("string_ring agrees with a deque through both ends and the middle")
+TEST_CASE("seg_list agrees with a deque through both ends and the middle")
 {
     uint32_t r = 99;
     auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
-  // Kept under 100 the whole run it is only ever the ring; left to grow it
-  // moves to the deque at BIG_AT and is checked there too.
+  // Kept under 100 the whole run, and left to grow into thousands of blocks
+  // with the map ring wrapping at both ends.
   for (const size_t cap : { size_t{100}, size_t{1} << 30 })
   {
-    string_ring ring;
+    seg_list ring;
     std::deque<std::string> ref;
     for (int step = 0; step < 50000; ++step)
     {
@@ -2332,9 +2332,9 @@ TEST_CASE("string_ring agrees with a deque through both ends and the middle")
         {
             for (size_t i = 0; i < ref.size(); ++i) REQUIRE(ring[i] == ref[i]);
             if (!ref.empty()) { CHECK(ring.front() == ref.front()); CHECK(ring.back() == ref.back()); }
-            string_ring copy(ring);
+            seg_list copy(ring);
             CHECK(copy == ring);
-            string_ring moved(std::move(copy));
+            seg_list moved(std::move(copy));
             CHECK(moved == ring);
         }
     }
@@ -2344,8 +2344,26 @@ TEST_CASE("string_ring agrees with a deque through both ends and the middle")
     auto e = ring.end();
     size_t j = ref.size();
     while (e != ring.begin()) { --e; CHECK(*e == ref[--j]); }
-    CHECK(ring.big() == (cap > 100));
     ring.clear();
     CHECK(ring.empty());
   }
+}
+
+TEST_CASE("seg_list taken from one end only, emptied and refilled")
+{
+    seg_list l;
+    std::deque<std::string> ref;
+    for (int round = 0; round < 3; ++round)
+    {
+        // LPUSH only: every eighth push takes a block in front, and the map
+        // ring wraps backwards.
+        for (int i = 0; i < 1000; ++i) { l.push_front(std::to_string(i)); ref.push_front(std::to_string(i)); }
+        for (size_t i = 0; i < ref.size(); ++i) REQUIRE(l[i] == ref[i]);
+        // RPOP to empty, then LPOP from a list refilled from the back.
+        while (!ref.empty()) { REQUIRE(l.back() == ref.back()); l.pop_back(); ref.pop_back(); }
+        CHECK(l.empty());
+        for (int i = 0; i < 20; ++i) { l.push_back("x" + std::to_string(i)); ref.push_back("x" + std::to_string(i)); }
+        while (!ref.empty()) { REQUIRE(l.front() == ref.front()); l.pop_front(); ref.pop_front(); }
+        CHECK(l.empty());
+    }
 }

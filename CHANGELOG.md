@@ -32,8 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over a million from 2.9 M to 7.4 M; MGET and MSET of ten keys gained 72–78%.
 - Small hashes, sorted sets and lists take less memory: a five-field hash 631 →
   263 bytes, a five-member sorted set 1,575 → 439, a one-element list 806 →
-  422. Lists of 9 to 128 elements read random indexes about 20% slower than
-  before in exchange.
+  726; list LINDEX, LSET and LRANGE are 12–18% faster.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 
