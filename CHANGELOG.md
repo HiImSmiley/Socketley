@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The daemon ignores SIGHUP; rotate `--log` and `-w` files with `copytruncate`.
 - The packaged unit reads home directories (`ProtectHome=read-only`), so a
   script or certificate kept there can be used.
+- **SDK:** `cache_store::hget()` returns `std::optional<std::string_view>`
+  instead of `const std::string*`. A small hash keeps its fields packed and
+  holds no `std::string` to point at.
+- A cache is faster once its keyspace outgrows the CPU caches: the keyspace is
+  an open-addressed table, the RESP loop fetches the keys of the next eight
+  pipelined commands ahead of running them, and MGET/MSET fetch theirs in
+  batches. Pipelined GET over 100,000 random keys went from 4.7 M to 8.8 M/s,
+  over a million from 2.9 M to 7.4 M; MGET and MSET of ten keys gained 72–78%.
+- Small hashes, sorted sets and lists take less memory: a five-field hash 631 →
+  263 bytes, a five-member sorted set 1,575 → 439, a one-element list 806 →
+  422. Lists of 9 to 128 elements read random indexes about 20% slower than
+  before in exchange.
+- ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
+  faster, and HGET/ZSCORE over many small keys 30–50% faster.
 
 ### Fixed
 
@@ -37,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UNSUBSCRIBE`, the subscription count, `HSET`'s count, `READONLY`, and
   `FLUSHALL` and `MULTI` on a sharded cache.
 - A stopping persistent cache is given time to finish its dump.
+- A request the server or the proxy refuses while it is still arriving (413,
+  431, 400, 502–504) reaches the client instead of being reset away by the
+  unread rest: the connection reads it away behind its FIN, for up to ten
+  seconds or 64 MiB.
+- A server answers a request head past 16 KiB with `431`, as documented,
+  instead of closing without a word.
+- A worker whose control socket backs up says so once per stall, not once per
+  refused frame.
 
 ## [1.1.0] - 2026-08-27
 
