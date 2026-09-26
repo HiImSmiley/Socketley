@@ -68,6 +68,13 @@ public:
     }
 
     // --- Strings (existing) ---
+    // Fetching a string key's slot and entry ahead of the command that will
+    // look it up, worth its hashing only once the table is past the caches.
+    bool keyspace_outgrows_cache() const { return m_data.bucket_count() >= (64u << 10); }
+    static uint64_t key_hash(std::string_view key) { return string_map::hash_for_prefetch(key); }
+    void prefetch_slot(uint64_t h) const  { m_data.prefetch_slot(h); }
+    void prefetch_entry(uint64_t h) const { m_data.prefetch_entry(h); }
+
     bool set(std::string_view key, std::string_view value);
     bool get(std::string_view key, std::string& out) const;
     const std::string* get_ptr(std::string_view key) const;

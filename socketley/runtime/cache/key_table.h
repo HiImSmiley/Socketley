@@ -222,10 +222,18 @@ public:
         if (want > m_cap) rebuild(want);
     }
 
-    // The slot's line, ahead of the find() that will need it.
-    void prefetch(std::string_view k) const
+    // Two steps ahead of a find(): the slot's line first, and once that has
+    // had time to arrive, the entry its home slot points at.
+    static uint64_t hash_for_prefetch(std::string_view k) { return hash_of(k); }
+    void prefetch_slot(uint64_t h) const
     {
-        if (m_cap) __builtin_prefetch(&m_slots[hash_of(k) & (m_cap - 1)]);
+        if (m_cap) __builtin_prefetch(&m_slots[h & (m_cap - 1)]);
+    }
+    void prefetch_entry(uint64_t h) const
+    {
+        if (!m_cap) return;
+        const slot& s = m_slots[h & (m_cap - 1)];
+        if (s.h == h) __builtin_prefetch(s.e);
     }
 
     template <class... A>

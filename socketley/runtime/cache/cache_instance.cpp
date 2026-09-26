@@ -8136,6 +8136,25 @@ bool cache_instance::process_resp(client_connection* conn)
     size_t offset = 0;
     bool   cut = false;
 
+    // Commands parsed ahead of the one running, so a keyspace past the
+    // caches has its slot and entry lines on their way before each lookup
+    // instead of every lookup waiting for its own.
+    static constexpr int AHEAD = 8, AHEAD_ARGS = 8;
+    struct ahead_cmd
+    {
+        std::string_view args[AHEAD_ARGS];
+        int              argc;
+        size_t           consumed;
+        uint64_t         h;
+    };
+    ahead_cmd q[AHEAD];
+    int    qh = 0, qn = 0;
+    size_t scan = 0;
+    // Stalled until the first command has run the ordinary way, so a read
+    // holding one command -- every read at depth 1 -- never copies it twice.
+    bool   scan_stalled = true;
+    const bool ahead = m_store.keyspace_outgrows_cache();
+
     while (offset < conn->partial.size())
     {
         // Same cut as parse_text_lines makes, for the same reason and in the
@@ -8167,8 +8186,54 @@ bool cache_instance::process_resp(client_connection* conn)
         if (SOCKETLEY_UNLIKELY(conn->closing))
             break;
 
-        std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
-        auto result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed, read_bulk_limit());
+        // Anything the lookahead cannot hold -- a long command, an incomplete
+        // or malformed one -- stops it there, and the parse below meets it.
+        while (ahead && !scan_stalled && qn < AHEAD && scan < conn->partial.size())
+        {
+            ahead_cmd& c = q[(qh + qn) % AHEAD];
+            std::string_view rest(conn->partial.data() + scan, conn->partial.size() - scan);
+            if (resp::parse_message_views(rest, c.args, AHEAD_ARGS, c.argc, c.consumed,
+                                          read_bulk_limit()) != resp::parse_result::ok
+                || c.argc < 1)
+            {
+                scan_stalled = true;
+                break;
+            }
+            c.h = 0;
+            if (c.argc >= 2)
+            {
+                c.h = cache_store::key_hash(c.args[1]);
+                m_store.prefetch_slot(c.h);
+            }
+            scan += c.consumed;
+            ++qn;
+        }
+
+        std::string_view* cargs = args;
+        resp::parse_result result;
+        if (qn > 0)
+        {
+            ahead_cmd& c = q[qh];
+            cargs    = c.args;
+            argc     = c.argc;
+            consumed = c.consumed;
+            result   = resp::parse_result::ok;
+            qh = (qh + 1) % AHEAD;
+            --qn;
+            // Three commands out the slot has had time to arrive.
+            if (qn >= 3 && q[(qh + 2) % AHEAD].h)
+                m_store.prefetch_entry(q[(qh + 2) % AHEAD].h);
+        }
+        else
+        {
+            std::string_view buf(conn->partial.data() + offset, conn->partial.size() - offset);
+            result = resp::parse_message_views(buf, args, MAX_RESP_ARGS, argc, consumed, read_bulk_limit());
+            if (result == resp::parse_result::ok)
+            {
+                scan = offset + consumed;
+                scan_stalled = false;
+            }
+        }
 
         if (result == resp::parse_result::incomplete)
             break;
@@ -8260,7 +8325,7 @@ bool cache_instance::process_resp(client_connection* conn)
         {
             SKL_TRACE_ADD(conn, commands_parsed, 1);
             const size_t rb_before = conn->response_buf.size();
-            process_resp_command(conn, args, argc);
+            process_resp_command(conn, cargs, argc);
             if (conn->response_buf.size() != rb_before)
                 SKL_TRACE_ADD(conn, responses_made, 1);
         }
