@@ -92,6 +92,10 @@ static constexpr size_t RETRY_KEEP_BYTES = 64 * 1024;
 // In shared/http_framing.h now, because the server asks the same question and
 // answered it differently -- which is to say not at all.
 static constexpr int PROXY_HEADER_TIMEOUT_SEC = http_header_deadline_secs;
+// A client answered and closed on is read away for at most this long and
+// this much, the server's bounds for the same drain.
+static constexpr int      PROXY_DRAIN_LIMIT_SEC   = 10;
+static constexpr uint32_t PROXY_DRAIN_LIMIT_BYTES = 64u << 20;
 
 struct alignas(64) proxy_client_connection
 {
@@ -119,8 +123,13 @@ struct alignas(64) proxy_client_connection
     bool client_conn_close{false};  // client sent Connection: close
     // Our FIN is out, sent before the armed read comes back so the client is not the one to close.
     bool wr_shutdown{false};
+    // Answered on our own account with the request possibly still arriving,
+    // so it is read away after our FIN until EOF, the byte bound, or
+    // header_deadline, which the answer no longer needs.
+    bool drain_on_close{false};
     int backend_fd{-1};
     uint32_t write_batch_count{0};
+    uint32_t drained_bytes{0};
     io_request read_req;
     io_request write_req;
 
@@ -647,7 +656,8 @@ private:
     // The tail shared by every response this proxy writes itself, in one copy
     // because a second exit from the answered-here path is how a descriptor
     // leaks.
-    void queue_final_response(proxy_client_connection* conn, std::string&& response);
+    void queue_final_response(proxy_client_connection* conn, std::string&& response,
+                              bool drain = true);
 
     bool resolve_backend(backend_info& b);
     bool configure_node_backends(backend_info& b, const std::vector<std::string>& paths,
@@ -681,6 +691,7 @@ private:
     // inherits the assertion instead of having to remember it.
     enum class close_reason { normal, force };
     void shutdown_client_write(proxy_client_connection* conn);
+    bool continue_drain(proxy_client_connection* conn, int fd, size_t bytes);
     void close_pair(int client_fd, int backend_fd,
                     close_reason reason = close_reason::normal);
     inline void close_pair_close_backend(int backend_fd,
@@ -777,7 +788,8 @@ private:
     // the client has nothing of its own in flight.
     void refuse_response(proxy_backend_connection* bconn,
                          proxy_client_connection* cconn);
-    void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body);
+    void send_error(proxy_client_connection* conn, std::string_view status, std::string_view body,
+                    bool drain = true);
     // The one answer for a request that will never reach a backend, where 502
     // is the backend's answer and 503 is this proxy running short locally --
     // and false is a decision rather than a failure, for TCP mode and for a

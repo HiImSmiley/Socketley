@@ -263,9 +263,11 @@ void proxy_client_connection::reset(int new_fd)
     response_started = false;
     client_conn_close = false;
     wr_shutdown = false;
+    drain_on_close = false;
     drained_reads = 0;
     backend_fd = -1;
     write_batch_count = 0;
+    drained_bytes = 0;
     read_req = {};
     write_req = {};
     splice_in_req = {};
@@ -3459,7 +3461,15 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     // by tls_feed on a session, which hits its own ceiling while decrypting.
     if (SOCKETLEY_UNLIKELY(conn->partial.size() > read_buffer_bytes()))
     {
-        answer_request_too_large(conn);
+        // Answered, the connection drains: what arrives now is thrown away
+        // rather than held, so the ceiling still bounds memory.
+        if (answer_request_too_large(conn) && conn->drain_on_close)
+        {
+            conn->partial.clear();
+            if (!conn->read_pending && !continue_drain(conn, fd, 0) && !conn->write_pending)
+                close_pair(fd, conn->backend_fd, close_reason::force);
+            return;
+        }
         // force: the refusal is the answer, and holding would leave the
         // multishot recv armed and go on accepting the very bytes the ceiling
         // exists to stop.
@@ -3474,6 +3484,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->closing))
     {
         conn->partial.clear();
+        if (conn->drain_on_close && continue_drain(conn, fd, static_cast<size_t>(cqe->res)))
+            return;
         if (!conn->write_pending)
             close_pair(fd, conn->backend_fd);
         return;
@@ -6910,7 +6922,8 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     defer_c = false;
                 else
                 {
-                    shutdown(client_fd, SHUT_RD);
+                    if (!conn->drain_on_close || reason == close_reason::force)
+                        shutdown(client_fd, SHUT_RD);
                     if (!peer_splicing_into_client)
                         shutdown_client_write(conn);
                 }
@@ -8167,6 +8180,20 @@ void proxy_instance::response_deadline_sweep()
             continue;
         remaining--;
 
+        // A drain past its time ends with the read side, which completes the
+        // armed read and lets the teardown run.
+        if (conn->closing && conn->drain_on_close)
+        {
+            if (now >= conn->header_deadline)
+            {
+                conn->drain_on_close = false;
+                shutdown(cfd, SHUT_RD);
+            }
+            else
+                still_waiting = true;
+            continue;
+        }
+
         if (conn->closing)
             continue;
 
@@ -8201,7 +8228,7 @@ void proxy_instance::response_deadline_sweep()
                 // behind them lands at an offset that is not a message boundary.
                 if (client_answerable(conn))
                 {
-                    send_error(conn, "408 Request Timeout", "Request Timeout\n");
+                    send_error(conn, "408 Request Timeout", "Request Timeout\n", /*drain=*/false);
                     continue;
                 }
                 // Torn down by hand, the way the 413 at the read ceiling is:
@@ -9050,7 +9077,8 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     return lent;
 }
 
-void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body)
+void proxy_instance::send_error(proxy_client_connection* conn, std::string_view status, std::string_view body,
+                                bool drain)
 {
     if (!m_loop || conn->closing)
         return;
@@ -9084,7 +9112,7 @@ void proxy_instance::send_error(proxy_client_connection* conn, std::string_view 
     response.append(hdr_buf, hdr_len);
     response += body;
 
-    queue_final_response(conn, std::move(response));
+    queue_final_response(conn, std::move(response), drain);
 }
 
 // See the declaration for why the status is chosen here, which is the whole of
@@ -9132,7 +9160,7 @@ bool proxy_instance::answer_gateway_failure(proxy_client_connection* conn, bool 
 // function because the filter chain answers requests too and a second exit
 // would skip the two things below.
 void proxy_instance::queue_final_response(proxy_client_connection* conn,
-                                          std::string&& response)
+                                          std::string&& response, bool drain)
 {
     conn->write_queue.push(std::move(response));
     conn->closing = true;
@@ -9142,11 +9170,42 @@ void proxy_instance::queue_final_response(proxy_client_connection* conn,
     if (!conn->write_pending && !flush_client_write_queue(conn))
         conn->write_queue.clear();
 
+    // The rest of the request may still be arriving, and a close with it
+    // unread is a reset that takes this answer with it -- so it is read away
+    // behind our FIN instead, within bounds the deadline sweep enforces.
+    if (drain && conn->ssl == nullptr && m_protocol == protocol_http)
+    {
+        conn->drain_on_close = true;
+        conn->header_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(PROXY_DRAIN_LIMIT_SEC);
+        arm_response_deadline_sweep();
+        return;
+    }
+
     // Saying "Connection: close" is not closing it, because under multishot
     // recv a read is pending for the connection's life -- so an error response
     // was the cheapest way there is to hold one open, and the half-close is
     // what ends it.
     shutdown(conn->fd, SHUT_RD);
+}
+
+// A draining client's read has come back: its bytes are already thrown away,
+// so either the read goes on or the drain is over and the half-close ends it.
+// Answers whether the connection is still draining.
+bool proxy_instance::continue_drain(proxy_client_connection* conn, int fd, size_t bytes)
+{
+    const uint64_t total = uint64_t{conn->drained_bytes} + bytes;
+    conn->drained_bytes = static_cast<uint32_t>(std::min<uint64_t>(total, PROXY_DRAIN_LIMIT_BYTES + 1u));
+    if (conn->drained_bytes > PROXY_DRAIN_LIMIT_BYTES ||
+        (!conn->read_pending && !arm_read(fd, conn)))
+    {
+        conn->drain_on_close = false;
+        shutdown(fd, SHUT_RD);
+        return false;
+    }
+    if (!conn->write_pending && conn->write_queue.empty())
+        shutdown_client_write(conn);
+    return true;
 }
 
 // ─── TLS record layer ───────────────────────────────────────────────────────
@@ -9579,7 +9638,8 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         }
     }
     else if (conn->closing && !conn->read_pending &&
-             !conn->splice_in_pending && !conn->splice_out_pending)
+             !conn->splice_in_pending && !conn->splice_out_pending &&
+             !(conn->drain_on_close && continue_drain(conn, fd, 0)))
     {
         close_pair(fd, conn->backend_fd);
         return;
