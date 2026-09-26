@@ -14,13 +14,15 @@
 #include <functional>
 #include <chrono>
 #include "field_map.h"
+#include "string_ring.h"
 #include "key_table.h"
 #include "zskiplist.h"
 
 #include "../../shared/transparent_string.h"
 
 using string_map = key_table<std::string>;
-using list_map = key_table<std::deque<std::string>>;
+using list_inner = string_ring;
+using list_map = key_table<list_inner>;
 using set_inner = key_set;
 using set_map = key_table<set_inner>;
 using hash_inner = field_map;
@@ -220,7 +222,7 @@ public:
     bool lpop(std::string_view key, std::string& out);
     bool rpop(std::string_view key, std::string& out);
     int llen(std::string_view key) const;
-    const std::deque<std::string>* list_ptr(std::string_view key) const;
+    const list_inner* list_ptr(std::string_view key) const;
     const std::string* lindex(std::string_view key, int idx) const;
 
     // --- Sets ---
@@ -663,7 +665,7 @@ private:
     // live write would have done, because inserting straight into the
     // containers left an empty LRU and an unenforceable maxmemory.
     void adopt_loaded_string(std::string&& key, std::string&& value);
-    void adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq);
+    void adopt_loaded_list(std::string&& key, list_inner&& deq);
     void adopt_loaded_set(std::string&& key, set_inner&& members);
     void adopt_loaded_hash(std::string&& key, hash_inner&& fields);
     void adopt_loaded_zset(std::string&& key, zset_inner&& members);
@@ -778,7 +780,7 @@ private:
     // because five hand-written copies of this loop is a permanent error in
     // the reported figure waiting to happen.
     static size_t entry_cost(std::string_view key, const std::string& val);
-    static size_t entry_cost(std::string_view key, const std::deque<std::string>& deq);
+    static size_t entry_cost(std::string_view key, const list_inner& deq);
     static size_t entry_cost(std::string_view key, const set_inner& members);
     static size_t entry_cost(std::string_view key, const hash_inner& fields);
     static size_t entry_cost(std::string_view key, const zset_inner& members);

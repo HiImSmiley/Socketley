@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
+#include <deque>
 #include <map>
 #include <limits>
 #include <set>
@@ -2285,4 +2286,66 @@ TEST_CASE("zset_inner agrees with a model, small and after the skiplist takes ov
         if (universe == 60) CHECK_FALSE(z.order.big());
         else                CHECK(z.order.big());
     }
+}
+
+TEST_CASE("string_ring agrees with a deque through both ends and the middle")
+{
+    uint32_t r = 99;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+  // Kept under 100 the whole run it is only ever the ring; left to grow it
+  // moves to the deque at BIG_AT and is checked there too.
+  for (const size_t cap : { size_t{100}, size_t{1} << 30 })
+  {
+    string_ring ring;
+    std::deque<std::string> ref;
+    for (int step = 0; step < 50000; ++step)
+    {
+        while (ref.size() >= cap) { ring.pop_back(); ref.pop_back(); }
+        // Past SSO now and then, so a move that loses the heap block shows.
+        const std::string v = (rnd() % 3 ? "v" : std::string(40, 'L')) + std::to_string(step);
+        switch (rnd() % 8)
+        {
+            case 0: ring.push_front(v); ref.push_front(v); break;
+            case 1: ring.emplace_back(v); ref.emplace_back(v); break;
+            case 2: if (!ref.empty()) { ring.pop_front(); ref.pop_front(); } break;
+            case 3: if (!ref.empty()) { ring.pop_back(); ref.pop_back(); } break;
+            case 4:
+            {
+                const size_t i = ref.empty() ? 0 : rnd() % (ref.size() + 1);
+                ring.insert(ring.begin() + static_cast<long>(i), v);
+                ref.insert(ref.begin() + static_cast<long>(i), v);
+                break;
+            }
+            case 5:
+                if (!ref.empty())
+                {
+                    const size_t i = rnd() % ref.size();
+                    ring.erase(ring.begin() + static_cast<long>(i));
+                    ref.erase(ref.begin() + static_cast<long>(i));
+                }
+                break;
+            case 6: if (!ref.empty()) { const size_t i = rnd() % ref.size(); ring[i] = v; ref[i] = v; } break;
+            default: ring.push_back(v); ref.push_back(v); break;
+        }
+        REQUIRE(ring.size() == ref.size());
+        if (step % 997 == 0)
+        {
+            for (size_t i = 0; i < ref.size(); ++i) REQUIRE(ring[i] == ref[i]);
+            if (!ref.empty()) { CHECK(ring.front() == ref.front()); CHECK(ring.back() == ref.back()); }
+            string_ring copy(ring);
+            CHECK(copy == ring);
+            string_ring moved(std::move(copy));
+            CHECK(moved == ring);
+        }
+    }
+    size_t i = 0;
+    for (const auto& s : ring) CHECK(s == ref[i++]);
+    // Backwards from end(), as LREM with a negative count walks it.
+    auto e = ring.end();
+    size_t j = ref.size();
+    while (e != ring.begin()) { --e; CHECK(*e == ref[--j]); }
+    CHECK(ring.big() == (cap > 100));
+    ring.clear();
+    CHECK(ring.empty());
+  }
 }

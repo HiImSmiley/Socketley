@@ -25,7 +25,7 @@ size_t cache_store::entry_cost(std::string_view key, const std::string& val)
     return stored_string(key) + stored_string(val);
 }
 
-size_t cache_store::entry_cost(std::string_view key, const std::deque<std::string>& deq)
+size_t cache_store::entry_cost(std::string_view key, const list_inner& deq)
 {
     size_t bytes = stored_string(key);
     for (const auto& e : deq) bytes += stored_string(e);
@@ -434,7 +434,7 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
         return false;
 
-    auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
+    auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
     nit->second.emplace_front(val);
     ++m_list_elems;
     track_add(entry_cost(nit->first, nit->second));
@@ -464,7 +464,7 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
     if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
         return false;
 
-    auto nit = m_lists.emplace(std::string(key), std::deque<std::string>{}).first;
+    auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
     nit->second.emplace_back(val);
     ++m_list_elems;
     track_add(entry_cost(nit->first, nit->second));
@@ -529,7 +529,7 @@ int cache_store::llen(std::string_view key) const
     return static_cast<int>(it->second.size());
 }
 
-const std::deque<std::string>* cache_store::list_ptr(std::string_view key) const
+const list_inner* cache_store::list_ptr(std::string_view key) const
 {
     auto it = m_lists.find(key);
     if (it == m_lists.end())
@@ -1898,7 +1898,7 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
     auto dit = m_lists.find(dst);
     if (dit == m_lists.end())
-        dit = m_lists.emplace(std::string(dst), std::deque<std::string>{}).first;
+        dit = m_lists.emplace(std::string(dst), list_inner{}).first;
     if (to_head) dit->second.push_front(out); else dit->second.push_back(out);
     ++m_list_elems;
     track_add(stored_string(out));
@@ -2892,7 +2892,7 @@ bool cache_store::load_v2(const char* data, size_t size)
             {
                 uint32_t count = 0;
                 if (!read_u32(count)) return false;
-                std::deque<std::string> deq;
+                list_inner deq;
                 for (uint32_t i = 0; i < count; i++)
                 {
                     std::string elem;
@@ -3037,7 +3037,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                 uint32_t count = 0;
                 file.read(reinterpret_cast<char*>(&count), sizeof(count));
                 if (!file) return false;
-                std::deque<std::string> deq;
+                list_inner deq;
                 for (uint32_t i = 0; i < count; i++)
                 {
                     std::string elem;
@@ -3181,7 +3181,7 @@ void cache_store::adopt_loaded_string(std::string&& key, std::string&& value)
     touch_lru(it->first);
 }
 
-void cache_store::adopt_loaded_list(std::string&& key, std::deque<std::string>&& deq)
+void cache_store::adopt_loaded_list(std::string&& key, list_inner&& deq)
 {
     m_list_elems += deq.size();
     auto it = m_lists.insert_or_assign(std::move(key), std::move(deq)).first;
