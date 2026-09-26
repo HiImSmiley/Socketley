@@ -1017,14 +1017,14 @@ private:
                    std::string_view message)
             {
                 // Skipped when the daemon has said there is nobody on the
-                // other side, because encode_publish() and frame() each copy
-                // the whole payload and write() copies it a third time -- and
-                // on a busy channel the backlog is full, so all three copies
-                // are made on the way to being dropped.
+                // other side, and built in place past the backlog check, so a
+                // frame costs one copy and a refused one none.
                 if (m_publish_interest &&
-                    !m_writer.write(worker_proto::frame(
-                        worker_proto::frame_type::publish,
-                        worker_proto::encode_publish(cache_name, channel, message)))) {}
+                    !m_writer.write_with(
+                        worker_proto::publish_frame_size(cache_name, channel, message),
+                        [&](std::string& out) {
+                            worker_proto::append_publish_frame(out, cache_name, channel, message);
+                        })) {}
 
                 // The daemon fans this back out to every worker EXCEPT this
                 // one, so delivering here is not a duplicate — it is the only

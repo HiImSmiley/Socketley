@@ -324,3 +324,19 @@ TEST_CASE("a manager that was never marked is still the daemon's")
     CHECK(mgr.get("made")->get_type() == runtime_server);
     CHECK(mgr.remove("made"));
 }
+
+TEST_CASE("a publish frame built in place is the frame built in three steps")
+{
+    const std::string big(70000, 'm');
+    for (auto [c, ch, m] : { std::tuple<std::string_view, std::string_view, std::string_view>{ "cache", "news", "hello" },
+                             { "", "", "" },
+                             { "c", "ch with space\n", big } })
+    {
+        std::string in_place;
+        worker_proto::append_publish_frame(in_place, c, ch, m);
+        const std::string built = worker_proto::frame(worker_proto::frame_type::publish,
+                                                      worker_proto::encode_publish(c, ch, m));
+        CHECK(in_place == built);
+        CHECK(in_place.size() == worker_proto::publish_frame_size(c, ch, m));
+    }
+}

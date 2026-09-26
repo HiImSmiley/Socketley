@@ -936,6 +936,26 @@ inline std::string encode_publish(std::string_view cache_name,
     return out;
 }
 
+// The same frame appended in place, for the one sender that writes it per
+// message: a publish frame built as a string, framed as another and appended
+// as a third was three copies of every message on its way out of a cache.
+inline size_t publish_frame_size(std::string_view cache_name, std::string_view channel,
+                                 std::string_view message)
+{
+    return header_size + 12 + cache_name.size() + channel.size() + message.size();
+}
+
+inline void append_publish_frame(std::string& out, std::string_view cache_name,
+                                 std::string_view channel, std::string_view message)
+{
+    put_u32(out, static_cast<uint32_t>(12 + cache_name.size() + channel.size() + message.size()));
+    put_u16(out, version);
+    put_u16(out, static_cast<uint16_t>(frame_type::publish));
+    put_str(out, cache_name);
+    put_str(out, channel);
+    put_str(out, message);
+}
+
 inline bool decode_publish(std::string_view payload, publish_wire& p)
 {
     reader r(payload.data(), payload.size());

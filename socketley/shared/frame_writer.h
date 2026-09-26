@@ -103,6 +103,20 @@ public:
         return true;
     }
 
+    // write() for a frame built straight into the queue: `fill` appends
+    // exactly `size` bytes, and is not called for a frame the cap refuses.
+    template <class Fill>
+    bool write_with(size_t size, Fill&& fill)
+    {
+        if (!m_gate.admit(pending(), size, MAX_BACKLOG,
+                          "frame writer: backlog full; the peer is not reading"))
+            return false;
+        fill(m_out);
+        if (!m_loop)
+            blocking_flush();
+        return true;
+    }
+
     void flush()
     {
         if (m_loop)
