@@ -18,9 +18,9 @@
 
 using string_map = key_table<std::string>;
 using list_map = key_table<std::deque<std::string>>;
-using set_inner = std::unordered_set<std::string, string_hash, string_equal>;
+using set_inner = key_set;
 using set_map = key_table<set_inner>;
-using hash_inner = std::unordered_map<std::string, std::string, string_hash, string_equal>;
+using hash_inner = key_table<std::string>;
 using hash_map = key_table<hash_inner>;
 
 // A sorted set is two views of one thing: scores by member, and members in
@@ -29,8 +29,8 @@ using hash_map = key_table<hash_inner>;
 // sits -- see zskiplist.h for the sweep that settled it.
 struct zset_inner
 {
-    std::unordered_map<std::string, double, string_hash, string_equal> score;
-    zskiplist                                                          order;
+    key_table<double> score;
+    zskiplist         order;
 
     size_t size() const { return score.size(); }
     bool   empty() const { return score.empty(); }

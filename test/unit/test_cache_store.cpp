@@ -2080,3 +2080,64 @@ TEST_CASE("SCAN over a keyspace with deletes between pages returns every key tha
         if (store.exists(k)) CHECK(got.count(k) == 1);
     }
 }
+
+TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and removals")
+{
+    zskiplist z;
+    std::set<std::pair<double, std::string>> ref;
+    std::map<std::string, double> score;
+    uint32_t r = 12345;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    for (int step = 0; step < 60000; ++step)
+    {
+        // Long names too, so the member lives outside the string object.
+        const std::string m = (rnd() % 3 ? "m" : "a-member-name-past-sso-") + std::to_string(rnd() % 2000);
+        const double sc = static_cast<double>(rnd() % 500);
+        auto it = score.find(m);
+        if (rnd() % 4 == 0)
+        {
+            if (it != score.end())
+            {
+                CHECK(z.erase(it->second, m) == 1);
+                ref.erase({ it->second, m });
+                score.erase(it);
+            }
+            else
+                CHECK(z.erase(sc, m) == 0);
+        }
+        else if (it != score.end())
+        {
+            std::string name;
+            REQUIRE(z.extract(it->second, m, name));
+            CHECK(name == m);
+            ref.erase({ it->second, m });
+            z.emplace(sc, std::move(name));
+            ref.insert({ sc, m });
+            it->second = sc;
+        }
+        else
+        {
+            z.emplace(sc, m);
+            ref.insert({ sc, m });
+            score[m] = sc;
+        }
+        if (step % 5000 == 0 || step == 59999)
+        {
+            REQUIRE(z.size() == ref.size());
+            size_t i = 0;
+            for (auto zit = z.begin(); zit != z.end(); ++zit, ++i)
+            {
+                auto rit = std::next(ref.begin(), static_cast<long>(i));
+                CHECK(*zit == *rit);
+                CHECK(z.rank(rit->first, rit->second) == i);
+                CHECK(*z.at(i) == *rit);
+            }
+            if (!ref.empty())
+                CHECK(*std::prev(z.end()) == *ref.rbegin());
+        }
+    }
+    zskiplist copy(z);
+    CHECK(copy.size() == z.size());
+    zskiplist moved(std::move(copy));
+    CHECK(moved.size() == z.size());
+}

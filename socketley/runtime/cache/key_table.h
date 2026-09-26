@@ -34,8 +34,8 @@ public:
     // std::pair; the key's bytes follow the struct in the same block.
     struct entry
     {
-        std::string_view first;
-        V                second;
+        std::string_view                 first;
+        [[no_unique_address]] V          second;
     };
 
 private:
@@ -136,8 +136,45 @@ public:
     using const_local_iterator = basic_local_iterator<true>;
 
     key_table() = default;
-    key_table(const key_table&) = delete;
-    key_table& operator=(const key_table&) = delete;
+    key_table(const key_table& o)
+    {
+        if (o.m_cap == 0)
+            return;
+        m_slots = static_cast<slot*>(std::calloc(o.m_cap, sizeof(slot)));
+        if (!m_slots)
+            throw std::bad_alloc();
+        m_cap = o.m_cap;
+        try
+        {
+            // Slot for slot, tombstones included, so the copy probes alike.
+            for (size_t i = 0; i < m_cap; ++i)
+            {
+                const slot& src = o.m_slots[i];
+                if (src.e)
+                {
+                    m_slots[i] = { src.h, make_entry(src.e->first, src.e->second) };
+                    ++m_size;
+                }
+                else
+                    m_slots[i] = { src.h, nullptr };
+            }
+        }
+        catch (...)
+        {
+            release();
+            throw;
+        }
+        m_tombs = o.m_tombs;
+    }
+    key_table& operator=(const key_table& o)
+    {
+        if (this != &o)
+        {
+            key_table copy(o);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
     key_table(key_table&& o) noexcept { steal(o); }
     key_table& operator=(key_table&& o) noexcept
     {
@@ -244,7 +281,9 @@ public:
 
 private:
     static constexpr size_t NPOS = ~size_t{0};
-    static constexpr size_t MIN_CAP = 16;
+    // Small, because a hash or set held as a value is often a handful of
+    // fields and pays for its slots whether they are used or not.
+    static constexpr size_t MIN_CAP = 4;
 
     slot*    m_slots{nullptr};
     size_t   m_cap{0};
@@ -356,4 +395,74 @@ private:
         m_tombs = o.m_tombs; m_epoch = o.m_epoch + 1;
         o.m_slots = nullptr; o.m_cap = o.m_size = o.m_tombs = 0;
     }
+};
+
+// The members of a set: a key_table whose entries carry no value, iterated as
+// the keys themselves.
+class key_set
+{
+    struct none {};
+    using table = key_table<none>;
+    table m_t;
+
+public:
+    class const_iterator
+    {
+        table::const_iterator m_it;
+        friend class key_set;
+        explicit const_iterator(table::const_iterator it) : m_it(it) {}
+
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type        = std::string_view;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = const std::string_view&;
+        using pointer           = const std::string_view*;
+
+        const_iterator() = default;
+        reference operator*()  const { return m_it->first; }
+        pointer   operator->() const { return &m_it->first; }
+        const_iterator& operator++() { ++m_it; return *this; }
+        const_iterator  operator++(int) { auto c = *this; ++m_it; return c; }
+        friend bool operator==(const const_iterator& a, const const_iterator& b) { return a.m_it == b.m_it; }
+        friend bool operator!=(const const_iterator& a, const const_iterator& b) { return a.m_it != b.m_it; }
+    };
+    using iterator = const_iterator;
+
+    class const_local_iterator
+    {
+        table::const_local_iterator m_it;
+
+    public:
+        explicit const_local_iterator(table::const_local_iterator it) : m_it(it) {}
+        const std::string_view& operator*() const { return m_it->first; }
+        const_local_iterator& operator++() { ++m_it; return *this; }
+        friend bool operator==(const const_local_iterator& a, const const_local_iterator& b) { return a.m_it == b.m_it; }
+        friend bool operator!=(const const_local_iterator& a, const const_local_iterator& b) { return a.m_it != b.m_it; }
+    };
+
+    size_t size()  const { return m_t.size(); }
+    bool   empty() const { return m_t.empty(); }
+    const_iterator begin() const { return const_iterator(m_t.begin()); }
+    const_iterator end()   const { return const_iterator(m_t.end()); }
+
+    size_t               bucket_count() const { return m_t.bucket_count(); }
+    const_local_iterator begin(size_t b) const { return const_local_iterator(m_t.begin(b)); }
+    const_local_iterator end(size_t b)   const { return const_local_iterator(m_t.end(b)); }
+    uint32_t             scan_epoch()   const { return m_t.scan_epoch(); }
+
+    std::pair<iterator, bool> insert(std::string_view k)
+    {
+        auto r = m_t.try_emplace(k);
+        return { const_iterator(r.first), r.second };
+    }
+    std::pair<iterator, bool> emplace(std::string_view k) { return insert(k); }
+
+    const_iterator find(std::string_view k) const { return const_iterator(m_t.find(k)); }
+    size_t count(std::string_view k)    const { return m_t.count(k); }
+    bool   contains(std::string_view k) const { return m_t.count(k) != 0; }
+    size_t erase(std::string_view k) { return m_t.erase(k); }
+    iterator erase(const_iterator pos) { return const_iterator(m_t.erase(pos.m_it)); }
+    void   clear() { m_t.clear(); }
+    void   reserve(size_t n) { m_t.reserve(n); }
 };

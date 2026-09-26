@@ -67,8 +67,9 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
             // in there twice.
             if (sit->second != score)
             {
-                it->second.order.erase({sit->second, sit->first});
-                it->second.order.emplace(score, sit->first);
+                std::string name;
+                it->second.order.extract(sit->second, sit->first, name);
+                it->second.order.emplace(score, std::move(name));
                 sit->second = score;
             }
             touch_lru(key);
@@ -108,7 +109,7 @@ bool cache_store::zrem(std::string_view key, std::string_view member)
     if (sit == it->second.score.end())
         return false;
 
-    it->second.order.erase({sit->second, sit->first});
+    it->second.order.erase(sit->second, sit->first);
     it->second.score.erase(sit);
     --m_zset_members;
     // The same delta zadd charges, for the same reason.
@@ -675,7 +676,7 @@ int cache_store::sinter(const std::string_view* keys, size_t n,
         bool in_all = true;
         for (size_t i = 0; i < sets.size() && in_all; ++i)
             if (i != smallest && sets[i]->find(m) == sets[i]->end()) in_all = false;
-        if (in_all) out.push_back(m);
+        if (in_all) out.emplace_back(m);
     }
     return 0;
 }
@@ -690,7 +691,7 @@ int cache_store::sunion(const std::string_view* keys, size_t n,
         const set_inner* sp = set_ptr(keys[i]);
         if (!sp) continue;
         for (const auto& m : *sp)
-            if (seen.insert(m).second) out.push_back(m);
+            if (seen.insert(m).second) out.emplace_back(m);
     }
     return 0;
 }
@@ -711,7 +712,7 @@ int cache_store::sdiff(const std::string_view* keys, size_t n,
             const set_inner* sp = set_ptr(keys[i]);
             if (sp && sp->find(m) != sp->end()) elsewhere = true;
         }
-        if (!elsewhere) out.push_back(m);
+        if (!elsewhere) out.emplace_back(m);
     }
     return 0;
 }
@@ -1958,9 +1959,9 @@ bool cache_store::srandmember(std::string_view key, std::string& out) const
 
 // What a pattern is matched against, which is the element itself in a set and
 // the field or member name in the other two.
-static inline std::string_view scan_key_of(const std::string& s) { return s; }
-template <typename A, typename B>
-static inline std::string_view scan_key_of(const std::pair<A, B>& p) { return p.first; }
+static inline std::string_view scan_key_of(std::string_view s) { return s; }
+template <typename E>
+static inline std::string_view scan_key_of(const E& e) { return e.first; }
 
 // ─── One collection, scanned ───
 //
@@ -1989,10 +1990,11 @@ static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
     const uint32_t was_buckets = static_cast<uint32_t>((cursor >> 32) & 0xFFFFFFu);
     size_t         bucket      = static_cast<size_t>(cursor & 0xFFFFFFFFu);
     const size_t   nbuckets    = map.bucket_count();
+    const size_t   shape       = scan_shape(map);
 
     // A table that has been rehashed under the caller is one this cursor
     // cannot resume into, so it starts again rather than reporting a slice.
-    if (was_buckets != 0 && was_buckets != (nbuckets & 0xFFFFFFu))
+    if (was_buckets != 0 && was_buckets != (shape & 0xFFFFFFu))
         bucket = 0;
 
     size_t emitted = 0, examined = 0;
@@ -2007,7 +2009,7 @@ static uint64_t scan_one_collection(const Map& map, uint64_t cursor,
         // Whole buckets only: half of one would need an element index the
         // cursor has no room for.
         if ((bound_by_examined ? examined : emitted) >= count && b + 1 < nbuckets)
-            return ((static_cast<uint64_t>(nbuckets) & 0xFFFFFFu) << 32)
+            return ((static_cast<uint64_t>(shape) & 0xFFFFFFu) << 32)
                  | (static_cast<uint64_t>(b + 1) & 0xFFFFFFFFu);
     }
     return 0;

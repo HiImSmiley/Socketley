@@ -9624,11 +9624,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { repl_refuse(args[1]); zlog = false; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int zadded = 0;
+            // The member's current score is only asked for by a flag.
+            const bool zask = znx || zxx || zgt || zlt || zch;
             for (size_t zi = 0; zi < zscores.size(); ++zi)
             {
                 const int i = zfirst + static_cast<int>(zi) * 2;
                 double zcur = 0.0;
-                const bool zhad = m_store.zscore(args[1], args[i + 1], zcur);
+                const bool zhad = zask && m_store.zscore(args[1], args[i + 1], zcur);
                 if ((znx && zhad) || (zxx && !zhad) ||
                     (zhad && zgt && !(zscores[zi] > zcur)) ||
                     (zhad && zlt && !(zscores[zi] < zcur)))
