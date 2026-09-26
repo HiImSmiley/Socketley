@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: every SDK example still builds against the tree it documents.
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────

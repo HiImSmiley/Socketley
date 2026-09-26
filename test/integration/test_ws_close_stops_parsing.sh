@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: nothing is processed after the connection is marked closing.
 #
 # The read path parsed everything still sitting in the buffer, no matter what an

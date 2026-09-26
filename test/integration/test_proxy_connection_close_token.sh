@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: the proxy reads `close` as a TOKEN in the Connection list,
 # not as the first two letters of the field value.
 #

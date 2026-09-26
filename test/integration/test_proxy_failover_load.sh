@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Three backends under load with one breaking three different ways, run in the
 # --health-check tcp configuration where a stall is not handled: the probe
 # connects to a process that has stopped answering, no request is ever recorded

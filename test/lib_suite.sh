@@ -3,9 +3,12 @@
 
 # A file that measures time or CPU, or that shares the suite's daemon, runs
 # alone: the first measures nothing under load, the second has no daemon of
-# its own to run beside anybody.
+# its own to run beside anybody.  A file that isolates without daemon_isolate
+# says so with `# suite: isolated`, which is a claim checked by reading it: 30
+# such files ran alone for 350 s a suite, most of the serial phase.
 suite_wants_serial() {   # file -> 0 when it must run alone
     grep -q '^# suite: quiet' "$1" && return 0
+    grep -q '^# suite: isolated' "$1" && return 1
     grep -q 'daemon_isolate' "$1" || return 0
     return 1
 }

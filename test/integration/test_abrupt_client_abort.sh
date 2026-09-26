@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A client that vanishes by RST with a reply still owed must be torn down,
 # provoked against a slow-echoing proxy and a cache pipelining hundreds of KiB
 # -- catching a connection never reaped, descriptors held past it, collateral

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: the server and the proxy agree about where a request ends.
 #
 # ─── THE DEFECT ─────────────────────────────────────────────────────────────

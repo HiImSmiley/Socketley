@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: HTTP proxy routing through an @group backend.
 #
 # Group backends are resolved per connection, so the group entry in m_backends

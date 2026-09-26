@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Its own daemon on its own socket and state directory, because on the shared
 # one a `create` for a name an earlier run had left behind failed into `||
 # true` and every assertion was satisfied by whatever `ps` happened to list.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: what a routed connection is called, and what a stale name does.
 #
 # Almost every assertion here is about a message that must NOT arrive, so the

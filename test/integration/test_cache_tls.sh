@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # TLS on a cache listener: a real handshake with RESP and the line protocol
 # over the encrypted stream, no downgrade for a plaintext client, mutual TLS,
 # aborts that do not accumulate, every incomplete flag set refused rather than

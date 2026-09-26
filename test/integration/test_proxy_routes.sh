@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A Lua script declares its routes, the daemon publishes them, and the proxy
 # refuses at the edge what the handler would have refused anyway -- so the
 # method list lives in one place rather than two that drift.

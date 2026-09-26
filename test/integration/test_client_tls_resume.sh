@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A client that reconnects should not buy the same certificate twice.  The peer
 # here is the oracle: python reports session_reused per connection, so what is
 # asserted is the server's own view of whether it did a full handshake, not a

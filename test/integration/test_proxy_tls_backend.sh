@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: a proxy speaking TLS -- to its backend, and to its clients.
 #
 # Both directions are documented.  socketley.1 gives --tls ("Enable TLS

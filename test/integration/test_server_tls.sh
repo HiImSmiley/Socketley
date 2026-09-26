@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # TLS on a server listener: a real handshake with data intact both ways, no
 # downgrade for a plaintext client and no splice leaking plaintext, aborts that
 # do not accumulate, mutual TLS, every incomplete flag set refused rather than

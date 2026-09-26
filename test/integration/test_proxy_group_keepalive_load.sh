@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # An @group HTTP gateway under concurrent keep-alive load with members joining
 # and leaving, because only the first request on a connection was rewritten and
 # the rest reached the member with the gateway's prefix still on them -- with

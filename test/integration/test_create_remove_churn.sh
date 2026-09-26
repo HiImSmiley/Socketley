@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Forty-five create/serve/remove cycles over three runtime types on one
 # deliberately reused port, because SO_REUSEPORT means a listener that outlived
 # its runtime silently takes a share of the next one's connections rather than

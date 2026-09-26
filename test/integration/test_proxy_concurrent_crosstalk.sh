@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A client that died first left a deferred backend holding a client_fd whose
 # number the next accept reuses within microseconds, so the stale backend
 # spliced into a stranger's socket -- and the fix clears the back-reference and

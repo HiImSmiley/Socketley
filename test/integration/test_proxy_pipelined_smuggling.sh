@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Only the first message in the buffer is validated while everything past the
 # first blank line was appended verbatim, so a second request carrying both
 # Content-Length and Transfer-Encoding reached the backend untouched --

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # detach_and_pool_backend's fallback for a backend with a completion owed
 # closed the whole pair, and a backend read is armed essentially all of the
 # time, so the client was torn down after every response despite keep-alive --

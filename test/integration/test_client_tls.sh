@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A client that encrypts and trusts anybody looks exactly like one that
 # encrypts and checks, right up until somebody stands in the middle, so most of
 # what is asserted here are refusals -- an unknown CA, an expired certificate,

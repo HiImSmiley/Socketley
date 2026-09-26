@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # A runtime restarted with traffic in flight comes back whole, which is the
 # only moment a fresh setup() runs over state a teardown() decided to keep --
 # catching a lost runtime, one answering wrongly, and descriptors or memory

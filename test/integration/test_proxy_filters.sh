@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # The filter chain runs before a backend is chosen, which a status code cannot
 # test, so the oracle is the backend's own accept and byte counters -- both,
 # because a pooled socket would carry a rejected request without moving the

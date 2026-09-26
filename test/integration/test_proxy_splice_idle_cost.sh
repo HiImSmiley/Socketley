@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: what a --protocol tcp proxy costs while nothing is happening.
 #
 # A TCP proxy forwards with splice, and io_uring never runs IORING_OP_SPLICE on

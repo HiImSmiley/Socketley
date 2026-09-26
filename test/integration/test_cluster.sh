@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Three daemons on one host with separate sockets and a shared cluster
 # directory, verifying discovery, group resolution and proxy @group routing --
 # a simulation, because a real member has a namespace to itself and finds its

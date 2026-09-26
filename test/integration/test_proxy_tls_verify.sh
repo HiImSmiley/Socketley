@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: what a proxy's TLS backend leg refuses.
 #
 # test_proxy_tls_backend.sh proves the transport works.  This one proves it is

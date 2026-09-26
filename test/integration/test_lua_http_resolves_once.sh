@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: socketley.http() asks the resolver once per host, not once
 # per call -- and asks again as soon as the address it kept stops working.
 #

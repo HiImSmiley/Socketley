@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Two daemons with a shared cluster directory running scripts that exercise
 # socketley.cluster.* and the on_cluster_* callbacks -- a simulation, since
 # members find each other through the directory and the addresses they

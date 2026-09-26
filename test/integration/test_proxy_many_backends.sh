@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: isolated -- a daemon, socket and port window of its own, so it runs beside the others
 # Integration test: a proxy with more backends than the old fixed-size buffer held.
 #
 # Random selection over healthy backends collected the available indices into a
