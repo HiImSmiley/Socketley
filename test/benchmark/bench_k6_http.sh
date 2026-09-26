@@ -267,7 +267,8 @@ test_http_arm() {
     server_cores=$(socketley_cores_since "$c0" "$c1" "$t0" "$t1")
 
     if awk -v c="$server_cores" 'BEGIN { exit !(c < 0.5) }'; then
-        log_warn "  server used ${server_cores} cores — this rate is k6's ceiling, not the server's"
+        log_warn "  server used ${server_cores} cores — this rate is k6's ceiling, not the server's;" \
+                 "read the per-stage latencies here and the wrk rows for throughput"
     else
         log_info "  server used ${server_cores} cores"
     fi
@@ -282,6 +283,55 @@ test_http_arm() {
     socketley_cmd stop bench_k6_http
     sleep 0.5
     socketley_cmd remove bench_k6_http
+}
+
+# Throughput of the same files from a client that can saturate the server.
+#
+# k6 left the server at 0.27-0.30 cores on 2026-09-26, so its 13 k req/s was
+# k6's ceiling and said nothing about static serving; it stays as the latency
+# profile under its load shape, and this is the rate.  The server's cores are
+# printed beside it, and a row under 0.9 says wrk was the limit instead.
+WRK_THREADS=${WRK_THREADS:-4}
+WRK_CONNS=${WRK_CONNS:-64}
+WRK_SECS=${WRK_SECS:-5}
+
+test_http_wrk_arm() {   # mode flag
+    local mode=$1 flag=$2 path out rps p50 p99 c0 c1 t0 t1 cores
+
+    log_section "Test: wrk HTTP Static Serving (${mode}, ${WRK_THREADS} threads x ${WRK_CONNS} connections, ${WRK_SECS}s)"
+
+    socketley_cmd stop bench_wrk_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_wrk_http 2>/dev/null
+    wait_for_port_free $HTTP_PORT
+    socketley_cmd create server bench_wrk_http -p $HTTP_PORT --http "$HTTP_ROOT" $flag -s
+    wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
+    sleep 0.5
+
+    for path in index.html large.bin; do
+        c0=$(socketley_cpu_ticks); t0=$(date +%s%N)
+        out=$(timeout 60 wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"${WRK_SECS}s" --latency \
+              "http://127.0.0.1:${HTTP_PORT}/${path}" 2>&1)
+        t1=$(date +%s%N); c1=$(socketley_cpu_ticks)
+        cores=$(socketley_cores_since "$c0" "$c1" "$t0" "$t1")
+        rps=$(awk '/^Requests\/sec:/ { print $2 }' <<<"$out")
+        p50=$(awk '$1 == "50%" { print $2 }' <<<"$out")
+        p99=$(awk '$1 == "99%" { print $2 }' <<<"$out")
+        if grep -qE 'Non-2xx|Socket errors' <<<"$out"; then
+            log_error "  /${path}: $(grep -E 'Non-2xx|Socket errors' <<<"$out" | tr -s ' ')"
+        fi
+        if awk -v c="$cores" 'BEGIN { exit !(c < 0.9) }'; then
+            log_warn "  /${path}: ${rps} req/s  p50 ${p50}  p99 ${p99}  server ${cores} cores — wrk was the limit"
+        else
+            log_success "  /${path}: ${rps} req/s  p50 ${p50}  p99 ${p99}  server ${cores} cores"
+        fi
+        append_result
+        write_json_result "wrk_http_${mode}_${path%%.*}" "$RESULTS_FILE" \
+            "requests_per_sec" "${rps:-0}" "p50" "${p50}" "p99" "${p99}" \
+            "server_cores" "${cores:-0}" "connections" "$WRK_CONNS"
+    done
+
+    socketley_cmd stop bench_wrk_http
+    sleep 0.5
+    socketley_cmd remove bench_wrk_http
 }
 
 # Main
@@ -302,6 +352,19 @@ run_k6_http_benchmarks() {
     log_bench "START" "k6_http_cached"
     test_http_arm cached "--http-cache"
     log_bench "DONE" "k6_http_cached"
+    fresh_daemon
+
+    if command -v wrk >/dev/null 2>&1; then
+        log_bench "START" "wrk_http_disk"
+        test_http_wrk_arm disk ""
+        log_bench "DONE" "wrk_http_disk"
+        fresh_daemon
+        log_bench "START" "wrk_http_cached"
+        test_http_wrk_arm cached "--http-cache"
+        log_bench "DONE" "wrk_http_cached"
+    else
+        log_warn "wrk not installed: no HTTP throughput row, only k6's latency profile"
+    fi
 
     echo "]" >> "$RESULTS_FILE"
 

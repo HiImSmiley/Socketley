@@ -92,7 +92,13 @@ print(f'{error_val * 100:.4f}')
 
     log_success "Connections: $ws_conns  Messages sent: $ws_msgs  Echoes: $ws_echoes"
     log_success "Messages/sec: $msgs_rate"
-    log_success "RTT avg: ${rtt_avg}ms  p50: ${rtt_p50}ms  p95: ${rtt_p95}ms  p99: ${rtt_p99}ms"
+    # Not printed as a latency: ws_bench.js times an echo with Date.now(), whole
+    # milliseconds, and a loopback echo takes about 12 us, so every sample is 0
+    # or 1 and the "p50 0 ms" of 2026-09-26 was rounding.  socketley_bench ws
+    # echo in bench_websocket.sh times the same echo in microseconds.
+    log_info "RTT: not measurable here (k6's clock is whole ms; the echo is ~12 us) --" \
+             "see ws echo in bench_websocket.sh"
+    log_info "server used ${K6_WS_SERVER_CORES:-?} cores$(awk -v c="${K6_WS_SERVER_CORES:-0}" 'BEGIN { if (c < 0.5) printf " — this rate is k6'"'"'s ceiling, not the server'"'"'s" }')"
     log_success "Error rate: ${error_rate}%"
 
     append_result
@@ -101,10 +107,9 @@ print(f'{error_val * 100:.4f}')
         "ws_messages_sent"  "$ws_msgs" \
         "ws_echoes_received" "$ws_echoes" \
         "messages_per_sec"  "$msgs_rate" \
-        "rtt_avg_ms"        "$rtt_avg" \
-        "rtt_p50_ms"        "$rtt_p50" \
-        "rtt_p95_ms"        "$rtt_p95" \
-        "rtt_p99_ms"        "$rtt_p99" \
+        "rtt_resolution_ms" "1" \
+        "rtt_usable"        "0" \
+        "server_cores"      "${K6_WS_SERVER_CORES:-0}" \
         "error_rate_percent" "$error_rate"
 }
 
@@ -112,7 +117,7 @@ print(f'{error_val * 100:.4f}')
 test_ws_echo() {
     local test_name="k6_ws_echo"
 
-    log_section "Test: k6 WebSocket Echo (throughput & latency)"
+    log_section "Test: k6 WebSocket Echo (throughput under k6's load shape)"
 
     write_echo_lua
 
@@ -123,6 +128,8 @@ test_ws_echo() {
     sleep 0.5
 
     local k6_export="/tmp/k6_ws_echo_${TIMESTAMP}.json"
+    local c0 c1 t0 t1
+    c0=$(socketley_cpu_ticks); t0=$(date +%s%N)
     timeout "$BENCH_TIMEOUT_K6" k6 run \
         --summary-export "$k6_export" \
         --env WS_URL="ws://localhost:${WS_PORT}" \
@@ -131,6 +138,8 @@ test_ws_echo() {
     if [[ $? -eq 124 ]]; then
         log_bench "TIMEOUT" "k6 ws echo"
     fi
+    t1=$(date +%s%N); c1=$(socketley_cpu_ticks)
+    K6_WS_SERVER_CORES=$(socketley_cores_since "$c0" "$c1" "$t0" "$t1")
 
     if [[ -f "$k6_export" ]]; then
         parse_k6_ws_summary "$k6_export" "$test_name"

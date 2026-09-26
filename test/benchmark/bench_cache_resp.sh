@@ -32,6 +32,12 @@ RESULTS_FILE="${RESULTS_DIR}/cache_resp_${TIMESTAMP}.json"
 TESTS="SET,GET,LPUSH,LPOP,SADD,HSET"
 OPS="SET GET LPUSH LPOP SADD HSET"
 CLIENTS=50
+# Client processes per arm, each with CLIENTS connections -- the README's four.
+# One redis-benchmark pegs at 1.0 core near 200k ops/s here, so a single one
+# measured itself at depth 1: every row of 2026-09-26 read "client-bound (0.98
+# cores)", and at depth 100 the cache read 5.6 M SET/s where four clients read
+# 11.6 M.
+CLIENT_PROCS=${BENCH_RESP_CLIENT_PROCS:-4}
 # Positional argument wins, then the environment, then the default.
 PAIRS=${1:-${BENCH_RESP_PAIRS:-3}}
 
@@ -135,64 +141,96 @@ calc_ratio() {
 # One leg: all six operations in one redis-benchmark invocation, with the
 # client's own CPU beside them.  Sampled while it runs rather than read after
 # it exits, because /proc/PID/stat is gone by then.
-run_leg() {   # port pipeline requests outfile -> echoes client cores, or TIMEOUT
+run_leg() {   # port pipeline requests outfile -> echoes the busiest client's cores, or TIMEOUT
     local port=$1 pipeline=$2 requests=$3 out=$4
-    local raw="$out.raw" t0 t1 ticks=0 pid rc t
+    local per=$((requests / CLIENT_PROCS)) t0 t1 i rc=0 spid s0 s1 t
+    local -a pids=() kids=() ticks=()
 
+    spid=$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+    # ss names only this user's processes, and redis-server runs as redis.
+    [[ -z $spid && $port == "$REDIS_PORT" ]] && spid=$(pgrep -x redis-server | head -1)
+    s0=$(cpu_ticks_of "${spid:-0}")
     t0=$(date +%s%N)
-    timeout "$BENCH_TIMEOUT_REDIS" redis-benchmark -p "$port" -c $CLIENTS -n "$requests" \
-        -P "$pipeline" -t "$TESTS" -r 100000 -q --precision 3 >"$raw" 2>/dev/null &
-    pid=$!
+    for ((i = 0; i < CLIENT_PROCS; i++)); do
+        timeout "$BENCH_TIMEOUT_REDIS" redis-benchmark -p "$port" -c $CLIENTS -n "$per" \
+            -P "$pipeline" -t "$TESTS" -r 100000 -q --precision 3 >"$out.raw.$i" 2>/dev/null &
+        pids+=($!); ticks+=(0)
+    done
 
     # timeout(1) forks the process it is timing, so its own /proc entry shows
-    # almost no CPU: sampling the pid $! returns reported 0.00 cores for a
-    # redis-benchmark sitting at a full one.  The child is found once and not
-    # per tick, because pgrep walks all of /proc and doing that every 100 ms is
-    # load the run under measurement then pays for -- the version that did
-    # widened this comparison's interval from 2% to 23%.
-    local child=""
-    for _ in 1 2 3 4 5; do
-        child=$(pgrep -P "$pid" 2>/dev/null | head -1)
-        [[ -n $child ]] && break
-        sleep 0.05
+    # almost no CPU; each child is found once and not per tick, because pgrep
+    # walks all of /proc and that is load the run under measurement pays for.
+    for ((i = 0; i < CLIENT_PROCS; i++)); do
+        kids[$i]=""
+        for _ in 1 2 3 4 5; do
+            kids[$i]=$(pgrep -P "${pids[$i]}" 2>/dev/null | head -1)
+            [[ -n ${kids[$i]} ]] && break
+            sleep 0.05
+        done
     done
-    while kill -0 "$pid" 2>/dev/null; do
-        t=$(cpu_ticks_of "${child:-$pid}")
-        # The last sample before exit is the one that counts, and the sample
-        # taken after it is zero -- keeping only non-zero readings drops that.
-        [[ ${t:-0} -gt 0 ]] && ticks=$t
-        sleep 0.1
+    local alive=1
+    while (( alive )); do
+        alive=0
+        for ((i = 0; i < CLIENT_PROCS; i++)); do
+            kill -0 "${pids[$i]}" 2>/dev/null || continue
+            alive=1
+            t=$(cpu_ticks_of "${kids[$i]:-${pids[$i]}}")
+            # The last sample before exit is the one that counts.
+            [[ ${t:-0} -gt 0 ]] && ticks[$i]=$t
+        done
+        (( alive )) && sleep 0.1
     done
-    wait "$pid"; rc=$?
+    for ((i = 0; i < CLIENT_PROCS; i++)); do
+        wait "${pids[$i]}" || rc=$?
+    done
     t1=$(date +%s%N)
-    sed 's/.*\r//' "$raw" > "$out"
+    s1=$(cpu_ticks_of "${spid:-0}")
 
     if (( rc == 124 )); then
-        # A timeout must not become a NUMBER.  On 2026-08-25 a run timed out
-        # once for socketley at P=100 and the summary then reported
-        # socketley_ops:0 against redis at 2.1M for all six operations -- which
-        # reads as a total failure of the cache and was nothing of the kind.
+        # A timeout must not become a NUMBER: on 2026-08-25 one did, and the
+        # summary reported socketley_ops:0 against redis at 2.1M for all six.
         log_bench "TIMEOUT" "redis-benchmark port $port P=$pipeline"
         echo "TIMEOUT"; return 1
     fi
-    # The parentheses are load-bearing: awk reads `printf fmt, a > b` as a
-    # redirection into the file named by b, so the unbracketed conditional was
-    # a syntax error and every client-CPU reading came out empty.
-    awk -v t="$ticks" -v hz="$HZ" -v ns=$((t1 - t0)) \
-        'BEGIN { printf "%.2f", (ns > 0 ? t / hz / (ns / 1e9) : 0) }'
+
+    # One file in the shape get_ops and get_p50 read: each operation's rate is
+    # the sum over the processes, which ran together, and its p50 their median.
+    : > "$out"
+    for t in $OPS; do
+        local rates="" p50s="" f
+        for ((i = 0; i < CLIENT_PROCS; i++)); do
+            f="$out.raw.$i"
+            rates+=" $(get_ops "$f" "$t" | tail -1)"
+            p50s+=" $(get_p50 "$f" "$t" | tail -1)"
+        done
+        awk -v t="$t" -v r="$rates" -v p="$p50s" 'BEGIN {
+            n = split(r, a, " "); s = 0; for (i = 1; i <= n; i++) s += a[i]
+            m = split(p, b, " "); for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (b[j] < b[i]) { x = b[i]; b[i] = b[j]; b[j] = x }
+            printf "%s: %.2f requests per second, p50=%.3f msec\n", t, s, (m ? b[int((m + 1) / 2)] : 0)
+        }' >> "$out"
+    done
+
+    # The server's cores beside it, in a file because this runs in a subshell.
+    awk -v d=$((s1 - s0)) -v hz="$HZ" -v ns=$((t1 - t0)) \
+        'BEGIN { printf "%.3f\n", (ns > 0 ? d / hz / (ns / 1e9) : 0) }' > "$out.srv"
+
+    # The busiest client, since one pegged process caps the arm whatever the
+    # others do; the parentheses keep awk from reading `a > b` as a redirection.
+    printf '%s\n' "${ticks[@]}" | awk -v hz="$HZ" -v ns=$((t1 - t0)) \
+        '{ if ($1 > m) m = $1 } END { printf "%.2f", (ns > 0 ? m / hz / (ns / 1e9) : 0) }'
 }
 
 # One pipeline depth, as interleaved pairs.  Fills PC_* for every operation,
 # every time, so a caller cannot read a stale value from the depth before.
 declare -A PC_S PC_R PC_RATIO PC_CI PC_SP50 PC_RP50
-PC_KEPT=0; PC_DROPPED=0; PC_BADRUN=0; PC_SCLIENT=0; PC_RCLIENT=0
+PC_KEPT=0; PC_DROPPED=0; PC_BADRUN=0; PC_SCLIENT=0; PC_RCLIENT=0; PC_SSERVER=0; PC_RSERVER=0
 
 paired_case() {   # pipeline requests
     local pipeline=$1 requests=$2
     local -A sv rv rt sp rp
     local kept=0 dropped=0 badrun=0 attempt=0
     local max_attempts=$((PAIRS * 2 + 2))
-    local sc_all="" rc_all="" t a b
+    local sc_all="" rc_all="" ss_all="" rs_all="" t a b
 
     for t in $OPS; do sv[$t]=""; rv[$t]=""; rt[$t]=""; sp[$t]=""; rp[$t]=""; done
 
@@ -242,6 +280,7 @@ paired_case() {   # pipeline requests
             rp[$t]+=" $(get_p50 "$rf" "$t" | tail -1)"
         done
         sc_all+=" $scores"; rc_all+=" $rcores"
+        ss_all+=" $(cat "$sf.srv" 2>/dev/null)"; rs_all+=" $(cat "$rf.srv" 2>/dev/null)"
         kept=$((kept + 1))
     done
 
@@ -251,6 +290,7 @@ paired_case() {   # pipeline requests
     (( kept == 0 )) && return 0
 
     PC_SCLIENT=$(median_of "$sc_all"); PC_RCLIENT=$(median_of "$rc_all")
+    PC_SSERVER=$(median_of "$ss_all"); PC_RSERVER=$(median_of "$rs_all")
     for t in $OPS; do
         PC_S[$t]=$(median_of "${sv[$t]}")
         PC_R[$t]=$(median_of "${rv[$t]}")
@@ -309,8 +349,10 @@ print_comparison() {
 
     echo ""
     log_info "$PC_KEPT pair(s) kept, $PC_DROPPED discarded for box load, $PC_BADRUN with an empty leg"
-    log_info "client cores: ${PC_SCLIENT} against socketley, ${PC_RCLIENT} against redis" \
-             "(one redis-benchmark process caps at 1.0)"
+    log_info "busiest client process: ${PC_SCLIENT} cores against socketley, ${PC_RCLIENT} against redis" \
+             "($CLIENT_PROCS processes per arm; one caps at 1.0)"
+    log_info "server cores: socketley ${PC_SSERVER}, redis ${PC_RSERVER}" \
+             "-- at 1.0 the row is each server's cost per operation"
 }
 
 # Print latency comparison
@@ -346,6 +388,9 @@ write_results_json() {
   "resolution_target_pct": $TARGET_PCT,
   "client_cores_socketley": $PC_SCLIENT,
   "client_cores_redis": $PC_RCLIENT,
+  "server_cores_socketley": $PC_SSERVER,
+  "server_cores_redis": $PC_RSERVER,
+  "client_processes": $CLIENT_PROCS,
   "timestamp": "$(date -Iseconds)",
   "redis_version": "$(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'redis_version:\K\S+')",
   "redis_uptime_s": $(redis-cli -p $REDIS_PORT info server 2>/dev/null | grep -oP 'uptime_in_seconds:\K\d+' || echo 0),
@@ -367,35 +412,53 @@ JEOF
     echo "}" >> "$RESULTS_FILE"
 }
 
-# Compare actual results against README claims
-print_readme_comparison() {
+# This run against the README's own table for the same depth, read from the
+# README itself: the table this replaced was typed in once and still claimed
+# 2.8x and 8.93 M SET/s long after the README said 3.45x and 10.31 M.
+readme_row() {   # depth op -> "rate ratio" from README.md, or nothing
+    local depth=$1 op=$2
+    awk -v d="**Pipeline depth $depth**" -v op="$op" '
+        index($0, d) == 1 { inside = 1; next }
+        inside && /^\*\*Pipeline depth/ { inside = 0 }
+        inside && $0 ~ "^\\| *"op" *\\|" {
+            n = split($0, c, "|")
+            # The first number and its unit, not every digit in the cell: the
+            # spread beside it ("261 K ±21%") is digits too.
+            rate = 0; mul = 1
+            if (match(c[3], /[0-9.]+ *[KM]?/)) {
+                tok = substr(c[3], RSTART, RLENGTH)
+                mul = (tok ~ /M/) ? 1e6 : ((tok ~ /K/) ? 1e3 : 1)
+                gsub(/[ KM]/, "", tok); rate = tok
+            }
+            ratio = c[5]; gsub(/[^0-9.]/, "", ratio)
+            printf "%.0f %s\n", rate * mul, ratio; exit
+        }' "$(dirname "$0")/../../README.md" 2>/dev/null
+}
+
+print_readme_comparison() {   # depth
+    local depth=$1 t row
 
     echo ""
-    log_section "Actual vs README Claims (P=100)"
-
-    # README claimed socketley ops/sec and ratios
-    local -a ops=(SET GET LPUSH LPOP SADD HSET)
-    local -a readme_s=(8930000 10200000 8200000 10400000 7170000 8300000)
-    local -a readme_ratio=("2.8x" "2.5x" "2.8x" "3.9x" "2.0x" "2.8x")
-
-    printf "%-10s  %14s  %14s  %12s  %12s\n" \
-        "Operation" "README Ratio" "Actual Ratio" "README SKT" "Actual SKT"
-    printf "%-10s  %14s  %14s  %12s  %12s\n" \
-        "─────────" "──────────────" "──────────────" "────────────" "────────────"
-
-    for ((i = 0; i < ${#ops[@]}; i++)); do
-        local test=${ops[$i]}
-        printf "%-10s  %14s  %13.1fx  %9s/s  %9s/s\n" \
-            "$test" "${readme_ratio[$i]}" "${PC_RATIO[$test]}" \
-            "$(fmt_ops "${readme_s[$i]}")" "$(fmt_ops "${PC_S[$test]}")"
+    log_section "This run against the README (P=$depth)"
+    printf "%-10s  %12s  %12s  %12s  %12s\n" \
+        "Operation" "README SKT" "This run" "README ratio" "This ratio"
+    printf "%-10s  %12s  %12s  %12s  %12s\n" \
+        "─────────" "────────────" "────────────" "────────────" "────────────"
+    for t in $OPS; do
+        row=$(readme_row "$depth" "$t")
+        [[ -z $row ]] && { printf "%-10s  %12s\n" "$t" "not in README"; continue; }
+        read -r rs rr <<<"$row"
+        printf "%-10s  %10s/s  %10s/s  %11sx  %11.2fx\n" \
+            "$t" "$(fmt_ops "$rs")" "$(fmt_ops "${PC_S[$t]}")" "$rr" "${PC_RATIO[$t]}"
     done
+    log_info "the README's absolute rates are another day's clock; compare the ratios"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────
 
 run_cache_resp_benchmarks() {
     log_section "CACHE vs REDIS BENCHMARK (RESP2, redis-benchmark)"
-    log_info "Methodology: redis-benchmark, $CLIENTS clients, RESP2 protocol"
+    log_info "Methodology: $CLIENT_PROCS redis-benchmark processes x $CLIENTS clients per arm, RESP2 protocol"
     log_info "Pairs per depth: $PAIRS, interleaved; the ratio is the median of the per-pair ratios"
 
     if ! command -v redis-benchmark &>/dev/null; then
@@ -432,7 +495,7 @@ run_cache_resp_benchmarks() {
     sleep 0.5
 
     # ── P=1 ──
-    log_section "Pipeline Depth = 1 ($CLIENTS clients, $(( P1_REQUESTS / 1000 ))K ops)"
+    log_section "Pipeline Depth = 1 ($CLIENT_PROCS x $CLIENTS clients, $(( P1_REQUESTS / 1000 ))K ops)"
 
     log_bench "START" "cache_resp_p1"
     log_info "Measuring both arms in interleaved pairs (P=1)..."
@@ -442,13 +505,14 @@ run_cache_resp_benchmarks() {
     print_comparison "Results: Pipeline Depth = 1"
     print_latency "Latency (P=1)"
     write_results_json 1
+    print_readme_comparison 1
 
     # Flush between runs
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
     fresh_daemon
 
     # ── P=100 ──
-    log_section "Pipeline Depth = 100 ($CLIENTS clients, $(( P100_REQUESTS / 1000 ))K ops)"
+    log_section "Pipeline Depth = 100 ($CLIENT_PROCS x $CLIENTS clients, $(( P100_REQUESTS / 1000 ))K ops)"
 
     log_bench "START" "cache_resp_p100"
     log_info "Measuring both arms in interleaved pairs (P=100)..."
@@ -458,6 +522,7 @@ run_cache_resp_benchmarks() {
     print_comparison "Results: Pipeline Depth = 100"
     print_latency "Latency (P=100)"
     write_results_json 100
+    print_readme_comparison 100
 
     # Cleanup
     socketley_cmd stop bench_cache_resp
@@ -466,9 +531,6 @@ run_cache_resp_benchmarks() {
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
 
     echo "]" >> "$RESULTS_FILE"
-
-    # README comparison
-    print_readme_comparison
 
     rm -rf "$TMPDIR_BENCH"
 

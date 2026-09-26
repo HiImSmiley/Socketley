@@ -802,6 +802,46 @@ bench_nc() {
 # invites reading the cache as 2.4% slower; the server was at a tenth of a core
 # for both and the numbers were k6's.  A rate without the server's own CPU
 # beside it cannot say whose ceiling it is.
+# Refuse to start on a box that is not quiet, and say who is busy.
+#
+# On 2026-09-26 lima-guestagent sat at 1.04-1.36 cores with nothing running --
+# stuck after the connection storms of an earlier run -- and every paired
+# comparison after it discarded all its pairs for box load, which read as an
+# instrument failure until the process was named.  A socketley left running
+# by another run is the other thing this catches.
+check_quiet_box() {
+    local limit=${BENCH_QUIET_START_CORES:-0.5} left busy
+    left=$(pgrep -x socketley 2>/dev/null | wc -l)
+    if (( left > 0 )) && [[ -z ${BENCH_ALLOW_BUSY:-} ]]; then
+        log_error "$left socketley process(es) already running; a benchmark beside them measures both"
+        return 1
+    fi
+    local -A t0
+    local p a b w0 w1
+    for p in /proc/[0-9]*; do
+        t0[${p#/proc/}]=$(awk '{print $14+$15}' "$p/stat" 2>/dev/null)
+    done
+    a=$(awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat); w0=$(date +%s%N)
+    sleep 1
+    b=$(awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat); w1=$(date +%s%N)
+    busy=$(awk -v d=$((b - a)) -v hz="$(getconf CLK_TCK)" -v ns=$((w1 - w0)) \
+        'BEGIN { printf "%.2f", d / hz / (ns / 1e9) }')
+    if awk -v x="$busy" -v l="$limit" 'BEGIN { exit !(x > l) }'; then
+        log_error "the box is busy before anything started: ${busy} cores (limit ${limit})"
+        for p in "${!t0[@]}"; do
+            local now
+            now=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null) || continue
+            [[ -n $now && -n ${t0[$p]} ]] || continue
+            echo "$((now - t0[$p])) $p $(tr -d '\0' < "/proc/$p/comm" 2>/dev/null)"
+        done | sort -rn | head -3 | while read -r d pid name; do
+            (( d > 0 )) && log_error "  ${name} (pid ${pid}): $(awk -v d="$d" -v hz="$(getconf CLK_TCK)" 'BEGIN { printf "%.2f", d / hz }') cores"
+        done
+        [[ -n ${BENCH_ALLOW_BUSY:-} ]] && { log_warn "BENCH_ALLOW_BUSY set: running anyway"; return 0; }
+        return 1
+    fi
+    return 0
+}
+
 socketley_cpu_ticks() {
     local own_exe p exe t=0
     own_exe=$(readlink -f "$SOCKETLEY_BIN" 2>/dev/null) || { echo 0; return; }

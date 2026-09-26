@@ -498,7 +498,8 @@ run_proxy_benchmarks() {
     fresh_daemon
 
     log_bench "START" "proxy_concurrent_connections"
-    test_concurrent_proxy_connections 20 100
+    # 2,000 each: at 100 the whole run was about 15 ms and spread 1.47x.
+    test_concurrent_proxy_connections 20 2000
     log_bench "DONE" "proxy_concurrent_connections"
     fresh_daemon
 

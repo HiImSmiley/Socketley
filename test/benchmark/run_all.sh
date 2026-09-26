@@ -136,12 +136,10 @@ run_benchmarks() {
 
     # Fan-out, which is the one shape none of the tests above measure: every
     # rate before this point is a round trip, and one message in producing N out
-    # is a different question with a different answer.  Three passes and 2 s
-    # runs here, around 80 s; the standalone script defaults to five passes and
-    # 3 s, which is what narrows the interval enough to read a ratio off.
-    export BENCH_FANOUT_PASSES=3 BENCH_FANOUT_RUN_MS=2000
+    # is a different question with a different answer.  The script's own five
+    # passes of 3 s: at three of 2 s the relay row read +-56% on 2026-09-26,
+    # which is no ratio at all.
     run_bench_script "$script_dir/bench_fanout.sh"
-    unset BENCH_FANOUT_PASSES BENCH_FANOUT_RUN_MS
     restart_daemon
 
     run_bench_script "$script_dir/bench_proxy.sh"
@@ -170,8 +168,10 @@ run_benchmarks() {
     # is not set and the interval only narrows as 1/sqrt(pairs): at 7 the same
     # script takes 652 s, and anyone raising the pair count to get a usable
     # interval should not also have to find this line.
-    export BENCH_HAPROXY_RUNS=3
-    BENCH_TIMEOUT_SCRIPT=900 run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
+    # Seven, the script's own default: at three the 8- and 32-connection rows
+    # read +-94% and +-45% on 2026-09-26, which says nothing either way.
+    export BENCH_HAPROXY_RUNS=7
+    BENCH_TIMEOUT_SCRIPT=1500 run_bench_script "$script_dir/bench_proxy_vs_haproxy.sh"
     unset BENCH_HAPROXY_RUNS
     restart_daemon
 
@@ -183,8 +183,10 @@ run_benchmarks() {
     # Its own timeout: seven cases at three seconds a run is minutes, not the
     # tens of seconds the shared BENCH_TIMEOUT_SCRIPT allows, and a benchmark
     # killed mid-write leaves JSON that no longer parses.
-    export BENCH_HTTP_RUNS=3
-    BENCH_TIMEOUT_SCRIPT=900 run_bench_script "$script_dir/bench_proxy_http_vs_haproxy.sh"
+    # Seven for the same reason: at three the 8- and 32-connection
+    # connection-per-request rows read +-29% and +-33%.
+    export BENCH_HTTP_RUNS=7
+    BENCH_TIMEOUT_SCRIPT=1500 run_bench_script "$script_dir/bench_proxy_http_vs_haproxy.sh"
     unset BENCH_HTTP_RUNS
     restart_daemon
 
@@ -271,7 +273,7 @@ EOF
             | "| \(.test)"
             + " | \(if .msg_size then "\(.msg_size) B" else "-" end)"
             + " | \(.metric)"
-            + " | \(.median_round_trips_per_sec // .median_writes_per_sec // .median_connects_per_sec // "-")"
+            + " | \(.median_round_trips_per_sec // .median_pipelined_ops_per_sec // .median_writes_per_sec // .median_connects_per_sec // "-")"
             + " | \(if .min_per_sec then "\(.min_per_sec | floor) .. \(.max_per_sec | floor)" else "-" end)"
             + " | \(if .spread_ratio then "\(.spread_ratio)x\(if .stable == 1 then "" else " (wide)" end)" else "-" end)"
             + " | \(if .median_MB_per_sec then "\(.median_MB_per_sec) MB/s" else "-" end)"
@@ -354,6 +356,7 @@ main() {
     # Pre-flight checks
     check_binary || exit 1
     check_dependencies || exit 1
+    check_quiet_box || exit 1
 
     # Setup
     setup_cleanup_trap

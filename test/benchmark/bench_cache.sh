@@ -906,22 +906,24 @@ run_cache_benchmarks() {
     ensure_socketley_bench || return 1
 
     log_bench "START" "cache_set_throughput"
-    test_set_throughput     10000 64
+    # A million each, because these are pipelined rates above 10 M/s: 10,000
+    # finished in under a millisecond and one run of GET read 1.6x the others.
+    test_set_throughput     1000000 64
     log_bench "DONE" "cache_set_throughput"
     fresh_daemon
 
     log_bench "START" "cache_get_throughput"
-    test_get_throughput     10000
+    test_get_throughput     1000000
     log_bench "DONE" "cache_get_throughput"
     fresh_daemon
 
     log_bench "START" "cache_mixed_workload"
-    test_mixed_workload     10000
+    test_mixed_workload     1000000
     log_bench "DONE" "cache_mixed_workload"
     fresh_daemon
 
     log_bench "START" "cache_concurrent_access"
-    test_concurrent_access  20 2000
+    test_concurrent_access  20 50000
     log_bench "DONE" "cache_concurrent_access"
     fresh_daemon
 

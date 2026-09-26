@@ -232,10 +232,22 @@ static int64_t lat_percentile(struct latency_log *l, double pct)
  * C. Connection helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* A loopback source address for tcp_connect() to bind, host order, 0 for the
+ * kernel's choice -- see bench_server_conn(). */
+static __thread uint32_t g_conn_src;
+
 static int tcp_connect(const char *host, int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    if (g_conn_src) {
+        struct sockaddr_in src;
+        memset(&src, 0, sizeof(src));
+        src.sin_family = AF_INET;
+        src.sin_addr.s_addr = htonl(g_conn_src);
+        if (bind(fd, (struct sockaddr *)&src, sizeof(src)) < 0) { close(fd); return -1; }
+    }
 
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
@@ -329,7 +341,11 @@ enum metric_kind {
      * of the other three: nobody asked for it, and one message in produces N of
      * these -- so a rate here says what the runtime delivered, not what a
      * client was served. */
-    METRIC_FANOUT
+    METRIC_FANOUT,
+    /* A whole batch of commands written on one connection before any reply is
+     * read.  The cache tests always were this and printed the round-trip line
+     * beside 11 M/s, which no serial round trip on this box reaches. */
+    METRIC_PIPELINED
 };
 
 static const char *metric_name(enum metric_kind m)
@@ -338,6 +354,7 @@ static const char *metric_name(enum metric_kind m)
         case METRIC_ROUND_TRIP: return "round_trip";
         case METRIC_WRITE_ONLY: return "write_only";
         case METRIC_FANOUT:     return "fanout_delivery";
+        case METRIC_PIPELINED:  return "pipelined";
         default:                return "connect";
     }
 }
@@ -351,6 +368,7 @@ static const char *metric_rate_key(enum metric_kind m)
         case METRIC_ROUND_TRIP: return "median_round_trips_per_sec";
         case METRIC_WRITE_ONLY: return "median_writes_per_sec";
         case METRIC_FANOUT:     return "median_deliveries_per_sec";
+        case METRIC_PIPELINED:  return "median_pipelined_ops_per_sec";
         default:                return "median_connects_per_sec";
     }
 }
@@ -364,6 +382,7 @@ static const char *metric_lat_label(enum metric_kind m)
         case METRIC_ROUND_TRIP: return "Round-trip latency";
         case METRIC_WRITE_ONLY: return "write() cost";
         case METRIC_FANOUT:     return "Publish-to-subscriber latency";
+        case METRIC_PIPELINED:  return "Batch latency";
         default:                return "Connect latency";
     }
 }
@@ -374,6 +393,7 @@ static const char *metric_lat_prefix(enum metric_kind m)
         case METRIC_ROUND_TRIP: return "rtt";
         case METRIC_WRITE_ONLY: return "write";
         case METRIC_FANOUT:     return "delivery";
+        case METRIC_PIPELINED:  return "batch";
         default:                return "connect";
     }
 }
@@ -390,6 +410,8 @@ static const char *metric_meaning(enum metric_kind m)
             return "writes accepted by the kernel; nothing was read back, so this is not a service rate";
         case METRIC_FANOUT:
             return "deliveries: one publish counted once per subscriber that read it, in order and exactly once";
+        case METRIC_PIPELINED:
+            return "pipelined commands answered: each connection wrote its whole batch before reading a reply, so this is not a round-trip rate";
         default:
             return "completed TCP connection establishments";
     }
@@ -775,6 +797,15 @@ static struct run_result bench_server_conn(struct bench_config *cfg)
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
 
+    /* Each run from its own loopback address.  From one address the kernel
+     * hands the ports out again every seventh run of 2,000, a SYN meets a
+     * 4-tuple still in TIME-WAIT, and its one-second retransmit made two runs
+     * in twenty read 2,400 conn/s against 71,000 -- the client's port pool,
+     * not the server. */
+    static uint32_t conn_run;
+    if (strncmp(cfg->host, "127.", 4) == 0)
+        g_conn_src = 0x7F000100u + 2u + (conn_run++ % 250u);
+
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -797,6 +828,7 @@ static struct run_result bench_server_conn(struct bench_config *cfg)
     }
 
     int64_t end = time_ns();
+    g_conn_src = 0;
     double elapsed = ns_to_s(end - start);
     r.throughput = r.success / elapsed;
 
@@ -2146,12 +2178,14 @@ struct ws_concurrent_args {
     pthread_barrier_t   *barrier;
     int                  thread_success;
     struct conc_slot    *slot;
+    uint32_t             src;   /* this thread's loopback source, see bench_server_conn() */
 };
 
 static void *ws_concurrent_worker(void *arg)
 {
     struct ws_concurrent_args *a = (struct ws_concurrent_args *)arg;
     struct bench_config *cfg = a->cfg;
+    g_conn_src = a->src;
 
     /* Wait for all threads to be ready before starting handshake storm */
     pthread_barrier_wait(a->barrier);
@@ -2198,6 +2232,8 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
     struct run_result r = {0};
 
     int nc = cfg->num_clients;
+    static uint32_t ws_conc_run;
+    ws_conc_run++;
     int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
     int cap = nc * (per_thread > 0 ? per_thread : 1);
     if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
@@ -2216,6 +2252,10 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
         args[i].barrier = &barrier;
         args[i].thread_success = 0;
         args[i].slot = &slots[i];
+        /* Every thread and every run its own address, since each handshake
+         * leaves a TIME-WAIT behind on this side. */
+        args[i].src = (strncmp(cfg->host, "127.", 4) == 0)
+            ? 0x7F000200u + 2u + ((ws_conc_run * (uint32_t)nc + (uint32_t)i) % 250u) : 0;
         lat_init(&slots[i].lat, per_thread > 0 ? per_thread : 1);
         pthread_create(&threads[i], NULL, ws_concurrent_worker, &args[i]);
     }
@@ -2250,6 +2290,124 @@ static struct run_result bench_ws_concurrent(struct bench_config *cfg)
     r.throughput = cs.rate;
     r.overlap = cs.overlap;
 
+    return r;
+}
+
+/* WebSocket and plain TCP clients on one port at once, every operation a round
+ * trip: even threads upgrade and echo frames, odd ones echo lines.  It replaces
+ * a bash loop whose own forks were 41% of every operation it timed. */
+struct ws_mixed_args {
+    struct bench_config *cfg;
+    pthread_barrier_t   *barrier;
+    int                  is_ws;
+    int                  thread_success;
+    struct conc_slot    *slot;
+};
+
+static void *ws_mixed_worker(void *arg)
+{
+    struct ws_mixed_args *a = (struct ws_mixed_args *)arg;
+    struct bench_config *cfg = a->cfg;
+    int msize = cfg->msg_size > 0 ? cfg->msg_size : 64;
+
+    int fd = tcp_connect(cfg->host, cfg->port);
+    if (fd >= 0 && a->is_ws && !ws_upgrade(fd, cfg->host, cfg->port)) { close(fd); fd = -1; }
+    if (fd >= 0) set_recv_timeout(fd, 5000);
+
+    char *payload = (char *)malloc(msize + 1);
+    memset(payload, a->is_ws ? 'W' : 'T', msize);
+    payload[msize] = '\n';
+    char *frame = (char *)malloc(msize + 14);
+    int frame_len = ws_build_frame(frame, payload, msize);
+    char *rep = (char *)malloc(msize + 1);
+
+    pthread_barrier_wait(a->barrier);
+    int local = 0;
+    if (fd >= 0) {
+        int warmup = cfg->num_ops * cfg->warmup_pct / 100;
+        int64_t warm_until = (cfg->duration_ms > 0)
+            ? time_ns() + (int64_t)cfg->duration_ms * cfg->warmup_pct * 10000LL : 0;
+        for (int i = 0; bench_op_continue(i, cfg); i++) {
+            int64_t t0 = time_ns();
+            if (a->is_ws) {
+                if (send_all(fd, frame, frame_len) < 0) break;
+                if (ws_recv_frame(fd, rep, msize) != msize) break;
+            } else {
+                if (send_all(fd, payload, msize + 1) != msize + 1) break;
+                if (recv_exact(fd, rep, msize + 1) != msize + 1) break;
+            }
+            int64_t t1 = time_ns();
+            local++;
+            if (warm_until ? (t1 >= warm_until) : (i >= warmup)) {
+                if (a->slot->counted == 0) a->slot->t_open = t0;
+                a->slot->counted++;
+                a->slot->t_close = t1;
+                lat_record(&a->slot->lat, t1 - t0);
+            }
+        }
+        close(fd);
+    }
+    free(payload); free(frame); free(rep);
+    a->thread_success = local;
+    return NULL;
+}
+
+static struct run_result bench_ws_mixed(struct bench_config *cfg)
+{
+    struct run_result r = {0};
+    int nc = cfg->num_clients < 2 ? 2 : cfg->num_clients;
+    int per_thread = cfg->num_ops - cfg->num_ops * cfg->warmup_pct / 100;
+    int cap = nc * (per_thread > 0 ? per_thread : 1);
+    if (cap > MAX_LATENCIES) cap = MAX_LATENCIES;
+    lat_init(&r.latencies, cap);
+
+    pthread_t *threads = (pthread_t *)malloc(nc * sizeof(pthread_t));
+    struct ws_mixed_args *args = (struct ws_mixed_args *)malloc(nc * sizeof(*args));
+    struct conc_slot *slots = (struct conc_slot *)calloc(nc, sizeof(*slots));
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, nc + 1);
+
+    for (int i = 0; i < nc; i++) {
+        args[i].cfg = cfg;
+        args[i].barrier = &barrier;
+        args[i].is_ws = (i % 2 == 0);
+        args[i].thread_success = 0;
+        args[i].slot = &slots[i];
+        lat_init(&slots[i].lat, per_thread > 0 ? per_thread : 1);
+        pthread_create(&threads[i], NULL, ws_mixed_worker, &args[i]);
+    }
+    pthread_barrier_wait(&barrier);
+    for (int i = 0; i < nc; i++)
+        pthread_join(threads[i], NULL);
+
+    /* Each kind on its own as well, so a runtime that served one and starved
+     * the other shows as that and not as an average. */
+    struct conc_slot *kind = (struct conc_slot *)calloc(nc, sizeof(*kind));
+    double kind_rate[2];
+    for (int k = 0; k < 2; k++) {
+        int m = 0;
+        for (int i = 0; i < nc; i++)
+            if (args[i].is_ws == (k == 0)) kind[m++] = slots[i];
+        kind_rate[k] = conc_finalize(kind, m).rate;
+    }
+    free(kind);
+    fprintf(stderr, "socketley-bench: ws mixed run: websocket %.0f rt/s, tcp %.0f rt/s\n",
+            kind_rate[0], kind_rate[1]);
+
+    int total = 0;
+    for (int i = 0; i < nc; i++) {
+        total += args[i].thread_success;
+        lat_merge(&r.latencies, &slots[i].lat);
+        lat_free(&slots[i].lat);
+    }
+    struct conc_summary cs = conc_finalize(slots, nc);
+    free(slots); free(threads); free(args);
+    pthread_barrier_destroy(&barrier);
+
+    r.success = total;
+    r.expected = (cfg->duration_ms > 0) ? 0 : nc * cfg->num_ops;
+    r.throughput = cs.rate;
+    r.overlap = cs.overlap;
     return r;
 }
 
@@ -3314,6 +3472,7 @@ static void usage(const char *prog)
         "  ws handshake <count>                  WS upgrade rate\n"
         "  ws echo <count> [msg_size]            WS echo RTT\n"
         "  ws concurrent <clients> <ops>         Multi-client WS\n"
+        "  ws mixed <clients> <ops> [size]       WS and TCP echoes on one port\n"
         "\n"
         "  fanout broadcast <subs> <msgs> <size> One publisher, N subscribers, via self.broadcast\n"
         "  fanout relay <subs> <msgs> <size>     The same, via a --mode inout server with no Lua\n"
@@ -3436,20 +3595,20 @@ int main(int argc, char **argv)
         if (strcmp(test, "set") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
             if (pcount >= 2) cfg.msg_size = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_cache_set, "cache", "set", "round-trip/sec", METRIC_ROUND_TRIP);
+            run_and_report(&cfg, bench_cache_set, "cache", "set", "ops/sec (pipelined)", METRIC_PIPELINED);
         }
         else if (strcmp(test, "get") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_cache_get, "cache", "get", "round-trip/sec", METRIC_ROUND_TRIP);
+            run_and_report(&cfg, bench_cache_get, "cache", "get", "ops/sec (pipelined)", METRIC_PIPELINED);
         }
         else if (strcmp(test, "mixed") == 0) {
             if (pcount >= 1) cfg.num_ops = atoi(argv[pstart]);
-            run_and_report(&cfg, bench_cache_mixed, "cache", "mixed", "round-trip/sec", METRIC_ROUND_TRIP);
+            run_and_report(&cfg, bench_cache_mixed, "cache", "mixed", "ops/sec (pipelined)", METRIC_PIPELINED);
         }
         else if (strcmp(test, "concurrent") == 0) {
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
-            run_and_report(&cfg, bench_cache_concurrent, "cache", "concurrent", "round-trip/sec", METRIC_ROUND_TRIP);
+            run_and_report(&cfg, bench_cache_concurrent, "cache", "concurrent", "ops/sec (pipelined)", METRIC_PIPELINED);
         }
         else {
             fprintf(stderr, "Unknown cache test: %s\n", test);
@@ -3505,6 +3664,12 @@ int main(int argc, char **argv)
             if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
             if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
             run_and_report(&cfg, bench_ws_concurrent, "ws", "concurrent", "handshake/sec", METRIC_ROUND_TRIP);
+        }
+        else if (strcmp(test, "mixed") == 0) {
+            if (pcount >= 1) cfg.num_clients = atoi(argv[pstart]);
+            if (pcount >= 2) cfg.num_ops = atoi(argv[pstart + 1]);
+            if (pcount >= 3) cfg.msg_size = atoi(argv[pstart + 2]);
+            run_and_report(&cfg, bench_ws_mixed, "ws", "mixed", "round-trip/sec", METRIC_ROUND_TRIP);
         }
         else {
             fprintf(stderr, "Unknown ws test: %s\n", test);

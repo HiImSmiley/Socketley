@@ -188,7 +188,8 @@ run_server_benchmarks() {
     fresh_daemon
 
     log_bench "START" "server_concurrent_clients"
-    test_concurrent_clients  100 500
+    # 5,000 each: at 500 the run was 0.3 s and spread 1.38x.
+    test_concurrent_clients  100 5000
     log_bench "DONE" "server_concurrent_clients"
 
     echo "]" >> "$RESULTS_FILE"
