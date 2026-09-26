@@ -194,7 +194,7 @@ ROW_N=0
 NROWS=$(printf '%s\n' "$ROWS" | grep -cE '^[A-Z]' || true)
 while IFS='|' read -r name transport size; do
     case "$name" in ''|'#'*) continue ;; esac
-    rv=""; rc=""; fv=""
+    rv=""; rc=""; fv=""; busy=0; why=""
     for ((pass = 1; pass <= PASSES; pass++)); do
         before=$(box_load_cores)
         if (( pass % 2 )); then
@@ -205,7 +205,10 @@ while IFS='|' read -r name transport size; do
             read -r r c <<<"$(runtime_arm "$transport" "$size")"
         fi
         after=$(box_load_cores)
-        awk -v x="$before" -v y="$after" -v l="$QUIET_CORES" 'BEGIN{exit !(x>l||y>l)}' && continue
+        if awk -v x="$before" -v y="$after" -v l="$QUIET_CORES" 'BEGIN{exit !(x>l||y>l)}'; then
+            busy=$((busy + 1)); [ -n "$why" ] || why=$(box_busiest)
+            continue
+        fi
         [ "${r:-0}" -gt 0 ] || continue
         rv="$rv $r"; rc="$rc $c"
         [ "${f:-0}" -gt 0 ] && fv="$fv $f"
@@ -214,14 +217,15 @@ while IFS='|' read -r name transport size; do
     ROW_N=$((ROW_N+1))
     printf '  [%2d/%2d] %-9s %10s msg/s  floor %10s  ±%s%%\n' \
         "$ROW_N" "$NROWS" "$name" "$s" "${f:-—}" "$ci" >&2
-    printf '%s|%s|%s|%s|%s|%s\n' "$name" "$transport" "$s" "$f" "$ci" "$cm" >> "$WORK/rows.txt"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$name" "$transport" "$s" "$f" "$ci" "$cm" "$busy" "${why:-}" >> "$WORK/rows.txt"
 done < <(printf '%s\n' "$ROWS" | grep -vE '^[[:space:]]*(#|$)')
 
 printf '\n  %-9s %11s %11s %9s %9s %9s %7s %7s  %s\n' \
     row 'msg/sec' 'C client' 'us/msg' 'C us' 'over' '±95%' 'cores' verdict
 printf '  %s\n' "$(printf '%.0s─' {1..100})"
-sort -t'|' -k3 -gr "$WORK/rows.txt" | while IFS='|' read -r name tr s f ci cm; do
+sort -t'|' -k3 -gr "$WORK/rows.txt" | while IFS='|' read -r name tr s f ci cm busy why; do
     awk -v n="$name" -v s="$s" -v f="$f" -v ci="$ci" -v c="$cm" \
+        -v busy="$busy" -v passes="$PASSES" -v why="$why" -v quiet="$QUIET_CORES" \
       'function verdict(us, fus,   d) {
          # An if-chain and not a nested ternary across lines: awk will not
          # continue a ?: past a newline, and the first version of this printed
@@ -236,7 +240,8 @@ sort -t'|' -k3 -gr "$WORK/rows.txt" | while IFS='|' read -r name tr s f ci cm; d
        }
        BEGIN{
          if (s <= 0) { printf "  %-9s %11s %11s %9s %9s %9s %6s%% %7s  %s\n",
-                       n,"-","-","-","-","-",ci,"-","measured nothing"; exit }
+                       n,"-","-","-","-","-",ci,"-",
+                       (busy > 0) ? sprintf("box busy: %d of %d passes over %s cores (%s)", busy, passes, quiet, why) : "measured nothing"; exit }
          us = 1e6/s
          if (f > 0) printf "  %-9s %11d %11d %9.2f %9.2f %+9.2f %6s%% %7.3f  %s\n",
                            n, s, f, us, 1e6/f, us-1e6/f, ci, c, verdict(us, 1e6/f)

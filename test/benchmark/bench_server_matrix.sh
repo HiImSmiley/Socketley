@@ -106,6 +106,12 @@ SK_HTTP_NAME=sm_http
 # hundred million is a run that never ends -- which is how the first draft of
 # this table hung.  A connection rate is also the one shape bounded by the
 # ephemeral port pool, so the count is small and the pool is waited for.
+#
+# WSHS-c32 is `ws concurrent`, which is a handshake storm and not messages:
+# each of 32 threads connects, upgrades and closes.  Named WS-c32 it read as a
+# message row four times slower than WS-64, and its floor -- a raw echo that
+# upgrades nothing -- pairs it with nothing.  It is the row that sets a Lima
+# guest agent spinning a core, after which every later pass is refused as load.
 ROWS_DEFAULT='
 LUA-64|lua|msg|1|64
 LUA-1K|lua|msg|1|1024
@@ -115,7 +121,7 @@ LUA-c32|lua|concurrent|32|64
 LUA-c100|lua|concurrent|100|64
 WS-64|ws|ws-echo|1|64
 WS-1K|ws|ws-echo|1|1024
-WS-c32|ws|ws-concurrent|32|64
+WSHS-c32|ws|ws-concurrent|32|64
 HTTP-c1|http|http-keepalive|1|small.txt
 HTTP-c8|http|http-keepalive|8|small.txt
 HTTP-c32|http|http-keepalive|32|small.txt
@@ -357,7 +363,7 @@ while IFS='|' read -r name fix shape conns size; do
     case "$name" in ''|'#'*) continue ;; esac
     target=${FPORT[$fix]}
     FIX_NOW=$fix
-    sv=""; sc=""; scl=""; fv=""; fc=""
+    sv=""; sc=""; scl=""; fv=""; fc=""; busy=0; why=""
     for ((pass = 1; pass <= PASSES; pass++)); do
         before=$(box_load_cores)
         # Interleaved and alternating, because this box drifts tens of percent
@@ -374,7 +380,10 @@ while IFS='|' read -r name fix shape conns size; do
         # A pass measured while somebody else was on the box is discarded whole,
         # never one arm of it -- a pass with one arm dropped is exactly the
         # unpaired comparison the interleaving exists to replace.
-        if awk -v x="$before" -v y="$after" -v l="$QUIET_CORES" 'BEGIN{exit !(x>l||y>l)}'; then continue; fi
+        if awk -v x="$before" -v y="$after" -v l="$QUIET_CORES" 'BEGIN{exit !(x>l||y>l)}'; then
+            busy=$((busy + 1)); [ -n "$why" ] || why=$(box_busiest)
+            continue
+        fi
         [ "${r:-0}" -gt 0 ] || continue
         sv="$sv $r"; sc="$sc $c"; scl="$scl $cl"
         if [ -n "$fr" ]; then
@@ -390,8 +399,8 @@ while IFS='|' read -r name fix shape conns size; do
     # end, so for twenty minutes a healthy run looks exactly like a hung one.
     printf '  [%2d/%2d] %-11s %10s ops/s  floor %10s  ±%s%%\n' \
         "$ROW_N" "$NROWS" "$name" "$s" "${f:-—}" "$sci" >&2
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-        "$name" "$fix" "$shape" "$s" "$f" "$sci" "$scm" "$fcm" "$sclm" >> "$WORK/rows.txt"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$name" "$fix" "$shape" "$s" "$f" "$sci" "$scm" "$fcm" "$sclm" "$busy" "${why:-}" >> "$WORK/rows.txt"
 done < <(printf '%s\n' "$ROWS" | grep -vE '^[[:space:]]*(#|$)')
 
 # ─── The table ──────────────────────────────────────────────────────────────
@@ -401,8 +410,9 @@ done < <(printf '%s\n' "$ROWS" | grep -vE '^[[:space:]]*(#|$)')
 printf '\n  %-11s %11s %11s %9s %9s %8s %7s %7s %7s  %s\n' \
     row 'ops/sec' 'floor/sec' 'us/op' 'floor us' 'over' '±95%' 'cores' 'cli' verdict
 printf '  %s\n' "$(printf '%.0s─' {1..112})"
-sort -t'|' -k5 -g "$WORK/rows.txt" | while IFS='|' read -r name fix shape s f ci scm fcm sclm; do
+sort -t'|' -k5 -g "$WORK/rows.txt" | while IFS='|' read -r name fix shape s f ci scm fcm sclm busy why; do
     awk -v n="$name" -v s="$s" -v f="$f" -v ci="$ci" -v c="$scm" -v fc="$fcm" -v cl="$sclm" \
+        -v busy="$busy" -v passes="$PASSES" -v why="$why" -v quiet="$QUIET_CORES" \
       'function verdict(  d, fus) {
          # The load generator first, because a row it dominates is a statement
          # about socketley_bench: measured on ws concurrent 32, the client
@@ -421,7 +431,8 @@ sort -t'|' -k5 -g "$WORK/rows.txt" | while IFS='|' read -r name fix shape s f ci
        }
        BEGIN{
          if (s <= 0) { printf "  %-11s %11s %11s %9s %9s %8s %7s %7s %7s  %s\n",
-                              n,"—","—","—","—","—",ci,"—","—","measured nothing"; exit }
+                              n,"—","—","—","—","—",ci,"—","—",
+                              (busy > 0) ? sprintf("box busy: %d of %d passes over %s cores (%s)", busy, passes, quiet, why) : "measured nothing"; exit }
          us = 1e6/s
          if (f > 0) printf "  %-11s %11d %11d %9.2f %9.2f %+8.2f %6s%% %7.3f %7.2f  %s\n",
                            n, s, f, us, 1e6/f, us-1e6/f, ci, c, cl, verdict()

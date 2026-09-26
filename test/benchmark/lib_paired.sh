@@ -75,6 +75,24 @@ box_load_cores() {
         'BEGIN { printf "%.3f", d / hz / (ns / 1e9) }'
 }
 
+# The process burning the most CPU over a moment, as "name cores", so a pass
+# refused for load can say whose load it was: a table of "measured nothing"
+# with no reason took an evening to trace to a guest agent spinning a core.
+box_busiest() {
+    local t0 t1
+    _busiest_snap() { cat /proc/[0-9]*/stat 2>/dev/null | awk '{
+        i = index($0, "("); j = match($0, /\) [A-Za-z] /)
+        if (!i || !j) next
+        comm = substr($0, i + 1, j - i - 1); gsub(/ /, "_", comm)
+        split(substr($0, j + 2), f, " ")
+        print $1, f[12] + f[13], comm }'; }
+    t0=$(_busiest_snap); sleep 0.3; t1=$(_busiest_snap)
+    awk -v hz="$HZ" 'NR == FNR { a[$1] = $2; next }
+        ($1 in a) && $2 - a[$1] > best { best = $2 - a[$1]; name = $3 }
+        END { if (best > 0) printf "%s %.2f", name, best / hz / 0.3 }' \
+        <(echo "$t0") <(echo "$t1")
+}
+
 # ─── Small statistics, in awk ───────────────────────────────────────────────
 
 median_of() {
