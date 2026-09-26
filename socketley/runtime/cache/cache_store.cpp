@@ -889,33 +889,33 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     auto it = m_hashes.find(key);
     if (it != m_hashes.end())
     {
-        auto fit = it->second.find(field);
-        if (fit != it->second.end())
+        std::string_view old;
+        if (it->second.get(field, old))
         {
             // Overwriting a field has to clear the same bar as adding one,
             // which this path did not, so a 5-byte value could become 100 KB
             // against a configured 1200.
-            if (__builtin_expect(m_max_memory != 0 && val.size() > fit->second.size(), 0))
+            if (__builtin_expect(m_max_memory != 0 && val.size() > old.size(), 0))
             {
-                const size_t held = stored_string(fit->second);
-                const size_t want = rewritten_string(fit->second, val.size());
+                const size_t held = stored_string(old.size());
+                const size_t want = stored_string(val.size());
                 if (want > held && !check_memory(want - held, key))
                     return false;
             }
-            track_sub(stored_string(fit->second));
-            fit->second = val;
-            track_add(stored_string(fit->second));
+            track_sub(stored_string(old.size()));
+            it->second.set(field, val);
+            track_add(stored_string(val.size()));
         }
         else
         {
             // Named so that eviction cannot take this hash, because `it` is
-            // held across the call and the emplace below writes through it.
+            // held across the call and the set below writes through it.
             if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead, key))
                 return false;
-            auto nfit = it->second.emplace(std::string(field), std::string(val)).first;
+            it->second.set(field, val);
             ++m_hash_fields;
             if (created) *created = true;
-            track_add(stored_string(nfit->first) + stored_string(nfit->second));
+            track_add(stored_string(field.size()) + stored_string(val.size()));
         }
         touch_lru(key);
         return true;
@@ -929,7 +929,7 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         return false;
 
     auto nit = m_hashes.emplace(std::string(key), hash_inner{}).first;
-    nit->second.emplace(std::string(field), std::string(val));
+    nit->second.set(field, val);
     ++m_hash_fields;
     if (created) *created = true;
     track_add(entry_cost(nit->first, nit->second));
@@ -937,17 +937,13 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     return true;
 }
 
-const std::string* cache_store::hget(std::string_view key, std::string_view field) const
+std::optional<std::string_view> cache_store::hget(std::string_view key, std::string_view field) const
 {
     auto it = m_hashes.find(key);
-    if (it == m_hashes.end())
-        return nullptr;
-
-    auto fit = it->second.find(field);
-    if (fit == it->second.end())
-        return nullptr;
-
-    return &fit->second;
+    std::string_view out;
+    if (it == m_hashes.end() || !it->second.get(field, out))
+        return std::nullopt;
+    return out;
 }
 
 bool cache_store::hdel(std::string_view key, std::string_view field)
@@ -956,12 +952,12 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     if (it == m_hashes.end())
         return false;
 
-    auto fit = it->second.find(field);
-    if (fit == it->second.end())
+    std::string_view old;
+    if (!it->second.get(field, old))
         return false;
 
-    track_sub(stored_string(fit->first) + stored_string(fit->second));
-    it->second.erase(fit);
+    track_sub(stored_string(field.size()) + stored_string(old.size()));
+    it->second.erase(field);
     --m_hash_fields;
 
     if (it->second.empty())
@@ -1332,12 +1328,12 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
                 const auto& p = filter.preds[i];
                 // A hash without the field is not a hash whose field is empty,
                 // so it does not match even a predicate that matches everything.
-                const auto fit = e.second.find(p.field ? *p.field : std::string_view{});
-                if (fit == e.second.end())
+                std::string_view fv;
+                if (!e.second.get(p.field ? *p.field : std::string_view{}, fv))
                     return;
-                if (!value_satisfies(fit->second, p))
+                if (!value_satisfies(fv, p))
                     return;
-                if (i == 0) shown = fit->second;
+                if (i == 0) shown = fv;
             }
             out.push_back(e.first);
             // The FIRST predicate's field, because that is the one the caller
@@ -2070,12 +2066,11 @@ cache_store::incr_result cache_store::hincrby(std::string_view key, std::string_
     auto it = m_hashes.find(key);
     if (it != m_hashes.end())
     {
-        auto fit = it->second.find(field);
-        if (fit != it->second.end())
+        std::string_view cur;
+        if (it->second.get(field, cur))
         {
-            auto [ptr, ec] = std::from_chars(fit->second.data(),
-                                             fit->second.data() + fit->second.size(), val);
-            if (ec != std::errc{} || ptr != fit->second.data() + fit->second.size())
+            auto [ptr, ec] = std::from_chars(cur.data(), cur.data() + cur.size(), val);
+            if (ec != std::errc{} || ptr != cur.data() + cur.size())
                 return incr_result::not_an_integer;
         }
     }
@@ -2946,7 +2941,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                     std::string field, val;
                     if (!read_string(field)) return false;
                     if (!read_string(val)) return false;
-                    h[std::move(field)] = std::move(val);
+                    h.set(field, val);
                 }
                 if (!read_expiry(key, expired)) return false;
                 if (!expired)
@@ -3094,7 +3089,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     std::string field, val;
                     if (!read_string(field)) return false;
                     if (!read_string(val)) return false;
-                    h[std::move(field)] = std::move(val);
+                    h.set(field, val);
                 }
                 if (!read_expiry(key, expired)) return false;
                 if (!expired)

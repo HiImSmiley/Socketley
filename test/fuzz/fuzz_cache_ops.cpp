@@ -777,8 +777,8 @@ void verify_model(world& w, bool evict_possible)
                 CACHE_CHECK(h->size() == e.fields.size(), "the hash has a different size than was written");
                 for (const auto& f : e.fields)
                 {
-                    const std::string* got = s.hget(k, f.first);
-                    CACHE_CHECK(got != nullptr, "a field that was written is not in the hash");
+                    const auto got = s.hget(k, f.first);
+                    CACHE_CHECK(got.has_value(), "a field that was written is not in the hash");
                     CACHE_CHECK(*got == f.second, "a hash field holds a value that was never written to it");
                 }
                 CACHE_CHECK(static_cast<size_t>(s.hlen(k)) == e.fields.size(), "hlen disagrees with the hash");
@@ -999,7 +999,7 @@ void check_save_load(world& w)
             CACHE_CHECK(a && b && a->size() == b->size(), "a hash changed size across save/load");
             for (const auto& f : *a)
             {
-                const std::string* got = dst.hget(k, f.first);
+                const auto got = dst.hget(k, f.first);
                 CACHE_CHECK(got && *got == f.second, "a hash field did not survive save/load");
             }
         }
@@ -1659,8 +1659,8 @@ bool run_step(world& w, const step& s)
         case OP_HGET:
         {
             const bool have = (e.type == T_HASH && e.fields.count(mem) != 0);
-            const std::string* p = w.store.hget(k, mem);
-            CACHE_CHECK((p != nullptr) == have, "hget() disagrees with the model about a field");
+            const auto p = w.store.hget(k, mem);
+            CACHE_CHECK(p.has_value() == have, "hget() disagrees with the model about a field");
             if (p)
                 CACHE_CHECK(*p == e.fields[mem], "hget() returned a value that was never written");
             break;

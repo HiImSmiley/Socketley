@@ -1,5 +1,6 @@
 #pragma once
 #include <charconv>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <chrono>
+#include "field_map.h"
 #include "key_table.h"
 #include "zskiplist.h"
 
@@ -20,7 +22,7 @@ using string_map = key_table<std::string>;
 using list_map = key_table<std::deque<std::string>>;
 using set_inner = key_set;
 using set_map = key_table<set_inner>;
-using hash_inner = key_table<std::string>;
+using hash_inner = field_map;
 using hash_map = key_table<hash_inner>;
 
 // A sorted set is two views of one thing: scores by member, and members in
@@ -174,7 +176,7 @@ public:
     // `created` is told whether the field is new, which is what HSET counts.
     bool hset(std::string_view key, std::string_view field, std::string_view val,
               bool* created = nullptr);
-    const std::string* hget(std::string_view key, std::string_view field) const;
+    std::optional<std::string_view> hget(std::string_view key, std::string_view field) const;
     bool hdel(std::string_view key, std::string_view field);
     int hlen(std::string_view key) const;
     const hash_inner* hash_ptr(std::string_view key) const;
@@ -587,6 +589,8 @@ private:
     static constexpr size_t expiry_entry_overhead = 64;
     static constexpr size_t list_elem_overhead    = 32;
     static constexpr size_t set_elem_overhead     = 64;
+    // The table form's; a packed hash (field_map.h) costs less, so it is
+    // charged more than it holds, which is the safe side of a memory bound.
     static constexpr size_t hash_field_overhead   = 74;
     // A member sits in two containers: an unordered_map node and a skiplist
     // node in the ordered view, whose entry also carries a copy of the name.

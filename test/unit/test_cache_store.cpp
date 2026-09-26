@@ -188,16 +188,16 @@ TEST_CASE("cache_store hash operations")
     SUBCASE("hset and hget")
     {
         CHECK(store.hset("h", "f1", "v1"));
-        const std::string* val = store.hget("h", "f1");
-        REQUIRE(val != nullptr);
+        auto val = store.hget("h", "f1");
+        REQUIRE(val.has_value());
         CHECK(*val == "v1");
     }
 
     SUBCASE("hget nonexistent")
     {
-        CHECK(store.hget("h", "f") == nullptr);
+        CHECK(store.hget("h", "f") == std::nullopt);
         store.hset("h", "f1", "v1");
-        CHECK(store.hget("h", "f2") == nullptr);
+        CHECK(store.hget("h", "f2") == std::nullopt);
     }
 
     SUBCASE("hdel")
@@ -362,7 +362,7 @@ TEST_CASE("cache_store eviction")
 
         REQUIRE(store.hset("h", "f", std::string(40, 'v')));
         store.hset("h", "g", std::string(400, 'w'));
-        CHECK(store.hget("h", "f") != nullptr);
+        CHECK(store.hget("h", "f") != std::nullopt);
     }
 
     SUBCASE("a refused write leaves the key it refused to write alone")
@@ -409,8 +409,8 @@ TEST_CASE("cache_store eviction")
         // same hole was closed for SET long ago.
         CHECK_FALSE(store.hset("h", "f", std::string(100000, 'x')));
 
-        const std::string* got = store.hget("h", "f");
-        REQUIRE(got != nullptr);
+        auto got = store.hget("h", "f");
+        REQUIRE(got.has_value());
         CHECK(*got == "v");
         CHECK(store.get_memory_used() == before);
         CHECK(store.get_memory_used() <= 1200);
@@ -927,8 +927,8 @@ TEST_CASE("cache_store new methods")
         store.hset("h", "f", "9223372036854775807");
         int64_t result = 0;
         CHECK(store.hincrby("h", "f", 1, result) == cache_store::incr_result::would_overflow);
-        const std::string* held = store.hget("h", "f");
-        REQUIRE(held != nullptr);
+        auto held = store.hget("h", "f");
+        REQUIRE(held.has_value());
         CHECK(*held == "9223372036854775807");
     }
 
@@ -2140,4 +2140,73 @@ TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and remov
     CHECK(copy.size() == z.size());
     zskiplist moved(std::move(copy));
     CHECK(moved.size() == z.size());
+}
+
+TEST_CASE("field_map agrees with a map, packed and after it moves to the table")
+{
+    uint32_t r = 777;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    for (int round = 0; round < 40; ++round)
+    {
+        field_map fm;
+        std::map<std::string, std::string> ref;
+        // Most rounds stay small and packed; some grow past either bound.
+        const int fields = (round % 4 == 0) ? 300 : 12;
+        const bool long_values = (round % 5 == 0);
+        for (int step = 0; step < 2000; ++step)
+        {
+            const std::string f = "f" + std::to_string(rnd() % fields);
+            const size_t vlen = long_values ? rnd() % 100 : rnd() % 20;
+            const std::string v(vlen, static_cast<char>('a' + rnd() % 26));
+            switch (rnd() % 4)
+            {
+                case 0:
+                    CHECK(fm.erase(f) == (ref.erase(f) == 1));
+                    break;
+                default:
+                {
+                    const bool is_new = ref.find(f) == ref.end();
+                    CHECK(fm.set(f, v) == is_new);
+                    ref[f] = v;
+                    break;
+                }
+            }
+            REQUIRE(fm.size() == ref.size());
+        }
+        for (const auto& [f, v] : ref)
+        {
+            std::string_view got;
+            REQUIRE(fm.get(f, got));
+            CHECK(got == v);
+        }
+        std::map<std::string, std::string> walked;
+        for (const auto& [f, v] : fm) walked.emplace(std::string(f), std::string(v));
+        CHECK(walked == ref);
+        // HSCAN's walk: every bucket, every entry once.
+        std::map<std::string, std::string> scanned;
+        for (size_t b = 0; b < fm.bucket_count(); ++b)
+            for (auto it = fm.begin(b); it != fm.end(b); ++it)
+                CHECK(scanned.emplace(std::string((*it).first), std::string((*it).second)).second);
+        CHECK(scanned == ref);
+        field_map copy(fm);
+        CHECK(copy.size() == fm.size());
+        if (fields == 12 && !long_values) CHECK(fm.packed());
+        if (fields == 300) CHECK_FALSE(fm.packed());
+    }
+}
+
+TEST_CASE("a small hash is packed and a large one is not, through the store")
+{
+    cache_store store;
+    for (int i = 0; i < 5; ++i) store.hset("small", "field" + std::to_string(i), "value");
+    CHECK(store.hash_ptr("small")->packed());
+    for (int i = 0; i < 200; ++i) store.hset("large", "field" + std::to_string(i), "value");
+    CHECK_FALSE(store.hash_ptr("large")->packed());
+    store.hset("longval", "f", std::string(100, 'x'));
+    CHECK_FALSE(store.hash_ptr("longval")->packed());
+    CHECK(store.hget("longval", "f") == std::string(100, 'x'));
+    CHECK(store.hlen("large") == 200);
+    CHECK(store.hdel("small", "field2"));
+    CHECK(store.hlen("small") == 4);
+    CHECK_FALSE(store.hget("small", "field2").has_value());
 }

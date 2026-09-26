@@ -6493,7 +6493,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 return;
             }
             if (m_has_ttl_keys) m_store.check_expiry(key);
-            const std::string* val = m_store.hget(key, field);
+            const auto val = m_store.hget(key, field);
             if (val)
             {
                 rb.append(*val);
@@ -7326,7 +7326,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
         {
             auto [key, f] = extract_key(args);
             if (key.empty() || f.empty()) { rb.append("usage: hstrlen key field\n", 25); return; }
-            const std::string* v = m_store.hget(key, f);
+            const auto v = m_store.hget(key, f);
             rb.append(std::to_string(v ? v->size() : 0)); rb.push_back('\n');
             break;
         }
@@ -7353,7 +7353,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             {
                 auto [f, next] = extract_key(walk);
                 if (f.empty()) break;
-                const std::string* v = m_store.hget(key, f);
+                const auto v = m_store.hget(key, f);
                 if (v) { rb.append(*v); rb.push_back('\n'); }
                 else   rb.append("nil\n", 4);
                 walk = next;
@@ -7952,14 +7952,14 @@ bool cache_instance::lua_hset(std::string_view key, std::string_view field, std:
 std::string cache_instance::lua_hget(std::string_view key, std::string_view field)
 {
     m_store.check_expiry(key);
-    const std::string* val = m_store.hget(key, field);
-    return val ? *val : "";
+    const auto val = m_store.hget(key, field);
+    return val ? std::string(*val) : std::string();
 }
 
 bool cache_instance::lua_hexists(std::string_view key, std::string_view field)
 {
     m_store.check_expiry(key);
-    return m_store.hget(key, field) != nullptr;
+    return m_store.hget(key, field).has_value();
 }
 
 bool cache_instance::lua_hdel(std::string_view key, std::string_view field)
@@ -10117,7 +10117,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
-            const std::string* val = m_store.hget(args[1], args[2]);
+            const auto val = m_store.hget(args[1], args[2]);
             if (val) resp::encode_bulk_into(rb, *val);
             else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'h')))
                 resp::encode_error_code_into(rb, wrongtype_msg);
@@ -10996,7 +10996,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_array_header_into(rb, argc - 2);
             for (int i = 2; i < argc; ++i)
             {
-                const std::string* v = m_store.hget(args[1], args[i]);
+                const auto v = m_store.hget(args[1], args[i]);
                 if (v) resp::encode_bulk_into(rb, *v);
                 else   resp::encode_null_into(rb);
             }
@@ -11017,7 +11017,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
         case fnv1a("hstrlen"):
         {
             if (argc < 3) { resp::encode_error_into(rb, "wrong number of arguments"); return; }
-            const std::string* v = m_store.hget(args[1], args[2]);
+            const auto v = m_store.hget(args[1], args[2]);
             resp::encode_integer_into(rb, v ? static_cast<int64_t>(v->size()) : 0);
             break;
         }
