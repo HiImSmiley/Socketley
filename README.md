@@ -377,8 +377,8 @@ limited by the client or by waiting on the network: each is a direct reading of
 **What `-P` changes, then.** Without pipelining, one message carries one
 command, so each operation is charged a full trip through the kernel: syscall,
 socket, TCP, wakeup. That charge is the same for both servers and it is nearly
-all of the cost — for `GET`, 3.71 µs of server CPU per operation at depth 1
-against 0.073 µs at depth 100, so **98% of a depth-1 operation is per-message
+all of the cost — for `GET`, 3.37 µs of server CPU per operation at depth 1
+against 0.082 µs at depth 100, so **98% of a depth-1 operation is per-message
 overhead rather than work on the data**. At `-P 100` a hundred commands arrive in one `read()` and that
 charge is divided by a hundred; what remains is parsing and execution.
 
@@ -389,59 +389,90 @@ spending it on its own code, which is where they differ. Most applications do
 not pipeline, so depth 1 is the honest number for an ordinary client and depth
 100 is the ceiling for bulk work; quoting either alone would mislead.
 
-**Pipeline depth 1** — 200 K operations per test, 9 passes:
+Re-measured **2026-09-26**, kernel 7.2.2, with the same method and longer
+runs than before: the 200 K and 2 M operation runs lasted 0.7 s and 0.4 s,
+short enough for a leg's start-up to be part of its rate.
 
-| Operation | Socketley   | Redis 7.0.15 | Ratio | Ratio spread | Server cores |
-|-----------|-------------|--------------|-------|--------------|--------------|
-| SET       | 261 K ±21%  | 228 K ±27%   | 1.15× | [0.86, 1.23] | 0.996 / 0.998 |
-| GET       | 269 K ±16%  | 253 K ±18%   | 1.08× | [1.01, 1.23] | 0.997 / 0.997 |
-| LPUSH     | 262 K ±25%  | 230 K ±23%   | 1.13× | [0.79, 1.30] | 0.998 / 0.998 |
-| LPOP      | 265 K ±16%  | 248 K ±16%   | 1.11× | [1.03, 1.40] | 0.996 / 0.998 |
-| SADD      | 266 K ±10%  | 256 K ±17%   | 1.05× | [0.99, 1.29] | 0.998 / 0.999 |
-| HSET      | 266 K ±9%   | 251 K ±14%   | 1.09× | [1.04, 1.20] | 0.998 / 0.998 |
+**Pipeline depth 1** — 1 M operations per test, 9 passes, one key:
+
+| Operation | Socketley | Redis 7.0.15 | Ratio | Ratio spread | Server cores |
+|-----------|-----------|--------------|-------|--------------|--------------|
+| SET       | 262 K     | 265 K        | 1.02× | [0.83, 1.35] | 1.000 / 0.999 |
+| GET       | 297 K     | 236 K        | 1.19× | [0.72, 1.38] | 0.999 / 0.999 |
+| LPUSH     | 290 K     | 250 K        | 1.20× | [0.80, 1.38] | 1.000 / 1.000 |
+| LPOP      | 267 K     | 241 K        | 1.11× | [1.04, 1.34] | 0.998 / 1.000 |
+| SADD      | 271 K     | 255 K        | 1.08× | [1.01, 1.22] | 0.998 / 0.998 |
+| HSET      | 271 K     | 252 K        | 1.08× | [1.05, 1.12] | 0.998 / 0.998 |
 
 At depth 1, **over TCP**, do not read any individual row as a result. Three
-spreads clear 1.00 here — GET, LPOP and HSET — but in a five-pass run of the
-same arms an hour earlier it was SET, GET, LPOP and SADD, and LPUSH and HSET
-contained 1.00. **Which rows clear keeps changing, which is what a false
-positive out of six comparisons looks like.**
+spreads clear 1.00 here — LPOP, SADD and HSET — where the run before this one
+cleared GET, LPOP and HSET, and one an hour before that SET, GET, LPOP and
+SADD. **Which rows clear keeps changing, which is what a false positive out of
+six comparisons looks like.**
 
-What does not change is the direction: all twelve medians across those two runs
-sit above 1.00, between 1.05× and 1.15×. So the honest reading is a small
-advantage of **at most about 10%**, too close to resolve row by row — not the
-flat tie an earlier run reported, and not something to quote per operation.
+What does not change is the direction: every median across those runs sits at
+or above 1.00, between 1.02× and 1.20×. So the honest reading is a small
+advantage of **about 10%**, too close to resolve row by row — not the flat tie
+an earlier run reported, and not something to quote per operation.
 
 The qualifier matters: over `AF_UNIX` the same comparison is 1.28×–1.29×, and
 SET's spread does not contain 1.00 (see **What the transport costs**). This table
 is a TCP measurement, and at depth 1 that is mostly a measurement of the
 kernel's per-message price, which both servers pay alike.
 
-**Pipeline depth 100** — 2 M operations per test, 9 passes:
+**Pipeline depth 100** — 10 M operations per test, 9 passes, one key:
 
-| Operation | Socketley    | Redis 7.0.15 | Speedup | Spread       | Server cores |
-|-----------|--------------|--------------|---------|--------------|--------------|
-| SET       | 10.31 M ±37% | 3.06 M ±13%  | 3.45×   | [3.27, 4.57] | 0.992 / 0.999 |
-| GET       | 13.39 M ±7%  | 3.63 M ±10%  | 3.68×   | [3.53, 4.04] | 0.982 / 0.996 |
-| LPUSH     | 8.90 M ±23%  | 2.78 M ±14%  | 3.32×   | [2.97, 3.91] | 0.993 / 0.998 |
-| LPOP      | 10.26 M ±25% | 2.43 M ±8%   | 4.27×   | [3.90, 4.99] | 0.996 / 0.998 |
-| SADD      | 8.86 M ±17%  | 3.23 M ±12%  | 2.62×   | [2.26, 2.95] | 0.994 / 0.997 |
-| HSET      | 10.12 M ±22% | 2.86 M ±9%   | 3.52×   | [2.91, 3.80] | 0.989 / 0.999 |
+| Operation | Socketley | Redis 7.0.15 | Speedup | Spread       | Server cores |
+|-----------|-----------|--------------|---------|--------------|--------------|
+| SET       | 11.46 M   | 2.90 M       | 3.97×   | [3.19, 4.66] | 0.997 / 0.998 |
+| GET       | 12.16 M   | 3.71 M       | 3.37×   | [2.70, 4.29] | 0.996 / 0.997 |
+| LPUSH     | 8.19 M    | 2.79 M       | 3.06×   | [2.57, 3.66] | 0.995 / 0.998 |
+| LPOP      | 10.99 M   | 2.38 M       | 4.61×   | [3.86, 5.23] | 0.998 / 1.000 |
+| SADD      | 11.52 M   | 3.38 M       | 3.36×   | [2.89, 3.82] | 0.998 / 0.998 |
+| HSET      | 9.78 M    | 2.69 M       | 3.46×   | [3.25, 4.28] | 0.992 / 0.998 |
 
-Pipelined, socketley is **2.6× to 4.3× faster than Redis 7**, and every spread
-sits well above 1.00. The previous run, on the older kernel, gave 2.4× to 4.6×
-and reproduced all six within their spreads — which is the only kind of
-cross-run agreement worth quoting: the conclusions repeat, the absolute figures
-do not have to.
+Pipelined, socketley is **3.1× to 4.6× faster than Redis 7**, and every spread
+sits well above 1.00. The runs before this gave 2.6× to 4.3× and 2.4× to 4.6×
+— which is the only kind of cross-run agreement worth quoting: the conclusions
+repeat, the absolute figures do not have to.
 
-At 13.4 M GET/s on one core at ~2.15 GHz an operation costs about **158 cycles**
-— parse, hash lookup, encode, with no syscall of its own. The same operation on
-the serial path costs about **7,970 cycles**, and the difference is the
-per-message charge that pipelining removes. (An earlier revision of this section
-put the serial figure at ~1,160 cycles, which cannot be right: it contradicts
-the 3.5 µs per operation quoted two paragraphs above it in the same text.)
+**With a real keyspace.** One key is `redis-benchmark`'s default, and it is the
+easy case: the same entry sits in L1 for every operation. With `-r 100000` the
+keys are drawn from a hundred thousand, the table no longer fits the caches, and
+each lookup waits on memory. Same method, both keyspaces written before the
+first pass:
+
+| Operation | depth 1 | ratio | depth 100 | Redis 7.0.15 | ratio | spread |
+|-----------|---------|-------|-----------|--------------|-------|--------|
+| SET       | 280 K   | 1.17× | 8.70 M    | 2.16 M       | 4.02× | [3.29, 4.79] |
+| GET       | 277 K   | 1.34× | 9.30 M    | 2.53 M       | 3.70× | [3.11, 3.96] |
+| LPUSH     | 296 K   | 1.14× | 8.99 M    | 2.77 M       | 3.21× | [2.73, 3.69] |
+| LPOP      | 272 K   | 1.16× | 10.92 M   | 2.42 M       | 4.41× | [3.52, 5.47] |
+| SADD      | 257 K   | 1.14× | 6.01 M    | 2.56 M       | 2.34× | [2.19, 2.42] |
+| HSET      | 254 K   | 1.25× | 4.28 M    | 2.12 M       | 2.03× | [1.97, 2.29] |
+
+SADD and HSET put a hundred thousand random members into ONE set and ONE hash,
+so their misses are inside the collection, where nothing fetches ahead; the
+string commands are across the keyspace, where the loop does.
+
+This table is the result of four changes on 2026-09-26, each measured on its
+own against the tree before it: the keyspace became an open-addressed table
+whose lookup is one slot line and one entry rather than three dependent misses
+(GET at depth 100 +27%), sets, hashes and sorted sets got the same table and a
+skiplist whose links live in the node (SADD +54%, ZADD from 0.53× Redis to
+0.99×), the RESP loop parses up to eight commands ahead and fetches their keys'
+lines before running each (GET +44%, 2.5× at a million keys), and MGET/MSET
+fetch their keys in batches (+72–78%). Before them, GET at depth 100 over this
+keyspace read 4.74 M against 12.3 M for one key; now 9.30 M.
+
+At 12.16 M GET/s on one core, 0.082 µs of server CPU per operation is about
+**176 cycles** at the ~2.15 GHz this box has measured at — parse, hash lookup,
+encode, with no syscall of its own. The same operation on the serial path costs
+3.37 µs, about **7,240 cycles**, and the difference is the per-message charge
+that pipelining removes.
 
 The same data read the other way is the clearer statement of cause. Pipelining
-is worth roughly **33× to 50×** to socketley and **10× to 14×** to Redis, and
+is worth roughly **28× to 44×** to socketley and **10× to 16×** to Redis, and
 the mechanism is that a batch is where this tree does its work:
 
 - **Zero-allocation RESP2 codec** — parse and encode directly into and out of
@@ -575,23 +606,22 @@ something else:
 
 | runtime | before | after | |
 |---|---|---|---|
-| cache | 14.10 KB | **2.04 KB** | −85.5% |
-| server | 22.21 KB | **4.92 KB** | −77.8% |
-| proxy | 69.93 KB | 65.93 KB | −5.7% |
+| cache | 14.10 KB | **2.07 KB** | −85.3% |
+| server | 22.21 KB | **4.41 KB** | −80.1% |
+| proxy | 69.93 KB | **6.89 KB** | −90.1% |
 
-The proxy keeps its sixty-four kilobytes on purpose, and that is a measurement
-and not an omission: taking them lazily from the heap made the *bounded* upload
-path hold 113 MB more at 1,100 uploading clients, and a sixteen-kilobyte inline
-buffer made it worse still. The buffer is load-bearing for the memory bound, not
-for speed. `socketley/runtime/proxy/proxy_instance.h` carries both figures at the
-field.
+Measured by `test/integration/test_idle_connection_costs_little.sh` over 2,000
+idle connections with `SOCKETLEY_HUGEPAGE=0`, because with huge pages the
+figure is the 2 MB step the heap happens to be on rather than the connections.
 
-What remains, measured and deliberately not acted on: the pool builds every
-connection with `make_unique<T>()`, which value-initializes, so the whole struct
-is zero-filled and touched before a byte arrives. `make_unique_for_overwrite`
-would skip that at no cost — but `int fd;` and four `io_request` members carry no
-initializer of their own and rely on the zeroing, so the swap wants MSan before
-anyone makes it.
+The proxy's sixty-four kilobyte read buffer is still inline in the connection,
+and deliberately: taking it lazily from the heap made the *bounded* upload path
+hold 113 MB more at 1,100 uploading clients. What changed is that a connection
+is no longer zero-filled when it is built (`shared/conn_alloc.h`), so the pages
+of that buffer are touched by the reads that use them and an idle connection
+never pays for them. The members that had relied on the zeroing were given
+initialisers, and the whole suite was run with the storage filled with `0xAA`
+instead, green.
 
 ## Quick Start
 
