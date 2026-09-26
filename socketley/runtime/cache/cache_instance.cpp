@@ -333,7 +333,11 @@ void cache_instance::pool_release(std::unique_ptr<client_connection> conn)
     conn->partial.clear();
     conn->response_buf.clear();
     conn->write_queue.clear();
-    for (uint32_t i = 0; i < conn->write_batch_count; i++) conn->write_batch[i].clear();
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+    {
+        { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
+        conn->write_batch_seg[i].reset();
+    }
     conn->write_batch_count = 0;
 
     SKL_INV_POOLABLE("cache::pool_release", conn->fd,
@@ -927,7 +931,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
                 bool broken = false;
                 while (!conn->write_queue.empty() && !broken)
                 {
-                    const std::string& msg = conn->write_queue.front();
+                    const std::string_view msg = conn->write_queue.front().view();
                     const int n = tls_context::ssl_write(conn->ssl, msg.data(),
                                                          static_cast<int>(msg.size()));
                     // 0 is the write BIO at its cap and -1 is a dead session;
@@ -968,7 +972,7 @@ void cache_instance::teardown(event_loop& /*loop*/)
             }
             while (!conn->write_queue.empty())
             {
-                const auto& msg = conn->write_queue.front();
+                const std::string_view msg = conn->write_queue.front().view();
                 if (!socketley::write_all(fd, msg.data(), msg.size()))
                     break;
                 conn->write_queue.pop();
@@ -2006,7 +2010,7 @@ bool cache_instance::tls_flush(client_connection* conn)
     {
         while (!conn->write_queue.empty())
         {
-            const std::string& msg = conn->write_queue.front();
+            const std::string_view msg = conn->write_queue.front().view();
             const int n = tls_context::ssl_write(conn->ssl, msg.data(),
                                                  static_cast<int>(msg.size()));
             if (n <= 0)
@@ -2051,7 +2055,7 @@ bool cache_instance::tls_flush(client_connection* conn)
     // Nothing is in flight (checked above), so any buffers still held are from
     // a completed write and are this function's to drop.
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].clear();
+        { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
 
     conn->write_batch[0] = std::move(cipher);
     conn->write_iovs[0].iov_base = conn->write_batch[0].data();
@@ -2518,7 +2522,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
     {
         SKL_TRACE_LOG("write failed fd=%d res=%d", fd, cqe->res);
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
+            { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
         conn->write_batch_count = 0;
         conn->closing = true;
         if (!conn->read_pending)
@@ -2563,9 +2567,10 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
                 {
                     conn->write_iovs[i] = conn->write_iovs[first_iov + i];
                     conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+                    conn->write_batch_seg[i] = std::move(conn->write_batch_seg[first_iov + i]);
                 }
                 for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].clear();
+                    { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
             }
             conn->write_batch_count = new_count;
 
@@ -2611,7 +2616,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 
     // Full write completed — release batch
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
-        conn->write_batch[i].clear();
+        { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
     conn->write_batch_count = 0;
 
     // Flush whatever is still owed, asking conn_has_output rather than the
@@ -7682,10 +7687,19 @@ bool cache_instance::flush_write_queue(client_connection* conn)
     uint32_t count = 0;
     while (!conn->write_queue.empty() && count < client_connection::MAX_WRITE_BATCH)
     {
-        conn->write_batch[count] = conn->write_queue.take_front();
-
-        conn->write_iovs[count].iov_base = conn->write_batch[count].data();
-        conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
+        socketley::write_chunk c = conn->write_queue.take_front();
+        if (c.owns())
+        {
+            conn->write_batch[count] = c.take_owned();
+            conn->write_iovs[count].iov_base = conn->write_batch[count].data();
+            conn->write_iovs[count].iov_len  = conn->write_batch[count].size();
+        }
+        else
+        {
+            conn->write_iovs[count].iov_base = const_cast<char*>(c.data());
+            conn->write_iovs[count].iov_len  = c.size();
+            conn->write_batch_seg[count] = c.take_shared();
+        }
         count++;
     }
 
@@ -7695,12 +7709,12 @@ bool cache_instance::flush_write_queue(client_connection* conn)
     bool queued;
     if (count == 1)
     {
-        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+        auto len = static_cast<uint32_t>(conn->write_iovs[0].iov_len);
         conn->write_req.type = op_write;
         if (conn->direct_fd)
-            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, static_cast<const char*>(conn->write_iovs[0].iov_base), len, &conn->write_req);
         else
-            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write(conn->fd, static_cast<const char*>(conn->write_iovs[0].iov_base), len, &conn->write_req);
     }
     else
     {
@@ -7716,7 +7730,7 @@ bool cache_instance::flush_write_queue(client_connection* conn)
     if (SOCKETLEY_UNLIKELY(!queued))
     {
         for (uint32_t i = 0; i < conn->write_batch_count; i++)
-            conn->write_batch[i].clear();
+            { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
         conn->write_batch_count = 0;
         conn->write_pending = false;
         return false;
@@ -11615,6 +11629,9 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
         // Lazily built per-format messages (avoid building both if only one type exists)
         std::string text_msg;
         std::string resp_msg;
+        // Placed once per format at its first subscriber, then only sliced.
+        std::shared_ptr<const std::string> text_seg, resp_seg;
+        uint32_t text_off = 0, resp_off = 0;
 
         for (int fd : *subs)
         {
@@ -11659,6 +11676,8 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
             }
 
             std::string& out = sub_conn->resp_mode ? resp_msg : text_msg;
+            std::shared_ptr<const std::string>& seg = sub_conn->resp_mode ? resp_seg : text_seg;
+            uint32_t& off = sub_conn->resp_mode ? resp_off : text_off;
             if (out.empty())
             {
                 if (sub_conn->resp_mode)
@@ -11680,14 +11699,15 @@ int cache_instance::publish(std::string_view channel, std::string_view message)
                 }
             }
 
-            // Appended to the tail rather than queued behind it while that
-            // keeps the entry a sensible size, which is what flush_responses
-            // does for a pipelined client and for the same reason one layer
-            // over: a subscriber that is not draining as fast as the channel
-            // fills otherwise collects thousands of separate entries, and only
-            // MAX_WRITE_BATCH of them reach the kernel per submission.
-            sub_conn->write_queue.push_coalesced(
-                out, client_connection::WRITE_COALESCE_LIMIT);
+            if (!seg)
+            {
+                auto& place = sub_conn->resp_mode ? m_pub_seg_resp : m_pub_seg_text;
+                off = socketley::place_in_segment(place, out);
+                seg = place;
+            }
+            // A subscriber still queued behind the last message takes this one
+            // by growing that slice: no copy and no new entry per message.
+            sub_conn->write_queue.push_slice(seg, off, static_cast<uint32_t>(out.size()));
 
             if (!sub_conn->write_pending && SOCKETLEY_UNLIKELY(!flush_write_queue(sub_conn)))
             {

@@ -5714,7 +5714,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
                 // question is about the payload and not about the recipient.
                 ws_msg = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
                                                       : ws_frame_binary_shared(payload);
-                ws_off = place_broadcast(m_bcast_ws_seg, *ws_msg);
+                ws_off = socketley::place_in_segment(m_bcast_ws_seg, *ws_msg);
                 ws_seg = m_bcast_ws_seg;
             }
             conn->write_queue.push_slice(ws_seg, ws_off, static_cast<uint32_t>(ws_msg->size()));
@@ -5727,7 +5727,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
             // ends at the previous broadcast takes this one by growing that slice.
             if (!seg)
             {
-                off = place_broadcast(m_bcast_seg, *msg);
+                off = socketley::place_in_segment(m_bcast_seg, *msg);
                 seg = m_bcast_seg;
             }
             conn->write_queue.push_slice(seg, off, static_cast<uint32_t>(msg->size()));
@@ -5739,17 +5739,6 @@ server_instance::fanout_count server_instance::queue_broadcast(
     return counted;
 }
 
-uint32_t server_instance::place_broadcast(std::shared_ptr<std::string>& seg, std::string_view bytes)
-{
-    if (!seg || seg->capacity() - seg->size() < bytes.size())
-    {
-        seg = std::make_shared<std::string>();
-        seg->reserve(std::max(BCAST_SEGMENT_BYTES, bytes.size()));
-    }
-    const auto off = static_cast<uint32_t>(seg->size());
-    seg->append(bytes);
-    return off;
-}
 
 // ─── Whether the message was taken ──────────────────────────────────────────
 // It used to answer nothing, and the comment at its caller said the rest out

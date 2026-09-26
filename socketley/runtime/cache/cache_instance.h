@@ -74,10 +74,14 @@ struct client_connection
     std::unique_ptr<char[]>   read_buf;
     std::string partial;
     std::string response_buf;
-    // write_queue holds owned strings — no shared_ptr overhead per flush
-    socketley::byte_counted_queue<std::string> write_queue;
+    // Owned replies, and slices of a published message's segment.
+    socketley::byte_counted_queue<socketley::write_chunk> write_queue;
 
     std::string write_batch[MAX_WRITE_BATCH];
+    // What keeps a published message's segment alive while the kernel sends a
+    // slice of it, beside write_batch rather than in it, because every entry
+    // of a batch array is paid by every connection, idle or not.
+    std::shared_ptr<const std::string> write_batch_seg[MAX_WRITE_BATCH];
     struct iovec write_iovs[MAX_WRITE_BATCH];
     struct msghdr write_msg{};
     uint32_t write_batch_count{0};
@@ -926,6 +930,10 @@ private:
     // for why a caller must not ignore that.
     bool flush_responses(client_connection* conn);
     bool flush_write_queue(client_connection* conn);
+    // Where a published message is written once for its subscribers, one
+    // segment per wire format; see socketley::place_in_segment().
+    std::shared_ptr<std::string> m_pub_seg_text;
+    std::shared_ptr<std::string> m_pub_seg_resp;
 
     // ── TLS record layer ────────────────────────────────────────────────────
     // OpenSSL does no I/O here, so the handshake is one call per completion

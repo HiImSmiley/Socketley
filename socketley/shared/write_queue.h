@@ -164,6 +164,11 @@ public:
 
     void clear() { m_owned.clear(); m_shared.reset(); give_back(); }
 
+    // For a queue that sends from an array of strings: the owned bytes, and
+    // the reference that keeps a slice's segment alive while it is sent.
+    std::string take_owned() { return std::move(m_owned); }
+    std::shared_ptr<const std::string> take_shared() { return std::move(m_shared); }
+
     // Whether the bytes at `off` in `seg` follow this slice's last byte, so
     // the slice can take them by growing.
     bool continues_at(const std::string* seg, uint32_t off) const
@@ -188,6 +193,22 @@ private:
     std::shared_ptr<const std::string> m_shared;
     borrowed_bytes                     m_borrowed;
 };
+
+// Where a message several connections send is written once: appended to `seg`,
+// or to a fresh one when it would not fit, since a segment that grew past its
+// reserve would move under the slices queues already hold -- the offset back.
+constexpr size_t write_segment_bytes = 64 * 1024;
+inline uint32_t place_in_segment(std::shared_ptr<std::string>& seg, std::string_view bytes)
+{
+    if (!seg || seg->capacity() - seg->size() < bytes.size())
+    {
+        seg = std::make_shared<std::string>();
+        seg->reserve(bytes.size() > write_segment_bytes ? bytes.size() : write_segment_bytes);
+    }
+    const auto off = static_cast<uint32_t>(seg->size());
+    seg->append(bytes);
+    return off;
+}
 
 inline size_t write_queue_size_of(const write_chunk& c)
 {
