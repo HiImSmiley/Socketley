@@ -16,6 +16,8 @@
 #
 #   * any of 64 concurrent 2 MB uploads cut off while still sending, or not
 #     reading its 413 status line
+#   * a head past 16 KiB closed in silence instead of answered 431, which the
+#     manual has always said it is
 #   * the server still serving afterwards
 #   * and a refused peer that keeps its connection being drained for a while
 #     and then cut off, so a drain cannot hold a slot as long as it likes
@@ -83,6 +85,40 @@ echo "  $N uploads of 2 MB: $GOT sent whole and read their 413; other outcomes: 
 if [ "$GOT" = "$N" ]; then pass
 else fail "every client sends its body and reads its 413" "$GOT of $N" "others: $OTHER" \
           "-- closed with the body unread, the reset overtook the answer"; fi
+
+# ── 1b. and a head past 16 KiB is answered 431, not closed in silence ─────────
+# The manual has said 431 all along; the code closed without a word, and the
+# unread head behind the close reset the connection besides.
+HEADS=$(timeout 120 python3 - "$P" <<'PY' 2>/dev/null || true
+import socket, sys, threading
+port = int(sys.argv[1])
+res = {}
+def one(i):
+    s = socket.create_connection(("127.0.0.1", port), 10); s.settimeout(20)
+    got = b""
+    try:
+        s.sendall(b"GET /index.html HTTP/1.1\r\nHost: t\r\nX-Big: " + b"a" * (2 * 1024 * 1024) + b"\r\n\r\n")
+        while b"\r\n" not in got:
+            c = s.recv(65536)
+            if not c: break
+            got += c
+        res[i] = got.split(b"\r\n", 1)[0].decode(errors="replace")
+    except OSError as e:
+        res[i] = "ERR:" + type(e).__name__
+    finally:
+        s.close()
+ts = [threading.Thread(target=one, args=(i,)) for i in range(64)]
+for t in ts: t.start()
+for t in ts: t.join()
+ok = sum(1 for v in res.values() if v.startswith("HTTP/1.1 431"))
+other = sorted(set(v or "<nothing>" for v in res.values() if not v.startswith("HTTP/1.1 431")))
+print("%d %s" % (ok, ";".join(other) or "-"))
+PY
+)
+read -r HGOT HOTHER <<<"${HEADS:-0 python-failed}"
+echo "  64 heads of 2 MB: $HGOT sent whole and read their 431; other outcomes: $HOTHER"
+if [ "$HGOT" = 64 ]; then pass
+else fail "every oversized head is answered 431" "$HGOT of 64" "others: $HOTHER"; fi
 
 # ── 2. and the server still answers ─────────────────────────────────────────
 AFTER=$(timeout 10 python3 - "$P" <<'PY' 2>/dev/null || true

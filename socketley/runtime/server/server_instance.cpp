@@ -964,6 +964,19 @@ static const std::shared_ptr<const std::string>& http_413_response()
     return resp;
 }
 
+// A head past the 16 KiB this server frames, answered where it used to be
+// closed in silence, as the proxy answers the same thing.
+static const std::shared_ptr<const std::string>& http_431_response()
+{
+    static const std::string body = "Request Header Fields Too Large\n";
+    static const auto resp = std::make_shared<const std::string>(
+        "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n\r\n" + body);
+    return resp;
+}
+
 // Closing, because the response the client was promised is not coming and
 // nothing else on the connection is owed.
 static const std::shared_ptr<const std::string>& http_500_response()
@@ -4066,7 +4079,7 @@ reparse:
             // Reject oversized upgrade requests (belt-and-suspenders for F1 partial limit)
             if (conn->partial.size() > 16384)
             {
-                conn->closing = true;
+                refuse_http_request(conn, http_431_response());
                 return;
             }
             // The size was bounded here and the time was not, so an upgrade
@@ -4465,7 +4478,7 @@ reparse:
         {
             if (conn->partial.size() > 16384)
             {
-                conn->closing = true;
+                refuse_http_request(conn, http_431_response());
                 return;
             }
             arm_header_deadline(conn);
