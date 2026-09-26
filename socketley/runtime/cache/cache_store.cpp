@@ -20,19 +20,19 @@
 
 // ─── Per-entry cost (see the constants in cache_store.h) ───
 
-size_t cache_store::entry_cost(const std::string& key, const std::string& val)
+size_t cache_store::entry_cost(std::string_view key, const std::string& val)
 {
     return stored_string(key) + stored_string(val);
 }
 
-size_t cache_store::entry_cost(const std::string& key, const std::deque<std::string>& deq)
+size_t cache_store::entry_cost(std::string_view key, const std::deque<std::string>& deq)
 {
     size_t bytes = stored_string(key);
     for (const auto& e : deq) bytes += stored_string(e);
     return bytes;
 }
 
-size_t cache_store::entry_cost(const std::string& key, const set_inner& members)
+size_t cache_store::entry_cost(std::string_view key, const set_inner& members)
 {
     size_t bytes = stored_string(key);
     for (const auto& e : members) bytes += stored_string(e);
@@ -41,7 +41,7 @@ size_t cache_store::entry_cost(const std::string& key, const set_inner& members)
 
 // ─── Sorted sets ────────────────────────────────────────────────────────────
 
-size_t cache_store::entry_cost(const std::string& key, const zset_inner& members)
+size_t cache_store::entry_cost(std::string_view key, const zset_inner& members)
 {
     size_t bytes = stored_string(key);
     // Twice per member, because the ordered view holds a copy of the name.
@@ -236,7 +236,7 @@ cache_store::zincrby(std::string_view key, double delta, std::string_view member
          ? zincr_result::ok : zincr_result::type_conflict;
 }
 
-size_t cache_store::entry_cost(const std::string& key, const hash_inner& fields)
+size_t cache_store::entry_cost(std::string_view key, const hash_inner& fields)
 {
     size_t bytes = stored_string(key);
     for (const auto& [f, v] : fields) bytes += stored_string(f) + stored_string(v);
@@ -1093,7 +1093,7 @@ std::vector<std::string> cache_store::sweep_expired()
     for (const auto& [key, tp] : m_expiry)
     {
         if (now >= tp)
-            expired.push_back(key);
+            expired.emplace_back(key);
     }
     for (const auto& key : expired)
         del(key);
@@ -1244,6 +1244,17 @@ static bool value_in_range(std::string_view sv,
 // on entries EXAMINED, because a selective predicate under the other rule walks
 // the whole map in one call -- 74 ms over 632,331 keys with the shard answering
 // nobody.  Written once here because it had been written three times.
+// What a cursor records of the table it walked, so a table whose entries have
+// moved since is walked again; a key_table can move them and keep its size.
+template <class Map>
+static size_t scan_shape(const Map& map)
+{
+    if constexpr (requires { map.scan_epoch(); })
+        return map.bucket_count() ^ (static_cast<size_t>(map.scan_epoch()) * 0x9E3779B1u);
+    else
+        return map.bucket_count();
+}
+
 template <class Map, class Visit, class Full>
 static uint64_t walk_buckets(const Map& map, uint8_t map_index, size_t first_bucket,
                              Visit visit, Full page_full)
@@ -1260,7 +1271,7 @@ static uint64_t walk_buckets(const Map& map, uint8_t map_index, size_t first_buc
         // Whole buckets and never half of one: a page boundary inside a bucket
         // would need an element index the cursor has no room for.
         if (page_full(examined) && b + 1 < nbuckets)
-            return scan_cursor_pack(map_index, nbuckets, b + 1);
+            return scan_cursor_pack(map_index, scan_shape(map), b + 1);
     }
     return 0;
 }
@@ -1268,14 +1279,14 @@ static uint64_t walk_buckets(const Map& map, uint8_t map_index, size_t first_buc
 // Where a walk of one map resumes, given a cursor that may name another map or a
 // table that has been rehashed since.  Both answers are "start again": repeating
 // keys is allowed by the contract and skipping them is not.
-static size_t resume_bucket(uint64_t cursor, uint8_t want_map, size_t nbuckets)
+static size_t resume_bucket(uint64_t cursor, uint8_t want_map, size_t shape)
 {
     if (cursor == 0) return 0;
     const uint8_t  in_map     = static_cast<uint8_t>((cursor >> 55) & 0x7u);
     const uint32_t in_buckets = static_cast<uint32_t>((cursor >> 32) & 0x7FFFFFu);
     const uint64_t in_bucket  = cursor & 0xFFFFFFFFu;
     if (in_map != want_map) return 0;
-    return (in_buckets == (nbuckets & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
+    return (in_buckets == (shape & 0x7FFFFF)) ? static_cast<size_t>(in_bucket) : 0;
 }
 
 // Whether one value satisfies one predicate's value tests.  The field is not
@@ -1308,7 +1319,7 @@ uint64_t cache_store::scan_hash_field(uint64_t cursor, std::string_view pattern,
 
     // Map three is the hash map; a cursor naming another one carries a bucket
     // index belonging to a different table.
-    return walk_buckets(m_hashes, 3, resume_bucket(cursor, 3, m_hashes.bucket_count()),
+    return walk_buckets(m_hashes, 3, resume_bucket(cursor, 3, scan_shape(m_hashes)),
         [&](const auto& e) {
             if (!match_all_keys && !socketley::glob_match(pattern, e.first))
                 return;
@@ -1345,7 +1356,7 @@ uint64_t cache_store::scan_values(uint64_t cursor, std::string_view pattern,
     // A cursor naming another map came from a walk that was not this one -- an
     // iteration that changed its options midway -- and its bucket index means
     // nothing here.
-    return walk_buckets(m_data, 0, resume_bucket(cursor, 0, m_data.bucket_count()),
+    return walk_buckets(m_data, 0, resume_bucket(cursor, 0, scan_shape(m_data)),
         [&](const auto& e) {
             if (!match_all_keys && !socketley::glob_match(pattern, e.first))
                 return;
@@ -1426,11 +1437,11 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
             // A rehash between calls invalidates the bucket index, so this map
             // restarts -- the answer that cannot skip, and may repeat, which
             // the contract allows.
-            const size_t now = (idx == 0 ? m_data.bucket_count()
-                              : idx == 1 ? m_lists.bucket_count()
-                              : idx == 2 ? m_sets.bucket_count()
-                              : idx == 3 ? m_hashes.bucket_count()
-                                         : m_zsets.bucket_count());
+            const size_t now = (idx == 0 ? scan_shape(m_data)
+                              : idx == 1 ? scan_shape(m_lists)
+                              : idx == 2 ? scan_shape(m_sets)
+                              : idx == 3 ? scan_shape(m_hashes)
+                                         : scan_shape(m_zsets));
             start = (in_buckets == (now & 0x7FFFFF)) ? in_bucket : 0;
         }
 
@@ -2494,14 +2505,14 @@ enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3,
 void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
                               uint32_t shard_count)
 {
-    const auto mine = [&](const std::string& k) {
+    const auto mine = [&](std::string_view k) {
         return cache_shard_of(k, shard_count) == shard_index;
     };
 
     // The deadline moves with the key, and it is read BEFORE the key is moved
     // out of `other` — after the move the string is gone and the lookup would
     // be against an empty key.
-    const auto carry_expiry = [&](const std::string& k) {
+    const auto carry_expiry = [&](std::string_view k) {
         const auto e = other.m_expiry.find(k);
         if (e != other.m_expiry.end())
             m_expiry[k] = e->second;

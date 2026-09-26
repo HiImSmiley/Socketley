@@ -11,16 +11,17 @@
 #include <cstdint>
 #include <functional>
 #include <chrono>
+#include "key_table.h"
 #include "zskiplist.h"
 
 #include "../../shared/transparent_string.h"
 
-using string_map = std::unordered_map<std::string, std::string, string_hash, string_equal>;
-using list_map = std::unordered_map<std::string, std::deque<std::string>, string_hash, string_equal>;
+using string_map = key_table<std::string>;
+using list_map = key_table<std::deque<std::string>>;
 using set_inner = std::unordered_set<std::string, string_hash, string_equal>;
-using set_map = std::unordered_map<std::string, set_inner, string_hash, string_equal>;
+using set_map = key_table<set_inner>;
 using hash_inner = std::unordered_map<std::string, std::string, string_hash, string_equal>;
-using hash_map = std::unordered_map<std::string, hash_inner, string_hash, string_equal>;
+using hash_map = key_table<hash_inner>;
 
 // A sorted set is two views of one thing: scores by member, and members in
 // score order.  The ordered half is a skiplist carrying spans, because the
@@ -34,8 +35,8 @@ struct zset_inner
     size_t size() const { return score.size(); }
     bool   empty() const { return score.empty(); }
 };
-using zset_map = std::unordered_map<std::string, zset_inner, string_hash, string_equal>;
-using expiry_map = std::unordered_map<std::string, std::chrono::steady_clock::time_point, string_hash, string_equal>;
+using zset_map = key_table<zset_inner>;
+using expiry_map = key_table<std::chrono::steady_clock::time_point>;
 using channel_map = std::unordered_map<std::string, std::unordered_set<int>, string_hash, string_equal>;
 
 enum eviction_policy : uint8_t
@@ -62,33 +63,7 @@ class cache_store
 public:
     cache_store()
     {
-        // Pre-allocate hash buckets to avoid rehashing during the initial
-        // load.
-        //
-        // max_load_factor is deliberately left at libstdc++'s 1.0, and the
-        // curve below is why -- measured on pipelined GET at about 173,000
-        // keys, nine passes per arm, interleaved with the order reversed:
-        //
-        //     0.5   0.663    (-34%)   0 of 8 passes favoured it
-        //     1.0   1.000    baseline
-        //     2.0   1.051 / 1.032     7 of 8, then 6 of 8 on a repeat
-        //     4.0   1.034    (+3.4%)  4 of 6, which is nothing
-        //     8.0   0.765    (-24%)   0 of 6
-        //
-        // The shape is the finding, not the peak.  Halving the load factor
-        // DOUBLES the bucket array -- 1.4 MB to 2.8 MB at this key count --
-        // and costs a third of the throughput, while shortening every chain.
-        // So what this table pays for is not collisions: it is whether the
-        // bucket array stays resident.  That is also why a better hash was
-        // measured and refused (wyhash, chi2/df 1.035 against 1.000, 0.975x
-        // throughput): fewer collisions buy nothing when the cost is a miss.
-        //
-        // 2.0 is left unset because the win is 3 to 5 per cent on a path whose
-        // noise floor is 5, it reads -0.5% at depth 1 where the kernel holds
-        // 86% of the time, and the peak moves with the key count -- so it
-        // would be tuning this constant for one table size.  The direction
-        // that does follow from the curve is a more COMPACT table: open
-        // addressing, or smaller nodes, not a cleverer hash.
+        // Sized for a first load, so a small cache never rebuilds its table.
         m_data.reserve(1024);
     }
 
@@ -622,6 +597,13 @@ private:
         return s.capacity() <= sso_capacity ? s.size() : malloc_chunk(s.capacity() + 1);
     }
 
+    // A key, which lives inside its table entry and is charged as the string
+    // it replaced would have been, so the constants above still hold.
+    static constexpr size_t stored_string(std::string_view k)
+    {
+        return stored_string(k.size());
+    }
+
     // What an existing string will cost once it holds `new_len` bytes, which
     // is the figure a write over an existing value is admitted against,
     // because libstdc++ reallocates to twice the old capacity and keeps the
@@ -655,11 +637,11 @@ private:
     // Accounted payload of one whole key for the removal paths, in one place,
     // because five hand-written copies of this loop is a permanent error in
     // the reported figure waiting to happen.
-    static size_t entry_cost(const std::string& key, const std::string& val);
-    static size_t entry_cost(const std::string& key, const std::deque<std::string>& deq);
-    static size_t entry_cost(const std::string& key, const set_inner& members);
-    static size_t entry_cost(const std::string& key, const hash_inner& fields);
-    static size_t entry_cost(const std::string& key, const zset_inner& members);
+    static size_t entry_cost(std::string_view key, const std::string& val);
+    static size_t entry_cost(std::string_view key, const std::deque<std::string>& deq);
+    static size_t entry_cost(std::string_view key, const set_inner& members);
+    static size_t entry_cost(std::string_view key, const hash_inner& fields);
+    static size_t entry_cost(std::string_view key, const zset_inner& members);
 
     // Derived from live container sizes rather than tracked incrementally, so
     // it cannot drift, with every term O(1).

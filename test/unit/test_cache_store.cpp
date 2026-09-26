@@ -1963,3 +1963,120 @@ TEST_CASE("a hand-written comparison still finds what the store put there")
         CHECK_FALSE(store.get(std::string_view(near), out));
     }
 }
+
+// ─── key_table: the keyspace's own hash table ───
+
+TEST_CASE("key_table finds what it holds and nothing else")
+{
+    key_table<std::string> t;
+    CHECK(t.empty());
+    CHECK(t.find("a") == t.end());
+    for (int i = 0; i < 10000; ++i)
+        CHECK(t.try_emplace("key:" + std::to_string(i), std::to_string(i)).second);
+    CHECK(t.size() == 10000);
+    CHECK_FALSE(t.try_emplace("key:17", "x").second);
+    for (int i = 0; i < 10000; ++i)
+    {
+        auto it = t.find("key:" + std::to_string(i));
+        REQUIRE(it != t.end());
+        CHECK(it->first == "key:" + std::to_string(i));
+        CHECK(it->second == std::to_string(i));
+    }
+    CHECK(t.find("key:10000") == t.end());
+    CHECK(t.count("") == 0);
+    t.try_emplace("", "empty key");
+    CHECK(t.find("")->second == "empty key");
+}
+
+TEST_CASE("key_table erase leaves every other key reachable")
+{
+    key_table<int> t;
+    std::set<int> live;
+    for (int i = 0; i < 5000; ++i) { t.try_emplace(std::to_string(i), i); live.insert(i); }
+    // Every third key out, then half of them back, so probes cross tombstones.
+    for (int i = 0; i < 5000; i += 3) { CHECK(t.erase(std::to_string(i)) == 1); live.erase(i); }
+    for (int i = 0; i < 5000; i += 6) { t.try_emplace(std::to_string(i), i); live.insert(i); }
+    CHECK(t.size() == live.size());
+    for (int i = 0; i < 5000; ++i)
+        CHECK((t.find(std::to_string(i)) != t.end()) == (live.count(i) == 1));
+    size_t walked = 0;
+    for (const auto& [k, v] : t) { CHECK(k == std::to_string(v)); ++walked; }
+    CHECK(walked == live.size());
+}
+
+TEST_CASE("key_table erase while iterating visits each entry once")
+{
+    key_table<int> t;
+    for (int i = 0; i < 1000; ++i) t.try_emplace(std::to_string(i), i);
+    std::set<int> seen;
+    for (auto it = t.begin(); it != t.end();)
+    {
+        CHECK(seen.insert(it->second).second);
+        if (it->second % 2) it = t.erase(it); else ++it;
+    }
+    CHECK(seen.size() == 1000);
+    CHECK(t.size() == 500);
+}
+
+TEST_CASE("key_table churn at a steady size does not grow the table without end")
+{
+    key_table<int> t;
+    for (int i = 0; i < 100; ++i) t.try_emplace(std::to_string(i), i);
+    const size_t cap = t.bucket_count();
+    for (int i = 100; i < 200000; ++i)
+    {
+        t.try_emplace(std::to_string(i), i);
+        CHECK(t.erase(std::to_string(i - 100)) == 1);
+    }
+    CHECK(t.size() == 100);
+    CHECK(t.bucket_count() <= cap * 2);
+    for (int i = 200000 - 100; i < 200000; ++i) CHECK(t.count(std::to_string(i)) == 1);
+}
+
+TEST_CASE("key_table insert_or_assign, operator[] and clear")
+{
+    key_table<std::string> t;
+    CHECK(t.insert_or_assign(std::string("k"), std::string("1")).second);
+    CHECK_FALSE(t.insert_or_assign(std::string("k"), std::string("2")).second);
+    CHECK(t.find("k")->second == "2");
+    t["n"] += "x";
+    CHECK(t.find("n")->second == "x");
+    const uint32_t before = t.scan_epoch();
+    t.clear();
+    CHECK(t.empty());
+    CHECK(t.bucket_count() == 0);
+    CHECK(t.scan_epoch() != before);
+    CHECK(t.find("k") == t.end());
+}
+
+TEST_CASE("key_table values keep their address across growth")
+{
+    key_table<std::string> t;
+    t.try_emplace("anchor", "value");
+    const std::string* p = &t.find("anchor")->second;
+    for (int i = 0; i < 50000; ++i) t.try_emplace(std::to_string(i), "v");
+    CHECK(&t.find("anchor")->second == p);
+}
+
+TEST_CASE("SCAN over a keyspace with deletes between pages returns every key that stayed")
+{
+    cache_store store;
+    for (int i = 0; i < 20000; ++i) store.set("k" + std::to_string(i), "v");
+    std::set<std::string> got;
+    uint64_t cursor = 0;
+    int page = 0;
+    do
+    {
+        std::vector<std::string_view> out;
+        cursor = store.scan(cursor, "*", 100, out);
+        for (auto k : out) got.insert(std::string(k));
+        // Deleting between pages leaves tombstones, which must not move anyone.
+        if (++page % 3 == 0)
+            for (int j = 0; j < 20; ++j) store.del("k" + std::to_string((page * 20 + j) % 20000));
+    } while (cursor != 0);
+    for (int i = 0; i < 20000; ++i)
+    {
+        const std::string k = "k" + std::to_string(i);
+        if (store.exists(k)) CHECK(got.count(k) == 1);
+    }
+}

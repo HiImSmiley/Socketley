@@ -590,7 +590,7 @@ void check_structure(cache_store& s)
     int live_count[NKEYS];
     for (int& c : live_count) c = 0;
 
-    auto count_live = [&](const std::string& k) {
+    auto count_live = [&](std::string_view k) {
         const int i = key_index(k);
         CACHE_CHECK(i >= 0, "the store holds a key that no operation ever wrote");
         live_count[i]++;
@@ -630,7 +630,7 @@ void check_structure(cache_store& s)
     // each).  Whether it is in the LRU is *observed* rather than derived from
     // the limit, so this stays a statement about bytes and not about
     // cache_store's own rules.
-    auto key_floor = [&](const std::string& k) {
+    auto key_floor = [&](std::string_view k) {
         size_t bytes = string_floor(k.size());
         if (s.m_lru_map.count(k))
             bytes += 2 * heap_block(k.size());
