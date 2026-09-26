@@ -47,10 +47,12 @@ int main()
     printf("user:1 ttl = %lld s\n", (long long)s.get_ttl("user:1"));
 
     // The lookup takes a string_view and builds no temporary key, so this
-    // costs a hash and a compare and no allocation at all.
+    // costs a hash and a compare and no allocation at all -- and answers a
+    // view, because a small hash keeps its fields packed and holds no
+    // std::string to point at.
     const char* field = "port";
-    if (const std::string* p = s.hget("cfg", std::string_view(field)))
-        printf("cfg.port = %s\n", p->c_str());
+    if (auto p = s.hget("cfg", std::string_view(field)))
+        printf("cfg.port = %.*s\n", static_cast<int>(p->size()), p->data());
 
     printf("keys = %u\n", s.size());
     return 0;
