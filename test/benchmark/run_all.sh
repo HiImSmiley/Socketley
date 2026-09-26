@@ -133,6 +133,10 @@ run_benchmarks() {
     unset BENCH_RESP_PAIRS
     restart_daemon
 
+    # The README's memory table, which was measured by hand until one of its
+    # rows was found 57% off the tree it described.  About two minutes.
+    run_bench_script "$script_dir/bench_cache_memory.sh"
+
     # Fan-out, which is the one shape none of the tests above measure: every
     # rate before this point is a round trip, and one message in producing N out
     # is a different question with a different answer.  The script's own five

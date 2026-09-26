@@ -580,20 +580,24 @@ doubting the figure.
 
 ### Memory per key
 
-Resident memory of a cache worker per key held, `SOCKETLEY_HUGEPAGE=0`, 100,000
-keys of each shape written over RESP, against Redis 7.0.15's `used_memory` for
-the same commands (`test/benchmark` has no row for this yet; the method is the
-RSS difference over the load):
+Resident memory of a cache worker per key held, `SOCKETLEY_HUGEPAGE=0`,
+1,000,000 keys of each shape written over RESP, against Redis 7.0.15's
+`used_memory` for the same commands. `test/benchmark/bench_cache_memory.sh`
+measures it in two minutes:
 
 | shape | socketley | Redis 7.0.15 | |
 |---|---|---|---|
-| string, 16-byte key, 3-byte value | 118 B | 105 B | 1.1× |
-| hash, 5 fields of 6 bytes | **248 B** (was 631) | 170 B | 1.5× |
-| set, 5 members | 471 B | 474 B | 1.0× |
-| sorted set, 5 members | **248 B** (was 1,575) | 137 B | 1.8× |
-| list, 1 element | **183 B** (was 806) | 185 B | 1.0× |
-| list, 5 elements | **231 B** (was 808) | 217 B | 1.1× |
-| list, 50 elements | **634 B** (was 2,791) | 617 B | 1.0× |
+| string, 16-byte key, 3-byte value | 118 B | 104 B | 1.1× |
+| hash, 5 fields of 6 bytes | 198 B | 168 B | 1.2× |
+| set, 5 members | 422 B | 472 B | 0.9× |
+| sorted set, 5 members | 198 B | 136 B | 1.5× |
+| list, 1 element | 134 B | 184 B | 0.7× |
+| list, 5 elements | 182 B | 216 B | 0.8× |
+| list, 50 elements | 583 B | 616 B | 0.9× |
+
+The key count matters: the keyspace's slot table doubles as it passes three
+quarters full, and at 100,000 keys it has just done so, which adds about 50
+bytes to every row above.
 
 Redis keeps a small hash, sorted set and list in one packed buffer (a
 listpack) and walks it; a hash here does the same below 128 fields of 64 bytes
