@@ -8784,6 +8784,27 @@ bool proxy_instance::lend_or_copy(socketley::byte_counted_queue<socketley::write
     return true;
 }
 
+// A relayed message sent as nginx sends it, with one send() and no submission:
+// through the ring it cost a submit, a completion and a second ring entry per
+// hop, and the serial small-message rows read 1-4% behind nginx for it.  Only
+// with nothing queued or in flight ahead, so the order on the wire is kept,
+// and never on a connection whose writes the completion handlers have more to
+// do for -- TLS, a close or a splice in progress.
+template <typename Conn>
+size_t proxy_instance::send_now(Conn* c, std::string_view out)
+{
+    if (c->ssl != nullptr || c->write_pending || !c->write_queue.empty() ||
+        c->closing || c->splice_active || c->fd < 0)
+        return 0;
+    const ssize_t n = ::send(c->fd, out.data(), out.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n <= 0)
+        return 0;
+#ifdef SOCKETLEY_INVARIANTS
+    inv_check_progress(c->fd, static_cast<int>(n), op_write, "proxy::send_now");
+#endif
+    return static_cast<size_t>(n);
+}
+
 bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::string_view data,
                                         int lent_buf)
 {
@@ -8895,17 +8916,23 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
         return false;
     }
 
+    const std::string_view out = hook_modified ? std::string_view(hook_storage) : data;
+    m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
+    const size_t sent = send_now(bconn, out);
+    if (sent > 0)
+    {
+        SKL_TRACE_ADD(bconn, bytes_written, (unsigned long long)sent);
+        SKL_TRACE_ADD(bconn, writes, 1);
+        bconn->send_retries = 0;
+        if (sent == out.size())
+            return false;
+    }
+
     bool lent = false;
     if (hook_modified)
-    {
-        m_stat_bytes_out.fetch_add(hook_storage.size(), std::memory_order_relaxed);
-        bconn->write_queue.emplace(std::move(hook_storage));
-    }
+        bconn->write_queue.emplace(hook_storage.substr(sent));
     else
-    {
-        m_stat_bytes_out.fetch_add(data.size(), std::memory_order_relaxed);
-        lent = lend_or_copy(bconn->write_queue, data, lent_buf);
-    }
+        lent = lend_or_copy(bconn->write_queue, data.substr(sent), lent_buf);
 
     // Undeliverable, and marking is all this may do, because the callers go on
     // using conn and the read handlers tear the pair down when they see
@@ -9060,17 +9087,16 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
         return false;
     }
 
+    m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
+    const size_t sent = send_now(cconn, out);
+    if (sent == out.size())
+        return false;
+
     bool lent = false;
     if (hook_modified)
-    {
-        m_stat_bytes_out.fetch_add(hook_storage.size(), std::memory_order_relaxed);
-        cconn->write_queue.emplace(std::move(hook_storage));
-    }
+        cconn->write_queue.emplace(hook_storage.substr(sent));
     else
-    {
-        m_stat_bytes_out.fetch_add(data.size(), std::memory_order_relaxed);
-        lent = lend_or_copy(cconn->write_queue, data, lent_buf);
-    }
+        lent = lend_or_copy(cconn->write_queue, data.substr(sent), lent_buf);
 
     if (!cconn->write_pending && !flush_client_write_queue(cconn))
         cconn->closing = true;

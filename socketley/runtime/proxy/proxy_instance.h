@@ -1006,6 +1006,9 @@ private:
     // and as a copy otherwise, true when it was lent.
     bool lend_or_copy(socketley::byte_counted_queue<socketley::write_chunk>& q,
                       std::string_view data, int lent_buf);
+    // What of `out` the socket took at once, sent directly when nothing is
+    // queued ahead of it; 0 when it must go through the queue.
+    template <typename Conn> size_t send_now(Conn* c, std::string_view out);
     // The buffer id when this read's bytes may be lent to the write queue, and
     // -1 when they must be copied: not the ring's, not a TCP relay, or too few
     // to be worth a whole buffer.

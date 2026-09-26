@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tens of elements are up to 14% slower, since a packed list is walked.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
+- The proxy sends a relayed message directly when nothing is queued ahead of
+  it, instead of through a submission and a completion: one connection's small
+  round trips went from level with nginx's stream proxy (0.96-0.99x) to
+  1.03-1.08x, at 11% less CPU per round trip.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
