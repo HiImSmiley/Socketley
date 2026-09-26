@@ -15,8 +15,9 @@
 //   const std::string* v = s.get_ptr("user:1");   // no copy
 //   if (auto f = s.hget("cfg", "port")) ...        // optional<string_view>
 //
-// hget() answers a view and not a std::string*, since 1.1.0's packed small
-// hashes hold no std::string to point at.
+// hget() and lindex() answer views and not std::string*, and list_ptr()'s
+// list is read through at() and iterators of views, because a small hash and a
+// small list are packed and hold no std::string to point at.
 //
 // What it gives you over the std:: container you would otherwise reach for:
 // lookups take a string_view and build no temporary key, get_ptr() hands back

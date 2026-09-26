@@ -6055,7 +6055,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 rb.append("error: invalid index\n", 21);
                 return;
             }
-            const std::string* val = m_store.lindex(key, idx);
+            const auto val = m_store.lindex(key, idx);
             if (val)
             {
                 rb.append(*val);
@@ -6097,10 +6097,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             if (stop < 0) stop += len;
             if (start < 0) start = 0;
             if (stop >= len) stop = len - 1;
-            for (int i = start; i <= stop; i++)
+            // One walk from start rather than an index per element, which in
+            // a packed list is a walk each.
+            if (start <= stop)
             {
-                rb.append((*deq)[static_cast<size_t>(i)]);
-                rb.push_back('\n');
+                auto e = deq->iterator_at(static_cast<size_t>(start));
+                for (int i = start; i <= stop; i++, ++e)
+                {
+                    rb.append(*e);
+                    rb.push_back('\n');
+                }
             }
             rb.append("end\n", 4);
             break;
@@ -7876,8 +7882,12 @@ sol::table cache_instance::lua_lrange(std::string_view key, int start, int stop)
     if (stop >= len) stop = len - 1;
 
     int lua_idx = 1;
-    for (int i = start; i <= stop; i++)
-        result[lua_idx++] = (*deq)[static_cast<size_t>(i)];
+    if (start <= stop)
+    {
+        auto e = deq->iterator_at(static_cast<size_t>(start));
+        for (int i = start; i <= stop; i++, ++e)
+            result[lua_idx++] = std::string(*e);
+    }
 
     return result;
 }
@@ -9625,8 +9635,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (stop >= len) stop = len - 1;
             int result_len = (start > stop) ? 0 : (stop - start + 1);
             resp::encode_array_header_into(rb, result_len);
-            for (int i = start; i <= stop; i++)
-                resp::encode_bulk_into(rb, (*deq)[static_cast<size_t>(i)]);
+            if (start <= stop)
+            {
+                auto e = deq->iterator_at(static_cast<size_t>(start));
+                for (int i = start; i <= stop; i++, ++e)
+                    resp::encode_bulk_into(rb, *e);
+            }
             break;
         }
         case fnv1a("lindex"):
@@ -9635,7 +9649,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_has_ttl_keys) m_store.check_expiry(args[1]);
             int idx = 0;
             if (!parse_int_sv(args[2], idx)) { resp::encode_error_into(rb, "value is not an integer or out of range"); return; }
-            const std::string* val = m_store.lindex(args[1], idx);
+            const auto val = m_store.lindex(args[1], idx);
             if (val) resp::encode_bulk_into(rb, *val);
             else if (SOCKETLEY_UNLIKELY(m_store.holds_other_type(args[1], 'l')))
                 resp::encode_error_code_into(rb, wrongtype_msg);

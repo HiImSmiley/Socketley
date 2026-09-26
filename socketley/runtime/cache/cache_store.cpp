@@ -419,11 +419,9 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
         // through a freed node.
         if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
             return false;
-        // Measured after it has been constructed in place, like every other add
-        // here: what it costs is the buffer it ended up with.
-        const std::string& elem = it->second.emplace_front(val);
+        it->second.push_front(val);
         ++m_list_elems;
-        track_add(stored_string(elem));
+        track_add(stored_string(val.size()));
         touch_lru(key);
         return true;
     }
@@ -435,7 +433,7 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
         return false;
 
     auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
-    nit->second.emplace_front(val);
+    nit->second.push_front(val);
     ++m_list_elems;
     track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
@@ -450,10 +448,9 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
         // Named for the same reason as in lpush(): `it` must survive the call.
         if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
             return false;
-        // Same as lpush(): measured once it exists.
-        const std::string& elem = it->second.emplace_back(val);
+        it->second.push_back(val);
         ++m_list_elems;
-        track_add(stored_string(elem));
+        track_add(stored_string(val.size()));
         touch_lru(key);
         return true;
     }
@@ -465,7 +462,7 @@ bool cache_store::rpush(std::string_view key, std::string_view val)
         return false;
 
     auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
-    nit->second.emplace_back(val);
+    nit->second.push_back(val);
     ++m_list_elems;
     track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
@@ -478,11 +475,10 @@ bool cache_store::lpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
-    // Measured before the move: `out` belongs to the caller and is reused across
-    // calls, so its capacity afterwards is its own history, not the element's.
-    const size_t elem_cost = stored_string(it->second.front());
-    out = std::move(it->second.front());
-    it->second.pop_front();
+    // Charged by length, as the push was: an element may be bytes in a packed
+    // buffer and have no capacity of its own.
+    out = it->second.pop_front();
+    const size_t elem_cost = stored_string(out.size());
     --m_list_elems;
     track_sub(elem_cost);
 
@@ -503,10 +499,9 @@ bool cache_store::rpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
-    // Same as lpop(): the element is measured while it is still the deque's.
-    const size_t elem_cost = stored_string(it->second.back());
-    out = std::move(it->second.back());
-    it->second.pop_back();
+    // Same as lpop().
+    out = it->second.pop_back();
+    const size_t elem_cost = stored_string(out.size());
     --m_list_elems;
     track_sub(elem_cost);
 
@@ -537,11 +532,11 @@ const list_inner* cache_store::list_ptr(std::string_view key) const
     return &it->second;
 }
 
-const std::string* cache_store::lindex(std::string_view key, int idx) const
+std::optional<std::string_view> cache_store::lindex(std::string_view key, int idx) const
 {
     auto it = m_lists.find(key);
     if (it == m_lists.end())
-        return nullptr;
+        return std::nullopt;
 
     const auto& deq = it->second;
     int len = static_cast<int>(deq.size());
@@ -549,9 +544,9 @@ const std::string* cache_store::lindex(std::string_view key, int idx) const
     if (idx < 0)
         idx += len;
     if (idx < 0 || idx >= len)
-        return nullptr;
+        return std::nullopt;
 
-    return &deq[static_cast<size_t>(idx)];
+    return deq.at(static_cast<size_t>(idx));
 }
 
 // ─── Sets ───
@@ -1734,21 +1729,20 @@ int cache_store::lset(std::string_view key, int64_t idx, std::string_view val)
     if (idx < 0 || idx >= static_cast<int64_t>(dq.size()))
         return -2;
 
-    auto& slot = dq[static_cast<size_t>(idx)];
-    if (__builtin_expect(m_max_memory != 0 && val.size() > slot.size(), 0))
+    const size_t old_len = dq.at(static_cast<size_t>(idx)).size();
+    if (__builtin_expect(m_max_memory != 0 && val.size() > old_len, 0))
     {
-        const size_t held = stored_string(slot);
-        const size_t want = rewritten_string(slot, val.size());
+        const size_t held = stored_string(old_len);
+        const size_t want = stored_string(val.size());
         if (want > held && !check_memory(want - held, key))
             return -2;
         it = m_lists.find(key);
         if (it == m_lists.end() || idx >= static_cast<int64_t>(it->second.size()))
             return -1;
     }
-    auto& target = it->second[static_cast<size_t>(idx)];
-    track_sub(stored_string(target));
-    target.assign(val.data(), val.size());
-    track_add(stored_string(target));
+    track_sub(stored_string(old_len));
+    it->second.set(static_cast<size_t>(idx), val);
+    track_add(stored_string(val.size()));
     touch_lru(key);
     return 0;
 }
@@ -1764,20 +1758,22 @@ int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
     int removed = 0;
     const size_t want = (count == 0) ? dq.size()
                                      : static_cast<size_t>(count < 0 ? -count : count);
+    // By position, since an erase in a packed list moves the bytes behind it
+    // and an iterator carrying their offset would name the wrong element.
     if (count >= 0)
     {
-        for (auto e = dq.begin(); e != dq.end() && static_cast<size_t>(removed) < want; )
+        for (size_t i = 0; i < dq.size() && static_cast<size_t>(removed) < want; )
         {
-            if (*e == val) { track_sub(stored_string(*e)); e = dq.erase(e); ++removed; --m_list_elems; }
-            else ++e;
+            if (dq.at(i) == val) { track_sub(stored_string(val.size())); dq.erase(i); ++removed; --m_list_elems; }
+            else ++i;
         }
     }
     else
     {
-        for (auto e = dq.end(); e != dq.begin() && static_cast<size_t>(removed) < want; )
+        for (size_t i = dq.size(); i > 0 && static_cast<size_t>(removed) < want; )
         {
-            --e;
-            if (*e == val) { track_sub(stored_string(*e)); e = dq.erase(e); ++removed; --m_list_elems; }
+            --i;
+            if (dq.at(i) == val) { track_sub(stored_string(val.size())); dq.erase(i); ++removed; --m_list_elems; }
         }
     }
 
@@ -1840,7 +1836,7 @@ int cache_store::linsert(std::string_view key, bool before, std::string_view piv
     auto at = std::find(dq.begin(), dq.end(), pivot);
     if (at == dq.end())
         return -1;
-    dq.insert(before ? at : std::next(at), std::string(val));
+    dq.insert(at.index() + (before ? 0 : 1), val);
     ++m_list_elems;
     track_add(stored_string(val.size()));
     touch_lru(key);
@@ -1864,17 +1860,16 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
     // Charged before the pop, for the same reason: a refusal after it would
     // have taken the element out of the queue and dropped it.
-    const std::string& head = from_head ? sit->second.front() : sit->second.back();
-    if (src != dst && !check_memory(stored_string(head.size())
+    const size_t head_len = (from_head ? sit->second.front() : sit->second.back()).size();
+    if (src != dst && !check_memory(stored_string(head_len)
                                     + new_key_cost(dst.size()) + list_elem_overhead, dst))
         return false;
     sit = m_lists.find(src);
     if (sit == m_lists.end() || sit->second.empty())
         return false;
 
-    if (from_head) { out = std::move(sit->second.front()); sit->second.pop_front(); }
-    else           { out = std::move(sit->second.back());  sit->second.pop_back();  }
-    track_sub(stored_string(out));
+    out = from_head ? sit->second.pop_front() : sit->second.pop_back();
+    track_sub(stored_string(out.size()));
     --m_list_elems;
 
     // src == dst is a rotation, and the deque above is the one below: taken
@@ -1883,7 +1878,7 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
     {
         if (to_head) sit->second.push_front(out); else sit->second.push_back(out);
         ++m_list_elems;
-        track_add(stored_string(out));
+        track_add(stored_string(out.size()));
         touch_lru(src);
         return true;
     }
@@ -1901,7 +1896,7 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
         dit = m_lists.emplace(std::string(dst), list_inner{}).first;
     if (to_head) dit->second.push_front(out); else dit->second.push_back(out);
     ++m_list_elems;
-    track_add(stored_string(out));
+    track_add(stored_string(out.size()));
     touch_lru(dst);
     return true;
 }

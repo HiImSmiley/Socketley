@@ -141,15 +141,15 @@ TEST_CASE("cache_store list operations")
         store.rpush("q", "b");
         store.rpush("q", "c");
 
-        const std::string* val = store.lindex("q", 0);
-        REQUIRE(val != nullptr);
+        auto val = store.lindex("q", 0);
+        REQUIRE(val.has_value());
         CHECK(*val == "a");
 
         val = store.lindex("q", -1);
-        REQUIRE(val != nullptr);
+        REQUIRE(val.has_value());
         CHECK(*val == "c");
 
-        CHECK(store.lindex("q", 10) == nullptr);
+        CHECK_FALSE(store.lindex("q", 10).has_value());
     }
 }
 
@@ -359,7 +359,7 @@ TEST_CASE("cache_store eviction")
         REQUIRE(store.rpush("l", std::string(40, 'e')));
         store.rpush("l", std::string(400, 'f'));
         CHECK(store.llen("l") >= 1);
-        CHECK(store.lindex("l", 0) != nullptr);
+        CHECK(store.lindex("l", 0).has_value());
 
         REQUIRE(store.hset("h", "f", std::string(40, 'v')));
         store.hset("h", "g", std::string(400, 'w'));
@@ -2365,5 +2365,51 @@ TEST_CASE("seg_list taken from one end only, emptied and refilled")
         for (int i = 0; i < 20; ++i) { l.push_back("x" + std::to_string(i)); ref.push_back("x" + std::to_string(i)); }
         while (!ref.empty()) { REQUIRE(l.front() == ref.front()); l.pop_front(); ref.pop_front(); }
         CHECK(l.empty());
+    }
+}
+
+TEST_CASE("list_items agrees with a deque, packed and after it moves to the seg_list")
+{
+    uint32_t r = 31337;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    for (int round = 0; round < 60; ++round)
+    {
+        list_items l;
+        std::deque<std::string> ref;
+        const size_t cap = (round % 3 == 0) ? 200 : 20;      // 200 crosses PACK_MAX_ITEMS
+        const bool long_values = (round % 5 == 0);           // and 100 bytes crosses PACK_MAX_LEN
+        for (int step = 0; step < 1500; ++step)
+        {
+            const size_t vlen = long_values ? rnd() % 100 : rnd() % 20;
+            const std::string v(vlen, static_cast<char>('a' + rnd() % 26));
+            switch (rnd() % 9)
+            {
+                case 0: if (ref.size() < cap) { l.push_front(v); ref.push_front(v); } break;
+                case 1: if (ref.size() < cap) { l.push_back(v); ref.push_back(v); } break;
+                case 2: if (!ref.empty()) { CHECK(l.pop_front() == ref.front()); ref.pop_front(); } break;
+                case 3: if (!ref.empty()) { CHECK(l.pop_back() == ref.back()); ref.pop_back(); } break;
+                case 4: if (!ref.empty()) { const size_t i = rnd() % ref.size(); l.set(i, v); ref[i] = v; } break;
+                case 5: if (!ref.empty()) { const size_t i = rnd() % ref.size(); l.erase(i); ref.erase(ref.begin() + static_cast<long>(i)); } break;
+                case 6: if (ref.size() < cap) { const size_t i = rnd() % (ref.size() + 1); l.insert(i, v); ref.insert(ref.begin() + static_cast<long>(i), v); } break;
+                default: if (ref.size() < cap) { l.push_back(v); ref.push_back(v); } break;
+            }
+            REQUIRE(l.size() == ref.size());
+            if (!ref.empty()) { REQUIRE(l.front() == ref.front()); REQUIRE(l.back() == ref.back()); }
+        }
+        size_t i = 0;
+        for (auto e = l.begin(); e != l.end(); ++e, ++i) CHECK(*e == ref[i]);
+        CHECK(i == ref.size());
+        size_t j = ref.size();
+        for (auto e = l.end(); e != l.begin(); ) { --e; CHECK(*e == ref[--j]); }
+        for (size_t k = 0; k < ref.size(); ++k) CHECK(l.at(k) == ref[k]);
+        if (!ref.empty())
+        {
+            const size_t s = rnd() % ref.size();
+            auto e = l.iterator_at(s);
+            for (size_t k = s; k < ref.size(); ++k, ++e) CHECK(*e == ref[k]);
+        }
+        list_items copy(l);
+        CHECK(copy == l);
+        if (cap == 20 && !long_values) CHECK(l.packed());
     }
 }

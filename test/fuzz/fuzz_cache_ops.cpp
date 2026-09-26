@@ -754,7 +754,7 @@ void verify_model(world& w, bool evict_possible)
                 CACHE_CHECK(d != nullptr, "type() says list but list_ptr() returns nothing");
                 CACHE_CHECK(d->size() == e.list.size(), "the list has a different length than was written");
                 for (size_t j = 0; j < e.list.size(); j++)
-                    CACHE_CHECK((*d)[j] == e.list[j], "a list element is not what was pushed");
+                    CACHE_CHECK(d->at(j) == e.list[j], "a list element is not what was pushed");
                 CACHE_CHECK(static_cast<size_t>(s.llen(k)) == e.list.size(), "llen disagrees with the list");
                 break;
             }
@@ -1565,12 +1565,12 @@ bool run_step(world& w, const step& s)
         case OP_LINDEX:
         {
             const int  idx = static_cast<int8_t>(s.a);
-            const std::string* p = w.store.lindex(k, idx);
+            const auto p = w.store.lindex(k, idx);
             long j = idx;
             if (e.type == T_LIST && j < 0)
                 j += static_cast<long>(e.list.size());
             const bool in_range = (e.type == T_LIST && j >= 0 && j < static_cast<long>(e.list.size()));
-            CACHE_CHECK((p != nullptr) == in_range, "lindex() disagrees with the model about the range");
+            CACHE_CHECK(p.has_value() == in_range, "lindex() disagrees with the model about the range");
             if (p)
                 CACHE_CHECK(*p == e.list[static_cast<size_t>(j)], "lindex() returned the wrong element");
             break;

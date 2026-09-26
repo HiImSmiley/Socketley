@@ -22,17 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The daemon ignores SIGHUP; rotate `--log` and `-w` files with `copytruncate`.
 - The packaged unit reads home directories (`ProtectHome=read-only`), so a
   script or certificate kept there can be used.
-- **SDK:** `cache_store::hget()` returns `std::optional<std::string_view>`
-  instead of `const std::string*`. A small hash keeps its fields packed and
-  holds no `std::string` to point at.
+- **SDK:** `cache_store::hget()` and `lindex()` return
+  `std::optional<std::string_view>` instead of `const std::string*`, and the
+  list `list_ptr()` returns is read through `at()` and iterators of views. A
+  small hash and a small list are packed and hold no `std::string` to point at.
 - A cache is faster once its keyspace outgrows the CPU caches: the keyspace is
   an open-addressed table, the RESP loop fetches the keys of the next eight
   pipelined commands ahead of running them, and MGET/MSET fetch theirs in
   batches. Pipelined GET over 100,000 random keys went from 4.7 M to 8.8 M/s,
   over a million from 2.9 M to 7.4 M; MGET and MSET of ten keys gained 72–78%.
 - Small hashes, sorted sets and lists take less memory: a five-field hash 631 →
-  263 bytes, a five-member sorted set 1,575 → 439, a one-element list 806 →
-  726; list LINDEX, LSET and LRANGE are 12–18% faster.
+  263 bytes, a five-member sorted set 1,575 → 439, a five-element list 808 →
+  248. RPUSH is a third faster and LRANGE 9–12%; LINDEX and LSET on lists of
+  tens of elements are up to 14% slower, since a packed list is walked.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 

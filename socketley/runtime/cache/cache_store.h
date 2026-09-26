@@ -14,14 +14,14 @@
 #include <functional>
 #include <chrono>
 #include "field_map.h"
-#include "seg_list.h"
+#include "list_items.h"
 #include "key_table.h"
 #include "zskiplist.h"
 
 #include "../../shared/transparent_string.h"
 
 using string_map = key_table<std::string>;
-using list_inner = seg_list;
+using list_inner = list_items;
 using list_map = key_table<list_inner>;
 using set_inner = key_set;
 using set_map = key_table<set_inner>;
@@ -223,7 +223,7 @@ public:
     bool rpop(std::string_view key, std::string& out);
     int llen(std::string_view key) const;
     const list_inner* list_ptr(std::string_view key) const;
-    const std::string* lindex(std::string_view key, int idx) const;
+    std::optional<std::string_view> lindex(std::string_view key, int idx) const;
 
     // --- Sets ---
     // Returns: 1 = added, 0 = already exists, -1 = type conflict
