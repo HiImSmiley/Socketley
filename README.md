@@ -578,6 +578,30 @@ box whose `vm.compaction_proactiveness` had been turned down and whose
 system still gets huge pages and gets less out of them. Check `buddyinfo` before
 doubting the figure.
 
+### Memory per key
+
+Resident memory of a cache worker per key held, `SOCKETLEY_HUGEPAGE=0`, 100,000
+keys of each shape written over RESP, against Redis 7.0.15's `used_memory` for
+the same commands (`test/benchmark` has no row for this yet; the method is the
+RSS difference over the load):
+
+| shape | socketley | Redis 7.0.15 | |
+|---|---|---|---|
+| string, 16-byte key, 3-byte value | 118 B | 105 B | 1.1× |
+| hash, 5 fields of 6 bytes | **263 B** (was 631) | 170 B | 1.5× |
+| set, 5 members | 471 B | 474 B | 1.0× |
+| sorted set, 5 members | **439 B** (was 1,575) | 137 B | 3.2× |
+| list, 1 element | **422 B** (was 806) | 185 B | 2.3× |
+| list, 5 elements | **423 B** (was 808) | 217 B | 1.9× |
+
+Redis keeps a small hash, sorted set and list in one packed buffer (a
+listpack) and walks it; a hash here does the same below 128 fields of 64 bytes,
+and a sorted set and a list keep their members in one sorted vector or ring of
+`std::string` below 128, which is where the remaining distance is: a string
+object is 32 bytes before its first character. A list of 9 to 128 elements
+that has regrown reads random indexes 22% slower than the `std::deque` it
+replaced, for having left the neighbourhood of its table entry.
+
 ### Many simultaneous connections
 
 This section used to say that many simultaneous connections are "not
