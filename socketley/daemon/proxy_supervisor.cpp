@@ -850,19 +850,10 @@ bool proxy_supervisor::write_frame(const std::string& framed)
     if (m_control_fd < 0)
         return false;
 
-    if (pending_out() + framed.size() > MAX_CONTROL_BACKLOG)
-    {
-        // Said once per crossing rather than per frame: a wedged child produces
-        // one of these per request otherwise.
-        if (!m_out_full)
-        {
-            LOG_WARN("proxy supervisor: control socket backlog full; the child "
-                     "is not reading");
-            m_out_full = true;
-        }
+    if (!m_out_gate.admit(pending_out(), framed.size(), MAX_CONTROL_BACKLOG,
+                          "proxy supervisor: control socket backlog full; the child "
+                          "is not reading"))
         return false;
-    }
-    m_out_full = false;
 
     m_out += framed;
     flush_control();

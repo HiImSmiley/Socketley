@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <sys/types.h>
 
+#include "../shared/backlog_gate.h"
 #include "../shared/conn_identity.h"
 #include "../shared/request_channel.h"
 // For runtime_state: await_startup() remembers the state the child reported
@@ -414,7 +415,7 @@ private:
 
     std::string  m_out;
     size_t       m_out_off{0};
-    bool         m_out_full{false};
+    backlog_gate m_out_gate;
 
     event_loop*  m_loop{nullptr};
 

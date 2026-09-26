@@ -9,6 +9,7 @@
 #include <string_view>
 #include <unistd.h>
 
+#include "backlog_gate.h"
 #include "event_loop.h"
 #include "event_loop_definitions.h"
 #include "logging.h"
@@ -90,16 +91,9 @@ public:
 
     bool write(std::string_view framed)
     {
-        if (pending() + framed.size() > MAX_BACKLOG)
-        {
-            if (!m_full)
-            {
-                LOG_WARN("frame writer: backlog full; the peer is not reading");
-                m_full = true;
-            }
+        if (!m_gate.admit(pending(), framed.size(), MAX_BACKLOG,
+                          "frame writer: backlog full; the peer is not reading"))
             return false;
-        }
-        m_full = false;
         m_out.append(framed);
 
         // Queue only: submitting per frame ends the ring's wait for a
@@ -187,11 +181,11 @@ private:
         else if (m_off >= 64 * 1024)    { m_out.erase(0, m_off); m_off = 0; }
     }
 
-    int         m_fd;
-    std::string m_out;
-    size_t      m_off{0};
-    bool        m_full{false};
-    bool        m_dead{false};
+    int          m_fd;
+    std::string  m_out;
+    size_t       m_off{0};
+    backlog_gate m_gate;
+    bool         m_dead{false};
 
     // Null until use_ring(); everything above works without it.
     event_loop* m_loop{nullptr};
