@@ -93,7 +93,9 @@ cleanup() {
     rm -rf "$WORK"
     return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM   # see setup_cleanup_trap in utils.sh
 
 BUSY=$(
   ps=$(pgrep -x socketley 2>/dev/null | tr '\n' ' '); t0=0; t1=0

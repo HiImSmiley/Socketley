@@ -294,6 +294,9 @@ test_http_arm() {
 WRK_THREADS=${WRK_THREADS:-4}
 WRK_CONNS=${WRK_CONNS:-64}
 WRK_SECS=${WRK_SECS:-5}
+# Three runs and the median: one run read 153 k req/s where five interleaved
+# passes of the same binary read 246 k, with a pass near 200 k in either arm.
+WRK_RUNS=${WRK_RUNS:-3}
 
 test_http_wrk_arm() {   # mode flag
     local mode=$1 flag=$2 path out rps p50 p99 c0 c1 t0 t1 cores
@@ -307,17 +310,25 @@ test_http_wrk_arm() {   # mode flag
     sleep 0.5
 
     for path in index.html large.bin; do
-        c0=$(socketley_cpu_ticks); t0=$(date +%s%N)
-        out=$(timeout 60 wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"${WRK_SECS}s" --latency \
-              "http://127.0.0.1:${HTTP_PORT}/${path}" 2>&1)
-        t1=$(date +%s%N); c1=$(socketley_cpu_ticks)
-        cores=$(socketley_cores_since "$c0" "$c1" "$t0" "$t1")
-        rps=$(awk '/^Requests\/sec:/ { print $2 }' <<<"$out")
-        p50=$(awk '$1 == "50%" { print $2 }' <<<"$out")
-        p99=$(awk '$1 == "99%" { print $2 }' <<<"$out")
-        if grep -qE 'Non-2xx|Socket errors' <<<"$out"; then
-            log_error "  /${path}: $(grep -E 'Non-2xx|Socket errors' <<<"$out" | tr -s ' ')"
-        fi
+        local runs="" best="" r lo hi
+        for ((r = 0; r < WRK_RUNS; r++)); do
+            c0=$(socketley_cpu_ticks); t0=$(date +%s%N)
+            out=$(timeout 60 wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"${WRK_SECS}s" --latency \
+                  "http://127.0.0.1:${HTTP_PORT}/${path}" 2>&1)
+            t1=$(date +%s%N); c1=$(socketley_cpu_ticks)
+            if grep -qE 'Non-2xx|Socket errors' <<<"$out"; then
+                log_error "  /${path}: $(grep -E 'Non-2xx|Socket errors' <<<"$out" | tr -s ' ')"
+            fi
+            # Each run's rate, cores, p50 and p99 on one line, so the median
+            # run's latencies are reported with its own rate.
+            runs+="$(awk '/^Requests\/sec:/ { r = $2 } $1 == "50%" { a = $2 } $1 == "99%" { b = $2 }
+                           END { printf "%s %s %s", r + 0, a, b }' <<<"$out") $(socketley_cores_since "$c0" "$c1" "$t0" "$t1")"$'\n'
+        done
+        best=$(sort -n <<<"${runs%$'\n'}" | awk '{ l[NR] = $0 } END { print l[int((NR + 1) / 2)] }')
+        read -r rps p50 p99 cores <<<"$best"
+        lo=$(sort -n <<<"${runs%$'\n'}" | head -1 | cut -d' ' -f1)
+        hi=$(sort -n <<<"${runs%$'\n'}" | tail -1 | cut -d' ' -f1)
+        log_info "  /${path}: ${WRK_RUNS} runs ${lo} .. ${hi} req/s, the median one below"
         if awk -v c="$cores" 'BEGIN { exit !(c < 0.9) }'; then
             log_warn "  /${path}: ${rps} req/s  p50 ${p50}  p99 ${p99}  server ${cores} cores — wrk was the limit"
         else

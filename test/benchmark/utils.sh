@@ -654,12 +654,18 @@ cleanup_all() {
 }
 
 # Trap for cleanup on exit
+# A signal ends the script as well as cleaning up after it: a TERM trap that
+# only cleaned up removed the runtimes and let the script go on measuring
+# ports with nothing behind them -- an hour of 600 s timeouts on 2026-09-26,
+# after run_all.sh's 300 s bound sent the TERM.
 setup_cleanup_trap() {
     if [[ "${SOCKETLEY_BENCH_PARENT:-}" != "1" ]]; then
-        trap 'cleanup_all; stop_daemon' EXIT INT TERM
+        trap 'cleanup_all; stop_daemon' EXIT
     else
-        trap 'cleanup_all' EXIT INT TERM
+        trap 'cleanup_all' EXIT
     fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
 # Check if daemon should be managed by this script

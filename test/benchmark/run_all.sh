@@ -123,14 +123,13 @@ run_benchmarks() {
 
     # Redis comparison: this is the headline claim in the README, so it belongs
     # in the standard suite rather than being something one has to remember to
-    # run.  Three interleaved pairs, around 70s: this used to be one unpaired
-    # repetition at around 40s, and the thirty seconds bought a SADD reading
-    # that was 0.8x on a single unlucky run and 1.02x over five pairs.  Raise
-    # BENCH_RESP_PAIRS when the numbers matter; the interval narrows as
-    # 1/sqrt(pairs).  It exits cleanly when redis-benchmark or a running Redis
-    # is missing.
-    export BENCH_RESP_PAIRS=3
-    run_bench_script "$script_dir/bench_cache_resp.sh"
+    # run.  Seven interleaved pairs of runs lasting seconds, about twelve
+    # minutes: three pairs resolved 5-56% and its 200K/2M runs lasted under a
+    # second.  Its own timeout, because the shared 300 s ended it mid-run on
+    # 2026-09-26 and the TERM left it measuring an empty port for an hour.  It
+    # exits cleanly when redis-benchmark or a running Redis is missing.
+    export BENCH_RESP_PAIRS=7
+    BENCH_TIMEOUT_SCRIPT=1500 run_bench_script "$script_dir/bench_cache_resp.sh"
     unset BENCH_RESP_PAIRS
     restart_daemon
 

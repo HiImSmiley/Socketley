@@ -92,7 +92,9 @@ cleanup() {
     rm -rf "$W"
     return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM   # see setup_cleanup_trap in utils.sh
 
 FLOOR_SRV=$PROJECT_ROOT/bin/Release/floor_server
 FLOOR_RLY=$PROJECT_ROOT/bin/Release/floor_relay

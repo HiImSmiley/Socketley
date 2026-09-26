@@ -193,7 +193,9 @@ cleanup() {
     rm -rf "$WORK"
     return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM   # see setup_cleanup_trap in utils.sh
 
 if ! command -v haproxy >/dev/null 2>&1; then
     log_error "haproxy is not installed — there is nothing to compare against"

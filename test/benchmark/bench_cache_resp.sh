@@ -418,22 +418,25 @@ JEOF
 # This run against the README's own table for the same depth, read from the
 # README itself: the table this replaced was typed in once and still claimed
 # 2.8x and 8.93 M SET/s long after the README said 3.45x and 10.31 M.
+# The README's -r 100000 table, which is the keyspace this script measures;
+# its two single-key tables keep one entry in L1 and are another question.
+# Columns: | op | depth 1 | ratio | depth 100 | Redis | ratio | spread |
 readme_row() {   # depth op -> "rate ratio" from README.md, or nothing
     local depth=$1 op=$2
-    awk -v d="**Pipeline depth $depth**" -v op="$op" '
-        index($0, d) == 1 { inside = 1; next }
-        inside && /^\*\*Pipeline depth/ { inside = 0 }
+    awk -v depth="$depth" -v op="$op" '
+        index($0, "**With a real keyspace.**") == 1 { inside = 1; next }
+        inside && /^\*\*|^### / { inside = 0 }
         inside && $0 ~ "^\\| *"op" *\\|" {
-            n = split($0, c, "|")
-            # The first number and its unit, not every digit in the cell: the
-            # spread beside it ("261 K ±21%") is digits too.
+            split($0, c, "|")
+            cell  = (depth == 1) ? c[3] : c[5]
+            ratio = (depth == 1) ? c[4] : c[7]
             rate = 0; mul = 1
-            if (match(c[3], /[0-9.]+ *[KM]?/)) {
-                tok = substr(c[3], RSTART, RLENGTH)
+            if (match(cell, /[0-9.]+ *[KM]?/)) {
+                tok = substr(cell, RSTART, RLENGTH)
                 mul = (tok ~ /M/) ? 1e6 : ((tok ~ /K/) ? 1e3 : 1)
                 gsub(/[ KM]/, "", tok); rate = tok
             }
-            ratio = c[5]; gsub(/[^0-9.]/, "", ratio)
+            gsub(/[^0-9.]/, "", ratio)
             printf "%.0f %s\n", rate * mul, ratio; exit
         }' "$(dirname "$0")/../../README.md" 2>/dev/null
 }
