@@ -45,7 +45,7 @@ size_t cache_store::entry_cost(std::string_view key, const zset_inner& members)
 {
     size_t bytes = stored_string(key);
     // Twice per member, because the ordered view holds a copy of the name.
-    for (const auto& [m, sc] : members.score) bytes += 2 * stored_string(m);
+    for (const auto& [sc, m] : members.order) bytes += 2 * stored_string(m);
     return bytes;
 }
 
@@ -59,19 +59,14 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
     auto it = m_zsets.find(key);
     if (it != m_zsets.end())
     {
-        auto sit = it->second.score.find(member);
-        if (sit != it->second.score.end())
+        double old = 0.0;
+        if (it->second.score_of(member, old))
         {
             // A score that moves is a move in the ordered view too, and the
             // old pair has to go before the new one arrives or the member is
             // in there twice.
-            if (sit->second != score)
-            {
-                std::string name;
-                it->second.order.extract(sit->second, sit->first, name);
-                it->second.order.emplace(score, std::move(name));
-                sit->second = score;
-            }
+            if (old != score)
+                it->second.rescore(member, old, score);
             touch_lru(key);
             return 0;
         }
@@ -87,8 +82,7 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
     if (it == m_zsets.end())
         it = m_zsets.emplace(std::string(key), zset_inner{}).first;
 
-    it->second.score.emplace(std::string(member), score);
-    it->second.order.emplace(score, std::string(member));
+    it->second.add(score, member);
     ++m_zset_members;
     // The delta and not two full walks: entry_cost() sums every member, so
     // every zadd was O(n) in the set's size and filling one was O(n squared).
@@ -105,12 +99,11 @@ bool cache_store::zrem(std::string_view key, std::string_view member)
     auto it = m_zsets.find(key);
     if (it == m_zsets.end())
         return false;
-    auto sit = it->second.score.find(member);
-    if (sit == it->second.score.end())
+    double old = 0.0;
+    if (!it->second.score_of(member, old))
         return false;
 
-    it->second.order.erase(sit->second, sit->first);
-    it->second.score.erase(sit);
+    it->second.remove(member, old);
     --m_zset_members;
     // The same delta zadd charges, for the same reason.
     track_sub(2 * stored_string(member.size()));
@@ -131,11 +124,7 @@ bool cache_store::zscore(std::string_view key, std::string_view member, double& 
     auto it = m_zsets.find(key);
     if (it == m_zsets.end())
         return false;
-    auto sit = it->second.score.find(member);
-    if (sit == it->second.score.end())
-        return false;
-    out = sit->second;
-    return true;
+    return it->second.score_of(member, out);
 }
 
 size_t cache_store::zcard(std::string_view key) const
@@ -150,14 +139,14 @@ bool cache_store::zrank(std::string_view key, std::string_view member, size_t& o
     auto it = m_zsets.find(key);
     if (it == m_zsets.end())
         return false;
-    auto sit = it->second.score.find(member);
-    if (sit == it->second.score.end())
+    double sc = 0.0;
+    if (!it->second.score_of(member, sc))
         return false;
 
     // The spans crossed on the way down are the rank, so this is O(log n) and
     // not a walk.  It was a walk, and at fifty thousand members that was
     // thirty-three times slower than Redis.
-    const size_t rank = it->second.order.rank(sit->second, sit->first);
+    const size_t rank = it->second.order.rank(sc, member);
     if (rank == zskiplist::npos)
         return false;
     out = reverse ? it->second.size() - 1 - rank : rank;
@@ -2045,7 +2034,7 @@ uint64_t cache_store::zscan(std::string_view key, uint64_t cursor,
 {
     auto it = m_zsets.find(key);
     if (it == m_zsets.end()) return 0;
-    return scan_one_collection(it->second.score, cursor, pattern, count,
+    return scan_one_collection(it->second, cursor, pattern, count,
         [&out](const auto& e) { out.emplace_back(std::string_view(e.first), e.second); return true; });
 }
 
@@ -2599,7 +2588,7 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     for (const auto& [key, z] : m_zsets)
     {
         total_size += entry_overhead(key) + 4;
-        for (const auto& [member, sc] : z.score) total_size += string_size(member) + 8;
+        for (const auto& [sc, member] : z.order) total_size += string_size(member) + 8;
     }
 
     // Phase 2: mmap temp file and serialize directly into mapped region
@@ -2712,8 +2701,8 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     for (const auto& [key, z] : m_zsets)
     {
         emit_key(TYPE_ZSET, key);
-        emit_u32(static_cast<uint32_t>(z.score.size()));
-        for (const auto& [member, sc] : z.score)
+        emit_u32(static_cast<uint32_t>(z.size()));
+        for (const auto& [sc, member] : z.order)
         {
             emit_string(member);
             std::memcpy(p, &sc, 8); p += 8;
@@ -2960,8 +2949,7 @@ bool cache_store::load_v2(const char* data, size_t size)
                     if (!read_string(member)) return false;
                     if (remaining() < 8) return false;
                     std::memcpy(&sc, p, 8); p += 8;
-                    z.order.emplace(sc, member);
-                    z.score.emplace(std::move(member), sc);
+                    z.add(sc, member);
                 }
                 if (!read_expiry(key, expired)) return false;
                 if (!expired)
@@ -3109,8 +3097,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     if (!read_string(member)) return false;
                     file.read(reinterpret_cast<char*>(&sc), sizeof(sc));
                     if (!file) return false;
-                    z.order.emplace(sc, member);
-                    z.score.emplace(std::move(member), sc);
+                    z.add(sc, member);
                 }
                 if (!read_expiry(key, expired)) return false;
                 if (!expired)

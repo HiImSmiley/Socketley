@@ -2210,3 +2210,79 @@ TEST_CASE("a small hash is packed and a large one is not, through the store")
     CHECK(store.hlen("small") == 4);
     CHECK_FALSE(store.hget("small", "field2").has_value());
 }
+
+TEST_CASE("zset_inner agrees with a model, small and after the skiplist takes over")
+{
+    uint32_t r = 4242;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    for (int round = 0; round < 30; ++round)
+    {
+        zset_inner z;
+        std::map<std::string, double> score;
+        std::set<std::pair<double, std::string>> ord;
+        const int universe = (round % 3 == 0) ? 400 : 60;   // 400 crosses SMALL_MAX
+        for (int step = 0; step < 3000; ++step)
+        {
+            const std::string m = (rnd() % 2 ? "m" : "a-long-member-name-") + std::to_string(rnd() % universe);
+            const double sc = static_cast<double>(rnd() % 50);
+            auto it = score.find(m);
+            if (rnd() % 5 == 0)
+            {
+                if (it != score.end())
+                {
+                    z.remove(m, it->second);
+                    ord.erase({ it->second, m });
+                    score.erase(it);
+                }
+            }
+            else if (it != score.end())
+            {
+                z.rescore(m, it->second, sc);
+                ord.erase({ it->second, m });
+                ord.insert({ sc, m });
+                it->second = sc;
+            }
+            else
+            {
+                z.add(sc, m);
+                ord.insert({ sc, m });
+                score[m] = sc;
+            }
+            REQUIRE(z.size() == score.size());
+        }
+        size_t i = 0;
+        for (auto it = z.order.begin(); it != z.order.end(); ++it, ++i)
+        {
+            const auto& want = *std::next(ord.begin(), static_cast<long>(i));
+            CHECK(*it == want);
+            CHECK(z.order.rank(want.first, want.second) == i);
+            CHECK(*z.order.at(i) == want);
+        }
+        CHECK(i == ord.size());
+        for (const auto& [m, sc] : score)
+        {
+            double got = -1;
+            REQUIRE(z.score_of(m, got));
+            CHECK(got == sc);
+        }
+        double none = 0;
+        CHECK_FALSE(z.score_of("absent", none));
+        // The first member at or past 25, as ZRANGEBYSCORE finds it.
+        auto lb = z.order.lower_bound_score(25.0, true);
+        auto rl = std::find_if(ord.begin(), ord.end(), [](const auto& e) { return e.first >= 25.0; });
+        CHECK((lb == z.order.end()) == (rl == ord.end()));
+        if (rl != ord.end()) CHECK(*lb == *rl);
+        if (!ord.empty()) CHECK(*std::prev(z.order.end()) == *ord.rbegin());
+        // ZSCAN's walk visits every member once with its score.
+        std::map<std::string, double> scanned;
+        for (size_t b = 0; b < z.bucket_count(); ++b)
+            for (auto it = z.begin(b); it != z.end(b); ++it)
+                CHECK(scanned.emplace(std::string((*it).first), (*it).second).second);
+        CHECK(scanned == score);
+        zset_inner copy(z);
+        CHECK(copy.size() == z.size());
+        // Sixty members never outgrow the vector; four hundred always did.
+        if (universe == 60) CHECK_FALSE(z.order.big());
+        else                CHECK(z.order.big());
+    }
+}

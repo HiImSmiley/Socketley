@@ -1,6 +1,7 @@
 #pragma once
 #include <charconv>
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,17 +26,123 @@ using set_map = key_table<set_inner>;
 using hash_inner = field_map;
 using hash_map = key_table<hash_inner>;
 
-// A sorted set is two views of one thing: scores by member, and members in
-// score order.  The ordered half is a skiplist carrying spans, because the
+// A sorted set is two views of one thing: members in score order, and scores
+// by member.  The ordered half is a skiplist carrying spans, because the
 // std::set it used to be had the right order and no way to ask WHERE a member
-// sits -- see zskiplist.h for the sweep that settled it.
-struct zset_inner
+// sits -- see zskiplist.h for the sweep that settled it.  The by-member half
+// exists only once the skiplist has outgrown its small vector: below that a
+// member's score is found by walking at most SMALL_MAX entries, and the index
+// cost more than the members it indexed.
+class zset_inner
 {
-    key_table<double> score;
-    zskiplist         order;
+public:
+    zskiplist order;   // read through here, changed only through the calls below
 
-    size_t size() const { return score.size(); }
-    bool   empty() const { return score.empty(); }
+    zset_inner() = default;
+    zset_inner(const zset_inner& o)
+        : order(o.order), m_index(o.m_index ? std::make_unique<key_table<double>>(*o.m_index) : nullptr) {}
+    zset_inner& operator=(const zset_inner& o)
+    {
+        if (this != &o) { zset_inner copy(o); *this = std::move(copy); }
+        return *this;
+    }
+    zset_inner(zset_inner&&) noexcept = default;
+    zset_inner& operator=(zset_inner&&) noexcept = default;
+
+    size_t size()  const { return order.size(); }
+    bool   empty() const { return order.empty(); }
+
+    bool score_of(std::string_view member, double& out) const
+    {
+        if (m_index)
+        {
+            auto it = m_index->find(member);
+            if (it == m_index->end()) return false;
+            out = it->second;
+            return true;
+        }
+        for (const auto& [sc, m] : order)
+            if (string_equal{}(m, member)) { out = sc; return true; }
+        return false;
+    }
+
+    // A member that is not in the set yet.
+    void add(double score, std::string_view member)
+    {
+        order.emplace(score, std::string(member));
+        if (m_index)
+            m_index->try_emplace(member, score);
+        else if (order.big())
+            build_index();
+    }
+
+    // A member that is, moved from `old` to `score`.
+    void rescore(std::string_view member, double old, double score)
+    {
+        std::string name;
+        order.extract(old, member, name);
+        order.emplace(score, std::move(name));
+        if (m_index)
+            m_index->insert_or_assign(member, score);
+        else if (order.big())
+            build_index();
+    }
+
+    void remove(std::string_view member, double old)
+    {
+        order.erase(old, member);
+        if (m_index) m_index->erase(member);
+    }
+
+    // What ZSCAN walks, as (member, score): the small vector as one bucket,
+    // answered in one page as Redis answers a listpack, or the index's slots.
+    class const_local_iterator
+    {
+        zskiplist::const_iterator                m_ord;
+        key_table<double>::const_local_iterator  m_slot;
+        bool                                     m_small;
+
+    public:
+        explicit const_local_iterator(zskiplist::const_iterator o) : m_ord(o), m_slot(), m_small(true) {}
+        explicit const_local_iterator(key_table<double>::const_local_iterator s) : m_ord(), m_slot(s), m_small(false) {}
+        std::pair<std::string_view, double> operator*() const
+        {
+            if (m_small) return { m_ord->second, m_ord->first };
+            return { m_slot->first, m_slot->second };
+        }
+        const_local_iterator& operator++()
+        {
+            if (m_small) ++m_ord; else ++m_slot;
+            return *this;
+        }
+        friend bool operator==(const const_local_iterator& a, const const_local_iterator& b)
+        {
+            return a.m_small ? a.m_ord == b.m_ord : a.m_slot == b.m_slot;
+        }
+        friend bool operator!=(const const_local_iterator& a, const const_local_iterator& b) { return !(a == b); }
+    };
+    size_t bucket_count() const { return m_index ? m_index->bucket_count() : 1; }
+    const_local_iterator begin(size_t b) const
+    {
+        return m_index ? const_local_iterator(std::as_const(*m_index).begin(b)) : const_local_iterator(order.begin());
+    }
+    const_local_iterator end(size_t b) const
+    {
+        return m_index ? const_local_iterator(std::as_const(*m_index).end(b)) : const_local_iterator(order.end());
+    }
+    // A cursor from the small form is never read against the index.
+    uint32_t scan_epoch() const { return m_index ? m_index->scan_epoch() + 1 : 0; }
+
+private:
+    std::unique_ptr<key_table<double>> m_index;
+
+    void build_index()
+    {
+        m_index = std::make_unique<key_table<double>>();
+        m_index->reserve(order.size());
+        for (const auto& [sc, m] : order)
+            m_index->try_emplace(m, sc);
+    }
 };
 using zset_map = key_table<zset_inner>;
 using expiry_map = key_table<std::chrono::steady_clock::time_point>;
