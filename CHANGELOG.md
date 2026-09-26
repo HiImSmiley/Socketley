@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tens of elements are up to 14% slower, since a packed list is walked.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
+- `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
+  `redis.call` works on the Lua stack and hands its arguments to the cache
+  without encoding them as RESP. An error a script catches from `redis.call`
+  is the cache's own text, without a `lua: error:` prefix.
 
 ### Fixed
 
@@ -48,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A dump restores a TTL as the deadline it was, not as the time that was left.
 - A write accepted after a torn journal tail survives the next crash.
 - `EVAL` refuses precompiled bytecode.
+- A script can no longer end the cache's worker: a returned table whose
+  `__index` raised did, and so did `EVAL` from inside `EVAL`. A script is
+  refused, as Redis refuses it, the commands that would outlive it on the
+  caller's connection (`MULTI`, `WATCH`, `SUBSCRIBE`, `EVAL`, `SCRIPT`, `RESET`,
+  …), and a blocking pop in a script answers at once.
 - Twelve cache answers Redis clients depend on, among them a bare
   `UNSUBSCRIBE`, the subscription count, `HSET`'s count, `READONLY`, and
   `FLUSHALL` and `MULTI` on a sharded cache.

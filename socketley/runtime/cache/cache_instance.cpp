@@ -3190,8 +3190,12 @@ static bool take_resp_array_header(std::string_view part, int64_t& count,
 void cache_instance::run_local_raw(client_connection* conn, std::string_view raw,
                                    bool resp, std::string& out)
 {
+    // The reply is written into `out`'s own buffer, so a caller that keeps it
+    // between calls allocates nothing.
     std::string held;
     held.swap(conn->response_buf);
+    out.clear();
+    conn->response_buf.swap(out);
 
     if (resp)
     {
@@ -3224,7 +3228,6 @@ void cache_instance::run_local_raw(client_connection* conn, std::string_view raw
         process_command_local(conn, raw);
     }
 
-    out.clear();
     out.swap(conn->response_buf);
     conn->response_buf.swap(held);
 }
@@ -8631,10 +8634,41 @@ void cache_instance::process_resp_command(client_connection* conn,
     run_in_reply_order(conn, [&] { process_resp_command_local(conn, args, argc); });
 }
 
+#ifndef SOCKETLEY_NO_LUA
+// What a script may not run, because each starts or ends a session the script
+// cannot finish: EVAL inside EVAL recursed until the worker died, and MULTI or
+// SUBSCRIBE left the caller's connection queueing or subscribed.
+static bool refused_in_script(uint32_t h)
+{
+    switch (h)
+    {
+        case fnv1a("eval"):  case fnv1a("evalsha"): case fnv1a("script"):
+        case fnv1a("multi"): case fnv1a("exec"):    case fnv1a("discard"):
+        case fnv1a("watch"): case fnv1a("unwatch"):
+        case fnv1a("subscribe"):  case fnv1a("unsubscribe"):
+        case fnv1a("psubscribe"): case fnv1a("punsubscribe"):
+        case fnv1a("quit"):  case fnv1a("reset"):   case fnv1a("hello"):
+        case fnv1a("auth"):  case fnv1a("client"):
+            return true;
+        default:
+            return false;
+    }
+}
+#endif
+
 void cache_instance::process_resp_command_local(client_connection* conn, std::string_view* args, int argc)
 {
     if (SOCKETLEY_UNLIKELY(argc == 0))
         return;
+
+#ifndef SOCKETLEY_NO_LUA
+    if (SOCKETLEY_UNLIKELY(m_script_depth > 0) && refused_in_script(fnv1a_lower(args[0])))
+    {
+        resp::encode_error_code_into(conn->response_buf,
+            "ERR This Redis command is not allowed from script");
+        return;
+    }
+#endif
 
     // Global rate limit check (across all connections)
     if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
@@ -11046,25 +11080,22 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 body = *found;
             }
             else
-            {
                 body = args[1];
-                // EVAL loads as well as runs, so the SHA it would have under
-                // SCRIPT LOAD works afterwards -- which is what lets a client
-                // try EVALSHA first and fall back once.
-                m_scripts.load(body);
-            }
 
-            std::vector<std::string_view> keys, argv;
-            keys.reserve(static_cast<size_t>(nkeys));
-            for (int i = 0; i < nkeys; ++i) keys.push_back(args[3 + i]);
-            for (int i = 3 + static_cast<int>(nkeys); i < argc; ++i) argv.push_back(args[i]);
+            const std::span<const std::string_view> keys(args + 3, static_cast<size_t>(nkeys));
+            const std::span<const std::string_view> argv(args + 3 + nkeys, static_cast<size_t>(argc - 3 - nkeys));
 
             std::string out, err;
+            const bool was_exec = conn->in_exec;
+            conn->in_exec = true;
+            ++m_script_depth;
             const bool okrun = m_scripts.eval(
                 body, keys, argv,
-                [this, conn](std::string_view raw, std::string& reply)
-                { script_command(conn, raw, reply); },
+                [this, conn](std::span<std::string_view> a, std::string& reply)
+                { script_command(conn, a, reply); },
                 out, err);
+            --m_script_depth;
+            conn->in_exec = was_exec;
             if (!okrun)
             {
                 // A redis.call that failed carries the cache's own error out
@@ -11286,10 +11317,24 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 // with the reply captured instead of queued.  A script therefore sees exactly
 // what a client would -- including the refusals -- and cannot reach past the
 // dispatch into the store.
-void cache_instance::script_command(client_connection* conn, std::string_view raw,
+void cache_instance::script_command(client_connection* conn, std::span<std::string_view> args,
                                     std::string& reply)
 {
-    run_local_raw(conn, raw, /*resp=*/true, reply);
+    // The parser's two limits, which a command from a script no longer passes.
+    std::string held;
+    held.swap(conn->response_buf);
+    reply.clear();
+    conn->response_buf.swap(reply);
+    const size_t limit = static_cast<size_t>(read_bulk_limit());
+    const auto too_large = [limit](std::string_view a) { return a.size() > limit; };
+    if (args.size() > static_cast<size_t>(resp::RESP_MAX_ARRAY_SIZE))
+        resp::encode_error_into(conn->response_buf, "too many arguments in one command");
+    else if (std::any_of(args.begin(), args.end(), too_large))
+        resp::encode_error_into(conn->response_buf, "value is larger than this cache accepts");
+    else
+        process_resp_command_local(conn, args.data(), static_cast<int>(args.size()));
+    reply.swap(conn->response_buf);
+    conn->response_buf.swap(held);
 }
 #endif
 

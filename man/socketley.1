@@ -5132,6 +5132,16 @@ are there;
 .B redis.log
 is accepted and writes nothing.
 .IP
+A command that would outlive the script on the caller's connection is refused
+with
+.BR "\-ERR This Redis command is not allowed from script" ,
+as Redis refuses it:
+.BR eval ", " evalsha ", " script ", " multi ", " exec ", " discard ,
+.BR watch ", " unwatch ,
+the four subscribe commands,
+.BR quit ", " reset ", " hello ", " auth " and " client .
+A blocking pop answers at once, as its non-blocking twin would.
+.IP
 The return value is converted as Redis converts it: a number becomes an
 integer truncated towards zero, a string a bulk, a table an array
 .I up to its first hole

@@ -109,9 +109,10 @@ struct client_connection
     bool                     multi_broken{false};
     std::vector<std::string> multi_queue;
     size_t                   multi_bytes{0};
-    // Set only while EXEC replays what it queued.  in_multi is already false
-    // by then -- EXEC clears it before the loop -- so a command that must
-    // behave differently inside a transaction has nothing else to read.
+    // Set only while EXEC replays what it queued, or a script runs.  in_multi
+    // is already false by then -- EXEC clears it before the loop -- so a
+    // command that must answer at once, as a blocking pop must, has nothing
+    // else to read.
     bool                     in_exec{false};
     // Enough for a batch worth queueing and small enough that a client cannot
     // park unbounded memory on a connection by never sending EXEC.
@@ -824,9 +825,11 @@ private:
     // one is the operator's code and the other arrived over the network.
     socketley::cache_script_engine m_scripts;
 
-    // Runs one RESP-encoded command for a script and hands back its reply,
-    // which is redis.call's only way into the cache.
-    void script_command(client_connection* conn, std::string_view raw, std::string& reply);
+    // Runs one command for a script and hands back its reply, which is
+    // redis.call's only way into the cache.
+    void script_command(client_connection* conn, std::span<std::string_view> args, std::string& reply);
+    // Scripts running now, counting one that redis.call started inside another.
+    uint32_t m_script_depth{0};
 #endif
 
     // ─── BLPOP / BRPOP ──────────────────────────────────────────────────────

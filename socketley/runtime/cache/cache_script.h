@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -38,18 +39,19 @@ namespace socketley {
 class cache_script_engine
 {
 public:
-    // Runs one command already encoded as a RESP array and appends its RESP
-    // reply.  This is `redis.call`'s whole contact with the cache: the engine
-    // knows nothing about the store, the dispatch or the shard map.
-    using command_fn = std::function<void(std::string_view raw_resp, std::string& reply)>;
+    // Runs one command, its arguments as views, and appends its RESP reply.
+    // This is `redis.call`'s whole contact with the cache: the engine knows
+    // nothing about the store, the dispatch or the shard map.
+    using command_fn = std::function<void(std::span<std::string_view> args, std::string& reply)>;
 
     cache_script_engine() = default;
 
-    // Evaluates `body` and appends the RESP form of its return value.  False
-    // means `err` holds a message already shaped as a RESP error line's text.
+    // Evaluates `body`, loaded as SCRIPT LOAD would load it, and appends the
+    // RESP form of its return value.  False means `err` holds a message
+    // already shaped as a RESP error line's text.
     bool eval(std::string_view body,
-              const std::vector<std::string_view>& keys,
-              const std::vector<std::string_view>& argv,
+              std::span<const std::string_view> keys,
+              std::span<const std::string_view> argv,
               const command_fn& call,
               std::string& resp_out,
               std::string& err);
@@ -69,6 +71,14 @@ private:
     // Built on the first EVAL and not before: a cache that is never scripted
     // pays nothing, and the state is the largest thing here.
     void ensure_state();
+
+    // redis.call and redis.pcall, on the Lua stack rather than through sol:
+    // its registry references and argument checks were most of what a
+    // one-command script cost.
+    static int call_raising(lua_State* L);
+    static int call_protected(lua_State* L);
+    // Pushes the reply and answers 1, or pushes the error text and answers 0.
+    int run_call(lua_State* L, bool raising);
 
     bool                m_ready{false};
     sol::state          m_lua;
@@ -108,6 +118,10 @@ private:
     // instead of once per call -- three tables and a dozen closures per EVAL
     // was the other half of the same cost.
     const command_fn*   m_call{nullptr};
+
+    // redis.call's arguments and reply, kept between calls for their capacity.
+    std::vector<std::string_view> m_args;
+    std::string                   m_reply_buf;
 };
 
 }  // namespace socketley

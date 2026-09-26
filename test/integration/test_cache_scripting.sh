@@ -219,7 +219,7 @@ want "a script with no keys runs where asked" "+ok" \
   '[["EVAL","return redis.status_reply(\"ok\")","0"]]' "$PS"
 
 # A script reaches the cache through the same door a client does -- redis.call
-# builds a RESP array and hands it to the dispatch -- so every option scan has
+# hands its arguments to the dispatch -- so every option scan has
 # is a script's too.  That follows from the structure and would stop following
 # it the day somebody gives scripts a dispatch of their own, which is what these
 # rows are for.
@@ -241,6 +241,35 @@ want "a script can count a type without walking it" ":2" \
 # over the wire: one answer instead of a page at a time.
 want "a script can run the cursor loop itself" ":1" \
   '[["EVAL","local c,n = \"0\",0; repeat local r = redis.call(\"scan\",c,\"count\",1000,\"field\",\"city\",\"valuematch\",\"berlin\"); c = r[1]; n = n + #r[2]; until c == \"0\"; return n","0"]]'
+
+echo ""
+echo "--- 9. a script cannot take the worker, or its own connection, with it ---"
+# MULTI and SUBSCRIBE would outlive the script on the caller's connection.
+want "MULTI from a script leaves nothing queueing" '$1 | v |' \
+  '[["SET","mk","v"],["EVAL","return redis.pcall(\"multi\")","0"],["GET","mk"]]'
+want "SUBSCRIBE from a script is refused" "not allowed from script" \
+  '[["EVAL","return redis.pcall(\"subscribe\",\"ch\")","0"]]'
+# Redis answers a blocking pop in a script as its non-blocking twin.
+want "a blocking pop in a script answers at once" "+PONG" \
+  '[["EVAL","return redis.call(\"blpop\",\"nolist\",0)","0"],["PING"]]'
+# The arguments reach the dispatch as they are, so the parser's limit is kept.
+want "a call with more arguments than a command takes is refused" "too many arguments" \
+  '[["EVAL","local t = {\"del\"} for i = 1, 1100 do t[#t+1] = \"k\" .. i end return redis.call(unpack(t))","0"]]'
+want "an error caught in the script is the cache's own text" '$29 | ERR wrong number of arguments' \
+  '[["EVAL","local ok, e = pcall(redis.call, \"set\", \"k\") return e","0"]]'
+# What a script returns is read after its pcall has ended, so an error raised
+# there had nothing to catch it: one EVAL ended the worker, for every client.
+resp '[["EVAL","return setmetatable({}, {__index = function() error(\"boom\") end})","0"]]' >/dev/null
+want "a returned table whose __index raises leaves the cache up" "+PONG" '[["PING"]]'
+# EVAL from inside EVAL recursed until the worker died; on a cache of its own,
+# so the row above cannot decide this one.
+PR=$((SL_PORT_BASE+1463))
+"$BIN" create cache sc_r -p "$PR" -s >/dev/null 2>&1
+for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$PR " && break; sleep 0.1; done
+REC='return redis.call(\"eval\", ARGV[1], 0, ARGV[1])'
+want "a script cannot run a script" "not allowed from script" \
+  "[[\"EVAL\",\"$REC\",\"0\",\"$REC\"]]" "$PR"
+want "and the cache is still there" "+PONG" '[["PING"]]' "$PR"
 
 echo ""
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

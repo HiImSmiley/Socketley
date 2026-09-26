@@ -35,11 +35,9 @@ std::string cache_script_engine::sha1_hex(std::string_view in)
 
 std::string cache_script_engine::load(std::string_view body)
 {
-    // EVAL registers its body on every call, so a client that never uses
-    // EVALSHA still paid for one SHA1 per command: an OpenSSL context
-    // allocated and freed, then forty characters appended one at a time.  That
-    // was 5% of the worker in the profile, under a name -- push_back -- that
-    // says nothing about scripting at all.
+    // A body that fails to compile is registered again by every EVAL of it,
+    // and SCRIPT LOAD may be sent any number of times: each would be an
+    // OpenSSL context and forty characters appended one at a time.
     //
     // The body is the thing we have; the digest is a name for it.  Naming it
     // twice gives the same answer, so the second time is a lookup.
@@ -90,9 +88,9 @@ namespace {
 
 // Consumes one reply from `p` and pushes the Lua value.  False means the reply
 // was malformed, which is a bug here rather than something a script can cause.
-bool reply_to_lua(sol::state& L, std::string_view& p, sol::object& out)
+bool push_reply(lua_State* L, std::string_view& p)
 {
-    if (p.empty()) return false;
+    if (p.empty() || !lua_checkstack(L, 3)) return false;
     const char t = p.front();
     const size_t nl = p.find("\r\n");
     if (nl == std::string_view::npos) return false;
@@ -102,35 +100,27 @@ bool reply_to_lua(sol::state& L, std::string_view& p, sol::object& out)
     switch (t)
     {
         case '+':
-        {
+        case '-':
             // A status is a table so a script can tell +OK from the string
             // "OK", which is what Redis's own contract promises.
-            sol::table tb = L.create_table();
-            tb["ok"] = std::string(head);
-            out = tb;
+            lua_createtable(L, 0, 1);
+            lua_pushlstring(L, head.data(), head.size());
+            lua_setfield(L, -2, t == '+' ? "ok" : "err");
             return true;
-        }
-        case '-':
-        {
-            sol::table tb = L.create_table();
-            tb["err"] = std::string(head);
-            out = tb;
-            return true;
-        }
         case ':':
         {
             long long v = 0;
             std::from_chars(head.data(), head.data() + head.size(), v);
-            out = sol::make_object(L, static_cast<double>(v));
+            lua_pushnumber(L, static_cast<lua_Number>(v));
             return true;
         }
         case '$':
         {
             long long n = -1;
             std::from_chars(head.data(), head.data() + head.size(), n);
-            if (n < 0) { out = sol::make_object(L, false); return true; }
+            if (n < 0) { lua_pushboolean(L, 0); return true; }
             if (p.size() < static_cast<size_t>(n) + 2) return false;
-            out = sol::make_object(L, std::string(p.substr(0, static_cast<size_t>(n))));
+            lua_pushlstring(L, p.data(), static_cast<size_t>(n));
             p.remove_prefix(static_cast<size_t>(n) + 2);
             return true;
         }
@@ -138,15 +128,13 @@ bool reply_to_lua(sol::state& L, std::string_view& p, sol::object& out)
         {
             long long n = -1;
             std::from_chars(head.data(), head.data() + head.size(), n);
-            if (n < 0) { out = sol::make_object(L, false); return true; }
-            sol::table tb = L.create_table(static_cast<int>(n), 0);
+            if (n < 0) { lua_pushboolean(L, 0); return true; }
+            lua_createtable(L, static_cast<int>(n), 0);
             for (long long i = 0; i < n; ++i)
             {
-                sol::object e;
-                if (!reply_to_lua(L, p, e)) return false;
-                tb[i + 1] = e;
+                if (!push_reply(L, p)) return false;
+                lua_rawseti(L, -2, static_cast<int>(i + 1));
             }
-            out = tb;
             return true;
         }
         default: return false;
@@ -157,56 +145,75 @@ bool reply_to_lua(sol::state& L, std::string_view& p, sol::object& out)
 // up to its first hole, which is Lua's own idea of where an array ends -- and
 // `err` and `ok` are checked first, because a table carrying either is a reply
 // and not a list.
-void lua_to_resp(const sol::object& v, std::string& out, int depth = 0)
+// Read raw, because this runs outside the script's pcall: a table whose
+// __index raised ended the worker, from one EVAL any client could send.
+void lua_to_resp(lua_State* L, int idx, std::string& out, int depth = 0)
 {
-    if (depth > 16) { resp::encode_null_into(out); return; }
+    if (depth > 16 || !lua_checkstack(L, 2)) { resp::encode_null_into(out); return; }
+    if (idx < 0) idx = lua_gettop(L) + idx + 1;
 
-    switch (v.get_type())
+    size_t len = 0;
+    switch (lua_type(L, idx))
     {
-        case sol::type::nil:
-        case sol::type::none:
-            resp::encode_null_into(out);
-            return;
-        case sol::type::boolean:
+        case LUA_TBOOLEAN:
             // false is a nil reply and true is 1: Lua has no other way to say
             // "no value", and Redis chose these.
-            if (v.as<bool>()) resp::encode_integer_into(out, 1);
-            else              resp::encode_null_into(out);
+            if (lua_toboolean(L, idx)) resp::encode_integer_into(out, 1);
+            else                       resp::encode_null_into(out);
             return;
-        case sol::type::number:
-        {
+        case LUA_TNUMBER:
             // Truncated towards zero, not rounded: a script returning 3.7 is
             // returning 3 on Redis, and a caller that wanted 3.7 has to return
             // a string.
-            const double d = v.as<double>();
-            resp::encode_integer_into(out, static_cast<int64_t>(d));
+            resp::encode_integer_into(out, static_cast<int64_t>(lua_tonumber(L, idx)));
+            return;
+        case LUA_TSTRING:
+        {
+            const char* s = lua_tolstring(L, idx, &len);
+            resp::encode_bulk_into(out, std::string_view(s, len));
             return;
         }
-        case sol::type::string:
-            resp::encode_bulk_into(out, v.as<std::string>());
-            return;
-        case sol::type::table:
+        case LUA_TTABLE:
         {
-            sol::table t = v.as<sol::table>();
-            sol::object err = t["err"];
-            if (err.valid() && err.get_type() == sol::type::string)
-            { resp::encode_error_code_into(out, err.as<std::string>()); return; }
-            sol::object ok = t["ok"];
-            if (ok.valid() && ok.get_type() == sol::type::string)
-            { resp::encode_simple_into(out, ok.as<std::string>()); return; }
+            lua_pushliteral(L, "err");
+            lua_rawget(L, idx);
+            if (lua_type(L, -1) == LUA_TSTRING)
+            {
+                const char* s = lua_tolstring(L, -1, &len);
+                resp::encode_error_code_into(out, std::string_view(s, len));
+                lua_pop(L, 1);
+                return;
+            }
+            lua_pop(L, 1);
+            lua_pushliteral(L, "ok");
+            lua_rawget(L, idx);
+            if (lua_type(L, -1) == LUA_TSTRING)
+            {
+                const char* s = lua_tolstring(L, -1, &len);
+                resp::encode_simple_into(out, std::string_view(s, len));
+                lua_pop(L, 1);
+                return;
+            }
+            lua_pop(L, 1);
 
             // The length is where the first hole is, so { 1, 2, nil, 4 } is
             // two elements -- Lua's rule, and Redis follows it.
             int n = 0;
             while (true)
             {
-                sol::object e = t[n + 1];
-                if (!e.valid() || e.get_type() == sol::type::nil) break;
+                lua_rawgeti(L, idx, n + 1);
+                const bool hole = lua_isnil(L, -1);
+                lua_pop(L, 1);
+                if (hole) break;
                 ++n;
             }
             resp::encode_array_header_into(out, n);
             for (int i = 1; i <= n; ++i)
-                lua_to_resp(t[i], out, depth + 1);
+            {
+                lua_rawgeti(L, idx, i);
+                lua_to_resp(L, -1, out, depth + 1);
+                lua_pop(L, 1);
+            }
             return;
         }
         default:
@@ -233,6 +240,98 @@ static std::string shape_lua_error(const char* what)
     while (!err.empty() && err.back() == ' ') err.pop_back();
     if (err.size() > 512) { err.resize(509); err += "..."; }
     return err;
+}
+
+// ─── redis.call ─────────────────────────────────────────────────────────────
+
+int cache_script_engine::call_raising(lua_State* L)
+{
+    auto* self = static_cast<cache_script_engine*>(lua_touserdata(L, lua_upvalueindex(1)));
+    // Raised here, where nothing is left to destroy, and not inside run_call.
+    if (self->run_call(L, true)) return 1;
+    return lua_error(L);
+}
+
+int cache_script_engine::call_protected(lua_State* L)
+{
+    auto* self = static_cast<cache_script_engine*>(lua_touserdata(L, lua_upvalueindex(1)));
+    if (self->run_call(L, false)) return 1;
+    lua_createtable(L, 0, 1);
+    lua_insert(L, -2);
+    lua_setfield(L, -2, "err");
+    return 1;
+}
+
+int cache_script_engine::run_call(lua_State* L, bool raising)
+{
+    const int argc = lua_gettop(L);
+    if (argc == 0 || !m_call)
+    {
+        lua_pushliteral(L, "Please specify at least one argument for redis.call()");
+        return 0;
+    }
+
+    // Taken rather than borrowed, so nothing the command runs can write into them.
+    std::vector<std::string_view> args;
+    args.swap(m_args);
+    args.clear();
+    for (int i = 1; i <= argc; ++i)
+    {
+        const int t = lua_type(L, i);
+        if (t == LUA_TNUMBER)
+        {
+            // An integer argument is spelled without a decimal point,
+            // because `redis.call('expire', k, 60)` must not send "60.0".
+            // The text replaces the number on the stack, which keeps it alive
+            // for as long as the view below.
+            const double d = lua_tonumber(L, i);
+            char buf[40];
+            int  n;
+            if (d == static_cast<double>(static_cast<long long>(d)))
+                n = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(d));
+            else
+                n = std::snprintf(buf, sizeof(buf), "%.17g", d);
+            lua_pushlstring(L, buf, static_cast<size_t>(n));
+            lua_replace(L, i);
+        }
+        else if (t != LUA_TSTRING)
+        {
+            m_args.swap(args);
+            lua_pushliteral(L, "Lua redis lib command arguments must be strings or integers");
+            return 0;
+        }
+        size_t len = 0;
+        const char* s = lua_tolstring(L, i, &len);
+        args.emplace_back(s, len);
+    }
+
+    std::string reply;
+    reply.swap(m_reply_buf);
+    reply.clear();
+    (*m_call)(args, reply);
+
+    int ok = 1;
+    std::string_view p(reply);
+    // redis.call raises what redis.pcall returns, which is the whole
+    // difference between them.
+    if (raising && !p.empty() && p.front() == '-')
+    {
+        const size_t nl = p.find("\r\n");
+        const std::string_view msg = p.substr(1, nl == std::string_view::npos ? p.size() - 1 : nl - 1);
+        lua_pushlstring(L, msg.data(), msg.size());
+        ok = 0;
+    }
+    else if (!push_reply(L, p))
+    {
+        lua_settop(L, argc);
+        lua_pushliteral(L, "the cache answered something this cannot read");
+        ok = 0;
+    }
+
+    m_args.swap(args);
+    // Not a large one, which would stay held by a cache that scripted it once.
+    if (reply.capacity() <= 64 * 1024) m_reply_buf.swap(reply);
+    return ok;
 }
 
 // ─── The state ──────────────────────────────────────────────────────────────
@@ -266,75 +365,16 @@ void cache_script_engine::ensure_state()
     // Built ONCE.  These closures read m_call rather than capturing it, so the
     // table survives between evals -- rebuilding it per call cost as much as
     // the script did.
-    const auto run = [this](bool raising, sol::variadic_args va) -> sol::object
-    {
-        std::string raw;
-        int n = 0;
-        for (auto a : va)
-        {
-            std::string sv;
-            if (a.get_type() == sol::type::number)
-            {
-                // An integer argument is spelled without a decimal point,
-                // because `redis.call('expire', k, 60)` must not send "60.0".
-                const double d = a.as<double>();
-                char buf[40];
-                if (d == static_cast<double>(static_cast<long long>(d)))
-                    std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(d));
-                else
-                    std::snprintf(buf, sizeof(buf), "%.17g", d);
-                sv = buf;
-            }
-            else if (a.get_type() == sol::type::string) sv = a.as<std::string>();
-            else
-            {
-                if (raising)
-                    throw sol::error("Lua redis lib command arguments must be strings or integers");
-                sol::table e = m_lua.create_table();
-                e["err"] = "Lua redis lib command arguments must be strings or integers";
-                return e;
-            }
-            resp::encode_bulk_into(raw, sv);
-            ++n;
-        }
-        if (n == 0 || !m_call)
-        {
-            if (raising) throw sol::error("Please specify at least one argument for redis.call()");
-            sol::table e = m_lua.create_table();
-            e["err"] = "Please specify at least one argument for redis.call()";
-            return e;
-        }
-
-        std::string cmd;
-        resp::encode_array_header_into(cmd, n);
-        cmd += raw;
-
-        std::string reply;
-        (*m_call)(cmd, reply);
-
-        std::string_view p(reply);
-        sol::object out;
-        if (!reply_to_lua(m_lua, p, out))
-        {
-            if (raising) throw sol::error("the cache answered something this cannot read");
-            sol::table e = m_lua.create_table();
-            e["err"] = "the cache answered something this cannot read";
-            return e;
-        }
-        // redis.call raises what redis.pcall returns, which is the whole
-        // difference between them.
-        if (raising && out.get_type() == sol::type::table)
-        {
-            sol::object e = out.as<sol::table>()["err"];
-            if (e.valid() && e.get_type() == sol::type::string)
-                throw sol::error(e.as<std::string>());
-        }
-        return out;
-    };
-
     sol::table redis = m_lua.create_table();
-    redis.set_function("call",  [run](sol::variadic_args va) { return run(true,  va); });
-    redis.set_function("pcall", [run](sol::variadic_args va) { return run(false, va); });
+    lua_State* L = m_lua.lua_state();
+    redis.push();
+    lua_pushlightuserdata(L, this);
+    lua_pushcclosure(L, &cache_script_engine::call_raising, 1);
+    lua_setfield(L, -2, "call");
+    lua_pushlightuserdata(L, this);
+    lua_pushcclosure(L, &cache_script_engine::call_protected, 1);
+    lua_setfield(L, -2, "pcall");
+    lua_pop(L, 1);
     redis.set_function("error_reply", [this](std::string m) {
         sol::table t = m_lua.create_table(); t["err"] = std::move(m); return t; });
     redis.set_function("status_reply", [this](std::string m) {
@@ -418,8 +458,8 @@ void cache_script_engine::ensure_state()
 }
 
 bool cache_script_engine::eval(std::string_view body,
-                               const std::vector<std::string_view>& keys,
-                               const std::vector<std::string_view>& argv,
+                               std::span<const std::string_view> keys,
+                               std::span<const std::string_view> argv,
                                const command_fn& call,
                                std::string& resp_out,
                                std::string& err)
@@ -428,27 +468,40 @@ bool cache_script_engine::eval(std::string_view body,
 
     // Refilled, not rebuilt.  The tables and their two global bindings are made
     // once; a call only writes the elements it needs and clears whatever the
-    // previous script left past its own end.  Views go in directly -- sol
-    // pushes a Lua string of that length, so the std::string copy per key was
-    // an allocation for nothing.
+    // previous script left past its own end.
     // The tail is measured on the table and not remembered from last time: a
     // script may write KEYS[5] itself, and trusting our own count would leave
-    // that entry visible to the next script.  Scripts already share globals
-    // here -- there is no metatable guarding them, which Redis does have -- so
-    // this does not close that door, it just does not open it wider.
-    const size_t prev_k = m_keys_tbl.size();
-    const size_t prev_a = m_argv_tbl.size();
-    for (size_t i = 0; i < keys.size(); ++i) m_keys_tbl[i + 1] = keys[i];
-    for (size_t i = keys.size(); i < prev_k; ++i) m_keys_tbl[i + 1] = sol::lua_nil;
-    for (size_t i = 0; i < argv.size(); ++i) m_argv_tbl[i + 1] = argv[i];
-    for (size_t i = argv.size(); i < prev_a; ++i) m_argv_tbl[i + 1] = sol::lua_nil;
+    // that entry visible to the next script.
+    // Written raw, so a metatable one script set on KEYS runs nothing for the next.
+    lua_State* L = m_lua.lua_state();
+    const auto refill = [L](const sol::table& t, std::span<const std::string_view> v)
+    {
+        t.push();
+        const size_t prev = lua_objlen(L, -1);
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            lua_pushlstring(L, v[i].data(), v[i].size());
+            lua_rawseti(L, -2, static_cast<int>(i + 1));
+        }
+        for (size_t i = v.size(); i < prev; ++i)
+        {
+            lua_pushnil(L);
+            lua_rawseti(L, -2, static_cast<int>(i + 1));
+        }
+        lua_pop(L, 1);
+    };
+    refill(m_keys_tbl, keys);
+    refill(m_argv_tbl, argv);
 
     // For the duration of this call only: the closures in the `redis` table
-    // read it, and it is cleared on the way out so a stale one cannot be used
-    // by a script that somehow runs outside an eval.
+    // read it, and what it held before is put back on the way out, so an eval
+    // that redis.call started leaves the outer script its own.
+    struct call_guard
+    {
+        const command_fn** slot; const command_fn* prev;
+        ~call_guard() { *slot = prev; }
+    } cg{ &m_call, m_call };
     m_call = &call;
-    struct call_guard { const command_fn** slot; ~call_guard() { *slot = nullptr; } }
-        cg{ &m_call };
 
     // Looked up by the body itself.  The SHA it used to be keyed by cost an
     // OpenSSL context allocation and a forty-character string build on every
@@ -456,6 +509,11 @@ bool cache_script_engine::eval(std::string_view body,
     auto cached = m_compiled.find(body);
     if (cached == m_compiled.end())
     {
+        // EVAL loads as well as runs, so the SHA it would have under SCRIPT
+        // LOAD works afterwards -- which is what lets a client try EVALSHA
+        // first and fall back once.  Here and not per call: SCRIPT FLUSH empties
+        // both maps, so a body compiled is a body loaded.
+        load(body);
         // Named so a compile error points at "user_script" the way Redis's
         // does, rather than at the script's own first line quoted back.
         // Text only, because LuaJIT runs bytecode unverified and a crafted
@@ -487,8 +545,8 @@ bool cache_script_engine::eval(std::string_view body,
         return false;
     }
 
-    sol::object v = r.get<sol::object>();
-    lua_to_resp(v, resp_out);
+    if (r.return_count() > 0) lua_to_resp(L, r.stack_index(), resp_out);
+    else                      resp::encode_null_into(resp_out);
     return true;
 }
 
