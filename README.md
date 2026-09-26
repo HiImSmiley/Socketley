@@ -590,16 +590,15 @@ RSS difference over the load):
 | string, 16-byte key, 3-byte value | 118 B | 105 B | 1.1× |
 | hash, 5 fields of 6 bytes | **263 B** (was 631) | 170 B | 1.5× |
 | set, 5 members | 471 B | 474 B | 1.0× |
-| sorted set, 5 members | **439 B** (was 1,575) | 137 B | 3.2× |
+| sorted set, 5 members | **295 B** (was 1,575) | 137 B | 2.2× |
 | list, 1 element | **182 B** (was 806) | 185 B | 1.0× |
 | list, 5 elements | **248 B** (was 808) | 217 B | 1.1× |
 | list, 50 elements | **1,047 B** (was 2,791) | 613 B | 1.7× |
 
 Redis keeps a small hash, sorted set and list in one packed buffer (a
 listpack) and walks it; a hash here does the same below 128 fields of 64 bytes
-and a list below 128 elements of 64 bytes, and a sorted set keeps its members
-in one sorted vector below 128, which is where its remaining distance is: a
-string object is 32 bytes before its first character. A packed list is walked
+a list below 128 elements of 64 bytes, and a sorted set below 128 members of
+64 bytes; what is left is the fixed part of each key's entry. A packed list is walked
 to an index, so LINDEX and LSET on a fifty-element list read 13–14% slower than
 the `std::deque` it replaced, while RPUSH is a third faster and LRANGE 9–12%.
 

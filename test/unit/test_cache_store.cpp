@@ -2082,6 +2082,14 @@ TEST_CASE("SCAN over a keyspace with deletes between pages returns every key tha
     }
 }
 
+
+// A skiplist entry against the model's pair: the list answers the member as a
+// view, and std::pair compares only like with like.
+static bool same_entry(const zskiplist::entry& a, const std::pair<double, std::string>& b)
+{
+    return a.first == b.first && a.second == b.second;
+}
+
 TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and removals")
 {
     zskiplist z;
@@ -2129,12 +2137,12 @@ TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and remov
             for (auto zit = z.begin(); zit != z.end(); ++zit, ++i)
             {
                 auto rit = std::next(ref.begin(), static_cast<long>(i));
-                CHECK(*zit == *rit);
+                CHECK(same_entry(*zit, *rit));
                 CHECK(z.rank(rit->first, rit->second) == i);
-                CHECK(*z.at(i) == *rit);
+                CHECK(same_entry(*z.at(i), *rit));
             }
             if (!ref.empty())
-                CHECK(*std::prev(z.end()) == *ref.rbegin());
+                CHECK(same_entry(*std::prev(z.end()), *ref.rbegin()));
         }
     }
     zskiplist copy(z);
@@ -2255,9 +2263,9 @@ TEST_CASE("zset_inner agrees with a model, small and after the skiplist takes ov
         for (auto it = z.order.begin(); it != z.order.end(); ++it, ++i)
         {
             const auto& want = *std::next(ord.begin(), static_cast<long>(i));
-            CHECK(*it == want);
+            CHECK(same_entry(*it, want));
             CHECK(z.order.rank(want.first, want.second) == i);
-            CHECK(*z.order.at(i) == want);
+            CHECK(same_entry(*z.order.at(i), want));
         }
         CHECK(i == ord.size());
         for (const auto& [m, sc] : score)
@@ -2272,8 +2280,8 @@ TEST_CASE("zset_inner agrees with a model, small and after the skiplist takes ov
         auto lb = z.order.lower_bound_score(25.0, true);
         auto rl = std::find_if(ord.begin(), ord.end(), [](const auto& e) { return e.first >= 25.0; });
         CHECK((lb == z.order.end()) == (rl == ord.end()));
-        if (rl != ord.end()) CHECK(*lb == *rl);
-        if (!ord.empty()) CHECK(*std::prev(z.order.end()) == *ord.rbegin());
+        if (rl != ord.end()) CHECK(same_entry(*lb, *rl));
+        if (!ord.empty()) CHECK(same_entry(*std::prev(z.order.end()), *ord.rbegin()));
         // ZSCAN's walk visits every member once with its score.
         std::map<std::string, double> scanned;
         for (size_t b = 0; b < z.bucket_count(); ++b)
@@ -2412,4 +2420,25 @@ TEST_CASE("list_items agrees with a deque, packed and after it moves to the seg_
         CHECK(copy == l);
         if (cap == 20 && !long_values) CHECK(l.packed());
     }
+}
+
+TEST_CASE("a sorted set moves to the skiplist for a long member and stays ordered")
+{
+    zset_inner z;
+    for (int i = 0; i < 10; ++i) z.add(static_cast<double>(i), "m" + std::to_string(i));
+    CHECK_FALSE(z.order.big());
+    const std::string long_name(100, 'L');
+    z.add(4.5, long_name);
+    CHECK(z.order.big());
+    REQUIRE(z.size() == 11);
+    double sc = 0;
+    REQUIRE(z.score_of(long_name, sc));
+    CHECK(sc == 4.5);
+    CHECK(z.order.rank(4.5, long_name) == 5);
+    CHECK((*z.order.at(5)).second == long_name);
+    z.rescore("m0", 0.0, 99.0);
+    CHECK((*std::prev(z.order.end())).second == "m0");
+    z.remove(long_name, 4.5);
+    CHECK(z.size() == 10);
+    CHECK_FALSE(z.score_of(long_name, sc));
 }

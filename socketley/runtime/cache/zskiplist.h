@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <string>
@@ -39,18 +40,24 @@ class zskiplist
 public:
     using value_type = std::pair<double, std::string>;
 
-    // A small set is a sorted vector and has no head at all: the head's 32
-    // links alone were 512 bytes, three times what Redis spends on a whole
-    // five-member set.  Past SMALL_MAX members it becomes the skiplist.
-    static constexpr size_t SMALL_MAX = 128;
+    // A small set is one sorted buffer of [score][length][member][length] and
+    // has no head at all: the head's 32 links alone were 512 bytes, three times
+    // what Redis spends on a whole five-member set, and a vector of pairs was
+    // still 40 bytes a member before its name.  Past SMALL_MAX members, or a
+    // member past SMALL_MAX_LEN bytes, it becomes the skiplist for good.
+    static constexpr size_t SMALL_MAX     = 128;
+    static constexpr size_t SMALL_MAX_LEN = 64;
+
+    // What an iterator answers in either form: the score and a view of the name.
+    using entry = std::pair<double, std::string_view>;
 
     zskiplist() = default;
     ~zskiplist() { clear(); }
 
-    zskiplist(const zskiplist& o) { for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, it->second); }
+    zskiplist(const zskiplist& o) { for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, std::string(it->second)); }
     zskiplist& operator=(const zskiplist& o)
     {
-        if (this != &o) { clear(); for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, it->second); }
+        if (this != &o) { clear(); for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, std::string(it->second)); }
         return *this;
     }
     zskiplist(zskiplist&& o) noexcept { steal(o); }
@@ -108,21 +115,27 @@ public:
     class const_iterator
     {
     public:
-        using value_type        = zskiplist::value_type;
-        using reference         = const value_type&;
-        using pointer           = const value_type*;
+        using value_type        = entry;
+        using reference         = entry;
         using difference_type   = std::ptrdiff_t;
         using iterator_category = std::bidirectional_iterator_tag;
+        struct arrow { entry e; const entry* operator->() const { return &e; } };
+        using pointer           = arrow;
 
         const_iterator() = default;
         explicit const_iterator(const node* p, const zskiplist* owner) : m_p(p), m_owner(owner) {}
-        explicit const_iterator(size_t i, const zskiplist* owner) : m_owner(owner), m_i(i) {}
+        const_iterator(size_t i, size_t off, const zskiplist* owner) : m_owner(owner), m_i(i), m_off(off) {}
 
-        reference operator*()  const { return m_owner->m_head ? m_p->v : m_owner->m_small[m_i]; }
-        pointer   operator->() const { return &**this; }
+        entry operator*() const
+        {
+            if (m_owner->m_head) return { m_p->v.first, m_p->v.second };
+            return { m_owner->score_at(m_off), m_owner->member_at(m_off) };
+        }
+        arrow operator->() const { return { **this }; }
         const_iterator& operator++()
         {
-            if (m_owner->m_head) m_p = m_p->L(0).fwd; else ++m_i;
+            if (m_owner->m_head) m_p = m_p->L(0).fwd;
+            else { m_off = m_owner->next_off(m_off); ++m_i; }
             return *this;
         }
         const_iterator  operator++(int) { const_iterator t = *this; ++*this; return t; }
@@ -131,7 +144,7 @@ public:
         // carries its list.
         const_iterator& operator--()
         {
-            if (m_owner && !m_owner->m_head) { --m_i; return *this; }
+            if (m_owner && !m_owner->m_head) { m_off = m_owner->prev_off(m_off); --m_i; return *this; }
             m_p = m_p ? m_p->back : (m_owner ? m_owner->m_tail : nullptr);
             return *this;
         }
@@ -145,7 +158,8 @@ public:
     private:
         const node*      m_p{nullptr};
         const zskiplist* m_owner{nullptr};
-        size_t           m_i{0};
+        size_t           m_i{0};     // small: position
+        size_t           m_off{0};   // small: byte offset of that position
         friend class zskiplist;
     };
 
@@ -153,18 +167,19 @@ public:
 
     const_iterator begin() const
     {
-        return m_head ? const_iterator(m_head->L(0).fwd, this) : const_iterator(size_t{0}, this);
+        return m_head ? const_iterator(m_head->L(0).fwd, this) : const_iterator(0, 0, this);
     }
     const_iterator end() const
     {
-        return m_head ? const_iterator(nullptr, this) : const_iterator(m_small.size(), this);
+        return m_head ? const_iterator(nullptr, this) : const_iterator(m_count, m_pack.size(), this);
     }
     const_iterator last() const
     {
-        return m_head ? const_iterator(m_tail, this) : const_iterator(m_small.size() - 1, this);
+        return m_head ? const_iterator(m_tail, this)
+                      : const_iterator(m_count - 1, prev_off(m_pack.size()), this);
     }
 
-    size_t size()  const { return m_head ? m_len : m_small.size(); }
+    size_t size()  const { return m_head ? m_len : m_count; }
     bool   empty() const { return size() == 0; }
 
     // Back to small and empty, head and all.
@@ -178,7 +193,8 @@ public:
             m_head = nullptr;
         }
         m_tail = nullptr; m_len = 0; m_level = 1;
-        std::vector<value_type>().swap(m_small);
+        std::string().swap(m_pack);
+        m_count = 0;
     }
 
     // Named emplace because that is what the seventeen call sites already say.
@@ -188,12 +204,9 @@ public:
     {
         if (!m_head)
         {
-            if (m_small.size() < SMALL_MAX)
+            if (m_count < SMALL_MAX && member.size() <= SMALL_MAX_LEN)
             {
-                // By a quarter rather than the vector's doubling.
-                if (m_small.size() == m_small.capacity())
-                    m_small.reserve(m_small.size() + m_small.size() / 4 + 1);
-                m_small.emplace(small_lower(score, member), score, std::move(member));
+                small_insert(small_lower(score, member).second, score, member);
                 return;
             }
             promote();
@@ -263,11 +276,12 @@ public:
     {
         if (!m_head)
         {
-            auto pos = small_lower(score, member);
-            if (pos == m_small.end() || pos->first != score || pos->second != member)
+            const size_t off = small_lower(score, member).second;
+            if (off == m_pack.size() || score_at(off) != score || member_at(off) != member)
                 return false;
-            out = std::move(pos->second);
-            m_small.erase(pos);
+            out.assign(member_at(off));
+            m_pack.erase(off, next_off(off) - off);
+            --m_count;
             return true;
         }
         node* update[max_level];
@@ -311,10 +325,10 @@ public:
     {
         if (!m_head)
         {
-            auto pos = small_lower(score, member);
-            if (pos == m_small.end() || pos->first != score || pos->second != member)
+            const auto [i, off] = small_lower(score, member);
+            if (off == m_pack.size() || score_at(off) != score || member_at(off) != member)
                 return npos;
-            return static_cast<size_t>(pos - m_small.begin());
+            return i;
         }
         size_t r = 0;
         const node* x = m_head;
@@ -335,7 +349,12 @@ public:
     const_iterator at(size_t index) const
     {
         if (index >= size()) return end();
-        if (!m_head) return const_iterator(index, this);
+        if (!m_head)
+        {
+            size_t off = 0;
+            for (size_t k = 0; k < index; ++k) off = next_off(off);
+            return const_iterator(index, off, this);
+        }
         size_t traversed = 0;
         const node* x = m_head;
         for (int i = m_level - 1; i >= 0; --i)
@@ -357,10 +376,13 @@ public:
     {
         if (!m_head)
         {
-            auto pos = std::partition_point(m_small.begin(), m_small.end(), [&](const value_type& e) {
-                return inclusive ? e.first < min : e.first <= min;
-            });
-            return const_iterator(static_cast<size_t>(pos - m_small.begin()), this);
+            size_t i = 0, off = 0;
+            for (; off < m_pack.size(); off = next_off(off), ++i)
+            {
+                const double sc = score_at(off);
+                if (inclusive ? sc >= min : sc > min) break;
+            }
+            return const_iterator(i, off, this);
         }
         const node* x = m_head;
         for (int i = m_level - 1; i >= 0; --i)
@@ -387,39 +409,78 @@ private:
         return a.second <= member;
     }
 
-    template <class Self>
-    static auto small_lower_in(Self& v, double score, std::string_view member)
+    // ─── The packed form: [8-byte score][length][member][length] per member,
+    //     the trailing length walking back as the leading one walks forward ───
+
+    double score_at(size_t off) const
     {
-        return std::partition_point(v.begin(), v.end(), [&](const value_type& e) {
-            return less(e, score, member);
-        });
+        double d;
+        std::memcpy(&d, m_pack.data() + off, sizeof d);
+        return d;
     }
-    std::vector<value_type>::iterator small_lower(double score, std::string_view member)
+    size_t mlen_at(size_t off) const { return static_cast<unsigned char>(m_pack[off + 8]); }
+    std::string_view member_at(size_t off) const { return { m_pack.data() + off + 9, mlen_at(off) }; }
+    size_t next_off(size_t off) const { return off + 10 + mlen_at(off); }
+    size_t prev_off(size_t end) const { return end - 10 - static_cast<unsigned char>(m_pack[end - 1]); }
+
+    // The first entry not ordered before (score, member): its position and
+    // offset, the pack's end when there is none.
+    std::pair<size_t, size_t> small_lower(double score, std::string_view member) const
     {
-        return small_lower_in(m_small, score, member);
-    }
-    std::vector<value_type>::const_iterator small_lower(double score, std::string_view member) const
-    {
-        return small_lower_in(m_small, score, member);
+        size_t i = 0, off = 0;
+        for (; off < m_pack.size(); off = next_off(off), ++i)
+        {
+            const double sc = score_at(off);
+            if (sc != score ? !(sc < score) : !(member_at(off) < member)) break;
+        }
+        return { i, off };
     }
 
-    // The vector's members, in order, into a skiplist with a head of its own.
+    void small_insert(size_t off, double score, std::string_view member)
+    {
+        char e[10 + SMALL_MAX_LEN];
+        std::memcpy(e, &score, 8);
+        e[8] = static_cast<char>(member.size());
+        std::memcpy(e + 9, member.data(), member.size());
+        e[9 + member.size()] = static_cast<char>(member.size());
+        const size_t add = 10 + member.size();
+        // By a quarter rather than the doubling libstdc++ uses.
+        if (m_pack.size() + add > m_pack.capacity())
+        {
+            std::string bigger;
+            bigger.reserve((m_pack.size() + add) + (m_pack.size() + add) / 4);
+            bigger.append(m_pack);
+            m_pack.swap(bigger);
+        }
+        m_pack.insert(off, e, add);
+        ++m_count;
+    }
+
+    // The packed members, in order, into a skiplist with a head of its own.
     void promote()
     {
-        std::vector<value_type> v;
-        v.swap(m_small);
+        std::string pack;
+        pack.swap(m_pack);
+        const size_t n = m_count;
+        m_count = 0;
         m_head = make_node(max_level, 0.0, std::string());
         m_tail = nullptr; m_len = 0; m_level = 1;
-        for (auto& e : v)
-            insert_big(e.first, std::move(e.second));
+        for (size_t off = 0, k = 0; k < n; ++k)
+        {
+            double sc;
+            std::memcpy(&sc, pack.data() + off, 8);
+            const size_t len = static_cast<unsigned char>(pack[off + 8]);
+            insert_big(sc, std::string(pack.data() + off + 9, len));
+            off += 10 + len;
+        }
     }
 
     void steal(zskiplist& o) noexcept
     {
-        m_small = std::move(o.m_small);
+        m_pack = std::move(o.m_pack); m_count = o.m_count;
         m_head = o.m_head; m_tail = o.m_tail; m_len = o.m_len; m_level = o.m_level; m_rng = o.m_rng;
         o.m_head = nullptr; o.m_tail = nullptr; o.m_len = 0; o.m_level = 1;
-        o.m_small.clear();
+        o.m_pack.clear(); o.m_count = 0;
     }
 
     int random_level()
@@ -436,7 +497,8 @@ private:
         return m_rng;
     }
 
-    std::vector<value_type> m_small;
+    std::string m_pack;
+    uint32_t    m_count{0};
     node*    m_head{nullptr};
     node*    m_tail{nullptr};
     size_t   m_len{0};

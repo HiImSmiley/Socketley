@@ -2161,7 +2161,7 @@ size_t cache_store::zremrangebyrank(std::string_view key, int64_t start, int64_t
     for (const auto& m : it->second.order)
     {
         if (i > e) break;
-        if (i >= s) doomed.push_back(m.second);
+        if (i >= s) doomed.emplace_back(m.second);
         ++i;
     }
     for (const auto& m : doomed)
@@ -2183,7 +2183,7 @@ size_t cache_store::zremrangebyscore(std::string_view key, double min, double ma
     {
         if (e->first > max || (!max_incl && e->first == max))
             break;
-        doomed.push_back(e->second);
+        doomed.emplace_back(e->second);
     }
     for (const auto& m : doomed)
         zrem(key, m);
