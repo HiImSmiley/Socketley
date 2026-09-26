@@ -2442,3 +2442,105 @@ TEST_CASE("a sorted set moves to the skiplist for a long member and stays ordere
     CHECK(z.size() == 10);
     CHECK_FALSE(z.score_of(long_name, sc));
 }
+
+// Both flavours, because the one with room of its own moves its bytes rather
+// than its pointer, and a move that forgot to was a view into the source.
+template <class Buf>
+static void pack_buf_agrees_with_a_string(uint32_t seed)
+{
+    uint32_t r = seed;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    Buf b;
+    std::string ref;
+    auto same = [&](const Buf& x, const std::string& s) {
+        REQUIRE(x.size() == s.size());
+        CHECK(std::string_view(x.data(), x.size()) == s);
+    };
+    for (int step = 0; step < 20000; ++step)
+    {
+        const std::string v(rnd() % 40, static_cast<char>('a' + rnd() % 26));
+        switch (rnd() % 10)
+        {
+            case 0: case 1: case 2:
+            {
+                const size_t off = ref.empty() ? 0 : rnd() % (ref.size() + 1);
+                b.insert(off, v.data(), v.size()); ref.insert(off, v);
+                break;
+            }
+            case 3: if (!ref.empty()) { const size_t off = rnd() % ref.size(), n = rnd() % (ref.size() - off + 1);
+                                        b.erase(off, n); ref.erase(off, n); } break;
+            case 4: if (!ref.empty()) { const size_t off = rnd() % ref.size(), n = rnd() % (ref.size() - off + 1);
+                                        b.replace(off, n, v.data(), v.size()); ref.replace(off, n, v); } break;
+            case 5: if (!ref.empty()) { const size_t off = rnd() % (ref.size() + 1); b.truncate(off); ref.resize(off); } break;
+            case 6: { Buf c(b); same(c, ref); Buf m(std::move(c)); same(m, ref); CHECK(c.size() == 0);
+                      b = std::move(m); same(b, ref); } break;
+            case 7: { Buf o; o.insert(0, v.data(), v.size()); b.swap(o); same(b, v); same(o, ref);
+                      b.swap(o); same(b, ref); same(o, v); } break;
+            case 8: { Buf c; c = b; same(c, ref); c.release(); CHECK(c.size() == 0); } break;
+            default: if (ref.size() > 4000) { b.release(); ref.clear(); } break;
+        }
+        same(b, ref);
+    }
+}
+
+TEST_CASE("pack_buf agrees with a string, with and without room of its own")
+{
+    pack_buf_agrees_with_a_string<basic_pack_buf<0>>(4242);
+    pack_buf_agrees_with_a_string<basic_pack_buf<24>>(2424);
+}
+
+TEST_CASE("zskiplist moves and copies between its small and big forms")
+{
+    auto filled = [](int n, int name_len) {
+        zskiplist z;
+        for (int i = 0; i < n; ++i)
+            z.emplace(static_cast<double>(i % 7), std::string(static_cast<size_t>(name_len), 'm') + std::to_string(i));
+        return z;
+    };
+    auto listing = [](const zskiplist& z) {
+        std::vector<std::pair<double, std::string>> v;
+        for (auto e : z) v.emplace_back(e.first, std::string(e.second));
+        return v;
+    };
+    for (const int n_a : { 0, 5, 300 })
+        for (const int n_b : { 0, 5, 300 })
+        {
+            const zskiplist a0 = filled(n_a, 3), b0 = filled(n_b, 9);
+            const auto la = listing(a0), lb = listing(b0);
+            zskiplist a(a0), b(b0);
+            CHECK(listing(a) == la);
+            a = std::move(b);                       // either form over either form
+            CHECK(listing(a) == lb);
+            CHECK(b.empty());
+            b.emplace(1.0, "after");                // a moved-from set is a usable empty one
+            CHECK(b.size() == 1);
+            b = a0;
+            CHECK(listing(b) == la);
+            zskiplist c(std::move(b));
+            CHECK(listing(c) == la);
+            c.clear();
+            CHECK(c.empty());
+            CHECK_FALSE(c.big());
+            c.emplace(2.0, "x");
+            CHECK(c.rank(2.0, "x") == 0);
+        }
+}
+
+TEST_CASE("a packed list short enough to sit in place survives being moved")
+{
+    list_items a;
+    a.push_back("one");
+    a.push_back("two");
+    REQUIRE(a.packed());
+    list_items b(std::move(a));
+    CHECK(b.size() == 2);
+    CHECK(b.at(0) == "one");
+    CHECK(b.at(1) == "two");
+    list_items c;
+    c.push_back("gone");
+    c = std::move(b);
+    CHECK(c.at(1) == "two");
+    for (int i = 0; i < 20; ++i) c.push_back("more-than-fits-in-place");
+    CHECK(c.at(0) == "one");
+    CHECK(c.back() == "more-than-fits-in-place");
+}

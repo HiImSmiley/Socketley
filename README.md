@@ -588,12 +588,12 @@ RSS difference over the load):
 | shape | socketley | Redis 7.0.15 | |
 |---|---|---|---|
 | string, 16-byte key, 3-byte value | 118 B | 105 B | 1.1× |
-| hash, 5 fields of 6 bytes | **263 B** (was 631) | 170 B | 1.5× |
+| hash, 5 fields of 6 bytes | **248 B** (was 631) | 170 B | 1.5× |
 | set, 5 members | 471 B | 474 B | 1.0× |
-| sorted set, 5 members | **295 B** (was 1,575) | 137 B | 2.2× |
-| list, 1 element | **182 B** (was 806) | 185 B | 1.0× |
-| list, 5 elements | **248 B** (was 808) | 217 B | 1.1× |
-| list, 50 elements | **1,047 B** (was 2,791) | 613 B | 1.7× |
+| sorted set, 5 members | **248 B** (was 1,575) | 137 B | 1.8× |
+| list, 1 element | **183 B** (was 806) | 185 B | 1.0× |
+| list, 5 elements | **231 B** (was 808) | 217 B | 1.1× |
+| list, 50 elements | **634 B** (was 2,791) | 617 B | 1.0× |
 
 Redis keeps a small hash, sorted set and list in one packed buffer (a
 listpack) and walks it; a hash here does the same below 128 fields of 64 bytes

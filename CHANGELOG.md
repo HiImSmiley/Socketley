@@ -32,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   batches. Pipelined GET over 100,000 random keys went from 4.7 M to 8.8 M/s,
   over a million from 2.9 M to 7.4 M; MGET and MSET of ten keys gained 72–78%.
 - Small hashes, sorted sets and lists take less memory: a five-field hash 631 →
-  263 bytes, a five-member sorted set 1,575 → 295, a five-element list 808 →
-  248. RPUSH is a third faster and LRANGE 9–12%; LINDEX and LSET on lists of
+  248 bytes, a five-member sorted set 1,575 → 248, a five-element list 808 →
+  231. RPUSH is a third faster and LRANGE 9–12%; LINDEX and LSET on lists of
   tens of elements are up to 14% slower, since a packed list is walked.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.

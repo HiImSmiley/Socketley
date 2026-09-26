@@ -15,20 +15,23 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
 
+#include "pack_buf.h"
 #include "seg_list.h"
 
 // A packed list's bytes and count, outside the class so the variant below can
-// default-construct it while list_items is still incomplete.
+// default-construct it while list_items is still incomplete.  The seg_list
+// sets the variant's size, so the bytes up to it hold a short list in place.
 struct list_items_packed
 {
-    std::string buf;
-    uint32_t    n = 0;
+    basic_pack_buf<24> buf;
+    uint32_t           n = 0;
 };
 
 class list_items
@@ -97,7 +100,7 @@ public:
         auto& p = packed_ref();
         const size_t off = prev(p.buf.size());
         out.assign(item(off));
-        p.buf.erase(off);
+        p.buf.truncate(off);
         --p.n;
     }
     // And without a caller to hand the element to.
@@ -112,7 +115,7 @@ public:
     {
         if (seg_list* s = std::get_if<1>(&m_v)) { s->pop_back(); return; }
         auto& p = packed_ref();
-        p.buf.erase(prev(p.buf.size()));
+        p.buf.truncate(prev(p.buf.size()));
         --p.n;
     }
 
@@ -122,7 +125,8 @@ public:
         if (!is_packed()) { seg()[i].assign(v.data(), v.size()); return; }
         const size_t off = offset_of(i);
         auto& p = packed_ref();
-        p.buf.replace(off, next(off) - off, frame(v));
+        char f[2 + PACK_MAX_LEN];
+        p.buf.replace(off, next(off) - off, f, frame(f, v));
     }
 
     void erase(size_t i)
@@ -238,37 +242,20 @@ private:
         return false;
     }
 
-    static std::string frame(std::string_view v)
+    // `v` between its two length bytes, into `f`; answers the bytes written.
+    static size_t frame(char* f, std::string_view v)
     {
-        std::string f;
-        f.reserve(v.size() + 2);
-        f.push_back(static_cast<char>(v.size()));
-        f.append(v);
-        f.push_back(static_cast<char>(v.size()));
-        return f;
+        f[0] = static_cast<char>(v.size());
+        std::memcpy(f + 1, v.data(), v.size());
+        f[1 + v.size()] = static_cast<char>(v.size());
+        return v.size() + 2;
     }
 
-    // By a quarter, as field_map grows, not by the doubling libstdc++ uses.
     void place(size_t off, std::string_view v)
     {
         auto& p = packed_ref();
-        const size_t need = p.buf.size() + v.size() + 2;
-        if (need > p.buf.capacity())
-        {
-            std::string bigger;
-            bigger.reserve(need + need / 4);
-            bigger.append(p.buf);
-            p.buf.swap(bigger);
-        }
-        const char len = static_cast<char>(v.size());
-        if (off == p.buf.size())
-        {
-            p.buf.push_back(len);
-            p.buf.append(v);
-            p.buf.push_back(len);
-        }
-        else
-            p.buf.insert(off, frame(v));
+        char f[2 + PACK_MAX_LEN];
+        p.buf.insert(off, f, frame(f, v));
         ++p.n;
     }
 

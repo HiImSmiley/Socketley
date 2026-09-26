@@ -12,12 +12,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "key_table.h"
+#include "pack_buf.h"
 
 class field_map
 {
@@ -92,11 +94,12 @@ public:
             unpack();
             return m_table->try_emplace(f, v).second;
         }
-        grow_for(2 + f.size() + v.size());
-        m_pack.push_back(static_cast<char>(f.size()));
-        m_pack.append(f);
-        m_pack.push_back(static_cast<char>(v.size()));
-        m_pack.append(v);
+        char e[2 + 2 * PACK_MAX_LEN];
+        e[0] = static_cast<char>(f.size());
+        std::memcpy(e + 1, f.data(), f.size());
+        e[1 + f.size()] = static_cast<char>(v.size());
+        std::memcpy(e + 2 + f.size(), v.data(), v.size());
+        m_pack.insert(m_pack.size(), e, 2 + f.size() + v.size());
         ++m_count;
         return true;
     }
@@ -109,11 +112,11 @@ public:
         if (!find_packed(f, at, &end)) return false;
         m_pack.erase(at, end - at);
         --m_count;
-        if (m_count == 0) std::string().swap(m_pack);
+        if (m_count == 0) m_pack.release();
         return true;
     }
 
-    void clear() { std::string().swap(m_pack); m_count = 0; m_table.reset(); ++m_epoch; }
+    void clear() { m_pack.release(); m_count = 0; m_table.reset(); ++m_epoch; }
 
     // ─── Walking it ───
 
@@ -205,25 +208,12 @@ public:
     uint32_t scan_epoch() const { return m_table ? m_table->scan_epoch() + m_epoch : m_epoch; }
 
 private:
-    std::string            m_pack;
+    pack_buf               m_pack;
     uint32_t               m_count{0};
     // Moved to the table and back to empty count as changes of shape, so a
     // cursor into the one is never read against the other.
     uint32_t               m_epoch{0};
     std::unique_ptr<table> m_table;
-
-    // By a quarter and not libstdc++'s doubling, which put five fields of
-    // fourteen bytes in a 128-byte block.
-    void grow_for(size_t more)
-    {
-        const size_t need = m_pack.size() + more;
-        if (need <= m_pack.capacity())
-            return;
-        std::string bigger;
-        bigger.reserve(need + need / 4);
-        bigger.append(m_pack);
-        m_pack.swap(bigger);
-    }
 
     size_t len_at(size_t pos) const { return static_cast<unsigned char>(m_pack[pos]); }
 
@@ -260,7 +250,7 @@ private:
         for (size_t p = 0; p < m_pack.size(); p = next_at(p))
             t->try_emplace(field_at(p), value_at(p));
         m_table = std::move(t);
-        std::string().swap(m_pack);
+        m_pack.release();
         m_count = 0;
         ++m_epoch;
     }
