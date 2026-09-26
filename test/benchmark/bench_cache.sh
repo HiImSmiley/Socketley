@@ -125,7 +125,9 @@ append_result() {
 # one count cannot give both a usable window -- which is exactly how the old
 # fixed 5000 ended up timing five milliseconds.  Each measurement probes once,
 # then picks its own count.
-CACHE_PIPE_TARGET_MS=${CACHE_PIPE_TARGET_MS:-250}
+# 1000 and not 250: at 250 the rows spread up to 3.90x (SET 64B, 2026-09-26),
+# which resolves nothing; the fast rows still stop at the op cap below first.
+CACHE_PIPE_TARGET_MS=${CACHE_PIPE_TARGET_MS:-1000}
 CACHE_PIPE_MIN_OPS=${CACHE_PIPE_MIN_OPS:-200000}
 # The cap is memory, not time: the store holds everything a run writes into it,
 # and 2M list entries is about 130 MB.
@@ -401,9 +403,9 @@ cache_pipe_report() {
 
 # Ensure bench_cache runtime is cleaned up before starting a new test.
 ensure_clean() {
-    socketley_cmd stop bench_cache 2>/dev/null
+    socketley_cmd stop bench_cache >/dev/null 2>&1
     sleep 0.5
-    socketley_cmd remove bench_cache 2>/dev/null
+    socketley_cmd remove bench_cache >/dev/null 2>&1
 }
 
 # ─── The second that was being reported as I/O ──────────────────────────────
@@ -841,6 +843,9 @@ test_set_ds_throughput() {
     cache_pipe_report "$test_name" "SISMEMBER" "sismember_ops_sec" \
         'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "SISMEMBER benchset member%d\n", int(rand()*n)+1 }' \
         'BEGIN{ print "DEL benchset"; for(i=1;i<=n;i++) printf "SADD benchset member%d\n", i }'
+    # The read walks n entries at random and the write in the order they were
+    # made, so the gap between the two rows is memory latency, not the command.
+    log_info "    the read row draws from all n at random, the write row walks them in order: compare reads with reads"
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -865,6 +870,9 @@ test_hash_throughput() {
     cache_pipe_report "$test_name" "HGET" "hget_ops_sec" \
         'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "HGET benchhash field%d\n", int(rand()*n)+1 }' \
         'BEGIN{ print "DEL benchhash"; for(i=1;i<=n;i++) printf "HSET benchhash field%d value%d\n", i, i }'
+    # The read walks n entries at random and the write in the order they were
+    # made, so the gap between the two rows is memory latency, not the command.
+    log_info "    the read row draws from all n at random, the write row walks them in order: compare reads with reads"
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -893,6 +901,9 @@ test_ttl_throughput() {
     cache_pipe_report "$test_name" "TTL" "ttl_ops_sec" \
         'BEGIN{ srand(42); for(i=1;i<=n;i++) printf "TTL ttlkey%d\n", int(rand()*n)+1 }' \
         'BEGIN{ for(i=1;i<=n;i++) printf "SET ttlkey%d val%d\nEXPIRE ttlkey%d 3600\n", i, i, i }'
+    # The read walks n entries at random and the write in the order they were
+    # made, so the gap between the two rows is memory latency, not the command.
+    log_info "    the read row draws from all n at random, the write row walks them in order: compare reads with reads"
 
     socketley_cmd stop bench_cache
     sleep 0.5
@@ -923,7 +934,7 @@ run_cache_benchmarks() {
     fresh_daemon
 
     log_bench "START" "cache_concurrent_access"
-    test_concurrent_access  20 50000
+    test_concurrent_access  20 200000
     log_bench "DONE" "cache_concurrent_access"
     fresh_daemon
 

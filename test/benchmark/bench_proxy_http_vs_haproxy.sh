@@ -130,11 +130,11 @@ HA_PID=""
 
 cleanup() {
     [[ -n "$HA_PID" ]] && kill "$HA_PID" 2>/dev/null
-    socketley_cmd stop  "$SK_NAME" 2>/dev/null
-    socketley_cmd stop  "$BE_NAME" 2>/dev/null
+    socketley_cmd stop  "$SK_NAME" >/dev/null 2>&1
+    socketley_cmd stop  "$BE_NAME" >/dev/null 2>&1
     sleep 0.4
-    socketley_cmd remove "$SK_NAME" 2>/dev/null
-    socketley_cmd remove "$BE_NAME" 2>/dev/null
+    socketley_cmd remove "$SK_NAME" >/dev/null 2>&1
+    socketley_cmd remove "$BE_NAME" >/dev/null 2>&1
     rm -rf "$WORK"
 }
 trap cleanup EXIT

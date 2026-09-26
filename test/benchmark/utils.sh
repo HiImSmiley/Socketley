@@ -303,9 +303,9 @@ cleanup_runtimes() {
     log_info "Cleaning up runtimes..."
     local runtimes=$(socketley_cmd ls 2>/dev/null | tail -n +2 | awk '{print $2}')
     for name in $runtimes; do
-        socketley_cmd stop "$name" 2>/dev/null
+        socketley_cmd stop "$name" >/dev/null 2>&1
         sleep 0.5
-        socketley_cmd remove "$name" 2>/dev/null
+        socketley_cmd remove "$name" >/dev/null 2>&1
     done
 }
 

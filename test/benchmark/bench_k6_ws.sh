@@ -121,7 +121,7 @@ test_ws_echo() {
 
     write_echo_lua
 
-    socketley_cmd stop bench_k6_ws 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_ws 2>/dev/null
+    socketley_cmd stop bench_k6_ws >/dev/null 2>&1; sleep 0.5; socketley_cmd remove bench_k6_ws >/dev/null 2>&1
     wait_for_port_free $WS_PORT
     socketley_cmd create server bench_k6_ws -p $WS_PORT --lua "$LUA_ECHO" -s
     wait_for_port $WS_PORT || { log_error "Server failed to start"; return 1; }

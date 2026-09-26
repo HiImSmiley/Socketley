@@ -246,7 +246,7 @@ test_http_arm() {
 
     log_section "Test: k6 HTTP Static Serving (${mode})"
 
-    socketley_cmd stop bench_k6_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_k6_http 2>/dev/null
+    socketley_cmd stop bench_k6_http >/dev/null 2>&1; sleep 0.5; socketley_cmd remove bench_k6_http >/dev/null 2>&1
     wait_for_port_free $HTTP_PORT
     socketley_cmd create server bench_k6_http -p $HTTP_PORT --http "$HTTP_ROOT" $flag -s
     wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }
@@ -300,7 +300,7 @@ test_http_wrk_arm() {   # mode flag
 
     log_section "Test: wrk HTTP Static Serving (${mode}, ${WRK_THREADS} threads x ${WRK_CONNS} connections, ${WRK_SECS}s)"
 
-    socketley_cmd stop bench_wrk_http 2>/dev/null; sleep 0.5; socketley_cmd remove bench_wrk_http 2>/dev/null
+    socketley_cmd stop bench_wrk_http >/dev/null 2>&1; sleep 0.5; socketley_cmd remove bench_wrk_http >/dev/null 2>&1
     wait_for_port_free $HTTP_PORT
     socketley_cmd create server bench_wrk_http -p $HTTP_PORT --http "$HTTP_ROOT" $flag -s
     wait_for_port $HTTP_PORT || { log_error "Server failed to start"; return 1; }

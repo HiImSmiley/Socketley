@@ -22,10 +22,10 @@ HTTP_CONCURRENCY=${HTTP_CONCURRENCY:-40}
 # Timed, not counted.  A fixed request count is a window that narrows as the
 # code gets faster: 2000 requests took 242 ms when the fixture was Python and
 # would take 140 ms against the one below, which is short enough for the
-# scheduler to be a visible share of it.  2000 ms x 3 runs, plus the run
-# socketley_bench discards, is about 8 s per row.
+# scheduler to be a visible share of it.  Five runs of 2000 ms, because three
+# resolved only 33 per cent, plus the run socketley_bench discards: 12 s a row.
 HTTP_RUN_MS=${HTTP_RUN_MS:-2000}
-HTTP_RUNS=${HTTP_RUNS:-3}
+HTTP_RUNS=${HTTP_RUNS:-5}
 # The count becomes an upper bound when -d is given; it is here only so a run
 # cannot end early.
 HTTP_OPS_CAP=100000000
@@ -44,20 +44,20 @@ append_result() {
 }
 
 ensure_clean() {
-    socketley_cmd stop bench_proxy 2>/dev/null
-    socketley_cmd stop backend1 2>/dev/null
-    socketley_cmd stop named_backend 2>/dev/null
+    socketley_cmd stop bench_proxy >/dev/null 2>&1
+    socketley_cmd stop backend1 >/dev/null 2>&1
+    socketley_cmd stop named_backend >/dev/null 2>&1
     # The HTTP backends are runtimes now rather than a Python process, so a run
     # that died between create and remove leaves them holding their ports and
     # the next run's wait_for_port is satisfied by the corpse.
-    socketley_cmd stop bench_be1 2>/dev/null
-    socketley_cmd stop bench_be2 2>/dev/null
+    socketley_cmd stop bench_be1 >/dev/null 2>&1
+    socketley_cmd stop bench_be2 >/dev/null 2>&1
     sleep 0.5
-    socketley_cmd remove bench_proxy 2>/dev/null
-    socketley_cmd remove backend1 2>/dev/null
-    socketley_cmd remove named_backend 2>/dev/null
-    socketley_cmd remove bench_be1 2>/dev/null
-    socketley_cmd remove bench_be2 2>/dev/null
+    socketley_cmd remove bench_proxy >/dev/null 2>&1
+    socketley_cmd remove backend1 >/dev/null 2>&1
+    socketley_cmd remove named_backend >/dev/null 2>&1
+    socketley_cmd remove bench_be1 >/dev/null 2>&1
+    socketley_cmd remove bench_be2 >/dev/null 2>&1
 }
 
 # ─── The HTTP fixture, and why it stopped being Python ──────────────────────
@@ -493,7 +493,7 @@ run_proxy_benchmarks() {
     fresh_daemon
 
     log_bench "START" "proxy_tcp_throughput"
-    test_tcp_throughput 3000 128
+    test_tcp_throughput 20000 128
     log_bench "DONE" "proxy_tcp_throughput"
     fresh_daemon
 
@@ -509,7 +509,7 @@ run_proxy_benchmarks() {
     fresh_daemon
 
     log_bench "START" "proxy_runtime_name_backend"
-    test_runtime_name_backend 500
+    test_runtime_name_backend 5000
     log_bench "DONE" "proxy_runtime_name_backend"
 
     echo "]" >> "$RESULTS_FILE"

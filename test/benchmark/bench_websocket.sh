@@ -19,9 +19,9 @@ append_result() {
 }
 
 ensure_clean() {
-    socketley_cmd stop bench_ws 2>/dev/null
+    socketley_cmd stop bench_ws >/dev/null 2>&1
     sleep 0.5
-    socketley_cmd remove bench_ws 2>/dev/null
+    socketley_cmd remove bench_ws >/dev/null 2>&1
 }
 
 # Test 1: WebSocket handshake throughput
@@ -134,7 +134,7 @@ run_ws_benchmarks() {
     ensure_socketley_bench || return 1
 
     log_bench "START" "ws_handshake_throughput"
-    test_ws_handshake 200
+    test_ws_handshake 2000
     log_bench "DONE" "ws_handshake_throughput"
     fresh_daemon
 

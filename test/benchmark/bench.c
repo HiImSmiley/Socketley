@@ -656,9 +656,10 @@ static char *build_mixed_pipeline(int count, const char *value, int value_len,
     return buf;
 }
 
-/* Send a full pipeline buffer and drain responses (count newlines until we
- * have `expected` responses). Returns number of responses received. */
-/* `bounded` stops draining when a time-boxed run's window closes.
+/* Send a pipeline buffer, never more than PIPE_WINDOW commands ahead of their
+ * replies, and count replies until `expected` have come back.
+ *
+ * `bounded` stops draining when a time-boxed run's window closes.
  *
  * It is a parameter and not a check inside, because the six callers want
  * opposite things and the difference is not visible from here.  Three of them
@@ -671,17 +672,38 @@ static char *build_mixed_pipeline(int count, const char *value, int value_len,
  *
  * The wrappers below carry the choice in their names, so a call site states
  * which it is instead of passing a bare 1. */
+/* Commands a connection may have sent and not yet had answered.  The whole
+ * buffer written before the first read put a million replies, 80 MB of them,
+ * behind a client that read nothing, and the cache closes a client that holds
+ * 8 MiB of replies unread -- every 1M-op run ended at 145K.  Twenty thousand
+ * is about 1.3 MB of 64-byte values and still a pipeline deep enough that the
+ * server never waits for the client. */
+#define PIPE_WINDOW 20000
+
 static int pipeline_drain(int fd, const char *cmd_buf, size_t cmd_len,
                           int expected_responses, int bounded)
 {
-    if (send_all(fd, cmd_buf, cmd_len) < 0)
-        return 0;
-
-    /* Drain responses: each response ends with \n */
     char rbuf[BUF_SIZE];
-    int got = 0;
+    size_t off = 0;
+    int sent = 0, got = 0;
     while (got < expected_responses) {
         if (bounded && deadline_passed()) break;
+        if (off < cmd_len && sent - got < PIPE_WINDOW) {
+            size_t chunk = cmd_len - off;
+            if (chunk > 65536) chunk = 65536;
+            ssize_t w = send(fd, cmd_buf + off, chunk, MSG_NOSIGNAL);
+            if (w <= 0) break;
+            sent += count_newlines(cmd_buf + off, (size_t)w);
+            off += (size_t)w;
+            /* Whatever has come back, without waiting for more. */
+            for (;;) {
+                ssize_t n = recv(fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
+                if (n > 0) { got += count_newlines(rbuf, n); continue; }
+                if (n == 0) return got;
+                break;
+            }
+            continue;
+        }
         ssize_t n = read(fd, rbuf, sizeof(rbuf));
         if (n <= 0) break;
         got += count_newlines(rbuf, n);
@@ -2063,6 +2085,12 @@ static struct run_result bench_ws_handshake(struct bench_config *cfg)
 
     int warmup = cfg->num_ops * cfg->warmup_pct / 100;
 
+    /* Its own loopback address per run, for the reason bench_server_conn
+     * gives: a count long enough to measure reuses the port pool otherwise. */
+    static uint32_t hs_run;
+    if (strncmp(cfg->host, "127.", 4) == 0)
+        g_conn_src = 0x7F000300u + 2u + (hs_run++ % 250u);
+
     int64_t start = time_ns();
 
     for (int i = 0; i < cfg->num_ops; i++) {
@@ -2084,6 +2112,7 @@ static struct run_result bench_ws_handshake(struct bench_config *cfg)
     }
 
     int64_t end = time_ns();
+    g_conn_src = 0;
     double elapsed = ns_to_s(end - start);
     r.throughput = r.success / elapsed;
 

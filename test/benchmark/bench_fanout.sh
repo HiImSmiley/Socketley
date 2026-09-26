@@ -199,7 +199,7 @@ for SUBS in $SUB_CASES; do
 
     declare -A RATES WC CC P50
     for arm in $ARMS; do RATES[$arm]=""; WC[$arm]=""; CC[$arm]=""; P50[$arm]=""; done
-    R_BC=""; R_RL=""
+    R_BC=""; R_RL=""; U_BC=""; U_RL=""
     kept=0; dropped=0; badrun=0; attempt=0
     max_attempts=$((PASSES * 2 + 2))
 
@@ -250,6 +250,12 @@ for SUBS in $SUB_CASES; do
         # bench_cache_resp.sh documents, met again one file later.
         R_BC="$R_BC $(awk -v a="${pr[broadcast]}" -v b="${pr[pubsub]}" 'BEGIN{printf "%.4f", (b > 0 ? a / b : 0)}')"
         R_RL="$R_RL $(awk -v a="${pr[relay]}"     -v b="${pr[pubsub]}" 'BEGIN{printf "%.4f", (b > 0 ? a / b : 0)}')"
+        # And the same pair on worker CPU per delivery, which is the headline:
+        # pubsub's cost over the arm's, so above 1 the arm is the cheaper one.
+        U_BC="$U_BC $(awk -v wa="${pw[broadcast]}" -v ra="${pr[broadcast]}" -v wb="${pw[pubsub]}" -v rb="${pr[pubsub]}" \
+                         'BEGIN{printf "%.4f", ((wa > 0 && rb > 0) ? (wb / rb) / (wa / ra) : 0)}')"
+        U_RL="$U_RL $(awk -v wa="${pw[relay]}" -v ra="${pr[relay]}" -v wb="${pw[pubsub]}" -v rb="${pr[pubsub]}" \
+                         'BEGIN{printf "%.4f", ((wa > 0 && rb > 0) ? (wb / rb) / (wa / ra) : 0)}')"
         kept=$((kept + 1))
     done
 
@@ -275,10 +281,14 @@ for SUBS in $SUB_CASES; do
     done
     printf '  queue_p50 is publish to receipt under a saturating publisher: queueing depth, not service latency\n'
 
-    M_BC=$(median_of "$R_BC"); C_BC=$(ci_pct_of "$R_BC")
-    M_RL=$(median_of "$R_RL"); C_RL=$(ci_pct_of "$R_RL")
-    printf '\n  broadcast / pubsub  %sx  ±%s%%\n' "$M_BC" "$C_BC"
-    printf '  relay     / pubsub  %sx  ±%s%%\n'   "$M_RL" "$C_RL"
+    M_BC=$(median_of "$U_BC"); C_BC=$(ci_pct_of "$U_BC")
+    M_RL=$(median_of "$U_RL"); C_RL=$(ci_pct_of "$U_RL")
+    printf '\n  worker cost per delivery, pubsub over the arm (above 1: the arm is cheaper)\n'
+    printf '  broadcast  %sx  ±%s%%\n' "$M_BC" "$C_BC"
+    printf '  relay      %sx  ±%s%%\n' "$M_RL" "$C_RL"
+    printf '  rate, the arm over pubsub (the client decides it when a worker is under 1.0)\n'
+    printf '  broadcast  %sx  ±%s%%\n' "$(median_of "$R_BC")" "$(ci_pct_of "$R_BC")"
+    printf '  relay      %sx  ±%s%%\n' "$(median_of "$R_RL")" "$(ci_pct_of "$R_RL")"
     printf '  %d passes kept, %d dropped for box load, %d for lost deliveries\n' \
         "$kept" "$dropped" "$badrun"
 
@@ -310,8 +320,8 @@ for SUBS in $SUB_CASES; do
                 "$arm" "$(median_of "${P50[$arm]}")"
             printf ',"%s_us_of_worker_per_delivery":%s' "$arm" "${UPD[$arm]}"
         done
-        printf ',"broadcast_over_pubsub":%s,"broadcast_over_pubsub_ci_pct":%s' "$M_BC" "$C_BC"
-        printf ',"relay_over_pubsub":%s,"relay_over_pubsub_ci_pct":%s}\n'      "$M_RL" "$C_RL"
+        printf ',"broadcast_cost_advantage":%s,"broadcast_cost_advantage_ci_pct":%s' "$M_BC" "$C_BC"
+        printf ',"relay_cost_advantage":%s,"relay_cost_advantage_ci_pct":%s}\n'      "$M_RL" "$C_RL"
     } >> "$RESULTS_FILE"
 done
 

@@ -39,7 +39,7 @@ CLIENTS=50
 # 11.6 M.
 CLIENT_PROCS=${BENCH_RESP_CLIENT_PROCS:-4}
 # Positional argument wins, then the environment, then the default.
-PAIRS=${1:-${BENCH_RESP_PAIRS:-3}}
+PAIRS=${1:-${BENCH_RESP_PAIRS:-7}}
 
 # Three is the fewest that yields an interval at all, and one pair is refused
 # outright: it produces a ratio with no error bar, which is the form the SADD
@@ -57,8 +57,11 @@ fi
 TARGET_PCT=${BENCH_RESOLUTION_TARGET:-5}
 QUIET_CORES=${BENCH_QUIET_CORES:-1.0}
 
-P1_REQUESTS=200000
-P100_REQUESTS=2000000
+# Seconds per arm and not the README's 200K and 2M, which ran 0.7 s and 0.4 s
+# here: a leg that short carries its start-up in the rate and gave CIs of 10
+# to 56 per cent over three pairs.
+P1_REQUESTS=1000000
+P100_REQUESTS=10000000
 
 TMPDIR_BENCH=$(mktemp -d)
 
@@ -486,12 +489,12 @@ run_cache_resp_benchmarks() {
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null 2>&1
 
     # Start socketley cache with RESP protocol
-    socketley_cmd stop bench_cache_resp 2>/dev/null
+    socketley_cmd stop bench_cache_resp >/dev/null 2>&1
     sleep 0.5
-    socketley_cmd remove bench_cache_resp 2>/dev/null
+    socketley_cmd remove bench_cache_resp >/dev/null 2>&1
     wait_for_port_free $CACHE_PORT
     socketley_cmd create cache bench_cache_resp -p $CACHE_PORT --resp -s
-    wait_for_port $CACHE_PORT || { log_error "Cache (RESP) failed to start"; socketley_cmd stop bench_cache_resp 2>/dev/null; sleep 0.5; socketley_cmd remove bench_cache_resp 2>/dev/null; return 1; }
+    wait_for_port $CACHE_PORT || { log_error "Cache (RESP) failed to start"; socketley_cmd stop bench_cache_resp >/dev/null 2>&1; sleep 0.5; socketley_cmd remove bench_cache_resp >/dev/null 2>&1; return 1; }
     sleep 0.5
 
     # ── P=1 ──

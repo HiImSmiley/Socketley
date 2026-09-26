@@ -19,9 +19,9 @@ append_result() {
 }
 
 ensure_clean() {
-    socketley_cmd stop bench_srv 2>/dev/null
+    socketley_cmd stop bench_srv >/dev/null 2>&1
     sleep 0.5
-    socketley_cmd remove bench_srv 2>/dev/null
+    socketley_cmd remove bench_srv >/dev/null 2>&1
 }
 
 # Test 1: Connection establishment rate (sequential connect/close)
