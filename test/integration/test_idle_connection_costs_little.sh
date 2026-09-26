@@ -94,6 +94,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Integration: an idle connection costs kilobytes, not tens ==="
+# Small pages, because with the worker's huge-page malloc the heap grows in
+# 2 MB steps -- a kilobyte a connection at 2,000 of them -- and whether a step
+# fell before or after the baseline read 1.9 or 4.9 KB on one binary.
+export SOCKETLEY_HUGEPAGE=0
 daemon_start "$BIN"
 create_ok "a cache" "$BIN" create cache ic -p "$P"
 "$BIN" start ic >/dev/null 2>&1 || true
