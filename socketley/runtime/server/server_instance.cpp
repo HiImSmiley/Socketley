@@ -189,6 +189,7 @@ socketley::reach::owed server_instance::conn_owed(const server_connection* conn)
     o.splice_in      = conn->splice_in_pending;
     o.splice_out     = conn->splice_out_pending;
     o.promised_reply = conn->cache_pending > 0;
+    o.drain          = conn->wr_shutdown && conn->read_pending && drains_on_close(conn);
     o.read           = conn->read_pending;   // not counted; see the header
     return o;
 }
@@ -322,6 +323,8 @@ void server_instance::pool_release(std::unique_ptr<server_connection> conn)
     conn->file_read_pending = false;
     conn->http_keep_alive = false;
     conn->wr_shutdown = false;
+    conn->drain_on_close = false;
+    conn->drained_bytes = 0;
 
     SKL_INV_POOLABLE("server::pool_release", conn->fd,
         conn_ops_pending(conn.get()),
@@ -1753,8 +1756,21 @@ void server_instance::queue_http_response(server_connection* conn,
 }
 
 void server_instance::refuse_http_request(server_connection* conn,
-                                          const std::shared_ptr<const std::string>& resp)
+                                          const std::shared_ptr<const std::string>& resp,
+                                          bool drain)
 {
+    // The rest of a refused request may still be on its way, and closing with
+    // it unread resets the connection ahead of the answer; a peer that
+    // stopped sending has nothing to drain.
+    if (drain)
+    {
+        conn->drain_on_close = true;
+        conn->header_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(DRAIN_LIMIT_SECS);
+        m_drains_outstanding = true;
+        arm_idle_sweep();
+    }
+
     // The buffer goes first, because everything in it was measured against a
     // header block this end could not frame, so its boundaries are exactly
     // what is in doubt.
@@ -2839,10 +2855,25 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // peers at once, so a line each would be a log flood produced
                 // by the defence.
                 uint32_t hs_dropped = 0, head_dropped = 0;
+                bool drains_left = false;
                 for (int cfd : m_active_fds)
                 {
                     auto* cconn = m_conn_idx[cfd];
-                    if (!cconn || cconn->closing)
+                    if (!cconn)
+                        continue;
+                    // A refused peer that is still sending after the bound
+                    // is cut off, which ends the read the drain was holding.
+                    if (cconn->closing && cconn->drain_on_close)
+                    {
+                        if (now > cconn->header_deadline)
+                        {
+                            cconn->drain_on_close = false;
+                            shutdown(cfd, SHUT_RD);
+                        }
+                        else
+                            drains_left = true;
+                    }
+                    if (cconn->closing)
                         continue;
                     // A peer that has not finished its handshake is not a
                     // client yet, so this one does not wait for a timeout
@@ -2868,7 +2899,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                             // status on the same deadline.  refuse_http_request
                             // sets closing itself.
                             cconn->awaiting_headers = false;
-                            refuse_http_request(cconn, http_408_response());
+                            refuse_http_request(cconn, http_408_response(), /*drain=*/false);
                             ++head_dropped;
                             continue;
                         }
@@ -2884,6 +2915,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 // count, because a connection can stop awaiting headers on any
                 // read and nothing would have decremented it.
                 m_headers_outstanding = heads_left;
+                m_drains_outstanding  = drains_left;
 
                 // A peer dropped on a deadline has nothing said to it -- there
                 // is no protocol yet to say it in -- so the log is the only
@@ -2912,7 +2944,7 @@ void server_instance::on_cqe(struct io_uring_cqe* cqe)
                 if (sweep_idle && m_udp && !m_udp_peers.empty())
                     forget_idle_udp_peers(now, timeout);
 
-                if (sweep_idle || m_tls || m_headers_outstanding)
+                if (sweep_idle || m_tls || m_headers_outstanding || m_drains_outstanding)
                     m_idle_sweep_armed = m_loop->submit_timeout(&m_idle_sweep_ts, &m_idle_sweep_req);
             }
 #ifndef SOCKETLEY_NO_LUA
@@ -4798,6 +4830,8 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     {
         if (is_provided)
             m_loop->for_each_cqe_buf(BUF_GROUP_ID, cqe, [](char*, uint32_t) {});
+        const uint64_t drained = uint64_t{conn->drained_bytes} + static_cast<uint32_t>(cqe->res);
+        conn->drained_bytes = static_cast<uint32_t>(std::min<uint64_t>(drained, DRAIN_LIMIT_BYTES + 1u));
         goto submit_next_read;
     }
 
@@ -4928,11 +4962,18 @@ submit_next_read:
             arm_conn_read(conn);
         }
     }
-    else if (conn->closing && !conn_ops_pending(conn))
+    else if (conn->closing)
     {
+        // Our FIN is out and the peer may still be sending what we refused:
+        // read it away until its EOF, because closing with it unread resets
+        // the connection and takes our answer with it.
+        if (m_loop && conn->wr_shutdown && !conn->read_pending && !conn->file_read_pending &&
+            drains_on_close(conn))
+            submit_conn_read(conn);
         // Nothing left in the ring for this connection, so it can go now;
         // otherwise whichever operation is outstanding owns the teardown.
-        close_conn(conn);
+        if (!conn_ops_pending(conn))
+            close_conn(conn);
     }
 }
 
@@ -6066,11 +6107,16 @@ void server_instance::maybe_shutdown_write(server_connection* conn)
     if (conn->cache_pending > 0)
         return;
 
-    // Nothing is armed to hold the connection open, so the caller's own branch
-    // is about to close it properly; only the armed-read case needs a FIN of
-    // its own.
+    // A read is what drains whatever the peer is still sending after our FIN;
+    // without one the caller closes, which is only right when none can be armed.
     if (!conn->read_pending)
-        return;
+    {
+        if (!m_loop || conn->file_read_pending || !drains_on_close(conn))
+            return;
+        submit_conn_read(conn);
+        if (!conn->read_pending)
+            return;
+    }
 
     conn->wr_shutdown = true;
     if (shutdown(conn->fd, SHUT_WR) < 0) {}
@@ -7420,11 +7466,11 @@ void server_instance::arm_header_deadline(server_connection* conn)
 
 void server_instance::arm_idle_sweep()
 {
-    // Armed for any of three questions: the idle timeout if one was
+    // Armed for any of four questions: the idle timeout if one was
     // configured, the handshake deadline on any TLS listener whether one was or
-    // not, and a head that has arrived in part.
+    // not, a head that has arrived in part, and a refused peer still draining.
     if (!m_loop || m_idle_sweep_armed ||
-        (m_idle_timeout_cached <= 0 && !m_tls && !m_headers_outstanding))
+        (m_idle_timeout_cached <= 0 && !m_tls && !m_headers_outstanding && !m_drains_outstanding))
         return;
 
     m_idle_sweep_ts.tv_sec  = 30;

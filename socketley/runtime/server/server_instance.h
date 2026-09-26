@@ -86,6 +86,11 @@ struct alignas(64) server_connection
     // alone so no emitter has to know.
     bool http_head{false};
     bool wr_shutdown{false};   // our FIN is already on the wire (shutdown SHUT_WR)
+    // Refused mid-request, so what the peer is still sending is read away
+    // after our FIN until its EOF, header_deadline, or the byte bound.
+    bool drain_on_close{false};
+    // What a closing connection read and threw away while its FIN was out.
+    uint32_t drained_bytes{0};
     // This runtime closed the connection because the producer outran the
     // socket, not because the peer went away.  Sticky, and read by the refusal
     // a script gets so it can tell "slow down" from "it is gone".
@@ -1013,7 +1018,8 @@ private:
     // connection, in one function because a refusal that forgets to clear
     // `partial` leaves bytes the reparse loop reads as a fresh request.
     void refuse_http_request(server_connection* conn,
-                             const std::shared_ptr<const std::string>& resp);
+                             const std::shared_ptr<const std::string>& resp,
+                             bool drain = true);
 
     // End a WebSocket connection over a frame that broke the protocol, with
     // 1002 rather than the 1000 a goodbye carries.
@@ -1115,6 +1121,11 @@ private:
     // connection that cannot be read sits in m_clients against
     // --max-connections until the runtime stops.
     bool arm_conn_read(server_connection* conn);
+    static bool drains_on_close(const server_connection* conn)
+    {
+        return conn->drain_on_close && conn->ssl == nullptr &&
+               conn->drained_bytes <= DRAIN_LIMIT_BYTES;
+    }
     void release_fixed_slot(server_connection* conn);
 
     // UDP helpers
@@ -1229,6 +1240,8 @@ private:
     // waiting, because the sweep decides whether to re-arm and a walk it has
     // already finished is the only place that knows.
     bool m_headers_outstanding{false};
+    // The same for a refused connection still draining, kept by the same walk.
+    bool m_drains_outstanding{false};
     bool m_relay_deadline_armed{false};
     bool m_await_sweep_armed{false};
     bool m_udp_recv_armed{false};
@@ -1325,6 +1338,11 @@ private:
     static constexpr uint16_t BUF_GROUP_ID = 1;
     // A ring turns through every buffer it has, so this is 4 MiB resident once
     // traffic has cycled it, the cache's footprint.
+    // Past this a closing connection stops waiting for the peer's EOF, which
+    // is the cache's bound for the same drain.
+    static constexpr uint32_t DRAIN_LIMIT_BYTES = 64u << 20;
+    // And past this many seconds, which the 30-second sweep rounds up.
+    static constexpr uint32_t DRAIN_LIMIT_SECS = 10;
     static constexpr uint32_t BUF_COUNT = 256;
     static constexpr uint32_t BUF_SIZE = 16384;
     bool m_use_provided_bufs{false};
