@@ -2394,8 +2394,8 @@ TEST_CASE("list_items agrees with a deque, packed and after it moves to the seg_
             {
                 case 0: if (ref.size() < cap) { l.push_front(v); ref.push_front(v); } break;
                 case 1: if (ref.size() < cap) { l.push_back(v); ref.push_back(v); } break;
-                case 2: if (!ref.empty()) { CHECK(l.pop_front() == ref.front()); ref.pop_front(); } break;
-                case 3: if (!ref.empty()) { CHECK(l.pop_back() == ref.back()); ref.pop_back(); } break;
+                case 2: if (!ref.empty()) { std::string o; l.pop_front(o); CHECK(o == ref.front()); ref.pop_front(); } break;
+                case 3: if (!ref.empty()) { std::string o; l.pop_back(o); CHECK(o == ref.back()); ref.pop_back(); } break;
                 case 4: if (!ref.empty()) { const size_t i = rnd() % ref.size(); l.set(i, v); ref[i] = v; } break;
                 case 5: if (!ref.empty()) { const size_t i = rnd() % ref.size(); l.erase(i); ref.erase(ref.begin() + static_cast<long>(i)); } break;
                 case 6: if (ref.size() < cap) { const size_t i = rnd() % (ref.size() + 1); l.insert(i, v); ref.insert(ref.begin() + static_cast<long>(i), v); } break;

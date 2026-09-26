@@ -6004,13 +6004,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 return;
             }
             if (m_has_ttl_keys) m_store.check_expiry(args);
-            std::string val;
-            if (m_store.lpop(args, val))
-            {
-                rb.append(val);
-                rb.push_back('\n');
+            if (m_store.pop_with(args, true, [&](std::string_view v) { rb.append(v); rb.push_back('\n'); }))
                 replicate_command(line);   // was not replicated at all
-            }
             else
                 rb.append("nil\n", 4);
             break;
@@ -6023,13 +6018,8 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 return;
             }
             if (m_has_ttl_keys) m_store.check_expiry(args);
-            std::string val;
-            if (m_store.rpop(args, val))
-            {
-                rb.append(val);
-                rb.push_back('\n');
+            if (m_store.pop_with(args, false, [&](std::string_view v) { rb.append(v); rb.push_back('\n'); }))
                 replicate_command(line);   // was not replicated at all
-            }
             else
                 rb.append("nil\n", 4);
             break;
@@ -9583,8 +9573,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp_pop_count(conn, args, argc, true, rb);
                 break;
             }
-            std::string val;
-            if (m_store.lpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, 2); }
+            if (m_store.pop_with(args[1], true, [&](std::string_view v) { resp::encode_bulk_into(rb, v); }))
+                repl(args, 2);
             else resp::encode_null_into(rb);
             break;
         }
@@ -9598,8 +9588,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 resp_pop_count(conn, args, argc, false, rb);
                 break;
             }
-            std::string val;
-            if (m_store.rpop(args[1], val)) { resp::encode_bulk_into(rb, val); repl(args, 2); }
+            if (m_store.pop_with(args[1], false, [&](std::string_view v) { resp::encode_bulk_into(rb, v); }))
+                repl(args, 2);
             else resp::encode_null_into(rb);
             break;
         }

@@ -55,45 +55,65 @@ public:
         return item(prev(packed_ref().buf.size()));
     }
 
+    // The seg_list asked for first and once: a long list is the one pushed
+    // and popped at millions a second, and each variant test was a share of it.
     void push_back(std::string_view v)
     {
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->emplace_back(v); return; }
         if (fits(v)) { place(packed_ref().buf.size(), v); return; }
-        seg().emplace_back(v);
+        seg_ref().emplace_back(v);
     }
     void push_front(std::string_view v)
     {
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->emplace_front(v); return; }
         if (fits(v)) { place(0, v); return; }
-        seg().emplace_front(v);
+        seg_ref().emplace_front(v);
     }
 
-    std::string pop_front()
+    // Into the caller's string, once: returning it by value moved every
+    // element twice, the second move where two return paths defeat NRVO, and
+    // LPOP on a long list read 16 ns an element slower than the deque for it.
+    void pop_front(std::string& out)
     {
-        if (!is_packed())
+        if (seg_list* s = std::get_if<1>(&m_v))
         {
-            std::string out = std::move(seg().front());
-            seg().pop_front();
-            return out;
+            out = std::move(s->front());
+            s->pop_front();
+            return;
         }
         auto& p = packed_ref();
-        std::string out(item(0));
+        out.assign(item(0));
         p.buf.erase(0, next(0));
         --p.n;
-        return out;
     }
-    std::string pop_back()
+    void pop_back(std::string& out)
     {
-        if (!is_packed())
+        if (seg_list* s = std::get_if<1>(&m_v))
         {
-            std::string out = std::move(seg().back());
-            seg().pop_back();
-            return out;
+            out = std::move(s->back());
+            s->pop_back();
+            return;
         }
         auto& p = packed_ref();
         const size_t off = prev(p.buf.size());
-        std::string out(item(off));
+        out.assign(item(off));
         p.buf.erase(off);
         --p.n;
-        return out;
+    }
+    // And without a caller to hand the element to.
+    void pop_front()
+    {
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->pop_front(); return; }
+        auto& p = packed_ref();
+        p.buf.erase(0, next(0));
+        --p.n;
+    }
+    void pop_back()
+    {
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->pop_back(); return; }
+        auto& p = packed_ref();
+        p.buf.erase(prev(p.buf.size()));
+        --p.n;
     }
 
     void set(size_t i, std::string_view v)
@@ -187,10 +207,11 @@ private:
     std::variant<packed_t, seg_list> m_v;
 
     bool is_packed() const { return m_v.index() == 0; }
-    packed_t&       packed_ref()       { return std::get<0>(m_v); }
-    const packed_t& packed_ref() const { return std::get<0>(m_v); }
-    seg_list&       seg_ref()          { return std::get<1>(m_v); }
-    const seg_list& seg_ref()    const { return std::get<1>(m_v); }
+    // Unchecked: every caller has asked which form it holds.
+    packed_t&       packed_ref()       { return *std::get_if<0>(&m_v); }
+    const packed_t& packed_ref() const { return *std::get_if<0>(&m_v); }
+    seg_list&       seg_ref()          { return *std::get_if<1>(&m_v); }
+    const seg_list& seg_ref()    const { return *std::get_if<1>(&m_v); }
     // The seg_list, moving to it first if the list is still packed.
     seg_list& seg() { if (is_packed()) unpack(); return seg_ref(); }
 

@@ -53,28 +53,26 @@ public:
     const std::string& back()  const { return (*this)[m_size - 1]; }
 
     // Built in place: a block is raw storage, and only [front, back] holds
-    // live strings.  The value is built first, so an argument naming an
-    // element of this list is read before anything moves.
+    // live strings.  Blocks never move, so an argument naming an element of
+    // this list is still that element after a block is added.
     template <class... A>
     std::string& emplace_back(A&&... a)
     {
-        std::string v(std::forward<A>(a)...);
         if (m_off + m_size == size_t{m_blocks} * B)
             add_block_back();
-        std::string* slot = ::new (&raw_at(m_off + m_size)) std::string(std::move(v));
+        std::string* slot = ::new (&raw_at(m_off + m_size)) std::string(std::forward<A>(a)...);
         ++m_size;
         return *slot;
     }
     template <class... A>
     std::string& emplace_front(A&&... a)
     {
-        std::string v(std::forward<A>(a)...);
         if (m_off == 0)
         {
             add_block_front();
             m_off = B;
         }
-        std::string* slot = ::new (&raw_at(m_off - 1)) std::string(std::move(v));
+        std::string* slot = ::new (&raw_at(m_off - 1)) std::string(std::forward<A>(a)...);
         --m_off;
         ++m_size;
         return *slot;

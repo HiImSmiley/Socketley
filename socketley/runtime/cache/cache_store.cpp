@@ -477,19 +477,8 @@ bool cache_store::lpop(std::string_view key, std::string& out)
 
     // Charged by length, as the push was: an element may be bytes in a packed
     // buffer and have no capacity of its own.
-    out = it->second.pop_front();
-    const size_t elem_cost = stored_string(out.size());
-    --m_list_elems;
-    track_sub(elem_cost);
-
-    if (it->second.empty())
-    {
-        track_sub(stored_string(it->first));
-        m_list_elems -= it->second.size();
-        m_lists.erase(it);
-        m_expiry.erase(std::string(key));
-        drop_lru(key);
-    }
+    it->second.pop_front(out);
+    after_pop(it, key, stored_string(out.size()));
     return true;
 }
 
@@ -499,12 +488,17 @@ bool cache_store::rpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
-    // Same as lpop().
-    out = it->second.pop_back();
-    const size_t elem_cost = stored_string(out.size());
+    it->second.pop_back(out);
+    after_pop(it, key, stored_string(out.size()));
+    return true;
+}
+
+void cache_store::after_pop(list_map::iterator it, std::string_view key, size_t elem_cost)
+{
     --m_list_elems;
     track_sub(elem_cost);
 
+    // An empty list is not a key.
     if (it->second.empty())
     {
         track_sub(stored_string(it->first));
@@ -513,7 +507,6 @@ bool cache_store::rpop(std::string_view key, std::string& out)
         m_expiry.erase(std::string(key));
         drop_lru(key);
     }
-    return true;
 }
 
 int cache_store::llen(std::string_view key) const
@@ -1868,7 +1861,7 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
     if (sit == m_lists.end() || sit->second.empty())
         return false;
 
-    out = from_head ? sit->second.pop_front() : sit->second.pop_back();
+    if (from_head) sit->second.pop_front(out); else sit->second.pop_back(out);
     track_sub(stored_string(out.size()));
     --m_list_elems;
 

@@ -221,6 +221,21 @@ public:
     bool rpush(std::string_view key, std::string_view val);
     bool lpop(std::string_view key, std::string& out);
     bool rpop(std::string_view key, std::string& out);
+    // The end element handed to `take` as a view before it is removed, so a
+    // reply is written from the list itself rather than from a copy of it.
+    template <class F>
+    bool pop_with(std::string_view key, bool from_head, F&& take)
+    {
+        auto it = m_lists.find(key);
+        if (it == m_lists.end() || it->second.empty())
+            return false;
+        const std::string_view v = from_head ? it->second.front() : it->second.back();
+        take(v);
+        const size_t cost = stored_string(v.size());
+        if (from_head) it->second.pop_front(); else it->second.pop_back();
+        after_pop(it, key, cost);
+        return true;
+    }
     int llen(std::string_view key) const;
     const list_inner* list_ptr(std::string_view key) const;
     std::optional<std::string_view> lindex(std::string_view key, int idx) const;
@@ -688,6 +703,10 @@ private:
     // called at the point a write is known to be going ahead -- doing it on
     // the way in stripped the TTL off keys whose write was then refused.
     void drop_expiry(std::string_view key);
+
+    // The accounting of one element gone from the front or back of a list,
+    // and the key with it once the list is empty.
+    void after_pop(list_map::iterator it, std::string_view key, size_t elem_cost);
 
     // Structural cost of the containers in bytes per entry, measured on this
     // toolchain and covering the fixed part only, because the heap block a
