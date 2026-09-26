@@ -10,7 +10,8 @@
 # about this one.  Here the keyspace is loaded past the threshold first, and
 # then a stream is sent that walks every edge the lookahead has: commands with
 # more arguments than it holds, a command split across two reads, a write
-# followed at once by a read of the same key, and errors in the middle.
+# followed at once by a read of the same key, and errors in the middle -- and
+# MGET and MSET long enough to cross the 32-key batches they fetch ahead in.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
@@ -104,10 +105,21 @@ for step in range(30000):
         n = 1 if k in model else 0
         model.pop(k, None)
         cmd(("DEL", k), b":%d" % n)
-    elif r < 0.88:
+    elif r < 0.84:
         ks = ["k:%d" % rnd.randrange(N + 2000) for _ in range(12)]
         parts = [b"$-1" if model.get(x) is None else b"$" + model[x].encode() for x in ks]
         cmd(["MGET"] + ks, b"*" + b"|".join(parts))
+    elif r < 0.86:
+        # Seventy keys, across the 32-key batches MGET fetches ahead in.
+        ks = ["k:%d" % rnd.randrange(N + 2000) for _ in range(70)]
+        parts = [b"$-1" if model.get(x) is None else b"$" + model[x].encode() for x in ks]
+        cmd(["MGET"] + ks, b"*" + b"|".join(parts))
+    elif r < 0.88:
+        pairs = []
+        for j in range(40):
+            kk = "k:%d" % rnd.randrange(N); vv = "b:%d:%d" % (step, j)
+            pairs += [kk, vv]; model[kk] = vv
+        cmd(["MSET"] + pairs, b"+OK")
     elif r < 0.94:
         c = "cnt:%d" % rnd.randrange(50)
         cur = int(model.get(c, "0")) + 1; model[c] = str(cur)

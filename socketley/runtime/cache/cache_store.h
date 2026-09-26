@@ -75,6 +75,28 @@ public:
     void prefetch_slot(uint64_t h) const  { m_data.prefetch_slot(h); }
     void prefetch_entry(uint64_t h) const { m_data.prefetch_entry(h); }
 
+    // Every `step`th of n keys, slots then entries, ahead of a command that
+    // looks them all up in turn -- one wait for the lot instead of one each.
+    // At most PREFETCH_BATCH keys, which is what a caller walks between calls.
+    static constexpr size_t PREFETCH_BATCH = 32;
+    void prefetch_keys(const std::string_view* keys, size_t n, size_t step) const
+    {
+        if (!keyspace_outgrows_cache())
+            return;
+        uint64_t h[PREFETCH_BATCH];
+        size_t   m = 0;
+        for (size_t i = 0; i < n && m < PREFETCH_BATCH; i += step)
+        {
+            h[m] = key_hash(keys[i]);
+            m_data.prefetch_slot(h[m]);
+            // Eight keys behind, the slot has had time to arrive.
+            if (m >= 8) m_data.prefetch_entry(h[m - 8]);
+            ++m;
+        }
+        for (size_t j = m > 8 ? m - 8 : 0; j < m; ++j)
+            m_data.prefetch_entry(h[j]);
+    }
+
     bool set(std::string_view key, std::string_view value);
     bool get(std::string_view key, std::string& out) const;
     const std::string* get_ptr(std::string_view key) const;

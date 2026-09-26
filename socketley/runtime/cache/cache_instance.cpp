@@ -9414,6 +9414,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             resp::encode_array_header_into(rb, argc - 1);
             for (int i = 1; i < argc; i++)
             {
+                if ((i - 1) % cache_store::PREFETCH_BATCH == 0)
+                    m_store.prefetch_keys(args + i, static_cast<size_t>(argc - i), 1);
                 if (m_has_ttl_keys) m_store.check_expiry(args[i]);
                 const std::string* val = m_store.get_ptr(args[i]);
                 if (val) resp::encode_bulk_into(rb, *val);
@@ -9427,6 +9429,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_mode == cache_mode_readonly) { resp::encode_error_into(rb, "readonly mode"); return; }
             for (int i = 1; i + 1 < argc; i += 2)
             {
+                if ((i - 1) / 2 % cache_store::PREFETCH_BATCH == 0)
+                    m_store.prefetch_keys(args + i, static_cast<size_t>(argc - i), 2);
                 if (m_has_ttl_keys) m_store.check_expiry(args[i]);
                 m_store.set(args[i], args[i+1]);
 #ifndef SOCKETLEY_NO_LUA
