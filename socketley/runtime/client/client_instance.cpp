@@ -258,7 +258,7 @@ connected:
     // A dial and not a connection, for the same reason the paragraph above
     // gives: total_connections is counted where the kernel confirms one, in
     // note_connected().
-    m_stat_dial_attempts.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_dial_attempts, 1);
     m_conn_counted = false;
     m_conn->partial.clear();
     m_conn->partial.reserve(65536);
@@ -519,7 +519,7 @@ void client_instance::note_connected()
     // Per socket, because this runs every turn until it is true and a client
     // that reconnects all day must count connections and not turns.
     m_conn_counted = true;
-    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_connections, 1);
 }
 
 // A completion carrying bytes is the first thing that proves the peer accepted
@@ -847,7 +847,7 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
     }
 
     note_established();
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
 
     if (m_udp)
     {
@@ -1093,7 +1093,7 @@ void client_instance::handle_write(struct io_uring_cqe* cqe)
     }
 
     note_established();
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     // Resume a short write before moving on to the next message.
     m_conn->write_off += static_cast<size_t>(cqe->res);
@@ -1159,7 +1159,7 @@ void client_instance::handle_timeout(struct io_uring_cqe* cqe, io_request* req)
 
 void client_instance::process_message(std::string_view msg)
 {
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_messages, 1);
     print_bash_message(msg);
     write_received_message(msg);
     notify_interactive(msg);

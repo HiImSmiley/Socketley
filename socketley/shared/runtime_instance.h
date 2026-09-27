@@ -327,6 +327,13 @@ public:
     std::atomic<uint64_t> m_stat_bytes_in{0};
     std::atomic<uint64_t> m_stat_bytes_out{0};
 
+    // That plain add, for a counter only the calling thread ever writes.
+    static void stat_add(std::atomic<uint64_t>& counter, uint64_t n)
+    {
+        counter.store(counter.load(std::memory_order_relaxed) + n,
+                      std::memory_order_relaxed);
+    }
+
     // The figures to report whichever process holds them, computed when the
     // question is asked -- out of this object's atomics, or summed over the
     // shared table -- so there is no age to declare and any thread may call

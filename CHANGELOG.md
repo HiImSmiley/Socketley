@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A client hands its script each line straight from the buffer it was read
   into, and copies only a line that is still unfinished at the end of a read:
   TODO% more lines a second through a client script.
+- A client counts its messages and bytes with plain adds instead of locked
+  ones, since only its own loop writes them: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
