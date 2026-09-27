@@ -4125,6 +4125,9 @@ reparse:
             // speak is the case where saying so is strictly better than 101.
             bool ws_version_seen = false;
             bool ws_version_13   = false;
+            // Views into `partial`, copied onto the connection only once this
+            // GET turns out to be an upgrade.
+            std::string_view ws_cookie_v, ws_origin_v, ws_protocol_v, ws_auth_v;
 
             // Walk headers line by line
             size_t line_start = hdrs.find("\r\n"); // skip request line
@@ -4206,12 +4209,12 @@ reparse:
                         {
                             size_t vs = colon + 1;
                             while (vs < line.size() && line[vs] == ' ') ++vs;
-                            std::string val(line.substr(vs));
+                            const std::string_view val = line.substr(vs);
                             switch (h) {
-                                case fnv1a("cookie"):                 conn->ws_cookie   = std::move(val); break;
-                                case fnv1a("origin"):                 conn->ws_origin   = std::move(val); break;
-                                case fnv1a("sec-websocket-protocol"): conn->ws_protocol = std::move(val); break;
-                                case fnv1a("authorization"):          conn->ws_auth     = std::move(val); break;
+                                case fnv1a("cookie"):                 ws_cookie_v   = val; break;
+                                case fnv1a("origin"):                 ws_origin_v   = val; break;
+                                case fnv1a("sec-websocket-protocol"): ws_protocol_v = val; break;
+                                case fnv1a("authorization"):          ws_auth_v     = val; break;
                             }
                             break;
                         }
@@ -4283,6 +4286,13 @@ reparse:
                 }
 
                 std::string_view ws_key = hdrs.substr(ws_key_pos, ws_key_end - ws_key_pos);
+
+                // All four, an absent one as empty, so a plain GET earlier on
+                // this keep-alive connection cannot lend the upgrade its fields.
+                conn->ws_cookie.assign(ws_cookie_v);
+                conn->ws_origin.assign(ws_origin_v);
+                conn->ws_protocol.assign(ws_protocol_v);
+                conn->ws_auth.assign(ws_auth_v);
 
                 // Send 101 response
                 auto resp_msg = std::make_shared<std::string>();

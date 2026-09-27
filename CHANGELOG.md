@@ -93,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   upstream read, and a client's single-shot read. TODO: measurement.
 - A server's HTTP request keeps its header list between requests on a
   keep-alive connection instead of growing a new one each time: TODO%.
+- A server copies a GET's `Cookie`, `Origin`, `Sec-WebSocket-Protocol` and
+  `Authorization` only when the GET is a WebSocket upgrade, instead of on
+  every GET: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
@@ -100,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A WebSocket upgrade on a keep-alive connection that had already served a
+  plain GET could hand `on_websocket` and `self.ws_headers` that GET's
+  `Cookie`, `Origin`, `Sec-WebSocket-Protocol` or `Authorization` when the
+  upgrade itself did not carry the field.
 - A script that stopped its own runtime from inside a callback
   (`socketley.stop(self.name)` in `on_message`) read and popped an empty frame
   stack once the callback returned.
