@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Integration test: a server's echoes, a cache's replies, a client's sends, a
-# server's sends to its upstream and a server script's sends to a client and
-# to a websocket arrive byte for byte and in order, through every mix of sends
-# taken at once and sends that had to go through the ring
+# server's sends to its upstream, a server script's sends to a client and to a
+# websocket and a server's HTTP answers arrive byte for byte and in order,
+# through every mix of sends taken at once and sends that had to go through the
+# ring
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -18,7 +19,8 @@
 # lines of 1 byte to 30 KB to an echo server, pipelined GETs of values up to
 # 500 KB to a cache, and the same lines from a client runtime's script, from a
 # server's script to its upstream, from one to a connected client and from one
-# to a websocket as frames, each to a peer that reads late.
+# to a websocket as frames, each to a peer that reads late -- and pipelined
+# requests for static files of 1 byte to 200 KB to an --http-cache server.
 # What arrives must be exactly what was expected.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
@@ -29,6 +31,8 @@
 #   * a server's sends to its upstream the same way
 #   * a server script's sends to a client the same way
 #   * a server script's frames to a websocket the same way, or malformed
+#   * a server's pipelined HTTP answers the same way -- an answer sent
+#     directly while an earlier one is still queued lands ahead of it
 # suite: isolated
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -47,7 +51,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; ec
 
 PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312)); PK=$((SL_PORT_BASE + 1313))
 PU=$((SL_PORT_BASE + 1314)); PUS=$((SL_PORT_BASE + 1315)); PL=$((SL_PORT_BASE + 1316))
-PW=$((SL_PORT_BASE + 1317))
+PW=$((SL_PORT_BASE + 1317)); PH=$((SL_PORT_BASE + 1318))
 daemon_isolate directsend
 daemon_start "$BIN"
 WORK=$SOCKETLEY_TMPD
@@ -193,6 +197,58 @@ elif mode == "sink":
     print("ready", flush=True)
     c, _ = ls.accept()
     slow_read(c, b"".join(lines()))
+elif mode == "http":
+    # The expected stream is the server's own answers, fetched one at a time
+    # first, so no header this file does not control has to be spelled here.
+    def http_req(method, path, close):
+        return b"%s %s HTTP/1.1\r\nHost: x\r\n%s\r\n" % (
+            method, path, b"Connection: close\r\n" if close else b"")
+
+    def fetch_one(sock, method, path, close):
+        sock.sendall(http_req(method, path, close))
+        sock.settimeout(10)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            b = sock.recv(65536)
+            if not b: return buf
+            buf += b
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        cl = 0
+        for ln in head.split(b"\r\n")[1:]:
+            k, _, v = ln.partition(b":")
+            if k.strip().lower() == b"content-length":
+                cl = int(v)
+        if method == b"HEAD":
+            cl = 0
+        while len(rest) < cl:
+            b = sock.recv(65536)
+            if not b: break
+            rest += b
+        return head + b"\r\n\r\n" + rest[:cl]
+
+    kinds = [(b"GET", b"/a.txt"), (b"GET", b"/b.txt"), (b"GET", b"/c.html"),
+             (b"GET", b"/d.bin"), (b"GET", b"/e.bin"), (b"HEAD", b"/d.bin"),
+             (b"GET", b"/missing")]
+    kept = socket.create_connection(("127.0.0.1", port))
+    alone = {k: fetch_one(kept, k[0], k[1], False) for k in kinds}
+    kept.close()
+    last = socket.create_connection(("127.0.0.1", port))
+    last_alone = fetch_one(last, b"GET", b"/e.bin", True)
+    last.close()
+    # A server that answered nothing would make both sides empty and equal.
+    if not all(v.startswith(b"HTTP/1.1 ") for v in list(alone.values()) + [last_alone]):
+        print("no answer to a lone request: %r" % {k: v[:40] for k, v in alone.items()}, flush=True)
+        sys.exit(0)
+
+    # Fifty requests in one write, the last asking to close, read late through
+    # a small window so later answers find earlier ones still queued.
+    order = [rnd.choice(kinds) for _ in range(49)]
+    payload = b"".join(http_req(m, p, False) for m, p in order) + http_req(b"GET", b"/e.bin", True)
+    expect = b"".join(alone[k] for k in order) + last_alone
+    c = socket.socket()
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    c.connect(("127.0.0.1", port))
+    run(c, payload, expect)
 elif mode == "server":
     # Each line carries its index, so a reorder changes the digest.
     lines = []
@@ -324,6 +380,23 @@ for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PW " && break; sleep 
 OUT=$(timeout 90 python3 "$WORK/peer.py" wsclient "$PW" 2>&1 || true)
 echo "  ws:       $OUT"
 check "a server script's frames to a websocket arrive whole and in order" "$OUT"
+
+# ── 7. a server's pipelined HTTP answers arrive whole and in order ────────
+# --http-cache, so every answer is ready at once: the first goes out directly,
+# and those behind a full socket have to follow through the queue.  A HEAD, a
+# 404 and a closing last request are in the mix, as each takes its own turn
+# through queue_http_response() before the send.
+mkdir -p "$WORK/www"
+printf 'a' > "$WORK/www/a.txt"
+head -c 700 /dev/zero | tr '\0' 'b' > "$WORK/www/b.txt"
+{ printf '<html><body>'; head -c 3000 /dev/zero | tr '\0' 'c'; printf '</body></html>'; } > "$WORK/www/c.html"
+head -c 60000 /dev/urandom > "$WORK/www/d.bin"
+head -c 200000 /dev/urandom > "$WORK/www/e.bin"
+"$BIN" create server dsh -p "$PH" --http "$WORK/www" --http-cache -s >/dev/null 2>&1 || true
+for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PH " && break; sleep 0.1; done
+OUT=$(timeout 90 python3 "$WORK/peer.py" http "$PH" 2>&1 || true)
+echo "  http:     $OUT"
+check "a server's pipelined HTTP answers arrive whole and in order" "$OUT"
 
 if [ "$FAIL" -gt 0 ]; then
     if grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /'; then :; fi
