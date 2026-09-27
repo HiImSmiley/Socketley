@@ -234,6 +234,9 @@ struct alignas(64) server_connection
     // string above -- so the streamed request and a gathered one cannot come to
     // different conclusions about the same head.
     http_request http_req_saved;
+    // The header list a gathered request borrows and hands back empty, so a
+    // keep-alive connection grows it once rather than once per request.
+    std::vector<std::pair<std::string_view, std::string_view>> http_hdr_scratch;
 
     // A 206 in progress: where the slice starts, and the file's whole length,
     // which Content-Range has to state and Content-Length must not.

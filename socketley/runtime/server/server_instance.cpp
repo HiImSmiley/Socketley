@@ -4610,6 +4610,12 @@ reparse:
             return;
         }
 
+        size_t total_expected = hdr_end + 4 + content_length;
+        if (!stream_body && conn->partial.size() < total_expected)
+            return;  // Need more body data
+
+        hreq.headers.swap(conn->http_hdr_scratch);
+
         // The header pairs for the Lua API, deciding nothing, because a second
         // walk that came to its own conclusions about Content-Length is what
         // produced the table above.
@@ -4680,13 +4686,17 @@ reparse:
             return;
         }
 
-        size_t total_expected = hdr_end + 4 + content_length;
-        if (conn->partial.size() < total_expected)
-            return;  // Need more body data
-
         hreq.body = full.substr(hdr_end + 4, content_length);
 
         handle_http_request(conn, hreq, total_expected);
+
+        // Handed back only while small, so a head of thousands of fields does
+        // not stay with the slot for every connection after it.
+        if (hreq.headers.capacity() <= 64)
+        {
+            hreq.headers.clear();
+            conn->http_hdr_scratch.swap(hreq.headers);
+        }
 
         // Round again rather than waiting for a read that is not coming,
         // because a multishot recv has already moved the pipelined request

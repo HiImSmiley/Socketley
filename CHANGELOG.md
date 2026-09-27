@@ -91,6 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of first trying a receive that can only come back empty: the proxy's HTTP
   and early TCP reads, its read on a backend taken from the pool, a server's
   upstream read, and a client's single-shot read. TODO: measurement.
+- A server's HTTP request keeps its header list between requests on a
+  keep-alive connection instead of growing a new one each time: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
