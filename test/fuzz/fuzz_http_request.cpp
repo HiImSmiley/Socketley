@@ -104,7 +104,7 @@ struct tag_parse_request_line
 };
 struct tag_rewrite_request
 {
-    using type = std::string (proxy_instance::*)(proxy_client_connection*, std::string_view);
+    using type = void (proxy_instance::*)(proxy_client_connection*, std::string_view, std::string&);
 };
 struct tag_backends
 {
@@ -471,7 +471,7 @@ std::string feed(std::string_view chunk1, std::string_view chunk2)
     // rewrite sees for a bare-prefix request, and it keeps the path attacker-
     // controlled, which is the point.
     std::string new_path = conn->path.empty() ? std::string("/") : conn->path;
-    forwarded = (px.*rewrite)(conn.get(), new_path);
+    (px.*rewrite)(conn.get(), new_path, forwarded);
 
     FUZZ_CHECK(!forwarded.empty(), "rewrite_http_request produced nothing from a request it accepted");
     FUZZ_CHECK(forwarded.find("\r\n") != std::string::npos,
