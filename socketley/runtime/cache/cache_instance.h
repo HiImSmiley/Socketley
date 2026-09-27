@@ -25,6 +25,7 @@
 #include "../../shared/mutation_journal.h"
 #include "../../shared/trace.h"
 #include "../../shared/write_queue.h"
+#include "../../shared/direct_send.h"
 #include "../../shared/tls_context.h"
 #include "../../shared/unix_companion.h"
 
@@ -932,6 +933,7 @@ private:
     // Both report whether the submission reached the ring; see the definitions
     // for why a caller must not ignore that.
     bool flush_responses(client_connection* conn);
+    void after_write(client_connection* conn, int fd);
     bool flush_write_queue(client_connection* conn);
     // Where a published message is written once for its subscribers, one
     // segment per wire format; see socketley::place_in_segment().
@@ -1136,6 +1138,10 @@ private:
 
     // Idle connection sweep timer
     std::unique_ptr<timer_op> m_idle_sweep_timer;
+
+    socketley::direct_send_gate m_direct_gate;
+    // The connection a direct send went out on this turn, -1 for none.
+    int m_direct_fd{-1};
 
     std::string m_persistent_path;
     // 0 keeps exactly the behaviour every cache before the flag had: a dump at

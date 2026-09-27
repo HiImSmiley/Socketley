@@ -170,7 +170,7 @@ conn_ref server_instance::ref_for_fd(int fd) const
 // one dispatch later.
 bool server_instance::conn_ops_pending(const server_connection* conn) const
 {
-    return conn->read_pending || conn->write_pending
+    return conn->read_pending || conn->write_pending || direct_owed(conn)
         || conn->file_read_pending || conn->splice_in_pending || conn->splice_out_pending
         // The streamed file's read writes into this struct's own buffer, so a
         // reuse while it is armed is the kernel writing into the next client's
@@ -184,7 +184,7 @@ bool server_instance::conn_ops_pending(const server_connection* conn) const
 socketley::reach::owed server_instance::conn_owed(const server_connection* conn) const
 {
     socketley::reach::owed o;
-    o.write          = conn->write_pending;
+    o.write          = conn->write_pending || direct_owed(conn);
     o.file_read      = conn->file_read_pending;
     o.splice_in      = conn->splice_in_pending;
     o.splice_out     = conn->splice_out_pending;
@@ -3385,6 +3385,19 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
 
 void server_instance::on_loop_turn()
 {
+    // A direct send has no completion, so what one would have run runs here,
+    // once the turn has settled what the connection wants -- a refusal marks
+    // it closing only after its answer is queued.
+    if (m_direct_serial != 0)
+    {
+        const auto it = m_conn_by_serial.find(m_direct_serial);
+        m_direct_serial = 0;
+        auto* c = (it != m_conn_by_serial.end() && it->second >= 0 && it->second < MAX_FDS)
+                      ? m_conn_idx[it->second] : nullptr;
+        if (c && !c->write_pending)
+            after_write(c);
+    }
+    m_direct_gate.next_turn();
     if (m_companion)
         m_companion->pump();
 
@@ -6252,19 +6265,26 @@ void server_instance::flush_write_queue(server_connection* conn)
     }
 
     conn->write_batch_count = count;
+    if (send_direct(conn))
+        return;
+
+    // What send_direct() did not get out, which a partial send left starting
+    // part way into the first iovec.
+    count = conn->write_batch_count;
     conn->write_pending = true;
 
     bool queued;
     if (count == 1)
     {
-        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+        const auto* data = static_cast<const char*>(conn->write_iovs[0].iov_base);
+        auto len = static_cast<uint32_t>(conn->write_iovs[0].iov_len);
 
         // Single message — use plain write (lower overhead than writev)
         conn->write_req.type = op_write;
         if (conn->direct_fd)
-            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, data, len, &conn->write_req);
         else
-            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write(conn->fd, data, len, &conn->write_req);
     }
     else
     {
@@ -6286,6 +6306,79 @@ void server_instance::flush_write_queue(server_connection* conn)
         conn->write_batch_count = 0;
         conn->closing = true;
     }
+}
+
+// Drops the first `written` bytes of the batch, whole iovecs and then part of
+// one, so what is left is exactly what the socket did not take.
+void server_instance::skip_written(server_connection* conn, size_t written)
+{
+    size_t remaining = written;
+    uint32_t first_iov = 0;
+    for (; first_iov < conn->write_batch_count; first_iov++)
+    {
+        if (remaining < conn->write_iovs[first_iov].iov_len)
+        {
+            conn->write_iovs[first_iov].iov_base =
+                static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
+            conn->write_iovs[first_iov].iov_len -= remaining;
+            break;
+        }
+        remaining -= conn->write_iovs[first_iov].iov_len;
+    }
+
+    // Shift remaining iovecs and batch refs to front
+    const uint32_t new_count = conn->write_batch_count - first_iov;
+    if (first_iov > 0)
+    {
+        for (uint32_t i = 0; i < new_count; i++)
+        {
+            conn->write_iovs[i] = conn->write_iovs[first_iov + i];
+            conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
+        }
+        for (uint32_t i = new_count; i < conn->write_batch_count; i++)
+            conn->write_batch[i].clear();
+    }
+    conn->write_batch_count = new_count;
+}
+
+// True when the batch went out whole.  A lone write goes by sendmsg(), sparing
+// it the ring entry and the completion (see direct_send_gate), and only when
+// that completion would have had nothing to do but release the batch.
+bool server_instance::send_direct(server_connection* conn)
+{
+    if (!m_direct_gate.admit(conn->fd) || conn->closing || conn->wr_shutdown || conn->fd < 0
+        || conn->ref_serial == 0
+        || conn->drain_wanted || conn->stream_remaining > 0 || conn->splice_pending
+        || conn->splice_in_pending || conn->splice_out_pending)
+        return false;
+
+    size_t total = 0;
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        total += conn->write_iovs[i].iov_len;
+
+    struct msghdr msg{};
+    msg.msg_iov = conn->write_iovs;
+    msg.msg_iovlen = conn->write_batch_count;
+    const ssize_t n = ::sendmsg(conn->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n <= 0)
+        return false;
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+
+    if (static_cast<size_t>(n) < total)
+    {
+        skip_written(conn, static_cast<size_t>(n));
+        return false;
+    }
+
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        conn->write_batch[i].clear();
+    conn->write_batch_count = 0;
+    m_direct_serial = conn->ref_serial;
+
+    // More than one batch was queued, and the rest takes the ring.
+    if (!conn->write_queue.empty())
+        flush_write_queue(conn);
+    return true;
 }
 
 void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
@@ -6339,34 +6432,8 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         }
         if (written < total_submitted)
         {
-            // Advance past fully-written iovecs
-            size_t remaining = written;
-            uint32_t first_iov = 0;
-            for (; first_iov < conn->write_batch_count; first_iov++)
-            {
-                if (remaining < conn->write_iovs[first_iov].iov_len)
-                {
-                    conn->write_iovs[first_iov].iov_base =
-                        static_cast<char*>(conn->write_iovs[first_iov].iov_base) + remaining;
-                    conn->write_iovs[first_iov].iov_len -= remaining;
-                    break;
-                }
-                remaining -= conn->write_iovs[first_iov].iov_len;
-            }
-
-            // Shift remaining iovecs and batch refs to front
-            uint32_t new_count = conn->write_batch_count - first_iov;
-            if (first_iov > 0)
-            {
-                for (uint32_t i = 0; i < new_count; i++)
-                {
-                    conn->write_iovs[i] = conn->write_iovs[first_iov + i];
-                    conn->write_batch[i] = std::move(conn->write_batch[first_iov + i]);
-                }
-                for (uint32_t i = new_count; i < conn->write_batch_count; i++)
-                    conn->write_batch[i].clear();
-            }
-            conn->write_batch_count = new_count;
+            skip_written(conn, written);
+            const uint32_t new_count = conn->write_batch_count;
 
             conn->write_pending = true;
             bool requeued;
@@ -6409,6 +6476,13 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         conn->write_batch[i].clear();
     conn->write_batch_count = 0;
 
+    after_write(conn);
+}
+
+// What a finished write leaves to do, run from its completion or, for a direct
+// send that has none, from the end of the turn that made it.
+void server_instance::after_write(server_connection* conn)
+{
     // The queue has shrunk, so this is the moment the crossing can be seen.
     // Recorded and not called: a script's on_writable will send, which reaches
     // flush_write_queue and can mark this same connection closing, and the

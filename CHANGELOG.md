@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it, instead of through a submission and a completion: one connection's small
   round trips went from level with nginx's stream proxy (0.96-0.99x) to
   1.03-1.08x, at 11% less CPU per round trip.
+- A server's and a cache's answer to a single client goes out by a direct
+  send instead of a submission and a completion: 2.5-3% more round trips and
+  6-7% less CPU each. With several clients the answers still share one ring
+  entry per turn, which a send per answer measured slower.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

@@ -1706,6 +1706,16 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
 void cache_instance::on_loop_turn()
 {
+    // A direct send has no completion, so what one would have run runs here,
+    // once the turn has settled what the connection wants.
+    if (m_direct_fd >= 0)
+    {
+        const int fd = m_direct_fd;
+        m_direct_fd = -1;
+        if (auto* c = m_conn_idx[fd]; c && !c->write_pending)
+            after_write(c, fd);
+    }
+    m_direct_gate.next_turn();
     if (m_companion)
         m_companion->pump();
 }
@@ -2619,6 +2629,13 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         { conn->write_batch[i].clear(); conn->write_batch_seg[i].reset(); }
     conn->write_batch_count = 0;
 
+    after_write(conn, fd);
+}
+
+// What a finished write leaves to do, run from its completion or, for a direct
+// send that has none, from the end of the turn that made it.
+void cache_instance::after_write(client_connection* conn, int fd)
+{
     // Flush whatever is still owed, asking conn_has_output rather than the
     // queue, because a TLS connection owes handshake records with nothing
     // queued at all.
@@ -7613,6 +7630,28 @@ bool cache_instance::flush_responses(client_connection* conn)
     if (SOCKETLEY_LIKELY(!conn->write_pending && conn->write_queue.empty() &&
                          conn->ssl == nullptr))
     {
+        // A lone answer goes by send(), sparing it the ring entry and the
+        // completion; see direct_send_gate for when that is a saving.
+        size_t sent = 0;
+        if (m_direct_gate.admit(conn->fd))
+        {
+            const ssize_t n = ::send(conn->fd, conn->response_buf.data(), conn->response_buf.size(),
+                                     MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n > 0)
+            {
+                sent = static_cast<size_t>(n);
+                SKL_TRACE_ADD(conn, writes, 1);
+                SKL_TRACE_ADD(conn, bytes_written, sent);
+                m_stat_bytes_out.fetch_add(sent, std::memory_order_relaxed);
+                if (sent == conn->response_buf.size())
+                {
+                    conn->response_buf.clear();
+                    m_direct_fd = conn->fd;
+                    return true;
+                }
+            }
+        }
+
         // swap and clear, not move and reserve.  The move destroyed
         // write_batch[0]'s buffer and stole response_buf's, leaving
         // response_buf empty -- so the reserve had to allocate again, and both
@@ -7629,18 +7668,19 @@ bool cache_instance::flush_responses(client_connection* conn)
         // at from below.
         conn->write_batch[0].swap(conn->response_buf);
         conn->response_buf.clear();
-        conn->write_iovs[0].iov_base = conn->write_batch[0].data();
-        conn->write_iovs[0].iov_len  = conn->write_batch[0].size();
+        char* const rest = conn->write_batch[0].data() + sent;
+        conn->write_iovs[0].iov_base = rest;
+        conn->write_iovs[0].iov_len  = conn->write_batch[0].size() - sent;
         conn->write_batch_count = 1;
         conn->write_pending = true;
 
-        auto len = static_cast<uint32_t>(conn->write_batch[0].size());
+        auto len = static_cast<uint32_t>(conn->write_iovs[0].iov_len);
         bool queued;
         conn->write_req.type = op_write;
         if (conn->direct_fd)
-            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write_fixed_file(conn->fixed_idx, rest, len, &conn->write_req);
         else
-            queued = m_loop->submit_write(conn->fd, conn->write_batch[0].data(), len, &conn->write_req);
+            queued = m_loop->submit_write(conn->fd, rest, len, &conn->write_req);
 
         if (SOCKETLEY_UNLIKELY(!queued))
         {

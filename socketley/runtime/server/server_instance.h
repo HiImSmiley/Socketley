@@ -19,6 +19,7 @@
 #include "../../shared/runtime_instance.h"
 #include "../../shared/unix_companion.h"
 #include "../../shared/write_queue.h"
+#include "../../shared/direct_send.h"
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/tls_context.h"
@@ -1085,6 +1086,9 @@ private:
     void abandon_for_backlog(server_connection* conn);
     bool admit_send(server_connection* conn, size_t bytes, bool even_when_closing);
     void flush_write_queue(server_connection* conn);
+    bool send_direct(server_connection* conn);
+    void after_write(server_connection* conn);
+    static void skip_written(server_connection* conn, size_t written);
 
     // ── TLS record layer ────────────────────────────────────────────────────
     // OpenSSL does no I/O here: these two move bytes between the memory BIO
@@ -1277,6 +1281,13 @@ private:
     // recycled fd would hand the call to whoever took the slot -- a serial
     // that no longer resolves is exactly the answer wanted.
     std::vector<uint64_t> m_drain_pending;
+    socketley::direct_send_gate m_direct_gate;
+    // The connection a direct send went out on this turn, 0 for none.  Its
+    // write counts as outstanding until the turn ends, where on_loop_turn()
+    // runs what the completion would have, so no teardown overtakes it.
+    uint64_t m_direct_serial{0};
+    bool direct_owed(const server_connection* conn) const
+    { return m_direct_serial != 0 && conn->ref_serial == m_direct_serial; }
     // Connections whose streamed response ended with a pipelined request still
     // buffered.  end_chunked_response() is reached from inside a Lua callback,
     // and calling the parser from there is re-entering the function that is
