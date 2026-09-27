@@ -5,6 +5,7 @@
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
 #include "../../shared/tls_context.h"
+#include "../../shared/line_framing.h"
 
 #include <unistd.h>
 #include <cstring>
@@ -888,68 +889,31 @@ void client_instance::handle_read(struct io_uring_cqe* cqe)
         goto resubmit;
     }
 
-    // On a TLS connection these bytes are ciphertext and tls_feed is what puts
-    // plaintext into partial; everything below this point reads exactly the
-    // same buffer it always did and knows nothing about TLS.
-    if (is_provided)
     {
-        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-        char* buf_ptr = m_loop->get_buf_ptr(BUF_GROUP_ID, buf_id);
-        if (buf_ptr)
-        {
-            if (m_conn->ssl)
-                tls_feed(buf_ptr, static_cast<size_t>(cqe->res));
-            else
-                m_conn->partial.append(buf_ptr, cqe->res);
-            // Back to the group whatever the session made of it: the group is
-            // shared with every other client on this loop, and one failed
-            // handshake is no reason to starve them.
-            m_loop->return_buf(BUF_GROUP_ID, buf_id);
-        }
-    }
-    else if (m_conn->ssl)
+    // Kept apart from m_loop, which a stop inside a callback below nulls
+    // while the buffer this read holds is still owed to the group.
+    event_loop* const ring = m_loop;
+    const size_t len = static_cast<size_t>(cqe->res);
+    const uint16_t buf_id = static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+    const char* data = is_provided ? ring->get_buf_ptr(BUF_GROUP_ID, buf_id)
+                                   : m_conn->read_buf;
+    if (data)
     {
-        tls_feed(m_conn->read_buf, static_cast<size_t>(cqe->res));
-    }
-    else
-    {
-        m_conn->partial.append(m_conn->read_buf, cqe->res);
-    }
-
-    // A send-only TLS client reads because the record layer has to, so the
-    // application data is dropped here rather than parsed -- otherwise --tls
-    // would quietly start delivering what `--mode out` says no to.
-    if (m_conn->ssl && m_mode == client_mode_out)
-        m_conn->partial.clear();
-
-    if (m_conn->partial.size() > read_buffer_bytes())
-    {
-        m_conn->closing = true;
-        goto resubmit;
-    }
-
-    {
-    size_t scan_from = 0;
-    size_t pos;
-    while ((pos = m_conn->partial.find('\n', scan_from)) != std::string::npos)
-    {
-        std::string_view line(m_conn->partial.data() + scan_from, pos - scan_from);
-
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
-
-        if (!line.empty())
-            process_message(line);
-
-        scan_from = pos + 1;
-    }
-
-    if (scan_from > 0)
-    {
-        if (scan_from >= m_conn->partial.size())
-            m_conn->partial.clear();
+        // Only a provided buffer is read in place, because nothing can point
+        // the kernel at it again before return_buf, while read_buf is re-armed
+        // by whatever calls arm_read().
+        if (m_conn->ssl)
+            read_tls(data, len);
+        else if (is_provided)
+            read_in_place(data, len);
         else
-            m_conn->partial.erase(0, scan_from);
+            read_through_partial(data, len);
+
+        // Back to the group only after the last line in it was delivered, and
+        // whatever the session made of it, because every client on this loop
+        // shares the group.
+        if (is_provided)
+            ring->return_buf(BUF_GROUP_ID, buf_id);
     }
     }
 
@@ -974,6 +938,119 @@ resubmit:
     }
 
     arm_read();
+}
+
+// Whether the socket a read belongs to is still the one being read, asked
+// after every delivered line because a script can stop this runtime from
+// on_message and every later line of that read was meant for nobody.
+bool client_instance::still_reading(const client_tcp_connection* conn,
+                                    uint32_t generation, int fd) const
+{
+    return m_conn.get() == conn && m_conn_generation == generation && conn->fd == fd;
+}
+
+size_t client_instance::deliver_lines(const char* data, size_t len, size_t search_from)
+{
+    const client_tcp_connection* const conn = m_conn.get();
+    const uint32_t generation = m_conn_generation;
+    const int fd = conn->fd;
+    const size_t used = socketley::for_each_line(data, len, search_from,
+        [&](std::string_view line)
+        {
+            process_message(line);
+            return still_reading(conn, generation, fd);
+        });
+
+    // The socket went and its unfinished line with it, unless a stop or a
+    // dial already gave this struct a new generation and cleared it itself.
+    if (used == socketley::line_framing_stopped
+        && m_conn.get() == conn && m_conn_generation == generation)
+        m_conn->partial.clear();
+    return used;
+}
+
+// The complete lines partial holds, where `scanned` is how much of it an
+// earlier read already searched, and a partial over the bound is refused.
+void client_instance::deliver_partial(size_t scanned)
+{
+    std::string& partial = m_conn->partial;
+    if (partial.size() > read_buffer_bytes())
+    {
+        m_conn->closing = true;
+        return;
+    }
+
+    const size_t used = deliver_lines(partial.data(), partial.size(), scanned);
+    if (used == socketley::line_framing_stopped || used == 0)
+        return;
+    if (used >= partial.size())
+        partial.clear();
+    else
+        partial.erase(0, used);
+}
+
+// Lines straight out of a provided buffer, with partial holding only the
+// unfinished line on either side of it.
+void client_instance::read_in_place(const char* data, size_t len)
+{
+    std::string& partial = m_conn->partial;
+
+    // Over the bound the copying path refuses it, bytes kept, so every later
+    // read on this closing connection is refused too.
+    if (partial.size() + len > read_buffer_bytes())
+    {
+        read_through_partial(data, len);
+        return;
+    }
+
+    size_t from = 0;
+    if (!partial.empty())
+    {
+        const void* nl = std::memchr(data, '\n', len);
+        if (!nl)
+        {
+            partial.append(data, len);
+            return;
+        }
+        from = static_cast<size_t>(static_cast<const char*>(nl) - data) + 1;
+        partial.append(data, from);
+        if (deliver_lines(partial.data(), partial.size(), partial.size() - 1)
+            == socketley::line_framing_stopped)
+            return;
+        partial.clear();
+    }
+
+    const size_t used = deliver_lines(data + from, len - from, 0);
+    if (used == socketley::line_framing_stopped)
+        return;
+    partial.append(data + from + used, len - from - used);
+}
+
+// Bytes copied into partial before any callback runs, for read_buf, which a
+// callback may arm the next read into.
+void client_instance::read_through_partial(const char* data, size_t len)
+{
+    const size_t scanned = m_conn->partial.size();
+    m_conn->partial.append(data, len);
+    deliver_partial(scanned);
+}
+
+// Ciphertext in, and whatever plaintext tls_feed put into partial framed as
+// the copying path frames it.
+void client_instance::read_tls(const char* data, size_t len)
+{
+    const size_t scanned = m_conn->partial.size();
+    tls_feed(data, len);
+
+    // A send-only TLS client reads because the record layer has to, so the
+    // application data is dropped here rather than parsed -- otherwise --tls
+    // would quietly start delivering what `--mode out` says no to.
+    if (m_mode == client_mode_out)
+    {
+        m_conn->partial.clear();
+        return;
+    }
+    deliver_partial(scanned);
 }
 
 // The two read_pending guards defer a teardown to an armed read, which

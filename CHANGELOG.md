@@ -76,6 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   frame goes out from a header on the stack and the script's string, and
   otherwise it is built once from the message rather than from a copy of it
   with a newline added. TODO: measurement.
+- A client hands its script each line straight from the buffer it was read
+  into, and copies only a line that is still unfinished at the end of a read:
+  TODO% more lines a second through a client script.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

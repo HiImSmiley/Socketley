@@ -119,6 +119,17 @@ private:
     void arm_handshake_deadline();
 
     void process_message(std::string_view msg);
+    // One read's plaintext into lines: in place for a provided buffer, through
+    // partial for read_buf, and after the record layer for TLS.
+    void read_in_place(const char* data, size_t len);
+    void read_through_partial(const char* data, size_t len);
+    void read_tls(const char* data, size_t len);
+    void deliver_partial(size_t scanned);
+    // Every complete line to process_message until a callback loses the
+    // socket, which returns socketley::line_framing_stopped.
+    size_t deliver_lines(const char* data, size_t len, size_t search_from);
+    bool still_reading(const client_tcp_connection* conn, uint32_t generation,
+                       int fd) const;
     // Returns whether the reconnect clock is actually armed, since a caller
     // that ignores it claims a client will dial again when nothing will make
     // it.
