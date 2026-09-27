@@ -117,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A server now fails a WebSocket connection whose text message is not valid
+  UTF-8, with close code 1007, as RFC 6455 8.1 requires. Such a message used
+  to be handed to `on_message` and `on_client_message` as it was, and with no
+  script relayed as a binary frame. A message split into fragments is judged
+  whole, so a character split across two fragments is accepted. Binary
+  messages are not checked.
 - A backend that answers a HEAD with a body, or otherwise sends bytes after
   an answer, no longer has them glued to the next answer on the same backend
   connection: the proxy sends that request again on a fresh connection, or

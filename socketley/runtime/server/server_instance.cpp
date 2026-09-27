@@ -3656,10 +3656,18 @@ void server_instance::tls_feed(server_connection* conn, const char* data, size_t
 }
 
 // A WebSocket connection is failed by telling the peer why and then closing,
-// in one function because both of its callers are one decision made twice.
-void server_instance::fail_ws_connection(server_connection* conn)
+// in one function because every caller is one decision made again.
+void server_instance::fail_ws_connection(server_connection* conn, uint16_t code)
 {
-    conn->write_queue.push(ws_frame_close_protocol_error_shared());
+    if (const auto* pre = ws_frame_close_pre(code))
+        conn->write_queue.push(*pre);
+    else
+    {
+        std::string close_frame;
+        ws_frame_close_code_into(close_frame, code);
+        conn->write_queue.push_coalesced(std::move(close_frame),
+            server_connection::WRITE_COALESCE_LIMIT);
+    }
     if (!conn->write_pending)
         flush_write_queue(conn);
     conn->closing = true;
@@ -4464,22 +4472,28 @@ reparse:
                     conn->ws_frag_opcode = frame.opcode;
                 conn->ws_frag_len += frame.payload_len;
             }
-            else if (message_open)
+            else
             {
-                // Final fragment of a fragmented message — deliver complete reassembled payload
-                conn->ws_frag_len += frame.payload_len;
-                std::string_view msg(conn->partial.data(), conn->ws_frag_len);
+                // A final frame completes a message: the reassembled one at
+                // partial[0..), or this frame alone on the unfragmented path.
+                if (message_open)
+                    conn->ws_frag_len += frame.payload_len;
+                const std::string_view msg = message_open
+                    ? std::string_view(conn->partial.data(), conn->ws_frag_len)
+                    : std::string_view(frame.payload_ptr, frame.payload_len);
+                const uint8_t opcode = message_open ? conn->ws_frag_opcode : frame.opcode;
+
+                // RFC 6455 8.1 fails a connection whose text message is not
+                // UTF-8, judged whole because a code point may span fragments.
+                if (SOCKETLEY_UNLIKELY(opcode == WS_OP_TEXT && !ws_payload_is_utf8(msg)))
+                {
+                    fail_ws_connection(conn, 1007);
+                    break;
+                }
                 if (!msg.empty())
                     process_message(conn, msg);
                 conn->ws_frag_len = 0;
                 conn->ws_frag_opcode = 0;
-            }
-            else
-            {
-                // Unfragmented frame (FIN=1, no prior fragments) — fast path
-                std::string_view payload(frame.payload_ptr, frame.payload_len);
-                if (!payload.empty())
-                    process_message(conn, payload);
             }
 
             // Once the connection is marked closing everything still buffered

@@ -1027,8 +1027,8 @@ private:
                              bool drain = true);
 
     // End a WebSocket connection over a frame that broke the protocol, with
-    // 1002 rather than the 1000 a goodbye carries.
-    void fail_ws_connection(server_connection* conn);
+    // the RFC 6455 7.4.1 code for what broke rather than a goodbye's 1000.
+    void fail_ws_connection(server_connection* conn, uint16_t code = 1002);
 
     // Upstream helpers
     bool upstream_try_connect(upstream_connection* uc);

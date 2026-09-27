@@ -2889,7 +2889,9 @@ Detected when an HTTP request contains
 The server completes the RFC 6455 handshake and transparently frames/deframes
 messages. The
 .B on_websocket
-callback fires after the upgrade.
+callback fires after the upgrade. A text message that is not valid UTF\-8
+fails its connection with close code 1007 and never reaches a script; a
+fragmented message is checked once it is whole.
 .TP
 .B RESP (Redis protocol)
 Detected when the first byte is
