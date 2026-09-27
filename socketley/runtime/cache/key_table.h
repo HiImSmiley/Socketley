@@ -16,8 +16,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <compare>
 #include <cstring>
 #include <iterator>
+#include <stdexcept>
 #include <new>
 #include <string>
 #include <string_view>
@@ -30,11 +32,43 @@ template <class V>
 class key_table
 {
 public:
+    struct entry;
+
+    // An entry's key: its bytes follow the entry in the same block, so the
+    // length is all it holds -- four bytes where a string_view took sixteen,
+    // which moved a string key's block from 72 to 64 bytes of malloc chunk.
+    // Not copyable, because a copy would find some other block's bytes.
+    class key_ref
+    {
+        uint32_t m_n;
+        friend class key_table;
+        explicit key_ref(uint32_t n) : m_n(n) {}
+
+    public:
+        key_ref(const key_ref&) = delete;
+        key_ref& operator=(const key_ref&) = delete;
+
+        const char* data() const { return reinterpret_cast<const char*>(this) + sizeof(entry); }
+        size_t size()   const { return m_n; }
+        size_t length() const { return m_n; }
+        bool   empty()  const { return m_n == 0; }
+        const char* begin() const { return data(); }
+        const char* end()   const { return data() + m_n; }
+        char operator[](size_t i) const { return data()[i]; }
+        std::string_view view() const { return { data(), m_n }; }
+        operator std::string_view() const { return view(); }
+        std::string_view substr(size_t pos, size_t n = std::string_view::npos) const { return view().substr(pos, n); }
+
+        friend bool operator==(const key_ref& a, std::string_view b) { return a.view() == b; }
+        friend bool operator==(const key_ref& a, const key_ref& b) { return a.view() == b.view(); }
+        friend auto operator<=>(const key_ref& a, std::string_view b) { return a.view() <=> b; }
+    };
+
     // Two members only, so `auto& [key, value] = *it` binds as it did for a
     // std::pair; the key's bytes follow the struct in the same block.
     struct entry
     {
-        std::string_view                 first;
+        key_ref                          first;
         [[no_unique_address]] V          second;
     };
 
@@ -62,6 +96,8 @@ private:
     template <class... A>
     static entry* make_entry(std::string_view k, A&&... a)
     {
+        if (k.size() > UINT32_MAX)
+            throw std::length_error("key_table: key over 4 GiB");
         void* mem = ::operator new(sizeof(entry) + (k.empty() ? 1 : k.size()));
         // A heap address above 48 bits would lose its top to the tag, which
         // Linux never hands out without being asked for one.
@@ -71,7 +107,7 @@ private:
         if (!k.empty()) std::memcpy(kb, k.data(), k.size());
         try
         {
-            return ::new (mem) entry{ std::string_view(kb, k.size()), V(std::forward<A>(a)...) };
+            return ::new (mem) entry{ key_ref(static_cast<uint32_t>(k.size())), V(std::forward<A>(a)...) };
         }
         catch (...)
         {
@@ -437,10 +473,11 @@ public:
 
     public:
         using iterator_category = std::forward_iterator_tag;
+        // By value, since a member is stored as a key_ref and not as a view.
         using value_type        = std::string_view;
         using difference_type   = std::ptrdiff_t;
-        using reference         = const std::string_view&;
-        using pointer           = const std::string_view*;
+        using reference         = std::string_view;
+        using pointer           = const table::key_ref*;
 
         const_iterator() = default;
         reference operator*()  const { return m_it->first; }
@@ -458,7 +495,7 @@ public:
 
     public:
         explicit const_local_iterator(table::const_local_iterator it) : m_it(it) {}
-        const std::string_view& operator*() const { return m_it->first; }
+        std::string_view operator*() const { return m_it->first; }
         const_local_iterator& operator++() { ++m_it; return *this; }
         friend bool operator==(const const_local_iterator& a, const const_local_iterator& b) { return a.m_it == b.m_it; }
         friend bool operator!=(const const_local_iterator& a, const const_local_iterator& b) { return a.m_it != b.m_it; }
