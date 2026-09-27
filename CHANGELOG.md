@@ -74,43 +74,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A message a server script sends to one WebSocket client with `self.send` is
   framed without being copied twice: when nothing is queued ahead of it the
   frame goes out from a header on the stack and the script's string, and
-  otherwise it is built once from the message rather than from a copy of it
-  with a newline added. TODO: measurement.
+  otherwise it is built once from the message. 1.5–3.3% more WebSocket round
+  trips through a Lua echo; the distance to a C echo 1.44 → 1.16 µs at 64
+  bytes and 1.80 → 1.48 µs at 1 KB.
 - A client hands its script each line straight from the buffer it was read
-  into, and copies only a line that is still unfinished at the end of a read:
-  TODO% more lines a second through a client script.
-- A client counts its messages and bytes with plain adds instead of locked
-  ones, since only its own loop writes them: TODO%.
-- A server counts its messages, connections and bytes with plain adds instead
-  of locked ones, since only its own loop writes them: TODO%.
-- A proxy counts what it forwards with plain adds instead of locked ones,
-  since only its own loop writes the counters: TODO%.
-- A cache counts its commands, connections and bytes with plain adds instead
-  of locked ones, since only its own loop writes them: TODO%.
+  into, and copies only a line still unfinished at the end of a read: the
+  distance to a C client at 16 KB lines 1.49 → 1.28 µs; unchanged at 64 bytes
+  and 1 KB.
+- Server, proxy, cache and client count their messages, connections and bytes
+  with plain adds instead of locked ones, since only their own loop writes
+  them. No difference this machine resolves.
 - A read re-armed on a socket the last read left empty waits for data instead
   of first trying a receive that can only come back empty: the proxy's HTTP
   and early TCP reads, its read on a backend taken from the pool, a server's
-  upstream read, and a client's single-shot read. TODO: measurement.
-- A server's HTTP request keeps its header list between requests on a
-  keep-alive connection instead of growing a new one each time: TODO%.
-- A server copies a GET's `Cookie`, `Origin`, `Sec-WebSocket-Protocol` and
-  `Authorization` only when the GET is a WebSocket upgrade, instead of on
-  every GET: TODO%.
-- A static file served by `--http` looks its path up without copying it: a
-  path without a percent escape is no longer decoded into a new string, and
-  neither the cache lookup nor the open builds one: TODO%.
-- A server's HTTP response goes straight to the socket when nothing is queued
-  ahead of it, without passing through the connection's write queue: TODO%.
-- A server script's `on_http_request` gets its request and header tables
-  built at their final size, and the `body` it returns is copied once, into
-  the response, instead of twice: TODO%.
+  upstream read, and a client's single-shot read. No difference this machine
+  resolves yet.
+- A server's HTTP path allocates less per request: the header list is kept
+  between requests on a keep-alive connection, a GET's `Cookie`, `Origin`,
+  `Sec-WebSocket-Protocol` and `Authorization` are copied only for a WebSocket
+  upgrade, a static path without a percent escape is looked up without being
+  copied, a response with nothing queued ahead of it goes straight to the
+  socket, and `on_http_request` gets its tables built at their final size and
+  its `body` copied once. Together: the distance to a C server on one
+  keep-alive connection 1.48 → 1.36 µs.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
   is the cache's own text, without a `lua: error:` prefix.
 - A proxied HTTP request is rewritten into a buffer its connection keeps, so
   a keep-alive connection no longer allocates and frees one per request.
-  TODO: measured effect.
 
 ### Fixed
 
