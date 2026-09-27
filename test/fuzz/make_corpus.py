@@ -506,6 +506,9 @@ _OPS = [
     "SADD", "SREM", "SISMEMBER",
     "HSET", "HGET", "HDEL",
     "MAXMEM", "EVICTION", "SWEEP", "SAVELOAD", "SCAN", "KEYS",
+    "ZADD", "ZREM", "ZINCRBY",
+    "COPY", "RENAME", "SMOVE", "LMOVE",
+    "LTRIM", "LSET", "LREM", "LINSERT",
 ]
 _OP = {name: i for i, name in enumerate(_OPS)}
 

@@ -3444,3 +3444,91 @@ TEST_CASE("a value that churns keeps its block, and one that shrinks a lot gives
         });
     }
 }
+
+TEST_CASE("SMOVE the destination has no room for leaves the member in the source")
+{
+    cache_store store;
+    store.set_eviction(evict_none);
+    REQUIRE(store.sadd("s", std::string(100, 'm')) == 1);
+    REQUIRE(store.sadd("s", "other") == 1);
+    store.set_max_memory(store.get_memory_used() + 100);
+    CHECK(store.smove("s", "d", std::string(100, 'm')) == 0);
+    CHECK(store.sismember("s", std::string(100, 'm')));
+    CHECK_FALSE(store.exists("d"));
+}
+
+TEST_CASE("every change to a collection is given back exactly when the key goes")
+{
+    // A figure that drifts by a few bytes a write is a limit that drifts with
+    // it, so each round trip has to land on the byte it started from.
+    for (int limit = 0; limit < 2; ++limit)
+    {
+        CAPTURE(limit);
+        cache_store store;
+        if (limit) { store.set_max_memory(size_t(1) << 30); store.set_eviction(evict_allkeys_lru); }
+        REQUIRE(store.set("base", std::string(5000, 'b')));
+        const size_t base = store.get_memory_used();
+        std::string out;
+        double sc = 0;
+
+        SUBCASE("ZADD and ZINCRBY moving scores, small and big")
+        {
+            for (int n : {5, 300})
+            {
+                for (int i = 0; i < n; ++i) REQUIRE(store.zadd("z", i, "m" + std::to_string(i)) == 1);
+                for (int r = 0; r < 3 * n; ++r)
+                {
+                    const std::string m = "m" + std::to_string(r % n);
+                    REQUIRE(store.zadd("z", r % 7 == 0 ? 70000.25 * r : r * 0.5, m) == 0);
+                    REQUIRE(store.zincrby("z", r % 2 ? 1.5 : -100000.0, m, sc) == cache_store::zincr_result::ok);
+                }
+                REQUIRE(store.del("z"));
+                CHECK(store.get_memory_used() == base);
+                for (int i = 0; i < n; ++i) REQUIRE(store.zadd("z", i, "m" + std::to_string(i)) == 1);
+                for (int r = 0; r < n; ++r) REQUIRE(store.zincrby("z", 0.25, "m" + std::to_string(r), sc) == cache_store::zincr_result::ok);
+                for (int i = 0; i < n; ++i) REQUIRE(store.zrem("z", "m" + std::to_string(i)));
+                CHECK(store.get_memory_used() == base);
+            }
+        }
+
+        SUBCASE("LSET, LREM, LINSERT and pops, packed and not")
+        {
+            for (size_t len : {size_t(10), size_t(100)})
+            {
+                for (int i = 0; i < 60; ++i) REQUIRE(store.rpush("l", std::string(len, char('a' + i % 5))));
+                for (int i = 0; i < 200; ++i)
+                    REQUIRE(store.lset("l", i % 60, std::string((i * 37) % 250, 'x')) == 0);
+                CHECK(store.lrem("l", 2, std::string((37 * 7) % 250, 'x')) >= 0);
+                CHECK(store.lrem("l", -3, std::string(len, 'a')) >= 0);
+                for (int i = 0; i < 20; ++i)
+                    CHECK(store.linsert("l", i % 2 == 0, std::string(len, 'b'), std::string(i * 9, 'i')) != 0);
+                REQUIRE(store.del("l"));
+                CHECK(store.get_memory_used() == base);
+
+                for (int i = 0; i < 60; ++i) REQUIRE(store.rpush("l", std::string(len, 'p')));
+                for (int i = 0; i < 30; ++i) REQUIRE(store.lset("l", i, std::string(len / 2, 'q')) == 0);
+                for (int i = 0; i < 30; ++i) REQUIRE(store.lpop("l", out));
+                for (int i = 0; i < 30; ++i) REQUIRE(store.rpop("l", out));
+                CHECK_FALSE(store.exists("l"));
+                CHECK(store.get_memory_used() == base);
+            }
+        }
+
+        SUBCASE("HSET overwriting, packed and in the table")
+        {
+            for (size_t len : {size_t(10), size_t(100)})
+            {
+                for (int i = 0; i < 60; ++i) REQUIRE(store.hset("h", "f" + std::to_string(i), std::string(len, 'v')));
+                for (int i = 0; i < 300; ++i)
+                    REQUIRE(store.hset("h", "f" + std::to_string(i % 60), std::string((i * 37) % 250, 'w')));
+                REQUIRE(store.del("h"));
+                CHECK(store.get_memory_used() == base);
+
+                for (int i = 0; i < 60; ++i) REQUIRE(store.hset("h", "f" + std::to_string(i), std::string(len, 'v')));
+                for (int i = 0; i < 60; ++i) REQUIRE(store.hset("h", "f" + std::to_string(i), std::string(len + 7, 'w')));
+                for (int i = 0; i < 60; ++i) REQUIRE(store.hdel("h", "f" + std::to_string(i)));
+                CHECK(store.get_memory_used() == base);
+            }
+        }
+    }
+}
