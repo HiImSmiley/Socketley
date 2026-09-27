@@ -2819,7 +2819,7 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
             goto proxy_resubmit_accept;
         }
 
-        m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+        stat_add(m_stat_total_connections, 1);
 
         auto conn = client_pool_acquire(client_fd);
         // Grown on demand: sixty-four kilobytes charged at accept, before the
@@ -3181,8 +3181,8 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         conn->last_activity = std::chrono::steady_clock::now();
 
     // Track bytes in
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
+    stat_add(m_stat_total_messages, 1);
 
     // --rate-limit is implemented here, having been parsed, stored and
     // reported while nothing read it, charged per read completion so the two
@@ -8993,7 +8993,7 @@ bool proxy_instance::forward_to_backend(proxy_client_connection* conn, std::stri
     }
 
     const std::string_view out = hook_modified ? std::string_view(hook_storage) : data;
-    m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, out.size());
     const size_t sent = send_now(bconn, out);
     if (sent > 0)
     {
@@ -9159,11 +9159,11 @@ bool proxy_instance::forward_to_client(proxy_backend_connection* conn, std::stri
     const std::string_view out = hook_modified ? std::string_view(hook_storage) : data;
     if (last && send_final_and_fin(cconn, out))
     {
-        m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
+        stat_add(m_stat_bytes_out, out.size());
         return false;
     }
 
-    m_stat_bytes_out.fetch_add(out.size(), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, out.size());
     const size_t sent = send_now(cconn, out);
     if (sent == out.size())
         return false;
