@@ -210,15 +210,25 @@ private:
         ++x->epoch;
     }
 
+    // key_table's rule: live and dead slots under three quarters, and at
+    // most half full after a rebuild.
+    static bool ix_room(size_t cap, size_t size, size_t tombs)
+    {
+        return cap != 0 && (size + tombs + 1) * 4 <= cap * 3;
+    }
+    static size_t ix_cap_after_insert(size_t cap, size_t size, size_t tombs)
+    {
+        if (ix_room(cap, size, tombs)) return cap;
+        size_t want = 8;
+        while (want < (size + 1) * 2) want <<= 1;
+        return want < cap ? cap : want;
+    }
+
     void ix_insert(node* n)
     {
         member_index* x = ix();
-        if (x->cap == 0 || (x->size + x->tombs + 1) * 4 > x->cap * 3)
-        {
-            size_t want = 8;
-            while (want < (x->size + 1) * 2) want <<= 1;
-            ix_rebuild(want < x->cap ? x->cap : want);
-        }
+        if (!ix_room(x->cap, x->size, x->tombs))
+            ix_rebuild(ix_cap_after_insert(x->cap, x->size, x->tombs));
         if (reinterpret_cast<uint64_t>(n) & ~IX_ADDR) std::abort();   // see key_table's make_entry
         const uint64_t h = mhash(n->member());
         const size_t mask = x->cap - 1;
@@ -324,6 +334,40 @@ public:
     size_t size()  const { return m_count; }
     bool   empty() const { return size() == 0; }
 
+    // A big set's head node and member index, a block each.
+    static constexpr size_t head_bytes  = sizeof(link) * static_cast<size_t>(max_level) + sizeof(node);
+    static constexpr size_t index_bytes = sizeof(member_index);
+
+    // What the set's own blocks are: its packed buffer, or its head, index and
+    // the index's slots, beside the members they hold.
+    struct footprint
+    {
+        size_t n{0};
+        size_t pack_size{0};
+        size_t pack_heap{0};      // the packed buffer's heap block
+        size_t index_slots{0};    // 0 while small
+        bool   big{false};
+    };
+    footprint now() const
+    {
+        if (big()) return { m_count, 0, 0, ix()->cap, true };
+        return { m_count, m_pack.size(), m_pack.heap_capacity(), 0, false };
+    }
+    // After a member of `len` bytes that is not there yet goes in at `score`.
+    footprint after_insert(double score, size_t len) const
+    {
+        if (big()) return { m_count + 1, 0, 0, ix_cap_after_insert(ix()->cap, ix()->size, ix()->tombs), true };
+        if (packs(len))
+        {
+            const size_t e = 3 + score_width(score_tag(score)) + len;
+            return { m_count + 1, m_pack.size() + e, m_pack.heap_part(m_pack.capacity_for(e)), 0, false };
+        }
+        // promote() puts every member into an empty index, and then this one.
+        size_t cap = 0;
+        for (size_t s = 0; s <= m_count; ++s) cap = ix_cap_after_insert(cap, s, 0);
+        return { m_count + 1, 0, 0, cap, true };
+    }
+
     // Back to small and empty, head and all.
     void clear()
     {
@@ -340,7 +384,7 @@ public:
     {
         if (!big())
         {
-            if (m_count < SMALL_MAX && member.size() <= SMALL_MAX_LEN)
+            if (packs(member.size()))
             {
                 small_insert(small_lower(score, member).second, score, member);
                 return;
@@ -632,6 +676,9 @@ private:
             default: { double d; std::memcpy(&d, p, 8); return d; }
         }
     }
+
+    // Whether a member of `len` bytes joins the packed form.
+    bool packs(size_t len) const { return m_count < SMALL_MAX && len <= SMALL_MAX_LEN; }
 
     unsigned char tag_at(size_t off) const { return static_cast<unsigned char>(m_pack[off]); }
     double score_at(size_t off) const { return decode_score(m_pack.data() + off + 1, tag_at(off)); }

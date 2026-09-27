@@ -262,11 +262,25 @@ public:
     size_t count(std::string_view k) const { return locate(k, hash_of(k)) == NPOS ? 0 : 1; }
     bool   contains(std::string_view k) const { return count(k) != 0; }
 
-    // Room for n entries without a rebuild.
-    void reserve(size_t n)
+    // The slots a table made for n entries has.
+    static size_t capacity_for(size_t n)
     {
         size_t want = MIN_CAP;
         while (want < n * 2) want <<= 1;
+        return want;
+    }
+    // The slots the table has once one more entry is in.
+    size_t capacity_after_insert() const
+    {
+        if (room_for_one()) return m_cap;
+        const size_t want = capacity_for(m_size + 1);   // at most half full after
+        return want < m_cap ? m_cap : want;
+    }
+
+    // Room for n entries without a rebuild.
+    void reserve(size_t n)
+    {
+        const size_t want = capacity_for(n);
         if (want > m_cap) rebuild(want);
     }
 
@@ -406,13 +420,11 @@ private:
 
     // Keeps live and dead slots under three quarters, past which linear
     // probing's runs grow faster than the table does.
+    bool room_for_one() const { return m_cap && (m_size + m_tombs + 1) * 4 <= m_cap * 3; }
     void reserve_one()
     {
-        if (m_cap && (m_size + m_tombs + 1) * 4 <= m_cap * 3)
-            return;
-        size_t want = MIN_CAP;
-        while (want < (m_size + 1) * 2) want <<= 1;   // at most half full after
-        rebuild(want < m_cap ? m_cap : want);
+        if (!room_for_one())
+            rebuild(capacity_after_insert());
     }
 
     void rebuild(size_t cap)
@@ -507,6 +519,7 @@ public:
     const_iterator end()   const { return const_iterator(m_t.end()); }
 
     size_t               bucket_count() const { return m_t.bucket_count(); }
+    size_t capacity_after_insert() const { return m_t.capacity_after_insert(); }
     const_local_iterator begin(size_t b) const { return const_local_iterator(m_t.begin(b)); }
     const_local_iterator end(size_t b)   const { return const_local_iterator(m_t.end(b)); }
     uint32_t             scan_epoch()   const { return m_t.scan_epoch(); }

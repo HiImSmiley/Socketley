@@ -77,6 +77,16 @@ public:
     size_t size()     const { return m_size; }
     size_t capacity() const { return m_cap; }
     bool   empty()    const { return m_size == 0; }
+
+    // The capacity room for `more` bytes leaves, which is what grow_for() makes.
+    size_t capacity_for(size_t more) const
+    {
+        const size_t need = m_size + more;
+        return need > m_cap ? need + need / 4 : m_cap;
+    }
+    // The heap block a capacity stands for, 0 while the bytes sit in the owner.
+    static size_t heap_part(size_t cap) { return cap > Local ? cap : 0; }
+    size_t heap_capacity() const { return heap_part(m_cap); }
     char  operator[](size_t i) const { return m_p[i]; }
     char& operator[](size_t i)       { return m_p[i]; }
 
@@ -131,8 +141,8 @@ private:
 
     void grow_for(size_t more)
     {
-        const size_t need = m_size + more;
-        if (need > m_cap) reserve_exact(need + need / 4);
+        const size_t cap = capacity_for(more);
+        if (cap != m_cap) reserve_exact(cap);
     }
     void reserve_exact(size_t cap)
     {

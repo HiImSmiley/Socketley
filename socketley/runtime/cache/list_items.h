@@ -44,6 +44,43 @@ public:
     bool   empty()  const { return size() == 0; }
     bool   packed() const { return is_packed(); }
 
+    // What the list's own blocks are: its packed buffer, or its segment
+    // blocks and map, beside the elements they hold.
+    struct footprint
+    {
+        size_t          n{0};
+        size_t          pack_size{0};
+        size_t          pack_heap{0};    // the packed buffer's heap block, 0 while in place
+        seg_list::shape seg{};
+        bool            packed{true};
+    };
+    footprint now() const
+    {
+        if (!is_packed()) return { size(), 0, 0, seg_ref().now(), false };
+        const auto& p = packed_ref();
+        return { p.n, p.buf.size(), p.buf.heap_capacity(), {}, true };
+    }
+    // After one more element of `len` bytes at an end; an insert grows the
+    // list as one at the back does.
+    footprint after_push(size_t len, bool front) const
+    {
+        if (!is_packed()) return { size() + 1, 0, 0, seg_ref().now().pushed(front), false };
+        const auto& p = packed_ref();
+        if (packs(len, p.n))
+            return { p.n + 1, p.buf.size() + len + 2, p.buf.heap_part(p.buf.capacity_for(len + 2)), {}, true };
+        return { p.n + 1, 0, 0, seg_list::built(p.n).pushed(front), false };
+    }
+    // After element `i` becomes `len` bytes long.
+    footprint after_set(size_t i, size_t len) const
+    {
+        if (!is_packed()) return now();
+        const auto& p = packed_ref();
+        if (len > PACK_MAX_LEN) return { p.n, 0, 0, seg_list::built(p.n), false };
+        const size_t old = item(offset_of(i)).size();
+        return { p.n, p.buf.size() - old + len,
+                 p.buf.heap_part(p.buf.capacity_for(len > old ? len - old : 0)), {}, true };
+    }
+
     std::string_view at(size_t i) const
     {
         if (!is_packed()) return seg_ref()[i];
@@ -233,11 +270,14 @@ private:
         return off;
     }
 
+    // Whether an element of `len` bytes joins `n` in the packed form.
+    static bool packs(size_t len, size_t n) { return len <= PACK_MAX_LEN && n < PACK_MAX_ITEMS; }
+
     // Whether `v` goes into the packed form, moving to the seg_list if not.
     bool fits(std::string_view v)
     {
         if (!is_packed()) return false;
-        if (v.size() <= PACK_MAX_LEN && packed_ref().n < PACK_MAX_ITEMS) return true;
+        if (packs(v.size(), packed_ref().n)) return true;
         unpack();
         return false;
     }

@@ -27,14 +27,14 @@ size_t cache_store::entry_cost(std::string_view key, const std::string& val)
 
 size_t cache_store::entry_cost(std::string_view key, const list_inner& deq)
 {
-    size_t bytes = stored_string(key);
+    size_t bytes = stored_string(key) + shape_cost(deq);
     for (const auto& e : deq) bytes += stored_string(e);
     return bytes;
 }
 
 size_t cache_store::entry_cost(std::string_view key, const set_inner& members)
 {
-    size_t bytes = stored_string(key);
+    size_t bytes = stored_string(key) + shape_cost(members);
     for (const auto& e : members) bytes += stored_string(e);
     return bytes;
 }
@@ -43,7 +43,7 @@ size_t cache_store::entry_cost(std::string_view key, const set_inner& members)
 
 size_t cache_store::entry_cost(std::string_view key, const zset_inner& members)
 {
-    size_t bytes = stored_string(key);
+    size_t bytes = stored_string(key) + shape_cost(members);
     // Twice per member, because the ordered view holds a copy of the name.
     for (const auto& [sc, m] : members.order) bytes += 2 * stored_string(m);
     return bytes;
@@ -66,7 +66,7 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
             // old pair has to go before the new one arrives or the member is
             // in there twice.
             if (old != score)
-                it->second.rescore(member, old, score);
+                rescore(it->second, member, old, score);
             touch_lru(key);
             return 0;
         }
@@ -75,13 +75,23 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
     if (it == m_zsets.end() && has_type_conflict_for_zset(key))
         return -1;
 
+    const zset_inner* had = it == m_zsets.end() ? nullptr : &it->second;
     if (!check_memory(2 * stored_string(member.size()) + new_key_cost(key.size())
-                      + zset_member_overhead, key))
+                      + zset_member_overhead + member_growth(had, score, member.size()), key))
         return -1;
 
     if (it == m_zsets.end())
+    {
         it = m_zsets.emplace(std::string(key), zset_inner{}).first;
+        it->second.add(score, member);
+        ++m_zset_members;
+        // The key's own bytes with it, which a new sorted set was never charged.
+        track_add(entry_cost(it->first, it->second));
+        touch_lru(key);
+        return 1;
+    }
 
+    const size_t shape = shape_cost(it->second);
     it->second.add(score, member);
     ++m_zset_members;
     // The delta and not two full walks: entry_cost() sums every member, so
@@ -89,8 +99,18 @@ int cache_store::zadd(std::string_view key, double score, std::string_view membe
     // The number is the same one those two walks produced -- a member costs
     // its name twice, because the ordered view holds a copy.
     track_add(2 * stored_string(member.size()));
+    reshape(shape, shape_cost(it->second));
     touch_lru(key);
     return 1;
+}
+
+void cache_store::rescore(zset_inner& z, std::string_view member, double old, double score)
+{
+    // Not refused for room: the member is already paid for, and what can grow
+    // is the packed buffer by a wider score or the index by a rebuild.
+    const size_t shape = shape_cost(z);
+    z.rescore(member, old, score);
+    reshape(shape, shape_cost(z));
 }
 
 bool cache_store::zrem(std::string_view key, std::string_view member)
@@ -103,10 +123,12 @@ bool cache_store::zrem(std::string_view key, std::string_view member)
     if (!it->second.score_of(member, old))
         return false;
 
+    const size_t shape = shape_cost(it->second);
     it->second.remove(member, old);
     --m_zset_members;
     // The same delta zadd charges, for the same reason.
     track_sub(2 * stored_string(member.size()));
+    reshape(shape, shape_cost(it->second));
 
     // An empty sorted set is not a key, the way an empty list is not one here.
     if (it->second.empty())
@@ -224,7 +246,7 @@ cache_store::zincrby(std::string_view key, double delta, std::string_view member
     if (had)
     {
         if (out != current)
-            it->second.rescore(member, current, out);
+            rescore(it->second, member, current, out);
         touch_lru(key);
         return zincr_result::ok;
     }
@@ -236,7 +258,7 @@ cache_store::zincrby(std::string_view key, double delta, std::string_view member
 
 size_t cache_store::entry_cost(std::string_view key, const hash_inner& fields)
 {
-    size_t bytes = stored_string(key);
+    size_t bytes = stored_string(key) + shape_cost(fields);
     for (const auto& [f, v] : fields) bytes += stored_string(f) + stored_string(v);
     return bytes;
 }
@@ -419,17 +441,30 @@ const std::string* cache_store::check_expiry_and_get_ptr(std::string_view key)
 
 bool cache_store::lpush(std::string_view key, std::string_view val)
 {
+    return push(key, val, true);
+}
+
+bool cache_store::rpush(std::string_view key, std::string_view val)
+{
+    return push(key, val, false);
+}
+
+bool cache_store::push(std::string_view key, std::string_view val, bool front)
+{
     auto it = m_lists.find(key);
     if (it != m_lists.end())
     {
         // The key is named to check_memory() so eviction cannot take it,
         // because `it` has to survive the call and the emplace below went
         // through a freed node.
-        if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
+        if (!check_memory(stored_string(val.size()) + list_elem_overhead
+                          + push_growth(&it->second, val.size(), front), key))
             return false;
-        it->second.push_front(val);
+        const size_t shape = shape_cost(it->second);
+        if (front) it->second.push_front(val); else it->second.push_back(val);
         ++m_list_elems;
         track_add(stored_string(val.size()));
+        reshape(shape, shape_cost(it->second));
         touch_lru(key);
         return true;
     }
@@ -437,40 +472,12 @@ bool cache_store::lpush(std::string_view key, std::string_view val)
     if (has_type_conflict_for_list(key))
         return false;
 
-    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
+    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead
+                      + push_growth(nullptr, val.size(), front), key))
         return false;
 
     auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
-    nit->second.push_front(val);
-    ++m_list_elems;
-    track_add(entry_cost(nit->first, nit->second));
-    touch_lru(key);
-    return true;
-}
-
-bool cache_store::rpush(std::string_view key, std::string_view val)
-{
-    auto it = m_lists.find(key);
-    if (it != m_lists.end())
-    {
-        // Named for the same reason as in lpush(): `it` must survive the call.
-        if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
-            return false;
-        it->second.push_back(val);
-        ++m_list_elems;
-        track_add(stored_string(val.size()));
-        touch_lru(key);
-        return true;
-    }
-
-    if (has_type_conflict_for_list(key))
-        return false;
-
-    if (!check_memory(stored_string(val.size()) + new_key_cost(key.size()) + list_elem_overhead, key))
-        return false;
-
-    auto nit = m_lists.emplace(std::string(key), list_inner{}).first;
-    nit->second.push_back(val);
+    if (front) nit->second.push_front(val); else nit->second.push_back(val);
     ++m_list_elems;
     track_add(entry_cost(nit->first, nit->second));
     touch_lru(key);
@@ -485,8 +492,9 @@ bool cache_store::lpop(std::string_view key, std::string& out)
 
     // Charged by length, as the push was: an element may be bytes in a packed
     // buffer and have no capacity of its own.
+    const size_t shape = shape_cost(it->second);
     it->second.pop_front(out);
-    after_pop(it, key, stored_string(out.size()));
+    after_pop(it, key, stored_string(out.size()), shape);
     return true;
 }
 
@@ -496,20 +504,23 @@ bool cache_store::rpop(std::string_view key, std::string& out)
     if (it == m_lists.end() || it->second.empty())
         return false;
 
+    const size_t shape = shape_cost(it->second);
     it->second.pop_back(out);
-    after_pop(it, key, stored_string(out.size()));
+    after_pop(it, key, stored_string(out.size()), shape);
     return true;
 }
 
-void cache_store::after_pop(list_map::iterator it, std::string_view key, size_t elem_cost)
+void cache_store::after_pop(list_map::iterator it, std::string_view key, size_t elem_cost,
+                            size_t shape_before)
 {
     --m_list_elems;
     track_sub(elem_cost);
+    reshape(shape_before, shape_cost(it->second));
 
     // An empty list is not a key.
     if (it->second.empty())
     {
-        track_sub(stored_string(it->first));
+        track_sub(entry_cost(it->first, it->second));
         m_list_elems -= it->second.size();
         m_lists.erase(it);
         m_expiry.erase(std::string(key));
@@ -558,13 +569,16 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     if (it != m_sets.end())
     {
         // Named for the same reason as in lpush(): `it` must survive the call.
-        if (!check_memory(stored_string(member.size()) + set_elem_overhead, key))
+        if (!check_memory(stored_string(member.size()) + set_elem_overhead
+                          + set_growth(&it->second), key))
             return -1;
+        const size_t shape = shape_cost(it->second);
         auto [mit, inserted] = it->second.emplace(member);
         if (inserted)
         {
             ++m_set_elems;
             track_add(stored_string(*mit));
+            reshape(shape, shape_cost(it->second));
             touch_lru(key);
         }
         return inserted ? 1 : 0;
@@ -573,7 +587,8 @@ int cache_store::sadd(std::string_view key, std::string_view member)
     if (has_type_conflict_for_set(key))
         return -1;
 
-    if (!check_memory(stored_string(member.size()) + new_key_cost(key.size()) + set_elem_overhead, key))
+    if (!check_memory(stored_string(member.size()) + new_key_cost(key.size()) + set_elem_overhead
+                      + set_growth(nullptr), key))
         return -1;
 
     auto nit = m_sets.emplace(std::string(key), set_inner{}).first;
@@ -594,13 +609,15 @@ bool cache_store::srem(std::string_view key, std::string_view member)
     if (mit == it->second.end())
         return false;
 
+    const size_t shape = shape_cost(it->second);
     track_sub(stored_string(*mit));
     it->second.erase(mit);
     --m_set_elems;
+    reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
     {
-        track_sub(stored_string(it->first));
+        track_sub(entry_cost(it->first, it->second));
         m_set_elems -= it->second.size();
         m_sets.erase(it);
         m_expiry.erase(std::string(key));
@@ -874,16 +891,18 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
     auto it = m_hashes.find(key);
     if (it != m_hashes.end())
     {
+        const size_t shape = shape_cost(it->second);
         std::string_view old;
         if (it->second.get(field, old))
         {
             // Overwriting a field has to clear the same bar as adding one,
             // which this path did not, so a 5-byte value could become 100 KB
             // against a configured 1200.
-            if (__builtin_expect(m_max_memory != 0 && val.size() > old.size(), 0))
+            if (__builtin_expect(m_max_memory != 0, 0))
             {
-                const size_t held = stored_string(old.size());
-                const size_t want = stored_string(val.size());
+                const size_t held = stored_string(old.size()) + shape;
+                const size_t want = stored_string(val.size()) + shape
+                                  + field_growth(&it->second, field, val.size(), &old);
                 if (want > held && !check_memory(want - held, key))
                     return false;
             }
@@ -895,13 +914,15 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         {
             // Named so that eviction cannot take this hash, because `it` is
             // held across the call and the set below writes through it.
-            if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead, key))
+            if (!check_memory(stored_string(field.size()) + stored_string(val.size()) + hash_field_overhead
+                              + field_growth(&it->second, field, val.size(), nullptr), key))
                 return false;
             it->second.set(field, val);
             ++m_hash_fields;
             if (created) *created = true;
             track_add(stored_string(field.size()) + stored_string(val.size()));
         }
+        reshape(shape, shape_cost(it->second));
         touch_lru(key);
         return true;
     }
@@ -910,7 +931,8 @@ bool cache_store::hset(std::string_view key, std::string_view field, std::string
         return false;
 
     if (!check_memory(stored_string(field.size()) + stored_string(val.size())
-                      + new_key_cost(key.size()) + hash_field_overhead, key))
+                      + new_key_cost(key.size()) + hash_field_overhead
+                      + field_growth(nullptr, field, val.size(), nullptr), key))
         return false;
 
     auto nit = m_hashes.emplace(std::string(key), hash_inner{}).first;
@@ -941,13 +963,15 @@ bool cache_store::hdel(std::string_view key, std::string_view field)
     if (!it->second.get(field, old))
         return false;
 
+    const size_t shape = shape_cost(it->second);
     track_sub(stored_string(field.size()) + stored_string(old.size()));
     it->second.erase(field);
     --m_hash_fields;
+    reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
     {
-        track_sub(stored_string(it->first));
+        track_sub(entry_cost(it->first, it->second));
         m_hash_fields -= it->second.size();
         m_hashes.erase(it);
         m_expiry.erase(std::string(key));
@@ -1731,10 +1755,12 @@ int cache_store::lset(std::string_view key, int64_t idx, std::string_view val)
         return -2;
 
     const size_t old_len = dq.at(static_cast<size_t>(idx)).size();
-    if (__builtin_expect(m_max_memory != 0 && val.size() > old_len, 0))
+    const size_t shape   = shape_cost(dq);
+    if (__builtin_expect(m_max_memory != 0, 0))
     {
-        const size_t held = stored_string(old_len);
-        const size_t want = stored_string(val.size());
+        const size_t held = stored_string(old_len) + shape;
+        const size_t want = stored_string(val.size())
+                          + std::max(shape, shape_cost(dq.after_set(static_cast<size_t>(idx), val.size())));
         if (want > held && !check_memory(want - held, key))
             return -2;
         it = m_lists.find(key);
@@ -1744,6 +1770,7 @@ int cache_store::lset(std::string_view key, int64_t idx, std::string_view val)
     track_sub(stored_string(old_len));
     it->second.set(static_cast<size_t>(idx), val);
     track_add(stored_string(val.size()));
+    reshape(shape, shape_cost(it->second));
     touch_lru(key);
     return 0;
 }
@@ -1759,6 +1786,7 @@ int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
     int removed = 0;
     const size_t want = (count == 0) ? dq.size()
                                      : static_cast<size_t>(count < 0 ? -count : count);
+    const size_t shape = shape_cost(dq);
     // By position, since an erase in a packed list moves the bytes behind it
     // and an iterator carrying their offset would name the wrong element.
     if (count >= 0)
@@ -1777,6 +1805,7 @@ int cache_store::lrem(std::string_view key, int64_t count, std::string_view val)
             if (dq.at(i) == val) { track_sub(stored_string(val.size())); dq.erase(i); ++removed; --m_list_elems; }
         }
     }
+    reshape(shape, shape_cost(dq));
 
     // An empty list is not a key, the way an empty sorted set is not one here.
     if (dq.empty())
@@ -1811,10 +1840,12 @@ bool cache_store::ltrim(std::string_view key, int64_t start, int64_t stop)
         return true;
     }
 
+    const size_t shape = shape_cost(dq);
     while (static_cast<int64_t>(dq.size()) > e + 1)
     { track_sub(stored_string(dq.back())); dq.pop_back(); --m_list_elems; }
     for (int64_t i = 0; i < s; ++i)
     { track_sub(stored_string(dq.front())); dq.pop_front(); --m_list_elems; }
+    reshape(shape, shape_cost(dq));
     touch_lru(key);
     return true;
 }
@@ -1827,7 +1858,8 @@ int cache_store::linsert(std::string_view key, bool before, std::string_view piv
     if (it == m_lists.end())
         return 0;
 
-    if (!check_memory(stored_string(val.size()) + list_elem_overhead, key))
+    if (!check_memory(stored_string(val.size()) + list_elem_overhead
+                      + push_growth(&it->second, val.size(), false), key))
         return -1;
     it = m_lists.find(key);
     if (it == m_lists.end())
@@ -1837,9 +1869,11 @@ int cache_store::linsert(std::string_view key, bool before, std::string_view piv
     auto at = std::find(dq.begin(), dq.end(), pivot);
     if (at == dq.end())
         return -1;
+    const size_t shape = shape_cost(dq);
     dq.insert(at.index() + (before ? 0 : 1), val);
     ++m_list_elems;
     track_add(stored_string(val.size()));
+    reshape(shape, shape_cost(dq));
     touch_lru(key);
     return static_cast<int>(dq.size());
 }
@@ -1856,30 +1890,37 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
     // The destination must be a list or absent; a string there is a refusal
     // and NOT a pop, or the element would be gone with nowhere to be.
-    if (m_lists.find(dst) == m_lists.end() && has_type_conflict_for_list(dst))
+    const auto dfound = m_lists.find(dst);
+    if (dfound == m_lists.end() && has_type_conflict_for_list(dst))
         return false;
 
     // Charged before the pop, for the same reason: a refusal after it would
     // have taken the element out of the queue and dropped it.
     const size_t head_len = (from_head ? sit->second.front() : sit->second.back()).size();
-    if (src != dst && !check_memory(stored_string(head_len)
-                                    + new_key_cost(dst.size()) + list_elem_overhead, dst))
+    if (src != dst && !check_memory(stored_string(head_len) + new_key_cost(dst.size()) + list_elem_overhead
+                                    + push_growth(dfound == m_lists.end() ? nullptr : &dfound->second,
+                                                  head_len, to_head), dst))
         return false;
     sit = m_lists.find(src);
     if (sit == m_lists.end() || sit->second.empty())
         return false;
 
+    const size_t shape = shape_cost(sit->second);
     if (from_head) sit->second.pop_front(out); else sit->second.pop_back(out);
     track_sub(stored_string(out.size()));
     --m_list_elems;
+    reshape(shape, shape_cost(sit->second));
 
     // src == dst is a rotation, and the deque above is the one below: taken
     // before the source can be erased for being empty, which it is not.
     if (src == dst)
     {
+        // Not refused for room, since the list holds no more than it did.
+        const size_t turned = shape_cost(sit->second);
         if (to_head) sit->second.push_front(out); else sit->second.push_back(out);
         ++m_list_elems;
         track_add(stored_string(out.size()));
+        reshape(turned, shape_cost(sit->second));
         touch_lru(src);
         return true;
     }
@@ -1894,10 +1935,20 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
 
     auto dit = m_lists.find(dst);
     if (dit == m_lists.end())
+    {
         dit = m_lists.emplace(std::string(dst), list_inner{}).first;
+        if (to_head) dit->second.push_front(out); else dit->second.push_back(out);
+        ++m_list_elems;
+        // The key's own bytes with it, which a new destination was never charged.
+        track_add(entry_cost(dit->first, dit->second));
+        touch_lru(dst);
+        return true;
+    }
+    const size_t dshape = shape_cost(dit->second);
     if (to_head) dit->second.push_front(out); else dit->second.push_back(out);
     ++m_list_elems;
     track_add(stored_string(out.size()));
+    reshape(dshape, shape_cost(dit->second));
     touch_lru(dst);
     return true;
 }
@@ -1913,13 +1964,15 @@ bool cache_store::spop(std::string_view key, std::string& out)
 
     auto mit = it->second.begin();
     out = *mit;
+    const size_t shape = shape_cost(it->second);
     track_sub(stored_string(*mit));
     it->second.erase(mit);
     --m_set_elems;
+    reshape(shape, shape_cost(it->second));
 
     if (it->second.empty())
     {
-        track_sub(stored_string(it->first));
+        track_sub(entry_cost(it->first, it->second));
         m_sets.erase(it);
         m_expiry.erase(std::string(key));
         drop_lru(key);

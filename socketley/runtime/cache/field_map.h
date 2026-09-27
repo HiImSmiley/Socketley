@@ -50,6 +50,35 @@ public:
     bool   empty() const { return size() == 0; }
     bool   packed() const { return !m_table; }
 
+    // What the map's own blocks are: its packed buffer, or its table and the
+    // table's slots, beside the fields they hold.
+    struct footprint
+    {
+        size_t n{0};
+        size_t pack_size{0};
+        size_t pack_heap{0};    // the packed buffer's heap block
+        size_t slots{0};        // the table's, 0 while packed
+        bool   packed{true};
+    };
+    footprint now() const
+    {
+        if (m_table) return { m_table->size(), 0, 0, m_table->bucket_count(), false };
+        return { m_count, m_pack.size(), m_pack.heap_capacity(), 0, true };
+    }
+    // After a field of `flen` bytes is set to `vlen` bytes, `old` being the
+    // value it holds now, or null for a new field.
+    footprint after_set(size_t flen, size_t vlen, const std::string_view* old) const
+    {
+        const size_t n = size() + (old ? 0 : 1);
+        if (m_table)
+            return { n, 0, 0, old ? m_table->bucket_count() : m_table->capacity_after_insert(), false };
+        if (!packs(flen, vlen) || (!old && m_count + 1 > PACK_MAX_FIELDS))
+            return { n, 0, 0, table::capacity_for(m_count + 1), false };
+        const size_t more = old ? (vlen > old->size() ? vlen - old->size() : 0) : 2 + flen + vlen;
+        const size_t bytes = old ? m_pack.size() - old->size() + vlen : m_pack.size() + 2 + flen + vlen;
+        return { n, bytes, m_pack.heap_part(m_pack.capacity_for(more)), 0, true };
+    }
+
     // The value of `f`, or false.
     bool get(std::string_view f, std::string_view& out) const
     {
@@ -71,7 +100,7 @@ public:
     // Stores `v` under `f`; answers whether the field is new.
     bool set(std::string_view f, std::string_view v)
     {
-        if (!m_table && (f.size() > PACK_MAX_LEN || v.size() > PACK_MAX_LEN))
+        if (!m_table && !packs(f.size(), v.size()))
             unpack();
         if (m_table)
         {
@@ -214,6 +243,9 @@ private:
     // cursor into the one is never read against the other.
     uint32_t               m_epoch{0};
     std::unique_ptr<table> m_table;
+
+    // Whether a field and value of these lengths may be packed at all.
+    static bool packs(size_t flen, size_t vlen) { return flen <= PACK_MAX_LEN && vlen <= PACK_MAX_LEN; }
 
     size_t len_at(size_t pos) const { return static_cast<unsigned char>(m_pack[pos]); }
 

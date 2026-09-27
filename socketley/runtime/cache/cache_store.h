@@ -187,9 +187,10 @@ public:
             return false;
         const std::string_view v = from_head ? it->second.front() : it->second.back();
         take(v);
-        const size_t cost = stored_string(v.size());
+        const size_t cost  = stored_string(v.size());
+        const size_t shape = shape_cost(it->second);
         if (from_head) it->second.pop_front(); else it->second.pop_back();
-        after_pop(it, key, cost);
+        after_pop(it, key, cost, shape);
         return true;
     }
     int llen(std::string_view key) const;
@@ -660,9 +661,16 @@ private:
     // the way in stripped the TTL off keys whose write was then refused.
     void drop_expiry(std::string_view key);
 
+    // LPUSH and RPUSH, which differ only in the end they write.
+    bool push(std::string_view key, std::string_view val, bool front);
+
     // The accounting of one element gone from the front or back of a list,
     // and the key with it once the list is empty.
-    void after_pop(list_map::iterator it, std::string_view key, size_t elem_cost);
+    void after_pop(list_map::iterator it, std::string_view key, size_t elem_cost,
+                   size_t shape_before);
+
+    // A member's score moved, with the change it makes to the set's shape.
+    void rescore(zset_inner& z, std::string_view member, double old, double score);
 
     // Structural cost of the containers in bytes per entry, measured on this
     // toolchain and covering the fixed part only, because the heap block a
@@ -759,6 +767,91 @@ private:
     static size_t entry_cost(std::string_view key, const set_inner& members);
     static size_t entry_cost(std::string_view key, const hash_inner& fields);
     static size_t entry_cost(std::string_view key, const zset_inner& members);
+
+    // One open-addressed slot, of which every per-element overhead above
+    // includes at least one.
+    static constexpr size_t slot_bytes = sizeof(uint64_t);
+    // A list's and a set's table entry are this much wider than the string
+    // entry key_entry_overhead was measured on.
+    static constexpr size_t list_entry_extra = sizeof(list_inner) - sizeof(std::string);
+    static constexpr size_t set_entry_extra  = sizeof(set_inner) - sizeof(std::string);
+    static_assert(sizeof(list_inner) >= sizeof(std::string) && sizeof(set_inner) >= sizeof(std::string));
+
+    static size_t heap_chunk(size_t request) { return request ? malloc_chunk(request) : 0; }
+    static size_t over(size_t held, size_t charged) { return held > charged ? held - charged : 0; }
+
+    // What a collection's own blocks hold past what its per-element figures
+    // already charge for them, so a collection is charged for its packed
+    // buffer's room, segment blocks and map, table and slots, or skiplist head
+    // however it came to hold them.
+    static size_t shape_cost(const list_inner::footprint& f)
+    {
+        // A packed element's bytes are charged as its string and its two length
+        // bytes out of its overhead; a block is B strings at the overhead each.
+        if (f.packed)
+            return list_entry_extra
+                 + over(heap_chunk(f.pack_heap), f.pack_size + f.n * (list_elem_overhead - 2));
+        return list_entry_extra
+             + over(f.seg.blocks * malloc_chunk(sizeof(std::string) * seg_list::B)
+                    + heap_chunk(f.seg.map_cap * sizeof(std::string*)),
+                    f.n * list_elem_overhead);
+    }
+    static size_t shape_cost(const hash_inner::footprint& f)
+    {
+        if (f.packed)
+            return over(heap_chunk(f.pack_heap), f.pack_size + f.n * (hash_field_overhead - 2));
+        return over(malloc_chunk(sizeof(hash_inner::table)) + heap_chunk(f.slots * slot_bytes),
+                    f.n * slot_bytes);
+    }
+    static size_t shape_cost(const zskiplist::footprint& f)
+    {
+        // A packed member is framed by at most a tag, an 8-byte score and two
+        // length bytes.
+        if (!f.big)
+            return over(heap_chunk(f.pack_heap), f.pack_size + f.n * (zset_member_overhead - 11));
+        return over(malloc_chunk(zskiplist::head_bytes) + malloc_chunk(zskiplist::index_bytes)
+                    + heap_chunk(f.index_slots * slot_bytes), f.n * slot_bytes);
+    }
+    static size_t set_shape_cost(size_t slots, size_t n)
+    {
+        return set_entry_extra + over(heap_chunk(slots * slot_bytes), n * slot_bytes);
+    }
+    static size_t shape_cost(const list_inner& l) { return shape_cost(l.now()); }
+    static size_t shape_cost(const hash_inner& h) { return shape_cost(h.now()); }
+    static size_t shape_cost(const zset_inner& z) { return shape_cost(z.order.now()); }
+    static size_t shape_cost(const set_inner& s)  { return set_shape_cost(s.bucket_count(), s.size()); }
+
+    // What one more element grows a collection's shape by, which is admitted
+    // with it, a null collection being a key not there yet.
+    size_t push_growth(const list_inner* l, size_t len, bool front) const
+    {
+        if (m_max_memory == 0) return 0;
+        if (!l) return shape_cost(list_inner{}.after_push(len, front));
+        return over(shape_cost(l->after_push(len, front)), shape_cost(*l));
+    }
+    size_t field_growth(const hash_inner* h, std::string_view f, size_t vlen,
+                        const std::string_view* old) const
+    {
+        if (m_max_memory == 0) return 0;
+        if (!h) return shape_cost(hash_inner{}.after_set(f.size(), vlen, nullptr));
+        return over(shape_cost(h->after_set(f.size(), vlen, old)), shape_cost(*h));
+    }
+    size_t member_growth(const zset_inner* z, double score, size_t len) const
+    {
+        if (m_max_memory == 0) return 0;
+        if (!z) return shape_cost(zskiplist().after_insert(score, len));
+        return over(shape_cost(z->order.after_insert(score, len)), shape_cost(*z));
+    }
+    size_t set_growth(const set_inner* s) const
+    {
+        if (m_max_memory == 0) return 0;
+        if (!s) return set_shape_cost(set_inner{}.capacity_after_insert(), 1);
+        return over(set_shape_cost(s->capacity_after_insert(), s->size() + 1), shape_cost(*s));
+    }
+
+    // A write's change of shape, charged as measured after it rather than as
+    // predicted, so the books follow the containers exactly.
+    void reshape(size_t before, size_t after) { track_add(after); track_sub(before); }
 
     // Derived from live container sizes rather than tracked incrementally, so
     // it cannot drift, with every term O(1).

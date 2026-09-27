@@ -45,6 +45,37 @@ public:
     size_t size()  const { return m_size; }
     bool   empty() const { return m_size == 0; }
 
+    // The blocks and map slots a list holds with where its elements sit in
+    // them, and what one more element at either end makes of those.
+    struct shape
+    {
+        uint32_t blocks{0}, map_cap{0}, off{0}, size{0};
+
+        // Whether an element going in at that end needs a block first.
+        bool full_at(bool front) const { return front ? off == 0 : off + size == blocks * B; }
+        shape pushed(bool front) const
+        {
+            shape s = *this;
+            if (full_at(front))
+            {
+                if (s.blocks == s.map_cap) s.map_cap = grown_map(s.map_cap);
+                ++s.blocks;
+                if (front) s.off = B;
+            }
+            if (front) --s.off;
+            ++s.size;
+            return s;
+        }
+    };
+    shape now() const { return { m_blocks, m_map_cap, m_off, m_size }; }
+    // A list of `n` pushed at the back, which is how a packed one is unpacked.
+    static shape built(size_t n)
+    {
+        shape s;
+        while (n--) s = s.pushed(false);
+        return s;
+    }
+
     std::string&       operator[](size_t i)       { return slot_at(m_off + i); }
     const std::string& operator[](size_t i) const { return slot_at(m_off + i); }
     std::string&       front()       { return (*this)[0]; }
@@ -58,7 +89,7 @@ public:
     template <class... A>
     std::string& emplace_back(A&&... a)
     {
-        if (m_off + m_size == size_t{m_blocks} * B)
+        if (now().full_at(false))
             add_block_back();
         std::string* slot = ::new (&raw_at(m_off + m_size)) std::string(std::forward<A>(a)...);
         ++m_size;
@@ -67,7 +98,7 @@ public:
     template <class... A>
     std::string& emplace_front(A&&... a)
     {
-        if (m_off == 0)
+        if (now().full_at(true))
         {
             add_block_front();
             m_off = B;
@@ -228,9 +259,11 @@ private:
         return static_cast<std::string*>(::operator new(sizeof(std::string) * B));
     }
 
+    static uint32_t grown_map(uint32_t cap) { return cap ? cap * 2 : 2; }
+
     void grow_map()
     {
-        const uint32_t cap = m_map_cap ? m_map_cap * 2 : 2;
+        const uint32_t cap = grown_map(m_map_cap);
         auto** fresh = static_cast<std::string**>(std::malloc(sizeof(std::string*) * cap));
         if (!fresh) throw std::bad_alloc();
         for (uint32_t b = 0; b < m_blocks; ++b)

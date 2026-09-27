@@ -2837,10 +2837,11 @@ namespace
     }
 
     // The heap `grow` leaves held must not exceed what the store reports for
-    // it, give or take `slack` for what neither side sees exactly: freed chunks
-    // glibc keeps in its thread cache, and the key tables' own rounding.
+    // it, give or take `slack` and a sixteenth for what neither side sees
+    // exactly: freed chunks glibc keeps in its thread cache, the split
+    // remainders it hands out whole, and the key tables' own rounding.
     template <class F>
-    void check_charged(cache_store& store, F&& grow, size_t slack = 16384)
+    void check_charged(cache_store& store, F&& grow, size_t slack = 32768)
     {
         if (!heap_is_visible())
         {
@@ -2854,7 +2855,7 @@ namespace
         const int64_t used = static_cast<int64_t>(store.get_memory_used()) - static_cast<int64_t>(used_before);
         CAPTURE(real);
         CAPTURE(used);
-        CHECK(real <= used + static_cast<int64_t>(slack));
+        CHECK(real <= used + used / 16 + static_cast<int64_t>(slack));
     }
 }
 
@@ -2910,5 +2911,294 @@ TEST_CASE("a value overwritten with less keeps no buffer the store does not char
                 REQUIRE(store.lrem("l", 1, big) == 1);
             }
         });
+    }
+}
+
+TEST_CASE("a list past its packed form is charged for its blocks and map")
+{
+    SUBCASE("a first element over the packed limit")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 2000; ++i)
+                REQUIRE(store.rpush("l" + std::to_string(i), std::string(100, 'e')));
+        });
+    }
+
+    SUBCASE("a list grown long and popped back to one")
+    {
+        cache_store store;
+        std::string out;
+        check_charged(store, [&] {
+            for (int k = 0; k < 20; ++k)
+            {
+                const std::string key = "l" + std::to_string(k);
+                for (int i = 0; i < 20000; ++i) REQUIRE(store.rpush(key, "e"));
+                for (int i = 1; i < 20000; ++i) REQUIRE(store.lpop(key, out));
+            }
+        });
+    }
+}
+
+TEST_CASE("a sorted set in its big form is charged for its head and member index")
+{
+    SUBCASE("a first member over the packed limit")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 2000; ++i)
+                REQUIRE(store.zadd("z" + std::to_string(i), 1, std::string(65, 'm')) == 1);
+        });
+    }
+
+    SUBCASE("a set grown big and removed back to one")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 100000; ++i)
+                REQUIRE(store.zadd("z", i, "m" + std::to_string(i)) == 1);
+            for (int i = 1; i < 100000; ++i)
+                REQUIRE(store.zrem("z", "m" + std::to_string(i)));
+        });
+    }
+}
+
+TEST_CASE("a hash in its table form is charged for the table and its slots")
+{
+    SUBCASE("moved there by one long value")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 4000; ++i)
+                REQUIRE(store.hset("h" + std::to_string(i), "f", std::string(100, 'v')));
+        });
+    }
+
+    SUBCASE("grown big and deleted back to one field")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 100000; ++i)
+                REQUIRE(store.hset("h", "f" + std::to_string(i), "v"));
+            for (int i = 1; i < 100000; ++i)
+                REQUIRE(store.hdel("h", "f" + std::to_string(i)));
+        });
+    }
+}
+
+TEST_CASE("a set grown big and removed back to one is charged for its slots")
+{
+    cache_store store;
+    check_charged(store, [&] {
+        for (int i = 0; i < 100000; ++i)
+            REQUIRE(store.sadd("s", "m" + std::to_string(i)) == 1);
+        for (int i = 1; i < 100000; ++i)
+            REQUIRE(store.srem("s", "m" + std::to_string(i)));
+    });
+}
+
+TEST_CASE("a packed collection is charged for the room its buffer keeps")
+{
+    SUBCASE("a hash whose fields are gone")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int k = 0; k < 200; ++k)
+            {
+                const std::string key = "h" + std::to_string(k);
+                for (int i = 0; i < 128; ++i)
+                    REQUIRE(store.hset(key, std::string(60, 'f') + std::to_string(i), std::string(64, 'v')));
+                REQUIRE(store.hash_ptr(key)->packed());
+                for (int i = 1; i < 128; ++i)
+                    REQUIRE(store.hdel(key, std::string(60, 'f') + std::to_string(i)));
+            }
+        });
+    }
+
+    SUBCASE("a list whose elements are gone")
+    {
+        cache_store store;
+        std::string out;
+        check_charged(store, [&] {
+            for (int k = 0; k < 200; ++k)
+            {
+                const std::string key = "l" + std::to_string(k);
+                for (int i = 0; i < 128; ++i) REQUIRE(store.rpush(key, std::string(64, 'e')));
+                REQUIRE(store.list_ptr(key)->packed());
+                for (int i = 1; i < 128; ++i) REQUIRE(store.rpop(key, out));
+            }
+        });
+    }
+
+    SUBCASE("a sorted set whose members are gone")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int k = 0; k < 200; ++k)
+            {
+                const std::string key = "z" + std::to_string(k);
+                for (int i = 0; i < 128; ++i)
+                    REQUIRE(store.zadd(key, 0.5 + i, std::string(60, 'm') + std::to_string(i)) == 1);
+                for (int i = 1; i < 128; ++i)
+                    REQUIRE(store.zrem(key, std::string(60, 'm') + std::to_string(i)));
+            }
+        });
+    }
+}
+
+TEST_CASE("a memory limit holds against the heap a collection takes")
+{
+    // Admission has to count what the write will make the collection hold,
+    // or the limit is passed by everything that is not counted.
+    constexpr size_t room = size_t(1) << 20;
+    auto fill = [&](auto&& write) {
+        cache_store store;
+        store.set_eviction(evict_none);
+        store.set_max_memory(store.get_memory_used() + room);
+        check_charged(store, [&] {
+            int i = 0;
+            while (write(store, std::to_string(i))) ++i;
+            CHECK(i > 100);
+            CHECK(store.get_memory_used() <= store.get_max_memory());
+        }, 65536);
+    };
+
+    SUBCASE("lists of one long element")
+    {
+        fill([](cache_store& s, const std::string& n) { return s.rpush("l" + n, std::string(100, 'e')); });
+    }
+    SUBCASE("sorted sets of one long member")
+    {
+        fill([](cache_store& s, const std::string& n) { return s.zadd("z" + n, 1, std::string(65, 'm')) == 1; });
+    }
+    SUBCASE("hashes of one long value")
+    {
+        fill([](cache_store& s, const std::string& n) { return s.hset("h" + n, "f", std::string(100, 'v')); });
+    }
+}
+
+TEST_CASE("a collection's key is charged for its name when the write creates it")
+{
+    // Charged nowhere and given back when the collection emptied, so every
+    // round trip took the name's bytes off what the store believed it held.
+    cache_store store;
+    std::string out;
+    REQUIRE(store.set("base", std::string(5000, 'b')));
+    const size_t before = store.get_memory_used();
+    const std::string name(1000, 'k');
+
+    REQUIRE(store.zadd(name, 1, "m") == 1);
+    CHECK(store.get_memory_used() >= before + 1000);
+    REQUIRE(store.zrem(name, "m"));
+    CHECK(store.get_memory_used() == before);
+
+    REQUIRE(store.rpush("src", "e"));
+    const size_t with_src = store.get_memory_used();
+    REQUIRE(store.lmove("src", name, true, true, out));
+    CHECK(store.get_memory_used() >= with_src + 1000 - 200);
+    REQUIRE(store.lpop(name, out));
+    CHECK(store.get_memory_used() == before);
+}
+
+TEST_CASE("a collection's predicted shape is the shape it takes")
+{
+    // Admission is asked against these predictions, so one that falls short
+    // lets a write past the limit by the difference.
+    auto same_list = [](const list_items::footprint& a, const list_items::footprint& b) {
+        return a.n == b.n && a.packed == b.packed && a.pack_size == b.pack_size && a.pack_heap == b.pack_heap
+            && a.seg.blocks == b.seg.blocks && a.seg.map_cap == b.seg.map_cap
+            && a.seg.off == b.seg.off && a.seg.size == b.seg.size;
+    };
+
+    SUBCASE("a list pushed at either end, across the packed limits and block edges")
+    {
+        for (int front = 0; front < 2; ++front)
+            for (size_t len : {size_t(0), size_t(5), size_t(22), size_t(64), size_t(65), size_t(100)})
+            {
+                list_items l;
+                for (int i = 0; i < 300; ++i)
+                {
+                    const std::string v(i % 7 == 3 ? len : size_t(i % 30), 'x');
+                    const auto want = l.after_push(v.size(), front != 0);
+                    if (front) l.push_front(v); else l.push_back(v);
+                    REQUIRE(same_list(want, l.now()));
+                }
+                std::string out;
+                for (int i = 0; i < 150; ++i) { if (front) l.pop_back(out); else l.pop_front(out); }
+                const std::string v(len, 'y');
+                const auto want = l.after_push(v.size(), front != 0);
+                if (front) l.push_front(v); else l.push_back(v);
+                CHECK(same_list(want, l.now()));
+            }
+    }
+
+    SUBCASE("a list element set longer or shorter, and one inserted in the middle")
+    {
+        for (size_t len : {size_t(1), size_t(30), size_t(64), size_t(65)})
+        {
+            list_items l;
+            for (int i = 0; i < 10; ++i) l.push_back(std::string(20, 'x'));
+            const auto want = l.after_set(4, len);
+            l.set(4, std::string(len, 's'));
+            CHECK(same_list(want, l.now()));
+
+            const auto ins = l.after_push(len, false);
+            l.insert(3, std::string(len, 'i'));
+            CHECK(same_list(ins, l.now()));
+        }
+    }
+
+    SUBCASE("a hash set field by field, overwritten, and moved to its table")
+    {
+        auto same = [](const field_map::footprint& a, const field_map::footprint& b) {
+            return a.n == b.n && a.packed == b.packed && a.pack_size == b.pack_size
+                && a.pack_heap == b.pack_heap && a.slots == b.slots;
+        };
+        for (size_t len : {size_t(3), size_t(64), size_t(65)})
+        {
+            field_map h;
+            for (int i = 0; i < 200; ++i)
+            {
+                const std::string f = "f" + std::to_string(i % 150);
+                const std::string v(i == 140 ? len : size_t(i % 40), 'v');
+                std::string_view old;
+                const bool had = h.get(f, old);
+                const auto want = h.after_set(f.size(), v.size(), had ? &old : nullptr);
+                h.set(f, v);
+                REQUIRE(same(want, h.now()));
+            }
+        }
+    }
+
+    SUBCASE("a sorted set filled small, promoted by a long member or by count, and big")
+    {
+        auto same = [](const zskiplist::footprint& a, const zskiplist::footprint& b) {
+            return a.n == b.n && a.big == b.big && a.pack_size == b.pack_size
+                && a.pack_heap == b.pack_heap && a.index_slots == b.index_slots;
+        };
+        for (size_t at : {size_t(0), size_t(7), size_t(127), size_t(1000)})
+        {
+            zskiplist z;
+            for (size_t i = 0; i < 300; ++i)
+            {
+                const std::string m = (i == at ? std::string(70, 'l') : "m") + std::to_string(i);
+                const double score = i % 3 == 0 ? double(i) : i % 3 == 1 ? i + 0.5 : 70000.0 * double(i);
+                const auto want = z.after_insert(score, m.size());
+                z.insert(score, m);
+                REQUIRE(same(want, z.now()));
+            }
+        }
+    }
+
+    SUBCASE("a set's slots after one more member")
+    {
+        key_set s;
+        for (int i = 0; i < 1000; ++i)
+        {
+            const size_t want = s.capacity_after_insert();
+            s.insert("m" + std::to_string(i));
+            REQUIRE(want == s.bucket_count());
+            if (i % 3 == 0) s.erase("m" + std::to_string(i / 2));
+        }
     }
 }

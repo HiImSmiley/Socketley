@@ -124,6 +124,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and then short: the long value's buffer stayed behind, charged as the short
   one, so 64 fields set to 100 KB and back to one byte held 6.4 MB the cache
   counted as 5 KB, as many times over as a client liked.
+- A cache's memory limit counts what a collection holds besides its elements:
+  a list's segment blocks and map, a hash's table and slots, a sorted set's
+  skiplist head and index, a set's slots, and the room a small one's buffer
+  keeps after it shrinks. Lists of one 100-byte element filled a 1 MB limit
+  with 2.6 MB, and a hash, set or sorted set grown to 100,000 members and
+  emptied to one held 2 MB counted as nothing. A large hash, set or sorted set
+  now reads about 9 bytes a member more, a list key 24 and a set key 48.
+- The name of a sorted set created by `ZADD` and of a list created by `LMOVE`
+  is counted; it was given back when the collection emptied, so each such
+  round trip wore the count down by the length of the name.
 
 ## [1.1.0] - 2026-08-27
 
