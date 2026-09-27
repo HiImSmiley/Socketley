@@ -1,7 +1,7 @@
 #pragma once
-// The cache's keyspace table: string keys to V, open-addressed over slots that
-// carry the whole hash, each pointing at one allocation holding the value and
-// the key bytes behind it.
+// The cache's keyspace table: string keys to V, open-addressed over one-word
+// slots, each a pointer to one allocation holding the value and the key bytes
+// behind it, with sixteen bits of the key's hash in the pointer's unused top.
 //
 // std::unordered_map reached a key through the bucket, the node BEFORE the
 // match, the match, and a heap block for any key past 15 bytes -- three or four
@@ -39,23 +39,34 @@ public:
     };
 
 private:
+    // A slot is one word: 0 empty, 1 a tombstone, and otherwise an entry's
+    // address with the top sixteen bits of its key's hash above it.  Half the
+    // sixteen bytes a hash and a pointer took, and at the three-quarter load
+    // limit that was 21-43 bytes a key, the largest single cost of a small one.
     static constexpr uint64_t EMPTY = 0;
     static constexpr uint64_t TOMB  = 1;
-    // Set on every live hash, so no live slot reads as EMPTY or TOMB.
-    static constexpr uint64_t LIVE  = uint64_t{1} << 63;
+    static constexpr int      TAG_SHIFT = 48;
+    static constexpr uint64_t ADDR_MASK = (uint64_t{1} << TAG_SHIFT) - 1;
 
     struct slot
     {
-        uint64_t h;
-        entry*   e;
+        uint64_t w;
+        entry* e() const { return reinterpret_cast<entry*>(w & ADDR_MASK); }
+        bool live() const { return w > TOMB; }
     };
 
-    static uint64_t hash_of(std::string_view k) { return string_hash{}(k) | LIVE; }
+    static uint64_t hash_of(std::string_view k) { return string_hash{}(k); }
+    static uint64_t tag_of(uint64_t h) { return h & ~ADDR_MASK; }
+    static uint64_t word(uint64_t h, entry* e) { return tag_of(h) | reinterpret_cast<uint64_t>(e); }
 
     template <class... A>
     static entry* make_entry(std::string_view k, A&&... a)
     {
         void* mem = ::operator new(sizeof(entry) + (k.empty() ? 1 : k.size()));
+        // A heap address above 48 bits would lose its top to the tag, which
+        // Linux never hands out without being asked for one.
+        if (reinterpret_cast<uint64_t>(mem) & ~ADDR_MASK)
+            std::abort();
         char* kb  = static_cast<char*>(mem) + sizeof(entry);
         if (!k.empty()) std::memcpy(kb, k.data(), k.size());
         try
@@ -87,7 +98,7 @@ public:
         basic_iterator(table_ptr t, size_t i) : m_t(t), m_i(i) { skip(); }
         void skip()
         {
-            while (m_i < m_t->m_cap && m_t->m_slots[m_i].e == nullptr) ++m_i;
+            while (m_i < m_t->m_cap && !m_t->m_slots[m_i].live()) ++m_i;
         }
 
     public:
@@ -102,8 +113,8 @@ public:
         template <bool C = Const, class = std::enable_if_t<C>>
         basic_iterator(const basic_iterator<false>& o) : m_t(o.m_t), m_i(o.m_i) {}
 
-        reference operator*()  const { return *m_t->m_slots[m_i].e; }
-        pointer   operator->() const { return m_t->m_slots[m_i].e; }
+        reference operator*()  const { return *m_t->m_slots[m_i].e(); }
+        pointer   operator->() const { return m_t->m_slots[m_i].e(); }
         basic_iterator& operator++() { ++m_i; skip(); return *this; }
         basic_iterator  operator++(int) { auto c = *this; ++*this; return c; }
         friend bool operator==(const basic_iterator& a, const basic_iterator& b) { return a.m_i == b.m_i; }
@@ -150,13 +161,14 @@ public:
             for (size_t i = 0; i < m_cap; ++i)
             {
                 const slot& src = o.m_slots[i];
-                if (src.e)
+                if (src.live())
                 {
-                    m_slots[i] = { src.h, make_entry(src.e->first, src.e->second) };
+                    entry* e = make_entry(src.e()->first, src.e()->second);
+                    m_slots[i].w = (src.w & ~ADDR_MASK) | reinterpret_cast<uint64_t>(e);
                     ++m_size;
                 }
                 else
-                    m_slots[i] = { src.h, nullptr };
+                    m_slots[i] = src;
             }
         }
         catch (...)
@@ -192,9 +204,9 @@ public:
     const_iterator end()   const { return const_iterator(this, m_cap); }
 
     size_t               bucket_count() const { return m_cap; }
-    local_iterator       begin(size_t b)       { return local_iterator(m_slots[b].e); }
+    local_iterator       begin(size_t b)       { return local_iterator(m_slots[b].live() ? m_slots[b].e() : nullptr); }
     local_iterator       end(size_t)           { return local_iterator(); }
-    const_local_iterator begin(size_t b) const { return const_local_iterator(m_slots[b].e); }
+    const_local_iterator begin(size_t b) const { return const_local_iterator(m_slots[b].live() ? m_slots[b].e() : nullptr); }
     const_local_iterator end(size_t)   const { return const_local_iterator(); }
 
     // Changes whenever entries change slots, which bucket_count() alone does
@@ -233,7 +245,7 @@ public:
     {
         if (!m_cap) return;
         const slot& s = m_slots[h & (m_cap - 1)];
-        if (s.h == h) __builtin_prefetch(s.e);
+        if (s.live() && tag_of(s.w) == tag_of(h)) __builtin_prefetch(s.e());
     }
 
     template <class... A>
@@ -303,13 +315,14 @@ private:
     {
         if (m_size == 0)
             return NPOS;
-        const size_t mask = m_cap - 1;
+        const size_t   mask = m_cap - 1;
+        const uint64_t tag  = tag_of(h);
         for (size_t i = h & mask;; i = (i + 1) & mask)
         {
             const slot& s = m_slots[i];
-            if (s.h == h && string_equal{}(s.e->first, k))
+            if (s.live() && tag_of(s.w) == tag && string_equal{}(s.e()->first, k))
                 return i;
-            if (s.h == EMPTY)
+            if (s.w == EMPTY)
                 return NPOS;
         }
     }
@@ -320,37 +333,37 @@ private:
     {
         const size_t mask = m_cap - 1;
         for (size_t i = h & mask;; i = (i + 1) & mask)
-            if (m_slots[i].h == EMPTY || m_slots[i].h == TOMB)
+            if (!m_slots[i].live())
                 return i;
     }
 
     void occupy(size_t i, uint64_t h, entry* e)
     {
-        if (m_slots[i].h == TOMB) --m_tombs;
-        m_slots[i] = { h, e };
+        if (m_slots[i].w == TOMB) --m_tombs;
+        m_slots[i].w = word(h, e);
         ++m_size;
     }
 
     void vacate(size_t i)
     {
-        drop_entry(m_slots[i].e);
+        drop_entry(m_slots[i].e());
         --m_size;
         const size_t mask = m_cap - 1;
         // A tombstone is only needed where a probe might have to pass it, so
         // one followed by an empty slot is empty, and so are the tombstones
         // that only it was holding up.
-        if (m_slots[(i + 1) & mask].h == EMPTY)
+        if (m_slots[(i + 1) & mask].w == EMPTY)
         {
-            m_slots[i] = { EMPTY, nullptr };
-            for (size_t j = (i - 1) & mask; m_slots[j].h == TOMB; j = (j - 1) & mask)
+            m_slots[i].w = EMPTY;
+            for (size_t j = (i - 1) & mask; m_slots[j].w == TOMB; j = (j - 1) & mask)
             {
-                m_slots[j] = { EMPTY, nullptr };
+                m_slots[j].w = EMPTY;
                 --m_tombs;
             }
         }
         else
         {
-            m_slots[i] = { TOMB, nullptr };
+            m_slots[i].w = TOMB;
             ++m_tombs;
         }
     }
@@ -371,14 +384,16 @@ private:
         slot* fresh = static_cast<slot*>(std::calloc(cap, sizeof(slot)));
         if (!fresh)
             throw std::bad_alloc();
+        // The slot keeps only the top of the hash, so the home slot is hashed
+        // again from the key.
         const size_t mask = cap - 1;
         for (size_t i = 0; i < m_cap; ++i)
         {
             const slot& s = m_slots[i];
-            if (s.e == nullptr)
+            if (!s.live())
                 continue;
-            size_t j = s.h & mask;
-            while (fresh[j].h != EMPTY) j = (j + 1) & mask;
+            size_t j = hash_of(s.e()->first) & mask;
+            while (fresh[j].w != EMPTY) j = (j + 1) & mask;
             fresh[j] = s;
         }
         std::free(m_slots);
@@ -391,7 +406,7 @@ private:
     void release()
     {
         for (size_t i = 0; i < m_cap; ++i)
-            if (m_slots[i].e) drop_entry(m_slots[i].e);
+            if (m_slots[i].live()) drop_entry(m_slots[i].e());
         std::free(m_slots);
         m_slots = nullptr;
         m_cap = m_size = m_tombs = 0;

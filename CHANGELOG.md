@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   248 bytes, a five-member sorted set 1,575 → 248, a five-element list 808 →
   231. RPUSH is a third faster and LRANGE 9–12%; LINDEX and LSET on lists of
   tens of elements are up to 14% slower, since a packed list is walked.
+- A cache key costs 17 bytes less in every type, and a small set 81 bytes
+  less: the keyspace and field tables hold one word per slot instead of two.
+  A string key is now 101 bytes against Redis's 104. Writes into one large
+  hash are 6% faster.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 - The proxy sends a relayed message directly when nothing is queued ahead of
