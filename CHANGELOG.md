@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `self.upstream_send` no longer builds a string and a shared pointer per
   message: 2.2% more upstream round trips, the distance to a C relay 2.39 →
   1.82 µs.
+- A line a server script sends to one client with `self.send` goes out
+  straight from the script's string when nothing is queued ahead of it,
+  instead of being copied into a new string first: 2.7% more 16 KB round
+  trips through a Lua echo, the distance to a C echo 2.04 → 1.65 µs.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

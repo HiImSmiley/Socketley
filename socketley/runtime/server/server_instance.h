@@ -1088,7 +1088,9 @@ private:
     void abandon_for_backlog(server_connection* conn);
     bool admit_send(server_connection* conn, size_t bytes, bool even_when_closing);
     void flush_write_queue(server_connection* conn);
+    void submit_batch(server_connection* conn);
     bool send_direct(server_connection* conn);
+    bool send_line_now(server_connection* conn, std::string_view msg, bool add_nl);
     void after_write(server_connection* conn);
     // A client's batch or an upstream's, which hold it in the same fields.
     template <class C> static void skip_written(C* conn, size_t written);

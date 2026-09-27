@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Integration test: a server's echoes, a cache's replies, a client's sends and
-# a server's sends to its upstream arrive byte for byte and in order, through
-# every mix of sends taken at once and sends that had to go through the ring
+# Integration test: a server's echoes, a cache's replies, a client's sends, a
+# server's sends to its upstream and a server script's sends to a client
+# arrive byte for byte and in order, through every mix of sends taken at once
+# and sends that had to go through the ring
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -15,8 +16,9 @@
 # So the client sends its whole load before it reads a byte, which fills the
 # kernel buffers and forces partial sends and a queue, then reads everything:
 # lines of 1 byte to 30 KB to an echo server, pipelined GETs of values up to
-# 500 KB to a cache, and the same lines from a client runtime's script and
-# from a server's script to its upstream, each to a peer that reads late.
+# 500 KB to a cache, and the same lines from a client runtime's script, from a
+# server's script to its upstream and from one to a connected client, each to
+# a peer that reads late.
 # What arrives must be exactly what was expected.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
@@ -25,6 +27,7 @@
 #   * the cache's reply stream the same way
 #   * a client runtime's sends the same way
 #   * a server's sends to its upstream the same way
+#   * a server script's sends to a client the same way
 # suite: isolated
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -42,7 +45,7 @@ echo "=== Integration: direct sends keep a server's and a cache's output in orde
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
 PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312)); PK=$((SL_PORT_BASE + 1313))
-PU=$((SL_PORT_BASE + 1314)); PUS=$((SL_PORT_BASE + 1315))
+PU=$((SL_PORT_BASE + 1314)); PUS=$((SL_PORT_BASE + 1315)); PL=$((SL_PORT_BASE + 1316))
 daemon_isolate directsend
 daemon_start "$BIN"
 WORK=$SOCKETLEY_TMPD
@@ -87,16 +90,10 @@ def lines():
     sizes = [1, 7, 64, 1000, 8000, 30000]
     return [(b"%06d|" % i) + bytes([97 + i % 26]) * sizes[(i * 7) % 6] + b"\n" for i in range(900)]
 
-if mode == "sink":
-    # Reads late and then slowly through a small window, so the socket always
-    # has some room and never enough: a write the client sends directly then
-    # goes out in part, and the rest has to follow it through the ring.
-    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-    ls.bind(("127.0.0.1", port)); ls.listen(1)
-    print("ready", flush=True)
-    c, _ = ls.accept()
-    want = b"".join(lines())
+def slow_read(c, want):
+    """Reads late and then slowly through a small window, so the socket always
+    has some room and never enough: a write sent directly then goes out in
+    part, and the rest has to follow it through the ring."""
     time.sleep(1.0)
     h, n = hashlib.sha256(), 0
     c.settimeout(20)
@@ -108,8 +105,20 @@ if mode == "sink":
             time.sleep(0.0005)
     except socket.timeout:
         pass
-    got = [(h.hexdigest(), n)]
-    print("expect=%s %d got=%s %d" % (hashlib.sha256(want).hexdigest(), len(want), got[0][0], got[0][1]), flush=True)
+    print("expect=%s %d got=%s %d" % (hashlib.sha256(want).hexdigest(), len(want), h.hexdigest(), n), flush=True)
+
+if mode == "slowclient":
+    c = socket.socket()
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    c.connect(("127.0.0.1", port))
+    slow_read(c, b"".join(lines()))
+elif mode == "sink":
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    ls.bind(("127.0.0.1", port)); ls.listen(1)
+    print("ready", flush=True)
+    c, _ = ls.accept()
+    slow_read(c, b"".join(lines()))
 elif mode == "server":
     # Each line carries its index, so a reorder changes the digest.
     lines = []
@@ -195,6 +204,28 @@ kill "$USINK_PID" 2>/dev/null || true
 OUT=$(grep '^expect' "$WORK/usink.out" || true)
 echo "  upstream: $OUT"
 check "a server's sends to its upstream arrive whole and in order" "$OUT"
+
+# ── 5. a server script's sends to a client arrive whole and in order ──────
+# One line a tick, so each is the only write of its turn and is tried
+# directly, against a socket the slow reader keeps nearly full.
+cat > "$WORK/tell.lua" <<'LUA'
+function on_connect(id)
+    local sizes = { 1, 7, 64, 1000, 8000, 30000 }
+    local i = 0
+    local iv
+    iv = socketley.set_interval(1, function()
+        local line = string.format("%06d|", i) .. string.rep(string.char(97 + i % 26), sizes[(i * 7) % 6 + 1])
+        self.send(id, i % 2 == 0 and line .. "\n" or line)
+        i = i + 1
+        if i == 900 then socketley.clear_interval(iv) end
+    end)
+end
+LUA
+"$BIN" create server dsl -p "$PL" --lua "$WORK/tell.lua" -s >/dev/null 2>&1 || true
+for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PL " && break; sleep 0.1; done
+OUT=$(timeout 90 python3 "$WORK/peer.py" slowclient "$PL" 2>&1 || true)
+echo "  tell:     $OUT"
+check "a server script's sends to a client arrive whole and in order" "$OUT"
 
 if [ "$FAIL" -gt 0 ]; then
     if grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /'; then :; fi

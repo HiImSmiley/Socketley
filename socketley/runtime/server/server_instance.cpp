@@ -6268,10 +6268,14 @@ void server_instance::flush_write_queue(server_connection* conn)
     conn->write_batch_count = count;
     if (send_direct(conn))
         return;
+    submit_batch(conn);
+}
 
-    // What send_direct() did not get out, which a partial send left starting
-    // part way into the first iovec.
-    count = conn->write_batch_count;
+// The batch to the ring: what send_direct() did not get out, which a partial
+// send left starting part way into the first iovec.
+void server_instance::submit_batch(server_connection* conn)
+{
+    const uint32_t count = conn->write_batch_count;
     conn->write_pending = true;
 
     bool queued;
@@ -7260,10 +7264,15 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     // a connection a script may answer; see the queue_send below.
     if (SOCKETLEY_UNLIKELY(conn->closing && conn->cache_pending == 0)) return false;
 
+    const bool add_nl = msg.empty() || msg.back() != '\n';
+    if (SOCKETLEY_LIKELY(m_loop && conn->proto != proto_ws && conn->ssl == nullptr && conn->write_queue.empty()
+                         && !conn->write_pending && conn->write_batch_count == 0))
+        return send_line_now(conn, msg, add_nl);
+
     std::string buf;
     buf.reserve(msg.size() + 1);
     buf.append(msg);
-    if (buf.empty() || buf.back() != '\n') buf.push_back('\n');
+    if (add_nl) buf.push_back('\n');
     // Queued, which is what "sent" means on an async write path here -- and
     // NOT queued is now an answer too, rather than a true for a message that
     // was dropped on the way to closing the connection.
@@ -7276,6 +7285,35 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     // with and the shared_ptr was buying a second allocation and an entry the
     // queue could not coalesce.
     return queue_send(conn, std::move(buf), conn->cache_pending > 0);
+}
+
+// A line to a raw connection with nothing ahead of it: the batch points at the
+// caller's bytes and send_direct() gets the first try, so a line the socket
+// takes whole is never copied, and only what it did not take is.
+bool server_instance::send_line_now(server_connection* conn, std::string_view msg, bool add_nl)
+{
+    if (!admit_send(conn, msg.size() + (add_nl ? 1 : 0), conn->cache_pending > 0))
+        return false;
+
+    static const char nl = '\n';
+    uint32_t count = 0;
+    if (!msg.empty())
+        conn->write_iovs[count++] = { const_cast<char*>(msg.data()), msg.size() };
+    if (add_nl)
+        conn->write_iovs[count++] = { const_cast<char*>(&nl), 1 };
+    conn->write_batch_count = count;
+    if (send_direct(conn))
+        return true;
+
+    // The rest is still the caller's, so it becomes the batch's own before the ring sees it.
+    std::string rest;
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        rest.append(static_cast<const char*>(conn->write_iovs[i].iov_base), conn->write_iovs[i].iov_len);
+    conn->write_batch[0] = socketley::write_chunk(std::move(rest));
+    conn->write_iovs[0] = { const_cast<char*>(conn->write_batch[0].data()), conn->write_batch[0].size() };
+    conn->write_batch_count = 1;
+    submit_batch(conn);
+    return true;
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)
