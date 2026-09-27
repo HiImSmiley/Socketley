@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Integration test: a server's echoes and a cache's replies arrive byte for
-# byte and in order, through every mix of sends taken at once and sends that
-# had to go through the ring
+# Integration test: a server's echoes, a cache's replies and a client's sends
+# arrive byte for byte and in order, through every mix of sends taken at once
+# and sends that had to go through the ring
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -14,13 +14,15 @@
 #
 # So the client sends its whole load before it reads a byte, which fills the
 # kernel buffers and forces partial sends and a queue, then reads everything:
-# lines of 1 byte to 30 KB to an echo server, and pipelined GETs of values up
-# to 500 KB to a cache.  What comes back must be exactly what was expected.
+# lines of 1 byte to 30 KB to an echo server, pipelined GETs of values up to
+# 500 KB to a cache, and the same lines from a client runtime's script to a
+# peer that reads late.  What arrives must be exactly what was expected.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * the echo stream reordered, duplicated or short
 #   * the cache's reply stream the same way
+#   * a client runtime's sends the same way
 # suite: isolated
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -37,7 +39,7 @@ fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
 echo "=== Integration: direct sends keep a server's and a cache's output in order ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
-PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312))
+PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312)); PK=$((SL_PORT_BASE + 1313))
 daemon_isolate directsend
 daemon_start "$BIN"
 WORK=$SOCKETLEY_TMPD
@@ -76,7 +78,36 @@ def resp(*args):
 
 mode, port = sys.argv[1], int(sys.argv[2])
 rnd = random.Random(7)
-if mode == "server":
+def lines():
+    """Each line carries its index, so a reorder changes the digest; the
+    client's script builds the same ones."""
+    sizes = [1, 7, 64, 1000, 8000, 30000]
+    return [(b"%06d|" % i) + bytes([97 + i % 26]) * sizes[(i * 7) % 6] + b"\n" for i in range(900)]
+
+if mode == "sink":
+    # Reads late and then slowly through a small window, so the socket always
+    # has some room and never enough: a write the client sends directly then
+    # goes out in part, and the rest has to follow it through the ring.
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    ls.bind(("127.0.0.1", port)); ls.listen(1)
+    print("ready", flush=True)
+    c, _ = ls.accept()
+    want = b"".join(lines())
+    time.sleep(1.0)
+    h, n = hashlib.sha256(), 0
+    c.settimeout(20)
+    try:
+        while n < len(want):
+            b = c.recv(8192)
+            if not b: break
+            h.update(b); n += len(b)
+            time.sleep(0.0005)
+    except socket.timeout:
+        pass
+    got = [(h.hexdigest(), n)]
+    print("expect=%s %d got=%s %d" % (hashlib.sha256(want).hexdigest(), len(want), got[0][0], got[0][1]), flush=True)
+elif mode == "server":
     # Each line carries its index, so a reorder changes the digest.
     lines = []
     for i in range(1500):
@@ -121,6 +152,25 @@ check "the echo stream arrives whole and in order" "$OUT"
 OUT=$(timeout 90 python3 "$WORK/peer.py" cache "$PC" 2>&1 || true)
 echo "  cache:  $OUT"
 check "the cache's replies arrive whole and in order" "$OUT"
+
+# ── 3. a client runtime's sends arrive whole and in order ─────────────────
+python3 "$WORK/peer.py" sink "$PK" > "$WORK/sink.out" 2>&1 &
+SINK_PID=$!
+for _ in $(seq 1 50); do grep -q ready "$WORK/sink.out" 2>/dev/null && break; sleep 0.1; done
+cat > "$WORK/client.lua" <<'LUA'
+function on_connect()
+    local sizes = { 1, 7, 64, 1000, 8000, 30000 }
+    for i = 0, 899 do
+        self.send(string.format("%06d|", i) .. string.rep(string.char(97 + i % 26), sizes[(i * 7) % 6 + 1]) .. "\n")
+    end
+end
+LUA
+"$BIN" create client dsk -t "127.0.0.1:$PK" --lua "$WORK/client.lua" -s >/dev/null 2>&1 || true
+for _ in $(seq 1 300); do grep -q '^expect' "$WORK/sink.out" 2>/dev/null && break; sleep 0.1; done
+kill "$SINK_PID" 2>/dev/null || true
+OUT=$(grep '^expect' "$WORK/sink.out" || true)
+echo "  client: $OUT"
+check "the client's sends arrive whole and in order" "$OUT"
 
 if [ "$FAIL" -gt 0 ]; then
     if grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /'; then :; fi
