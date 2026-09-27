@@ -794,8 +794,8 @@ private:
 
     // What a collection's own blocks hold past what its per-element figures
     // already charge for them, so a collection is charged for its packed
-    // buffer's room, segment blocks and map, table and slots, or skiplist head
-    // however it came to hold them.
+    // buffer's room, segment blocks and map, table and slots, skiplist head, or
+    // the room its values' blocks keep, however it came to hold them.
     static size_t shape_cost(const list_inner::footprint& f)
     {
         // A packed element's bytes are charged as its string and its two length
@@ -803,7 +803,7 @@ private:
         if (f.packed)
             return list_entry_extra
                  + over(heap_chunk(f.pack_heap), f.pack_size + f.n * (list_elem_overhead - 2));
-        return list_entry_extra
+        return list_entry_extra + f.spare
              + over(f.seg.blocks * malloc_chunk(sizeof(std::string) * seg_list::B)
                     + heap_chunk(f.seg.map_cap * sizeof(std::string*)),
                     f.n * list_elem_overhead);
@@ -812,8 +812,8 @@ private:
     {
         if (f.packed)
             return over(heap_chunk(f.pack_heap), f.pack_size + f.n * (hash_field_overhead - 2));
-        return over(malloc_chunk(sizeof(hash_inner::table)) + heap_chunk(f.slots * slot_bytes),
-                    f.n * slot_bytes);
+        return f.spare + over(malloc_chunk(sizeof(hash_inner::table)) + heap_chunk(f.slots * slot_bytes),
+                              f.n * slot_bytes);
     }
     static size_t shape_cost(const zskiplist::footprint& f)
     {
@@ -845,8 +845,8 @@ private:
                         const std::string_view* old) const
     {
         if (m_max_memory == 0) return 0;
-        if (!h) return shape_cost(hash_inner{}.after_set(f.size(), vlen, nullptr));
-        return over(shape_cost(h->after_set(f.size(), vlen, old)), shape_cost(*h));
+        if (!h) return shape_cost(hash_inner{}.after_set(f, vlen, nullptr));
+        return over(shape_cost(h->after_set(f, vlen, old)), shape_cost(*h));
     }
     size_t member_growth(const zset_inner* z, double score, size_t len) const
     {

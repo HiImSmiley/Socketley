@@ -18,6 +18,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "pack_buf.h"
+
 class seg_list
 {
 public:
@@ -76,6 +78,26 @@ public:
         return s;
     }
 
+    // What the elements' blocks hold past their lengths (see spare_bytes()).
+    size_t spare() const { return size_t{m_spare} * 16; }
+    // The same after element `i` is set to `len` bytes by assign().
+    size_t spare_after_assign(size_t i, size_t len) const
+    {
+        const std::string& s = (*this)[i];
+        return spare() - size_t{units(s)} * 16
+             + size_t{units(fitted_capacity(s.capacity(), len), len)} * 16;
+    }
+    void assign(size_t i, std::string_view v)
+    {
+        std::string& s = (*this)[i];
+        m_spare -= units(s);
+        assign_fitted(s, v);
+        m_spare += units(s);
+    }
+    // The end element moved into `out` and gone, its spare with it.
+    void take_front(std::string& out) { m_spare -= units(front()); out = std::move(front()); pop_front(); }
+    void take_back(std::string& out)  { m_spare -= units(back());  out = std::move(back());  pop_back(); }
+
     std::string&       operator[](size_t i)       { return slot_at(m_off + i); }
     const std::string& operator[](size_t i) const { return slot_at(m_off + i); }
     std::string&       front()       { return (*this)[0]; }
@@ -93,6 +115,7 @@ public:
             add_block_back();
         std::string* slot = ::new (&raw_at(m_off + m_size)) std::string(std::forward<A>(a)...);
         ++m_size;
+        m_spare += units(*slot);
         return *slot;
     }
     template <class... A>
@@ -106,6 +129,7 @@ public:
         std::string* slot = ::new (&raw_at(m_off - 1)) std::string(std::forward<A>(a)...);
         --m_off;
         ++m_size;
+        m_spare += units(*slot);
         return *slot;
     }
     void push_back(std::string v)  { emplace_back(std::move(v)); }
@@ -113,6 +137,7 @@ public:
 
     void pop_front()
     {
+        m_spare -= units(front());
         front().~basic_string();
         ++m_off;
         if (--m_size == 0) { release(); return; }
@@ -127,6 +152,7 @@ public:
     }
     void pop_back()
     {
+        m_spare -= units(back());
         back().~basic_string();
         if (--m_size == 0) { release(); return; }
         if (m_off + m_size <= size_t{m_blocks - 1} * B)
@@ -217,10 +243,13 @@ public:
     {
         const size_t i = pos.m_i;
         if (i == m_size) { emplace_back(std::move(v)); return { this, i }; }
+        // Every block moves whole to a string left empty, so only `v` adds spare.
+        const uint32_t spare = m_spare;
         emplace_back(std::move(back()));
         for (size_t k = m_size - 2; k > i; --k)
             (*this)[k] = std::move((*this)[k - 1]);
         (*this)[i] = std::move(v);
+        m_spare = spare + units((*this)[i]);
         return { this, i };
     }
 
@@ -237,6 +266,14 @@ private:
     uint32_t      m_blocks{0};
     uint32_t      m_off{0};       // first element's place in the first block
     uint32_t      m_size{0};
+    // spare() in 16-byte units, in what was padding: 64 GiB before it wraps.
+    uint32_t      m_spare{0};
+
+    static uint32_t units(size_t cap, size_t len)
+    {
+        return static_cast<uint32_t>((spare_bytes(cap, len) + 15) / 16);
+    }
+    static uint32_t units(const std::string& s) { return units(s.capacity(), s.size()); }
 
     std::string& slot_at(size_t p) const
     {
@@ -313,7 +350,7 @@ private:
         std::free(m_map);
         m_map = nullptr;
         m_front_blk = m_back_blk = nullptr;
-        m_map_cap = m_head = m_blocks = m_off = m_size = 0;
+        m_map_cap = m_head = m_blocks = m_off = m_size = m_spare = 0;
     }
 
     void steal(seg_list& o) noexcept
@@ -321,7 +358,8 @@ private:
         m_front_blk = o.m_front_blk; m_back_blk = o.m_back_blk;
         o.m_front_blk = o.m_back_blk = nullptr;
         m_map = o.m_map; m_map_cap = o.m_map_cap; m_head = o.m_head;
-        m_blocks = o.m_blocks; m_off = o.m_off; m_size = o.m_size;
-        o.m_map = nullptr; o.m_map_cap = o.m_head = o.m_blocks = o.m_off = o.m_size = 0;
+        m_blocks = o.m_blocks; m_off = o.m_off; m_size = o.m_size; m_spare = o.m_spare;
+        o.m_map = nullptr; o.m_map_cap = o.m_head = o.m_blocks = o.m_off = o.m_size = o.m_spare = 0;
     }
 };
+static_assert(sizeof(seg_list) == 48, "the spare count lives in what was padding");

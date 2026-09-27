@@ -7,7 +7,6 @@
 // pointer and two lengths, with `Local` bytes of its own only where the owner
 // has them spare, and it grows by a quarter where libstdc++ doubles.
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -18,15 +17,35 @@
 #include <type_traits>
 #include <utility>
 
-// `v` into `s` in the block a fresh string of its length would take, because
-// a collection charges a value by its length and assign() keeps a larger block
-// or grows one to twice its size.
+// The capacity assign_fitted() leaves a string of capacity `cap` holding `len`
+// bytes: inside the string when it fits there, its own block while that is at
+// most twice the need and 32 bytes, libstdc++'s growth when too small, and a
+// block of exactly `len` when too large.
+inline size_t fitted_capacity(size_t cap, size_t len)
+{
+    const size_t local = std::string().capacity();
+    if (len <= local) return local;
+    if (len > cap)    return len < 2 * cap ? 2 * cap : len;
+    return cap <= 2 * len + 32 ? cap : len;
+}
+
+// `v` into `s` at fitted_capacity(), so a value that shrinks a little or
+// churns keeps its block and one that shrinks a lot gives it back.
 inline void assign_fitted(std::string& s, std::string_view v)
 {
-    if (s.capacity() == std::max(v.size(), std::string().capacity()))
+    if (v.size() > s.capacity() || fitted_capacity(s.capacity(), v.size()) == s.capacity())
         s.assign(v.data(), v.size());
     else
         std::string(v).swap(s);
+}
+
+// What a string's block holds past the one a fresh string of its length would
+// take, bounded through malloc's 8-byte header and 16-byte rounding.
+inline size_t spare_bytes(size_t cap, size_t len)
+{
+    const size_t local = std::string().capacity();
+    if (cap <= local || cap == len) return 0;
+    return len <= local ? cap + 24 - len : cap - len + 15;
 }
 
 template <uint32_t Local = 0>

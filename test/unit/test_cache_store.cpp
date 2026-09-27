@@ -3107,7 +3107,7 @@ TEST_CASE("a collection's predicted shape is the shape it takes")
     auto same_list = [](const list_items::footprint& a, const list_items::footprint& b) {
         return a.n == b.n && a.packed == b.packed && a.pack_size == b.pack_size && a.pack_heap == b.pack_heap
             && a.seg.blocks == b.seg.blocks && a.seg.map_cap == b.seg.map_cap
-            && a.seg.off == b.seg.off && a.seg.size == b.seg.size;
+            && a.seg.off == b.seg.off && a.seg.size == b.seg.size && a.spare == b.spare;
     };
 
     SUBCASE("a list pushed at either end, across the packed limits and block edges")
@@ -3146,13 +3146,26 @@ TEST_CASE("a collection's predicted shape is the shape it takes")
             l.insert(3, std::string(len, 'i'));
             CHECK(same_list(ins, l.now()));
         }
+
+        // Past the packed form, where an element keeps or refits its block.
+        list_items l;
+        for (int i = 0; i < 40; ++i) l.push_back(std::string(100, 'x'));
+        for (size_t k = 0; k < 400; ++k)
+        {
+            const size_t i   = (k * 7) % 40;
+            const size_t len = (k * 37) % 300;
+            const auto want = l.after_set(i, len);
+            l.set(i, std::string(len, 's'));
+            REQUIRE(same_list(want, l.now()));
+            if (k % 50 == 0) { l.erase(i); l.insert(i / 2, std::string(len, 'i')); }
+        }
     }
 
     SUBCASE("a hash set field by field, overwritten, and moved to its table")
     {
         auto same = [](const field_map::footprint& a, const field_map::footprint& b) {
             return a.n == b.n && a.packed == b.packed && a.pack_size == b.pack_size
-                && a.pack_heap == b.pack_heap && a.slots == b.slots;
+                && a.pack_heap == b.pack_heap && a.slots == b.slots && a.spare == b.spare;
         };
         for (size_t len : {size_t(3), size_t(64), size_t(65)})
         {
@@ -3163,7 +3176,7 @@ TEST_CASE("a collection's predicted shape is the shape it takes")
                 const std::string v(i == 140 ? len : size_t(i % 40), 'v');
                 std::string_view old;
                 const bool had = h.get(f, old);
-                const auto want = h.after_set(f.size(), v.size(), had ? &old : nullptr);
+                const auto want = h.after_set(f, v.size(), had ? &old : nullptr);
                 h.set(f, v);
                 REQUIRE(same(want, h.now()));
             }
@@ -3380,4 +3393,54 @@ TEST_CASE("a renamed key is charged as the same key made under its new name")
             fill(made, name);
             CHECK(renamed.get_memory_used() == made.get_memory_used());
         }
+}
+
+TEST_CASE("a value that churns keeps its block, and one that shrinks a lot gives it back")
+{
+    // A 100/90/110 byte churn allocated on every write while each write fitted
+    // its block exactly; the block is kept while it is at most twice the need.
+    SUBCASE("the string itself")
+    {
+        std::string s(100, 'a');
+        assign_fitted(s, std::string(90, 'b'));
+        CHECK(s.capacity() == 100);
+        assign_fitted(s, std::string(110, 'c'));
+        CHECK(s.capacity() == fitted_capacity(100, 110));
+        const char* block = s.data();
+        for (int i = 0; i < 1000; ++i)
+        {
+            const size_t len = i % 3 == 0 ? 100 : i % 3 == 1 ? 90 : 110;
+            const size_t want = fitted_capacity(s.capacity(), len);
+            assign_fitted(s, std::string(len, 'd'));
+            REQUIRE(s.capacity() == want);
+            REQUIRE(s.data() == block);
+        }
+        assign_fitted(s, std::string(40, 'e'));      // more than twice the need and 32
+        CHECK(s.capacity() == 40);
+        assign_fitted(s, std::string(1000000, 'f'));
+        assign_fitted(s, "g");
+        CHECK(s.capacity() == std::string().capacity());
+    }
+
+    // What a kept block holds past the value is charged, or a field set to
+    // 1000 bytes and then 600 held 400 more than it was charged.
+    SUBCASE("a hash field in the table form, charged for the block it keeps")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 1000; ++i)
+                REQUIRE(store.hset("h", "f" + std::to_string(i), std::string(1000, 'v')));
+            for (int i = 0; i < 1000; ++i)
+                REQUIRE(store.hset("h", "f" + std::to_string(i), std::string(600, 'w')));
+        });
+    }
+
+    SUBCASE("a list element, charged for the block it keeps")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (int i = 0; i < 1000; ++i) REQUIRE(store.rpush("l", std::string(1000, 'v')));
+            for (int i = 0; i < 1000; ++i) REQUIRE(store.lset("l", i, std::string(600, 'w')) == 0);
+        });
+    }
 }

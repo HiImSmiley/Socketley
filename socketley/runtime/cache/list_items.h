@@ -52,33 +52,36 @@ public:
         size_t          pack_size{0};
         size_t          pack_heap{0};    // the packed buffer's heap block, 0 while in place
         seg_list::shape seg{};
+        size_t          spare{0};        // the elements' blocks past their lengths
         bool            packed{true};
     };
     footprint now() const
     {
-        if (!is_packed()) return { size(), 0, 0, seg_ref().now(), false };
+        if (!is_packed()) return { size(), 0, 0, seg_ref().now(), seg_ref().spare(), false };
         const auto& p = packed_ref();
-        return { p.n, p.buf.size(), p.buf.heap_capacity(), {}, true };
+        return { p.n, p.buf.size(), p.buf.heap_capacity(), {}, 0, true };
     }
     // After one more element of `len` bytes at an end; an insert grows the
     // list as one at the back does.
     footprint after_push(size_t len, bool front) const
     {
-        if (!is_packed()) return { size() + 1, 0, 0, seg_ref().now().pushed(front), false };
+        if (!is_packed())
+            return { size() + 1, 0, 0, seg_ref().now().pushed(front), seg_ref().spare(), false };
         const auto& p = packed_ref();
         if (packs(len, p.n))
-            return { p.n + 1, p.buf.size() + len + 2, p.buf.heap_part(p.buf.capacity_for(len + 2)), {}, true };
-        return { p.n + 1, 0, 0, seg_list::built(p.n).pushed(front), false };
+            return { p.n + 1, p.buf.size() + len + 2, p.buf.heap_part(p.buf.capacity_for(len + 2)), {}, 0, true };
+        return { p.n + 1, 0, 0, seg_list::built(p.n).pushed(front), 0, false };
     }
     // After element `i` becomes `len` bytes long.
     footprint after_set(size_t i, size_t len) const
     {
-        if (!is_packed()) return now();
+        if (!is_packed())
+            return { size(), 0, 0, seg_ref().now(), seg_ref().spare_after_assign(i, len), false };
         const auto& p = packed_ref();
-        if (len > PACK_MAX_LEN) return { p.n, 0, 0, seg_list::built(p.n), false };
+        if (len > PACK_MAX_LEN) return { p.n, 0, 0, seg_list::built(p.n), 0, false };
         const size_t old = item(offset_of(i)).size();
         return { p.n, p.buf.size() - old + len,
-                 p.buf.heap_part(p.buf.capacity_for(len > old ? len - old : 0)), {}, true };
+                 p.buf.heap_part(p.buf.capacity_for(len > old ? len - old : 0)), {}, 0, true };
     }
 
     std::string_view at(size_t i) const
@@ -115,12 +118,7 @@ public:
     // LPOP on a long list read 16 ns an element slower than the deque for it.
     void pop_front(std::string& out)
     {
-        if (seg_list* s = std::get_if<1>(&m_v))
-        {
-            out = std::move(s->front());
-            s->pop_front();
-            return;
-        }
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->take_front(out); return; }
         auto& p = packed_ref();
         out.assign(item(0));
         p.buf.erase(0, next(0));
@@ -128,12 +126,7 @@ public:
     }
     void pop_back(std::string& out)
     {
-        if (seg_list* s = std::get_if<1>(&m_v))
-        {
-            out = std::move(s->back());
-            s->pop_back();
-            return;
-        }
+        if (seg_list* s = std::get_if<1>(&m_v)) { s->take_back(out); return; }
         auto& p = packed_ref();
         const size_t off = prev(p.buf.size());
         out.assign(item(off));
@@ -159,7 +152,7 @@ public:
     void set(size_t i, std::string_view v)
     {
         if (is_packed() && v.size() > PACK_MAX_LEN) unpack();
-        if (!is_packed()) { assign_fitted(seg()[i], v); return; }
+        if (!is_packed()) { seg().assign(i, v); return; }
         const size_t off = offset_of(i);
         auto& p = packed_ref();
         char f[2 + PACK_MAX_LEN];

@@ -27,7 +27,16 @@ public:
     static constexpr size_t PACK_MAX_FIELDS = 128;
     static constexpr size_t PACK_MAX_LEN    = 64;
 
-    using table = key_table<std::string>;
+    // The table form, with what its values' blocks hold past their lengths.
+    class table : public key_table<std::string>
+    {
+    public:
+        size_t spare = 0;
+        table() = default;
+        // A copy's strings are made at their length and hold nothing spare.
+        table(const table& o) : key_table<std::string>(o) {}
+        table& operator=(const table&) = delete;
+    };
     using value_type = std::pair<std::string_view, std::string_view>;
 
     field_map() = default;
@@ -58,25 +67,32 @@ public:
         size_t pack_size{0};
         size_t pack_heap{0};    // the packed buffer's heap block
         size_t slots{0};        // the table's, 0 while packed
+        size_t spare{0};        // the table's values' blocks past their lengths
         bool   packed{true};
     };
     footprint now() const
     {
-        if (m_table) return { m_table->size(), 0, 0, m_table->bucket_count(), false };
-        return { m_count, m_pack.size(), m_pack.heap_capacity(), 0, true };
+        if (m_table) return { m_table->size(), 0, 0, m_table->bucket_count(), m_table->spare, false };
+        return { m_count, m_pack.size(), m_pack.heap_capacity(), 0, 0, true };
     }
-    // After a field of `flen` bytes is set to `vlen` bytes, `old` being the
-    // value it holds now, or null for a new field.
-    footprint after_set(size_t flen, size_t vlen, const std::string_view* old) const
+    // After field `f` is set to `vlen` bytes, `old` being the value it holds
+    // now, or null for a new field.
+    footprint after_set(std::string_view f, size_t vlen, const std::string_view* old) const
     {
         const size_t n = size() + (old ? 0 : 1);
         if (m_table)
-            return { n, 0, 0, old ? m_table->bucket_count() : m_table->capacity_after_insert(), false };
-        if (!packs(flen, vlen) || (!old && m_count + 1 > PACK_MAX_FIELDS))
-            return { n, 0, 0, table::capacity_for(m_count + 1), false };
-        const size_t more = old ? (vlen > old->size() ? vlen - old->size() : 0) : 2 + flen + vlen;
-        const size_t bytes = old ? m_pack.size() - old->size() + vlen : m_pack.size() + 2 + flen + vlen;
-        return { n, bytes, m_pack.heap_part(m_pack.capacity_for(more)), 0, true };
+        {
+            if (!old) return { n, 0, 0, m_table->capacity_after_insert(), m_table->spare, false };
+            const std::string& s = m_table->find(f)->second;
+            return { n, 0, 0, m_table->bucket_count(),
+                     m_table->spare - spare_bytes(s.capacity(), s.size())
+                     + spare_bytes(fitted_capacity(s.capacity(), vlen), vlen), false };
+        }
+        if (!packs(f.size(), vlen) || (!old && m_count + 1 > PACK_MAX_FIELDS))
+            return { n, 0, 0, table::capacity_for(m_count + 1), 0, false };
+        const size_t more = old ? (vlen > old->size() ? vlen - old->size() : 0) : 2 + f.size() + vlen;
+        const size_t bytes = old ? m_pack.size() - old->size() + vlen : m_pack.size() + 2 + f.size() + vlen;
+        return { n, bytes, m_pack.heap_part(m_pack.capacity_for(more)), 0, 0, true };
     }
 
     // The value of `f`, or false.
@@ -105,7 +121,13 @@ public:
         if (m_table)
         {
             auto [it, inserted] = m_table->try_emplace(f, v);
-            if (!inserted) assign_fitted(it->second, v);
+            if (!inserted)
+            {
+                std::string& s = it->second;
+                m_table->spare -= spare_bytes(s.capacity(), s.size());
+                assign_fitted(s, v);
+                m_table->spare += spare_bytes(s.capacity(), s.size());
+            }
             return inserted;
         }
         size_t at = 0;
@@ -136,7 +158,13 @@ public:
     bool erase(std::string_view f)
     {
         if (m_table)
-            return m_table->erase(f) == 1;
+        {
+            auto it = m_table->find(f);
+            if (it == m_table->end()) return false;
+            m_table->spare -= spare_bytes(it->second.capacity(), it->second.size());
+            m_table->erase(it);
+            return true;
+        }
         size_t at = 0, end = 0;
         if (!find_packed(f, at, &end)) return false;
         m_pack.erase(at, end - at);
