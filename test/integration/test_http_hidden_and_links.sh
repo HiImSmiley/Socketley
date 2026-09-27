@@ -17,6 +17,16 @@
 # there, and a relative link that stays inside the root must still work, by its
 # own name -- --http-cache filed every link under its target's until this file;
 # each row runs against both modes.
+#
+# ─── THE NAME AS THE REQUEST SPELLS IT ──────────────────────────────────────
+#
+# The path is looked up and opened without being copied when it has no
+# percent escape, and from one decoded copy when it has, which the file system
+# then reads as a C string.  So a name is asked for plainly, with an escape,
+# with a query string, and with a %3F that decoding turns into one -- and
+# again long enough to leave the small-string buffer.  A decode skipped, or a
+# decoded name cut at its '?' by shortening the view instead of the string,
+# sends the open a name that is not the file's, and answers 404.
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -40,6 +50,7 @@ echo page > "$WWW/index.txt"
 echo SECRET=1 > "$WWW/.env"
 echo "[core]" > "$WWW/.git/config"
 echo token > "$WWW/.well-known/acme-challenge/tok"
+echo token2 > "$WWW/.well-known/acme-challenge/second-token"
 echo outside > "$SOCKETLEY_TMPD/outside.txt"
 ln -s "$SOCKETLEY_TMPD/outside.txt" "$WWW/out.txt"
 ln -s index.txt "$WWW/in.txt"
@@ -67,6 +78,15 @@ for mode in "disk:$P" "cache:$((P + 1))"; do
     ok "$(code "$port" /out.txt)" "404" "$m: a link to a file outside the root is not followed"
     ok "$(code "$port" /in.txt)" "200" "$m: a relative link that stays inside the root is"
     ok "$(code "$port" /abs.txt)" "404" "$m: an absolute link is refused, as openat2 refuses it"
+    ok "$(code "$port" /in%64ex.txt)" "200" "$m: a percent escape in an ordinary name is decoded"
+    ok "$(code "$port" '/index.txt?v=1')" "200" "$m: a query string is not part of the name"
+    ok "$(code "$port" /index.txt%3Fv=1)" "200" "$m: nor is a query string spelled %3F, once decoded"
+    # A file nothing asked for yet, twice: in disk mode the first is opened
+    # with openat2() and the second is the revalidating hit, named to statx().
+    for n in 1 2; do
+        ok "$(code "$port" /.well-known/acme-challenge/second-t%6fken%3Fx)" "200" \
+           "$m: a long name decoded and cut at its %3F, request $n"
+    done
 done
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
