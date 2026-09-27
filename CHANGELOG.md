@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A TCP proxy whose backend shut its sending side first no longer drops the
+  rest of what the client is still sending: the backend's FIN reaches the
+  client after the last byte of its answer, and the pair closes once both sides
+  have finished, as HAProxy does.
 - The proxy finds the end of a chunked response, so the next keep-alive request
   is served at once instead of after the 10 s header deadline, and the end of a
   chunked request body, so a request pipelined behind one is checked like any

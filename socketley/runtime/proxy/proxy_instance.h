@@ -298,6 +298,9 @@ struct alignas(64) proxy_backend_connection
     // stated so a TCP proxy can ask it, since response_started is never set
     // outside HTTP mode.
     bool sent_to_client{false};
+    // The backend has shut its write side, so its read is not armed again and
+    // the pair lives on for what the client still sends.
+    bool backend_eof{false};
     int client_fd{-1};
     uint32_t write_batch_count{0};
     // Bumped on every reuse and stamped into read_req, because structs and fds
@@ -702,6 +705,11 @@ private:
     // pass that half-close on to the backend.
     bool hold_tcp_half_close(proxy_client_connection* conn);
     void forward_client_half_close(proxy_client_connection* conn);
+    // And the same for a backend that has shut its write side first.
+    bool hold_backend_half_close(proxy_backend_connection* bconn);
+    void forward_backend_half_close(proxy_client_connection* cconn);
+    bool tcp_pair_done(const proxy_client_connection* c,
+                       const proxy_backend_connection* b) const;
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.

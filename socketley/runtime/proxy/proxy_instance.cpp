@@ -343,6 +343,7 @@ void proxy_backend_connection::reset(int new_fd)
     pool_draining = false;
     recv_withdrawing = false;
     sent_to_client = false;
+    backend_eof = false;
     drained_reads = 0;
     send_retries = 0;
     pool_abandoned = false;
@@ -1052,7 +1053,7 @@ bool proxy_instance::client_read_armable(const proxy_client_connection* conn) co
 
 bool proxy_instance::backend_read_armable(const proxy_backend_connection* conn) const
 {
-    return !conn->closing && !conn->splice_active;
+    return !conn->closing && !conn->splice_active && !conn->backend_eof;
 }
 
 bool proxy_instance::backend_backpressured(const proxy_client_connection* conn) const
@@ -3921,6 +3922,11 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             }
         }
 
+        // A TCP backend's clean half-close ends its own direction only, held
+        // for whatever the client is still sending.
+        if (cqe->res == 0 && hold_backend_half_close(conn))
+            return;
+
         // force: this pair has no source of further bytes and everything
         // answerable was answered above -- the answer-owed invariant found
         // this site, on a truncating backend whose framing is incomplete
@@ -6262,8 +6268,9 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
         }
     }
 
-    // Backend -> pipe_write (first leg of backend -> client)
-    if (!bconn->splice_in_pending)
+    // Backend -> pipe_write (first leg of backend -> client), which a backend
+    // at end of stream has no more of.
+    if (!bconn->splice_in_pending && !bconn->backend_eof)
     {
         bconn->splice_in_pending = true;
         if (SOCKETLEY_UNLIKELY(!arm_splice_in_poll(bconn->fd, &bconn->splice_in_req)))
@@ -6503,6 +6510,12 @@ void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
                     }
                     return;
                 }
+
+                // The backend's half-close, held as on the copy path, with
+                // nothing re-armed on this leg.
+                if (cqe->res == 0 && !conn->closing && hold_backend_half_close(conn))
+                    return;
+
                 close_pair(conn->client_fd, conn->fd);
                 return;
             }
@@ -7319,6 +7332,69 @@ void proxy_instance::forward_client_half_close(proxy_client_connection* conn)
     // TCP mode never sends one.
     if (shutdown(bfd, SHUT_WR) < 0) {}
     conn->backend_half_closed = true;
+}
+
+// A TCP backend's half-close is the mirror of the client's: its answer is over
+// but the client may still be sending, so the pair is held for the upload --
+// dropping it lost the rest of every upload a backend answered early, which
+// HAProxy relays and nginx drops unless told proxy_half_close.  Reachability
+// is asked before anything changes, as it is there.
+bool proxy_instance::hold_backend_half_close(proxy_backend_connection* bconn)
+{
+    if (m_protocol != protocol_tcp || bconn->closing || bconn->ssl != nullptr)
+        return false;
+
+    const int cfd = bconn->client_fd;
+    if (cfd < 0 || cfd >= MAX_FDS || m_conn_idx[cfd].side != conn_client)
+        return false;
+    auto* cconn = m_conn_idx[cfd].client;
+    // A TLS client is owed a close_notify, which TCP mode never sends.
+    if (cconn->closing || cconn->backend_fd != bconn->fd || cconn->ssl != nullptr)
+        return false;
+
+    // The client's direction is over and passed on, so there is nothing to
+    // hold for.
+    if (cconn->client_eof && cconn->backend_half_closed)
+        return false;
+
+    if (!client_op_in_flight(cconn) && cconn->write_queue.empty() &&
+        !backend_op_in_flight(bconn) && bconn->write_queue.empty())
+        return false;
+
+    bconn->backend_eof = true;
+    forward_backend_half_close(cconn);
+    return true;
+}
+
+// The client-side FIN, sent only once everything the backend said before it
+// has reached the client, for the ordering reason forward_client_half_close()
+// gives.
+void proxy_instance::forward_backend_half_close(proxy_client_connection* cconn)
+{
+    if (m_protocol != protocol_tcp || cconn->wr_shutdown || cconn->closing || cconn->fd < 0)
+        return;
+
+    const int bfd = cconn->backend_fd;
+    if (bfd < 0 || bfd >= MAX_FDS || m_conn_idx[bfd].side != conn_backend)
+        return;
+    const auto* bconn = m_conn_idx[bfd].backend;
+    if (!bconn->backend_eof)
+        return;
+
+    if (cconn->write_pending || !cconn->write_queue.empty() ||
+        bconn->splice_in_pending || bconn->splice_out_pending)
+        return;
+
+    cconn->wr_shutdown = true;
+    if (shutdown(cconn->fd, SHUT_WR) < 0) {}
+}
+
+// Both directions ended by their sender and both FINs passed on.
+bool proxy_instance::tcp_pair_done(const proxy_client_connection* c,
+                                   const proxy_backend_connection* b) const
+{
+    return m_protocol == protocol_tcp && c->client_eof && c->backend_half_closed &&
+           c->wr_shutdown && b->backend_eof;
 }
 
 bool proxy_instance::is_backend_available(size_t idx)
@@ -9671,7 +9747,20 @@ void proxy_instance::handle_client_write(struct io_uring_cqe* cqe, io_request* r
         return;
     }
     else
+    {
         shutdown_client_write(conn);
+
+        // The last of a half-closed backend's answer is out, so its FIN may
+        // follow, and with the client's own passed on that is the pair done.
+        forward_backend_half_close(conn);
+        if (conn->backend_fd >= 0 && conn->backend_fd < MAX_FDS &&
+            m_conn_idx[conn->backend_fd].side == conn_backend &&
+            tcp_pair_done(conn, m_conn_idx[conn->backend_fd].backend))
+        {
+            close_pair(fd, conn->backend_fd);
+            return;
+        }
+    }
 
     // Backpressure resume: if client write queue drained below threshold, restart backend reads
     if (conn->write_queue.bytes() < write_watermark_bytes() &&
@@ -9804,7 +9893,15 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
     {
         auto& he = m_conn_idx[conn->client_fd];
         if (he.side == conn_client && he.client->backend_fd == conn->fd)
+        {
             forward_client_half_close(he.client);
+            // And with the backend's own FIN already passed on, the pair is done.
+            if (tcp_pair_done(he.client, conn))
+            {
+                close_pair(conn->client_fd, fd);
+                return;
+            }
+        }
     }
 
     // Backpressure resume, never onto a socket that reported end of stream,

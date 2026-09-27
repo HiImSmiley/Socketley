@@ -14,14 +14,18 @@
 # So both peers stall at first, which fills the kernel buffers and forces the
 # proxy through partial sends and a queue, then read everything; records of
 # 1 byte to 70 KB go each way, and each side's digest must match what the
-# other side sent.  The backend half-closes only after the client's end has
-# reached it: a backend's FIN ends the pair on this proxy, as it does on
-# nginx's default, and 12 of 12 runs lost upload bytes when it came first.
+# other side sent.  Twice: once with the backend half-closing after the
+# client's end has reached it, and once with the backend half-closing the
+# moment it has sent -- a backend's FIN used to end the pair, as it does on
+# nginx's default, and 12 of 12 runs lost the rest of the upload.  Both on the
+# copy path and on the splice path, which hold a half-close in different code.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
-#   * the upstream stream reaching the backend reordered, duplicated or short
+#   * the upstream stream reaching the backend reordered, duplicated or short,
+#     or cut off by the backend's half-close
 #   * the downstream stream reaching the client the same way
+#   * a pair whose two sides have both closed left open behind them
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -30,7 +34,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib_ports.sh"
 exec 2>&1
 PASS=0; FAIL=0; TOTAL=0
-cleanup(){ [ -n "${BE_PID:-}" ] && kill "$BE_PID" 2>/dev/null || true; daemon_stop; }
+PEER_DIR=$(mktemp -d /tmp/socketley-relayorder-peer-XXXXXX)
+cleanup(){ [ -n "${BE_PID:-}" ] && kill "$BE_PID" 2>/dev/null || true; daemon_stop; rm -rf "$PEER_DIR"; }
 trap cleanup EXIT
 pass(){ TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); }
 fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; }
@@ -39,11 +44,7 @@ echo "=== Integration: a TCP proxy relays both directions in order ==="
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
 BE=$((SL_PORT_BASE + 1301)); PX=$((SL_PORT_BASE + 1302))
-daemon_isolate relayorder
-daemon_start "$BIN"
-WORK=$SOCKETLEY_TMPD
-
-cat > "$WORK/peer.py" <<'PY'
+cat > "$PEER_DIR/peer.py" <<'PY'
 import hashlib, random, socket, sys, threading, time
 
 def records(seed, total):
@@ -73,9 +74,8 @@ def drain(sock, stall, result):
     result.append((h.hexdigest(), n))
 
 def run(sock, seed, stall_send, stall_recv, tag, close_first):
-    """The client half-closes when it has sent; the backend only once it has
-    read the client's end, as an answer does -- a backend's half-close ends the
-    pair on this proxy, as it does on nginx's default."""
+    """Half-closes as soon as everything is sent, or only once the other
+    side's end has been read, as an answer does."""
     recs = records(seed, 12 << 20)
     got = []
     t = threading.Thread(target=drain, args=(sock, stall_recv, got)); t.start()
@@ -93,38 +93,69 @@ if mode == "backend":
     ls.bind(("127.0.0.1", port)); ls.listen(1)
     print("ready", flush=True)
     c, _ = ls.accept()
-    run(c, 2, 0.2, 1.0, "backend", False)   # reads late, so the proxy's upstream queues
+    run(c, 2, 0.2, 1.0, "backend", sys.argv[3] == "first")   # reads late, so the proxy's upstream queues
 else:
     c = socket.create_connection(("127.0.0.1", port))
     run(c, 1, 0.0, 1.0, "client", True)     # reads late, so the proxy's downstream queues
 PY
 
-python3 "$WORK/peer.py" backend "$BE" > "$WORK/be.out" 2>&1 &
-BE_PID=$!
-for _ in $(seq 1 50); do grep -q ready "$WORK/be.out" 2>/dev/null && break; sleep 0.1; done
-"$BIN" create proxy relayp -p "$PX" --backend "127.0.0.1:$BE" --protocol tcp -s >/dev/null 2>&1 || true
-for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PX " && break; sleep 0.1; done
+exchange(){   # backend's half-close: late | first, and the path
+    python3 "$PEER_DIR/peer.py" backend "$BE" "$1" > "$SOCKETLEY_TMPD/be.out" 2>&1 &
+    BE_PID=$!
+    for _ in $(seq 1 50); do grep -q ready "$SOCKETLEY_TMPD/be.out" 2>/dev/null && break; sleep 0.1; done
 
-CL=$(timeout 90 python3 "$WORK/peer.py" client "$PX" 2>&1 || true)
-wait "$BE_PID" 2>/dev/null || true
-BEO=$(grep '^backend' "$WORK/be.out" || true)
-echo "  $CL"
-echo "  $BEO"
+    CL=$(timeout 90 python3 "$PEER_DIR/peer.py" client "$PX" 2>&1 || true)
+    wait "$BE_PID" 2>/dev/null || true
+    BE_PID=""
+    BEO=$(grep '^backend' "$SOCKETLEY_TMPD/be.out" || true)
+    echo "  $2, backend half-closes $1:"
+    echo "    $CL"
+    echo "    $BEO"
 
-c_sent=$(sed -n 's/.*sent=\([0-9a-f]*\) \([0-9]*\).*/\1 \2/p' <<<"$CL")
-c_recv=$(sed -n 's/.*recv=\([0-9a-f-]*\) \([0-9]*\).*/\1 \2/p' <<<"$CL")
-b_sent=$(sed -n 's/.*sent=\([0-9a-f]*\) \([0-9]*\).*/\1 \2/p' <<<"$BEO")
-b_recv=$(sed -n 's/.*recv=\([0-9a-f-]*\) \([0-9]*\).*/\1 \2/p' <<<"$BEO")
+    c_sent=$(sed -n 's/.*sent=\([0-9a-f]*\) \([0-9]*\).*/\1 \2/p' <<<"$CL")
+    c_recv=$(sed -n 's/.*recv=\([0-9a-f-]*\) \([0-9]*\).*/\1 \2/p' <<<"$CL")
+    b_sent=$(sed -n 's/.*sent=\([0-9a-f]*\) \([0-9]*\).*/\1 \2/p' <<<"$BEO")
+    b_recv=$(sed -n 's/.*recv=\([0-9a-f-]*\) \([0-9]*\).*/\1 \2/p' <<<"$BEO")
 
-# ── 1. what the client sent is what the backend read ───────────────────────
-if [ -n "$c_sent" ] && [ "$c_sent" = "$b_recv" ]; then pass
-else fail "the upstream stream arrives whole and in order" "client sent '$c_sent', backend read '$b_recv'"; fi
-# ── 2. and what the backend sent is what the client read ──────────────────
-if [ -n "$b_sent" ] && [ "$b_sent" = "$c_recv" ]; then pass
-else fail "the downstream stream arrives whole and in order" "backend sent '$b_sent', client read '$c_recv'"; fi
+    # what the client sent is what the backend read
+    if [ -n "$c_sent" ] && [ "$c_sent" = "$b_recv" ]; then pass
+    else fail "the upstream stream arrives whole and in order ($2, $1)" "client sent '$c_sent', backend read '$b_recv'"; fi
+    # and what the backend sent is what the client read
+    if [ -n "$b_sent" ] && [ "$b_sent" = "$c_recv" ]; then pass
+    else fail "the downstream stream arrives whole and in order ($2, $1)" "backend sent '$b_sent', client read '$c_recv'"; fi
+}
 
-if [ "$FAIL" -gt 0 ]; then
-    grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /' || true
-fi
+phase(){   # copy | splice
+    daemon_isolate relayorder
+    if [ "$1" = splice ]; then export SOCKETLEY_PROXY_SPLICE=1; else unset SOCKETLEY_PROXY_SPLICE; fi
+    daemon_start "$BIN"
+    "$BIN" create proxy relayp -p "$PX" --backend "127.0.0.1:$BE" --protocol tcp -s >/dev/null 2>&1 || true
+    for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PX " && break; sleep 0.1; done
+
+    exchange late "$1"
+    exchange first "$1"
+
+    # Both sides have closed, so nothing of either pair may be left open.
+    local st=""
+    for _ in $(seq 1 30); do
+        st=$("$BIN" stats relayp 2>/dev/null | awk -F: '/^(connections|backend_connections):/{printf "%s=%s ", $1, $2+0}')
+        [ "$st" = "connections=0 backend_connections=0 " ] && break
+        sleep 0.1
+    done
+    if [ "$st" = "connections=0 backend_connections=0 " ]; then pass
+    else fail "both pairs are released once their sides have closed ($1)" "stats: '$st'"; fi
+
+    if [ "$FAIL" -gt 0 ]; then
+        grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /' || true
+    fi
+    daemon_stop
+    for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$PX " || break; sleep 0.1; done
+}
+
+# ── 1-5. the copy path: the backend half-closes late, then first ─────────
+phase copy
+# ── 6-10. the splice path, the same two ───────────────────────────────────
+phase splice
+
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
