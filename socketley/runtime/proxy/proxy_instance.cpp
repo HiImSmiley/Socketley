@@ -297,6 +297,8 @@ void proxy_client_connection::reset(int new_fd)
     retries_remaining = 0;
     backend_idx = 0;
     saved_request.clear();
+    parked_backend_fd = -1;
+    kept_alive = false;
     SKL_TRACE_RESET(*this);
     SKL_INV_RESET(*this);
     client_eof = false;
@@ -346,6 +348,8 @@ void proxy_backend_connection::reset(int new_fd)
     recv_withdrawing = false;
     sent_to_client = false;
     backend_eof = false;
+    parked = false;
+    parked_for = -1;
     drained_reads = 0;
     send_retries = 0;
     pool_abandoned = false;
@@ -1157,7 +1161,7 @@ void proxy_instance::withdraw_armed_backend_reads()
         // A single-shot read declines itself at the bottom of
         // handle_backend_read, and a read already being taken back for the pool
         // is spoken for by finish_pool_drain().
-        if (!b->read_pending || b->recv_withdrawing || b->pool_draining)
+        if (!b->read_pending || b->recv_withdrawing || b->pool_draining || b->parked)
             continue;
         // Only a read this proxy could arm again is worth taking back.
         if (!backend_read_armable(b))
@@ -1724,6 +1728,7 @@ bool proxy_instance::setup(event_loop& loop)
 
     m_client_count = 0;
     m_backend_count = 0;
+    m_parked_count = 0;
 
     m_loop = &loop;
     // Kept across teardown: a descriptor closed after a stop still has to be
@@ -2130,6 +2135,7 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     }
     m_client_count = 0;
     m_backend_count = 0;
+    m_parked_count = 0;
 
     // Close pooled backend connections and free their sessions, before start()
     // can build a new context -- and acquire_pooled_backend checks tls_owner
@@ -2643,6 +2649,7 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     h = inv_mix(h, c->declared_body_len);
     h = inv_mix(h, c->body_remaining);
     h = inv_mix(h, static_cast<uint64_t>(c->backend_fd));
+    h = inv_mix(h, static_cast<uint64_t>(c->parked_backend_fd));
     h = inv_mix(h, c->backend_idx);
     h = inv_mix(h, c->backend_port);
     h = inv_mix(h, static_cast<uint64_t>(c->retries_remaining));
@@ -2676,6 +2683,7 @@ uint64_t proxy_instance::inv_digest(const proxy_client_connection* c)
     f |= uint64_t(c->awaiting_headers)      << 19;
     f |= uint64_t(c->ssl != nullptr)        << 20;
     f |= uint64_t(c->backend_half_closed)   << 21;
+    f |= uint64_t(c->kept_alive)            << 22;
     return inv_mix(h, f);
 }
 
@@ -2723,6 +2731,7 @@ uint64_t proxy_instance::inv_digest(const proxy_backend_connection* b)
     // would make the one transition that travels separately invisible to the
     // progress ledger.
     f |= uint64_t(b->http_frame.overrun)             << 20;
+    f |= uint64_t(b->parked)                         << 21;
     return inv_mix(h, f);
 }
 
@@ -3819,6 +3828,13 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         return;
     }
 
+    // Idle between two requests of its client, so this is not traffic either.
+    if (SOCKETLEY_UNLIKELY(conn->parked))
+    {
+        finish_parked_read(conn, cqe, req);
+        return;
+    }
+
     // The withdrawal this turn's pacing asked for, landing.
     if (SOCKETLEY_UNLIKELY(conn->recv_withdrawing) && cqe->res == -ECANCELED)
     {
@@ -4152,6 +4168,8 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // backend connection per request -- and the group guard read
                 // slot 0, so an @group gateway never detached and every later
                 // request reached the member with the prefix still on it.
+                if (park_backend(ce.client, conn))
+                    return;
                 detach_and_pool_backend(ce.client, fd);
                 return;
             }
@@ -5747,17 +5765,7 @@ int proxy_instance::acquire_pooled_backend(size_t backend_idx, std::string_view 
         ssize_t r = recv(pb.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
         if (SOCKETLEY_UNLIKELY(r > 0))
         {
-            // Once per instance, because a backend that does this does it on
-            // every socket it has, and a client receiving somebody else's
-            // answer is what the silent version cost.
-            if (!m_pool_unbidden_warned)
-            {
-                m_pool_unbidden_warned = true;
-                LOG_WARN("proxy: a pooled backend socket had unread data on it — the backend "
-                         "sent bytes nobody asked for, or an answer this proxy judged "
-                         "finished was not.  The connection is dropped rather than reused; "
-                         "reusing it would give those bytes to the next client.");
-            }
+            warn_pool_unbidden();
             discard_pooled(pb, true);
             continue;
         }
@@ -5795,6 +5803,20 @@ void proxy_instance::arm_idle_sweep()
                       "backend sockets will not be reclaimed");
         }
     }
+}
+
+// Once per instance, because a backend that does this does it on every socket
+// it has, and a client receiving somebody else's answer is what the silent
+// version cost.
+void proxy_instance::warn_pool_unbidden()
+{
+    if (m_pool_unbidden_warned)
+        return;
+    m_pool_unbidden_warned = true;
+    LOG_WARN("proxy: a pooled backend socket had unread data on it — the backend "
+             "sent bytes nobody asked for, or an answer this proxy judged "
+             "finished was not.  The connection is dropped rather than reused; "
+             "reusing it would give those bytes to the next client.");
 }
 
 // Every path that pools a backend fd comes through here, which is where it is
@@ -5936,6 +5958,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
     // route to a backend passes through.
     if (m_protocol == protocol_http)
         arm_response_deadline(conn);
+
+    // The backend this client's last answer came from, still attached and
+    // with its read armed, before the pool is asked for anything.
+    if (conn->parked_backend_fd >= 0 && take_parked_backend(conn))
+        return true;
 
     int bfd = -1;
     const bool backend_tls = conn_backend_tls(conn);
@@ -6703,6 +6730,7 @@ inline void proxy_instance::close_pair_close_backend(int backend_fd,
     bool can_pool = cconn && backend_pool_eligible(bconn, cconn, m_backends, m_protocol) &&
                     backend_endpoint_of(cconn, m_backends, host, port);
 
+    unpark(bconn);
     m_conn_idx[backend_fd] = {};
 
     if (can_pool)
@@ -6869,6 +6897,11 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
         if (ce.side == conn_client)
         {
             auto* conn = ce.client;
+
+            // The parked backend is at a message boundary whatever ends the
+            // client, so it goes to the pool rather than down with the pair.
+            if (conn->parked_backend_fd >= 0)
+                release_parked_backend(conn);
 
             // Also close the other side of the pair
             if (conn->backend_fd >= 0 && conn->backend_fd != backend_fd && conn->backend_fd < MAX_FDS)
@@ -7214,6 +7247,207 @@ void proxy_instance::finish_pool_drain(proxy_backend_connection* conn,
     }
 }
 
+// ─── PARKED BACKENDS ────────────────────────────────────────────────────────
+// A keep-alive client's next request goes out on the backend socket its last
+// answer came from, without the cancel, the two trips through the pool and the
+// liveness probe in between -- which is HAProxy's `http-reuse safe`, kept to
+// the one shape where the next selection cannot choose another endpoint.
+
+bool proxy_instance::park_backend(proxy_client_connection* cconn,
+                                  proxy_backend_connection* bconn)
+{
+    // One plain cleartext backend, because only there is the next request's
+    // endpoint this socket's by construction, and a TLS peer's session
+    // tickets would read as bytes nobody asked for.
+    if (m_backends.size() != 1 || m_backends[0].is_group || !m_backends[0].nodes.empty() ||
+        cconn->backend_from_group || cconn->backend_idx != 0 || bconn->ssl != nullptr)
+        return false;
+    // A client that will not ask again leaves nothing to keep the socket for,
+    // and one that has not yet asked twice would mostly cost a cancel at its
+    // close instead of saving a trip through the pool.
+    if (!cconn->kept_alive || cconn->client_eof || cconn->client_conn_close ||
+        cconn->parked_backend_fd >= 0)
+        return false;
+    if (m_parked_count >= MAX_POOL_PER_BACKEND)
+        return false;
+    // Only the read may be in flight, and it must not be on its way back.
+    if (bconn->write_pending || bconn->splice_in_pending || bconn->splice_out_pending ||
+        bconn->recv_withdrawing || bconn->pool_draining)
+        return false;
+    // The pool's own test that the stream is at a message boundary.
+    if (!backend_pool_eligible(bconn, cconn, m_backends, m_protocol))
+        return false;
+    std::string_view host;
+    uint16_t port = 0;
+    if (!backend_endpoint_of(cconn, m_backends, host, port))
+        return false;
+    // The armed read is what hears a backend closing the idle socket.
+    if (!bconn->read_pending && !arm_read(bconn->fd, bconn))
+        return false;
+
+    // The key a later release files it under, read now while the client
+    // still describes this socket rather than its next selection.
+    if (bconn->pool_host != host)
+        bconn->pool_host.assign(host);
+    bconn->pool_port = port;
+    bconn->pool_backend_idx = cconn->backend_idx;
+
+    bconn->parked = true;
+    bconn->parked_for = cconn->fd;
+    bconn->client_fd = -1;
+    cconn->parked_backend_fd = bconn->fd;
+    cconn->backend_fd = -1;
+    ++m_parked_count;
+
+    reset_client_for_next_request(cconn);
+    return true;
+}
+
+bool proxy_instance::take_parked_backend(proxy_client_connection* conn)
+{
+    auto* b = parked_backend_of(conn);
+    if (!b)
+        return false;
+
+    // The selection ran afresh, so the endpoint it chose is compared with the
+    // one this socket reaches rather than assumed.
+    std::string_view host;
+    uint16_t port = 0;
+    const bool same = !conn_backend_tls(conn) &&
+                      backend_endpoint_of(conn, m_backends, host, port) &&
+                      conn->backend_idx == b->pool_backend_idx &&
+                      port == b->pool_port && host == b->pool_host;
+    if (!same || !b->read_pending)
+    {
+        release_parked_backend(conn);
+        return false;
+    }
+
+    unpark(b);
+    b->parked_for = -1;
+    conn->parked_backend_fd = -1;
+    b->client_fd = conn->fd;
+    conn->backend_fd = b->fd;
+
+    // A new exchange framed from its first byte, with a HEAD's missing body
+    // told as backend_pool_acquire tells it, and without a new generation
+    // because the armed read carries this one.
+    b->http_frame = {};
+    if (conn->method == "HEAD")
+        b->http_frame.no_body = true;
+    b->sent_to_client = false;
+    return true;
+}
+
+proxy_backend_connection* proxy_instance::parked_backend_of(proxy_client_connection* cconn)
+{
+    const int bfd = cconn->parked_backend_fd;
+    if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
+    {
+        auto* b = m_conn_idx[bfd].backend;
+        // Mutual, because a descriptor number is not an identity.
+        if (b->parked && b->parked_for == cconn->fd)
+            return b;
+    }
+    cconn->parked_backend_fd = -1;
+    return nullptr;
+}
+
+void proxy_instance::release_parked_backend(proxy_client_connection* cconn)
+{
+    auto* b = parked_backend_of(cconn);
+    if (!b)
+        return;
+    const int bfd = b->fd;
+    cconn->parked_backend_fd = -1;
+    b->parked_for = -1;
+
+    // The armed read is taken back and finish_pool_drain files the socket
+    // once that lands, the road detach_and_pool_backend takes.
+    if (b->read_pending && !b->write_pending && !b->splice_in_pending &&
+        !b->splice_out_pending && m_loop && m_loop->submit_cancel_request(&b->read_req))
+    {
+        unpark(b);
+        b->pool_draining = true;
+        b->pool_abandoned = false;
+        return;
+    }
+
+    if (!backend_op_in_flight(b))
+    {
+        unpark(b);
+        m_conn_idx[bfd] = {};
+        if (b->pool_backend_idx < m_backend_pool.size() && pool_key_ok(b->pool_host, b->pool_port))
+            release_to_pool(bfd, b->pool_backend_idx, b->pool_host, b->pool_port, b);
+        else
+        {
+            shutdown(bfd, SHUT_RDWR);
+            close_tracked(bfd);
+        }
+        if (m_backend_slots[bfd])
+        {
+            backend_pool_release(std::move(m_backend_slots[bfd]));
+            m_backend_count--;
+        }
+        return;
+    }
+
+    // A cancel the ring refused leaves the read armed, so the socket is shut
+    // and dropped instead.
+    drop_parked_backend(b);
+}
+
+void proxy_instance::drop_parked_backend(proxy_backend_connection* bconn)
+{
+    const int pf = bconn->parked_for;
+    if (pf >= 0 && pf < MAX_FDS && m_conn_idx[pf].side == conn_client &&
+        m_conn_idx[pf].client->parked_backend_fd == bconn->fd)
+        m_conn_idx[pf].client->parked_backend_fd = -1;
+    bconn->parked_for = -1;
+    bconn->closing = true;
+
+    // Still armed, so the shutdown ends that read and its completion comes
+    // back through finish_parked_read, with `parked` still set, to finish this.
+    if (backend_op_in_flight(bconn))
+    {
+        shutdown(bconn->fd, SHUT_RDWR);
+        return;
+    }
+    unpark(bconn);
+    close_pair(-1, bconn->fd);
+}
+
+void proxy_instance::unpark(proxy_backend_connection* bconn)
+{
+    if (!bconn->parked)
+        return;
+    bconn->parked = false;
+    --m_parked_count;
+}
+
+void proxy_instance::finish_parked_read(proxy_backend_connection* bconn,
+                                        struct io_uring_cqe* cqe, io_request* req)
+{
+    // The buffer belongs to the ring whatever ended the read.
+    if (cqe->flags & IORING_CQE_F_BUFFER)
+    {
+        uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+        m_loop->return_buf(BUF_GROUP_ID, buf_id);
+    }
+
+    if (!(is_multishot_recv_op(req->type) && (cqe->flags & IORING_CQE_F_MORE)))
+    {
+        bconn->read_pending = false;
+        bconn->recv_withdrawing = false;
+    }
+
+    // An EOF or an error is a backend ending an idle connection, which is
+    // ordinary and neither a failure nor anything the client asked about.
+    if (cqe->res > 0 && !bconn->closing)
+        warn_pool_unbidden();
+    drop_parked_backend(bconn);
+}
+
 void proxy_instance::reset_client_for_next_request(proxy_client_connection* cconn)
 {
     // There is no next request, said by client_eof or by client_conn_close, so
@@ -7233,6 +7467,7 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
 
     cconn->header_parsed = false;
     cconn->response_started = false;
+    cconn->kept_alive = true;
     // The exchange this connection was timed for is over, and the next request
     // arms deadlines of its own; until then it is merely idle, which is
     // --idle-timeout's business.
@@ -8709,6 +8944,16 @@ std::string proxy_instance::stats_lines() const
         out += "pooled_connections:";
         auto [p3, e3] = std::to_chars(num_buf, num_buf + sizeof(num_buf), pool_total);
         out.append(num_buf, static_cast<size_t>(p3 - num_buf));
+        out += '\n';
+    }
+
+    // Backends kept on a keep-alive client for its next request, counted in
+    // backend_connections as well, and printed only when there are some.
+    if (m_parked_count > 0)
+    {
+        out += "parked_connections:";
+        auto [p3b, e3b] = std::to_chars(num_buf, num_buf + sizeof(num_buf), m_parked_count);
+        out.append(num_buf, static_cast<size_t>(p3b - num_buf));
         out += '\n';
     }
 

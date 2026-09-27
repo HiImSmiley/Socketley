@@ -103,6 +103,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is the cache's own text, without a `lua: error:` prefix.
 - A proxied HTTP request is rewritten into a buffer its connection keeps, so
   a keep-alive connection no longer allocates and frees one per request.
+  TODO: measured effect.
+- An HTTP proxy with one backend keeps a keep-alive client's backend
+  connection for that client's next request, from its second answer on,
+  instead of returning it to the pool and probing it on the way back out, as
+  HAProxy's `http-reuse safe` does. A backend closing such an idle connection
+  costs the client nothing and is not counted against the backend's circuit
+  breaker; `stats` shows the held connections as `parked_connections`, and
+  they go to the pool when the client leaves. TODO: measured effect.
 
 ### Fixed
 

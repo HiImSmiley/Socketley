@@ -199,6 +199,12 @@ struct alignas(64) proxy_client_connection
     int retries_remaining{0};
     size_t backend_idx{0};
     std::string saved_request;
+    // The backend kept idle for this connection's next request, or -1; see
+    // proxy_instance::park_backend.
+    int parked_backend_fd{-1};
+    // An exchange on this connection has finished and it stayed open, which
+    // is the evidence park_backend waits for.
+    bool kept_alive{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -301,6 +307,9 @@ struct alignas(64) proxy_backend_connection
     // The backend has shut its write side, so its read is not armed again and
     // the pair lives on for what the client still sends.
     bool backend_eof{false};
+    // Idle between two requests of the client in parked_for, with client_fd
+    // -1 and only its read armed, so any completion means it is unusable.
+    bool parked{false};
     int client_fd{-1};
     uint32_t write_batch_count{0};
     // Bumped on every reuse and stamped into read_req, because structs and fds
@@ -346,6 +355,8 @@ struct alignas(64) proxy_backend_connection
     size_t pool_backend_idx{0};
     std::string pool_host;
     uint16_t pool_port{0};
+    // The client a parked connection is kept for, -1 otherwise.
+    int parked_for{-1};
 
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
@@ -714,6 +725,25 @@ private:
     bool tcp_pair_done(const proxy_client_connection* c,
                        const proxy_backend_connection* b) const;
     void detach_and_pool_backend(proxy_client_connection* cconn, int backend_fd);
+    // Keeping a finished backend for its client's next request, which HAProxy
+    // calls `http-reuse safe`: true when it was kept and the caller must
+    // return, with the client already reset for that request.
+    bool park_backend(proxy_client_connection* cconn, proxy_backend_connection* bconn);
+    // The parked backend reattached for the request being routed, false when
+    // there is none or the request goes to another endpoint.
+    bool take_parked_backend(proxy_client_connection* conn);
+    // The client's parked backend handed to the shared pool by the road
+    // detach_and_pool_backend takes, for a client going away or routed
+    // elsewhere.
+    void release_parked_backend(proxy_client_connection* cconn);
+    proxy_backend_connection* parked_backend_of(proxy_client_connection* cconn);
+    void drop_parked_backend(proxy_backend_connection* bconn);
+    void unpark(proxy_backend_connection* bconn);
+    // A completion on a parked backend, which is an EOF, an error or bytes
+    // nobody asked for, and is never charged to the backend.
+    void finish_parked_read(proxy_backend_connection* bconn,
+                            struct io_uring_cqe* cqe, io_request* req);
+    void warn_pool_unbidden();
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
     void finish_pool_drain(proxy_backend_connection* bconn,
@@ -989,6 +1019,10 @@ private:
     std::unique_ptr<proxy_backend_connection> m_backend_slots[MAX_FDS];
     size_t m_client_count{0};
     size_t m_backend_count{0};
+    // Backends parked on a client, a subset of m_backend_count, capped at
+    // MAX_POOL_PER_BACKEND so idle clients hold no more idle backend sockets
+    // than the pool itself would.
+    size_t m_parked_count{0};
 
     proxy_conn_entry m_conn_idx[MAX_FDS]{};
     backend_info m_scratch_backend{};
