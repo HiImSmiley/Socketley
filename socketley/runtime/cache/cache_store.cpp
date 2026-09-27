@@ -730,7 +730,12 @@ size_t cache_store::sreplace(std::string_view dest, std::vector<std::string>&& m
     s.reserve(members.size());
     for (auto& m : members) s.insert(std::move(m));
     const size_t n = s.size();
-    m_sets.emplace(std::string(dest), std::move(s));
+    // Charged as any new set, though not refused: the STORE forms have no
+    // answer for it, and the result is no larger than the sets it came from.
+    auto it = m_sets.emplace(std::string(dest), std::move(s)).first;
+    m_set_elems += n;
+    track_add(entry_cost(it->first, it->second));
+    touch_lru(dest);
     return n;
 }
 
@@ -740,26 +745,24 @@ int cache_store::smove(std::string_view src, std::string_view dst,
     if (holds_other_type(src, 't') || holds_other_type(dst, 't')) return -1;
     auto it = m_sets.find(src);
     if (it == m_sets.end()) return 0;
-    auto m = it->second.find(member);
-    if (m == it->second.end()) return 0;
+    if (it->second.find(member) == it->second.end()) return 0;
+    if (src == dst) return 1;     // Redis's no-op, where the removal below took it out
     // Taken from the source only once the destination has it, so a failure
     // between the two cannot lose the member.
-    sadd(dst, member);
-    it->second.erase(m);
-    if (it->second.empty()) m_sets.erase(it);
+    if (sadd(dst, member) < 0) return 0;
+    // sadd() may have evicted the source to make room, which srem() finds gone.
+    srem(src, member);
     return 1;
 }
 
 // ─── Whole-key operations ───
 
-namespace
-{
-// Moves or copies one key between two maps of the same kind, leaving the
-// source alone when `keep` is set.  Written once as a template because doing
-// it five times by hand is five chances to forget one container -- which has
-// already happened twice in this file, to dump_commands and to holds_other_type.
+// Written once as a template because doing it five times by hand is five
+// chances to forget one container -- which has already happened twice in this
+// file, to dump_commands and to holds_other_type.
 template <typename Map>
-bool move_one(Map& m, std::string_view src, std::string_view dst, bool keep)
+bool cache_store::move_one(Map& m, size_t* elems, std::string_view src, std::string_view dst,
+                           bool keep)
 {
     auto it = m.find(src);
     if (it == m.end())
@@ -767,17 +770,37 @@ bool move_one(Map& m, std::string_view src, std::string_view dst, bool keep)
     if (keep)
     {
         auto copy = it->second;                 // before the insert can rehash
-        m.insert_or_assign(std::string(dst), std::move(copy));
+        auto nit = m.insert_or_assign(std::string(dst), std::move(copy)).first;
+        if (elems) *elems += nit->second.size();
+        track_add(entry_cost(nit->first, nit->second));
     }
     else
     {
+        track_sub(entry_cost(it->first, it->second));
         auto held = std::move(it->second);
         m.erase(it);
-        m.insert_or_assign(std::string(dst), std::move(held));
+        auto nit = m.insert_or_assign(std::string(dst), std::move(held)).first;
+        track_add(entry_cost(nit->first, nit->second));
     }
+    touch_lru(dst);
     return true;
 }
-}  // namespace
+
+size_t cache_store::copy_cost(std::string_view src, std::string_view dst) const
+{
+    // The source's own name is in its entry_cost() and the copy's in new_key_cost().
+    const auto value = [&](const auto& it, size_t elem_overhead) {
+        return entry_cost(it->first, it->second) - stored_string(it->first)
+             + it->second.size() * elem_overhead;
+    };
+    size_t bytes = new_key_cost(dst.size()) + (m_expiry.count(src) ? expiry_entry_overhead : 0);
+    if (auto it = m_data.find(src);   it != m_data.end())   return bytes + value(it, 0);
+    if (auto it = m_lists.find(src);  it != m_lists.end())  return bytes + value(it, list_elem_overhead);
+    if (auto it = m_sets.find(src);   it != m_sets.end())   return bytes + value(it, set_elem_overhead);
+    if (auto it = m_hashes.find(src); it != m_hashes.end()) return bytes + value(it, hash_field_overhead);
+    if (auto it = m_zsets.find(src);  it != m_zsets.end())  return bytes + value(it, zset_member_overhead);
+    return bytes;
+}
 
 int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
 {
@@ -801,11 +824,13 @@ int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
     }
     drop_lru(src);
 
-    if (!move_one(m_data,   src, dst, false)
-     && !move_one(m_lists,  src, dst, false)
-     && !move_one(m_sets,   src, dst, false)
-     && !move_one(m_hashes, src, dst, false)
-     && !move_one(m_zsets,  src, dst, false))
+    // Not refused for room, since RENAME has no answer for it: what grows is
+    // the name, and it is charged.
+    if (!move_one(m_data,   nullptr,         src, dst, false)
+     && !move_one(m_lists,  &m_list_elems,   src, dst, false)
+     && !move_one(m_sets,   &m_set_elems,    src, dst, false)
+     && !move_one(m_hashes, &m_hash_fields,  src, dst, false)
+     && !move_one(m_zsets,  &m_zset_members, src, dst, false))
         return -2;
 
     // The deadline travels with the key, which is what Redis does: renaming is
@@ -822,17 +847,20 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
         return -2;
     if (src == dst)
         return 0;
-    if (exists(dst))
-    {
-        if (!replace)
-            return 0;
+    const bool taken = exists(dst);
+    if (taken && !replace)
+        return 0;
+    // Refused for room before REPLACE deletes anything, as a copy that was not
+    // made, which is the answer the callers give for a destination in the way.
+    if (!check_memory(copy_cost(src, dst), src))
+        return 0;
+    if (taken)
         del(dst);
-    }
-    if (!move_one(m_data,   src, dst, true)
-     && !move_one(m_lists,  src, dst, true)
-     && !move_one(m_sets,   src, dst, true)
-     && !move_one(m_hashes, src, dst, true)
-     && !move_one(m_zsets,  src, dst, true))
+    if (!move_one(m_data,   nullptr,         src, dst, true)
+     && !move_one(m_lists,  &m_list_elems,   src, dst, true)
+     && !move_one(m_sets,   &m_set_elems,    src, dst, true)
+     && !move_one(m_hashes, &m_hash_fields,  src, dst, true)
+     && !move_one(m_zsets,  &m_zset_members, src, dst, true))
         return -2;
     // The deadline is copied too.  This first read "COPY copies the value, not
     // the deadline", which sounded right and is not what redis-server does --
@@ -1832,7 +1860,8 @@ bool cache_store::ltrim(std::string_view key, int64_t start, int64_t stop)
     const bool keep = resolve_range(static_cast<int64_t>(dq.size()), s, e);
     if (!keep)
     {
-        for (const auto& v : dq) { track_sub(stored_string(v)); --m_list_elems; }
+        // entry_cost() is the elements too, which were once taken off here first.
+        m_list_elems -= dq.size();
         track_sub(entry_cost(it->first, it->second));
         m_lists.erase(it);
         m_expiry.erase(std::string(key));

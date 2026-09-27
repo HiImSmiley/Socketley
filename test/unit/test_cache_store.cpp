@@ -3202,3 +3202,128 @@ TEST_CASE("a collection's predicted shape is the shape it takes")
         }
     }
 }
+
+TEST_CASE("a key copied, renamed or stored is charged while it is there and given back once")
+{
+    // Each of these put a key in place without charging or counting it, and
+    // deleting it took back what had never been added: COPY and DEL of the
+    // copy, repeated, wore the figure down to nothing.
+    cache_store store;
+    REQUIRE(store.set("base", std::string(5000, 'b')));
+    const size_t base = store.get_memory_used();
+    std::string out;
+
+    auto fill = [&](std::string_view key, int type) {
+        for (int i = 0; i < 40; ++i)
+        {
+            const std::string e = std::string(70, 'e') + std::to_string(i);
+            switch (type)
+            {
+                case 0: REQUIRE(store.set(key, e)); return;
+                case 1: REQUIRE(store.rpush(key, e)); break;
+                case 2: REQUIRE(store.sadd(key, e) == 1); break;
+                case 3: REQUIRE(store.hset(key, e, e)); break;
+                default: REQUIRE(store.zadd(key, i, e) == 1); break;
+            }
+        }
+    };
+
+    SUBCASE("COPY, of every type")
+    {
+        for (int type = 0; type < 5; ++type)
+        {
+            CAPTURE(type);
+            fill("k", type);
+            const size_t one = store.get_memory_used() - base;
+            REQUIRE(store.copy_key("k", "k2", false) == 1);
+            CHECK(store.get_memory_used() >= base + 2 * one - 64);
+            REQUIRE(store.del("k2"));
+            CHECK(store.get_memory_used() == base + one);
+            REQUIRE(store.del("k"));
+            CHECK(store.get_memory_used() == base);
+        }
+    }
+
+    SUBCASE("RENAME to a longer name, of every type")
+    {
+        const std::string name(1000, 'n');
+        for (int type = 0; type < 5; ++type)
+        {
+            CAPTURE(type);
+            fill("k", type);
+            const size_t one = store.get_memory_used() - base;
+            REQUIRE(store.rename_key("k", name, false) == 1);
+            CHECK(store.get_memory_used() >= base + one + 1000);
+            REQUIRE(store.del(name));
+            CHECK(store.get_memory_used() == base);
+        }
+    }
+
+    SUBCASE("the STORE forms of set algebra")
+    {
+        fill("s1", 2);
+        const size_t one = store.get_memory_used() - base;
+        std::vector<std::string> members;
+        const std::string_view keys[] = {"s1"};
+        REQUIRE(store.sunion(keys, 1, members) == 0);
+        REQUIRE(store.sreplace("d", std::move(members)) == 40);
+        CHECK(store.get_memory_used() >= base + 2 * one - 64);
+        REQUIRE(store.del("d"));
+        CHECK(store.get_memory_used() == base + one);
+    }
+
+    SUBCASE("SMOVE, and SMOVE of the last member")
+    {
+        fill("s", 2);
+        const std::string first = std::string(70, 'e') + "0";
+        REQUIRE(store.smove("s", "d", first) == 1);
+        for (int i = 1; i < 40; ++i)
+            REQUIRE(store.smove("s", "d", std::string(70, 'e') + std::to_string(i)) == 1);
+        CHECK_FALSE(store.exists("s"));
+        REQUIRE(store.del("d"));
+        CHECK(store.get_memory_used() == base);
+    }
+
+    SUBCASE("SMOVE onto its own set leaves the member where it is")
+    {
+        fill("s", 2);
+        const std::string first = std::string(70, 'e') + "0";
+        CHECK(store.smove("s", "s", first) == 1);
+        CHECK(store.sismember("s", first));
+    }
+
+    SUBCASE("LTRIM to nothing")
+    {
+        fill("l", 1);
+        REQUIRE(store.ltrim("l", 5, 2));
+        CHECK_FALSE(store.exists("l"));
+        CHECK(store.get_memory_used() == base);
+    }
+}
+
+TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing")
+{
+    cache_store store;
+    store.set_max_memory(size_t(1) << 20);
+    store.set_eviction(evict_allkeys_lru);
+
+    SUBCASE("RENAME")
+    {
+        // The rename took the key out of the eviction order and never put
+        // it back, so it outlived every key written after it.
+        REQUIRE(store.set("old", std::string(1000, 'o')));
+        REQUIRE(store.rename_key("old", "renamed", false) == 1);
+        for (int i = 0; i < 2000 && store.exists("renamed"); ++i)
+            REQUIRE(store.set("fill" + std::to_string(i), std::string(1000, 'f')));
+        CHECK_FALSE(store.exists("renamed"));
+    }
+
+    SUBCASE("COPY past the limit")
+    {
+        store.set_eviction(evict_none);
+        REQUIRE(store.set("k", std::string(600000, 'v')));
+        CHECK(store.copy_key("k", "k2", false) == 0);
+        CHECK_FALSE(store.exists("k2"));
+        CHECK(store.get_memory_used() <= store.get_max_memory());
+    }
+}

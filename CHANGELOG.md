@@ -134,6 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The name of a sorted set created by `ZADD` and of a list created by `LMOVE`
   is counted; it was given back when the collection emptied, so each such
   round trip wore the count down by the length of the name.
+- `COPY`, `RENAME`, the `STORE` forms of set algebra, `SMOVE` and an `LTRIM`
+  to nothing keep a cache's memory count: a copy or a stored set was never
+  counted and was taken off when deleted, a rename kept the old name's size,
+  `SMOVE` never gave back what it moved, and `LTRIM` gave back every element
+  twice. Each wore the count toward zero, and the limit with it, and deleting
+  a copied list or set left the count at 16 EiB. `COPY` past the limit copies
+  nothing and answers 0, a renamed key can be evicted again, and `SMOVE` onto
+  its own set leaves the member where it is.
 
 ## [1.1.0] - 2026-08-27
 

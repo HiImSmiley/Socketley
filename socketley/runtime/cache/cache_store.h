@@ -235,6 +235,7 @@ public:
     //
     // 1 done, 0 refused because the destination exists (the NX forms), -2 the
     // source is not there.
+    // COPY answers 0 for want of room too, where RENAME is not refused for it.
     int rename_key(std::string_view src, std::string_view dst, bool nx);
     int copy_key(std::string_view src, std::string_view dst, bool replace);
 
@@ -671,6 +672,15 @@ private:
 
     // A member's score moved, with the change it makes to the set's shape.
     void rescore(zset_inner& z, std::string_view member, double old, double score);
+
+    // Moves or copies one key within its own map with the books kept,
+    // answering false when `src` is not in it; `elems` counts the map's
+    // elements, and is null for strings.
+    template <typename Map>
+    bool move_one(Map& m, size_t* elems, std::string_view src, std::string_view dst, bool keep);
+
+    // What a copy of `src` named `dst` will cost, deadline included.
+    size_t copy_cost(std::string_view src, std::string_view dst) const;
 
     // Structural cost of the containers in bytes per entry, measured on this
     // toolchain and covering the fixed part only, because the heap block a
