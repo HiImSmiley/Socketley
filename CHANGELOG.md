@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A script that stopped its own runtime from inside a callback
+  (`socketley.stop(self.name)` in `on_message`) read and popped an empty frame
+  stack once the callback returned.
 - A TCP proxy whose backend shut its sending side first no longer drops the
   rest of what the client is still sending: the backend's FIN reaches the
   client after the last byte of its answer, and the pair closes once both sides

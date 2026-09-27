@@ -395,6 +395,11 @@ private:
             rc = lua_resume(started.th, nullptr, nargs);
         }
 
+        // A script that stopped its own runtime ran forget_all() under this
+        // resume, which let the frame go with everything else.
+        if (SOCKETLEY_UNLIKELY(m_frames.empty()))
+            return outcome::failed;
+
         const frame done = m_frames.back();   // an await may have given it an id
         m_frames.pop_back();
 
