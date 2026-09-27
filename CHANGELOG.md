@@ -96,6 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A server copies a GET's `Cookie`, `Origin`, `Sec-WebSocket-Protocol` and
   `Authorization` only when the GET is a WebSocket upgrade, instead of on
   every GET: TODO%.
+- A static file served by `--http` looks its path up without copying it: a
+  path without a percent escape is no longer decoded into a new string, and
+  neither the cache lookup nor the open builds one: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

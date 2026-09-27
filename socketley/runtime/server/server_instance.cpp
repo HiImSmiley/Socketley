@@ -1184,7 +1184,7 @@ void server_instance::open_http_root()
     // which is what it did before this existed.
 }
 
-void server_instance::serve_http(server_connection* conn, std::string_view path,
+void server_instance::serve_http(server_connection* conn, const std::string& path,
                                  std::string_view range_hdr)
 {
     // Cleared per request and not per connection: under keep-alive this struct
@@ -1193,13 +1193,14 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
     // response's answer standing.
     conn->is_range = false;
 
-    // Normalize: "/" → "/index.html"
-    std::string url_path(path);
-    if (url_path == "/")
-        url_path = "/index.html";
+    // Always followed by a NUL, because it is a literal, `path` or `owned` --
+    // which is what lets the open below take it without a copy.
+    std::string owned;
+    std::string_view url_path = (path == "/") ? std::string_view("/index.html")
+                                              : std::string_view(path);
 
     // Percent-decode the path to catch %2e%2e → .. traversal
-    auto percent_decode = [](std::string& s) {
+    auto percent_decode = [](std::string_view s) {
         std::string out;
         out.reserve(s.size());
         for (size_t i = 0; i < s.size(); i++)
@@ -1222,13 +1223,19 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
             }
             out += s[i];
         }
-        s = std::move(out);
+        return out;
     };
-    percent_decode(url_path);
+    // Without a '%' the decode is the identity, so only a path that has one
+    // pays for the copy.
+    if (url_path.find('%') != std::string_view::npos)
+    {
+        owned = percent_decode(url_path);
+        url_path = owned;
+    }
 
     // Security: reject path traversal and null bytes
-    if (url_path.find("..") != std::string::npos ||
-        url_path.find('\0') != std::string::npos)
+    if (url_path.find("..") != std::string_view::npos ||
+        url_path.find('\0') != std::string_view::npos)
     {
         queue_http_response(conn, http_404_response(conn->http_keep_alive));
         if (!conn->http_keep_alive)
@@ -1238,10 +1245,16 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
         return;
     }
 
-    // Strip query string
+    // Strip query string, which the parser already split off and a decoded
+    // %3F puts back.
     auto qpos = url_path.find('?');
-    if (qpos != std::string::npos)
-        url_path = url_path.substr(0, qpos);
+    if (qpos != std::string_view::npos)
+    {
+        if (url_path.data() != owned.data())
+            owned.assign(url_path);
+        owned.resize(qpos);
+        url_path = owned;
+    }
 
     if (http_hidden_path(url_path))
     {
@@ -1290,9 +1303,8 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
         // One statx decides whether the kept bytes are still the file's, and
         // dev+ino is in the comparison because `mv` into place plus `touch -r`
         // makes an (mtime, size) check serve the old bytes forever.
-        std::string rel_path(url_path.substr(1));
-        if (rel_path.empty())
-            rel_path = ".";
+        const std::string_view rel_view = url_path.substr(1);
+        const char* rel_path = rel_view.empty() ? "." : rel_view.data();
 
         // A cached entry is the WHOLE file's response, so serving it for a
         // Range request would answer a seek with the entire body under a 200.
@@ -1308,7 +1320,7 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
             {
                 struct statx sx{};
                 const unsigned want = STATX_TYPE | STATX_INO | STATX_MTIME | STATX_SIZE;
-                if (::statx(m_http_root_fd, rel_path.c_str(), 0, want, &sx) == 0 &&
+                if (::statx(m_http_root_fd, rel_path, 0, want, &sx) == 0 &&
                     (sx.stx_mask & want) == want &&
                     S_ISREG(sx.stx_mode) &&
                     makedev(sx.stx_dev_major, sx.stx_dev_minor) == rit->second.dev &&
@@ -1342,11 +1354,11 @@ void server_instance::serve_http(server_connection* conn, std::string_view path,
         fs::path resolved;
         if (m_http_root_fd >= 0)
         {
-            const std::string& rel = rel_path;
+            const char* rel = rel_path;
             struct open_how how{};
             how.flags   = static_cast<uint64_t>(O_RDONLY | O_CLOEXEC);
             how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
-            long r = ::syscall(__NR_openat2, m_http_root_fd, rel.c_str(), &how, sizeof(how));
+            long r = ::syscall(__NR_openat2, m_http_root_fd, rel, &how, sizeof(how));
             if (r >= 0)
             {
                 ffd = static_cast<int>(r);

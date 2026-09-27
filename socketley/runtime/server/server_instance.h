@@ -23,6 +23,7 @@
 #include "../../shared/event_loop_definitions.h"
 #include "../../shared/request_channel.h"
 #include "../../shared/tls_context.h"
+#include "../../shared/transparent_string.h"
 #include <linux/time_types.h>
 
 class runtime_manager;
@@ -1010,7 +1011,7 @@ private:
     // with an empty body, so the response path is the one it always was.
     void finish_streamed_body(server_connection* conn);
 
-    void serve_http(server_connection* conn, std::string_view path,
+    void serve_http(server_connection* conn, const std::string& path,
                     std::string_view range_hdr = {});
     void handle_http_request(server_connection* conn, const http_request& req, size_t total_consumed);
     // `ends_exchange` false when bytes still follow or a refusal owns the teardown.
@@ -1429,7 +1430,7 @@ private:
         std::shared_ptr<const std::string> response;        // Connection: keep-alive
         std::shared_ptr<const std::string> response_close;  // Connection: close
     };
-    std::unordered_map<std::string, cached_file> m_http_cache;
+    std::unordered_map<std::string, cached_file, string_hash, string_equal> m_http_cache;
 
     // ─── DISK MODE'S REVALIDATING CACHE ─────────────────────────────────────
     // One statx per request to decide whether a cached response is still good
@@ -1447,7 +1448,7 @@ private:
         std::shared_ptr<const std::string> response;        // Connection: keep-alive
         std::shared_ptr<const std::string> response_close;  // Connection: close
     };
-    std::unordered_map<std::string, reval_file> m_http_reval;
+    std::unordered_map<std::string, reval_file, string_hash, string_equal> m_http_reval;
     size_t m_http_reval_bytes{0};
     bool   m_http_reval_full_logged{false};
 
