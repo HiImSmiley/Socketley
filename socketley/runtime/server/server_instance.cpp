@@ -1775,6 +1775,19 @@ void server_instance::queue_http_response(server_connection* conn,
         return;
     if (ends_exchange && !conn->http_keep_alive && send_final_and_fin(conn, *resp))
         return;
+    // Nothing ahead of it, so it goes straight into the batch that
+    // flush_write_queue() would have moved it to from the queue.
+    if (SOCKETLEY_LIKELY(conn->ssl == nullptr && conn->write_queue.empty()
+                         && !conn->write_pending && conn->write_batch_count == 0))
+    {
+        conn->write_batch[0] = socketley::write_chunk(std::move(resp));
+        conn->write_iovs[0] = { const_cast<char*>(conn->write_batch[0].data()),
+                                conn->write_batch[0].size() };
+        conn->write_batch_count = 1;
+        if (!send_direct(conn))
+            submit_batch(conn);
+        return;
+    }
     conn->write_queue.push(std::move(resp));
     if (!conn->write_pending)
         flush_write_queue(conn);
