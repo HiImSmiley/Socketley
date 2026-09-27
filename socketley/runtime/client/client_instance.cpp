@@ -291,7 +291,7 @@ connected:
 
 // The one place a read is armed, never while one already is, because both
 // would write into m_conn->read_buf.
-void client_instance::arm_read()
+void client_instance::arm_read(bool poll_first)
 {
     if (!m_loop || !m_connected || m_conn->closing || m_conn->fd < 0)
         return;
@@ -312,7 +312,8 @@ void client_instance::arm_read()
     if (m_recv_multishot)
         m_conn->read_pending = m_loop->submit_recv_multishot(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req);
     if (!m_conn->read_pending && m_use_provided_bufs)
-        m_conn->read_pending = m_loop->submit_read_provided(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req);
+        m_conn->read_pending = m_loop->submit_read_provided(m_conn->fd, BUF_GROUP_ID, &m_conn->read_req,
+                                                            poll_first);
 
     // A refused submission is the ring being momentarily full, not the peer
     // being gone -- and the arm below is the one the cache and the server fall
@@ -329,7 +330,8 @@ void client_instance::arm_read()
     {
         m_conn->read_req.type = op_read;
         m_conn->read_pending = m_loop->submit_read(m_conn->fd, m_conn->read_buf,
-                                                  sizeof(m_conn->read_buf), &m_conn->read_req);
+                                                  sizeof(m_conn->read_buf), &m_conn->read_req,
+                                                  poll_first);
     }
 
     // Nothing reached the ring at all, so no completion will arrive for this
@@ -937,7 +939,9 @@ resubmit:
         return;
     }
 
-    arm_read();
+    // A datagram socket never reports what it still holds, so there the flag's
+    // absence says nothing.
+    arm_read(!m_udp && event_loop::recv_drained(cqe));
 }
 
 // Whether the socket a read belongs to is still the one being read, asked

@@ -8181,7 +8181,8 @@ submit_next:
     if (m_loop && !uc->closing)
     {
         uc->read_pending = true;
-        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(uc->fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req)))
+        if (SOCKETLEY_UNLIKELY(!m_loop->submit_read(uc->fd, uc->read_buf, sizeof(uc->read_buf), &uc->read_req,
+                                                    event_loop::recv_drained(cqe))))
         {
             uc->read_pending = false;
             uc->closing = true;

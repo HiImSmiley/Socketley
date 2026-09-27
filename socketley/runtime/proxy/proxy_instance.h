@@ -565,8 +565,9 @@ public:
 
     // Arming a read goes through here and nowhere else, so the question that
     // decides multishot is asked in one place rather than at twenty call sites.
-    bool arm_read(int fd, proxy_client_connection* conn);
-    bool arm_read(int fd, proxy_backend_connection* conn);
+    // poll_first only where the read just completed left the socket empty.
+    bool arm_read(int fd, proxy_client_connection* conn, bool poll_first = false);
+    bool arm_read(int fd, proxy_backend_connection* conn, bool poll_first = false);
     bool earned_multishot(uint8_t drained_reads) const;
     void decline_armed_read(proxy_client_connection* conn);
     void decline_armed_read(proxy_backend_connection* conn);
@@ -607,7 +608,7 @@ private:
     // from handle_client_read and from reset_client_for_next_request, because
     // a pipelined request is already in the buffer and no further read will
     // arrive.
-    void drive_client_request(proxy_client_connection* conn, int fd);
+    void drive_client_request(proxy_client_connection* conn, int fd, bool poll_first = false);
 
     // Puts a bound on a request held back behind the exchange in flight, so that
     // a response this proxy cannot frame cannot strand one for ever.

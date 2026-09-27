@@ -35,9 +35,11 @@
 // Defined below, next to the read handlers they belong to; handle_accept needs
 // them earlier than that.
 static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connection* conn,
-                                  bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
+                                  bool recv_multishot, bool use_provided_bufs, uint16_t buf_group,
+                                  bool poll_first);
 static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backend_connection* conn,
-                                          bool recv_multishot, bool use_provided_bufs, uint16_t buf_group);
+                                          bool recv_multishot, bool use_provided_bufs, uint16_t buf_group,
+                                          bool poll_first);
 
 
 // Is this (host, port) something a backend socket may be filed under, asked in
@@ -1067,17 +1069,17 @@ bool proxy_instance::backend_backpressured(const proxy_client_connection* conn) 
 
 // Arming a read, asked of the connection rather than of the fleet, because the
 // withdrawal below asks per connection and the two have to agree.
-bool proxy_instance::arm_read(int fd, proxy_client_connection* conn)
+bool proxy_instance::arm_read(int fd, proxy_client_connection* conn, bool poll_first)
 {
     return submit_read_op(m_loop, fd, conn, m_recv_multishot || earned_multishot(conn->drained_reads),
-                          m_use_provided_bufs, BUF_GROUP_ID);
+                          m_use_provided_bufs, BUF_GROUP_ID, poll_first);
 }
 
-bool proxy_instance::arm_read(int fd, proxy_backend_connection* conn)
+bool proxy_instance::arm_read(int fd, proxy_backend_connection* conn, bool poll_first)
 {
     return submit_read_op_backend(m_loop, fd, conn,
                                   m_recv_multishot || earned_multishot(conn->drained_reads),
-                                  m_use_provided_bufs, BUF_GROUP_ID);
+                                  m_use_provided_bufs, BUF_GROUP_ID, poll_first);
 }
 
 // Below MULTISHOT_MIN_CLIENTS a TCP relay's connection is armed multishot once it
@@ -2939,7 +2941,8 @@ proxy_resubmit_accept:
 // not reach the ring, because the caller must not leave the connection marked
 // pending with no completion coming.
 static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connection* conn,
-                                   bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
+                                   bool recv_multishot, bool use_provided_bufs, uint16_t buf_group,
+                                   bool poll_first)
 {
     conn->read_pending = true;
 
@@ -2951,7 +2954,7 @@ static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connect
     if (recv_multishot)
         queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
     if (!queued && use_provided_bufs)
-        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
+        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req, poll_first);
     if (!queued)
     {
         // read_buf is already here -- it is the sixty-four kilobytes this
@@ -2960,7 +2963,8 @@ static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connect
         // multishot or provided type, and the completion handler reads exactly
         // that to decide whether the kernel re-arms or this code does.
         conn->read_req.type = op_read;
-        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req,
+                                   poll_first);
     }
 
     if (SOCKETLEY_UNLIKELY(!queued))
@@ -2969,7 +2973,8 @@ static inline bool submit_read_op(event_loop* loop, int fd, proxy_client_connect
 }
 
 static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backend_connection* conn,
-                                           bool recv_multishot, bool use_provided_bufs, uint16_t buf_group)
+                                           bool recv_multishot, bool use_provided_bufs, uint16_t buf_group,
+                                           bool poll_first)
 {
     conn->read_pending = true;
 
@@ -2981,7 +2986,7 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
     if (recv_multishot)
         queued = loop->submit_recv_multishot(fd, buf_group, &conn->read_req);
     if (!queued && use_provided_bufs)
-        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req);
+        queued = loop->submit_read_provided(fd, buf_group, &conn->read_req, poll_first);
     if (!queued)
     {
         // read_buf is already here -- it is the sixty-four kilobytes this
@@ -2990,7 +2995,8 @@ static inline bool submit_read_op_backend(event_loop* loop, int fd, proxy_backen
         // multishot or provided type, and the completion handler reads exactly
         // that to decide whether the kernel re-arms or this code does.
         conn->read_req.type = op_read;
-        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req);
+        queued = loop->submit_read(fd, conn->read_buf, sizeof(conn->read_buf), &conn->read_req,
+                                   poll_first);
     }
 
     if (SOCKETLEY_UNLIKELY(!queued))
@@ -3076,6 +3082,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
 
     auto* conn = entry.client;
+    const bool drained = event_loop::recv_drained(cqe);
 
     // The withdrawal this turn's pacing asked for, landing.  Only the
     // -ECANCELED is the withdrawal: a data completion queued ahead of it is a
@@ -3277,7 +3284,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         if (conn->partial.empty())
         {
             if (!conn->read_pending &&
-                SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                 close_pair(fd, conn->backend_fd);
             return;
         }
@@ -3321,7 +3328,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             // Pause reads if too much data buffered, resume in handle_connect
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending &&
                 conn->saved_request.size() < read_buffer_bytes())
-                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                 {
                     close_pair(fd, conn->backend_fd);
                     return;
@@ -3358,7 +3365,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             {
                 // Async connect submitted — handle_connect will forward saved data
                 if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
                         close_pair(fd, conn->backend_fd);
                         return;
@@ -3373,7 +3380,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             if (SOCKETLEY_LIKELY(!conn->closing))
             {
                 if (!conn->splice_active && !conn->read_pending)
-                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
                         close_pair(fd, conn->backend_fd);
                         return;
@@ -3414,7 +3421,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
                 // queue fills, and handle_backend_write resumes them when it
                 // drains.
                 if (!backend_backpressured(conn))
-                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                    if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                     {
                         close_pair(fd, conn->backend_fd);
                         return;
@@ -3444,7 +3451,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
     if (SOCKETLEY_UNLIKELY(conn->connect_pending))
     {
         if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-            if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+            if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
             {
                 // A submission that did not reach the ring is this proxy's
                 // shortage while a whole request waits on a handshake, so 503
@@ -3492,7 +3499,7 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
         return;
     }
 
-    drive_client_request(conn, fd);
+    drive_client_request(conn, fd, drained);
 }
 
 // See the declaration for why the answer lives on the backend.
@@ -3568,7 +3575,7 @@ void proxy_instance::bound_pipelined_hold(proxy_client_connection* conn)
 
 // See the declaration for why this is reachable from two places; everything
 // below is the same code that sat inline at the end of handle_client_read.
-void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
+void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd, bool poll_first)
 {
     // ── the tunnel ──────────────────────────────────────────────────────────
     // A tunnel is relayed rather than read, and this branch is first because
@@ -3616,7 +3623,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
             arm_header_deadline(conn);
 
             if (!conn->read_pending)
-                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, poll_first)))
                 {
                     close_pair(fd, conn->backend_fd);
                     return;
@@ -3697,7 +3704,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd)
         {
             // Async connect submitted — handle_connect will forward saved_request
             if (SOCKETLEY_LIKELY(!conn->closing) && !conn->read_pending)
-                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, poll_first)))
                 {
                     answer_gateway_failure(conn, true);
                     close_pair(fd, conn->backend_fd);
@@ -3757,7 +3764,7 @@ proxy_http_resubmit:
             // Backpressure: pause client reads while the backend write queue
             // fills, and handle_backend_write resumes them when it drains.
             if (!backend_backpressured(conn))
-                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, poll_first)))
                 {
                     // The request has gone to a backend and the pair is being
                     // torn down, which is our shortage rather than the
@@ -3784,6 +3791,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         return;
 
     auto* conn = entry.backend;
+    const bool drained = event_loop::recv_drained(cqe);
 
     // Backend fds and structs are both pooled, so the generation stamped at
     // submit time is what stops one backend's bytes being spliced into an
@@ -4015,7 +4023,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // Mid-handshake, or a record that carried no application data, so
             // re-arm and wait for the next flight.
             if (!conn->read_pending &&
-                SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                 close_pair(conn->client_fd, fd);
             return;
         }
@@ -4173,7 +4181,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // Backpressure: pause backend reads while the client write queue
             // fills, and handle_client_write resumes them when it drains.
             if (!client_backpressured(conn))
-                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn)))
+                if (SOCKETLEY_UNLIKELY(!arm_read(fd, conn, drained)))
                 {
                     close_pair(conn->client_fd, fd);
                     return;
@@ -6010,7 +6018,9 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
             }
         }
 
-        if (SOCKETLEY_UNLIKELY(!arm_read(bfd, ptr)))
+        // acquire_pooled_backend just found this socket empty, and the backend
+        // has nothing to send until this request reaches it.
+        if (SOCKETLEY_UNLIKELY(!arm_read(bfd, ptr, true)))
         {
             // Give up the backend only, because every caller keeps working
             // with conn after a false return -- and the client's half of the

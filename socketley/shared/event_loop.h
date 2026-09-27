@@ -124,7 +124,15 @@ public:
     // Direct-descriptor multishot accept: accepted fds go straight into the
     // fixed file table at IORING_FILE_INDEX_ALLOC, skipping the process fd table.
     bool submit_multishot_accept_direct(int listen_fd, io_request* req);
-    bool submit_read(int fd, char* buf, uint32_t len, io_request* req);
+    // poll_first says the last read left this socket empty, so the kernel
+    // waits for data instead of trying a receive that can only say EAGAIN.
+    bool submit_read(int fd, char* buf, uint32_t len, io_request* req, bool poll_first = false);
+    // Whether a stream receive took data and left the socket empty, which is
+    // what a caller passes as poll_first when it re-arms that socket.
+    static bool recv_drained(const struct io_uring_cqe* cqe)
+    {
+        return cqe->res > 0 && !(cqe->flags & IORING_CQE_F_SOCK_NONEMPTY);
+    }
     bool submit_write(int fd, const char* buf, uint32_t len, io_request* req);
     bool submit_writev(int fd, struct iovec* iovs, uint32_t count, io_request* req);
     bool submit_sendmsg(int fd, struct msghdr* msg, io_request* req);
@@ -162,7 +170,7 @@ public:
     // first instance to reach here decides the geometry and a later one asking
     // for different dimensions gets the existing pool and a warning.
     bool setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t buf_size);
-    bool submit_read_provided(int fd, uint16_t group_id, io_request* req);
+    bool submit_read_provided(int fd, uint16_t group_id, io_request* req, bool poll_first = false);
     // Cancel every pending operation on a descriptor in one SQE, counted
     // against that descriptor like any other submission because it too names a
     // number the kernel resolves late; close_fd() submits one when it needs
@@ -391,6 +399,8 @@ private:
     // IORING_ACCEPT_POLL_FIRST needs kernel 6.11; probed rather than assumed,
     // because an unknown ioprio bit makes the kernel refuse every accept.
     bool m_accept_poll_first{false};
+    // IORING_RECVSEND_POLL_FIRST, probed for the same reason in the same field.
+    bool m_recv_poll_first{false};
     // Whether a caller chose, which the value below cannot say because
     // "unrestricted" is both a legitimate choice and the state of having made
     // none.

@@ -136,8 +136,9 @@ private:
     [[nodiscard]] bool schedule_reconnect();
 
     bool try_connect();
-    // The one place a read is armed, and only when one is not already armed.
-    void arm_read();
+    // The one place a read is armed, and only when one is not already armed;
+    // poll_first says the read just completed left the socket empty.
+    void arm_read(bool poll_first = false);
     // The one place a write is armed, recording the descriptor so a completion
     // for a socket since lost is spotted.
     void arm_write(const char* data, uint32_t len);

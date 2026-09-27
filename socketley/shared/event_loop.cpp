@@ -175,6 +175,53 @@ static bool probe_accept_variant(bool multishot, bool poll_first)
     return ok;
 }
 
+// One real recv carrying IORING_RECVSEND_POLL_FIRST on an empty socket pair,
+// because the bit lives in sqe->ioprio and a kernel that checks that field
+// without knowing the bit fails every read that carries it with -EINVAL.
+static bool probe_recv_poll_first()
+{
+    int sv[2] = { -1, -1 };
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0)
+        return false;
+
+    struct io_uring ring;
+    if (io_uring_queue_init(4, &ring, 0) < 0)
+    {
+        close(sv[0]);
+        close(sv[1]);
+        return false;
+    }
+
+    bool ok = false;
+    char buf[16];
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (sqe)
+    {
+        io_uring_prep_recv(sqe, sv[0], buf, sizeof(buf), 0);
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+        io_uring_sqe_set_data(sqe, nullptr);
+
+        if (io_uring_submit(&ring) >= 0)
+        {
+            struct io_uring_cqe* cqe = nullptr;
+            if (io_uring_peek_cqe(&ring, &cqe) != 0)
+            {
+                ok = true;               // armed on an empty socket, as it should be
+            }
+            else
+            {
+                ok = (cqe->res >= 0);    // an immediate answer here means refusal
+                io_uring_cqe_seen(&ring, cqe);
+            }
+        }
+    }
+
+    io_uring_queue_exit(&ring);
+    close(sv[0]);
+    close(sv[1]);
+    return ok;
+}
+
 bool event_loop::supports_multishot_accept()
 {
     return probe_accept_variant(true, false);
@@ -911,6 +958,7 @@ bool event_loop::init()
     // Only worth probing when multishot itself works; the flag lives in the same
     // ioprio field and is meaningless without it.
     m_accept_poll_first = m_multishot_supported && probe_accept_variant(true, true);
+    m_recv_poll_first = probe_recv_poll_first();
 
     // Probe for advanced io_uring features
     {
@@ -1314,7 +1362,7 @@ bool event_loop::submit_multishot_accept_direct(int listen_fd, io_request* req)
     return true;
 }
 
-bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
+bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req, bool poll_first)
 {
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
@@ -1322,6 +1370,8 @@ bool event_loop::submit_read(int fd, char* buf, uint32_t len, io_request* req)
     // recv() is more efficient than read() for sockets: skips VFS layer,
     // avoids file-position locking, and enables MSG_NOSIGNAL
     io_uring_prep_recv(sqe, fd, buf, len, 0);
+    if (poll_first && m_recv_poll_first)
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
     io_uring_sqe_set_data(sqe, req);
     arm(req, raw_target(fd));
     return true;
@@ -1681,7 +1731,7 @@ bool event_loop::setup_buf_ring(uint16_t group_id, uint32_t buf_count, uint32_t 
     return true;
 }
 
-bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req)
+bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req, bool poll_first)
 {
     if (group_id >= MAX_BUF_GROUPS || !m_buf_rings[group_id].ring)
         return false;
@@ -1690,6 +1740,8 @@ bool event_loop::submit_read_provided(int fd, uint16_t group_id, io_request* req
     if (!sqe) return false;
 
     io_uring_prep_recv(sqe, fd, nullptr, m_buf_rings[group_id].buf_size, 0);
+    if (poll_first && m_recv_poll_first)
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
     sqe->flags |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = group_id;
     io_uring_sqe_set_data(sqe, req);
