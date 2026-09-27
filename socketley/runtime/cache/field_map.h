@@ -76,7 +76,7 @@ public:
         if (m_table)
         {
             auto [it, inserted] = m_table->try_emplace(f, v);
-            if (!inserted) it->second.assign(v.data(), v.size());
+            if (!inserted) assign_fitted(it->second, v);
             return inserted;
         }
         size_t at = 0;

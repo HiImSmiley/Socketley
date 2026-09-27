@@ -7,14 +7,27 @@
 // pointer and two lengths, with `Local` bytes of its own only where the owner
 // has them spare, and it grows by a quarter where libstdc++ doubles.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+
+// `v` into `s` in the block a fresh string of its length would take, because
+// a collection charges a value by its length and assign() keeps a larger block
+// or grows one to twice its size.
+inline void assign_fitted(std::string& s, std::string_view v)
+{
+    if (s.capacity() == std::max(v.size(), std::string().capacity()))
+        s.assign(v.data(), v.size());
+    else
+        std::string(v).swap(s);
+}
 
 template <uint32_t Local = 0>
 class basic_pack_buf

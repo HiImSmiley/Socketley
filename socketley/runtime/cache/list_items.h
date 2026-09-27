@@ -122,7 +122,7 @@ public:
     void set(size_t i, std::string_view v)
     {
         if (is_packed() && v.size() > PACK_MAX_LEN) unpack();
-        if (!is_packed()) { seg()[i].assign(v.data(), v.size()); return; }
+        if (!is_packed()) { assign_fitted(seg()[i], v); return; }
         const size_t off = offset_of(i);
         auto& p = packed_ref();
         char f[2 + PACK_MAX_LEN];

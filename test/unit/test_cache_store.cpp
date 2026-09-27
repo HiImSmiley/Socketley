@@ -8,6 +8,7 @@
 #include <limits>
 #include <set>
 #include <thread>
+#include <malloc.h>
 #include <unistd.h>
 
 TEST_CASE("cache_store string operations")
@@ -2813,4 +2814,101 @@ TEST_CASE("a packed list short enough to sit in place survives being moved")
     for (int i = 0; i < 20; ++i) c.push_back("more-than-fits-in-place");
     CHECK(c.at(0) == "one");
     CHECK(c.back() == "more-than-fits-in-place");
+}
+
+// What glibc's heap holds in use, arenas and mmapped blocks both, which is the
+// resident memory the reported figure is a bound on.
+namespace
+{
+    size_t heap_in_use()
+    {
+        const struct mallinfo2 m = mallinfo2();
+        return m.uordblks + m.hblkhd;
+    }
+
+    // Under ASan the allocator is not glibc's and the figure above never moves.
+    bool heap_is_visible()
+    {
+        const size_t before = heap_in_use();
+        void* volatile p = std::malloc(size_t(1) << 20);
+        const bool seen = heap_in_use() >= before + (size_t(1) << 20);
+        std::free(p);
+        return seen;
+    }
+
+    // The heap `grow` leaves held must not exceed what the store reports for
+    // it, give or take `slack` for what neither side sees exactly: freed chunks
+    // glibc keeps in its thread cache, and the key tables' own rounding.
+    template <class F>
+    void check_charged(cache_store& store, F&& grow, size_t slack = 16384)
+    {
+        if (!heap_is_visible())
+        {
+            MESSAGE("glibc's heap is not the allocator here, so there is nothing to measure");
+            return;
+        }
+        const size_t real_before = heap_in_use();
+        const size_t used_before = store.get_memory_used();
+        grow();
+        const int64_t real = static_cast<int64_t>(heap_in_use()) - static_cast<int64_t>(real_before);
+        const int64_t used = static_cast<int64_t>(store.get_memory_used()) - static_cast<int64_t>(used_before);
+        CAPTURE(real);
+        CAPTURE(used);
+        CHECK(real <= used + static_cast<int64_t>(slack));
+    }
+}
+
+TEST_CASE("a value overwritten with less keeps no buffer the store does not charge")
+{
+    // assign() keeps the buffer it has, so a field set to 100 KB and then to
+    // one byte went on holding the 100 KB while the store charged one byte, as
+    // many times over as there were fields.
+    const std::string big(100000, 'v');
+
+    SUBCASE("a hash field in the table form")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            REQUIRE(store.hset("h", "long", std::string(100, 'l')));
+            REQUIRE_FALSE(store.hash_ptr("h")->packed());
+            for (int i = 0; i < 64; ++i)
+            {
+                const std::string f = "f" + std::to_string(i);
+                REQUIRE(store.hset("h", f, big));
+                REQUIRE(store.hset("h", f, "x"));
+            }
+        });
+    }
+
+    SUBCASE("a list element set by LSET")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            REQUIRE(store.rpush("l", std::string(100, 'l')));
+            REQUIRE_FALSE(store.list_ptr("l")->packed());
+            for (int i = 0; i < 64; ++i) REQUIRE(store.rpush("l", "s"));
+            for (int i = 1; i <= 64; ++i)
+            {
+                REQUIRE(store.lset("l", i, big) == 0);
+                REQUIRE(store.lset("l", i, "x") == 0);
+            }
+        });
+    }
+
+    SUBCASE("a list element that LREM shifts into a removed element's place")
+    {
+        // The shift move-assigns each element over the one before it, and a
+        // short element moved over a long one is copied into the long one's
+        // buffer rather than taking its own.
+        cache_store store;
+        check_charged(store, [&] {
+            REQUIRE(store.rpush("l", std::string(100, 'l')));
+            for (int i = 0; i < 64; ++i) REQUIRE(store.rpush("l", "s"));
+            for (int i = 0; i < 64; ++i)
+            {
+                REQUIRE(store.lpush("l", big));
+                REQUIRE(store.lrem("l", 1, big) == 1);
+            }
+        });
+    }
 }

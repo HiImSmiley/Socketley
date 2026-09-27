@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   instead of closing without a word.
 - A worker whose control socket backs up says so once per stall, not once per
   refused frame.
+- A cache's memory limit holds against a hash field or list element set long
+  and then short: the long value's buffer stayed behind, charged as the short
+  one, so 64 fields set to 100 KB and back to one byte held 6.4 MB the cache
+  counted as 5 KB, as many times over as a client liked.
 
 ## [1.1.0] - 2026-08-27
 

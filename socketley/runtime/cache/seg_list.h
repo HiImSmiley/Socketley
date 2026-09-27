@@ -169,11 +169,13 @@ public:
     const_iterator end()   const { return { this, m_size }; }
 
     // What was behind `pos` moves up one; answers the position it named.
+    // Swapped rather than moved, since a short string moved over a long one is
+    // copied into the long one's block and would keep it.
     iterator erase(const_iterator pos)
     {
         const size_t i = pos.m_i;
         for (size_t k = i; k + 1 < m_size; ++k)
-            (*this)[k] = std::move((*this)[k + 1]);
+            (*this)[k].swap((*this)[k + 1]);
         pop_back();
         return { this, i };
     }
