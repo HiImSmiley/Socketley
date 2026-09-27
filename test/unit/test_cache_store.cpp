@@ -2692,6 +2692,48 @@ TEST_CASE("zskiplist at() lands on the same entry from either end")
     }
 }
 
+TEST_CASE("a big zskiplist keeps member bytes exactly, the empty one and NULs included")
+{
+    // A member over SMALL_MAX_LEN makes the set big at once, so every name
+    // below lives in a node's own block.
+    const std::string long_name(100, 'L');
+    const std::vector<std::string> names = {
+        long_name, std::string(), std::string("\0a", 2), std::string("a\0", 2),
+        std::string(15, 's'), std::string(16, 's'), std::string(1000, '\xff') };
+    zskiplist z;
+    std::vector<std::pair<double, std::string>> ref;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        z.emplace(static_cast<double>(i % 3), names[i]);
+        ref.emplace_back(static_cast<double>(i % 3), names[i]);
+    }
+    REQUIRE(z.big());
+    std::sort(ref.begin(), ref.end());
+    size_t k = 0;
+    for (auto e : z)
+    {
+        REQUIRE(k < ref.size());
+        CHECK(e.first == ref[k].first);
+        CHECK(e.second == ref[k].second);
+        ++k;
+    }
+    CHECK(k == ref.size());
+
+    // extract hands back the bytes, and a copy and a move keep them.
+    std::string out;
+    REQUIRE(z.extract(ref[2].first, ref[2].second, out));
+    CHECK(out == ref[2].second);
+    ref.erase(ref.begin() + 2);
+    zskiplist c(z);
+    zskiplist m(std::move(z));
+    for (const zskiplist* zz : { &c, &m })
+    {
+        size_t j = 0;
+        for (auto e : *zz) { CHECK(e.second == ref[j].second); ++j; }
+        CHECK(j == ref.size());
+    }
+}
+
 TEST_CASE("a packed list short enough to sit in place survives being moved")
 {
     list_items a;

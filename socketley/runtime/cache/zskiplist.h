@@ -95,24 +95,33 @@ private:
     // The links sit in front of the node in the same block, level 0 nearest,
     // so a step down the list reads the score it compares and the link it
     // takes next from one line or two adjacent ones.
+    // The member's bytes follow the node in the same block, where a
+    // std::string took 32 bytes of it and, past 15 bytes of name, a heap block
+    // of its own: 186 bytes a member of a million-member set against Redis's
+    // 125, which shares one sds between its skiplist and its dict.
     struct node
     {
-        value_type v;
-        node*      back{nullptr};
-        int        level{1};
+        double   score;
+        node*    back{nullptr};
+        int      level{1};
+        uint32_t len{0};
 
+        std::string_view member() const { return { reinterpret_cast<const char*>(this + 1), len }; }
         link&       L(int i)       { return reinterpret_cast<link*>(this)[-1 - i]; }
         const link& L(int i) const { return reinterpret_cast<const link*>(this)[-1 - i]; }
     };
     static_assert(sizeof(link) % alignof(node) == 0 && alignof(link) <= alignof(node));
 
-    static node* make_node(int level, double score, std::string member)
+    static node* make_node(int level, double score, std::string_view member)
     {
         const size_t front = sizeof(link) * static_cast<size_t>(level);
-        char* mem = static_cast<char*>(::operator new(front + sizeof(node)));
+        char* mem = static_cast<char*>(::operator new(front + sizeof(node) + member.size()));
         for (int i = 0; i < level; ++i)
             ::new (mem + front - sizeof(link) * static_cast<size_t>(i + 1)) link{};
-        return ::new (mem + front) node{ value_type(score, std::move(member)), nullptr, level };
+        node* n = ::new (mem + front) node{ score, nullptr, level, static_cast<uint32_t>(member.size()) };
+        if (!member.empty())
+            std::memcpy(n + 1, member.data(), member.size());
+        return n;
     }
     static void destroy(node* n)
     {
@@ -138,7 +147,7 @@ public:
 
         entry operator*() const
         {
-            if (m_owner->big()) return { m_p->v.first, m_p->v.second };
+            if (m_owner->big()) return { m_p->score, m_p->member() };
             return { m_owner->score_at(m_off), m_owner->member_at(m_off) };
         }
         arrow operator->() const { return { **this }; }
@@ -215,11 +224,11 @@ public:
             }
             promote();
         }
-        insert_big(score, std::move(member));
+        insert_big(score, member);
     }
 
 private:
-    void insert_big(double score, std::string member)
+    void insert_big(double score, std::string_view member)
     {
         node*  update[max_level];
         size_t rank[max_level];
@@ -227,7 +236,7 @@ private:
         for (int i = m_level - 1; i >= 0; --i)
         {
             rank[i] = (i == m_level - 1) ? 0 : rank[i + 1];
-            while (x->L(i).fwd && less(x->L(i).fwd->v, score, member))
+            while (x->L(i).fwd && less(x->L(i).fwd, score, member))
             {
                 rank[i] += x->L(i).span;
                 x = x->L(i).fwd;
@@ -247,7 +256,7 @@ private:
             m_level = static_cast<uint8_t>(lvl);
         }
 
-        node* n = make_node(lvl, score, std::move(member));
+        node* n = make_node(lvl, score, member);
         for (int i = 0; i < lvl; ++i)
         {
             n->L(i).fwd         = update[i]->L(i).fwd;
@@ -292,12 +301,12 @@ public:
         node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            while (x->L(i).fwd && less(x->L(i).fwd->v, score, member))
+            while (x->L(i).fwd && less(x->L(i).fwd, score, member))
                 x = x->L(i).fwd;
             update[i] = x;
         }
         x = x->L(0).fwd;
-        if (!x || x->v.first != score || x->v.second != member)
+        if (!x || x->score != score || x->member() != member)
             return false;
 
         for (int i = 0; i < m_level; ++i)
@@ -315,7 +324,7 @@ public:
         if (x->L(0).fwd) x->L(0).fwd->back = x->back;
         else              m_big.head->back = x->back;
         while (m_level > 1 && !m_big.head->L(m_level - 1).fwd) --m_level;
-        out = std::move(x->v.second);
+        out.assign(x->member());
         destroy(x);
         --m_count;
         return true;
@@ -338,13 +347,13 @@ public:
         const node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
-            while (x->L(i).fwd && less_eq(x->L(i).fwd->v, score, member))
+            while (x->L(i).fwd && less_eq(x->L(i).fwd, score, member))
             {
                 r += x->L(i).span;
                 x = x->L(i).fwd;
             }
         }
-        if (x != m_big.head && x->v.first == score && x->v.second == member)
+        if (x != m_big.head && x->score == score && x->member() == member)
             return r - 1;
         return npos;
     }
@@ -402,8 +411,8 @@ public:
         for (int i = m_level - 1; i >= 0; --i)
         {
             while (x->L(i).fwd &&
-                   (inclusive ? x->L(i).fwd->v.first <  min
-                              : x->L(i).fwd->v.first <= min))
+                   (inclusive ? x->L(i).fwd->score <  min
+                              : x->L(i).fwd->score <= min))
                 x = x->L(i).fwd;
         }
         return const_iterator(x->L(0).fwd, this);
@@ -412,15 +421,15 @@ public:
 private:
     // Ordered by score, then by member -- the same order the pair gave, and the
     // reason two members with one score stay apart and stay stable.
-    static bool less(const value_type& a, double score, std::string_view member)
+    static bool less(const node* a, double score, std::string_view member)
     {
-        if (a.first != score) return a.first < score;
-        return a.second < member;
+        if (a->score != score) return a->score < score;
+        return a->member() < member;
     }
-    static bool less_eq(const value_type& a, double score, std::string_view member)
+    static bool less_eq(const node* a, double score, std::string_view member)
     {
-        if (a.first != score) return a.first < score;
-        return a.second <= member;
+        if (a->score != score) return a->score < score;
+        return a->member() <= member;
     }
 
     // ─── The packed form, per member: [tag][score][length][member][size].
@@ -505,14 +514,14 @@ private:
         items.reserve(m_count);
         for (size_t off = 0; off < m_pack.size(); off = next_off(off))
             items.emplace_back(score_at(off), std::string(member_at(off)));
-        node* head = make_node(max_level, 0.0, std::string());
+        node* head = make_node(max_level, 0.0, {});
         m_pack.~pack_buf();
         m_big.head = head;
         m_big.aux  = nullptr;
         m_count = 0;
         m_level = 1;
         for (auto& [sc, member] : items)
-            insert_big(sc, std::move(member));
+            insert_big(sc, member);
     }
 
     // Everything this holds, leaving neither form alive.

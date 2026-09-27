@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   8, as Redis's listpack does, and no longer carries the index pointer only a
   large one uses: 133 bytes a five-member set against Redis's 136.
 - ZREVRANGE on a small sorted set is 67% faster and ZINCRBY 58% faster.
+- A large sorted set keeps each member's name inside its skiplist node: 138
+  bytes a member of a million-member set instead of 186 (Redis 125), and
+  ZADD into it 9% faster.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 - The proxy sends a relayed message directly when nothing is queued ahead of
