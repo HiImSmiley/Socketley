@@ -679,8 +679,10 @@ private:
     template <typename Map>
     bool move_one(Map& m, size_t* elems, std::string_view src, std::string_view dst, bool keep);
 
-    // What a copy of `src` named `dst` will cost, deadline included.
-    size_t copy_cost(std::string_view src, std::string_view dst) const;
+    // What a key's value holds in the books, its elements' overheads included,
+    // and what the whole key does, name, LRU and deadline too; 0 if absent.
+    size_t value_cost(std::string_view key) const;
+    size_t key_cost(std::string_view key) const;
 
     // Structural cost of the containers in bytes per entry, measured on this
     // toolchain and covering the fixed part only, because the heap block a

@@ -776,30 +776,37 @@ bool cache_store::move_one(Map& m, size_t* elems, std::string_view src, std::str
     }
     else
     {
-        track_sub(entry_cost(it->first, it->second));
+        // The value moves whole, its blocks and capacities with it, so only
+        // the name's cost changes and a rename stays O(1).
+        track_sub(stored_string(it->first));
         auto held = std::move(it->second);
         m.erase(it);
-        auto nit = m.insert_or_assign(std::string(dst), std::move(held)).first;
-        track_add(entry_cost(nit->first, nit->second));
+        m.insert_or_assign(std::string(dst), std::move(held));
+        track_add(stored_string(dst));
     }
     touch_lru(dst);
     return true;
 }
 
-size_t cache_store::copy_cost(std::string_view src, std::string_view dst) const
+size_t cache_store::value_cost(std::string_view key) const
 {
-    // The source's own name is in its entry_cost() and the copy's in new_key_cost().
     const auto value = [&](const auto& it, size_t elem_overhead) {
         return entry_cost(it->first, it->second) - stored_string(it->first)
              + it->second.size() * elem_overhead;
     };
-    size_t bytes = new_key_cost(dst.size()) + (m_expiry.count(src) ? expiry_entry_overhead : 0);
-    if (auto it = m_data.find(src);   it != m_data.end())   return bytes + value(it, 0);
-    if (auto it = m_lists.find(src);  it != m_lists.end())  return bytes + value(it, list_elem_overhead);
-    if (auto it = m_sets.find(src);   it != m_sets.end())   return bytes + value(it, set_elem_overhead);
-    if (auto it = m_hashes.find(src); it != m_hashes.end()) return bytes + value(it, hash_field_overhead);
-    if (auto it = m_zsets.find(src);  it != m_zsets.end())  return bytes + value(it, zset_member_overhead);
-    return bytes;
+    if (auto it = m_data.find(key);   it != m_data.end())   return value(it, 0);
+    if (auto it = m_lists.find(key);  it != m_lists.end())  return value(it, list_elem_overhead);
+    if (auto it = m_sets.find(key);   it != m_sets.end())   return value(it, set_elem_overhead);
+    if (auto it = m_hashes.find(key); it != m_hashes.end()) return value(it, hash_field_overhead);
+    if (auto it = m_zsets.find(key);  it != m_zsets.end())  return value(it, zset_member_overhead);
+    return 0;
+}
+
+size_t cache_store::key_cost(std::string_view key) const
+{
+    return stored_string(key) + key_entry_overhead + value_cost(key)
+         + (m_lru_map.count(key) ? lru_entry_overhead + lru_key_copies(key.size()) : 0)
+         + (m_expiry.count(key) ? expiry_entry_overhead : 0);
 }
 
 int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
@@ -852,8 +859,17 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
         return 0;
     // Refused for room before REPLACE deletes anything, as a copy that was not
     // made, which is the answer the callers give for a destination in the way.
-    if (!check_memory(copy_cost(src, dst), src))
-        return 0;
+    if (m_max_memory != 0)
+    {
+        const size_t need  = new_key_cost(dst.size()) + value_cost(src)
+                           + (m_expiry.count(src) ? expiry_entry_overhead : 0);
+        const size_t freed = taken ? key_cost(dst) : 0;   // what REPLACE gives back
+        if (need > freed && !check_memory(need - freed, src))
+            return 0;
+        // Eviction may have taken the destination, whose room was then counted twice.
+        if (taken && !exists(dst) && !check_memory(need, src))
+            return 0;
+    }
     if (taken)
         del(dst);
     if (!move_one(m_data,   nullptr,         src, dst, true)

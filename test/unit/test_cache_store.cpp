@@ -3326,4 +3326,58 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
         CHECK_FALSE(store.exists("k2"));
         CHECK(store.get_memory_used() <= store.get_max_memory());
     }
+
+    SUBCASE("COPY REPLACE onto a larger destination, which it frees")
+    {
+        // Admitted as if the destination stayed, this answered 0 where Redis
+        // copies: 700 KB and 200 KB fit a megabyte, and so do 200 KB twice.
+        store.set_eviction(evict_none);
+        REQUIRE(store.set("k2", std::string(700000, 'd')));
+        REQUIRE(store.set("k", std::string(200000, 'v')));
+        CHECK(store.copy_key("k", "k2", true) == 1);
+        CHECK(store.strlen_key("k2") == 200000);
+        CHECK(store.get_memory_used() <= store.get_max_memory());
+    }
+
+    SUBCASE("a refused COPY REPLACE leaves the destination alone")
+    {
+        store.set_eviction(evict_none);
+        REQUIRE(store.set("k2", std::string(100000, 'd')));
+        REQUIRE(store.set("k", std::string(600000, 'v')));
+        CHECK(store.copy_key("k", "k2", true) == 0);
+        CHECK(store.strlen_key("k2") == 100000);
+        CHECK(store.get_memory_used() <= store.get_max_memory());
+    }
+}
+
+TEST_CASE("a renamed key is charged as the same key made under its new name")
+{
+    // RENAME moves the value whole, so only the name's cost may change.
+    const std::string name(1000, 'n');
+    for (int limit = 0; limit < 2; ++limit)
+        for (int type = 0; type < 5; ++type)
+        {
+            CAPTURE(limit);
+            CAPTURE(type);
+            auto fill = [&](cache_store& s, const std::string& key) {
+                if (limit) { s.set_max_memory(size_t(1) << 30); s.set_eviction(evict_allkeys_lru); }
+                for (int i = 0; i < 300; ++i)
+                {
+                    const std::string e = std::string(i % 90, 'e') + std::to_string(i);
+                    switch (type)
+                    {
+                        case 0: REQUIRE(s.set(key, e)); break;
+                        case 1: REQUIRE(s.rpush(key, e)); break;
+                        case 2: REQUIRE(s.sadd(key, e) == 1); break;
+                        case 3: REQUIRE(s.hset(key, e, e)); break;
+                        default: REQUIRE(s.zadd(key, i, e) == 1); break;
+                    }
+                }
+            };
+            cache_store renamed, made;
+            fill(renamed, "k");
+            REQUIRE(renamed.rename_key("k", name, false) == 1);
+            fill(made, name);
+            CHECK(renamed.get_memory_used() == made.get_memory_used());
+        }
 }

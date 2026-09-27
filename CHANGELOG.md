@@ -140,8 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SMOVE` never gave back what it moved, and `LTRIM` gave back every element
   twice. Each wore the count toward zero, and the limit with it, and deleting
   a copied list or set left the count at 16 EiB. `COPY` past the limit copies
-  nothing and answers 0, a renamed key can be evicted again, and `SMOVE` onto
-  its own set leaves the member where it is.
+  nothing and answers 0, counting what `REPLACE` frees, a renamed key can be
+  evicted again, and `SMOVE` onto its own set leaves the member where it is.
 
 ## [1.1.0] - 2026-08-27
 
