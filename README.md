@@ -600,6 +600,12 @@ with 16 bits of the key's hash above it, and one block holding a 4-byte key
 length, the value and the key's bytes. A small sorted set stores whole-number
 scores in 1, 2 or 4 bytes, as Redis's listpack does.
 
+One collection of 1,000,000 members with 16-byte names, worker RSS over the
+load against Redis's `used_memory`: a sorted set costs 90 bytes
+a member against Redis's 125, a hash 85 against 87 and a set 53 against 72.
+A big sorted set keeps each name once, inside its skiplist node, and finds a
+member through an index of the nodes themselves.
+
 The key count matters: at 100,000 keys every row reads about 45 bytes more
 (string 128 B, sorted set 180 B), evenly across shapes. About 4 of those are
 the slot table, which has just doubled there; the rest is some 4.5 MB the
