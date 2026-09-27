@@ -25,6 +25,7 @@
 // ordered walk the rest of the store does is unchanged: follow level 0.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -42,8 +43,8 @@ class zskiplist
 public:
     using value_type = std::pair<double, std::string>;
 
-    // A small set is one sorted buffer of [score][length][member][length] and
-    // has no head at all: the head's 32 links alone were 512 bytes, three times
+    // A small set is one sorted buffer of [tag][score][length][member][size]
+    // and has no head at all: the head's 32 links alone were 512 bytes, three times
     // what Redis spends on a whole five-member set, and a vector of pairs was
     // still 40 bytes a member before its name.  Past SMALL_MAX members, or a
     // member past SMALL_MAX_LEN bytes, it becomes the skiplist for good.
@@ -405,19 +406,45 @@ private:
         return a.second <= member;
     }
 
-    // ─── The packed form: [8-byte score][length][member][length] per member,
-    //     the trailing length walking back as the leading one walks forward ───
+    // ─── The packed form, per member: [tag][score][length][member][size].
+    //     A whole-number score that fits an int8, int16 or int32 is stored as
+    //     one, 1, 2 or 4 bytes, and anything else as the 8-byte double -- the
+    //     tag is log2 of the width.  Redis's listpack does the same, and five
+    //     members scored 0-4 went from 85 bytes to 55, a 96-byte malloc chunk
+    //     to a 64.  The last byte is the entry's whole size, so a walk back
+    //     reads it as a walk forward reads the tag. ───
 
-    double score_at(size_t off) const
+    static unsigned char score_tag(double s)
     {
-        double d;
-        std::memcpy(&d, m_pack.data() + off, sizeof d);
-        return d;
+        // -0.0 compares equal to 0 and would come back as +0; it stays a double.
+        if (!(s >= -2147483648.0 && s <= 2147483647.0) || s != static_cast<double>(static_cast<int32_t>(s)) ||
+            (s == 0.0 && std::signbit(s)))
+            return 3;
+        const int32_t v = static_cast<int32_t>(s);
+        if (v >= INT8_MIN && v <= INT8_MAX)   return 0;
+        if (v >= INT16_MIN && v <= INT16_MAX) return 1;
+        return 2;
     }
-    size_t mlen_at(size_t off) const { return static_cast<unsigned char>(m_pack[off + 8]); }
-    std::string_view member_at(size_t off) const { return { m_pack.data() + off + 9, mlen_at(off) }; }
-    size_t next_off(size_t off) const { return off + 10 + mlen_at(off); }
-    size_t prev_off(size_t end) const { return end - 10 - static_cast<unsigned char>(m_pack[end - 1]); }
+    static size_t score_width(unsigned char tag) { return size_t{1} << tag; }
+
+    static double decode_score(const char* p, unsigned char tag)
+    {
+        switch (tag)
+        {
+            case 0: return static_cast<int8_t>(p[0]);
+            case 1: { int16_t v; std::memcpy(&v, p, 2); return v; }
+            case 2: { int32_t v; std::memcpy(&v, p, 4); return v; }
+            default: { double d; std::memcpy(&d, p, 8); return d; }
+        }
+    }
+
+    unsigned char tag_at(size_t off) const { return static_cast<unsigned char>(m_pack[off]); }
+    double score_at(size_t off) const { return decode_score(m_pack.data() + off + 1, tag_at(off)); }
+    size_t len_off(size_t off) const { return off + 1 + score_width(tag_at(off)); }
+    size_t mlen_at(size_t off) const { return static_cast<unsigned char>(m_pack[len_off(off)]); }
+    std::string_view member_at(size_t off) const { return { m_pack.data() + len_off(off) + 1, mlen_at(off) }; }
+    size_t next_off(size_t off) const { return len_off(off) + 2 + mlen_at(off); }
+    size_t prev_off(size_t end) const { return end - static_cast<unsigned char>(m_pack[end - 1]); }
 
     // The first entry not ordered before (score, member): its position and
     // offset, the pack's end when there is none.
@@ -434,34 +461,41 @@ private:
 
     void small_insert(size_t off, double score, std::string_view member)
     {
-        char e[10 + SMALL_MAX_LEN];
-        std::memcpy(e, &score, 8);
-        e[8] = static_cast<char>(member.size());
-        std::memcpy(e + 9, member.data(), member.size());
-        e[9 + member.size()] = static_cast<char>(member.size());
-        m_pack.insert(off, e, 10 + member.size());
+        char e[1 + 8 + 1 + SMALL_MAX_LEN + 1];
+        const unsigned char tag = score_tag(score);
+        e[0] = static_cast<char>(tag);
+        switch (tag)
+        {
+            case 0: e[1] = static_cast<char>(static_cast<int8_t>(score)); break;
+            case 1: { const int16_t v = static_cast<int16_t>(score); std::memcpy(e + 1, &v, 2); break; }
+            case 2: { const int32_t v = static_cast<int32_t>(score); std::memcpy(e + 1, &v, 4); break; }
+            default: std::memcpy(e + 1, &score, 8); break;
+        }
+        size_t n = 1 + score_width(tag);
+        e[n++] = static_cast<char>(member.size());
+        std::memcpy(e + n, member.data(), member.size());
+        n += member.size();
+        e[n] = static_cast<char>(n + 1);
+        m_pack.insert(off, e, n + 1);
         ++m_count;
     }
 
     // The packed members, in order, into a skiplist with a head of its own.
     void promote()
     {
+        // Read out through the helpers while the pack is still the member.
+        std::vector<value_type> items;
+        items.reserve(m_count);
+        for (size_t off = 0; off < m_pack.size(); off = next_off(off))
+            items.emplace_back(score_at(off), std::string(member_at(off)));
         node* head = make_node(max_level, 0.0, std::string());
-        pack_buf pack(std::move(m_pack));
         m_pack.~pack_buf();
-        const size_t n = m_count;
         m_big.head = head;
         m_big.tail = nullptr;
         m_count = 0;
         m_level = 1;
-        for (size_t off = 0, k = 0; k < n; ++k)
-        {
-            double sc;
-            std::memcpy(&sc, pack.data() + off, 8);
-            const size_t len = static_cast<unsigned char>(pack[off + 8]);
-            insert_big(sc, std::string(pack.data() + off + 9, len));
-            off += 10 + len;
-        }
+        for (auto& [sc, member] : items)
+            insert_big(sc, std::move(member));
     }
 
     // Everything this holds, leaving neither form alive.

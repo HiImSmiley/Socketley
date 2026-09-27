@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A cache key's entry holds its key as a 4-byte length instead of a 16-byte
   view, 16 bytes less a string, hash or list key: a string key is 85 bytes
   against Redis's 104, a five-field hash 165 against 168.
+- A small sorted set stores a whole-number score in 1, 2 or 4 bytes instead of
+  8, as Redis's listpack does.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 - The proxy sends a relayed message directly when nothing is queued ahead of

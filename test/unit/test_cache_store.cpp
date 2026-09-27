@@ -1,4 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <cstring>
+#include <algorithm>
 #include "doctest.h"
 #include "../../socketley/runtime/cache/cache_store.h"
 #include <deque>
@@ -2524,6 +2526,83 @@ TEST_CASE("zskiplist moves and copies between its small and big forms")
             c.emplace(2.0, "x");
             CHECK(c.rank(2.0, "x") == 0);
         }
+}
+
+TEST_CASE("a small zskiplist keeps every score exactly through its compact widths")
+{
+    // Each side of every width's edge, the signs, the non-integers and the
+    // values no integer holds; -0.0 last-but-not-least, since it compares equal
+    // to 0 and an integer encoding would bring it back positive.
+    const double scores[] = {
+        0.0, -0.0, 1.0, -1.0, 127.0, 128.0, -128.0, -129.0,
+        32767.0, 32768.0, -32768.0, -32769.0,
+        2147483647.0, 2147483648.0, -2147483648.0, -2147483649.0,
+        0.5, -2.25, 1e300, -1e300, 4503599627370497.0,
+        std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::denorm_min() };
+    auto same_bits = [](double a, double b) { return std::memcmp(&a, &b, sizeof a) == 0; };
+
+    zskiplist z;
+    std::vector<std::pair<double, std::string>> ref;
+    int i = 0;
+    for (const double sc : scores)
+    {
+        std::string m = "m" + std::to_string(i++);
+        z.emplace(sc, m);
+        ref.emplace_back(sc, std::move(m));
+    }
+    std::sort(ref.begin(), ref.end());
+    REQUIRE_FALSE(z.big());
+    REQUIRE(z.size() == ref.size());
+
+    auto check_all = [&](const zskiplist& zz) {
+        size_t k = 0;
+        for (auto e : zz)
+        {
+            REQUIRE(k < ref.size());
+            // Which of 0.0 and -0.0 sorts first is a matter of member name,
+            // so the member decides which reference the score is checked on.
+            const auto rit = std::find_if(ref.begin(), ref.end(), [&](const auto& r) { return r.second == e.second; });
+            REQUIRE(rit != ref.end());
+            CHECK(same_bits(e.first, rit->first));
+            CHECK(zz.rank(rit->first, rit->second) == k);
+            ++k;
+        }
+        CHECK(k == ref.size());
+    };
+    check_all(z);
+
+    // Backwards over the same entries, which walks the trailing size byte.
+    std::vector<std::string> back;
+    for (auto it = z.last();; --it)
+    {
+        back.emplace_back((*it).second);
+        if (it == z.begin()) break;
+    }
+    std::vector<std::string> fwd;
+    for (auto e : z) fwd.emplace_back(e.second);
+    std::reverse(back.begin(), back.end());
+    CHECK(back == fwd);
+
+    // Removing from the middle keeps the neighbours' encodings readable.
+    for (const auto& r : std::vector<std::pair<double, std::string>>(ref))
+        if (r.first == 32768.0 || r.first == 0.5)
+        {
+            CHECK(z.erase(r.first, r.second) == 1);
+            ref.erase(std::find(ref.begin(), ref.end(), r));
+        }
+    check_all(z);
+
+    // And through the move to the skiplist, scores still bit for bit.
+    for (int j = 0; j < static_cast<int>(zskiplist::SMALL_MAX) + 10; ++j)
+    {
+        std::string m = "fill" + std::to_string(j);
+        z.emplace(1000.0 + j, m);
+        ref.emplace_back(1000.0 + j, std::move(m));
+    }
+    std::sort(ref.begin(), ref.end());
+    REQUIRE(z.big());
+    check_all(z);
 }
 
 TEST_CASE("a packed list short enough to sit in place survives being moved")
