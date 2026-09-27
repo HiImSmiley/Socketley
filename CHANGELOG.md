@@ -103,7 +103,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is the cache's own text, without a `lua: error:` prefix.
 - A proxied HTTP request is rewritten into a buffer its connection keeps, so
   a keep-alive connection no longer allocates and frees one per request.
-  TODO: measured effect.
 - An HTTP proxy with one backend keeps a keep-alive client's backend
   connection for that client's next request, from its second answer on,
   instead of returning it to the pool and probing it on the way back out, as
@@ -113,7 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sent again on a fresh connection instead of answered 502. A held connection
   idle past the pool's 60 s is not reused; `stats` shows the held connections
   as `parked_connections`, and they go to the pool when the client leaves.
-  TODO: measured effect.
+  Against HAProxy on one keep-alive connection 1.30× → 1.32× the rate and
+  1.51× → 1.62× per core; at 32 connections 1.32× → 1.47×.
 
 ### Fixed
 
