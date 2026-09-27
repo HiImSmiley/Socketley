@@ -355,6 +355,16 @@ public:
         if (index >= size()) return end();
         if (!big())
         {
+            // From whichever end is nearer: ZREVRANGE asks for the last
+            // member first, and walking to it from the front made a reverse
+            // read of the whole set cost two passes over it (1.26x Redis
+            // where the forward read was 2.07x).
+            if (index >= m_count / 2)
+            {
+                size_t off = m_pack.size();
+                for (size_t k = m_count; k > index; --k) off = prev_off(off);
+                return const_iterator(index, off, this);
+            }
             size_t off = 0;
             for (size_t k = 0; k < index; ++k) off = next_off(off);
             return const_iterator(index, off, this);

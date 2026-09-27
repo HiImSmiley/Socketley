@@ -197,11 +197,14 @@ cache_store::zincr_result
 cache_store::zincrby(std::string_view key, double delta, std::string_view member,
                      double& out)
 {
+    // One lookup and one walk for a member that is there, where going through
+    // zscore, zadd and a zscore to check was three lookups and five walks of
+    // a small set -- ZINCRBY read 1.15x Redis beside ZADD's 1.75x.
+    check_expiry(key);
+    auto it = m_zsets.find(key);
     double current = 0.0;
-    if (zscore(key, member, current))
-        out = current + delta;
-    else
-        out = delta;
+    const bool had = it != m_zsets.end() && it->second.score_of(member, current);
+    out = had ? current + delta : delta;
 
     // inf plus -inf is NaN, and a NaN score is in every range and in none: it
     // compares false against both bounds, so `zrangebyscore k 0 1` answered with
@@ -218,12 +221,17 @@ cache_store::zincrby(std::string_view key, double delta, std::string_view member
     if (std::isnan(out))
         return zincr_result::not_a_number;
 
-    // zadd carries the type check and the memory refusal, and answers `new`
-    // rather than `stored`, so the score is what says this worked.
-    zadd(key, out, member);
-    double check = 0.0;
-    return (zscore(key, member, check) && check == out)
-         ? zincr_result::ok : zincr_result::type_conflict;
+    if (had)
+    {
+        if (out != current)
+            it->second.rescore(member, current, out);
+        touch_lru(key);
+        return zincr_result::ok;
+    }
+
+    // A new member: zadd carries the type check and the memory refusal, and
+    // either is the one answer this door has for a write that did not happen.
+    return zadd(key, out, member) == 1 ? zincr_result::ok : zincr_result::type_conflict;
 }
 
 size_t cache_store::entry_cost(std::string_view key, const hash_inner& fields)

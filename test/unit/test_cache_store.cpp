@@ -1815,6 +1815,29 @@ TEST_CASE("cache_store zincrby refuses a result that is not a number")
         double out = 0;
         CHECK(store.zincrby("s", 1.0, "m", out) == zr::type_conflict);
     }
+
+    SUBCASE("a member that moves is found at its new rank, small and big")
+    {
+        for (const int n : { 10, static_cast<int>(zskiplist::SMALL_MAX) + 20 })
+        {
+            const std::string key = "r" + std::to_string(n);
+            for (int i = 0; i < n; ++i) store.zadd(key, i, "m" + std::to_string(i));
+            double out = 0;
+            CHECK(store.zincrby(key, n + 0.5, "m0", out) == zr::ok);     // first to last
+            CHECK(out == n + 0.5);
+            CHECK(store.zincrby(key, 0.0, "m1", out) == zr::ok);         // no move at all
+            CHECK(out == 1.0);
+            size_t rank = 0;
+            REQUIRE(store.zrank(key, "m0", rank, false));
+            CHECK(rank == static_cast<size_t>(n - 1));
+            REQUIRE(store.zrank(key, "m1", rank, false));
+            CHECK(rank == 0);
+            CHECK(store.zcard(key) == static_cast<size_t>(n));
+            double sc = 0;
+            REQUIRE(store.zscore(key, "m0", sc));
+            CHECK(sc == n + 0.5);
+        }
+    }
 }
 
 // Two things asked of one key at once, which is the question a store full of
@@ -2641,6 +2664,32 @@ TEST_CASE("zset_inner's member index follows its skiplist through copies and mov
             c.remove("late", 99999.0);
             CHECK_FALSE(c.score_of("late", sc));
         }
+}
+
+TEST_CASE("zskiplist at() lands on the same entry from either end")
+{
+    // at() walks a small set from whichever end is nearer, so every index is
+    // checked against the forward walk, across the move to the big form.
+    for (const int n : { 0, 1, 2, 3, 7, 64, 127, 128, 129, 200 })
+    {
+        zskiplist z;
+        for (int i = 0; i < n; ++i) z.emplace((i * 7919) % 101 - 50.5, "m" + std::to_string(i));
+        std::vector<std::pair<double, std::string>> fwd;
+        for (auto e : z) fwd.emplace_back(e.first, std::string(e.second));
+        REQUIRE(fwd.size() == static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+        {
+            auto it = z.at(static_cast<size_t>(i));
+            REQUIRE(it != z.end());
+            CHECK((*it).first == fwd[static_cast<size_t>(i)].first);
+            CHECK((*it).second == fwd[static_cast<size_t>(i)].second);
+            // And iterating on from there reaches the end in the right number of steps.
+            size_t left = 0;
+            for (auto j = it; j != z.end(); ++j) ++left;
+            CHECK(left == static_cast<size_t>(n - i));
+        }
+        CHECK(z.at(static_cast<size_t>(n)) == z.end());
+    }
 }
 
 TEST_CASE("a packed list short enough to sit in place survives being moved")

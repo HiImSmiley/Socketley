@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A small sorted set stores a whole-number score in 1, 2 or 4 bytes instead of
   8, as Redis's listpack does, and no longer carries the index pointer only a
   large one uses: 133 bytes a five-member set against Redis's 136.
+- ZREVRANGE on a small sorted set is 67% faster and ZINCRBY 58% faster.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 - The proxy sends a relayed message directly when nothing is queued ahead of
