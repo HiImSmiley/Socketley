@@ -1578,7 +1578,7 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
         socket_tuning::keepalive_dead_peer(client_fd);
     }
 
-    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_connections, 1);
 
     auto conn = pool_acquire(client_fd);
     SKL_TRACE_SET(conn, opened_ms, ::skl_trace::now_ms());
@@ -2373,7 +2373,7 @@ void cache_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
     // chokepoint: what a completion contributes is decided by the branches
     // above and which completions count is a per-runtime decision that already
     // diverges.
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
 
     // On a TLS connection these bytes are ciphertext and tls_feed puts
     // plaintext into partial, so everything below reads the same buffer it
@@ -2544,7 +2544,7 @@ void cache_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
 
     // Wire bytes out counted per completed send, with a short write's
     // remainder counted when it completes again.
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     // Short write handling: resubmit remaining bytes
     if (conn->write_batch_count > 0)
@@ -5460,7 +5460,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
     }
 
     m_stat_commands++;
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_messages, 1);
 
     size_t first_space = line.find(' ');
     std::string_view cmd = (first_space != std::string_view::npos)
@@ -7642,7 +7642,7 @@ bool cache_instance::flush_responses(client_connection* conn)
                 sent = static_cast<size_t>(n);
                 SKL_TRACE_ADD(conn, writes, 1);
                 SKL_TRACE_ADD(conn, bytes_written, sent);
-                m_stat_bytes_out.fetch_add(sent, std::memory_order_relaxed);
+                stat_add(m_stat_bytes_out, sent);
                 if (sent == conn->response_buf.size())
                 {
                     conn->response_buf.clear();
@@ -8735,7 +8735,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
     }
 
     m_stat_commands++;
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_messages, 1);
 
     // ─── WHAT A FOLLOWER CAN PUT BACK TOGETHER ──────────────────────────────
     // Both consumers of a replicated record -- a follower's link and this
@@ -12110,7 +12110,7 @@ void cache_instance::handle_follower_write(struct io_uring_cqe* cqe, follower_co
 
     // Replication bytes are this runtime's wire traffic too, counted in each
     // handler for the reason the bytes_in note in handle_read() gives.
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     // A short write is normal; only the acknowledged prefix may be dropped.
     size_t written = std::min(static_cast<size_t>(cqe->res), f.in_flight);
@@ -12552,7 +12552,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
     // The replication stream from the leader is wire traffic in, counted here
     // for the reason the bytes_in note gives.
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
 
     link.bytes_seen += static_cast<uint64_t>(cqe->res);
     link.partial.append(link.buf, cqe->res);

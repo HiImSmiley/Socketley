@@ -85,6 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of locked ones, since only its own loop writes them: TODO%.
 - A proxy counts what it forwards with plain adds instead of locked ones,
   since only its own loop writes the counters: TODO%.
+- A cache counts its commands, connections and bytes with plain adds instead
+  of locked ones, since only its own loop writes them: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
