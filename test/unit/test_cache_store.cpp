@@ -2734,6 +2734,49 @@ TEST_CASE("a big zskiplist keeps member bytes exactly, the empty one and NULs in
     }
 }
 
+TEST_CASE("ZSCAN over a big sorted set returns every member, across a rebuild too")
+{
+    cache_store store;
+    const int n = static_cast<int>(zskiplist::SMALL_MAX) * 4;
+    for (int i = 0; i < n; ++i) store.zadd("z", i * 0.25, "member:" + std::to_string(i));
+
+    auto scan_all = [&](int grow_after_pages) {
+        std::map<std::string, double> seen;
+        uint64_t cursor = 0;
+        int pages = 0, added = 0;
+        do
+        {
+            std::vector<std::pair<std::string_view, double>> page;
+            cursor = store.zscan("z", cursor, "*", 10, page);
+            for (const auto& [m, sc] : page) seen[std::string(m)] = sc;
+            // Members added mid-scan force the index to rebuild under the cursor.
+            if (++pages == grow_after_pages)
+                for (; added < n; ++added)
+                    store.zadd("z", -1.0, "late:" + std::to_string(added));
+        } while (cursor != 0 && pages < 100000);
+        return seen;
+    };
+
+    const auto seen = scan_all(-1);
+    REQUIRE(seen.size() == static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+    {
+        const auto it = seen.find("member:" + std::to_string(i));
+        REQUIRE(it != seen.end());
+        CHECK(it->second == i * 0.25);
+    }
+
+    // Every member that was there for the whole scan is returned at least once.
+    const auto seen2 = scan_all(3);
+    for (int i = 0; i < n; ++i)
+        CHECK(seen2.count("member:" + std::to_string(i)) == 1);
+
+    double sc = 0;
+    CHECK(store.zscore("z", "late:7", sc));
+    CHECK(sc == -1.0);
+    CHECK_FALSE(store.zscore("z", "nobody", sc));
+}
+
 TEST_CASE("a packed list short enough to sit in place survives being moved")
 {
     list_items a;

@@ -28,7 +28,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <new>
 #include <string>
@@ -72,12 +74,34 @@ public:
 
     bool big() const { return m_level != 0; }
 
-    // One word an owner may keep here while the set is big -- a sorted set's
-    // member index, which would otherwise cost eight bytes of every small
-    // set.  Moved along with the nodes, never copied, never freed: the owner
-    // frees it before clear() or destruction drop it.
-    void* aux() const { return big() ? m_big.aux : nullptr; }
-    void  set_aux(void* p) { m_big.aux = p; }
+    // A member's score: a walk of the pack while the set is small, the member
+    // index once it is big.
+    bool score_of(std::string_view member, double& out) const
+    {
+        if (big())
+        {
+            const size_t i = ix_locate(member, mhash(member));
+            if (i == npos) return false;
+            out = ix_node(ix()->slots[i])->score;
+            return true;
+        }
+        for (size_t off = 0; off < m_pack.size(); off = next_off(off))
+            if (member_at(off) == member) { out = score_at(off); return true; }
+        return false;
+    }
+
+    // What ZSCAN walks while the set is big: the index's slots, each holding
+    // one member or none, and an epoch that changes whenever they move.
+    size_t   index_buckets() const { return big() ? ix()->cap : 0; }
+    uint32_t index_epoch()   const { return big() ? ix()->epoch : 0; }
+    bool index_entry(size_t b, entry& out) const
+    {
+        const uint64_t w = ix()->slots[b];
+        if (w <= IX_TOMB) return false;
+        const node* n = ix_node(w);
+        out = { n->score, n->member() };
+        return true;
+    }
 
 private:
     // 32 levels carries four billion members at p=1/4, which is more than the
@@ -128,6 +152,105 @@ private:
         char* mem = reinterpret_cast<char*>(n) - sizeof(link) * static_cast<size_t>(n->level);
         n->~node();
         ::operator delete(static_cast<void*>(mem));
+    }
+
+    // The member index of a big set: open addressing over one-word slots, each
+    // a node's address with the top 16 bits of its name's hash above it -- the
+    // slot key_table uses, keyed by the name the node already holds.  A
+    // key_table<double> kept a second copy of every name, about 50 of the 138
+    // bytes a member of a million-member set cost.
+    struct member_index
+    {
+        uint64_t* slots{nullptr};
+        size_t    cap{0};
+        size_t    size{0};
+        size_t    tombs{0};
+        uint32_t  epoch{0};
+        ~member_index() { std::free(slots); }
+    };
+    static constexpr uint64_t IX_EMPTY = 0;
+    static constexpr uint64_t IX_TOMB  = 1;
+    static constexpr uint64_t IX_ADDR  = (uint64_t{1} << 48) - 1;
+
+    static uint64_t mhash(std::string_view m) { return std::hash<std::string_view>{}(m); }
+    static node* ix_node(uint64_t w) { return reinterpret_cast<node*>(w & IX_ADDR); }
+    member_index* ix() const { return static_cast<member_index*>(m_big.aux); }
+
+    size_t ix_locate(std::string_view m, uint64_t h) const
+    {
+        const member_index* x = ix();
+        if (x->size == 0) return npos;
+        const size_t   mask = x->cap - 1;
+        const uint64_t tag  = h & ~IX_ADDR;
+        for (size_t i = h & mask;; i = (i + 1) & mask)
+        {
+            const uint64_t w = x->slots[i];
+            if (w > IX_TOMB && (w & ~IX_ADDR) == tag && ix_node(w)->member() == m) return i;
+            if (w == IX_EMPTY) return npos;
+        }
+    }
+
+    void ix_rebuild(size_t cap)
+    {
+        member_index* x = ix();
+        auto* fresh = static_cast<uint64_t*>(std::calloc(cap, sizeof(uint64_t)));
+        if (!fresh) throw std::bad_alloc();
+        for (size_t i = 0; i < x->cap; ++i)
+        {
+            const uint64_t w = x->slots[i];
+            if (w <= IX_TOMB) continue;
+            size_t j = mhash(ix_node(w)->member()) & (cap - 1);
+            while (fresh[j] != IX_EMPTY) j = (j + 1) & (cap - 1);
+            fresh[j] = w;
+        }
+        std::free(x->slots);
+        x->slots = fresh;
+        x->cap   = cap;
+        x->tombs = 0;
+        ++x->epoch;
+    }
+
+    void ix_insert(node* n)
+    {
+        member_index* x = ix();
+        if (x->cap == 0 || (x->size + x->tombs + 1) * 4 > x->cap * 3)
+        {
+            size_t want = 8;
+            while (want < (x->size + 1) * 2) want <<= 1;
+            ix_rebuild(want < x->cap ? x->cap : want);
+        }
+        if (reinterpret_cast<uint64_t>(n) & ~IX_ADDR) std::abort();   // see key_table's make_entry
+        const uint64_t h = mhash(n->member());
+        const size_t mask = x->cap - 1;
+        size_t i = h & mask;
+        while (x->slots[i] > IX_TOMB) i = (i + 1) & mask;
+        if (x->slots[i] == IX_TOMB) --x->tombs;
+        x->slots[i] = (h & ~IX_ADDR) | reinterpret_cast<uint64_t>(n);
+        ++x->size;
+    }
+
+    void ix_erase(std::string_view m)
+    {
+        member_index* x = ix();
+        const size_t i = ix_locate(m, mhash(m));
+        if (i == npos) return;
+        --x->size;
+        const size_t mask = x->cap - 1;
+        // As key_table::vacate: a tombstone only where a probe may pass it.
+        if (x->slots[(i + 1) & mask] == IX_EMPTY)
+        {
+            x->slots[i] = IX_EMPTY;
+            for (size_t j = (i - 1) & mask; x->slots[j] == IX_TOMB; j = (j - 1) & mask)
+            {
+                x->slots[j] = IX_EMPTY;
+                --x->tombs;
+            }
+        }
+        else
+        {
+            x->slots[i] = IX_TOMB;
+            ++x->tombs;
+        }
     }
 
 public:
@@ -272,6 +395,7 @@ private:
         if (n->L(0).fwd) n->L(0).fwd->back = n;
         else              m_big.head->back = n;
         ++m_count;
+        ix_insert(n);
     }
 
 public:
@@ -325,6 +449,7 @@ public:
         else              m_big.head->back = x->back;
         while (m_level > 1 && !m_big.head->L(m_level - 1).fwd) --m_level;
         out.assign(x->member());
+        ix_erase(out);
         destroy(x);
         --m_count;
         return true;
@@ -517,7 +642,7 @@ private:
         node* head = make_node(max_level, 0.0, {});
         m_pack.~pack_buf();
         m_big.head = head;
-        m_big.aux  = nullptr;
+        m_big.aux  = new member_index();
         m_count = 0;
         m_level = 1;
         for (auto& [sc, member] : items)
@@ -531,6 +656,7 @@ private:
         node* n = m_big.head->L(0).fwd;
         while (n) { node* next = n->L(0).fwd; destroy(n); n = next; }
         destroy(m_big.head);
+        delete ix();
     }
 
     // Into a zskiplist holding neither form, leaving `o` small and empty.
@@ -566,7 +692,7 @@ private:
     // A small set is its pack and a big one its head, never both, so the two
     // share their bytes; m_level is 0 while the set is small.  The tail lives
     // in the head's back link, which nothing else uses, and that frees the
-    // word beside the head for aux().
+    // word beside the head for the member index.
     struct big_t { node* head; void* aux; };
     node* tail() const { return m_big.head->back; }
     union

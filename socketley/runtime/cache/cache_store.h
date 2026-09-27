@@ -40,49 +40,14 @@ class zset_inner
 public:
     zskiplist order;   // read through here, changed only through the calls below
 
-    zset_inner() = default;
-    ~zset_inner() { delete index(); }
-    // A copy of a big set can come out small, since the skiplist copies by
-    // inserting, and a small one has no index.
-    zset_inner(const zset_inner& o) : order(o.order) { if (order.big()) build_index(); }
-    zset_inner& operator=(const zset_inner& o)
-    {
-        if (this != &o) { zset_inner copy(o); *this = std::move(copy); }
-        return *this;
-    }
-    zset_inner(zset_inner&& o) noexcept : order(std::move(o.order)) {}
-    zset_inner& operator=(zset_inner&& o) noexcept
-    {
-        if (this != &o) { delete index(); order = std::move(o.order); }
-        return *this;
-    }
-
     size_t size()  const { return order.size(); }
     bool   empty() const { return order.empty(); }
 
-    bool score_of(std::string_view member, double& out) const
-    {
-        if (const auto* ix = index())
-        {
-            auto it = ix->find(member);
-            if (it == ix->end()) return false;
-            out = it->second;
-            return true;
-        }
-        for (const auto& [sc, m] : order)
-            if (string_equal{}(m, member)) { out = sc; return true; }
-        return false;
-    }
+    // The skiplist answers it: a walk while small, its member index once big.
+    bool score_of(std::string_view member, double& out) const { return order.score_of(member, out); }
 
     // A member that is not in the set yet.
-    void add(double score, std::string_view member)
-    {
-        order.emplace(score, std::string(member));
-        if (index())
-            index()->try_emplace(member, score);
-        else if (order.big())
-            build_index();
-    }
+    void add(double score, std::string_view member) { order.emplace(score, std::string(member)); }
 
     // A member that is, moved from `old` to `score`.
     void rescore(std::string_view member, double old, double score)
@@ -90,71 +55,56 @@ public:
         std::string name;
         order.extract(old, member, name);
         order.emplace(score, std::move(name));
-        if (index())
-            index()->insert_or_assign(member, score);
-        else if (order.big())
-            build_index();
     }
 
-    void remove(std::string_view member, double old)
-    {
-        order.erase(old, member);
-        if (index()) index()->erase(member);
-    }
+    void remove(std::string_view member, double old) { order.erase(old, member); }
 
-    // What ZSCAN walks, as (member, score): the small vector as one bucket,
-    // answered in one page as Redis answers a listpack, or the index's slots.
+    // What ZSCAN walks, as (member, score): the small form as one bucket,
+    // answered in one page as Redis answers a listpack, or the member index's
+    // slots, one member or none each.
     class const_local_iterator
     {
-        zskiplist::const_iterator                m_ord;
-        key_table<double>::const_local_iterator  m_slot;
-        bool                                     m_small;
+        zskiplist::const_iterator m_ord;
+        const zskiplist*          m_z{nullptr};
+        size_t                    m_b{0};
+        bool                      m_small{true};
+        bool                      m_done{true};
 
     public:
-        explicit const_local_iterator(zskiplist::const_iterator o) : m_ord(o), m_slot(), m_small(true) {}
-        explicit const_local_iterator(key_table<double>::const_local_iterator s) : m_ord(), m_slot(s), m_small(false) {}
+        explicit const_local_iterator(zskiplist::const_iterator o) : m_ord(o) {}
+        const_local_iterator(const zskiplist* z, size_t b, bool done)
+            : m_z(z), m_b(b), m_small(false), m_done(done) {}
         std::pair<std::string_view, double> operator*() const
         {
             if (m_small) return { m_ord->second, m_ord->first };
-            return { m_slot->first, m_slot->second };
+            zskiplist::entry e;
+            m_z->index_entry(m_b, e);
+            return { e.second, e.first };
         }
         const_local_iterator& operator++()
         {
-            if (m_small) ++m_ord; else ++m_slot;
+            if (m_small) ++m_ord; else m_done = true;
             return *this;
         }
         friend bool operator==(const const_local_iterator& a, const const_local_iterator& b)
         {
-            return a.m_small ? a.m_ord == b.m_ord : a.m_slot == b.m_slot;
+            return a.m_small ? a.m_ord == b.m_ord : a.m_done == b.m_done;
         }
         friend bool operator!=(const const_local_iterator& a, const const_local_iterator& b) { return !(a == b); }
     };
-    size_t bucket_count() const { return index() ? index()->bucket_count() : 1; }
+    size_t bucket_count() const { return order.big() ? order.index_buckets() : 1; }
     const_local_iterator begin(size_t b) const
     {
-        return index() ? const_local_iterator(std::as_const(*index()).begin(b)) : const_local_iterator(order.begin());
+        if (!order.big()) return const_local_iterator(order.begin());
+        zskiplist::entry e;
+        return const_local_iterator(&order, b, !order.index_entry(b, e));
     }
     const_local_iterator end(size_t b) const
     {
-        return index() ? const_local_iterator(std::as_const(*index()).end(b)) : const_local_iterator(order.end());
+        return order.big() ? const_local_iterator(&order, b, true) : const_local_iterator(order.end());
     }
     // A cursor from the small form is never read against the index.
-    uint32_t scan_epoch() const { return index() ? index()->scan_epoch() + 1 : 0; }
-
-private:
-    // Kept in the skiplist's aux word while it is big: a small set has none,
-    // and the pointer it used to hold here was 8 of every small set's bytes,
-    // the ones that moved its keyspace entry from a 64-byte malloc chunk to 48.
-    key_table<double>* index() const { return static_cast<key_table<double>*>(order.aux()); }
-
-    void build_index()
-    {
-        auto ix = std::make_unique<key_table<double>>();
-        ix->reserve(order.size());
-        for (const auto& [sc, m] : order)
-            ix->try_emplace(m, sc);
-        order.set_aux(ix.release());
-    }
+    uint32_t scan_epoch() const { return order.big() ? order.index_epoch() + 1 : 0; }
 };
 static_assert(sizeof(zset_inner) == 24);
 using zset_map = key_table<zset_inner>;
