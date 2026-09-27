@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and finds a member through an index of the nodes themselves: 90 bytes a
   member of a million-member set instead of 186 (Redis 125), ZADD into it 21%
   faster and ZRANK 12% faster.
+- ZINCRBY or ZADD that leaves a member between the same neighbours changes
+  its score in place instead of taking it out and putting it back: 5% more
+  ZINCRBYs by 0.001 on a million-member set, at 6% less CPU each.
 - ZADD is about twice as fast (0.53× Redis → 0.99×), SADD into a large set 54%
   faster, and HGET/ZSCORE over many small keys 30–50% faster.
 - The proxy sends a relayed message directly when nothing is queued ahead of

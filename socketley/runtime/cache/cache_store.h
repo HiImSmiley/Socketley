@@ -47,15 +47,10 @@ public:
     bool score_of(std::string_view member, double& out) const { return order.score_of(member, out); }
 
     // A member that is not in the set yet.
-    void add(double score, std::string_view member) { order.emplace(score, std::string(member)); }
+    void add(double score, std::string_view member) { order.emplace(score, member); }
 
     // A member that is, moved from `old` to `score`.
-    void rescore(std::string_view member, double old, double score)
-    {
-        std::string name;
-        order.extract(old, member, name);
-        order.emplace(score, std::move(name));
-    }
+    void rescore(std::string_view member, double old, double score) { order.rescore(old, member, score); }
 
     void remove(std::string_view member, double old) { order.erase(old, member); }
 

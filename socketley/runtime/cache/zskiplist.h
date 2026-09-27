@@ -59,10 +59,10 @@ public:
     zskiplist() noexcept { ::new (&m_pack) pack_buf(); }
     ~zskiplist() { destroy_all(); }
 
-    zskiplist(const zskiplist& o) : zskiplist() { for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, std::string(it->second)); }
+    zskiplist(const zskiplist& o) : zskiplist() { for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, it->second); }
     zskiplist& operator=(const zskiplist& o)
     {
-        if (this != &o) { clear(); for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, std::string(it->second)); }
+        if (this != &o) { clear(); for (auto it = o.begin(); it != o.end(); ++it) insert(it->first, it->second); }
         return *this;
     }
     zskiplist(zskiplist&& o) noexcept { steal(o); }
@@ -333,10 +333,10 @@ public:
         m_count = 0;
     }
 
-    // Named emplace because that is what the seventeen call sites already say.
-    void emplace(double score, std::string member) { insert(score, std::move(member)); }
+    // Named emplace because that is what zset_inner and the tests say.
+    void emplace(double score, std::string_view member) { insert(score, member); }
 
-    void insert(double score, std::string member)
+    void insert(double score, std::string_view member)
     {
         if (!big())
         {
@@ -398,30 +398,10 @@ private:
         ix_insert(n);
     }
 
-public:
-    size_t erase(const value_type& v) { return erase(v.first, v.second); }
-
-    size_t erase(double score, std::string_view member)
+    // The node holding (score, member), with the last node before it on every
+    // level in `update`; null when it is not there.
+    node* find(double score, std::string_view member, node** update) const
     {
-        std::string gone;
-        return extract(score, member, gone) ? 1 : 0;
-    }
-
-    // erase() that hands the member's string back, so a score change moves
-    // the name into its new node instead of copying it and freeing the old.
-    bool extract(double score, std::string_view member, std::string& out)
-    {
-        if (!big())
-        {
-            const size_t off = small_lower(score, member).second;
-            if (off == m_pack.size() || score_at(off) != score || member_at(off) != member)
-                return false;
-            out.assign(member_at(off));
-            m_pack.erase(off, next_off(off) - off);
-            --m_count;
-            return true;
-        }
-        node* update[max_level];
         node* x = m_big.head;
         for (int i = m_level - 1; i >= 0; --i)
         {
@@ -430,9 +410,12 @@ public:
             update[i] = x;
         }
         x = x->L(0).fwd;
-        if (!x || x->score != score || x->member() != member)
-            return false;
+        return (x && x->score == score && x->member() == member) ? x : nullptr;
+    }
 
+    // Takes `x` out of the order and leaves it whole, index entry and all.
+    void link_out(node* x, node* const* update)
+    {
         for (int i = 0; i < m_level; ++i)
         {
             if (update[i]->L(i).fwd == x)
@@ -448,10 +431,71 @@ public:
         if (x->L(0).fwd) x->L(0).fwd->back = x->back;
         else              m_big.head->back = x->back;
         while (m_level > 1 && !m_big.head->L(m_level - 1).fwd) --m_level;
-        out.assign(x->member());
-        ix_erase(out);
-        destroy(x);
         --m_count;
+    }
+
+public:
+    size_t erase(const value_type& v) { return erase(v.first, v.second); }
+
+    size_t erase(double score, std::string_view member)
+    {
+        if (!big())
+        {
+            const size_t off = small_lower(score, member).second;
+            if (off == m_pack.size() || score_at(off) != score || member_at(off) != member)
+                return 0;
+            m_pack.erase(off, next_off(off) - off);
+            --m_count;
+            return 1;
+        }
+        node* update[max_level];
+        node* x = find(score, member, update);
+        if (!x) return 0;
+        link_out(x, update);
+        ix_erase(x->member());
+        destroy(x);
+        return 1;
+    }
+
+    // A member moved from `old` to `score`.  Like zslUpdateScore, a score that
+    // does not pass a neighbour is written in place, which spares the second
+    // walk; one that does gets a new node, which measured cheaper than moving
+    // the old one.
+    bool rescore(double old, std::string_view member, double score)
+    {
+        if (!big())
+        {
+            const size_t off = small_lower(old, member).second;
+            if (off == m_pack.size() || score_at(off) != old || member_at(off) != member)
+                return false;
+            // The name may be a view of the entry about to go.
+            char name[SMALL_MAX_LEN];
+            const std::string_view m(name, member.size());
+            std::memcpy(name, member.data(), member.size());
+            m_pack.erase(off, next_off(off) - off);
+            --m_count;
+            small_insert(small_lower(score, m).second, score, m);
+            return true;
+        }
+        node* update[max_level];
+        node* x = find(old, member, update);
+        if (!x) return false;
+        const std::string_view m = x->member();
+        if ((x->back && !less(x->back, score, m)) || (x->L(0).fwd && less_eq(x->L(0).fwd, score, m)))
+        {
+            // The name is held here because the node holding it goes first.
+            char held[256];
+            std::string spill;
+            std::string_view name = m;
+            if (m.size() <= sizeof(held)) { std::memcpy(held, m.data(), m.size()); name = { held, m.size() }; }
+            else                          { spill.assign(m); name = spill; }
+            link_out(x, update);
+            ix_erase(m);
+            destroy(x);
+            insert_big(score, name);
+        }
+        else
+            x->score = score;
         return true;
     }
 

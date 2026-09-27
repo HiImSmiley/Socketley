@@ -2141,11 +2141,8 @@ TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and remov
         }
         else if (it != score.end())
         {
-            std::string name;
-            REQUIRE(z.extract(it->second, m, name));
-            CHECK(name == m);
+            REQUIRE(z.rescore(it->second, m, sc));
             ref.erase({ it->second, m });
-            z.emplace(sc, std::move(name));
             ref.insert({ sc, m });
             it->second = sc;
         }
@@ -2168,6 +2165,23 @@ TEST_CASE("zskiplist agrees with an ordered set through inserts, moves and remov
             }
             if (!ref.empty())
                 CHECK(same_entry(*std::prev(z.end()), *ref.rbegin()));
+            // Backwards too, and every member found by name at its score:
+            // a moved node keeps its back link and its index slot.
+            if (!ref.empty())
+            {
+                auto zit = z.last();
+                for (auto rit = ref.rbegin();; --zit)
+                {
+                    REQUIRE(same_entry(*zit, *rit));
+                    if (++rit == ref.rend()) break;
+                }
+            }
+            for (const auto& [name, sc] : score)
+            {
+                double got = -1.0;
+                REQUIRE(z.score_of(name, got));
+                CHECK(got == sc);
+            }
         }
     }
     zskiplist copy(z);
@@ -2719,11 +2733,16 @@ TEST_CASE("a big zskiplist keeps member bytes exactly, the empty one and NULs in
     }
     CHECK(k == ref.size());
 
-    // extract hands back the bytes, and a copy and a move keep them.
-    std::string out;
-    REQUIRE(z.extract(ref[2].first, ref[2].second, out));
-    CHECK(out == ref[2].second);
+    // A member moved to the far end keeps its bytes, and a copy and a move keep them.
+    REQUIRE(z.rescore(ref[2].first, ref[2].second, 1e9));
+    ref.push_back({ 1e9, ref[2].second });
     ref.erase(ref.begin() + 2);
+    {
+        double sc = 0.0;
+        REQUIRE(z.score_of(ref.back().second, sc));
+        CHECK(sc == 1e9);
+        CHECK((*z.last()).second == ref.back().second);
+    }
     zskiplist c(z);
     zskiplist m(std::move(z));
     for (const zskiplist* zz : { &c, &m })
