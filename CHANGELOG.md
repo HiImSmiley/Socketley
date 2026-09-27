@@ -129,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the opcode it arrived with, including after reassembly from fragments and
   when it was held for a client still finishing its upgrade. What a script
   sends is framed as before: text if it is valid UTF-8, binary otherwise.
+- A backend that answers `HTTP/1.0` without `Connection: keep-alive` closes its
+  connection behind the answer, and the proxy no longer keeps that connection
+  for the client's next request: the request goes out on a new one instead of
+  into the one closing, where it was sent twice or answered 502. The client's
+  own connection stays open.
 - A backend that answers a HEAD with a body, or otherwise sends bytes after
   an answer, no longer has them glued to the next answer on the same backend
   connection: the proxy sends that request again on a fresh connection, or

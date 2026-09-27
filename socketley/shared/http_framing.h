@@ -218,6 +218,7 @@ struct http_header_scan
     bool   transfer_encoding{false};
     bool   chunked{false};
     bool   conn_close{false};
+    bool   conn_keep_alive{false};
 };
 
 // Read the header lines of one block, where `headers` excludes the terminating
@@ -304,6 +305,8 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
         {
             if (http_list_has_token(val, "close", 5))
                 out.conn_close = true;
+            if (http_list_has_token(val, "keep-alive", 10))
+                out.conn_keep_alive = true;
         }
     }
     // A length beside a transfer coding is the shape request smuggling is made
@@ -311,6 +314,21 @@ inline http_header_scan http_scan_header_lines(std::string_view headers, size_t 
     if (SOCKETLEY_UNLIKELY(out.transfer_encoding && out.has_content_length))
         out.ok = false;
     return out;
+}
+
+// Does the sender keep the connection open behind this response (RFC 9112
+// Section 9.3), where `status_line` has passed http_status_code() and a version
+// that is not one digit, a dot and one digit is read as the one that closes.
+inline bool http_response_persists(std::string_view status_line, const http_header_scan& h)
+{
+    if (h.conn_close)
+        return false;
+    if (status_line.find(' ') != 8 || status_line[6] != '.' ||
+        status_line[5] < '0' || status_line[5] > '9' ||
+        status_line[7] < '0' || status_line[7] > '9')
+        return false;
+    const int version = (status_line[5] - '0') * 10 + (status_line[7] - '0');
+    return version >= 11 || (version == 10 && h.conn_keep_alive);
 }
 
 // Request framing, which is worse than response framing because two recipients
@@ -633,7 +651,11 @@ struct http_response_framing
 {
     bool headers_parsed{false};
     bool has_content_length{false};
+    // The backend closes this socket behind this response, by Connection: close
+    // or by answering HTTP/1.0 without keep-alive.
     bool conn_close{false};
+    // It said so with Connection: close, which reaches the client as well.
+    bool close_said{false};
     bool chunked{false};
     bool no_body{false};            // 204/304/1xx: no message body
     uint16_t status_code{0};
@@ -898,7 +920,8 @@ inline void http_response_scan_chunk(http_response_framing& st, std::string_view
         st.body_remaining     = h.content_length;
         st.transfer_encoding  = h.transfer_encoding;
         st.chunked            = h.chunked;
-        st.conn_close         = h.conn_close;
+        st.conn_close         = !http_response_persists(status_line, h);
+        st.close_said         = h.conn_close;
 
         // Deduct body bytes already here and notice when there are more than
         // the response had room for, which is what a backend flushing an

@@ -4200,8 +4200,9 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
 
     // The "is it finished" half of the pool test is one shared predicate now,
     // so a change to what finished means reaches the teardown paths as well as
-    // this one.
-    if (m_protocol == protocol_http && !conn->http_frame.conn_close &&
+    // this one -- and a backend that closes without saying close, HTTP/1.0, is
+    // let go of here with its client kept, because the pool gate refuses it.
+    if (m_protocol == protocol_http && !conn->http_frame.close_said &&
         !conn->closing && !conn->splice_active &&
         backend_response_complete(conn))
     {
@@ -6735,7 +6736,8 @@ static inline bool backend_pool_eligible(const proxy_backend_connection* bconn,
         return false;
     if (bconn->pipe_to_client[0] >= 0)
         return false;
-    // Don't pool if backend signalled Connection: close
+    // The backend closes this socket behind its answer, by Connection: close or
+    // by answering HTTP/1.0 without keep-alive.
     if (bconn->http_frame.conn_close)
         return false;
     // Where this response ended could not be established, and reuse needs both
