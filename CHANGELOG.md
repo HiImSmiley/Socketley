@@ -117,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A backend that answers a HEAD with a body, or otherwise sends bytes after
+  an answer, no longer has them glued to the next answer on the same backend
+  connection: the proxy sends that request again on a fresh connection, or
+  answers 502, instead of relaying bytes that do not start a response. The
+  client connection is also no longer left open behind that answer after
+  the client closes it.
 - A WebSocket upgrade on a keep-alive connection that had already served a
   plain GET could hand `on_websocket` and `self.ws_headers` that GET's
   `Cookie`, `Origin`, `Sec-WebSocket-Protocol` or `Authorization` when the

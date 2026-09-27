@@ -360,8 +360,9 @@ struct alignas(64) proxy_backend_connection
     uint16_t pool_port{0};
     // The client a parked connection is kept for, -1 otherwise.
     int parked_for{-1};
-    // Taken from parking for the exchange now on it, see reissue_unanswered.
-    bool from_park{false};
+    // Taken from parking or the pool for the exchange now on it, so the
+    // stream carries earlier answers and its first bytes are checked.
+    bool reused{false};
     // The loop turn it was parked in and when, the second also carried into
     // the pool by release_to_pool so its age survives the move.
     uint64_t park_turn{0};
@@ -757,6 +758,10 @@ private:
     // it was taken from parking for closed before a byte of the answer, true
     // when the client has been dealt with and the caller must return.
     bool reissue_unanswered(proxy_client_connection* cconn, proxy_backend_connection* bconn);
+    // An answer on a reused socket that cannot be an HTTP response, sent again
+    // on a fresh connection or refused 502; false when there is no client
+    // waiting on it and the ordinary path goes on.
+    bool refuse_desynced_answer(proxy_backend_connection* bconn, int bfd);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
     void finish_pool_drain(proxy_backend_connection* bconn,

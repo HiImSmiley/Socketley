@@ -125,6 +125,15 @@ static inline bool backend_op_in_flight(const proxy_backend_connection* b)
            b->splice_in_pending || b->splice_out_pending;
 }
 
+// Whether a response can start with these bytes, false only once they rule
+// out "HTTP/", so a head split after its first byte is not refused.
+static inline bool http_status_prefix_ok(std::string_view chunk)
+{
+    constexpr std::string_view proto = "HTTP/";
+    const size_t n = std::min(chunk.size(), proto.size());
+    return chunk.substr(0, n) == proto.substr(0, n);
+}
+
 // Only idempotent methods unless retry_all, with OPTIONS added because the man
 // page has always named it and the code was the half that was wrong -- TRACE
 // stays out as a behaviour change nobody asked for.
@@ -360,7 +369,7 @@ void proxy_backend_connection::reset(int new_fd)
     backend_eof = false;
     parked = false;
     parked_for = -1;
-    from_park = false;
+    reused = false;
     park_turn = 0;
     idle_since = {};
     drained_reads = 0;
@@ -3924,7 +3933,7 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
                 // answer is most likely the backend's idle close crossing this
                 // request, which HAProxy retries on a fresh connection and
                 // does not hold against the backend.
-                if (m_protocol == protocol_http && conn->from_park && !teardown_is_ours &&
+                if (m_protocol == protocol_http && conn->reused && !teardown_is_ours &&
                     !ce.client->response_started && !ce.client->closing &&
                     reissue_unanswered(ce.client, conn))
                     return;
@@ -4074,6 +4083,20 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
         tls_plain.swap(conn->partial);
         data_ptr = tls_plain.data();
         data_len = tls_plain.size();
+    }
+
+    // A reused socket whose answer does not open with a status line is still
+    // carrying the tail of an earlier one -- a HEAD answered with a body the
+    // backend sent late -- so none of it reaches the client, which otherwise
+    // got those bytes glued to its answer and a framing that never ended.
+    if (SOCKETLEY_UNLIKELY(m_protocol == protocol_http && conn->reused &&
+                           !conn->http_frame.response_bytes_seen &&
+                           !http_status_prefix_ok({data_ptr, data_len})) &&
+        refuse_desynced_answer(conn, fd))
+    {
+        if (is_provided)
+            m_loop->return_buf(BUF_GROUP_ID, buf_id);
+        return;
     }
 
     // Below the decryption, because on a TLS leg counting a handshake
@@ -6029,6 +6052,7 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         conn->backend_fd = bfd;
 
         auto bconn = backend_pool_acquire(bfd, conn);
+        bconn->reused = true;
         // The session before anything else looks at the struct, as an
         // assignment rather than an overwrite -- and tls_conn_ready rather
         // than handshake, because this connection finished its handshake
@@ -7382,7 +7406,7 @@ bool proxy_instance::take_parked_backend(proxy_client_connection* conn)
     conn->parked_backend_fd = -1;
     b->client_fd = conn->fd;
     conn->backend_fd = b->fd;
-    b->from_park = true;
+    b->reused = true;
     b->idle_since = {};
 
     // Kept whole in saved_request only when nothing of it is still to arrive,
@@ -7509,6 +7533,28 @@ bool proxy_instance::reissue_unanswered(proxy_client_connection* cconn,
     // An asynchronous connect is forwarded by handle_connect.
     if (!cconn->connect_pending)
         forward_to_backend(cconn, cconn->saved_request);
+    return true;
+}
+
+bool proxy_instance::refuse_desynced_answer(proxy_backend_connection* bconn, int bfd)
+{
+    if (bconn->client_fd < 0 || bconn->client_fd >= MAX_FDS ||
+        m_conn_idx[bconn->client_fd].side != conn_client)
+        return false;
+    auto* cconn = m_conn_idx[bconn->client_fd].client;
+    if (cconn->backend_fd != bfd || cconn->response_started)
+        return false;
+
+    warn_pool_unbidden();
+    // Not charged: the stray bytes belong to an answer the backend finished
+    // earlier, and the request itself never reached a clean stream.
+    if (!cconn->closing && reissue_unanswered(cconn, bconn))
+        return true;
+
+    cconn->backend_fd = -1;
+    bconn->client_fd = -1;
+    answer_gateway_failure(cconn, false);
+    close_pair(-1, bfd, close_reason::force);
     return true;
 }
 

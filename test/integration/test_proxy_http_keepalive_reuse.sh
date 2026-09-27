@@ -72,6 +72,12 @@
 #        framed as the second answer; whether they share the head's read (the
 #        overrun road) or arrive in the next one (the same-turn probe) is the
 #        kernel's timing, so this guards both and pins neither
+#   (j)  a pipelined pair behind a HEAD whose body the backend sends only
+#        once the next request has reached it -- (i) with the timing made
+#        certain: the stray bytes glued to the second answer, and the client's
+#        close never seen because the framing they left could not end.  Both
+#        the pool and the park put the second request on that socket, so this
+#        failed on the tree before parking as well
 #   (f)  backend connections left over once every client has gone
 set -uo pipefail
 
@@ -157,6 +163,17 @@ def serve(c, ordinal):
                 time.sleep(0.1)
                 c.sendall(b"BODYBODYBODY")
                 continue
+            if target.startswith("/headlazy"):
+                # The same, sent only once the next request has arrived, which
+                # is after any probe the proxy could have made.
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+                while b"\r\n\r\n" not in buf:
+                    b = c.recv(65536)
+                    if not b:
+                        return
+                    buf += b
+                c.sendall(b"BODYBODYBODY")
+                continue
             if target.startswith("/headbody"):
                 # The same at once, as http.server's HEAD with a body does.
                 c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
@@ -214,7 +231,10 @@ def read_response(s, buf, head=False):
         buf += b
     hdr, rest = buf.split(b"\r\n\r\n", 1)
     lines = hdr.split(b"\r\n")
-    status = lines[0].split(b" ")[1].decode("latin1")
+    # A head that does not open with the protocol is bytes glued to an
+    # answer, which a lenient split would have read as its status.
+    status = (lines[0].split(b" ")[1].decode("latin1")
+              if lines[0].startswith(b"HTTP/1.") else "BAD")
     clen = 0
     for l in lines[1:]:
         k, _, v = l.partition(b":")
@@ -294,6 +314,13 @@ elif mode == "pipehead":
               req("/ok?after=headbody"))
     buf = show("i1", s, buf, head=True)
     buf = show("i2", s, buf)
+elif mode == "pipelazy":
+    s.sendall(req("/ok?warm"))
+    buf = show("w", s, buf)
+    s.sendall(("HEAD /kr/headlazy HTTP/1.1\r\nHost: t\r\n\r\n").encode() +
+              req("/ok?after=headlazy"))
+    buf = show("j1", s, buf, head=True)
+    buf = show("j2", s, buf)
 s.close()
 print("DONE", flush=True)
 PYEOF
@@ -464,6 +491,20 @@ if [ "$I1" = 200 ] && [ "$I2" = "/ok?after=headbody" ]; then ok
 else bad "(i) a pipelined request behind a HEAD answered with a body gets its own answer" \
          "HEAD ${I1:-none}, then an answer for '${I2:-none}'" \
          "$(grep '^R i' "$SOCKETLEY_TMPD/i.out" | head -2 | tr '\n' ' ')"; fi
+
+# ─── (j): the same, with the stray body certain to come late ───────────────
+timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" pipelazy "$PX" >"$SOCKETLEY_TMPD/j.out" 2>&1
+J1=$(status_of j1 "$SOCKETLEY_TMPD/j.out")
+J2=$(sed -n 's/^R j2 200 .*target=\([^ ]*\).*/\1/p' "$SOCKETLEY_TMPD/j.out")
+# The client has closed, so the proxy has to have seen it go.
+J_CONNS=$(stat_when connections 0)
+echo "  (j) pipelined behind a HEAD whose body comes late: ${J1:-none}, then '${J2:-none}';" \
+     "connections after the client closed: ${J_CONNS:-none}"
+
+if [ "$J1" = 200 ] && [ "$J2" = "/ok?after=headlazy" ] && [ "${J_CONNS:-x}" = 0 ]; then ok
+else bad "(j) a pipelined request behind a HEAD's late body gets a clean answer and its close is seen" \
+         "HEAD ${J1:-none}, then an answer for '${J2:-none}', connections=${J_CONNS:-absent}" \
+         "$(grep '^R j' "$SOCKETLEY_TMPD/j.out" | head -2 | tr '\n' ' ')"; fi
 
 # ─── (f): nothing left once every client has gone ───────────────────────────
 FINAL=$(wait_backends_gone)
