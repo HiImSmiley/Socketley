@@ -1629,6 +1629,48 @@ project "test_udp_recv_ladder"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: Raft, as whole simulated clusters ───
+--
+-- Its own copy of raft.cpp, built with the planted defects the harness has to
+-- catch; the daemon's copy is compiled without them.
+
+project "test_raft"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    defines { "SOCKETLEY_RAFT_FAULTS" }
+
+    files {
+        "test/unit/test_raft.cpp",
+        "socketley/shared/raft.cpp",
+        "socketley/shared/raft.h"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Benchmark: the two cross-runtime transports against the in-process relay ───
 
 project "bench_conn_transfer"
