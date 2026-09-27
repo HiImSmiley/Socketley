@@ -319,6 +319,28 @@ if [ "$G1" = $'3\tone' ] && [ "$G2" = $'26\ttwo-is-longer-than-fifteen' ]; then 
          "request would show here as the first reading the second's value"
 fi
 
+# ─── ...and none of the one before it ───────────────────────────────────────
+#
+# The list the fields are collected into is kept by the connection between
+# requests, so a list handed on without being emptied gives the second request
+# the first one's entries -- views at offsets that now hold the second
+# request's bytes.  Last-wins hides that for a name both requests send, which
+# is why these names are sent only by the first and the COUNT is asserted.
+PIPE=$(send "GET /echo HTTP/1.1" "$H_HOST" "X-Only-First: 1" "X-Also-First: 22" \
+       -- "GET /echo HTTP/1.1" "$H_HOST" "Connection: close")
+FIRST=${PIPE%%$'\n---\n'*}
+SECOND=${PIPE##*$'\n---\n'}
+C1=$(head -1 <<<"$FIRST")
+C2=$(head -1 <<<"$SECOND")
+N2=$(awk -F'\t' 'NR > 1 { printf "%s,", $1 }' <<<"$SECOND")
+if [ "$C1" = $'COUNT\t3' ] && [ "$C2" = $'COUNT\t2' ] && [ "$N2" = "Connection,Host," ]; then pass; else
+    fail "a pipelined request sees none of the headers of the request before it" \
+         "first said [$C1] (wanted [COUNT	3]), second said [$C2] with names [$N2]" \
+         "(wanted [COUNT	2] with names [Connection,Host,])" \
+         "the header list is reused across requests on a connection; one handed" \
+         "on without being cleared adds the first request's fields to the second"
+fi
+
 # ─── The daemon survived it ─────────────────────────────────────────────────
 TOTAL=$((TOTAL+1))
 if kill -0 "$SOCKETLEY_DPID" 2>/dev/null && daemon_alive "$SOCKETLEY_SOCKET"; then
