@@ -18,7 +18,7 @@
 # callback does today for every header the request did not carry, so an empty
 # table is not distinguishable from a missing one by any weaker check.
 #
-# Three further claims, each with the case that separates it from a no-op:
+# Four further claims, each with the case that separates it from a no-op:
 #
 #   * on_websocket fires AFTER on_connect, which the man page states and nothing
 #     checked.  The order is recorded by the script and asserted as a sequence.
@@ -29,6 +29,10 @@
 #   * self.ws_headers(id) is NIL for a plain TCP client on the same server.  A
 #     build that returned a table for everything satisfies every assertion above
 #     it; this is the one that says the answer depends on the connection.
+#   * an upgrade on a keep-alive connection that already answered a plain GET
+#     is handed its own fields only.  The GET sends a Cookie and an Origin the
+#     upgrade does not, so fields kept on the connection from the GET, or
+#     copied there by it, show as those two values instead of [].
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -215,6 +219,65 @@ assert_eq "...and it reports no headers for it either" \
 assert_eq "on_websocket did not fire for the TCP client" \
           "1" "$(hits 'WS cb ' "$SOCKETLEY_DLOG")" \
     "one call in the whole run, from the one connection that upgraded"
+
+# ── An upgrade on a connection that already served a plain GET ─────────────
+# The fields are read from the upgrade request itself: the GET before it
+# carries a Cookie and an Origin the upgrade does not, and they must not reach
+# the script.  Last in the file, because it adds a second on_websocket call.
+cat > "$SOCKETLEY_TMPD/ws_after_get.py" <<'PYEOF'
+import base64, os, socket, sys, time
+
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+
+def answer():
+    """One response's status line, its Content-Length'd body read whole."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            sys.exit("server closed")
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    cl = 0
+    for ln in lines[1:]:
+        k, _, v = ln.partition(b":")
+        if k.strip().lower() == b"content-length":
+            cl = int(v)
+    while len(rest) < cl:
+        chunk = s.recv(4096)
+        if not chunk:
+            sys.exit("server closed in the body")
+        rest += chunk
+    return lines[0].decode("latin-1")
+
+s.sendall(b"GET /plain HTTP/1.1\r\nHost: x\r\n"
+          b"Cookie: sid=STALE-COOKIE\r\nOrigin: https://STALE-ORIGIN\r\n\r\n")
+first = answer()
+if " 404 " not in first + " ":
+    sys.exit("plain GET was not answered on a kept connection: " + first)
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+           "Connection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+           "Sec-WebSocket-Protocol: SECOND-PROTOCOL\r\n"
+           "Authorization: Bearer SECOND-AUTH\r\n\r\n").encode())
+second = answer()
+print("upgraded" if " 101 " in second + " " else "no 101: " + second)
+time.sleep(0.5)
+s.close()
+PYEOF
+
+UP2=$(python3 "$SOCKETLEY_TMPD/ws_after_get.py" "$PORT" 2>&1 || true)
+assert_eq "control: a plain GET and then an upgrade on one connection" "upgraded" "$UP2" \
+    "the assertion below is about the upgrade's callback"
+said 'WS cb .*SECOND-PROTOCOL' 10 || true
+assert_eq "an upgrade after a plain GET gets its own fields and none of the GET's" \
+          "1" "$(hits "WS cb cookie=[] origin=[] protocol=[SECOND-PROTOCOL] auth=[Bearer SECOND-AUTH]" "$SOCKETLEY_DLOG")" \
+    "the GET before it sent a Cookie and an Origin; a connection that kept" \
+    "them from that GET hands them to on_websocket for a request without them" \
+    "got: $(line 'WS cb .*SECOND-PROTOCOL.*')"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"
