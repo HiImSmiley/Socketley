@@ -1846,8 +1846,9 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
     // documented as declining.
     if (lua() && lua()->has_on_http_request())
     {
-        // Build Lua request table
-        sol::table lua_req = lua()->state().create_table();
+        // The request table, sized for its seven fields and the headers' for
+        // their count, so neither is rehashed while it is filled.
+        sol::table lua_req = lua()->state().create_table(0, 7);
         lua_req["method"] = req.method;
         lua_req["path"] = req.path;
         lua_req["query"] = req.query;
@@ -1855,7 +1856,8 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
         lua_req["client_id"] = req.client_id;
         lua_req["version"] = req.version;
 
-        sol::table lua_headers = lua()->state().create_table();
+        sol::table lua_headers =
+            lua()->state().create_table(0, static_cast<int>(req.headers.size()));
         // The views go straight through, because sol2 copies the bytes into the
         // Lua heap itself and the std::string between them was read by nobody.
         for (const auto& [k, v] : req.headers)
@@ -1941,7 +1943,10 @@ void server_instance::handle_http_request(server_connection* conn, const http_re
                 }
 
                 int status = resp_tbl.get_or("status", 200);
-                std::string body = resp_tbl.get_or<std::string>("body", "");
+                // Read out of the string body_obj anchors in the registry, so
+                // the response below is the only copy of it.
+                const std::string_view body = lua_field_present(body_obj)
+                    ? body_obj.as<std::string_view>() : std::string_view();
                 std::string_view reason = http_reason(status);
 
                 // A header this end cannot read costs the client that header,

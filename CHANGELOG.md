@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   neither the cache lookup nor the open builds one: TODO%.
 - A server's HTTP response goes straight to the socket when nothing is queued
   ahead of it, without passing through the connection's write queue: TODO%.
+- A server script's `on_http_request` gets its request and header tables
+  built at their final size, and the `body` it returns is copied once, into
+  the response, instead of twice: TODO%.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
