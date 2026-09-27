@@ -57,9 +57,10 @@
 #   (g)  the request after stray bytes arrived on a parked socket going out on
 #        that same socket: the bytes consumed and the socket kept, which is
 #        what the parked check in handle_backend_read exists to prevent
-#   (c)  the request after a `Connection: close` answer sent on that socket:
-#        this backend says close and then lingers without reading, so reuse
-#        is a 502 after 1.5 s rather than a lucky reconnect
+#   (c)  the next request, on a new client connection since the proxy closes
+#        one whose backend said close, sent on that backend socket: it says
+#        close and then lingers without reading, so reuse is a 502 after
+#        1.5 s rather than a lucky reconnect
 #   (e)  a pipelined pair answered out of order or not at all
 #   (e2) the pipelined second request on a different backend connection: the
 #        request routed from inside park_backend's own reset not finding the
@@ -211,8 +212,8 @@ def read_response(s, buf, head=False):
         if not b:
             raise ConnectionError("closed before an answer")
         buf += b
-    head, rest = buf.split(b"\r\n\r\n", 1)
-    lines = head.split(b"\r\n")
+    hdr, rest = buf.split(b"\r\n\r\n", 1)
+    lines = hdr.split(b"\r\n")
     status = lines[0].split(b" ")[1].decode("latin1")
     clen = 0
     for l in lines[1:]:
@@ -260,7 +261,10 @@ elif mode == "closehdr":
     buf = show("w", s, buf)
     s.sendall(req("/closehdr"))
     buf = show("c1", s, buf)
+    # The proxy closes a client whose backend said close, so the next
+    # request comes on a new connection and meets the pool, not a park.
     time.sleep(0.2)
+    s = socket.create_connection(("127.0.0.1", port)); s.settimeout(5); buf = b""
     s.sendall(req("/ok?after=closehdr"))
     buf = show("c2", s, buf)
 elif mode == "pipeline":
@@ -313,6 +317,15 @@ for _ in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/"$PX") 2>/dev/null && brea
 
 conns()   { cat "$SOCKETLEY_TMPD/conns" 2>/dev/null || echo 0; }
 stat_of() { "$BIN" stats "$NAME" 2>/dev/null | awk -F: -v k="$1" '$1 == k { print $2 + 0; exit }'; }
+# A worker's figures reach stats on its next report, so a count that should
+# be there now is asked for until it is, or for three seconds.
+stat_when() {   # key want
+    local v=""
+    for _ in $(seq 1 30); do
+        v=$(stat_of "$1"); [ "$v" = "$2" ] && break; sleep 0.1
+    done
+    echo "$v"
+}
 conn_of() { sed -n "s/^R $1 200 conn=\([0-9]*\) .*/\1/p" "$2" | head -1; }
 status_of() { awk -v l="$1" '$1 == "R" && $2 == l { print $3; exit }' "$2"; }
 # Waits for backend_connections to reach 0, printing the last reading.
@@ -333,8 +346,8 @@ python3 "$SOCKETLEY_TMPD/cl.py" seq "$PX" "$N" "$SIG" >"$SOCKETLEY_TMPD/a.out" 2
 CLPID=$!
 for _ in $(seq 1 100); do grep -q '^IDLE' "$SOCKETLEY_TMPD/a.out" 2>/dev/null && break; sleep 0.1; done
 A1=$(conns)
-PARKED_IDLE=$(stat_of parked_connections)
-BACKENDS_IDLE=$(stat_of backend_connections)
+PARKED_IDLE=$(stat_when parked_connections 1)
+BACKENDS_IDLE=$(stat_when backend_connections 1)
 touch "$SIG"
 wait "$CLPID" 2>/dev/null; CLPID=""
 AFTER_CLOSE=$(wait_backends_gone)
@@ -372,7 +385,7 @@ CLPID=$!
 for _ in $(seq 1 100); do grep -q '^B1DONE' "$SOCKETLEY_TMPD/b.out" 2>/dev/null && break; sleep 0.02; done
 # The backend closes a second after answering, so this reads the socket while
 # it is still parked and idle.
-B_PARKED=$(stat_of parked_connections)
+B_PARKED=$(stat_when parked_connections 1)
 wait "$CLPID" 2>/dev/null; CLPID=""
 B1=$(status_of b1 "$SOCKETLEY_TMPD/b.out"); B2=$(status_of b2 "$SOCKETLEY_TMPD/b.out")
 B1C=$(conn_of b1 "$SOCKETLEY_TMPD/b.out"); B2C=$(conn_of b2 "$SOCKETLEY_TMPD/b.out")
