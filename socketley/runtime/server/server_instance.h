@@ -1034,7 +1034,9 @@ private:
     void handle_upstream_write(struct io_uring_cqe* cqe, upstream_connection* uc);
     // Answers whether the message was taken; see the definition.
     bool queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg);
+    bool admit_upstream_send(upstream_connection* uc, size_t bytes);
     void upstream_flush_write_queue(upstream_connection* uc);
+    bool upstream_send_direct(upstream_connection* uc);
     void invoke_on_upstream(int conn_id, std::string_view data);
     void invoke_on_upstream_connect(int conn_id);
     void note_upstream_established();
@@ -1088,7 +1090,8 @@ private:
     void flush_write_queue(server_connection* conn);
     bool send_direct(server_connection* conn);
     void after_write(server_connection* conn);
-    static void skip_written(server_connection* conn, size_t written);
+    // A client's batch or an upstream's, which hold it in the same fields.
+    template <class C> static void skip_written(C* conn, size_t written);
 
     // ── TLS record layer ────────────────────────────────────────────────────
     // OpenSSL does no I/O here: these two move bytes between the memory BIO
@@ -1282,6 +1285,9 @@ private:
     // that no longer resolves is exactly the answer wanted.
     std::vector<uint64_t> m_drain_pending;
     socketley::direct_send_gate m_direct_gate;
+    // The upstream leg's own, because a relay alternates between the two fds
+    // and one gate shared by both would see a new fd every turn and admit neither.
+    socketley::direct_send_gate m_upstream_gate;
     // The connection a direct send went out on this turn, 0 for none.  Its
     // write counts as outstanding until the turn ends, where on_loop_turn()
     // runs what the completion would have, so no teardown overtakes it.

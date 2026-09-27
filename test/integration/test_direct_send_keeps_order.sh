@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Integration test: a server's echoes, a cache's replies and a client's sends
-# arrive byte for byte and in order, through every mix of sends taken at once
-# and sends that had to go through the ring
+# Integration test: a server's echoes, a cache's replies, a client's sends and
+# a server's sends to its upstream arrive byte for byte and in order, through
+# every mix of sends taken at once and sends that had to go through the ring
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -15,14 +15,16 @@
 # So the client sends its whole load before it reads a byte, which fills the
 # kernel buffers and forces partial sends and a queue, then reads everything:
 # lines of 1 byte to 30 KB to an echo server, pipelined GETs of values up to
-# 500 KB to a cache, and the same lines from a client runtime's script to a
-# peer that reads late.  What arrives must be exactly what was expected.
+# 500 KB to a cache, and the same lines from a client runtime's script and
+# from a server's script to its upstream, each to a peer that reads late.
+# What arrives must be exactly what was expected.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * the echo stream reordered, duplicated or short
 #   * the cache's reply stream the same way
 #   * a client runtime's sends the same way
+#   * a server's sends to its upstream the same way
 # suite: isolated
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -40,6 +42,7 @@ echo "=== Integration: direct sends keep a server's and a cache's output in orde
 command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; echo "  Results: 0/0 passed (0 failed)"; exit 0; }
 
 PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312)); PK=$((SL_PORT_BASE + 1313))
+PU=$((SL_PORT_BASE + 1314)); PUS=$((SL_PORT_BASE + 1315))
 daemon_isolate directsend
 daemon_start "$BIN"
 WORK=$SOCKETLEY_TMPD
@@ -171,6 +174,27 @@ kill "$SINK_PID" 2>/dev/null || true
 OUT=$(grep '^expect' "$WORK/sink.out" || true)
 echo "  client: $OUT"
 check "the client's sends arrive whole and in order" "$OUT"
+
+# ── 4. a server's sends to its upstream arrive whole and in order ─────────
+python3 "$WORK/peer.py" sink "$PU" > "$WORK/usink.out" 2>&1 &
+USINK_PID=$!
+for _ in $(seq 1 50); do grep -q ready "$WORK/usink.out" 2>/dev/null && break; sleep 0.1; done
+# Every other line leaves its newline to upstream_send, which adds one.
+cat > "$WORK/up.lua" <<'LUA'
+function on_upstream_connect(uid)
+    local sizes = { 1, 7, 64, 1000, 8000, 30000 }
+    for i = 0, 899 do
+        local line = string.format("%06d|", i) .. string.rep(string.char(97 + i % 26), sizes[(i * 7) % 6 + 1])
+        self.upstream_send(uid, i % 2 == 0 and line .. "\n" or line)
+    end
+end
+LUA
+"$BIN" create server dsu -p "$PUS" --upstream "127.0.0.1:$PU" --lua "$WORK/up.lua" -s >/dev/null 2>&1 || true
+for _ in $(seq 1 300); do grep -q '^expect' "$WORK/usink.out" 2>/dev/null && break; sleep 0.1; done
+kill "$USINK_PID" 2>/dev/null || true
+OUT=$(grep '^expect' "$WORK/usink.out" || true)
+echo "  upstream: $OUT"
+check "a server's sends to its upstream arrive whole and in order" "$OUT"
 
 if [ "$FAIL" -gt 0 ]; then
     if grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /'; then :; fi

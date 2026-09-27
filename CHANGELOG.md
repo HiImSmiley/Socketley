@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   send instead of a submission and a completion: 2.5-3% more round trips and
   6-7% less CPU each. With several clients the answers still share one ring
   entry per turn, which a send per answer measured slower.
+- A server's message to its upstream goes out by a direct send when nothing
+  is queued ahead of it, as its answers to a single client already did, and
+  `self.upstream_send` no longer builds a string and a shared pointer per
+  message: 2.2% more upstream round trips, the distance to a C relay 2.39 →
+  1.82 µs.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

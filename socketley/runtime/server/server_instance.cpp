@@ -3398,6 +3398,7 @@ void server_instance::on_loop_turn()
             after_write(c);
     }
     m_direct_gate.next_turn();
+    m_upstream_gate.next_turn();
     if (m_companion)
         m_companion->pump();
 
@@ -6310,7 +6311,8 @@ void server_instance::flush_write_queue(server_connection* conn)
 
 // Drops the first `written` bytes of the batch, whole iovecs and then part of
 // one, so what is left is exactly what the socket did not take.
-void server_instance::skip_written(server_connection* conn, size_t written)
+template <class C>
+void server_instance::skip_written(C* conn, size_t written)
 {
     size_t remaining = written;
     uint32_t first_iov = 0;
@@ -8134,32 +8136,8 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
         const size_t written = static_cast<size_t>(cqe->res);
         if (written < total_submitted)
         {
-            size_t remaining = written;
-            uint32_t first_iov = 0;
-            for (; first_iov < uc->write_batch_count; first_iov++)
-            {
-                if (remaining < uc->write_iovs[first_iov].iov_len)
-                {
-                    uc->write_iovs[first_iov].iov_base =
-                        static_cast<char*>(uc->write_iovs[first_iov].iov_base) + remaining;
-                    uc->write_iovs[first_iov].iov_len -= remaining;
-                    break;
-                }
-                remaining -= uc->write_iovs[first_iov].iov_len;
-            }
-
-            const uint32_t new_count = uc->write_batch_count - first_iov;
-            if (first_iov > 0)
-            {
-                for (uint32_t i = 0; i < new_count; i++)
-                {
-                    uc->write_iovs[i] = uc->write_iovs[first_iov + i];
-                    uc->write_batch[i] = std::move(uc->write_batch[first_iov + i]);
-                }
-                for (uint32_t i = new_count; i < uc->write_batch_count; i++)
-                    uc->write_batch[i].clear();
-            }
-            uc->write_batch_count = new_count;
+            skip_written(uc, written);
+            const uint32_t new_count = uc->write_batch_count;
 
             uc->write_pending = true;
             bool requeued;
@@ -8216,7 +8194,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
     }
 }
 
-bool server_instance::queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg)
+bool server_instance::admit_upstream_send(upstream_connection* uc, size_t bytes)
 {
     if (!m_loop || !uc->connected || uc->closing)
         return false;
@@ -8232,8 +8210,15 @@ bool server_instance::queue_upstream_send(upstream_connection* uc, const std::sh
         uc->closing = true;
         return false;
     }
-    if (queued + msg->size() >= write_watermark_bytes())
+    if (queued + bytes >= write_watermark_bytes())
         uc->drain_wanted = true;
+    return true;
+}
+
+bool server_instance::queue_upstream_send(upstream_connection* uc, const std::shared_ptr<const std::string>& msg)
+{
+    if (!admit_upstream_send(uc, msg->size()))
+        return false;
 
     // The same decision queue_send() makes one function up, because
     // upstream_broadcast() is the same shape pointed outwards: one payload,
@@ -8262,14 +8247,20 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     }
 
     uc->write_batch_count = count;
+    if (upstream_send_direct(uc))
+        return;
+
+    // What upstream_send_direct() did not get out, which a partial send left
+    // starting part way into the first iovec.
+    count = uc->write_batch_count;
     uc->write_pending = true;
 
     bool queued;
     if (count == 1)
     {
         uc->write_req.type = op_write;
-        queued = m_loop->submit_write(uc->fd, uc->write_batch[0].data(),
-            static_cast<uint32_t>(uc->write_batch[0].size()), &uc->write_req);
+        queued = m_loop->submit_write(uc->fd, static_cast<const char*>(uc->write_iovs[0].iov_base),
+            static_cast<uint32_t>(uc->write_iovs[0].iov_len), &uc->write_req);
     }
     else
     {
@@ -8287,6 +8278,42 @@ void server_instance::upstream_flush_write_queue(upstream_connection* uc)
     }
 }
 
+// True when the batch went out whole, as send_direct() is for a client.  No
+// turn-end tail is owed: the completion would only have released the batch,
+// and the two states that ask it for more, closing and a wanted drain, are
+// refused here.
+bool server_instance::upstream_send_direct(upstream_connection* uc)
+{
+    if (!m_upstream_gate.admit(uc->fd) || uc->closing || uc->drain_wanted || uc->fd < 0)
+        return false;
+
+    size_t total = 0;
+    for (uint32_t i = 0; i < uc->write_batch_count; i++)
+        total += uc->write_iovs[i].iov_len;
+
+    struct msghdr msg{};
+    msg.msg_iov = uc->write_iovs;
+    msg.msg_iovlen = uc->write_batch_count;
+    const ssize_t n = ::sendmsg(uc->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n <= 0)
+        return false;
+    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+
+    if (static_cast<size_t>(n) < total)
+    {
+        skip_written(uc, static_cast<size_t>(n));
+        return false;
+    }
+
+    for (uint32_t i = 0; i < uc->write_batch_count; i++)
+        uc->write_batch[i].clear();
+    uc->write_batch_count = 0;
+
+    if (!uc->write_queue.empty())
+        upstream_flush_write_queue(uc);
+    return true;
+}
+
 // ─── Lua upstream actions ───
 
 bool server_instance::upstream_send(int conn_id, std::string_view msg)
@@ -8295,17 +8322,23 @@ bool server_instance::upstream_send(int conn_id, std::string_view msg)
     if (it == m_upstreams.end() || !it->second->connected)
         return false;
 
-    std::string buf;
-    buf.reserve(msg.size() + 1);
-    buf.append(msg);
-    if (buf.empty() || buf.back() != '\n')
-        buf.push_back('\n');
-    auto shared = std::make_shared<const std::string>(std::move(buf));
+    // One target, so the queue takes the line into its tail instead of a
+    // string and a shared_ptr built to be copied out of and freed.
+    upstream_connection* uc = it->second.get();
+    const bool has_nl = !msg.empty() && msg.back() == '\n';
     // Answered rather than assumed: the old `return true` here is the same
     // defect send_to_client() carried, whose own comment admitted it -- "a
     // connection closed for exceeding the write-queue bound reported by the
     // connection going away".
-    return queue_upstream_send(it->second.get(), std::move(shared));
+    if (!admit_upstream_send(uc, msg.size() + (has_nl ? 0 : 1)))
+        return false;
+    if (has_nl)
+        uc->write_queue.push_coalesced(msg, upstream_connection::WRITE_COALESCE_LIMIT);
+    else
+        uc->write_queue.push_coalesced_line(msg, upstream_connection::WRITE_COALESCE_LIMIT);
+    if (!uc->write_pending)
+        upstream_flush_write_queue(uc);
+    return true;
 }
 
 server_instance::fanout_count server_instance::upstream_broadcast(std::string_view msg)
