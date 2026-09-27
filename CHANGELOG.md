@@ -123,6 +123,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   script relayed as a binary frame. A message split into fragments is judged
   whole, so a character split across two fragments is accepted. Binary
   messages are not checked.
+- A binary WebSocket message whose bytes happened to be valid UTF-8 was
+  relayed by a server without a script as a text frame, so a browser got a
+  string where it expected a Blob or ArrayBuffer. A relayed message now keeps
+  the opcode it arrived with, including after reassembly from fragments and
+  when it was held for a client still finishing its upgrade. What a script
+  sends is framed as before: text if it is valid UTF-8, binary otherwise.
 - A backend that answers a HEAD with a body, or otherwise sends bytes after
   an answer, no longer has them glued to the next answer on the same backend
   connection: the proxy sends that request again on a fresh connection, or

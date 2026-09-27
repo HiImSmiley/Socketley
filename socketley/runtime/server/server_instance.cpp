@@ -4491,7 +4491,8 @@ reparse:
                     break;
                 }
                 if (!msg.empty())
-                    process_message(conn, msg);
+                    process_message(conn, msg, opcode == WS_OP_TEXT ? ws_kind::text
+                                                                    : ws_kind::binary);
                 conn->ws_frag_len = 0;
                 conn->ws_frag_opcode = 0;
             }
@@ -5368,7 +5369,8 @@ void server_instance::on_request_reply(uint64_t cookie, request_status st,
         close_conn(conn);
 }
 
-void server_instance::process_message(server_connection* sender, std::string_view msg)
+void server_instance::process_message(server_connection* sender, std::string_view msg,
+                                      ws_kind kind)
 {
     // Rate limit check (per-connection)
     if (sender && !check_rate_limit(sender))
@@ -5400,7 +5402,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
             // again for a websocket peer, so nothing changes there.
             auto shared_msg = std::make_shared<const std::string>(
                 std::string(msg) + "\n");
-            queue_send(peer, shared_msg);
+            queue_send(peer, shared_msg, false, nullptr, kind);
         }
         return;
     }
@@ -5541,7 +5543,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                         buf.reserve(msg.size() + 1);
                         buf.append(msg);
                         buf.push_back('\n');
-                        queue_send(sender, std::move(buf));
+                        queue_send(sender, std::move(buf), false, kind);
                     }
                 }
                 else
@@ -5552,9 +5554,9 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                     buf.push_back('\n');
                     auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                     if ((to & send_to_sender) && sender)
-                        queue_send(sender, relay_msg);
+                        queue_send(sender, relay_msg, false, nullptr, kind);
                     if (to & send_to_others)
-                        queue_broadcast(relay_msg, sender ? sender->fd : -1);
+                        queue_broadcast(relay_msg, sender ? sender->fd : -1, -1, kind);
                 }
             }
             break;
@@ -5670,7 +5672,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                     buf.append(msg);
                     buf.push_back('\n');
                     auto relay_msg = std::make_shared<const std::string>(std::move(buf));
-                    queue_broadcast(relay_msg, sender->fd);
+                    queue_broadcast(relay_msg, sender->fd, -1, kind);
                 }
                 break;
             }
@@ -5699,7 +5701,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 buf.append(msg.data(), msg.size());
                 buf.push_back('\n');
                 auto fwd_msg = std::make_shared<const std::string>(std::move(buf));
-                queue_send(m_conn_idx[m_master_fd], fwd_msg);
+                queue_send(m_conn_idx[m_master_fd], fwd_msg, false, nullptr, kind);
             }
 
             if (m_send_to & (send_to_sender | send_to_others))
@@ -5710,11 +5712,11 @@ void server_instance::process_message(server_connection* sender, std::string_vie
                 buf.push_back('\n');
                 auto relay_msg = std::make_shared<const std::string>(std::move(buf));
                 if (m_send_to & send_to_sender)
-                    queue_send(sender, relay_msg);
+                    queue_send(sender, relay_msg, false, nullptr, kind);
                 // Two exclusions: the master has already had this message in
                 // its own form above, or was deliberately left out of the set.
                 if (m_send_to & send_to_others)
-                    queue_broadcast(relay_msg, sender->fd, m_master_fd);
+                    queue_broadcast(relay_msg, sender->fd, m_master_fd, kind);
             }
             break;
         }
@@ -5771,7 +5773,7 @@ server_instance::fanout_count server_instance::broadcast(std::string_view msg)
 // anything added here inherits that history.
 server_instance::fanout_count server_instance::queue_broadcast(
     const std::shared_ptr<const std::string>& msg, int exclude_fd,
-    int exclude_fd2)
+    int exclude_fd2, ws_kind kind)
 {
     fanout_count counted;
     if (SOCKETLEY_UNLIKELY(!m_loop))
@@ -5807,7 +5809,7 @@ server_instance::fanout_count server_instance::queue_broadcast(
             // known.  Measured while this was `continue` alone -- a broadcast
             // to three connected clients reported taken=1, the only one that
             // had spoken yet, which reads as two clients missed.
-            relay_hold_push(conn, msg);
+            relay_hold_push(conn, msg, kind);
             ++counted.taken;
             continue;
         }
@@ -5840,12 +5842,10 @@ server_instance::fanout_count server_instance::queue_broadcast(
                 std::string_view payload(*msg);
                 if (!payload.empty() && payload.back() == '\n')
                     payload.remove_suffix(1);
-                // Text only if the bytes may travel in one; see queue_send()
-                // for the rule and the measurement.  Built once for every
-                // websocket in the set, as the text frame always was -- the
-                // question is about the payload and not about the recipient.
-                ws_msg = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
-                                                      : ws_frame_binary_shared(payload);
+                // Built once for every websocket in the set, because the
+                // opcode is a fact about the message and not the recipient.
+                ws_msg = ws_frame_data_shared(
+                    static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload)), payload);
                 ws_off = socketley::place_in_segment(m_bcast_ws_seg, *ws_msg);
                 ws_seg = m_bcast_ws_seg;
             }
@@ -5930,7 +5930,8 @@ bool server_instance::admit_send(server_connection* conn, size_t bytes,
 
 bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                               bool even_when_closing,
-                              std::shared_ptr<const std::string>* ws_cache)
+                              std::shared_ptr<const std::string>* ws_cache,
+                              ws_kind kind)
 {
     if (!admit_send(conn, msg->size(), even_when_closing))
         return false;
@@ -5954,25 +5955,10 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
         if (!payload.empty() && payload.back() == '\n')
             payload.remove_suffix(1);
 
-        // ─── Which frame the bytes are allowed to travel in ──────────────────
-        // Every outbound frame was 0x81, text, and RFC 6455 5.6 says a text
-        // frame's payload MUST be valid UTF-8 -- with 8.1 saying a receiver
-        // that finds it is not MUST fail the connection.  So this is not a
-        // choice between two framings: for bytes that are not valid UTF-8,
-        // binary is the only conforming one.
-        //
-        // Reachable, and measured: a client sent a BINARY frame carrying
-        // ff fe 00 01 80 81, the server relayed it to the other client as
-        // opcode 0x1 with the bytes intact, and a conforming peer must close on
-        // that.  The opcode was the only thing wrong -- the payload arrived
-        // byte for byte -- so the payload is what decides, here where the
-        // destination is already known to be a websocket.
-        //
-        // Nothing that was already conforming moves: every relayed line is
-        // valid UTF-8 and still goes out as text, and ws_payload_is_utf8()
-        // spends one branch per byte on the ASCII that all of them are.
-        auto frame = ws_payload_is_utf8(payload) ? ws_frame_text_shared(payload)
-                                                 : ws_frame_binary_shared(payload);
+        // A relayed WebSocket message keeps its sender's opcode, and anything
+        // else is text only when RFC 6455 5.6 lets its bytes be.
+        auto frame = ws_frame_data_shared(
+            static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload)), payload);
         // Kept for the rest of the set, so the next recipient does not pay the
         // UTF-8 pass, the two allocations and the copy again.
         if (ws_cache)
@@ -6001,7 +5987,7 @@ bool server_instance::queue_send(server_connection* conn, const std::shared_ptr<
 // queue's own note on that measured 0.036 TCP segments per delivery against
 // 0.149 on a stream of small messages to one connection.
 bool server_instance::queue_send(server_connection* conn, std::string&& msg,
-                              bool even_when_closing)
+                              bool even_when_closing, ws_kind kind)
 {
     if (!admit_send(conn, msg.size(), even_when_closing))
         return false;
@@ -6016,7 +6002,7 @@ bool server_instance::queue_send(server_connection* conn, std::string&& msg,
         // built one queue entry apiece where the same stream to a raw socket
         // built one entry, 0.149 TCP segments per delivery against 0.036.
         //
-        // ws_frame_text_into writes the header and the payload straight into a
+        // ws_frame_data_into writes the header and the payload straight into a
         // buffer the queue may still grow, which is the same shape the plain
         // branch below has always had.  Frames are self-delimiting, so two of
         // them sharing one entry is what the peer reads anyway.
@@ -6028,10 +6014,8 @@ bool server_instance::queue_send(server_connection* conn, std::string&& msg,
         // an eight-byte length, plus the four a masked frame would carry.
         std::string frame;
         frame.reserve(14 + payload.size());
-        if (ws_payload_is_utf8(payload))
-            ws_frame_text_into(frame, payload);
-        else
-            ws_frame_binary_into(frame, payload);
+        ws_frame_data_into(frame, static_cast<uint8_t>(0x80 | ws_data_opcode(kind, payload)),
+                           payload);
 
         conn->write_queue.push_coalesced(std::move(frame),
             server_connection::WRITE_COALESCE_LIMIT);
@@ -6049,7 +6033,8 @@ bool server_instance::queue_send(server_connection* conn, std::string&& msg,
 }
 
 void server_instance::relay_hold_push(server_connection* conn,
-                                      const std::shared_ptr<const std::string>& msg)
+                                      const std::shared_ptr<const std::string>& msg,
+                                      ws_kind kind)
 {
     // The deadline runs from the first message held, or a listener on a busy
     // relay would have its clock reset by each broadcast and never reach it.
@@ -6060,7 +6045,7 @@ void server_instance::relay_hold_push(server_connection* conn,
             relay_deadline_arm(RELAY_HOLD_DEADLINE_MS);
     }
 
-    conn->relay_hold.push(msg);
+    conn->relay_hold.push(held_relay{msg, kind});
 
     // A loop and not a single pop, because one relayed message can be larger
     // than the whole bound and popping once would leave the hold over its
@@ -6090,7 +6075,10 @@ void server_instance::relay_hold_flush(server_connection* conn)
     // connection has a protocol now and a WebSocket needs every one of these
     // framed.
     while (!conn->relay_hold.empty())
-        queue_send(conn, conn->relay_hold.take_front());
+    {
+        const held_relay held = conn->relay_hold.take_front();
+        queue_send(conn, held.msg, false, nullptr, held.kind);
+    }
 
     conn->relay_hold_since = {};
 }

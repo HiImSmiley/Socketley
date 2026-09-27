@@ -379,6 +379,21 @@ inline bool ws_payload_is_utf8(std::string_view p)
     return true;
 }
 
+// What an outbound message is known to be, because a relayed WebSocket message
+// keeps the opcode it arrived with and everything else is judged by its bytes.
+enum class ws_kind : uint8_t { by_payload, text, binary };
+
+// The data opcode a message of `kind` goes out with, where `text` is only ever
+// given for bytes already checked to be UTF-8.
+inline uint8_t ws_data_opcode(ws_kind kind, std::string_view payload)
+{
+    if (kind == ws_kind::text)
+        return WS_OP_TEXT;
+    if (kind == ws_kind::binary)
+        return WS_OP_BINARY;
+    return ws_payload_is_utf8(payload) ? WS_OP_TEXT : WS_OP_BINARY;
+}
+
 // Create binary frame, for a payload RFC 6455 5.6 would require be valid UTF-8
 // in a text frame.
 inline std::string ws_frame_binary(std::string_view payload)

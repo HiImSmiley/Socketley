@@ -24,6 +24,7 @@
 #include "../../shared/request_channel.h"
 #include "../../shared/tls_context.h"
 #include "../../shared/transparent_string.h"
+#include "../../shared/ws_protocol.h"
 #include <linux/time_types.h>
 
 class runtime_manager;
@@ -54,6 +55,19 @@ struct http_request
     std::vector<std::pair<std::string_view, std::string_view>> headers;
     int client_id{-1};
 };
+
+// A relayed message held for a connection that has not said what it speaks,
+// with the kind its sender gave it so a websocket still gets that opcode.
+struct held_relay
+{
+    std::shared_ptr<const std::string> msg;
+    ws_kind kind;
+};
+
+inline size_t write_queue_size_of(const held_relay& h)
+{
+    return socketley::write_queue_size_of(h.msg);
+}
 
 struct alignas(64) server_connection
 {
@@ -141,7 +155,7 @@ struct alignas(64) server_connection
     // held rather than dropped because writing it early puts it in front of
     // the response the client is parsing for, and released by
     // relay_hold_flush() or by the deadline.
-    socketley::byte_counted_queue<std::shared_ptr<const std::string>> relay_hold;
+    socketley::byte_counted_queue<held_relay> relay_hold;
 
     // When this hold started, measured from the first message held rather than
     // from the accept, because until there is traffic to hold there is nothing
@@ -869,7 +883,8 @@ private:
 
     // Hold one relayed message for a connection that has no protocol yet.
     void relay_hold_push(server_connection* conn,
-                         const std::shared_ptr<const std::string>& msg);
+                         const std::shared_ptr<const std::string>& msg,
+                         ws_kind kind);
 
     // Release what was held once the protocol is known, from the one point
     // every path through handle_read reaches.
@@ -1048,7 +1063,9 @@ private:
     bool m_upstream_awaiting{false};
     void invoke_on_upstream_disconnect(int conn_id);
 
-    void process_message(server_connection* sender, std::string_view msg);
+    // `kind` is what a WebSocket sender's frame said, kept by every relay below.
+    void process_message(server_connection* sender, std::string_view msg,
+                         ws_kind kind = ws_kind::by_payload);
     // Two exclusions, because `others` in master mode means everyone who is
     // neither the sender nor the master, and one of those is the only thing
     // this ever needed before.
@@ -1059,7 +1076,7 @@ private:
     std::shared_ptr<std::string> m_bcast_seg;
     std::shared_ptr<std::string> m_bcast_ws_seg;
     fanout_count queue_broadcast(const std::shared_ptr<const std::string>& msg, int exclude_fd,
-                         int exclude_fd2 = -1);
+                         int exclude_fd2 = -1, ws_kind kind = ws_kind::by_payload);
     void remove_active_fd(int fd);
     // `even_when_closing` is for an answer that was already promised, which
     // nothing else may set: the socket is still open precisely because that
@@ -1075,7 +1092,8 @@ private:
     // been O(1).
     bool queue_send(server_connection* conn, const std::shared_ptr<const std::string>& msg,
                     bool even_when_closing = false,
-                    std::shared_ptr<const std::string>* ws_cache = nullptr);
+                    std::shared_ptr<const std::string>* ws_cache = nullptr,
+                    ws_kind kind = ws_kind::by_payload);
 
     // The same, for a caller that OWNS its bytes and has exactly one recipient
     // -- which is every self.send() and every reply to one client.  A
@@ -1084,7 +1102,7 @@ private:
     // be coalesced, because appending to a payload others hold would change it
     // for them.  See write_queue.h on the three kinds of entry.
     bool queue_send(server_connection* conn, std::string&& msg,
-                 bool even_when_closing = false);
+                 bool even_when_closing = false, ws_kind kind = ws_kind::by_payload);
 
     // Whether this connection will take `bytes` more, and the two flags that
     // follow from the answer.  Extracted because both queue_send forms have to

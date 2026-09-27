@@ -2892,6 +2892,10 @@ messages. The
 callback fires after the upgrade. A text message that is not valid UTF\-8
 fails its connection with close code 1007 and never reaches a script; a
 fragmented message is checked once it is whole.
+A message the server relays without a script \(em to other clients, back to
+its sender, or to the master \(em goes out as the kind of frame it arrived in,
+text or binary. A message a script sends goes out as text when it is valid
+UTF\-8 and as binary otherwise, as does a line relayed from a TCP client.
 .TP
 .B RESP (Redis protocol)
 Detected when the first byte is
