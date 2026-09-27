@@ -627,8 +627,10 @@ private:
     // Returns http_request_parse::invalid for a request that must never reach a
     // backend, which is a verdict the old bool return could not express at all.
     http_request_parse parse_http_request_line(proxy_client_connection* conn);
-    std::string rewrite_http_request(proxy_client_connection* conn,
-                                     std::string_view new_path);
+    // Writes into `result` rather than returning a string, so the buffer the
+    // caller passes keeps its capacity from one request to the next.
+    void rewrite_http_request(proxy_client_connection* conn,
+                              std::string_view new_path, std::string& result);
 
     // The path as the backend will see it, written in one place so the
     // forwarding site and on_route's third argument cannot drift, and

@@ -3671,16 +3671,18 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
             return;
         }
 
-        // Rewrite request before connect — save for forwarding
-        std::string rewritten = rewrite_http_request(conn, new_path);
+        // Rewritten straight into saved_request, whose capacity survives the
+        // clear() between requests, so a keep-alive connection stops
+        // allocating a request buffer per request.
+        rewrite_http_request(conn, new_path, conn->saved_request);
         if (SOCKETLEY_UNLIKELY(conn->req_chunk.st == http_chunked_decoder::phase::broken))
         {
             // Nothing has reached a backend yet, so the refusal is whole.
             conn->partial.clear();
+            conn->saved_request.clear();
             send_error(conn, "400 Bad Request", "Bad Request\n");
             return;
         }
-        conn->saved_request = std::move(rewritten);
 
         // Before the connect, because an asynchronous one returns out of this
         // function below and the bound would never be armed for the commonest
@@ -4310,12 +4312,12 @@ std::string_view proxy_instance::backend_path(std::string_view client_path) cons
 }
 
 // Case-insensitive header name match helper
-std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
-                                                  std::string_view new_path)
+void proxy_instance::rewrite_http_request(proxy_client_connection* conn,
+                                          std::string_view new_path, std::string& result)
 {
     // Find end of request line
     auto pos = conn->partial.find("\r\n");
-    std::string result;
+    result.clear();
     result.reserve(conn->method.size() + 1 + new_path.size() + 1
                    + conn->version.size() + conn->partial.size() - pos + 64);
     result += conn->method;
@@ -4602,8 +4604,6 @@ std::string proxy_instance::rewrite_http_request(proxy_client_connection* conn,
     // Consume exactly what was forwarded, with body_off the whole buffer on
     // the unreachable npos path so that case still clears it.
     conn->partial.erase(0, body_off + body_len);
-
-    return result;
 }
 
 // ─── Declared routes ────────────────────────────────────────────────────────

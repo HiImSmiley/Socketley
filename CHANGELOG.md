@@ -108,6 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`
   is the cache's own text, without a `lua: error:` prefix.
+- A proxied HTTP request is rewritten into a buffer its connection keeps, so
+  a keep-alive connection no longer allocates and frees one per request.
+  TODO: measured effect.
 
 ### Fixed
 
