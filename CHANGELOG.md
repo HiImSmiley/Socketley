@@ -109,8 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   instead of returning it to the pool and probing it on the way back out, as
   HAProxy's `http-reuse safe` does. A backend closing such an idle connection
   costs the client nothing and is not counted against the backend's circuit
-  breaker; `stats` shows the held connections as `parked_connections`, and
-  they go to the pool when the client leaves. TODO: measured effect.
+  breaker, and an idempotent request that meets that close on its way out is
+  sent again on a fresh connection instead of answered 502. A held connection
+  idle past the pool's 60 s is not reused; `stats` shows the held connections
+  as `parked_connections`, and they go to the pool when the client leaves.
+  TODO: measured effect.
 
 ### Fixed
 

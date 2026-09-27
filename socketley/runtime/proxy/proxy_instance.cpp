@@ -125,6 +125,15 @@ static inline bool backend_op_in_flight(const proxy_backend_connection* b)
            b->splice_in_pending || b->splice_out_pending;
 }
 
+// Only idempotent methods unless retry_all, with OPTIONS added because the man
+// page has always named it and the code was the half that was wrong -- TRACE
+// stays out as a behaviour change nobody asked for.
+static inline bool retry_safe_method(std::string_view method, bool retry_all)
+{
+    return retry_all || method == "GET" || method == "HEAD" || method == "PUT" ||
+           method == "DELETE" || method == "OPTIONS";
+}
+
 // Splice is off unless SOCKETLEY_PROXY_SPLICE says otherwise, because
 // IORING_OP_SPLICE is prepped REQ_F_FORCE_ASYNC and costs a thread hand-off
 // per transfer -- the copy path measured 1.79x the rate at 128 B and still
@@ -299,6 +308,7 @@ void proxy_client_connection::reset(int new_fd)
     saved_request.clear();
     parked_backend_fd = -1;
     kept_alive = false;
+    reissue_ok = false;
     SKL_TRACE_RESET(*this);
     SKL_INV_RESET(*this);
     client_eof = false;
@@ -350,6 +360,9 @@ void proxy_backend_connection::reset(int new_fd)
     backend_eof = false;
     parked = false;
     parked_for = -1;
+    from_park = false;
+    park_turn = 0;
+    idle_since = {};
     drained_reads = 0;
     send_retries = 0;
     pool_abandoned = false;
@@ -995,6 +1008,9 @@ size_t proxy_instance::get_connection_count() const
 // also the limit of what any rule here can do -- see MULTISHOT_MIN_CLIENTS.
 void proxy_instance::on_loop_turn()
 {
+    // Counted before anything returns, because take_parked_backend() reads it.
+    ++m_turn;
+
     if (!m_recv_multishot_supported)
     {
         m_recv_multishot = false;
@@ -3726,7 +3742,7 @@ void proxy_instance::drive_client_request(proxy_client_connection* conn, int fd,
 
         // Pooled connection acquired synchronously — forward now
         forward_to_backend(conn, conn->saved_request);
-        if (m_mesh.retry_count <= 0)
+        if (m_mesh.retry_count <= 0 && !conn->reissue_ok)
             conn->saved_request.clear();
     }
     else if (conn->backend_fd >= 0 && !conn->partial.empty())
@@ -3904,6 +3920,15 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // group member's failure on whatever occupied that slot.
             if (ce.side == conn_client)
             {
+                // A socket taken from parking that ends before a byte of the
+                // answer is most likely the backend's idle close crossing this
+                // request, which HAProxy retries on a fresh connection and
+                // does not hold against the backend.
+                if (m_protocol == protocol_http && conn->from_park && !teardown_is_ours &&
+                    !ce.client->response_started && !ce.client->closing &&
+                    reissue_unanswered(ce.client, conn))
+                    return;
+
                 // "The backend answered" is not "bytes arrived", so the charge
                 // is stated over the framing state -- all three terms, because
                 // a header block split across two reads leaves headers_parsed
@@ -5870,9 +5895,12 @@ void proxy_instance::release_to_pool(int backend_fd, size_t backend_idx,
         bconn->tls_peer_closed = false;
     }
 
+    // A socket that sat parked keeps the age it already has, so the pool's
+    // idle bound counts from when it last carried an answer.
+    const auto since = (bconn && bconn->idle_since != std::chrono::steady_clock::time_point{})
+                           ? bconn->idle_since : std::chrono::steady_clock::now();
     pool.push_back({backend_fd, backend_idx, std::string(host), port,
-                    std::chrono::steady_clock::now(), ssl,
-                    ssl ? m_backend_tls.get() : nullptr});
+                    since, ssl, ssl ? m_backend_tls.get() : nullptr});
 
     // Something is in the pool now, so there is something for the sweep to
     // reclaim; a no-op while it is already running.
@@ -7294,6 +7322,8 @@ bool proxy_instance::park_backend(proxy_client_connection* cconn,
 
     bconn->parked = true;
     bconn->parked_for = cconn->fd;
+    bconn->park_turn = m_turn;
+    bconn->idle_since = std::chrono::steady_clock::now();
     bconn->client_fd = -1;
     cconn->parked_backend_fd = bconn->fd;
     cconn->backend_fd = -1;
@@ -7323,11 +7353,42 @@ bool proxy_instance::take_parked_backend(proxy_client_connection* conn)
         return false;
     }
 
+    // Past the pool's own idle bound a NAT or the backend may have dropped it
+    // without a word, so it is not trusted with a request.
+    if (std::chrono::steady_clock::now() - b->idle_since >
+        std::chrono::seconds(POOL_IDLE_TIMEOUT_SEC))
+    {
+        drop_parked_backend(b);
+        return false;
+    }
+
+    // Parked this same turn, its read has not reached the ring and cannot have
+    // reported a FIN or stray bytes already waiting, so the pool's probe asks.
+    if (b->park_turn == m_turn)
+    {
+        char probe;
+        const ssize_t r = recv(b->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        {
+            if (r > 0)
+                warn_pool_unbidden();
+            drop_parked_backend(b);
+            return false;
+        }
+    }
+
     unpark(b);
     b->parked_for = -1;
     conn->parked_backend_fd = -1;
     b->client_fd = conn->fd;
     conn->backend_fd = b->fd;
+    b->from_park = true;
+    b->idle_since = {};
+
+    // Kept whole in saved_request only when nothing of it is still to arrive,
+    // which is what lets reissue_unanswered() send it again.
+    conn->reissue_ok = retry_safe_method(conn->method, m_mesh.retry_all) &&
+                       !conn->body_unbounded && conn->body_remaining == 0;
 
     // A new exchange framed from its first byte, with a HEAD's missing body
     // told as backend_pool_acquire tells it, and without a new generation
@@ -7417,6 +7478,40 @@ void proxy_instance::drop_parked_backend(proxy_backend_connection* bconn)
     close_pair(-1, bconn->fd);
 }
 
+bool proxy_instance::reissue_unanswered(proxy_client_connection* cconn,
+                                        proxy_backend_connection* bconn)
+{
+    if (!cconn->reissue_ok || cconn->saved_request.empty())
+        return false;
+    // Once, so a fresh connection that fails the same way takes the ordinary
+    // road and is charged for it.
+    cconn->reissue_ok = false;
+
+    const int bfd = bconn->fd;
+    cconn->backend_fd = -1;
+    bconn->client_fd = -1;
+    close_pair(-1, bfd, close_reason::force);
+
+    const backend_info* target = select_and_resolve_backend(cconn);
+    if (!target)
+    {
+        answer_gateway_failure(cconn, true);
+        return true;
+    }
+    bool ours = false;
+    if (!connect_to_backend(cconn, target, &ours))
+    {
+        if (!ours)
+            note_backend_failure(cconn);
+        answer_gateway_failure(cconn, ours);
+        return true;
+    }
+    // An asynchronous connect is forwarded by handle_connect.
+    if (!cconn->connect_pending)
+        forward_to_backend(cconn, cconn->saved_request);
+    return true;
+}
+
 void proxy_instance::unpark(proxy_backend_connection* bconn)
 {
     if (!bconn->parked)
@@ -7468,6 +7563,7 @@ void proxy_instance::reset_client_for_next_request(proxy_client_connection* ccon
     cconn->header_parsed = false;
     cconn->response_started = false;
     cconn->kept_alive = true;
+    cconn->reissue_ok = false;
     // The exchange this connection was timed for is over, and the next request
     // arms deadlines of its own; until then it is merely idle, which is
     // --idle-timeout's business.
@@ -8802,16 +8898,8 @@ bool proxy_instance::try_retry(proxy_client_connection* conn)
     if (conn->closing)
         return false;
 
-    // Only idempotent methods unless retry_all, with OPTIONS added because the
-    // man page has always named it and the code was the half that was wrong --
-    // TRACE stays out as a behaviour change nobody asked for.
-    if (!m_mesh.retry_all)
-    {
-        if (conn->method != "GET" && conn->method != "HEAD" &&
-            conn->method != "PUT" && conn->method != "DELETE" &&
-            conn->method != "OPTIONS")
-            return false;
-    }
+    if (!retry_safe_method(conn->method, m_mesh.retry_all))
+        return false;
 
     conn->retries_remaining--;
 

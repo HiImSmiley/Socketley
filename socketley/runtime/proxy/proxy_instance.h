@@ -205,6 +205,9 @@ struct alignas(64) proxy_client_connection
     // An exchange on this connection has finished and it stayed open, which
     // is the evidence park_backend waits for.
     bool kept_alive{false};
+    // The request in saved_request went whole onto a socket taken from
+    // parking, so an answer that never starts may be asked for again.
+    bool reissue_ok{false};
 
     // Bumped on every reuse from the pool and stamped into io_requests, so
     // late completions from the previous occupant can be recognised and
@@ -357,6 +360,12 @@ struct alignas(64) proxy_backend_connection
     uint16_t pool_port{0};
     // The client a parked connection is kept for, -1 otherwise.
     int parked_for{-1};
+    // Taken from parking for the exchange now on it, see reissue_unanswered.
+    bool from_park{false};
+    // The loop turn it was parked in and when, the second also carried into
+    // the pool by release_to_pool so its age survives the move.
+    uint64_t park_turn{0};
+    std::chrono::steady_clock::time_point idle_since{};
 
     SKL_TRACE_FIELD(tr)
     SKL_INV_FIELD(pr)
@@ -744,6 +753,10 @@ private:
     void finish_parked_read(proxy_backend_connection* bconn,
                             struct io_uring_cqe* cqe, io_request* req);
     void warn_pool_unbidden();
+    // Sends an idempotent request again on a fresh connection when the socket
+    // it was taken from parking for closed before a byte of the answer, true
+    // when the client has been dealt with and the caller must return.
+    bool reissue_unanswered(proxy_client_connection* cconn, proxy_backend_connection* bconn);
     // Consumes the completion of the read that detach_and_pool_backend
     // cancelled, and releases the fd and the struct once it is the last one.
     void finish_pool_drain(proxy_backend_connection* bconn,
@@ -1023,6 +1036,8 @@ private:
     // MAX_POOL_PER_BACKEND so idle clients hold no more idle backend sockets
     // than the pool itself would.
     size_t m_parked_count{0};
+    // Loop turns seen, so a socket parked this turn can be told apart.
+    uint64_t m_turn{0};
 
     proxy_conn_entry m_conn_idx[MAX_FDS]{};
     backend_info m_scratch_backend{};

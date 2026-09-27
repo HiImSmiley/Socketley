@@ -23,7 +23,10 @@
 #   * the client leaving is now what releases the socket, so a road out that
 #     forgets it leaks one backend connection per client
 #   * a pipelined request is routed from inside the response's own handler,
-#     onto the socket that has just been parked
+#     onto the socket that has just been parked, before its armed read has
+#     reached the ring -- so a FIN or stray bytes already waiting there have
+#     to be asked about, and a request that meets the backend's close anyway
+#     is sent again on a fresh connection rather than answered 502
 #
 # The backend stamps its accept ordinal into every body, so which backend
 # connection served a request is read off the answer rather than guessed, and
@@ -40,9 +43,20 @@
 #        out that does not release its parked socket
 #   (d2) no pooled_connections once it has: a release that closes the socket
 #        instead of handing it to the pool, one backend connect per client
+#   (b0) no parked_connections:1 while the backend's idle close is pending:
+#        (b) would then be about a pooled socket and prove nothing about the
+#        parked read
 #   (b)  a 502/503, an error line or an open breaker after the backend closed
 #        a parked idle connection: the idle EOF read as a failed exchange, or
-#        not heard at all and the next request written into a dead socket
+#        not heard at all and the next request written into a dead socket;
+#        B2 = 200 is the breaker's witness, since at threshold 1 a charged
+#        idle close answers the next request 503.  Deleting the parked check
+#        in handle_backend_read does NOT fail this: the EOF then takes the
+#        ordinary road with no client attached and closes the socket just as
+#        quietly -- (g) is the assertion that check answers to
+#   (g)  the request after stray bytes arrived on a parked socket going out on
+#        that same socket: the bytes consumed and the socket kept, which is
+#        what the parked check in handle_backend_read exists to prevent
 #   (c)  the request after a `Connection: close` answer sent on that socket:
 #        this backend says close and then lingers without reading, so reuse
 #        is a 502 after 1.5 s rather than a lucky reconnect
@@ -50,6 +64,13 @@
 #   (e2) the pipelined second request on a different backend connection: the
 #        request routed from inside park_backend's own reset not finding the
 #        socket that has just been parked
+#   (h)  a pipelined pair behind a backend that closes right after answering,
+#        without saying close: the second request written onto the just
+#        parked socket and answered 502 -- fails on 039baf42 every time
+#   (i)  a pipelined pair behind a HEAD answered with a body: the stray bytes
+#        framed as the second answer; whether they share the head's read (the
+#        overrun road) or arrive in the next one (the same-turn probe) is the
+#        kernel's timing, so this guards both and pins neither
 #   (f)  backend connections left over once every client has gone
 set -uo pipefail
 
@@ -129,10 +150,25 @@ def serve(c, ordinal):
                 respond(c, ordinal, k, target, b"Connection: close\r\n")
                 time.sleep(1.5)
                 return
+            if target.startswith("/headlate"):
+                # A HEAD answer, and then the body it must not have, late.
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+                time.sleep(0.1)
+                c.sendall(b"BODYBODYBODY")
+                continue
+            if target.startswith("/headbody"):
+                # The same at once, as http.server's HEAD with a body does.
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n")
+                c.sendall(b"BODYBODYBODY")
+                continue
             respond(c, ordinal, k, target)
             if target.startswith("/closeidle"):
-                # A keep-alive answer, then the backend's own idle close.
-                time.sleep(0.05)
+                # A keep-alive answer, then the backend's own idle close, late
+                # enough for the test to see the socket parked first.
+                time.sleep(1.0)
+                return
+            if target.startswith("/closenow"):
+                # Closes right behind a keep-alive answer without saying so.
                 return
     except Exception:
         pass
@@ -169,7 +205,7 @@ mode, port = sys.argv[1], int(sys.argv[2])
 def req(target, extra=""):
     return ("GET /kr%s HTTP/1.1\r\nHost: t\r\n%s\r\n" % (target, extra)).encode()
 
-def read_response(s, buf):
+def read_response(s, buf, head=False):
     while b"\r\n\r\n" not in buf:
         b = s.recv(65536)
         if not b:
@@ -181,7 +217,7 @@ def read_response(s, buf):
     clen = 0
     for l in lines[1:]:
         k, _, v = l.partition(b":")
-        if k.strip().lower() == b"content-length":
+        if k.strip().lower() == b"content-length" and not head:
             clen = int(v.strip())
     while len(rest) < clen:
         b = s.recv(65536)
@@ -190,9 +226,9 @@ def read_response(s, buf):
         rest += b
     return status, rest[:clen].decode("latin1").replace("\n", " ").strip(), rest[clen:]
 
-def show(label, s, buf):
+def show(label, s, buf, head=False):
     try:
-        st, body, buf = read_response(s, buf)
+        st, body, buf = read_response(s, buf, head)
         print("R %s %s %s" % (label, st, body), flush=True)
     except Exception as e:
         print("R %s ERR %s" % (label, type(e).__name__), flush=True)
@@ -215,7 +251,8 @@ elif mode == "closeidle":
     buf = show("w", s, buf)
     s.sendall(req("/closeidle"))
     buf = show("b1", s, buf)
-    time.sleep(0.5)
+    print("B1DONE", flush=True)
+    time.sleep(1.5)
     s.sendall(req("/ok?after=idleclose"))
     buf = show("b2", s, buf)
 elif mode == "closehdr":
@@ -232,6 +269,27 @@ elif mode == "pipeline":
     s.sendall(req("/ok?p=1") + req("/ok?p=2"))
     buf = show("e1", s, buf)
     buf = show("e2", s, buf)
+elif mode == "headlate":
+    s.sendall(req("/ok?warm"))
+    buf = show("w", s, buf)
+    s.sendall(("HEAD /kr/headlate HTTP/1.1\r\nHost: t\r\n\r\n").encode())
+    buf = show("g1", s, buf, head=True)
+    time.sleep(0.5)
+    s.sendall(req("/ok?after=headlate"))
+    buf = show("g2", s, buf)
+elif mode == "pipeclose":
+    s.sendall(req("/ok?warm"))
+    buf = show("w", s, buf)
+    s.sendall(req("/closenow") + req("/ok?after=closenow"))
+    buf = show("h1", s, buf)
+    buf = show("h2", s, buf)
+elif mode == "pipehead":
+    s.sendall(req("/ok?warm"))
+    buf = show("w", s, buf)
+    s.sendall(("HEAD /kr/headbody HTTP/1.1\r\nHost: t\r\n\r\n").encode() +
+              req("/ok?after=headbody"))
+    buf = show("i1", s, buf, head=True)
+    buf = show("i2", s, buf)
 s.close()
 print("DONE", flush=True)
 PYEOF
@@ -309,12 +367,23 @@ else bad "(d2) the released backend goes to the pool" \
 
 # ─── (b): the backend closes a parked idle connection ───────────────────────
 LOG_OFF=$(wc -c <"$SOCKETLEY_DLOG" 2>/dev/null || echo 0)
-timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" closeidle "$PX" >"$SOCKETLEY_TMPD/b.out" 2>&1
+timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" closeidle "$PX" >"$SOCKETLEY_TMPD/b.out" 2>&1 &
+CLPID=$!
+for _ in $(seq 1 100); do grep -q '^B1DONE' "$SOCKETLEY_TMPD/b.out" 2>/dev/null && break; sleep 0.02; done
+# The backend closes a second after answering, so this reads the socket while
+# it is still parked and idle.
+B_PARKED=$(stat_of parked_connections)
+wait "$CLPID" 2>/dev/null; CLPID=""
 B1=$(status_of b1 "$SOCKETLEY_TMPD/b.out"); B2=$(status_of b2 "$SOCKETLEY_TMPD/b.out")
 B1C=$(conn_of b1 "$SOCKETLEY_TMPD/b.out"); B2C=$(conn_of b2 "$SOCKETLEY_TMPD/b.out")
 B_LOG=$(tail -c +"$((LOG_OFF + 1))" "$SOCKETLEY_DLOG" 2>/dev/null | grep -E '\[(WARN|ERROR)\]' | head -3)
 B_CIRCUIT=$("$BIN" stats "$NAME" 2>/dev/null | grep -E '_circuit:|^open_circuits:' | head -2 | tr '\n' ' ')
-echo "  (b) before the idle close: ${B1:-none} on conn ${B1C:-?}; after: ${B2:-none} on conn ${B2C:-?}"
+echo "  (b) before the idle close: ${B1:-none} on conn ${B1C:-?}, parked=${B_PARKED:-none};" \
+     "after: ${B2:-none} on conn ${B2C:-?}"
+
+if [ "${B_PARKED:-0}" = 1 ]; then ok
+else bad "(b0) the socket the backend is about to close is parked" \
+         "parked_connections=${B_PARKED:-absent} between the answer and the backend's close"; fi
 
 if [ "$B1" = 200 ] && [ "$B2" = 200 ] && [ -n "$B1C" ] && [ -n "$B2C" ] && [ "$B1C" != "$B2C" ] &&
    [ -z "$B_LOG" ] && [ -z "$B_CIRCUIT" ]; then ok
@@ -347,6 +416,41 @@ else bad "(e) a pipelined pair is answered in order" \
 if [ -n "$E1C" ] && [ "$E1C" = "$E2C" ]; then ok
 else bad "(e2) the pipelined second request goes out on the parked connection" \
          "backend connections ${E1C:-?} then ${E2C:-?}"; fi
+
+# ─── (g): stray bytes on a parked socket ────────────────────────────────────
+timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" headlate "$PX" >"$SOCKETLEY_TMPD/g.out" 2>&1
+G1=$(status_of g1 "$SOCKETLEY_TMPD/g.out"); G2=$(status_of g2 "$SOCKETLEY_TMPD/g.out")
+W_G=$(conn_of w "$SOCKETLEY_TMPD/g.out"); G2C=$(conn_of g2 "$SOCKETLEY_TMPD/g.out")
+echo "  (g) HEAD with a late body: ${G1:-none} (warm-up on conn ${W_G:-?}); the next: ${G2:-none} on conn ${G2C:-?}"
+
+# The HEAD went out on the warm-up's socket, which the pool hands straight
+# back, so that is the socket the stray body landed on.
+if [ "$G1" = 200 ] && [ "$G2" = 200 ] && [ -n "$W_G" ] && [ -n "$G2C" ] && [ "$W_G" != "$G2C" ]; then ok
+else bad "(g) a parked socket that received stray bytes is not reused" \
+         "HEAD ${G1:-none}, then ${G2:-none} on conn ${G2C:-?} against the HEAD's conn ${W_G:-?}" \
+         "(want 200, 200, two different)"; fi
+
+# ─── (h): a pipelined pair behind a backend that closes after answering ─────
+timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" pipeclose "$PX" >"$SOCKETLEY_TMPD/h.out" 2>&1
+H1=$(sed -n 's/^R h1 200 .*target=\([^ ]*\).*/\1/p' "$SOCKETLEY_TMPD/h.out")
+H2=$(sed -n 's/^R h2 200 .*target=\([^ ]*\).*/\1/p' "$SOCKETLEY_TMPD/h.out")
+echo "  (h) pipelined behind a silent close: '${H1:-none}' then '${H2:-none}'"
+
+if [ "$H1" = "/closenow" ] && [ "$H2" = "/ok?after=closenow" ]; then ok
+else bad "(h) a pipelined request behind a backend's unannounced close is answered" \
+         "answers for '${H1:-none}' and '${H2:-none}'" \
+         "$(grep '^R h' "$SOCKETLEY_TMPD/h.out" | head -2 | tr '\n' ' ')"; fi
+
+# ─── (i): a pipelined pair behind a HEAD answered with a body ───────────────
+timeout 20 python3 "$SOCKETLEY_TMPD/cl.py" pipehead "$PX" >"$SOCKETLEY_TMPD/i.out" 2>&1
+I1=$(status_of i1 "$SOCKETLEY_TMPD/i.out")
+I2=$(sed -n 's/^R i2 200 .*target=\([^ ]*\).*/\1/p' "$SOCKETLEY_TMPD/i.out")
+echo "  (i) pipelined behind a HEAD with a body: ${I1:-none}, then '${I2:-none}'"
+
+if [ "$I1" = 200 ] && [ "$I2" = "/ok?after=headbody" ]; then ok
+else bad "(i) a pipelined request behind a HEAD answered with a body gets its own answer" \
+         "HEAD ${I1:-none}, then an answer for '${I2:-none}'" \
+         "$(grep '^R i' "$SOCKETLEY_TMPD/i.out" | head -2 | tr '\n' ' ')"; fi
 
 # ─── (f): nothing left once every client has gone ───────────────────────────
 FINAL=$(wait_backends_gone)
