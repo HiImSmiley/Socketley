@@ -134,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for the client's next request: the request goes out on a new one instead of
   into the one closing, where it was sent twice or answered 502. The client's
   own connection stays open.
+- An HTTP client that closes its side while its answer is still coming -- one
+  that ends only when the backend closes, or one short of its Content-Length --
+  is no longer held open for as long as the backend stays silent: from then on
+  the backend may go `--backend-timeout` without sending before both
+  connections are closed. A half-closed client still receives an answer that
+  keeps coming.
 - A backend that answers a HEAD with a body, or otherwise sends bytes after
   an answer, no longer has them glued to the next answer on the same backend
   connection: the proxy sends that request again on a fresh connection, or

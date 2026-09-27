@@ -3202,6 +3202,10 @@ void proxy_instance::handle_client_read(struct io_uring_cqe* cqe, io_request* re
             if (answer_owed)
             {
                 conn->client_eof = true;
+                // Only the backend can end an answer already under way, so its
+                // silence is bounded the way its first byte was.
+                if (conn->response_started)
+                    arm_response_deadline(conn);
                 return;
             }
         }
@@ -4118,6 +4122,10 @@ void proxy_instance::handle_backend_read(struct io_uring_cqe* cqe, io_request* r
             // rather than a fix.
             clear_response_deadline(ce.client);
         }
+        // A client that has sent its FIN can no longer end the answer itself,
+        // so each read restarts the bound on the backend's silence instead.
+        if (ce.side == conn_client && ce.client->client_eof)
+            arm_response_deadline(ce.client);
     }
 
     // The scan runs before the forward because it decides its length: a
@@ -8717,6 +8725,21 @@ void proxy_instance::response_deadline_sweep()
         if (now < conn->response_deadline)
         {
             still_waiting = true;
+            continue;
+        }
+
+        // A half-closed client's answer under way is closed rather than retried,
+        // answered 504 or charged, unless the client is still being written to.
+        if (conn->client_eof && conn->response_started)
+        {
+            if (conn->write_pending || !conn->write_queue.empty())
+            {
+                arm_response_deadline(conn);
+                still_waiting = true;
+                continue;
+            }
+            conn->awaiting_response = false;
+            close_pair(cfd, conn->backend_fd, close_reason::force);
             continue;
         }
 

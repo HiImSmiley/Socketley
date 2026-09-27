@@ -3556,7 +3556,11 @@ failure, so without a deadline it keeps its full share of the rotation
 and every request routed to it is held until the client gives up. HTTP
 mode only \(em TCP mode has no request/response framing to measure. Only
 the wait for the first byte is bounded, so a slow or streaming response
-body is never cut short once the backend has begun answering.
+body is never cut short once the backend has begun answering \(em unless
+the client has closed its side. Such a client cannot end the answer
+itself, so from then on the backend may go this long without sending a
+byte before both connections are closed, with no error charged; a
+backend that keeps sending is never cut short.
 .IP
 The 2-second default applies whether or not the flag is given. If any
 endpoint behind this proxy normally needs longer than that to
