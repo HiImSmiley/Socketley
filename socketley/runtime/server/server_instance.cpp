@@ -1732,7 +1732,7 @@ bool server_instance::send_final_and_fin(server_connection* conn, std::string_vi
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    m_stat_bytes_out.fetch_add(off, std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, off);
     if (off < data.size())
     {
         conn->write_queue.push(std::make_shared<const std::string>(data.substr(off)));
@@ -3319,7 +3319,7 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
     // ones included.
     ptr->last_activity = now_tp;
 
-    m_stat_total_connections.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_connections, 1);
     auto current_size = static_cast<uint32_t>(m_clients.size());
     if (current_size > m_stat_peak_connections)
         m_stat_peak_connections = current_size;
@@ -4847,7 +4847,7 @@ void server_instance::handle_read(struct io_uring_cqe* cqe, io_request* req)
 
     if (SOCKETLEY_UNLIKELY(m_idle_timeout_cached > 0))
         conn->last_activity = std::chrono::steady_clock::now();
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
 
     // A connection on its way out takes nothing more in, because a multishot
     // recv stays armed after `closing` is set and went on filling `partial`
@@ -5357,7 +5357,7 @@ void server_instance::process_message(server_connection* sender, std::string_vie
         }
     }
 
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_messages, 1);
     print_bash_message(msg);
     write_received_message(msg);
     notify_interactive(msg);
@@ -6368,7 +6368,7 @@ bool server_instance::send_direct(server_connection* conn)
     const ssize_t n = ::sendmsg(conn->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (n <= 0)
         return false;
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
 
     if (static_cast<size_t>(n) < total)
     {
@@ -6413,7 +6413,7 @@ void server_instance::handle_write(struct io_uring_cqe* cqe, io_request* req)
         return;
     }
 
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     // Short write handling: resubmit remaining bytes
     if (conn->write_batch_count > 0)
@@ -6775,7 +6775,7 @@ void server_instance::handle_splice_out(struct io_uring_cqe* cqe, server_connect
         return;
     }
 
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     auto bytes_out = static_cast<uint32_t>(cqe->res);
     conn->splice_pipe_pending -= bytes_out;
@@ -6877,7 +6877,7 @@ void server_instance::handle_udp_read(struct io_uring_cqe* cqe)
 
     // Counted before the peer check, because these bytes arrived whatever the
     // table decides about their sender.
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
 
     // Register peer if new; skip processing if peer list is full.  Reached on
     // res == 0 as well: a zero-length datagram is a message its sender sent,
@@ -6921,7 +6921,7 @@ bool server_instance::udp_send_one(std::string_view msg, const struct sockaddr_i
                              reinterpret_cast<const struct sockaddr*>(&to), sizeof(to));
     if (SOCKETLEY_LIKELY(n >= 0))
     {
-        m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+        stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
         return true;
     }
 
@@ -7454,7 +7454,7 @@ void server_instance::deliver_routed(const conn_ref& ref, std::string_view msg)
     if (it == m_forwarded_by_ref.end())
         return;
 
-    m_stat_total_messages.fetch_add(1, std::memory_order_relaxed);
+    stat_add(m_stat_total_messages, 1);
     invoke_on_client_message(it->second, msg);
     invoke_on_message(msg);
 }
@@ -8146,7 +8146,7 @@ void server_instance::handle_upstream_read(struct io_uring_cqe* cqe, upstream_co
         return;
     }
 
-    m_stat_bytes_in.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_in, static_cast<uint64_t>(cqe->res));
     uc->partial.append(uc->read_buf, cqe->res);
 
     if (uc->partial.size() > read_buffer_bytes())
@@ -8212,7 +8212,7 @@ void server_instance::handle_upstream_write(struct io_uring_cqe* cqe, upstream_c
         return;
     }
 
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(cqe->res), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
 
     // Short write handling, because releasing the batch on any positive result
     // dropped the rest and the upstream read a truncated message with the next
@@ -8387,7 +8387,7 @@ bool server_instance::upstream_send_direct(upstream_connection* uc)
     const ssize_t n = ::sendmsg(uc->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (n <= 0)
         return false;
-    m_stat_bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+    stat_add(m_stat_bytes_out, static_cast<uint64_t>(n));
 
     if (static_cast<size_t>(n) < total)
     {
