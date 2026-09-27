@@ -138,13 +138,24 @@ lag_once >/dev/null                # warm-up: the backend handshake, see above
 LAGS=""
 for _ in $(seq 1 10); do LAGS="$LAGS $(lag_once)"; done
 MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS )"
 
-# 100 ms separates two mechanisms rather than timing a fast path, so the margin
-# is what matters and not the tightness.
-if [ "$MEDIAN" -le 100 ] 2>/dev/null; then pass; else
+# A lag is at least one `stats` round trip, and under Sanitize one CLI start
+# is about 100 ms by itself -- the old flat bound of 100 read the CLI there and
+# failed at medians of 101-103 with live figures.  So the round trip is timed
+# here, as a median of ten, and the bound is on what the lag adds to it.
+CLI=""
+for _ in $(seq 1 10); do
+    t0=$(date +%s%3N); field px_oop connections >/dev/null
+    CLI="$CLI $(( $(date +%s%3N) - t0 ))"
+done
+CLI_MS=$(printf '%s\n' $CLI | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS ), one stats round trip ${CLI_MS} ms"
+
+# 100 ms past one round trip separates two mechanisms rather than timing a fast
+# path, so the margin is what matters and not the tightness.
+if [ "$MEDIAN" -le $(( CLI_MS + 100 )) ] 2>/dev/null; then pass; else
     fail "a connection is visible as soon as it is asked about" \
-         "the median lag over ten attempts was ${MEDIAN} ms, bound 100" \
+         "the median lag over ten attempts was ${MEDIAN} ms, bound ${CLI_MS} + 100" \
          "a figure summed at print time cannot be behind the loop turn that" \
          "counted the accept.  A median near a publish period is a pushed" \
          "figure back in front of these counters — see worker_figures()"
