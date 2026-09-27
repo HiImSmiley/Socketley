@@ -587,17 +587,24 @@ measures it in two minutes:
 
 | shape | socketley | Redis 7.0.15 | |
 |---|---|---|---|
-| string, 16-byte key, 3-byte value | 118 B | 104 B | 1.1× |
-| hash, 5 fields of 6 bytes | 198 B | 168 B | 1.2× |
-| set, 5 members | 422 B | 472 B | 0.9× |
-| sorted set, 5 members | 198 B | 136 B | 1.5× |
-| list, 1 element | 134 B | 184 B | 0.7× |
-| list, 5 elements | 182 B | 216 B | 0.8× |
-| list, 50 elements | 583 B | 616 B | 0.9× |
+| string, 16-byte key, 3-byte value | 85 B | 104 B | 0.8× |
+| hash, 5 fields of 6 bytes | 165 B | 168 B | 1.0× |
+| set, 5 members | 341 B | 472 B | 0.7× |
+| sorted set, 5 members | 133 B | 136 B | 1.0× |
+| list, 1 element | 101 B | 184 B | 0.5× |
+| list, 5 elements | 149 B | 216 B | 0.7× |
+| list, 50 elements | 549 B | 616 B | 0.9× |
 
-The key count matters: the keyspace's slot table doubles as it passes three
-quarters full, and at 100,000 keys it has just done so, which adds about 50
-bytes to every row above.
+A key costs one 8-byte slot in the keyspace table, holding the entry's address
+with 16 bits of the key's hash above it, and one block holding a 4-byte key
+length, the value and the key's bytes. A small sorted set stores whole-number
+scores in 1, 2 or 4 bytes, as Redis's listpack does.
+
+The key count matters: at 100,000 keys every row reads about 45 bytes more
+(string 128 B, sorted set 180 B), evenly across shapes. About 4 of those are
+the slot table, which has just doubled there; the rest is some 4.5 MB the
+worker touches under any load, its 4 MiB receive ring among it, spread over a
+tenth as many keys.
 
 Redis keeps a small hash, sorted set and list in one packed buffer (a
 listpack) and walks it; a hash here does the same below 128 fields of 64 bytes
