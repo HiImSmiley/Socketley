@@ -41,25 +41,31 @@ public:
     zskiplist order;   // read through here, changed only through the calls below
 
     zset_inner() = default;
-    zset_inner(const zset_inner& o)
-        : order(o.order), m_index(o.m_index ? std::make_unique<key_table<double>>(*o.m_index) : nullptr) {}
+    ~zset_inner() { delete index(); }
+    // A copy of a big set can come out small, since the skiplist copies by
+    // inserting, and a small one has no index.
+    zset_inner(const zset_inner& o) : order(o.order) { if (order.big()) build_index(); }
     zset_inner& operator=(const zset_inner& o)
     {
         if (this != &o) { zset_inner copy(o); *this = std::move(copy); }
         return *this;
     }
-    zset_inner(zset_inner&&) noexcept = default;
-    zset_inner& operator=(zset_inner&&) noexcept = default;
+    zset_inner(zset_inner&& o) noexcept : order(std::move(o.order)) {}
+    zset_inner& operator=(zset_inner&& o) noexcept
+    {
+        if (this != &o) { delete index(); order = std::move(o.order); }
+        return *this;
+    }
 
     size_t size()  const { return order.size(); }
     bool   empty() const { return order.empty(); }
 
     bool score_of(std::string_view member, double& out) const
     {
-        if (m_index)
+        if (const auto* ix = index())
         {
-            auto it = m_index->find(member);
-            if (it == m_index->end()) return false;
+            auto it = ix->find(member);
+            if (it == ix->end()) return false;
             out = it->second;
             return true;
         }
@@ -72,8 +78,8 @@ public:
     void add(double score, std::string_view member)
     {
         order.emplace(score, std::string(member));
-        if (m_index)
-            m_index->try_emplace(member, score);
+        if (index())
+            index()->try_emplace(member, score);
         else if (order.big())
             build_index();
     }
@@ -84,8 +90,8 @@ public:
         std::string name;
         order.extract(old, member, name);
         order.emplace(score, std::move(name));
-        if (m_index)
-            m_index->insert_or_assign(member, score);
+        if (index())
+            index()->insert_or_assign(member, score);
         else if (order.big())
             build_index();
     }
@@ -93,7 +99,7 @@ public:
     void remove(std::string_view member, double old)
     {
         order.erase(old, member);
-        if (m_index) m_index->erase(member);
+        if (index()) index()->erase(member);
     }
 
     // What ZSCAN walks, as (member, score): the small vector as one bucket,
@@ -123,29 +129,34 @@ public:
         }
         friend bool operator!=(const const_local_iterator& a, const const_local_iterator& b) { return !(a == b); }
     };
-    size_t bucket_count() const { return m_index ? m_index->bucket_count() : 1; }
+    size_t bucket_count() const { return index() ? index()->bucket_count() : 1; }
     const_local_iterator begin(size_t b) const
     {
-        return m_index ? const_local_iterator(std::as_const(*m_index).begin(b)) : const_local_iterator(order.begin());
+        return index() ? const_local_iterator(std::as_const(*index()).begin(b)) : const_local_iterator(order.begin());
     }
     const_local_iterator end(size_t b) const
     {
-        return m_index ? const_local_iterator(std::as_const(*m_index).end(b)) : const_local_iterator(order.end());
+        return index() ? const_local_iterator(std::as_const(*index()).end(b)) : const_local_iterator(order.end());
     }
     // A cursor from the small form is never read against the index.
-    uint32_t scan_epoch() const { return m_index ? m_index->scan_epoch() + 1 : 0; }
+    uint32_t scan_epoch() const { return index() ? index()->scan_epoch() + 1 : 0; }
 
 private:
-    std::unique_ptr<key_table<double>> m_index;
+    // Kept in the skiplist's aux word while it is big: a small set has none,
+    // and the pointer it used to hold here was 8 of every small set's bytes,
+    // the ones that moved its keyspace entry from a 64-byte malloc chunk to 48.
+    key_table<double>* index() const { return static_cast<key_table<double>*>(order.aux()); }
 
     void build_index()
     {
-        m_index = std::make_unique<key_table<double>>();
-        m_index->reserve(order.size());
+        auto ix = std::make_unique<key_table<double>>();
+        ix->reserve(order.size());
         for (const auto& [sc, m] : order)
-            m_index->try_emplace(m, sc);
+            ix->try_emplace(m, sc);
+        order.set_aux(ix.release());
     }
 };
+static_assert(sizeof(zset_inner) == 24);
 using zset_map = key_table<zset_inner>;
 using expiry_map = key_table<std::chrono::steady_clock::time_point>;
 using channel_map = std::unordered_map<std::string, std::unordered_set<int>, string_hash, string_equal>;

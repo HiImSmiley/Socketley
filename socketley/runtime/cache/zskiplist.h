@@ -72,6 +72,13 @@ public:
 
     bool big() const { return m_level != 0; }
 
+    // One word an owner may keep here while the set is big -- a sorted set's
+    // member index, which would otherwise cost eight bytes of every small
+    // set.  Moved along with the nodes, never copied, never freed: the owner
+    // frees it before clear() or destruction drop it.
+    void* aux() const { return big() ? m_big.aux : nullptr; }
+    void  set_aux(void* p) { m_big.aux = p; }
+
 private:
     // 32 levels carries four billion members at p=1/4, which is more than the
     // process can hold; the level is per node, so the cost of the ceiling is
@@ -148,7 +155,7 @@ public:
         const_iterator& operator--()
         {
             if (m_owner && !m_owner->big()) { m_off = m_owner->prev_off(m_off); --m_i; return *this; }
-            m_p = m_p ? m_p->back : (m_owner ? m_owner->m_big.tail : nullptr);
+            m_p = m_p ? m_p->back : (m_owner ? m_owner->tail() : nullptr);
             return *this;
         }
         const_iterator  operator--(int) { const_iterator t = *this; --*this; return t; }
@@ -178,7 +185,7 @@ public:
     }
     const_iterator last() const
     {
-        return big() ? const_iterator(m_big.tail, this)
+        return big() ? const_iterator(tail(), this)
                      : const_iterator(m_count - 1, prev_off(m_pack.size()), this);
     }
 
@@ -254,7 +261,7 @@ private:
 
         n->back = (update[0] == m_big.head) ? nullptr : update[0];
         if (n->L(0).fwd) n->L(0).fwd->back = n;
-        else              m_big.tail = n;
+        else              m_big.head->back = n;
         ++m_count;
     }
 
@@ -306,7 +313,7 @@ public:
             }
         }
         if (x->L(0).fwd) x->L(0).fwd->back = x->back;
-        else              m_big.tail = x->back;
+        else              m_big.head->back = x->back;
         while (m_level > 1 && !m_big.head->L(m_level - 1).fwd) --m_level;
         out = std::move(x->v.second);
         destroy(x);
@@ -491,7 +498,7 @@ private:
         node* head = make_node(max_level, 0.0, std::string());
         m_pack.~pack_buf();
         m_big.head = head;
-        m_big.tail = nullptr;
+        m_big.aux  = nullptr;
         m_count = 0;
         m_level = 1;
         for (auto& [sc, member] : items)
@@ -537,9 +544,12 @@ private:
         return rng;
     }
 
-    // A small set is its pack and a big one its head and tail, never both, so
-    // the two share their bytes; m_level is 0 while the set is small.
-    struct big_t { node* head; node* tail; };
+    // A small set is its pack and a big one its head, never both, so the two
+    // share their bytes; m_level is 0 while the set is small.  The tail lives
+    // in the head's back link, which nothing else uses, and that frees the
+    // word beside the head for aux().
+    struct big_t { node* head; void* aux; };
+    node* tail() const { return m_big.head->back; }
     union
     {
         pack_buf m_pack;

@@ -2605,6 +2605,44 @@ TEST_CASE("a small zskiplist keeps every score exactly through its compact width
     check_all(z);
 }
 
+TEST_CASE("zset_inner's member index follows its skiplist through copies and moves")
+{
+    auto filled = [](int n) {
+        zset_inner z;
+        for (int i = 0; i < n; ++i) z.add(i * 0.5, "m" + std::to_string(i));
+        return z;
+    };
+    auto scores_ok = [](const zset_inner& z, int n) {
+        for (int i = 0; i < n; ++i)
+        {
+            double sc = -1;
+            if (!z.score_of("m" + std::to_string(i), sc) || sc != i * 0.5) return false;
+        }
+        double sc;
+        return !z.score_of("absent", sc);
+    };
+    const int big = static_cast<int>(zskiplist::SMALL_MAX) + 50;
+    for (const int n_a : { 0, 5, big })
+        for (const int n_b : { 0, 5, big })
+        {
+            zset_inner a = filled(n_a), b = filled(n_b);
+            zset_inner a2(a);                       // a copy builds its own index
+            CHECK(scores_ok(a2, n_a));
+            a = std::move(b);                       // the old index goes, b's moves in
+            CHECK(scores_ok(a, n_b));
+            CHECK(b.size() == 0);
+            b = a2;                                 // copy-assign over an emptied one
+            CHECK(scores_ok(b, n_a));
+            zset_inner c(std::move(b));
+            CHECK(scores_ok(c, n_a));
+            c.add(99999.0, "late");
+            double sc;
+            CHECK((c.score_of("late", sc) && sc == 99999.0));
+            c.remove("late", 99999.0);
+            CHECK_FALSE(c.score_of("late", sc));
+        }
+}
+
 TEST_CASE("a packed list short enough to sit in place survives being moved")
 {
     list_items a;
