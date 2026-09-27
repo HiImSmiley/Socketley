@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   straight from the script's string when nothing is queued ahead of it,
   instead of being copied into a new string first: 2.7% more 16 KB round
   trips through a Lua echo, the distance to a C echo 2.04 → 1.65 µs.
+- A message a server script sends to one WebSocket client with `self.send` is
+  framed without being copied twice: when nothing is queued ahead of it the
+  frame goes out from a header on the stack and the script's string, and
+  otherwise it is built once from the message rather than from a copy of it
+  with a newline added. TODO: measurement.
 - `EVAL` is 46% faster, and a script calling `redis.call` about twice as fast:
   `redis.call` works on the Lua stack and hands its arguments to the cache
   without encoding them as RESP. An error a script catches from `redis.call`

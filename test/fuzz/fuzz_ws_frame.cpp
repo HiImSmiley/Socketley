@@ -127,9 +127,11 @@ void round_trip(const uint8_t* data, size_t size)
     FUZZ_CHECK(payload.substr(0, pout.payload.size()) == pout.payload,
                "ws_frame_pong truncated the payload to something other than its own prefix");
 
-    // Same payload as an appended frame: the _into variants write through
-    // resize() + memcpy rather than append(), which is a different set of
-    // bounds to get wrong.
+    // A frame the server sends from its parts is sized before its header is written.
+    FUZZ_CHECK(ws_header_size(payload.size()) + payload.size() == framed.size(),
+               "ws_header_size disagreed with the header ws_frame_text wrote");
+
+    // Same payload as an appended frame, behind bytes that must be left alone.
     std::string buf = "PREFIX";
     ws_frame_text_into(buf, payload);
     FUZZ_CHECK(buf.size() == 6 + framed.size(), "ws_frame_text_into wrote a different number of bytes than ws_frame_text");

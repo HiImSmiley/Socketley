@@ -277,6 +277,12 @@ inline int ws_write_header(char* hdr, uint8_t opcode_with_fin, size_t payload_le
     }
 }
 
+// What ws_write_header() writes for this payload, for a caller that must know the frame's size first.
+inline size_t ws_header_size(size_t payload_len)
+{
+    return payload_len <= 125 ? 2 : payload_len <= 65535 ? 4 : 10;
+}
+
 // Build a data frame (server->client, unmasked) with the caller's opcode, so
 // text and binary share one encoder.
 inline std::string ws_frame_data(uint8_t opcode_with_fin, std::string_view payload)
@@ -558,10 +564,9 @@ inline void ws_frame_data_into(std::string& buf, uint8_t opcode_with_fin,
     char hdr[14];
     int hdr_len = ws_write_header(hdr, opcode_with_fin, payload.size());
 
-    size_t off = buf.size();
-    buf.resize(off + static_cast<size_t>(hdr_len) + payload.size());
-    std::memcpy(&buf[off], hdr, static_cast<size_t>(hdr_len));
-    std::memcpy(&buf[off + hdr_len], payload.data(), payload.size());
+    // Appended rather than resized into, so the payload's bytes are written once and never zeroed first.
+    buf.append(hdr, static_cast<size_t>(hdr_len));
+    buf.append(payload);
 }
 
 // Append text frame directly into buf (no intermediate allocation)

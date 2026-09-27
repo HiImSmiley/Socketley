@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Integration test: a server's echoes, a cache's replies, a client's sends, a
-# server's sends to its upstream and a server script's sends to a client
-# arrive byte for byte and in order, through every mix of sends taken at once
-# and sends that had to go through the ring
+# server's sends to its upstream and a server script's sends to a client and
+# to a websocket arrive byte for byte and in order, through every mix of sends
+# taken at once and sends that had to go through the ring
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
@@ -17,8 +17,8 @@
 # kernel buffers and forces partial sends and a queue, then reads everything:
 # lines of 1 byte to 30 KB to an echo server, pipelined GETs of values up to
 # 500 KB to a cache, and the same lines from a client runtime's script, from a
-# server's script to its upstream and from one to a connected client, each to
-# a peer that reads late.
+# server's script to its upstream, from one to a connected client and from one
+# to a websocket as frames, each to a peer that reads late.
 # What arrives must be exactly what was expected.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
@@ -28,6 +28,7 @@
 #   * a client runtime's sends the same way
 #   * a server's sends to its upstream the same way
 #   * a server script's sends to a client the same way
+#   * a server script's frames to a websocket the same way, or malformed
 # suite: isolated
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -46,6 +47,7 @@ command -v python3 >/dev/null 2>&1 || { echo "  SKIP: python3 not available"; ec
 
 PS=$((SL_PORT_BASE + 1311)); PC=$((SL_PORT_BASE + 1312)); PK=$((SL_PORT_BASE + 1313))
 PU=$((SL_PORT_BASE + 1314)); PUS=$((SL_PORT_BASE + 1315)); PL=$((SL_PORT_BASE + 1316))
+PW=$((SL_PORT_BASE + 1317))
 daemon_isolate directsend
 daemon_start "$BIN"
 WORK=$SOCKETLEY_TMPD
@@ -112,6 +114,78 @@ if mode == "slowclient":
     c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
     c.connect(("127.0.0.1", port))
     slow_read(c, b"".join(lines()))
+elif mode == "wsclient":
+    # The server's frames carry each line without its newline, one frame a
+    # line, as text: every line is ASCII.
+    import base64, os, struct
+    want = [l[:-1] for l in lines()]
+    c = socket.socket()
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    c.connect(("127.0.0.1", port))
+    c.sendall(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n"
+               % base64.b64encode(os.urandom(16)).decode()).encode())
+    c.settimeout(10)
+    data = bytearray()
+    try:
+        while b"\r\n\r\n" not in data:
+            b = c.recv(4096)
+            if not b: break
+            data += b
+    except socket.timeout:
+        pass
+    head, sep, rest = bytes(data).partition(b"\r\n\r\n")
+    if not sep or b" 101 " not in head.split(b"\r\n")[0]:
+        print("no 101: %r" % head[:80], flush=True)
+        sys.exit(0)
+    data = bytearray(rest)
+    got, bad, pos = [], [], 0
+
+    def parse():
+        """Takes every whole frame off the front, noting any that is not a
+        final, unmasked text frame with its length in the shortest form."""
+        global pos
+        while len(data) - pos >= 2:
+            b0, b1 = data[pos], data[pos + 1]
+            n, hl = b1 & 0x7F, 2
+            if n == 126:
+                if len(data) - pos < 4: return
+                n, hl = struct.unpack_from("!H", data, pos + 2)[0], 4
+            elif n == 127:
+                if len(data) - pos < 10: return
+                n, hl = struct.unpack_from("!Q", data, pos + 2)[0], 10
+            if len(data) - pos < hl + n: return
+            if b0 != 0x81 or b1 & 0x80 or (hl == 4 and n < 126) or (hl == 10 and n <= 65535):
+                bad.append("frame %d header %02x %02x len %d" % (len(got), b0, b1, n))
+            got.append(bytes(data[pos + hl:pos + hl + n]))
+            pos += hl + n
+
+    time.sleep(1.0)
+    c.settimeout(20)
+    try:
+        parse()
+        while len(got) < len(want):
+            b = c.recv(8192)
+            if not b: break
+            data += b
+            parse()
+            time.sleep(0.0005)
+        # Anything after the last frame is a byte sent twice.
+        c.settimeout(0.5)
+        while True:
+            b = c.recv(8192)
+            if not b: break
+            data += b
+    except socket.timeout:
+        pass
+    extra = len(data) - pos
+    enc = lambda fs: b"".join(struct.pack("!I", len(f)) + f for f in fs)
+    e = enc(want)
+    g = enc(got) + ("|bad=%d|extra=%d" % (len(bad), extra)).encode() * (1 if bad or extra else 0)
+    print("expect=%s %d got=%s %d frames=%d bad=%d extra=%d%s" % (
+        hashlib.sha256(e).hexdigest(), len(e), hashlib.sha256(g).hexdigest(), len(g),
+        len(got), len(bad), extra, (" first: " + bad[0]) if bad else ""), flush=True)
 elif mode == "sink":
     ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
@@ -226,6 +300,30 @@ for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PL " && break; sleep 
 OUT=$(timeout 90 python3 "$WORK/peer.py" slowclient "$PL" 2>&1 || true)
 echo "  tell:     $OUT"
 check "a server script's sends to a client arrive whole and in order" "$OUT"
+
+# ── 6. a server script's frames to a websocket arrive whole and in order ──
+# The same, framed: each frame is tried directly from its header and the
+# script's string, so a partial send leaves part of a header or a payload to
+# be copied, and only that part may follow through the ring.  Started from
+# on_websocket, because on_connect runs before the upgrade.
+cat > "$WORK/ws.lua" <<'LUA'
+function on_websocket(id, headers)
+    local sizes = { 1, 7, 64, 1000, 8000, 30000 }
+    local i = 0
+    local iv
+    iv = socketley.set_interval(1, function()
+        local line = string.format("%06d|", i) .. string.rep(string.char(97 + i % 26), sizes[(i * 7) % 6 + 1])
+        self.send(id, i % 2 == 0 and line .. "\n" or line)
+        i = i + 1
+        if i == 900 then socketley.clear_interval(iv) end
+    end)
+end
+LUA
+"$BIN" create server dsw -p "$PW" --lua "$WORK/ws.lua" -s >/dev/null 2>&1 || true
+for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PW " && break; sleep 0.1; done
+OUT=$(timeout 90 python3 "$WORK/peer.py" wsclient "$PW" 2>&1 || true)
+echo "  ws:       $OUT"
+check "a server script's frames to a websocket arrive whole and in order" "$OUT"
 
 if [ "$FAIL" -gt 0 ]; then
     if grep -v '\[INFO\]' "$SOCKETLEY_DLOG" 2>/dev/null | tail -8 | sed 's/^/        log: /'; then :; fi

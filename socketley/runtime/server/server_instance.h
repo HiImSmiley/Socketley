@@ -1091,6 +1091,8 @@ private:
     void submit_batch(server_connection* conn);
     bool send_direct(server_connection* conn);
     bool send_line_now(server_connection* conn, std::string_view msg, bool add_nl);
+    bool send_ws_message(server_connection* conn, std::string_view msg);
+    void submit_borrowed(server_connection* conn);
     void after_write(server_connection* conn);
     // A client's batch or an upstream's, which hold it in the same fields.
     template <class C> static void skip_written(C* conn, size_t written);

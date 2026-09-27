@@ -7264,8 +7264,11 @@ bool server_instance::send_to_client(int client_id, std::string_view msg)
     // a connection a script may answer; see the queue_send below.
     if (SOCKETLEY_UNLIKELY(conn->closing && conn->cache_pending == 0)) return false;
 
+    if (SOCKETLEY_UNLIKELY(conn->proto == proto_ws))
+        return send_ws_message(conn, msg);
+
     const bool add_nl = msg.empty() || msg.back() != '\n';
-    if (SOCKETLEY_LIKELY(m_loop && conn->proto != proto_ws && conn->ssl == nullptr && conn->write_queue.empty()
+    if (SOCKETLEY_LIKELY(m_loop && conn->ssl == nullptr && conn->write_queue.empty()
                          && !conn->write_pending && conn->write_batch_count == 0))
         return send_line_now(conn, msg, add_nl);
 
@@ -7302,18 +7305,67 @@ bool server_instance::send_line_now(server_connection* conn, std::string_view ms
     if (add_nl)
         conn->write_iovs[count++] = { const_cast<char*>(&nl), 1 };
     conn->write_batch_count = count;
-    if (send_direct(conn))
-        return true;
+    if (!send_direct(conn))
+        submit_borrowed(conn);
+    return true;
+}
 
-    // The rest is still the caller's, so it becomes the batch's own before the ring sees it.
+// One frame to a websocket, sent from the caller's payload and a header on the
+// stack when nothing is ahead of it, as send_line_now() sends a line.
+bool server_instance::send_ws_message(server_connection* conn, std::string_view msg)
+{
+    // The line's newline is not the payload's, as queue_send() has always read it.
+    std::string_view payload = msg;
+    if (!payload.empty() && payload.back() == '\n')
+        payload.remove_suffix(1);
+
+    const size_t hdr_len = ws_header_size(payload.size());
+    if (!admit_send(conn, hdr_len + payload.size(), conn->cache_pending > 0))
+        return false;
+
+    // Text only if the bytes may travel in one; see queue_send().
+    char hdr[10];
+    ws_write_header(hdr, static_cast<uint8_t>(0x80 | (ws_payload_is_utf8(payload) ? WS_OP_TEXT : WS_OP_BINARY)),
+                    payload.size());
+
+    if (SOCKETLEY_LIKELY(conn->ssl == nullptr && conn->write_queue.empty()
+                         && !conn->write_pending && conn->write_batch_count == 0))
+    {
+        uint32_t count = 0;
+        conn->write_iovs[count++] = { hdr, hdr_len };
+        if (!payload.empty())
+            conn->write_iovs[count++] = { const_cast<char*>(payload.data()), payload.size() };
+        conn->write_batch_count = count;
+        if (!send_direct(conn))
+            submit_borrowed(conn);
+        return true;
+    }
+
+    std::string frame;
+    frame.reserve(hdr_len + payload.size());
+    frame.append(hdr, hdr_len);
+    frame.append(payload);
+    conn->write_queue.push_coalesced(std::move(frame), server_connection::WRITE_COALESCE_LIMIT);
+    if (SOCKETLEY_LIKELY(!conn->write_pending))
+        flush_write_queue(conn);
+    return true;
+}
+
+// A batch whose iovecs still point at the caller's bytes takes exactly what
+// send_direct() left of them into one chunk of its own before the ring sees it.
+void server_instance::submit_borrowed(server_connection* conn)
+{
+    size_t total = 0;
+    for (uint32_t i = 0; i < conn->write_batch_count; i++)
+        total += conn->write_iovs[i].iov_len;
     std::string rest;
+    rest.reserve(total);
     for (uint32_t i = 0; i < conn->write_batch_count; i++)
         rest.append(static_cast<const char*>(conn->write_iovs[i].iov_base), conn->write_iovs[i].iov_len);
     conn->write_batch[0] = socketley::write_chunk(std::move(rest));
     conn->write_iovs[0] = { const_cast<char*>(conn->write_batch[0].data()), conn->write_batch[0].size() };
     conn->write_batch_count = 1;
     submit_batch(conn);
-    return true;
 }
 
 bool server_instance::owner_send(int client_id, std::string_view msg)
