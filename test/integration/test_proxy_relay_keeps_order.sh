@@ -125,12 +125,33 @@ exchange(){   # backend's half-close: late | first, and the path
     else fail "the downstream stream arrives whole and in order ($2, $1)" "backend sent '$b_sent', client read '$c_recv'"; fi
 }
 
-phase(){   # copy | splice
+phase(){   # copy | splice | sockmap
     daemon_isolate relayorder
-    if [ "$1" = splice ]; then export SOCKETLEY_PROXY_SPLICE=1; else unset SOCKETLEY_PROXY_SPLICE; fi
+    unset SOCKETLEY_PROXY_SPLICE SOCKETLEY_PROXY_SOCKMAP
+    if [ "$1" = splice ]; then export SOCKETLEY_PROXY_SPLICE=1; fi
+    if [ "$1" = sockmap ]; then export SOCKETLEY_PROXY_SOCKMAP=1; fi
     daemon_start "$BIN"
-    "$BIN" create proxy relayp -p "$PX" --backend "127.0.0.1:$BE" --protocol tcp -s >/dev/null 2>&1 || true
+    # A --write-buffer above the 12 MiB each side sends, because a peer that
+    # reads late piles the whole transfer into the kernel, and the sockmap
+    # path drops a pair whose in-kernel backlog passes that bound (it cannot
+    # hand a queued backlog to the copy path without losing it).  The copy and
+    # splice paths pace losslessly and do not need it, but it is harmless there.
+    "$BIN" create proxy relayp -p "$PX" --backend "127.0.0.1:$BE" --protocol tcp \
+        --write-buffer 32M -s >/dev/null 2>&1 || true
     for _ in $(seq 1 100); do ss -ltn 2>/dev/null | grep -q ":$PX " && break; sleep 0.1; done
+
+    # The kernel relay needs CAP_BPF/CAP_NET_ADMIN; without them the proxy logs
+    # once and stays on the copy path, so this phase is skipped rather than
+    # failed on a box that cannot load BPF.
+    if [ "$1" = sockmap ]; then
+        for _ in $(seq 1 30); do grep -q 'kernel relay is unavailable' "$SOCKETLEY_DLOG" 2>/dev/null && break; sleep 0.1; done
+        if grep -q 'kernel relay is unavailable' "$SOCKETLEY_DLOG" 2>/dev/null; then
+            echo "  SKIP: kernel relay unavailable (needs CAP_BPF/CAP_NET_ADMIN)"
+            daemon_stop
+            for _ in $(seq 1 50); do ss -ltn 2>/dev/null | grep -q ":$PX " || break; sleep 0.1; done
+            return 0
+        fi
+    fi
 
     exchange late "$1"
     exchange first "$1"
@@ -156,6 +177,8 @@ phase(){   # copy | splice
 phase copy
 # ── 6-10. the splice path, the same two ───────────────────────────────────
 phase splice
+# ── 11-15. the kernel relay (sockmap), the same two; skips without CAP_BPF ─
+phase sockmap
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ]
