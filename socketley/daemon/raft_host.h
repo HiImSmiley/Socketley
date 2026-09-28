@@ -81,6 +81,9 @@ public:
     uint64_t now_ms() const;
     // The name a member goes by, or its hex id when the book does not hold it.
     std::string node_name(socketley::raft::node_id id) const;
+    socketley::raft::node_id self() const { return m_id; }
+    // What `socketley cluster placement` prints about the runtimes and the nodes, from this node's applied state.
+    std::string placement() const;
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 

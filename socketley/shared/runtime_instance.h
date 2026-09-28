@@ -456,6 +456,9 @@ public:
     std::string_view get_owner() const;
     void set_lua_created(bool v);
     bool is_lua_created() const;
+    // A replica the cluster placed here, which its reconciliation owns and no state file may resurrect after a restart.
+    void set_cluster_owned(bool v) { m_cluster_owned = v; }
+    bool is_cluster_owned() const { return m_cluster_owned; }
 
     // External (attach) mode — runtime is managed by another process
     void mark_external();
@@ -959,6 +962,7 @@ private:
     // Ownership
     std::string m_owner;
     bool m_lua_created = false;
+    bool m_cluster_owned = false;
     bool m_external = false;
     bool m_managed = false;
     bool m_out_of_process = false;

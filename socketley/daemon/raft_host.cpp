@@ -1350,6 +1350,77 @@ bool raft_host::decode_snapshot(std::string_view data, book& b, socketley::clust
 
 // ─── shutdown and status ───
 
+std::string raft_host::placement() const
+{
+    namespace cl = socketley::cluster;
+    const cl::state& st = m_brain->current();
+    std::string out;
+
+    if (st.specs.empty())
+    {
+        out += "no cluster runtimes declared\n";
+    }
+    else
+    {
+        struct line { std::string name, type, want, placed, nodes, note; };
+        std::vector<line> rows;
+        size_t w[5] = {7, 4, 8, 6, 5};
+        for (const auto& [name, sp] : st.specs)
+        {
+            line l;
+            l.name   = name;
+            l.type   = sp.type;
+            l.want   = std::to_string(sp.replicas);
+            l.placed = std::to_string(st.placed(name));
+            auto it = st.owners.find(name);
+            if (it != st.owners.end())
+                for (raft::node_id n : it->second)
+                    l.nodes += (l.nodes.empty() ? "" : " ") + node_name(n);
+            if (l.nodes.empty())
+                l.nodes = "-";
+            if (const size_t m = st.missing(name))
+                l.note = std::to_string(m) + (m == 1 ? " replica" : " replicas") + " unplaced: no more live nodes to hold "
+                         + (m == 1 ? "it" : "them");
+            w[0] = std::max(w[0], l.name.size());
+            w[1] = std::max(w[1], l.type.size());
+            w[2] = std::max(w[2], l.want.size() + 0);
+            w[3] = std::max(w[3], l.placed.size());
+            w[4] = std::max(w[4], l.nodes.size());
+            rows.push_back(std::move(l));
+        }
+        auto pad = [](const std::string& s, size_t n) { return s + std::string(n > s.size() ? n - s.size() : 0, ' ') + "  "; };
+        out += pad("RUNTIME", w[0]) + pad("TYPE", w[1]) + pad("REPLICAS", 8) + pad("PLACED", 6) + "NODES\n";
+        for (const line& l : rows)
+            out += pad(l.name, w[0]) + pad(l.type, w[1]) + pad(l.want, 8) + pad(l.placed, 6) + l.nodes
+                 + (l.note.empty() ? "" : "  (" + l.note + ")") + "\n";
+    }
+
+    const uint64_t at = now_ms();
+    const bool leader = m_node->current_role() == raft::role::leader;
+    const std::vector<raft::node_id> alive = m_brain->live(at, socketley::cluster::view_of(*m_node, m_applied, m_last_proposed));
+    out += "\nNODE  LOAD  STATE\n";
+    for (raft::node_id id : m_node->voters())
+    {
+        std::string state;
+        if (!leader)
+            state = id == m_id ? "this node" : "liveness is judged by the leader";
+        else if (std::find(alive.begin(), alive.end(), id) != alive.end())
+            state = id == m_id ? "up (leader)" : "up";
+        else
+            state = "DOWN, its replicas are being moved";
+        if (leader && id != m_id)
+            if (auto age = m_brain->heard_ms_ago(id, at))
+                state += ", last lease request " + std::to_string(*age) + " ms ago";
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%-5zu ", st.load(id));
+        out += node_name(id) + "  " + buf + " " + state + "\n";
+    }
+    out += "\nthis node: " + node_name(m_id) + ", " + role_name(m_node->current_role()) + ", "
+         + (m_brain->serving(at) ? "serving (lease " + std::to_string(m_brain->lease_left_ms(at)) + " ms left)"
+                                 : std::string("NOT serving: no lease, or its log has not caught up to the leader's")) + "\n";
+    return out;
+}
+
 void raft_host::hand_over(event_loop& loop)
 {
     if (!m_node || m_stopped || m_node->current_role() != raft::role::leader)

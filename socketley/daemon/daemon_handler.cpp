@@ -1,4 +1,5 @@
 #include "daemon_handler.h"
+#include "cluster_reconciler.h"
 #include "raft_host.h"
 #include "flag_handlers.h"
 #include "type_manifest.h"
@@ -284,7 +285,7 @@ private:
 // A running runtime shows how long it has been up and every other state shows
 // its name, because printing an uptime for a runtime that never came up makes
 // a failed one look healthy.
-std::string state_column(const runtime_instance* inst)
+std::string state_text(const runtime_instance* inst)
 {
     switch (inst->get_state())
     {
@@ -308,6 +309,12 @@ std::string state_column(const runtime_instance* inst)
         case runtime_failed:  return "Failed";
         default:              return "Unknown";
     }
+}
+
+// The state, and a marker on a replica the cluster placed here, which `ls` must not show as a runtime an operator made.
+std::string state_column(const runtime_instance* inst)
+{
+    return inst->is_cluster_owned() ? state_text(inst) + " [cluster]" : state_text(inst);
 }
 
 // The same thing for the machine-readable form.
@@ -1215,6 +1222,11 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("cluster-status"): return cmd_cluster_status(conn);
         case fnv1a("raft-status"):    return cmd_raft_status(conn);
+        case fnv1a("cluster-create"): return cmd_cluster_create(conn, pa);
+        case fnv1a("cluster-remove"): return cmd_cluster_remove(conn, pa);
+        case fnv1a("cluster-scale"):  return cmd_cluster_scale(conn, pa);
+        case fnv1a("cluster-has"):    return cmd_cluster_has(conn, pa);
+        case fnv1a("cluster-placement"): return cmd_cluster_placement(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
@@ -1297,6 +1309,8 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     // no longer exists -- and with one answer there is no argument order left
     // to get wrong.
     instance->mark_out_of_process();
+    if (m_cluster_creating)
+        instance->set_cluster_owned(true);
 
     for (size_t i = 3; i < pa.count; ++i)
     {
@@ -1588,6 +1602,9 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     auto names = resolve_names(pa);
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
+    const size_t withheld_start = withhold_cluster_names(names, "start", conn);
+    if (names.empty())
+        return withheld_start ? 1 : 0;
 
     if (want_interactive && names.size() > 1)
     {
@@ -1749,6 +1766,7 @@ int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
     auto names = resolve_names(pa);
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
+    const size_t withheld = withhold_cluster_names(names, "stop", conn);
 
     for (const auto& n : names)
     {
@@ -1760,7 +1778,7 @@ int daemon_handler::cmd_stop(ipc_connection* conn, const parsed_args& pa)
     // command returns: `stop` has to mean the port is free by the time the CLI
     // exits, whichever side the proxy was running on.
     reconcile_proxy_workers();
-    return 0;
+    return withheld ? 1 : 0;
 }
 
 int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
@@ -1774,6 +1792,7 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
     auto names = resolve_names(pa);
     int rc = check_empty_names(names, pa, "runtime not found: ", conn);
     if (rc >= 0) return rc;
+    const size_t withheld = withhold_cluster_names(names, "remove", conn);
 
     // A caller cannot mean "signal me".  Removing an external runtime SIGTERMs
     // the pid it attached with, which is right for an operator and fatal for
@@ -1810,7 +1829,7 @@ int daemon_handler::cmd_remove(ipc_connection* conn, const parsed_args& pa)
         }
     }
 
-    return 0;
+    return withheld ? 1 : 0;
 }
 
 // The refusal `ls` and `ps` share, because both read a set of column names out
@@ -1941,7 +1960,8 @@ int daemon_handler::cmd_ls(ipc_connection* conn, const parsed_args& pa)
                 << ",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << sp_detail::json_escape(owner)
                 << "\",\"group\":\"" << sp_detail::json_escape(group)
-                << "\"}";
+                << "\",\"cluster\":" << (instance->is_cluster_owned() ? "true" : "false")
+                << "}";
         }
         out << "]\n";
         conn->write_buf = out.str();
@@ -2160,7 +2180,8 @@ int daemon_handler::cmd_ps(ipc_connection* conn, const parsed_args& pa)
                 << ",\"connections\":" << instance->reported_connection_count()
                 << ",\"owner\":\"" << sp_detail::json_escape(owner)
                 << "\",\"group\":\"" << sp_detail::json_escape(group)
-                << "\"}";
+                << "\",\"cluster\":" << (instance->is_cluster_owned() ? "true" : "false")
+                << "}";
         }
         out << "]\n";
         conn->write_buf = out.str();
@@ -3216,6 +3237,13 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
         return 1;
     }
 
+    if (instance->is_cluster_owned() && !m_cluster_internal)
+    {
+        std::vector<std::string> only{std::string(name)};
+        withhold_cluster_names(only, "edit", conn);
+        return 1;
+    }
+
     runtime_type type = instance->get_type();
     bool is_running = instance->get_state() == runtime_running;
 
@@ -4076,6 +4104,8 @@ int daemon_handler::cmd_stats(ipc_connection* conn, const parsed_args& pa)
         if (inst)
         {
             conn->write_buf += inst->get_stats();
+            if (inst->is_cluster_owned())
+                conn->write_buf += "cluster:replica\n";
 
             // There is no age to print here any more, because the counters are
             // summed out of shared memory at this instant rather than pushed
@@ -6614,6 +6644,231 @@ int daemon_handler::cmd_raft_status(ipc_connection* conn)
     int code = 0;
     conn->write_buf = m_raft->status(code);
     return code;
+}
+
+void daemon_handler::set_raft(class raft_host* host)
+{
+    m_raft = host;
+    if (!host)
+        return;
+    m_reconciler = std::make_unique<cluster_reconciler>(*this, m_manager, *host);
+    host->set_on_tick([this] { m_reconciler->tick(); });
+}
+
+int daemon_handler::run_internal(std::string_view line, std::string& out, bool cluster_owned)
+{
+    ipc_connection scratch{};
+    scratch.fd = -1;
+    const bool was_internal = m_cluster_internal;
+    const bool was_creating = m_cluster_creating;
+    m_cluster_internal = true;
+    m_cluster_creating = cluster_owned;
+    const int rc = process_command(&scratch, line);
+    m_cluster_internal = was_internal;
+    m_cluster_creating = was_creating;
+    out = std::move(scratch.write_buf);
+    return rc;
+}
+
+size_t daemon_handler::withhold_cluster_names(std::vector<std::string>& names, const char* verb, ipc_connection* conn) const
+{
+    if (m_cluster_internal)
+        return 0;
+    size_t withheld = 0;
+    std::erase_if(names, [&](const std::string& n)
+    {
+        auto* inst = m_manager.get(n);
+        if (!inst || !inst->is_cluster_owned())
+            return false;
+        ++withheld;
+        // The cluster runs it, so the way to end it is to tell the cluster, and the way to change it is to declare it again.
+        conn->write_buf += n + " is a cluster runtime, placed here by the cluster: `" + verb + "` would be undone at the next tick.\n"
+                           "  `socketley cluster remove " + n + "` ends it everywhere; `socketley cluster placement` shows where it runs.\n";
+        return true;
+    });
+    return withheld;
+}
+
+namespace {
+
+const char* raft_needed =
+    "cluster runtimes need a Raft daemon: start it with socketley daemon --raft-listen <ip:port> "
+    "and --raft-init or --raft-join\n";
+
+// Proposes or forwards one command, and says why when it could not go anywhere.
+int submit_cluster_command(raft_host& raft, const socketley::cluster::command& c, std::string& out)
+{
+    namespace cl = socketley::cluster;
+    if (const std::string why = cl::refusal(c); !why.empty())
+    {
+        out = why + "\n";
+        return 1;
+    }
+    if (const std::string why = cl::conflict(raft.cluster(), c); !why.empty())
+    {
+        out = why + "\n";
+        return 1;
+    }
+    std::string err;
+    if (!raft.submit(cl::encode(c), err))
+    {
+        out = err;
+        return 2;
+    }
+    return 0;
+}
+
+}   // namespace
+
+int daemon_handler::cmd_cluster_create(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace cl = socketley::cluster;
+    if (!m_raft)
+    {
+        conn->write_buf = raft_needed;
+        return 1;
+    }
+    if (pa.count < 3)
+    {
+        conn->write_buf = "usage: cluster create <type> <name> [flags] [--replicas <n>]\n";
+        return 1;
+    }
+
+    cl::command c;
+    c.op          = cl::op::create;
+    c.sp.type     = std::string(pa.args[1]);
+    c.name        = std::string(pa.args[2]);
+    c.sp.replicas = 1;
+    for (size_t i = 3; i < pa.count; ++i)
+    {
+        if (pa.args[i] != "--replicas")
+        {
+            c.sp.args += (c.sp.args.empty() ? "" : " ") + std::string(pa.args[i]);
+            continue;
+        }
+        uint32_t n = 0;
+        const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+        const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
+        if (v.empty() || ec != std::errc{} || end != v.data() + v.size())
+        {
+            conn->write_buf = "--replicas takes a count\n";
+            return 1;
+        }
+        c.sp.replicas = n;
+        ++i;
+    }
+
+    if (const std::string why = cl::refusal(c); !why.empty())
+    {
+        conn->write_buf = why + "\n";
+        return 1;
+    }
+    if (const std::string why = cl::conflict(m_raft->cluster(), c); !why.empty())
+    {
+        conn->write_buf = why + "\n";
+        return 1;
+    }
+    // A runtime of this name here would keep the replica out, so it is said now and not found at the first tick.
+    if (m_manager.get(c.name))
+    {
+        conn->write_buf = "a local runtime named " + c.name + " exists on this node, and a cluster runtime cannot take its name\n";
+        return 1;
+    }
+    // The flags are run through `create --test` as this node would run them, so a typo is refused here and not on every node at once.
+    std::string out;
+    const std::string dry = "create " + c.sp.type + " " + c.name + " " + cl::expand_args(c.sp.args, m_raft->node_name(m_raft->self()))
+                          + " --test";
+    if (const int rc = run_internal(dry, out, false); rc != 0)
+    {
+        conn->write_buf = out.empty() ? "the flags were refused\n" : out;
+        return rc;
+    }
+    const int rc = submit_cluster_command(*m_raft, c, conn->write_buf);
+    return rc;
+}
+
+int daemon_handler::cmd_cluster_remove(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace cl = socketley::cluster;
+    if (!m_raft)
+    {
+        conn->write_buf = raft_needed;
+        return 1;
+    }
+    if (pa.count != 2)
+    {
+        conn->write_buf = "usage: cluster remove <name>\n";
+        return 1;
+    }
+    cl::command c;
+    c.op   = cl::op::remove;
+    c.name = std::string(pa.args[1]);
+    return submit_cluster_command(*m_raft, c, conn->write_buf);
+}
+
+int daemon_handler::cmd_cluster_scale(ipc_connection* conn, const parsed_args& pa)
+{
+    namespace cl = socketley::cluster;
+    if (!m_raft)
+    {
+        conn->write_buf = raft_needed;
+        return 1;
+    }
+    uint32_t n = 0;
+    const std::string_view v = pa.count == 3 ? pa.args[2] : std::string_view{};
+    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
+    if (pa.count != 3 || v.empty() || ec != std::errc{} || end != v.data() + v.size())
+    {
+        conn->write_buf = "usage: cluster scale <name> <replicas>\n";
+        return 1;
+    }
+    cl::command c;
+    c.op          = cl::op::scale;
+    c.name        = std::string(pa.args[1]);
+    c.sp.replicas = n;
+    return submit_cluster_command(*m_raft, c, conn->write_buf);
+}
+
+// Whether this node has applied a runtime, silently, which is what the CLI polls to know its command has taken effect.
+int daemon_handler::cmd_cluster_has(ipc_connection* conn, const parsed_args& pa)
+{
+    if (!m_raft)
+    {
+        conn->write_buf = raft_needed;
+        return 1;
+    }
+    if (pa.count < 2 || pa.count > 3)
+        return 1;
+    const auto& specs = m_raft->cluster().specs;
+    const auto it = specs.find(std::string(pa.args[1]));
+    if (pa.count == 3 && pa.args[2] == "absent")
+        return it == specs.end() ? 0 : 1;
+    if (it == specs.end())
+        return 1;
+    if (pa.count == 3)
+        return std::to_string(it->second.replicas) == pa.args[2] ? 0 : 1;
+    return 0;
+}
+
+int daemon_handler::cmd_cluster_placement(ipc_connection* conn)
+{
+    if (!m_raft)
+    {
+        conn->write_buf = raft_needed;
+        return 1;
+    }
+    conn->write_buf = m_raft->placement();
+    if (m_reconciler && !m_reconciler->report().empty())
+    {
+        conn->write_buf += "\nreplicas on this node:\n";
+        size_t w = 0;
+        for (const auto& r : m_reconciler->report())
+            w = std::max(w, r.name.size());
+        for (const auto& r : m_reconciler->report())
+            conn->write_buf += "  " + r.name + std::string(w - r.name.size() + 2, ' ') + r.state
+                             + (r.detail.empty() ? "" : "  " + r.detail) + "\n";
+    }
+    return 0;
 }
 
 void daemon_handler::stop_cluster()

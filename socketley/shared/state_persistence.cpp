@@ -1285,7 +1285,8 @@ bool state_persistence::read_json(const fs::path& path, runtime_config& cfg) con
 
 void state_persistence::save_runtime(const runtime_instance* instance)
 {
-    if (instance->is_lua_created())
+    // A cluster replica is placed by the log, so a state file would bring it back on a node that no longer owns it.
+    if (instance->is_lua_created() || instance->is_cluster_owned())
         return;
     // Read off the instance here on the caller's thread, because a `create`
     // followed by a `remove` may have freed it before the writer runs.

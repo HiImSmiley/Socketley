@@ -868,7 +868,11 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     // First, while the peers are still reachable, so the cluster elects nobody new by timeout.
     if (raft)
+    {
+        // Nothing may be started while the daemon is on its way out, and the replicas are stopped with the rest below.
+        raft->set_on_tick({});
         raft->hand_over(loop);
+    }
 
     // Still with a live ring, because every teardown submits, and run() ending
     // the ring on its way out was a segfault on every SIGTERM that found a

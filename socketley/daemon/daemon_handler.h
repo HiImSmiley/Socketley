@@ -20,6 +20,7 @@ class cluster_discovery;
 class endpoint_table;
 class proxy_supervisor;
 class request_channel;
+class cluster_reconciler;
 struct cluster_event;
 
 struct ipc_connection
@@ -75,8 +76,10 @@ public:
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);
 
-    // The daemon's Raft node, when --raft-listen started one, for `cluster raft-status`.
-    void set_raft(class raft_host* host) { m_raft = host; }
+    // The daemon's Raft node, when --raft-listen started one, for `cluster raft-status` and the cluster's runtimes, which it then reconciles on every Raft tick.
+    void set_raft(class raft_host* host);
+    // Runs a command line as the daemon itself, with its output in `out`, which is how the cluster's reconciliation reaches create, start, stop and remove.
+    int run_internal(std::string_view line, std::string& out, bool cluster_owned);
     // The file this daemon read its settings from, so `dashboard` can say
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
@@ -165,6 +168,13 @@ private:
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_cluster_status(ipc_connection* conn);
     int cmd_raft_status(ipc_connection* conn);
+    int cmd_cluster_create(ipc_connection* conn, const parsed_args& pa);
+    int cmd_cluster_remove(ipc_connection* conn, const parsed_args& pa);
+    int cmd_cluster_scale(ipc_connection* conn, const parsed_args& pa);
+    int cmd_cluster_has(ipc_connection* conn, const parsed_args& pa);
+    int cmd_cluster_placement(ipc_connection* conn);
+    // What to say to an operator who names a cluster replica in a verb that would change it from underneath the cluster, and drops it from `names`; the number dropped.
+    size_t withhold_cluster_names(std::vector<std::string>& names, const char* verb, ipc_connection* conn) const;
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
     int cmd_dashboard(ipc_connection* conn);
@@ -229,6 +239,10 @@ private:
     // asked to join.
     std::string m_cluster_error;
     class raft_host* m_raft = nullptr;
+    std::unique_ptr<cluster_reconciler> m_reconciler;
+    // Set while the daemon runs a command as itself, which is what lets the cluster act on the replicas it owns.
+    bool m_cluster_internal = false;
+    bool m_cluster_creating = false;
     std::string m_cluster_want_dir;
 
     // Health monitoring for managed runtimes, and the periodic reap of retired
