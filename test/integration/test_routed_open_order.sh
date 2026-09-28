@@ -69,6 +69,13 @@ function on_client_message(client_id, msg)
     end
     socketley.log("RO_MSG " .. tostring(msg))
 end
+function on_disconnect(client_id)
+    -- A load client's close is read after every line it sent, so its tag says
+    -- the target has worked through that client's share of the load.
+    if client_id < 16777216 then
+        socketley.log("RO_LOAD_DONE " .. tostring(client_id))
+    end
+end
 LUAEOF
 
 # Routed at accept, so the client's first line is the first `data` frame and
@@ -209,6 +216,18 @@ PY
 #   * QUIET_NEEDED consecutive unchanged samples, not one.  A single long turn
 #     cannot span five of them, and a run that genuinely lost frames still ends
 #     -- after five quiet seconds -- and still fails, which is the point.
+#   * and not before the load is drained.  Nobody logs the loaders' lines, so
+#     on a loaded box the target spent its whole drain of them with both tags
+#     unchanged: five quiet seconds passed with every routed open still queued
+#     behind the load, and the file reported 0 of 300 (5 of 5 runs beside 14
+#     busy cores; the log showed all 300 applied eleven seconds after the
+#     route).  Each loader's close is read after its last line, so the quiet
+#     count starts once all eight closes are in.
+LOADERS=8
+for _ in $(seq 1 300); do
+    [ "$(grep -a -c 'RO_LOAD_DONE ' "$SOCKETLEY_DLOG" 2>/dev/null)" -ge "$LOADERS" ] && break
+    sleep 1
+done
 QUIET_NEEDED=5
 QUIET=0
 LAST=-1
