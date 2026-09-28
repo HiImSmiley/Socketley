@@ -295,7 +295,7 @@ static constexpr int16_t K_INIT = -72;   // state_val, a fresh socket's counter
 // to any local listener -- enters the sockhash with a zeroed backlog counter,
 // and the close of such a socket deletes what it left in the maps.
 static int load_ops(int socks, int ports, int mine, int state, int snap, int pids,
-                    int counters, bool all, uint64_t pair_bytes)
+                    int counters, bool all, uint64_t pair_bytes, uint64_t netns_cookie)
 {
     bpf_asm a;
     const int out = a.label(), listen = a.label(), st = a.label(), connect = a.label();
@@ -378,6 +378,11 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, sorted);
     a.jnei(BPF_REG_7, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, out);
     a.bind(sorted);
+    // Only ever a socket in the daemon's own network namespace: at the root
+    // cgroup this program fires for containers too, whose 127.0.0.1 pairs share
+    // our tuple space and would otherwise overwrite our entries.
+    a.mov(BPF_REG_1, BPF_REG_6); a.call(BPF_FUNC_get_netns_cookie);
+    a.ld64(BPF_REG_1, netns_cookie); a.jne(BPF_REG_0, BPF_REG_1, out);
     keys();
     loopback();
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_TCP_CONNECT_CB, connect);
@@ -436,10 +441,12 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, count)), BPF_REG_1);
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ask)), BPF_REG_1);
     a.ld64(BPF_REG_1, pair_bytes); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, mark)), BPF_REG_1);
-    a.update(state, K_SELF, K_INIT, BPF_ANY);
+    // NOEXIST: a live entry with our tuple must not be overwritten -- the close
+    // callback deletes, so a reused tuple finds the key free.
+    a.update(state, K_SELF, K_INIT, BPF_NOEXIST); a.jnei(BPF_REG_0, 0, out);
     set_state_cb();
     a.mov(BPF_REG_1, BPF_REG_6); a.ld_map(BPF_REG_2, socks); a.fp_ptr(BPF_REG_3, K_SELF);
-    a.movi(BPF_REG_4, BPF_ANY); a.call(BPF_FUNC_sock_hash_update);
+    a.movi(BPF_REG_4, BPF_NOEXIST); a.call(BPF_FUNC_sock_hash_update);
     a.stwi(K_VAL, C_ENTERED); a.bump(counters, K_VAL);
     a.jmp(out);
 
@@ -1063,6 +1070,22 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
     if (!own_cgroup(own_cg))
         return fail("could not read this process's cgroup", 0);
 
+    // This daemon's network namespace, baked into the sockops guard so the
+    // shortcut never takes a socket from another one.  Read off any socket:
+    // SO_NETNS_COOKIE reports the namespace the socket lives in.
+    {
+        const int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (probe < 0)
+            return fail("could not open a socket to read the netns cookie", errno);
+        socklen_t len = sizeof(m_netns_cookie);
+        const int rc = ::getsockopt(probe, SOL_SOCKET, SO_NETNS_COOKIE, &m_netns_cookie, &len);
+        const int err = errno;
+        ::close(probe);
+        if (rc < 0)
+            return fail("this kernel has no SO_NETNS_COOKIE, needed to fence the shortcut "
+                        "to this namespace", err);
+    }
+
     // The per-socket maps are not preallocated and are pruned as sockets
     // close, so at rest they cost their bucket arrays; the sockhash sizes the
     // pair ceiling.
@@ -1082,7 +1105,7 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
             : "map creation failed", errno);
 
     m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids, m_counters,
-                     mode == fast_lo_mode::all, m_limits.pair_bytes);
+                     mode == fast_lo_mode::all, m_limits.pair_bytes, m_netns_cookie);
     if (m_ops >= 0)
         m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_counters, m_limits.pair_bytes);
     if (m_ops < 0 || m_msg < 0)
@@ -1253,7 +1276,7 @@ int main()
                 socks, ports, pids, mine, state, snap, ring, budget);
     for (bool all : { false, true })
     {
-        const int ops = load_ops(socks, ports, mine, state, snap, pids, counters, all, 4ull << 20);
+        const int ops = load_ops(socks, ports, mine, state, snap, pids, counters, all, 4ull << 20, 0);
         std::printf("load_ops(all=%d) = %d errno=%d\n", all, ops, errno);
         if (ops < 0) std::printf("%s\n", g_verifier_log);
     }

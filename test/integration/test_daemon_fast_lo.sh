@@ -25,6 +25,8 @@
 #     case) left on TCP -- the backend's own socket acks the echo -- or the
 #     echo corrupted on the way
 #   * own: that backend pair put on the shortcut
+#   * all: a pair in another netns with our tuple entering (a container's
+#     127.0.0.1 pair overwriting our socket's entry) -- red without the guard
 #   * all: a runtime's Lua HTTP call to a local service on ::1 left on TCP --
 #     the service's socket acks the 1 MiB body -- or the body corrupted; and a
 #     dual-stack service reached at 127.0.0.1 (both ends IPv4-mapped on its
@@ -59,8 +61,10 @@ daemon_isolate fastlo
 # The probes and the capped copy outlive each daemon's TMPD, which daemon_stop deletes.
 WORK=$(mktemp -d /tmp/socketley-fastlo-work-XXXXXX)
 daemon_watch "$WORK"
-ECHOPID=""; ORIGINPID=""
-cleanup(){ for p in "$ECHOPID" "$ORIGINPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done; daemon_stop; rm -rf "$WORK"; }
+ECHOPID=""; ORIGINPID=""; HCPID=""; NSPID=""
+cleanup(){ [ -n "$NSPID" ] && sudo -n kill -9 "$NSPID" 2>/dev/null || true
+    for p in "$ECHOPID" "$ORIGINPID" "$HCPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done
+    daemon_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1811))
@@ -70,6 +74,7 @@ SPORT=$((SL_PORT_BASE + 1815))
 PXFOREIGN=$((SL_PORT_BASE + 1817))
 ORIGIN6=$((SL_PORT_BASE + 1818))
 CALLER6=$((SL_PORT_BASE + 1819))
+NSA=$((SL_PORT_BASE + 1822))
 
 # A foreign client: pipelined SETs and GETs of 300 KB values, then the
 # sender's tcpi_bytes_acked (offset 120 of struct tcp_info).
@@ -359,6 +364,55 @@ if command -v ss >/dev/null 2>&1; then
     else fail "own: runtime pair" "a client runtime's pair to a server runtime is on the shortcut" "ss: ${LINE:-no connection to :$SPORT}"; fi
 else
     not_asserted "own: runtime pair" "ss not available"
+fi
+
+# ─── all: a pair in another netns with our tuple must not enter ─────────────
+# At the root cgroup the sockops program fires for containers too.  A pair in
+# another netns whose ports match a host pair on our cache's port shares our
+# tuple space; without the netns guard it enters, bumping the entered counter
+# and able to overwrite our socket's map entry.  The guard bakes the daemon's
+# netns cookie into the program and rejects any other.
+if command -v ss >/dev/null 2>&1 && sudo -n unshare -n true 2>/dev/null; then
+    cat >"$WORK/nspair.py" <<'PY'
+import socket, sys, time
+cp, a = int(sys.argv[1]), int(sys.argv[2])
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind(("127.0.0.1", cp)); l.listen(1)
+c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); c.bind(("127.0.0.1", a)); c.connect(("127.0.0.1", cp))
+s, _ = l.accept()
+print("ready", flush=True)
+c.sendall(b"x" * 1000)
+time.sleep(1.5)
+PY
+    cat >"$WORK/hostcli.py" <<'PY'
+import socket, sys, time, os
+cp, a, ready = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(a))); s.connect(("127.0.0.1", cp))
+s.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhello\r\n"); assert s.recv(100).startswith(b"+OK")
+while not os.path.exists(ready): time.sleep(0.05)
+s.settimeout(3); s.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+try: print("host", "ok" if s.recv(100) == b"$5\r\nhello\r\n" else "bad", flush=True)
+except socket.timeout: print("host noreply", flush=True)
+PY
+    restart "$CAPBIN" --fast-lo
+    attached
+    "$BIN" create cache c -p "$CPORT" -s >/dev/null
+    wait_port "$CPORT" || true
+    python3 "$WORK/hostcli.py" "$CPORT" "$NSA" "$WORK/nsready" >"$WORK/host.out" 2>&1 & HCPID=$!
+    sleep 0.5
+    E1=$("$BIN" daemon stats | grep -oE '^fast_lo_entered:[0-9]+' | cut -d: -f2)
+    sudo -n timeout 15 unshare -n sh -c "ip link set lo up && exec python3 $WORK/nspair.py $CPORT $NSA" >"$WORK/ns.out" 2>&1 & NSPID=$!
+    for _ in $(seq 1 50); do grep -q ready "$WORK/ns.out" 2>/dev/null && break; sleep 0.1; done
+    sleep 0.5
+    E2=$("$BIN" daemon stats | grep -oE '^fast_lo_entered:[0-9]+' | cut -d: -f2)
+    touch "$WORK/nsready"
+    wait "$HCPID" 2>/dev/null || true; HCPID=""
+    HOST=$(cat "$WORK/host.out" 2>/dev/null)
+    if [ "$HOST" = "host ok" ] && [ "${E1:-0}" = "${E2:-1}" ]; then pass
+    else fail "netns guard" "a pair in another netns with our tuple must not enter, and the host pair is intact" \
+        "host: $HOST  entered before ns: ${E1:-?}  after: ${E2:-?} (must be equal)"; fi
+else
+    not_asserted "netns guard" "no ss, or no sudo -n unshare -n"
 fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"

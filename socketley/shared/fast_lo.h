@@ -72,6 +72,7 @@ private:
     int m_ring{-1};
     int m_budget{-1};
     int m_counters{-1};         // per-CPU event counts, indexed by the C_* reasons
+    uint64_t m_netns_cookie{0}; // the daemon's netns, the only one the shortcut takes
     int m_ops{-1};
     int m_msg{-1};
     int m_link{-1};
