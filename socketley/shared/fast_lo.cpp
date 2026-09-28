@@ -245,7 +245,15 @@ static int prog_load(const bpf_asm& a, uint32_t type, const char* name)
     at.log_buf = reinterpret_cast<uint64_t>(g_verifier_log);
     g_verifier_log[0] = '\0';
     std::strncpy(at.prog_name, name, sizeof(at.prog_name) - 1);
-    return static_cast<int>(sys_bpf(BPF_PROG_LOAD, &at));
+    // The verifier gives up with EAGAIN whenever the caller has a signal or
+    // task work pending, which the daemon's io_uring queues, so it is retried
+    // as libbpf retries it.
+    for (int attempt = 1;; ++attempt)
+    {
+        const long fd = sys_bpf(BPF_PROG_LOAD, &at);
+        if (fd >= 0 || errno != EAGAIN || attempt == 5)
+            return static_cast<int>(fd);
+    }
 }
 
 // A socket's key is {local ip, remote ip, local port, remote port}, ports in
