@@ -147,6 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- SINTERSTORE, SUNIONSTORE and SDIFFSTORE are refused with `-OOM` when their
+  result has no room under `--maxmemory`, and leave the destination as it
+  was; they stored it past the limit.
 - LPUSH, RPUSH, SADD, ZADD, ZINCRBY and LSET past `--maxmemory` answer `-OOM`
   instead of `WRONGTYPE` (LSET: `index out of range`), and LMOVE instead of
   nil, so a client no longer treats a full store as a key of another type.

@@ -3356,6 +3356,28 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
         CHECK(store.get_memory_used() <= store.get_max_memory());
     }
 
+    SUBCASE("a STORE form past the limit stores nothing and leaves the destination alone")
+    {
+        // The result is a new copy of its members, so a union of two large
+        // sets doubles them; this stored it past the limit and never refused.
+        store.set_eviction(evict_none);
+        for (int i = 0; i < 1400; ++i)
+        {
+            REQUIRE(store.sadd("a", "member-a-" + std::string(200, 'x') + std::to_string(i)) == 1);
+            REQUIRE(store.sadd("b", "member-b-" + std::string(200, 'y') + std::to_string(i)) == 1);
+        }
+        REQUIRE(store.set("dst", "kept"));
+        const std::string_view keys[] = { "a", "b" };
+        std::vector<std::string> out;
+        REQUIRE(store.sunion(keys, 2, out) >= 0);
+        REQUIRE(out.size() == 2800);
+        CHECK(store.sreplace("dst", std::move(out)) == cache_store::sreplace_refused);
+        std::string v;
+        REQUIRE(store.get("dst", v));
+        CHECK(v == "kept");
+        CHECK(store.get_memory_used() <= store.get_max_memory());
+    }
+
     SUBCASE("a refused COPY REPLACE leaves the destination alone")
     {
         store.set_eviction(evict_none);

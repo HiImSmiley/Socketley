@@ -760,17 +760,32 @@ int cache_store::sdiff(const std::string_view* keys, size_t n,
 
 size_t cache_store::sreplace(std::string_view dest, std::vector<std::string>&& members)
 {
-    // Gone first, so a destination that was a string or a list stops being one
-    // -- Redis replaces the key outright and does not answer WRONGTYPE here.
-    del(dest);
     if (members.empty())
+    {
+        del(dest);
         return 0;                       // an empty result leaves no key behind
+    }
     set_inner s;
     s.reserve(members.size());
     for (auto& m : members) s.insert(std::move(m));
     const size_t n = s.size();
-    // Charged as any new set, though not refused: the STORE forms have no
-    // answer for it, and the result is no larger than the sets it came from.
+    // Admitted before the destination goes, as COPY is: the result is a new
+    // copy of its members, so a union of two large sets doubles them, and
+    // Redis refuses the STORE forms with -OOM.
+    if (m_max_memory != 0)
+    {
+        const size_t need  = new_key_cost(dest.size()) + entry_cost(dest, s) + n * set_elem_overhead;
+        const bool   taken = exists(dest);
+        const size_t freed = taken ? key_cost(dest) : 0;   // what replacing dest gives back
+        if (need > freed && !check_memory(need - freed, dest))
+            return sreplace_refused;
+        // Eviction may have taken the destination, whose room was then counted twice.
+        if (taken && !exists(dest) && !check_memory(need, dest))
+            return sreplace_refused;
+    }
+    // Gone first, so a destination that was a string or a list stops being one
+    // -- Redis replaces the key outright and does not answer WRONGTYPE here.
+    del(dest);
     auto it = m_sets.emplace(std::string(dest), std::move(s)).first;
     m_set_elems += n;
     track_add(entry_cost(it->first, it->second));

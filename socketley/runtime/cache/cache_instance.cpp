@@ -6428,6 +6428,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
                 break;
             }
             const size_t card = m_store.sreplace(ps[0], std::move(out));
+            if (card == cache_store::sreplace_refused) { rb.append("error: out of memory\n", 21); break; }
             replicate_command(line);
             rb.append(std::to_string(card)); rb.push_back('\n');
             break;
@@ -10233,6 +10234,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 break;
             }
             const size_t card = m_store.sreplace(args[1], std::move(out));
+            if (card == cache_store::sreplace_refused) { resp::encode_error_code_into(rb, oom_msg); break; }
             // Replicated as the command, not as the result: the follower holds
             // the same sets, so it computes the same answer -- and shipping the
             // members would be the whole result on the wire for every call.

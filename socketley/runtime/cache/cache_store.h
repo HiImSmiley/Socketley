@@ -225,6 +225,8 @@ public:
     // Replaces dest outright, as Redis does: an empty result DELETES it rather
     // than leaving an empty set behind, because an empty set is not a thing
     // Redis keeps and EXISTS would disagree with the store otherwise.
+    // sreplace_refused, with dest untouched, when the result has no room.
+    static constexpr size_t sreplace_refused = static_cast<size_t>(-1);
     size_t sreplace(std::string_view dest, std::vector<std::string>&& members);
 
     // 1 moved, 0 not a member, -1 type conflict.
