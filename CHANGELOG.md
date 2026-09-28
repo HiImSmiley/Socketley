@@ -72,6 +72,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection of small messages and loses on concurrent traffic; it stays
   opt-in.
 
+- **`socketley daemon --fast-lo [own|all]`** puts TCP pairs whose both ends
+  are 127.0.0.1 on a kernel shortcut: a BPF sockops program enters both
+  sockets in a sockhash when the connection is established, and an `sk_msg`
+  program places every send straight into the peer's receive queue, skipping
+  TCP/IP, the loopback device and its softirq. `all`, the default, takes any
+  local client connecting to a port one of the daemon's runtimes listens on;
+  `own` only pairs whose both ends are the daemon's runtimes, such as a client
+  runtime to a server runtime (a proxy already reaches a local runtime's
+  published nodes over unix sockets). Off unless given. Needs `CAP_BPF`,
+  `CAP_NET_ADMIN` and `CAP_PERFMON` and cgroup v2; without them the daemon logs
+  `fast-lo: unavailable, serving without it` and serves on the ordinary path.
+  The programs are hand-assembled and loaded with a raw `bpf(2)`, and are
+  detached when the daemon exits. Measured with redis-benchmark (50
+  connections, 4 threads, 3 alternating passes) against a cache: GET 210-285K
+  -> 592-695K requests/s, SET 267-276K -> 500-667K, GET pipelined 16 3.4-3.6M
+  -> 6.4-7.1M, with 45% less system CPU per request unpipelined. It has **no
+  backpressure**: a redirected send never waits for the receiver, so a peer
+  that stops reading lets the sender push until the kernel's global TCP memory
+  is exhausted (measured: 731 MiB accepted into a receiver that read nothing,
+  where TCP stops at 2.5 MiB), and the sender then gets ENOMEM. It also skips
+  netfilter, conntrack and the loopback device, so nftables rules on `lo` and
+  `tcpdump -i lo` do not see those bytes. A socket that sent a byte by TCP
+  stays on TCP for its lifetime, so order is kept when one end enters late.
+  The proxy's splice and kernel-relay paths read a queue a socket on the
+  shortcut does not fill, so a proxied pair with a 127.0.0.1 leg stays on the
+  copy path while `--fast-lo` is on.
+
 ### Changed
 
 - XACK finds a pending entry through a hash index instead of walking an

@@ -12,6 +12,7 @@
 #include "../shared/state_persistence.h"
 #include "../shared/runtime_config_apply.h"
 #include "../shared/lua_context.h"
+#include "../shared/fast_lo.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -514,7 +515,8 @@ static void restore_runtimes(state_persistence& persistence,
 // reach init() in time -- and unknown arguments are refused rather than
 // ignored.
 static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
-                               bool& saw_cpus, raft_host_config& raft)
+                               bool& saw_cpus, raft_host_config& raft,
+                               socketley::fast_lo_mode& lo_mode)
 {
     // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
     // no arguments decides nothing and leaves the environment in charge.
@@ -550,6 +552,21 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                 raft.init = true;
                 break;
 
+            // The mode is optional and all is the default, because a local
+            // client of another process is where the shortcut earns most:
+            // runtimes already reach each other's published nodes over unix.
+            case fnv1a("--fast-lo"):
+                lo_mode = socketley::fast_lo_mode::all;
+                if (i + 1 < argc && argv[i + 1][0] != '-' &&
+                    !socketley::parse_fast_lo_mode(argv[++i], lo_mode))
+                {
+                    std::cout << "invalid --fast-lo value: " << argv[i] << "\n"
+                              << "  own: between this daemon's runtimes; all: also local "
+                                 "clients of other processes\n";
+                    return false;
+                }
+                break;
+
             case fnv1a("--raft-insecure"):
                 raft.insecure = true;
                 break;
@@ -583,7 +600,8 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
 
             default:
                 std::cout << "unknown daemon flag: " << arg << "\n"
-                          << "  socketley daemon takes --cpus <set> and the --raft-* flags.\n"
+                          << "  socketley daemon takes --cpus <set>, --fast-lo [own|all] "
+                             "and the --raft-* flags.\n"
                           << "  Runtime flags belong on `create`; this command "
                              "configures the process's ring.\n";
                 return false;
@@ -607,7 +625,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // not this process was going to be the one serving the socket.
     bool saw_cpus = false;
     raft_host_config raft_cfg;
-    if (!parse_daemon_flags(argc, argv, loop, saw_cpus, raft_cfg))
+    socketley::fast_lo_mode lo_mode = socketley::fast_lo_mode::off;
+    if (!parse_daemon_flags(argc, argv, loop, saw_cpus, raft_cfg, lo_mode))
         return 1;
     if (const std::string why = raft_config_refusal(raft_cfg); !why.empty())
     {
@@ -694,6 +713,21 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+
+    // Opt-in, and a daemon that cannot attach it serves without it, because it
+    // is a shortcut and the path it skips is still there.  Before any worker is
+    // forked, which is what reads the variable.
+    socketley::fast_lo lo_shortcut;
+    ::unsetenv(socketley::fast_lo_env);
+    if (lo_mode != socketley::fast_lo_mode::off)
+    {
+        if (lo_shortcut.start(lo_mode))
+            ::setenv(socketley::fast_lo_env,
+                     lo_mode == socketley::fast_lo_mode::all ? "all" : "own", 1);
+        else
+            LOG_WARN((std::string("fast-lo: unavailable, serving without it: ") +
+                      lo_shortcut.reason()).c_str());
+    }
 
     // Experimental and opt-in: a daemon given --raft-listen that cannot run Raft
     // refuses to start rather than serve without the cluster it was asked for.

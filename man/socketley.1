@@ -14,6 +14,8 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .B daemon
 .RB [ \-\-cpus
 .IR set ]
+.RB [ \-\-fast\-lo
+.RB [ own | all ]]
 .br
 .B socketley
 .B daemon
@@ -196,8 +198,9 @@ Takes
 here shaping the ring this daemon is about to create rather than stating what a
 runtime requires of one. It is the command-line spelling of
 .BR SOCKETLEY_CPUS ,
-and the flag wins when both are given. It also takes the experimental Raft
-flags described under
+and the flag wins when both are given. It also takes
+.B \-\-fast\-lo
+(below) and the experimental Raft flags described under
 .BR "CLUSTER MODE" .
 Any other argument is refused: this
 command used to ignore its command line entirely, so
@@ -221,6 +224,99 @@ paid by the tail of whichever one is working, and widening the set is the
 lever. The daemon itself stayed under one per cent of a core at fifty
 runtimes, and creating one took the same fourteen milliseconds at five as at
 fifty, so neither of those is the thing to watch.
+.TP
+.BR "daemon \-\-fast\-lo " [ own | all ]
+Put TCP pairs whose both ends are 127.0.0.1 on a kernel shortcut. A BPF
+.B sockops
+program enters both sockets in a sockhash when the connection is established,
+and an
+.B sk_msg
+program places every send straight into the peer's receive queue, skipping
+TCP/IP, the loopback device and its softirq. Off unless given.
+.IP
+.B all
+(the default when no mode is given) takes any local client connecting to a port
+one of this daemon's runtimes listens on, as well as the runtimes among
+themselves.
+.B own
+takes only pairs whose both ends are this daemon's runtimes, such as a client
+runtime connected to a server runtime; a proxy already reaches a local runtime's
+published nodes over unix sockets, so
+.B own
+reaches less than it sounds.
+.IP
+Measured on one laptop with redis\-benchmark (50 connections, 4 threads) against
+a cache: GET 210\(en285K requests/s without it and 592\(en695K with it, SET
+267\(en276K and 500\(en667K, GET pipelined 16 deep 3.4\(en3.6M and 6.4\(en7.1M,
+with 45% less system CPU per request unpipelined.
+.IP
+Needs
+.BR CAP_BPF ,
+.B CAP_NET_ADMIN
+and
+.B CAP_PERFMON
+(root, or
+.B setcap cap_bpf,cap_net_admin,cap_perfmon+ep
+on the binary) and cgroup v2 at /sys/fs/cgroup. Without them the daemon logs
+.B fast\-lo: unavailable, serving without it
+with the reason, and serves on the ordinary path.
+.B own
+attaches to the daemon's cgroup and
+.B all
+to the root cgroup; the daemon's processes are recognised by the binary name and
+cgroup its workers run under. The programs and maps are anonymous and detached
+when the daemon exits.
+.IP
+What it costs:
+.RS
+.IP \(bu 2
+No backpressure. A redirected send never waits for the receiver, so a peer that
+stops reading lets the sender push until the kernel's global TCP memory
+.RB ( tcp_mem )
+is exhausted \(em measured, 731 MiB accepted into a receiver that read nothing,
+where TCP stops at 2.5 MiB \(em and the sender then gets
+.B ENOMEM
+rather than
+.BR EAGAIN .
+By then every TCP socket on the host is under memory pressure. Use it where the
+readers keep up: a client that pipelines without reading its replies, a slow
+pub/sub subscriber or a proxy holding back a backend for a slow client can each
+fill that memory.
+.IP \(bu 2
+Shortcut bytes skip netfilter, conntrack and the loopback device: nftables rules
+on
+.BR lo ,
+.B tcpdump \-i lo
+and the byte counters in
+.B ss
+do not see them.
+.IP \(bu 2
+IPv4 127.0.0.1 only, including IPv4\-mapped addresses on a dual\-stack socket;
+::1 and the rest of 127/8 stay on TCP.
+.IP \(bu 2
+A pair enters only when both ends are in the map before its first byte, and a
+socket that sent a byte by TCP stays on TCP for its lifetime, so no byte
+overtakes another. A client sending TCP Fast Open data stays on TCP.
+.IP \(bu 2
+The proxy's
+.B SOCKETLEY_PROXY_SPLICE
+and
+.B SOCKETLEY_PROXY_SOCKMAP
+paths read a queue a socket on the shortcut does not fill, so a proxied pair
+with a 127.0.0.1 leg stays on the copy path while it is on.
+.IP \(bu 2
+A connect or listen issued from an SQPOLL thread or an io\-wq worker is not made
+under the binary's name, so under
+.B own
+that pair stays on TCP.
+.RE
+.RS
+.PP
+.nf
+sudo socketley daemon --fast-lo &        # all
+sudo socketley daemon --fast-lo own &
+.fi
+.RE
 .TP
 .BI "daemon \-\-name " "name " "[\-\-cluster " "dir" "]"
 Configure the running daemon for cluster mode. These flags are sent as IPC
@@ -9516,7 +9612,9 @@ It is kept because what was measured is one machine and one shape of traffic.
 Zero copy is a claim about memory bandwidth; the case it could still win is
 bulk streaming across a real NIC on a box with less of it, and nobody has
 measured that. A TLS listener or TLS backend never splices whatever this is set
-to, and neither does a proxy with an
+to, nor does a pair with a 127.0.0.1 leg while the daemon runs with
+.BR \-\-fast\-lo ,
+and neither does a proxy with an
 .B on_proxy_request
 or
 .B on_proxy_response
@@ -9544,7 +9642,10 @@ or under a launcher that grants them). Without them the proxy logs once and
 uses the copy path, and any failure to load or attach the program falls back
 the same way. Ignored when
 .B SOCKETLEY_PROXY_SPLICE
-is on, since splice needs no privilege. TLS pairs, unix\-socket pairs and pairs
+is on, since splice needs no privilege, and for a pair with a 127.0.0.1 leg
+while the daemon runs with
+.BR \-\-fast\-lo .
+TLS pairs, unix\-socket pairs and pairs
 with an
 .B on_proxy_request
 or
@@ -9569,6 +9670,16 @@ and added to
 and
 .B bytes_out
 when the pair closes. Message counts do not include redirected messages.
+.TP
+.B SOCKETLEY_FAST_LO
+Set by a daemon started with
+.B \-\-fast\-lo
+once the shortcut is attached, to
+.B own
+or
+.BR all ,
+so its workers keep a proxied pair with a 127.0.0.1 leg off splice and the kernel
+relay. Not a setting: the daemon clears any inherited value at startup.
 .TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by

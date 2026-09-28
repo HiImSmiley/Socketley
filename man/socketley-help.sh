@@ -155,6 +155,17 @@ cli_commands() {
     echo -e "  ${CYAN}./bin/Release/socketley daemon &${NC}  # dev mode"
     echo -e "  ${CYAN}./bin/Release/socketley daemon --cpus 0-3 &${NC}"
     echo ""
+    echo -e "${BOLD}daemon --fast-lo [own|all]${NC}"
+    echo "  Put TCP pairs with both ends on 127.0.0.1 on a kernel shortcut: a"
+    echo "  send lands straight in the peer's receive queue, skipping TCP/IP."
+    echo "  all (default): any local client of a runtime's port; own: only this"
+    echo "  daemon's runtimes among themselves. Cache GET ~2.5x, 45% less CPU."
+    echo "  Needs CAP_BPF, CAP_NET_ADMIN and CAP_PERFMON; without them it logs"
+    echo "  and serves as usual. No backpressure: a peer that stops reading lets"
+    echo "  the sender fill the kernel's TCP memory. Bypasses nftables on lo and"
+    echo "  tcpdump. Use it where readers keep up."
+    echo -e "  ${CYAN}sudo socketley daemon --fast-lo &${NC}"
+    echo ""
     echo -e "${BOLD}daemon --raft-listen <ip:port> (--raft-init | --raft-join <ip:port>) [...]${NC}"
     echo "  Experimental, opt-in: run a Raft node on this daemon. Mutual TLS"
     echo "  (--raft-cert --raft-key --raft-ca, --raft-name) or --raft-insecure."
@@ -2238,7 +2249,8 @@ architecture() {
     echo "    against 26.3us copied at 128 B, and 394.5 against 350.5 at 256 KB,"
     echo "    at 0.86 CPU cores against 0.53 - 2.9x the CPU per request."
     echo "    Kept for the case nobody has measured — bulk streaming across a"
-    echo "    real NIC, where zero copy could still pay. Never used on a TLS leg"
+    echo "    real NIC, where zero copy could still pay. Never used on a TLS leg,"
+    echo "    on a 127.0.0.1 leg under daemon --fast-lo,"
     echo "    or with an on_proxy_request/on_proxy_response hook."
     echo ""
 
@@ -2249,7 +2261,8 @@ architecture() {
     echo "    relaying needs no userspace read, copy or send. Needs CAP_BPF and"
     echo "    CAP_NET_ADMIN (setcap cap_bpf,cap_net_admin+ep on the binary); with-"
     echo "    out them, or on any load failure, the proxy logs once and uses the"
-    echo "    copy path. Ignored when SOCKETLEY_PROXY_SPLICE is on. TLS, unix and"
+    echo "    copy path. Ignored when SOCKETLEY_PROXY_SPLICE is on, and for a"
+    echo "    127.0.0.1 leg under daemon --fast-lo. TLS, unix and"
     echo "    hooked pairs stay on the copy path. The kernel buffers a slow"
     echo "    reader's backlog unbounded and a map removal would drop it, so a"
     echo "    pair whose backlog passes --write-buffer is dropped, not paced."
@@ -2934,7 +2947,7 @@ socketley — a daemon for long-living network runtimes (server, client, proxy, 
 
 USAGE
   socketley <command> [options]
-  socketley daemon [--cpus <set>] [--name <name>]
+  socketley daemon [--cpus <set>] [--fast-lo [own|all]] [--name <name>]
   socketley --lua <file>
 
 RUNTIMES

@@ -403,7 +403,7 @@ int cli_dispatch(int argc, char** argv)
                 // Configuration mode talks to a daemon that is already up and
                 // --cpus configures one being started, so it would be read
                 // here, sent nowhere and do nothing.
-                if (arg == "--cpus" || arg.starts_with("--raft-"))
+                if (arg == "--cpus" || arg == "--fast-lo" || arg.starts_with("--raft-"))
                 {
                     std::cerr << arg << " cannot be combined with --name or --cluster\n"
                               << "  Those name a daemon that is already running; this "

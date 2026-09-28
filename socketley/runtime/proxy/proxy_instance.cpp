@@ -174,6 +174,14 @@ static bool sockmap_opt_in()
     return on;
 }
 
+// A socket on the loopback shortcut receives into a queue that neither splice
+// nor the kernel relay reads, so a pair with a leg on it stays on the copy path.
+static bool on_fast_lo(int client_fd, int backend_fd)
+{
+    return socketley::fast_lo_active() &&
+           (socketley::fast_lo_covers(client_fd) || socketley::fast_lo_covers(backend_fd));
+}
+
 // Socket buffer sizes: 256KB gives good throughput for bulk transfers
 static constexpr int SOCK_BUF_SIZE = 256 * 1024;
 
@@ -6376,6 +6384,8 @@ void proxy_instance::setup_splice_pipes(proxy_client_connection* conn, proxy_bac
     // the three call sites, since leaving splice_active false is all it takes.
     if (SOCKETLEY_UNLIKELY(conn->ssl != nullptr || bconn->ssl != nullptr))
         return;
+    if (on_fast_lo(conn->fd, bconn->fd))
+        return;
 
     // O_CLOEXEC on both pipe pairs, because a worker forked mid-transfer would
     // inherit four descriptors per connection in flight and hold them until it
@@ -6692,6 +6702,8 @@ bool proxy_instance::try_enter_sockmap(proxy_client_connection* conn,
     // and a unix socket loses bytes, so both ends must be AF_INET/AF_INET6.
     if (!socketley::sockmap_relay::is_inet(conn->fd) ||
         !socketley::sockmap_relay::is_inet(bconn->fd))
+        return false;
+    if (on_fast_lo(conn->fd, bconn->fd))
         return false;
     // Anything already queued to the backend by an earlier path means a
     // completion is owed; leave such a pair on the copy path.
