@@ -92,6 +92,7 @@ const char* type_name(raft::msg_type t)
     case raft::msg_type::snapshot:        return "snapshot";
     case raft::msg_type::read_index:      return "read_index";
     case raft::msg_type::read_index_resp: return "read_index_resp";
+    case raft::msg_type::timeout_now:     return "timeout_now";
     }
     return "?";
 }
@@ -122,6 +123,7 @@ struct profile
     uint32_t proposals       = 0;   // permille per tick
     uint32_t config          = 0;   // permille per tick
     uint32_t reads           = 0;   // permille per tick
+    uint32_t transfers       = 0;   // permille per tick
     uint32_t compact_every   = 16;  // applied entries between snapshots
     size_t   batch           = 64;  // max entries per append
     size_t   backlog         = 16;  // max uncommitted entries at a leader
@@ -156,6 +158,8 @@ profile random_profile(prng& r)
     p.heartbeat       = r.pick(heartbeat);
     static const std::vector<uint32_t> drift = {0, 100, 400};
     p.tick_skip       = r.pick(drift);
+    static const std::vector<uint32_t> transfer = {0, 10, 40, 150};
+    p.transfers       = r.pick(transfer);
     return p;
 }
 
@@ -177,6 +181,7 @@ struct stats
     uint64_t steps = 0, delivered = 0, dropped = 0, crashes = 0;
     uint64_t leaders = 0, committed = 0, restores = 0, compactions = 0;
     uint64_t config_commits = 0, reads = 0, liveness_ticks = 0;
+    uint64_t transfers = 0, learner_applies = 0;
 };
 
 struct outcome
@@ -318,6 +323,10 @@ public:
         return ok;
     }
 
+    // Anything a host may call on a node, with the ready it produces handled like every other.
+    template <class F>
+    void act(raft::node_id id, F&& f) { event(m_nodes[id - 1], std::forward<F>(f)); }
+
     raft::index_t applied(raft::node_id id) const { return m_nodes[id - 1].applied; }
     const stats&  counters() const { return m_stats; }
     bool          failed() const { return m_fail.has_value(); }
@@ -423,20 +432,20 @@ private:
         if (!leaders.empty() && m_rng.permille(m_p.config))
         {
             sim_node& sn = m_nodes[m_rng.pick(leaders) - 1];
+            event(sn, [&](raft::node& n) { change_membership(n); });
+        }
+
+        if (!leaders.empty() && m_rng.permille(m_p.transfers))
+        {
+            sim_node& sn = m_nodes[m_rng.pick(leaders) - 1];
             event(sn, [&](raft::node& n)
             {
-                const std::vector<raft::node_id>& v = n.voters();
-                if (static_cast<int>(v.size()) > m_o.voters)
-                {
-                    n.propose_remove(m_rng.pick(v));
-                    return;
-                }
-                std::vector<raft::node_id> outside;
-                for (const sim_node& o : m_nodes)
-                    if (!std::binary_search(v.begin(), v.end(), o.id))
-                        outside.push_back(o.id);
-                if (!outside.empty())
-                    n.propose_add(m_rng.pick(outside));
+                std::vector<raft::node_id> others;
+                for (raft::node_id v : n.voters())
+                    if (v != n.id())
+                        others.push_back(v);
+                if (!others.empty() && n.transfer_leadership(m_rng.pick(others)))
+                    ++m_stats.transfers;
             });
         }
 
@@ -453,6 +462,42 @@ private:
                 if (n.read_index(request))
                     m_read_floor[request] = floor;
             });
+        }
+    }
+
+    // One single-server change: a spare joins as a learner or a voter, a learner is promoted, or a member leaves.
+    void change_membership(raft::node& n)
+    {
+        const std::vector<raft::node_id>& v = n.voters();
+        const std::vector<raft::node_id>& l = n.learners();
+        if (static_cast<int>(v.size()) > m_o.voters)
+        {
+            n.propose_remove(m_rng.pick(v));
+            return;
+        }
+        std::vector<raft::node_id> outside;
+        for (const sim_node& o : m_nodes)
+            if (!n.is_voter(o.id) && !n.is_learner(o.id))
+                outside.push_back(o.id);
+
+        switch (m_rng.below(4))
+        {
+        case 0:
+            if (!outside.empty())
+                n.propose_add_learner(m_rng.pick(outside));
+            return;
+        case 1:
+            if (!l.empty())
+                n.propose_add(m_rng.pick(l));
+            return;
+        case 2:
+            if (!l.empty())
+                n.propose_remove(m_rng.pick(l));
+            return;
+        default:
+            if (!outside.empty())
+                n.propose_add(m_rng.pick(outside));
+            return;
         }
     }
 
@@ -654,6 +699,8 @@ private:
                             + " after " + std::to_string(sn.applied));
             if (!record(e, sn.n->term(), sn.id))
                 return;
+            if (sn.n->is_learner(sn.id))
+                ++m_stats.learner_applies;
             sn.sm_hash = chain(sn.sm_hash, e);
             sn.applied = e.index;
             if (e.type == raft::entry_type::config)
@@ -1107,6 +1154,8 @@ void sweep(int voters)
         total.compactions    += r.st.compactions;
         total.config_commits += r.st.config_commits;
         total.reads          += r.st.reads;
+        total.transfers      += r.st.transfers;
+        total.learner_applies += r.st.learner_applies;
         if (r.st.liveness_ticks > worst_liveness)
         {
             worst_liveness = r.st.liveness_ticks;
@@ -1120,7 +1169,8 @@ void sweep(int voters)
             << total.crashes << " crashes, " << total.leaders << " leaderships, " << total.committed
             << " committed, " << total.compactions << " compactions, " << total.restores
             << " snapshot installs, " << total.config_commits << " config entries applied, " << total.reads
-            << " reads served; slowest recovery " << worst_liveness << " ticks (seed " << worst_seed << ")");
+            << " reads served, " << total.transfers << " transfers started, " << total.learner_applies
+            << " entries applied by learners; slowest recovery " << worst_liveness << " ticks (seed " << worst_seed << ")");
 
     // A sweep that never crashed, restored, reconfigured or read would be green about nothing.
     if (count >= 100)
@@ -1130,6 +1180,8 @@ void sweep(int voters)
         CHECK(total.compactions > 0);
         CHECK(total.config_commits > 0);
         CHECK(total.reads > 0);
+        CHECK(total.transfers > 0);
+        CHECK(total.learner_applies > 0);
     }
 }
 
@@ -1196,6 +1248,9 @@ TEST_CASE("every planted safety defect is caught by the sweep")
         {"truncate the log after every append",         raft::fault_truncate_on_append,  true},
         {"answer ReadIndex without a quorum round",     raft::fault_read_without_quorum, true},
         {"allow a second config change in flight",      raft::fault_concurrent_config,   true},
+        {"count a learner's log toward the commit",     raft::fault_learner_in_quorum,   true},
+        {"count a learner's vote toward an election",   raft::fault_learner_votes,       true},
+        {"grant a handed-over vote a second time",      raft::fault_transfer_revotes,    true},
     };
     // Five nodes take thousands of seeds to stage Figure 8, so they are opt-in with RAFT_DEFECT_SEEDS.
     const uint64_t budget = env_u64("RAFT_DEFECT_SEEDS", 5000);
@@ -1289,4 +1344,120 @@ TEST_CASE("a proposal commits and applies on every node of a quiet cluster")
     const raft::index_t target = c.node(l)->last_index();
     for (raft::node_id id = 1; id <= 3; ++id)
         CHECK(c.applied(id) == target);
+}
+
+// ─── learners and leadership transfer, directed ───
+
+namespace {
+
+sim_options with_spare(uint32_t faults)
+{
+    sim_options o = three(faults);
+    o.spares = 1;
+    return o;
+}
+
+// Whether the leader, asked to hand over, has a new leader in its place within a few round trips.
+bool transfer_lands(uint32_t faults)
+{
+    cluster c(three(faults), quiet());
+    c.advance(50);
+    const raft::node_id l = c.leader();
+    REQUIRE(l != 0);
+    const raft::term_t before = c.node(l)->term();
+    const raft::node_id t = l == 1 ? 2 : 1;
+
+    bool started = false;
+    raft::propose_status during = raft::propose_status::ok;
+    c.act(l, [&](raft::node& n)
+    {
+        started = n.transfer_leadership(t);
+        during  = n.propose("during").status;
+    });
+    REQUIRE(started);
+    // A leader handing over takes nothing new, or the target could never catch up.
+    CHECK(during == raft::propose_status::transferring);
+    // The old leader cannot hear the target, so only the third node's vote, given inside its lease, can elect it.
+    c.block(t, l, true);
+
+    c.advance(8);
+    REQUIRE(!c.failed());
+    return c.leader() == t && c.node(t)->term() == before + 1;
+}
+
+// Whether a leader that can reach only a learner still commits a new entry.
+bool learner_commits_alone(uint32_t faults)
+{
+    cluster c(with_spare(faults), quiet());
+    c.advance(50);
+    const raft::node_id l = c.leader();
+    REQUIRE(l != 0);
+    c.act(l, [](raft::node& n) { REQUIRE(n.propose_add_learner(4).status == raft::propose_status::ok); });
+    c.advance(20);
+    REQUIRE(!c.failed());
+    REQUIRE(c.node(l)->is_learner(4));
+    REQUIRE(!c.node(l)->is_voter(4));
+    // The learner holds and applies everything the leader has.
+    REQUIRE(c.applied(4) == c.node(l)->last_index());
+
+    for (raft::node_id v = 1; v <= 3; ++v)
+        if (v != l)
+        {
+            c.block(l, v, true);
+            c.block(v, l, true);
+        }
+    REQUIRE(c.propose(l, "cut off"));
+    const raft::index_t target = c.node(l)->last_index();
+    c.advance(5);
+    REQUIRE(!c.failed());
+    return c.node(l)->commit_index() >= target;
+}
+
+}   // namespace
+
+TEST_CASE("a leader hands over to an up-to-date voter within a few round trips")
+{
+    CHECK(transfer_lands(0));
+    // The same handover with the lease still refusing the target's votes, to show the check can tell.
+    CHECK_FALSE(transfer_lands(raft::fault_transfer_in_lease));
+}
+
+TEST_CASE("a learner receives the log but never makes a quorum")
+{
+    CHECK_FALSE(learner_commits_alone(0));
+    CHECK(learner_commits_alone(raft::fault_learner_in_quorum));
+}
+
+TEST_CASE("a learner promoted by a single-server change votes and counts")
+{
+    cluster c(with_spare(0), quiet());
+    c.advance(50);
+    const raft::node_id l = c.leader();
+    REQUIRE(l != 0);
+    c.act(l, [](raft::node& n) { REQUIRE(n.propose_add_learner(4).status == raft::propose_status::ok); });
+    c.advance(10);
+    raft::propose_status promoted = raft::propose_status::not_leader;
+    c.act(l, [&](raft::node& n) { promoted = n.propose_add(4).status; });
+    REQUIRE(promoted == raft::propose_status::ok);
+    c.advance(10);
+    REQUIRE(!c.failed());
+    for (raft::node_id id = 1; id <= 4; ++id)
+    {
+        CHECK(c.node(id)->is_voter(4));
+        CHECK_FALSE(c.node(id)->is_learner(4));
+        CHECK(c.node(id)->voters().size() == 4);
+    }
+}
+
+TEST_CASE("membership encoding keeps voters and learners apart")
+{
+    const std::string both = raft::encode_config({3, 1, 2}, {9, 7});
+    const raft::membership m = raft::decode_config(both);
+    CHECK(m.voters == std::vector<raft::node_id>{1, 2, 3});
+    CHECK(m.learners == std::vector<raft::node_id>{7, 9});
+    // Voters alone encode as they did before learners existed.
+    CHECK(raft::encode_config({1, 2}).size() == 16);
+    CHECK(raft::decode_config(raft::encode_config({1, 2})).learners.empty());
+    // A node named on both sides is a voter.
+    CHECK(raft::decode_config(raft::encode_config({1, 2}, {2, 5})).learners == std::vector<raft::node_id>{5});
 }
