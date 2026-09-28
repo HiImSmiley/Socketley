@@ -1,5 +1,6 @@
 #include "raft_host.h"
 
+#include "../shared/byte_codec.h"
 #include "../shared/dial_address.h"
 #include "../shared/event_loop.h"
 #include "../shared/ipc_framing.h"
@@ -463,7 +464,7 @@ bool raft_host::start(event_loop& loop, std::string& err)
         // The founder's own record goes through the log like everyone's, since a joiner replays the log and never sees this snapshot.
         if (m_cfg.init)
             fresh.snap.voters = {m_id};
-        fresh.snap.data = encode_book({});
+        fresh.snap.data = encode_snapshot({}, {});
         if (!st::initialize(m_cfg.dir, fresh, err) || !st::recover(m_cfg.dir, rec, err))
             return false;
         info(std::string(m_cfg.init ? "founded a new cluster" : "joining through " + m_cfg.join) + " as node "
@@ -481,9 +482,9 @@ bool raft_host::start(event_loop& loop, std::string& err)
     o.seed           = random_u64();
     const raft::index_t first = rec.state.snap.index;
     const size_t logged = rec.state.log.size();
-    if (!decode_book(rec.state.snap.data, m_applied_book))
+    if (!decode_snapshot(rec.state.snap.data, m_applied_book, m_cluster))
     {
-        err = "the snapshot in " + m_cfg.dir + " does not hold a membership book";
+        err = "the snapshot in " + m_cfg.dir + " does not hold a membership book and a cluster state";
         return false;
     }
     m_node = std::make_unique<raft::node>(o, std::move(rec.state));
@@ -690,7 +691,7 @@ void raft_host::after_persist(bool ok)
     apply(m_pending);
     m_pending = raft::ready{};
 
-    if (m_applied >= m_snap_index + m_cfg.compact_every && m_node->compact(m_applied, encode_book(m_applied_book)))
+    if (m_applied >= m_snap_index + m_cfg.compact_every && m_node->compact(m_applied, encode_snapshot(m_applied_book, m_cluster)))
         m_snap_index = m_applied;
     arm_pump();
 }
@@ -700,10 +701,16 @@ void raft_host::apply(const raft::ready& r)
     if (r.restore)
     {
         book b;
-        if (decode_book(r.restore->data, b))
+        socketley::cluster::state c;
+        if (decode_snapshot(r.restore->data, b, c))
+        {
             m_applied_book = std::move(b);
+            m_cluster      = std::move(c);
+        }
         else
-            warn("a snapshot at " + std::to_string(r.restore->index) + " holds no readable membership book");
+        {
+            warn("a snapshot at " + std::to_string(r.restore->index) + " holds no readable membership book and cluster state");
+        }
         m_applied = r.restore->index;
         info("installed a snapshot at " + std::to_string(r.restore->index) + " from the leader");
     }
@@ -723,13 +730,51 @@ void raft_host::apply(const raft::ready& r)
             info("membership at " + std::to_string(e.index) + ": voters" + v + (l.empty() ? "" : "; learners" + l));
             continue;
         }
+        if (e.type != raft::entry_type::normal)
+            continue;
+        if (socketley::cluster::is_command(e.data))
+        {
+            apply_command(e.data, e.index);
+            continue;
+        }
         raft::node_id id = raft::no_node;
         member mb;
-        if (e.type == raft::entry_type::normal && decode_record(e.data, id, mb))
+        if (decode_record(e.data, id, mb))
             m_applied_book[id] = mb;
     }
     if (r.restore || !r.committed.empty())
         refresh_book();
+}
+
+void raft_host::apply_command(const std::string& data, raft::index_t index)
+{
+    namespace cl = socketley::cluster;
+    cl::command c;
+    if (!cl::decode(data, c))
+    {
+        warn("entry " + std::to_string(index) + " is a cluster command this node cannot read; every node skips it alike");
+        return;
+    }
+    if (!m_cluster.apply(c))
+        return;
+    switch (c.op)
+    {
+    case cl::op::create:
+        info("cluster runtime " + c.name + " declared: " + c.sp.type + ", " + std::to_string(c.sp.replicas) + " replicas");
+        break;
+    case cl::op::remove:
+        info("cluster runtime " + c.name + " removed");
+        break;
+    case cl::op::scale:
+        info("cluster runtime " + c.name + " scaled to " + std::to_string(c.sp.replicas) + " replicas");
+        break;
+    case cl::op::assign:
+        info("cluster runtime " + c.name + " assigned to " + describe(c.node));
+        break;
+    case cl::op::unassign:
+        info("cluster runtime " + c.name + " taken from " + describe(c.node));
+        break;
+    }
 }
 
 void raft_host::fail_stop(const std::string& why)
@@ -880,10 +925,65 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         handle_join(std::string(payload), f.req.id, f.req.name, f.req.addr, f.req.voter);
         return true;
 
+    case wire::kind::command:
+        // Only a member may hand the leader a command, and a leader that has since moved drops it, since the sender hears nothing either way.
+        if (!m_node->is_member(l.peer))
+            return false;
+        handle_command(f.cmd.data);
+        return true;
+
     case wire::kind::hello:
         return false;
     }
     return false;
+}
+
+void raft_host::handle_command(const std::string& data)
+{
+    socketley::cluster::command c;
+    if (m_node->current_role() != raft::role::leader || !socketley::cluster::decode(data, c))
+        return;
+    if (m_node->propose(data).status == raft::propose_status::ok)
+        arm_pump();
+}
+
+bool raft_host::submit(const std::string& data, std::string& err)
+{
+    socketley::cluster::command c;
+    if (m_stopped || !socketley::cluster::decode(data, c))
+    {
+        err = "the cluster command is malformed\n";
+        return false;
+    }
+    if (m_node->current_role() == raft::role::leader)
+    {
+        switch (m_node->propose(data).status)
+        {
+        case raft::propose_status::ok:
+            arm_pump();
+            return true;
+        case raft::propose_status::busy:
+            err = "the leader has too many uncommitted entries; try again shortly\n";
+            return false;
+        default:
+            err = "leadership is moving; try again shortly\n";
+            return false;
+        }
+    }
+    const raft::node_id leader = m_node->leader();
+    if (leader == raft::no_node)
+    {
+        err = "no leader is known: the cluster has no quorum or an election is running\n";
+        return false;
+    }
+    link* l = outbound(leader);
+    if (!l)
+    {
+        err = "the leader " + describe(leader) + " cannot be reached from this node\n";
+        return false;
+    }
+    enqueue(l, wire::encode(wire::command{data}));
+    return true;
 }
 
 void raft_host::handle_join(const std::string& payload, raft::node_id id, const std::string& name,
@@ -1105,6 +1205,36 @@ bool raft_host::decode_book(std::string_view data, book& b)
     return true;
 }
 
+std::string raft_host::node_name(raft::node_id id) const
+{
+    const member* mb = lookup(id);
+    return mb ? mb->name : hex_id(id);
+}
+
+// A snapshot is the membership book and the cluster state, each length-prefixed; an older one is the bare book.
+std::string raft_host::encode_snapshot(const book& b, const socketley::cluster::state& c)
+{
+    socketley::bytes::writer w;
+    w.u8('N');
+    w.bytes(encode_book(b));
+    w.bytes(socketley::cluster::encode(c));
+    return w.take();
+}
+
+bool raft_host::decode_snapshot(std::string_view data, book& b, socketley::cluster::state& c)
+{
+    c = socketley::cluster::state{};
+    if (!data.empty() && data[0] == 'B')
+        return decode_book(data, b);
+    socketley::bytes::reader r(data);
+    uint8_t tag = 0;
+    std::string book_bytes, cluster_bytes;
+    if (!r.u8(tag) || tag != 'N' || !r.bytes(book_bytes, ipc_frame::max_payload)
+        || !r.bytes(cluster_bytes, ipc_frame::max_payload) || r.left() != 0)
+        return false;
+    return decode_book(book_bytes, b) && socketley::cluster::decode(cluster_bytes, c);
+}
+
 // ─── shutdown and status ───
 
 void raft_host::hand_over(event_loop& loop)
@@ -1227,6 +1357,7 @@ std::string raft_host::status(int& exit_code) const
     line("quorum", std::string(reachable ? "reachable" : "NOT reachable") + " (" + std::to_string(heard) + " of "
                    + std::to_string(n.voters().size()) + " voters heard within "
                    + std::to_string(window.count()) + " ms)");
+    line("cluster", std::to_string(m_cluster.specs.size()) + " runtime(s) declared");
     line("transport", std::string(m_tls ? "mutual TLS" : "cleartext (--raft-insecure)") + ", " + std::to_string(m_sent)
                       + " frames sent, " + std::to_string(m_received) + " received, " + std::to_string(m_dropped)
                       + " dropped");

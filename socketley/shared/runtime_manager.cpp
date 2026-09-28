@@ -1,5 +1,6 @@
 #include "runtime_manager.h"
 #include "route_relay.h"
+#include "runtime_name.h"
 #include <algorithm>
 #include "runtime_factory.h"
 #include "event_loop.h"
@@ -241,30 +242,10 @@ void runtime_manager::install_replica(const std::vector<replica_entry>& entries)
     dropped.clear();
 }
 
-// One place that decides what a runtime may be called, because a name reaches
-// the filesystem, a JSON document, a command line and a cluster file, and this
-// character set is what all four carry without escaping.
+// One place that decides what a runtime may be called, in runtime_name.h.
 bool runtime_manager::valid_name(std::string_view name)
 {
-    // A leading '-' is refused because the CLI can never address it again:
-    // `create client --help` made a runtime that could not be removed.
-    if (name.empty() || name.size() > 128 || name[0] == '.' || name[0] == '-')
-        return false;
-
-    // And '..' anywhere, because state_persistence::config_path() already
-    // refuses it -- by answering an empty path, silently.  So a name like
-    // `a..b` passed this door, ran, and was never written down: it disappeared
-    // at the next daemon start with nothing having said no.  The two rules
-    // belong at one door, and this is the one that can still answer the
-    // operator.
-    if (name.find("..") != std::string_view::npos)
-        return false;
-    for (char c : name)
-    {
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.')
-            return false;
-    }
-    return true;
+    return socketley::valid_runtime_name(name);
 }
 
 runtime_manager::create_result

@@ -9,8 +9,14 @@
 //   even  the rest is one payload handed to wire::decode
 //   odd   the rest is a byte stream split with ipc_frame::peek_frame, each
 //         frame decoded, as raft_host's read path does
+//   0x80  the rest is a cluster command (bit 1 clear) or a cluster snapshot
+//         (bit 1 set), the two things a committed entry and a snapshot carry
+//         into the state machine
 //
 // Properties checked, beyond "did it crash":
+//   * a cluster command or snapshot that decodes re-encodes to the same bytes,
+//     and a state that decodes is one plan() can walk without leaving the
+//     invariants the state machine keeps;
 //   * the encoding is canonical: a payload decode accepts re-encodes to the
 //     exact same bytes, so two nodes cannot disagree about what one frame said;
 //   * decode(encode(x)) is x for every accepted message, hello and join;
@@ -29,10 +35,12 @@
 
 #include "fuzz_common.h"
 #include "shared/ipc_framing.h"
+#include "shared/cluster_state.h"
 #include "shared/raft_codec.h"
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace wire = socketley::raft::wire;
 namespace raft = socketley::raft;
@@ -77,6 +85,14 @@ void one_payload(std::string_view p)
                    "a join did not survive a round trip");
         break;
     }
+    case wire::kind::command:
+    {
+        again = wire::encode(f.cmd);
+        wire::frame g;
+        FUZZ_CHECK(wire::decode(again, g) && g.kind == wire::kind::command && g.cmd == f.cmd,
+                   "a forwarded command did not survive a round trip");
+        break;
+    }
     }
 
     FUZZ_CHECK(again == p, "an accepted payload does not re-encode to the same bytes");
@@ -111,6 +127,39 @@ void stream(std::string_view s)
     }
 }
 
+// Whatever decodes is what encode would have written, and planning on it never breaks the rules apply() keeps.
+void cluster_bytes(std::string_view p, bool snapshot)
+{
+    namespace cl = socketley::cluster;
+    if (!snapshot)
+    {
+        cl::command c;
+        if (cl::decode(p, c))
+        {
+            FUZZ_CHECK(cl::encode(c) == p, "a cluster command that decodes does not re-encode to the same bytes");
+            FUZZ_CHECK(cl::refusal(c).empty(), "a cluster command was accepted that refusal() refuses");
+        }
+        return;
+    }
+    cl::state s;
+    if (!cl::decode(p, s))
+        return;
+    FUZZ_CHECK(cl::encode(s) == p, "a cluster snapshot that decodes does not re-encode to the same bytes");
+    cl::state t;
+    FUZZ_CHECK(cl::decode(cl::encode(s), t) && t == s, "a cluster snapshot did not survive a round trip");
+    std::vector<cl::node_id> live = {1, 2, 3};
+    for (const auto& [name, held] : s.owners)
+        for (cl::node_id n : held)
+            live.push_back(n);
+    for (const cl::command& c : cl::plan(s, live))
+    {
+        FUZZ_CHECK(cl::refusal(c).empty(), "plan() proposed a command that refusal() refuses");
+        s.apply(c);
+    }
+    for (const auto& [name, sp] : s.specs)
+        FUZZ_CHECK(s.placed(name) <= sp.replicas, "a plan left a runtime with more owners than it wants replicas");
+}
+
 }   // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -119,7 +168,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     if (size < 1)
         return 0;
     const std::string_view rest(reinterpret_cast<const char*>(data + 1), size - 1);
-    if (data[0] & 1)
+    if (data[0] & 0x80)
+        cluster_bytes(rest, data[0] & 2);
+    else if (data[0] & 1)
         stream(rest);
     else
         one_payload(rest);

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "../shared/cluster_state.h"
 #include "../shared/event_loop_definitions.h"
 #include "../shared/raft.h"
 #include "../shared/raft_storage.h"
@@ -57,6 +58,14 @@ public:
     // What `socketley cluster raft-status` prints, and the exit code it means.
     std::string status(int& exit_code) const;
 
+    // Proposes an encoded cluster command at the leader, or hands it to the leader from a follower; false with `err` when it cannot go anywhere.
+    bool submit(const std::string& data, std::string& err);
+
+    // The cluster's desired state as this node has applied it.
+    const socketley::cluster::state& cluster() const { return m_cluster; }
+    // The name a member goes by, or its hex id when the book does not hold it.
+    std::string node_name(socketley::raft::node_id id) const;
+
     void on_cqe(struct io_uring_cqe* cqe) override;
 
     struct link;
@@ -94,6 +103,7 @@ private:
     void enqueue(link* l, const std::string& payload);
 
     bool on_frame(link& l, std::string_view payload);
+    void handle_command(const std::string& data);
     void handle_join(const std::string& payload_frame, socketley::raft::node_id id, const std::string& name,
                      const std::string& addr, bool voter);
     void try_join();
@@ -111,6 +121,9 @@ private:
     static bool        decode_record(std::string_view data, socketley::raft::node_id& id, member& m);
     static std::string encode_book(const book& b);
     static bool        decode_book(std::string_view data, book& b);
+    static std::string encode_snapshot(const book& b, const socketley::cluster::state& c);
+    static bool        decode_snapshot(std::string_view data, book& b, socketley::cluster::state& c);
+    void               apply_command(const std::string& data, socketley::raft::index_t index);
 
     raft_host_config m_cfg;
     event_loop*      m_loop = nullptr;
@@ -125,6 +138,8 @@ private:
     // Membership as applied, and as the whole log says it, which is where a message is addressed.
     book m_applied_book;
     book m_book;
+    // The desired state of the cluster's runtimes, applied from the log like the book.
+    socketley::cluster::state m_cluster;
     // What peers said about themselves in a hello, for a member whose record this node has not seen yet.
     book m_heard_book;
 

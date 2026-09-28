@@ -2256,6 +2256,35 @@ def raft_join(node, name, addr, voter=True):
     return struct.pack("<BBQ", 1, 3, node) + rw_bytes(name) + rw_bytes(addr) + struct.pack("<B", 1 if voter else 0)
 
 
+def raft_command(data):
+    return struct.pack("<BB", 1, 4) + rw_bytes(data)
+
+
+# socketley/shared/cluster_state.cpp: 'C', op, then the fields of that op.
+def cl_create(name, typ, args, replicas):
+    return b"C\x01" + rw_bytes(name) + rw_bytes(typ) + rw_bytes(args) + struct.pack("<I", replicas)
+
+
+def cl_remove(name):
+    return b"C\x02" + rw_bytes(name)
+
+
+def cl_scale(name, replicas):
+    return b"C\x03" + rw_bytes(name) + struct.pack("<I", replicas)
+
+
+def cl_assign(name, node, on=True):
+    return (b"C\x04" if on else b"C\x05") + rw_bytes(name) + struct.pack("<Q", node)
+
+
+# 'S', version 1, then per runtime: name, type, args, replicas, the nodes holding it.
+def cl_state(specs):
+    out = b"S\x01" + struct.pack("<I", len(specs))
+    for (name, typ, args, replicas, owners) in specs:
+        out += rw_bytes(name) + rw_bytes(typ) + rw_bytes(args) + struct.pack("<I", replicas) + rw_ids(owners)
+    return out
+
+
 def ipc(payload):
     return b"\x00" + struct.pack("<I", len(payload)) + payload
 
@@ -2289,6 +2318,28 @@ def raftmsg_seeds():
     s["snapshot_on_append"] = b"\x00" + raft_msg("append", snap=(1, 1, [1], [], b""))
     s["entries_out_of_order"] = b"\x00" + raft_msg("append", index=7, entries=[(3, 9, 0, b"")])
     s["huge_entry_count"] = b"\x00" + msgs["heartbeat"][:-5] + struct.pack("<I", 0xFFFFFFFF) + b"\x00"
+    # A cluster command handed to the leader by a follower, and the cluster state machine's own bytes (mode 0x80, bit 1 for a snapshot).
+    cmds = {
+        "create": cl_create(b"api", b"server", b"-p 8080 --listen unix:/tmp/{node}.sock", 2),
+        "remove": cl_remove(b"api"),
+        "scale": cl_scale(b"api", 3),
+        "assign": cl_assign(b"api", 0x1122334455667788),
+        "unassign": cl_assign(b"api", 5, on=False),
+    }
+    for label, c in cmds.items():
+        s["cmd_frame_" + label] = b"\x00" + raft_command(c)
+        s["cluster_" + label] = b"\x80" + c
+    s["cmd_frame_empty"] = b"\x00" + raft_command(b"")
+    s["cluster_cache_type"] = b"\x80" + cl_create(b"db", b"cache", b"", 1)
+    s["cluster_test_flag"] = b"\x80" + cl_create(b"api", b"server", b"--test", 1)
+    s["cluster_zero_replicas"] = b"\x80" + cl_create(b"api", b"server", b"", 0)
+    s["cluster_torn_create"] = b"\x80" + cmds["create"][:-2]
+    s["cluster_state"] = b"\x82" + cl_state([(b"api", b"server", b"-p 8080", 2, [5, 9]), (b"web", b"proxy", b"", 1, [])])
+    s["cluster_state_empty"] = b"\x82" + cl_state([])
+    s["cluster_state_node_zero"] = b"\x82" + cl_state([(b"api", b"server", b"", 2, [0])])
+    s["cluster_state_dup_owner"] = b"\x82" + cl_state([(b"api", b"server", b"", 2, [7, 7])])
+    s["cluster_state_bad_name"] = b"\x82" + cl_state([(b"a b", b"server", b"", 1, [])])
+    s["cluster_state_torn"] = b"\x82" + cl_state([(b"api", b"server", b"", 2, [5, 9])])[:-3]
     # Streams, as the host's read path splits them.
     s["stream_hello_then_append"] = b"\x01" + ipc(msgs["hello"]) + ipc(msgs["append_three"])
     s["stream_torn_second"] = b"\x01" + ipc(msgs["hello"]) + ipc(msgs["heartbeat"])[:-3]

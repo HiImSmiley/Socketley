@@ -1267,7 +1267,8 @@ project "fuzz_raft_msg"
         "test/fuzz/fuzz_replay_main.cpp",
         "test/fuzz/fuzz_common.h",
         "socketley/shared/raft_codec.cpp",
-        "socketley/shared/raft.cpp"
+        "socketley/shared/raft.cpp",
+        "socketley/shared/cluster_state.cpp"
     }
 
     fuzz_target_settings()
@@ -1676,6 +1677,44 @@ project "test_raft"
         "socketley/shared/raft.cpp",
         "socketley/shared/raft.h",
         "socketley/shared/raft_codec.cpp"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: the cluster's replicated desired state and its placement ───
+--
+-- Pure logic with no I/O, so it is two translation units and no libraries.
+
+project "test_cluster_state"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files {
+        "test/unit/test_cluster_state.cpp",
+        "socketley/shared/cluster_state.cpp"
     }
 
     filter "configurations:Debug"
