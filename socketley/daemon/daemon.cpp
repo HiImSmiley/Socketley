@@ -612,6 +612,17 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                 break;
             }
 
+            // How long a silent node is given before its replicas move, in seconds or with an ms suffix.
+            case fnv1a("--raft-down-after"):
+            {
+                if (i + 1 >= argc || !parse_raft_down_after(argv[++i], raft.down_after_ms))
+                {
+                    std::cout << "--raft-down-after takes a duration such as 4s or 3500ms, at least one millisecond\n";
+                    return false;
+                }
+                break;
+            }
+
             default:
                 std::cout << "unknown daemon flag: " << arg << "\n"
                           << "  socketley daemon takes --cpus <set>, --fast-lo [own|all] "
@@ -756,6 +767,12 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
             raft_cfg.tick_ms = static_cast<uint32_t>(std::atoi(t));
         if (const char* c = std::getenv("SOCKETLEY_RAFT_COMPACT_EVERY"); c && std::atoll(c) > 0)
             raft_cfg.compact_every = static_cast<uint64_t>(std::atoll(c));
+        if (const std::string why = raft_timing_refusal(raft_cfg); !why.empty())
+        {
+            std::cout << why;
+            loop.shutdown_ring();
+            return 1;
+        }
         raft = std::make_unique<raft_host>(raft_cfg);
         std::string err;
         if (!raft->start(loop, err))

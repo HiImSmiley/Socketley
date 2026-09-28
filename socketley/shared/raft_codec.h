@@ -12,7 +12,7 @@ namespace socketley::raft::wire
 // A peer speaking another version is refused, never guessed at.
 inline constexpr uint8_t version = 1;
 
-enum class kind : uint8_t { message = 1, hello = 2, join = 3, command = 4 };
+enum class kind : uint8_t { message = 1, hello = 2, join = 3, command = 4, lease_req = 5, lease_grant = 6 };
 
 // The first frame on every connection a node dials, naming who is speaking.
 struct hello
@@ -43,6 +43,15 @@ struct command
     bool operator==(const command&) const = default;
 };
 
+// A follower asking the leader to count it alive, and the leader's answer naming the same request and carrying the leader's commit index.
+struct lease
+{
+    uint64_t nonce = 0;
+    uint64_t index = 0;
+
+    bool operator==(const lease&) const = default;
+};
+
 struct frame
 {
     wire::kind    kind = wire::kind::message;
@@ -50,6 +59,8 @@ struct frame
     wire::hello   hi;
     wire::join    req;
     wire::command cmd;
+    // The body of a lease_req or a lease_grant, whichever `kind` says it is.
+    wire::lease   lease;
 };
 
 // Names and addresses are short, so a longer one is a corrupt frame rather than a long name.
@@ -61,6 +72,7 @@ std::string encode(const raft::message& m);
 std::string encode(const hello& h);
 std::string encode(const join& j);
 std::string encode(const command& c);
+std::string encode(kind k, const lease& l);
 
 // False on anything but one whole, well-formed payload of this version, with the reason in `why`.
 bool decode(std::string_view payload, frame& out, std::string* why = nullptr);

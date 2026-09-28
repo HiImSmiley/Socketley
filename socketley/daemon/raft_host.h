@@ -2,11 +2,13 @@
 // The daemon's Raft node: the core, its WAL and its peer transport on the daemon's own io_uring loop.
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "../shared/cluster_brain.h"
 #include "../shared/cluster_state.h"
 #include "../shared/event_loop_definitions.h"
 #include "../shared/raft.h"
@@ -33,12 +35,20 @@ struct raft_host_config
     uint32_t    election_ticks = 10;
     // Applied entries between snapshots.
     uint64_t    compact_every  = 1000;
+    // How long a node may be silent before the leader moves its replicas, zero for four election timeouts.
+    uint64_t    down_after_ms  = 0;
 
     bool enabled() const { return !listen.empty(); }
 };
 
 // The operator's reason when the configuration cannot run, empty when it can.
 std::string raft_config_refusal(const raft_host_config& c);
+
+// The operator's reason the failure timing cannot be safe against this tick and election timeout, empty when it can; judged once the tick is known.
+std::string raft_timing_refusal(const raft_host_config& c);
+
+// "4", "4s" or "3500ms" as milliseconds, false on anything else or on zero or more than a day.
+bool parse_raft_down_after(std::string_view text, uint64_t& ms);
 
 class raft_host : public io_handler
 {
@@ -62,7 +72,13 @@ public:
     bool submit(const std::string& data, std::string& err);
 
     // The cluster's desired state as this node has applied it.
-    const socketley::cluster::state& cluster() const { return m_cluster; }
+    const socketley::cluster::state& cluster() const { return m_brain->current(); }
+    const socketley::cluster::brain& brain() const { return *m_brain; }
+    // What this node should be running right now, and whether it may.
+    socketley::cluster::want desired() const { return m_brain->desired(now_ms()); }
+    // Called at the end of every Raft tick, which is where the daemon reconciles its runtimes with desired().
+    void set_on_tick(std::function<void()> fn) { m_on_tick = std::move(fn); }
+    uint64_t now_ms() const;
     // The name a member goes by, or its hex id when the book does not hold it.
     std::string node_name(socketley::raft::node_id id) const;
 
@@ -104,6 +120,9 @@ private:
 
     bool on_frame(link& l, std::string_view payload);
     void handle_command(const std::string& data);
+    socketley::cluster::view make_view();
+    void drive_cluster();
+    void flush_cluster(socketley::cluster::output& out);
     void handle_join(const std::string& payload_frame, socketley::raft::node_id id, const std::string& name,
                      const std::string& addr, bool voter);
     void try_join();
@@ -138,8 +157,11 @@ private:
     // Membership as applied, and as the whole log says it, which is where a message is addressed.
     book m_applied_book;
     book m_book;
-    // The desired state of the cluster's runtimes, applied from the log like the book.
-    socketley::cluster::state m_cluster;
+    // Placement, liveness and the serving lease, over the desired state applied from the log like the book.
+    std::unique_ptr<socketley::cluster::brain> m_brain;
+    socketley::raft::index_t m_last_proposed = 0;
+    std::function<void()>    m_on_tick;
+    clock::time_point        m_epoch = clock::now();
     // What peers said about themselves in a hello, for a member whose record this node has not seen yet.
     book m_heard_book;
 

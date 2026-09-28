@@ -137,12 +137,53 @@ bool get_label(std::string_view in, size_t& off, std::string& s)
 
 // ─── configuration ───
 
+static socketley::cluster::timing cluster_timing(const raft_host_config& c)
+{
+    socketley::cluster::timing t;
+    t.election_ms   = static_cast<uint64_t>(c.election_ticks) * c.tick_ms;
+    t.down_after_ms = c.down_after_ms ? c.down_after_ms : 4 * t.election_ms;
+    return t;
+}
+
+std::string raft_timing_refusal(const raft_host_config& c)
+{
+    const std::string why = socketley::cluster::timing_refusal(cluster_timing(c));
+    return why.empty() ? why : "--raft-down-after: " + why + "\n";
+}
+
+bool parse_raft_down_after(std::string_view text, uint64_t& ms)
+{
+    uint64_t unit = 1000;
+    if (text.ends_with("ms"))
+    {
+        unit = 1;
+        text.remove_suffix(2);
+    }
+    else if (text.ends_with('s'))
+    {
+        text.remove_suffix(1);
+    }
+    uint64_t n = 0;
+    if (text.empty() || text.size() > 9)
+        return false;
+    for (char c : text)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        n = n * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (n == 0 || n * unit > 86400000ull)
+        return false;
+    ms = n * unit;
+    return true;
+}
+
 std::string raft_config_refusal(const raft_host_config& c)
 {
     if (!c.enabled())
     {
         if (c.init || c.insecure || !c.join.empty() || !c.advertise.empty() || !c.name.empty()
-            || !c.cert.empty() || !c.key.empty() || !c.ca.empty())
+            || !c.cert.empty() || !c.key.empty() || !c.ca.empty() || c.down_after_ms)
             return "--raft-* flags need --raft-listen <ip:port>, the address this daemon's Raft peers dial\n";
         return {};
     }
@@ -482,11 +523,19 @@ bool raft_host::start(event_loop& loop, std::string& err)
     o.seed           = random_u64();
     const raft::index_t first = rec.state.snap.index;
     const size_t logged = rec.state.log.size();
-    if (!decode_snapshot(rec.state.snap.data, m_applied_book, m_cluster))
+    socketley::cluster::state restored;
+    if (!decode_snapshot(rec.state.snap.data, m_applied_book, restored))
     {
         err = "the snapshot in " + m_cfg.dir + " does not hold a membership book and a cluster state";
         return false;
     }
+    if (const std::string why = raft_timing_refusal(m_cfg); !why.empty())
+    {
+        err = why;
+        return false;
+    }
+    m_brain = std::make_unique<socketley::cluster::brain>(m_id, m_cfg.name, cluster_timing(m_cfg));
+    m_brain->restore(std::move(restored));
     m_node = std::make_unique<raft::node>(o, std::move(rec.state));
     m_applied = m_snap_index = first;
     refresh_book();
@@ -620,8 +669,56 @@ void raft_host::on_tick()
         m_node->tick();
     m_ticks += n;
     maintain();
+    drive_cluster();
     arm_pump();
     arm_tick();
+    // Last, because the daemon's reconciliation may block on a worker starting and the next tick is already armed.
+    if (m_on_tick && !m_stopped)
+        m_on_tick();
+}
+
+uint64_t raft_host::now_ms() const
+{
+    // One past zero, so a lease that was never granted is never mistaken for one that expires at the origin.
+    return 1 + static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - m_epoch).count());
+}
+
+socketley::cluster::view raft_host::make_view()
+{
+    if (m_node->current_role() != raft::role::leader)
+        m_last_proposed = 0;
+    return socketley::cluster::view_of(*m_node, m_applied, m_last_proposed);
+}
+
+void raft_host::drive_cluster()
+{
+    if (m_stopped)
+        return;
+    socketley::cluster::output out;
+    m_brain->tick(now_ms(), make_view(), out);
+    flush_cluster(out);
+}
+
+void raft_host::flush_cluster(socketley::cluster::output& out)
+{
+    for (const std::string& data : out.proposals)
+    {
+        const raft::proposal p = m_node->propose(data);
+        if (p.status != raft::propose_status::ok)
+            break;
+        m_last_proposed = p.index;
+    }
+    namespace cl = socketley::cluster;
+    for (const cl::frame& f : out.frames)
+    {
+        link* l = outbound(f.to);
+        if (!l)
+            continue;
+        const wire::kind k = f.type == cl::frame::kind::lease_req ? wire::kind::lease_req : wire::kind::lease_grant;
+        enqueue(l, wire::encode(k, wire::lease{f.nonce, f.index}));
+    }
+    if (!out.proposals.empty())
+        arm_pump();
 }
 
 void raft_host::maintain()
@@ -691,7 +788,7 @@ void raft_host::after_persist(bool ok)
     apply(m_pending);
     m_pending = raft::ready{};
 
-    if (m_applied >= m_snap_index + m_cfg.compact_every && m_node->compact(m_applied, encode_snapshot(m_applied_book, m_cluster)))
+    if (m_applied >= m_snap_index + m_cfg.compact_every && m_node->compact(m_applied, encode_snapshot(m_applied_book, m_brain->current())))
         m_snap_index = m_applied;
     arm_pump();
 }
@@ -705,7 +802,7 @@ void raft_host::apply(const raft::ready& r)
         if (decode_snapshot(r.restore->data, b, c))
         {
             m_applied_book = std::move(b);
-            m_cluster      = std::move(c);
+            m_brain->restore(std::move(c));
         }
         else
         {
@@ -742,6 +839,7 @@ void raft_host::apply(const raft::ready& r)
         if (decode_record(e.data, id, mb))
             m_applied_book[id] = mb;
     }
+    m_brain->note_applied(m_applied);
     if (r.restore || !r.committed.empty())
         refresh_book();
 }
@@ -755,7 +853,7 @@ void raft_host::apply_command(const std::string& data, raft::index_t index)
         warn("entry " + std::to_string(index) + " is a cluster command this node cannot read; every node skips it alike");
         return;
     }
-    if (!m_cluster.apply(c))
+    if (!m_brain->apply(c))
         return;
     switch (c.op)
     {
@@ -931,6 +1029,21 @@ bool raft_host::on_frame(link& l, std::string_view payload)
             return false;
         handle_command(f.cmd.data);
         return true;
+
+    case wire::kind::lease_req:
+    case wire::kind::lease_grant:
+    {
+        if (!m_node->is_member(l.peer))
+            return false;
+        socketley::cluster::output out;
+        const socketley::cluster::view v = make_view();
+        if (f.kind == wire::kind::lease_req)
+            m_brain->on_lease_req(l.peer, f.lease.nonce, now_ms(), v, out);
+        else
+            m_brain->on_lease_grant(l.peer, f.lease.nonce, f.lease.index, now_ms(), v);
+        flush_cluster(out);
+        return true;
+    }
 
     case wire::kind::hello:
         return false;
@@ -1357,7 +1470,10 @@ std::string raft_host::status(int& exit_code) const
     line("quorum", std::string(reachable ? "reachable" : "NOT reachable") + " (" + std::to_string(heard) + " of "
                    + std::to_string(n.voters().size()) + " voters heard within "
                    + std::to_string(window.count()) + " ms)");
-    line("cluster", std::to_string(m_cluster.specs.size()) + " runtime(s) declared");
+    const uint64_t at = now_ms();
+    line("cluster", std::to_string(m_brain->current().specs.size()) + " runtime(s) declared, this node "
+                    + (m_brain->serving(at) ? "may serve its replicas (lease " + std::to_string(m_brain->lease_left_ms(at)) + " ms left)"
+                                            : std::string("holds no lease and serves none")));
     line("transport", std::string(m_tls ? "mutual TLS" : "cleartext (--raft-insecure)") + ", " + std::to_string(m_sent)
                       + " frames sent, " + std::to_string(m_received) + " received, " + std::to_string(m_dropped)
                       + " dropped");

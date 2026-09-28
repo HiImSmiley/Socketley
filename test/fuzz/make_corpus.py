@@ -2256,6 +2256,10 @@ def raft_join(node, name, addr, voter=True):
     return struct.pack("<BBQ", 1, 3, node) + rw_bytes(name) + rw_bytes(addr) + struct.pack("<B", 1 if voter else 0)
 
 
+def raft_lease(grant, nonce, index=0):
+    return struct.pack("<BBQQ", 1, 6 if grant else 5, nonce, index)
+
+
 def raft_command(data):
     return struct.pack("<BB", 1, 4) + rw_bytes(data)
 
@@ -2330,6 +2334,9 @@ def raftmsg_seeds():
         s["cmd_frame_" + label] = b"\x00" + raft_command(c)
         s["cluster_" + label] = b"\x80" + c
     s["cmd_frame_empty"] = b"\x00" + raft_command(b"")
+    s["lease_req"] = b"\x00" + raft_lease(False, 7)
+    s["lease_grant"] = b"\x00" + raft_lease(True, 7, 4242)
+    s["lease_torn"] = b"\x00" + raft_lease(True, 7, 4242)[:-3]
     s["cluster_cache_type"] = b"\x80" + cl_create(b"db", b"cache", b"", 1)
     s["cluster_test_flag"] = b"\x80" + cl_create(b"api", b"server", b"--test", 1)
     s["cluster_zero_replicas"] = b"\x80" + cl_create(b"api", b"server", b"", 0)

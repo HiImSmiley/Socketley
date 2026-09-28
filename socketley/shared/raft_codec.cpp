@@ -90,6 +90,14 @@ std::string encode(const command& c)
     return w.take();
 }
 
+std::string encode(kind k, const lease& l)
+{
+    writer w(k);
+    w.u64(l.nonce);
+    w.u64(l.index);
+    return w.take();
+}
+
 bool decode(std::string_view payload, frame& out, std::string* why)
 {
     reader r(payload);
@@ -125,6 +133,13 @@ bool decode(std::string_view payload, frame& out, std::string* why)
             return fail(why, "malformed command");
         if (out.cmd.data.empty())
             return fail(why, "empty command");
+        break;
+
+    case static_cast<uint8_t>(kind::lease_req):
+    case static_cast<uint8_t>(kind::lease_grant):
+        out.kind = static_cast<kind>(k);
+        if (!r.u64(out.lease.nonce) || !r.u64(out.lease.index))
+            return fail(why, "malformed lease");
         break;
 
     case static_cast<uint8_t>(kind::message):

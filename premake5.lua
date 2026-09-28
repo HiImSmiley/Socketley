@@ -1734,6 +1734,47 @@ project "test_cluster_state"
         linkoptions { "-fsanitize=address,undefined" }
     filter {}
 
+-- ─── Test: placement, liveness and the serving lease, over real Raft nodes ───
+--
+-- The brain and the Raft core in virtual time, so a partition, a kill or a
+-- late message is a line of the test and the invariant is checked every tick.
+
+project "test_cluster_brain"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files {
+        "test/unit/test_cluster_brain.cpp",
+        "socketley/shared/cluster_brain.cpp",
+        "socketley/shared/cluster_state.cpp",
+        "socketley/shared/raft.cpp"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
 -- ─── Test: Raft's WAL and snapshot files, and the io_uring writer ───
 
 project "test_raft_storage"

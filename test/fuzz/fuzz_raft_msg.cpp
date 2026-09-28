@@ -85,6 +85,15 @@ void one_payload(std::string_view p)
                    "a join did not survive a round trip");
         break;
     }
+    case wire::kind::lease_req:
+    case wire::kind::lease_grant:
+    {
+        again = wire::encode(f.kind, f.lease);
+        wire::frame g;
+        FUZZ_CHECK(wire::decode(again, g) && g.kind == f.kind && g.lease == f.lease,
+                   "a lease frame did not survive a round trip");
+        break;
+    }
     case wire::kind::command:
     {
         again = wire::encode(f.cmd);
