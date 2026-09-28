@@ -5052,6 +5052,97 @@ gives above.
 Remove a range by position or by score and return how many went. Emptying the
 set removes the key.
 .PP
+.B Streams:
+.PP
+The stream commands are Redis 7.0's, with its arguments, its answers and its
+errors; the line protocol splits their words on spaces, so a field or value
+there cannot hold one, and answers an array one element a line followed by
+"end". An empty stream is still a key, as in Redis.
+.TP
+.BI "xadd " "key [nomkstream] [maxlen|minid [=|~] n [limit n]] *|id field value ..."
+Append an entry and return its id.
+.B *
+takes the clock in milliseconds, or the last id's with its sequence counted up
+when the clock has not moved past it;
+.I ms\-*
+asks for the next sequence in that millisecond. An id at or below the last one
+is refused. A replica and the journal receive the id it got, never
+.BR * .
+.B maxlen ~
+removes whole blocks of up to a hundred entries only, as Redis removes whole
+nodes, so it can leave more than asked for.
+.TP
+.BI "xlen " "key"
+The number of entries.
+.TP
+.BI "xrange " "key start end [count n]"
+.TQ
+.BI "xrevrange " "key end start [count n]"
+Entries in id order, or the reverse, one a line as "id field value ...".
+.B \-
+and
+.B +
+are the ends, a lone millisecond takes every sequence in it, and a leading
+.B (
+makes a bound exclusive.
+.TP
+.BI "xdel " "key id [id ...]"
+Remove entries and return how many there were.
+.TP
+.BI "xtrim " "key maxlen|minid [=|~] n [limit n]"
+Remove from the oldest end and return how many went.
+.TP
+.BI "xread " "[count n] [block ms] streams key [key ...] id [id ...]"
+Entries past each id, one a line as "key id field value ...".
+.B $
+is the last id when the read was asked.
+.B block
+waits for the next
+.B xadd
+to any of the keys when there is nothing yet, 0 waiting for ever; a wait
+inside
+.B multi
+answers "nil" at once, and a script may not wait at all. On a sharded cache
+every key must belong to one shard, and a blocking read is served only by the
+shard that owns its streams \(em through that shard's
+.B \-\-cluster
+port.
+.TP
+.BI "xgroup " "create key group id|$ [mkstream] [entriesread n]"
+.TQ
+.BI "xgroup " "setid|destroy|createconsumer|delconsumer key group ..."
+Make, move or remove a consumer group, or one of its consumers.
+.TP
+.BI "xreadgroup " "group g consumer [count n] [block ms] [noack] streams key ... id ..."
+.B >
+delivers what the group has not delivered and records it as pending on the
+consumer, unless
+.BR noack ;
+any other id re-reads that consumer's own pending entries.
+.TP
+.BI "xack " "key group id [id ...]"
+Take entries off the pending list and return how many were on it.
+.TP
+.BI "xpending " "key group [[idle ms] start end count [consumer]]"
+The pending list: a summary, or entries with their consumer, idle time and
+delivery count.
+.TP
+.BI "xclaim " "key group consumer min-idle id ... [idle ms] [time ms] [retrycount n] [force] [justid] [lastid id]"
+.TQ
+.BI "xautoclaim " "key group consumer min-idle start [count n] [justid]"
+Take over entries another consumer left pending, the second walking the list
+from
+.I start
+and also answering the ids that
+.B xdel
+removed from under the group.
+.TP
+.BI "xinfo " "stream key [full [count n]] | groups key | consumers key group"
+What a stream, its groups or a group's consumers hold.
+.TP
+.BI "xsetid " "key id [entriesadded n] [maxdeletedid id]"
+Set the stream's last id and counters, which is how a replica is told them.
+.PP
 .B Pattern subscriptions:
 .TP
 .BI "psubscribe " "pattern [pattern ...]"
@@ -5480,6 +5571,23 @@ HSTRLEN, HINCRBY, HSCAN
 ZADD, ZREM, ZSCORE, ZCARD, ZCOUNT, ZINCRBY, ZRANK, ZREVRANK, ZRANGE,
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZPOPMIN, ZPOPMAX,
 ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZSCAN
+.RE
+.PP
+.B Streams
+.RS 2
+XADD, XLEN, XRANGE, XREVRANGE, XREAD (BLOCK), XDEL, XTRIM, XSETID,
+XGROUP (CREATE, SETID, DESTROY, CREATECONSUMER, DELCONSUMER), XREADGROUP (BLOCK,
+NOACK), XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO (STREAM [FULL], GROUPS,
+CONSUMERS)
+.PP
+Replies and errors are Redis 7.0's, compared against a redis-server by
+.BR test_cache_streams_vs_redis.sh ;
+XINFO STREAM's radix-tree-nodes counts no tree, since the entries sit in blocks
+indexed by a sorted array. XADD, XGROUP CREATE and CREATECONSUMER are
+refused with OOM at the memory limit, as Redis refuses its denyoom commands;
+XREADGROUP and XCLAIM are not, which is also Redis's rule. An XREAD naming
+streams of several shards is answered
+.BR \-CROSSSLOT .
 .RE
 .PP
 .B Pub/Sub

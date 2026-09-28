@@ -154,7 +154,7 @@ Beyond the CLI and daemon, there's a lot more in this repository:
 - **Server**:TCP/UDP listener with broadcast, WebSocket auto-detection, master mode (TCP only), and `--send-to` to say who an incoming message reaches
 - **Client**:TCP/UDP connector with auto-reconnect
 - **Proxy**:HTTP/TCP reverse proxy with round-robin, random, or Lua-based routing
-- **Cache**:In-memory key-value store with strings, lists, sets, hashes, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching. It has no password, so it serves only this machine unless created with `--public` or given mutual TLS
+- **Cache**:In-memory key-value store with strings, lists, sets, hashes, sorted sets, streams with consumer groups and blocking reads, TTL, pub/sub, RESP2 (Redis wire protocol), LRU eviction, persistence, leader-follower replication, and DB-backend Lua hooks for read-through / write-behind caching. It has no password, so it serves only this machine unless created with `--public` or given mutual TLS
 - **Lua scripting**:Per-runtime callbacks (`on_message`, `on_connect`, `on_auth`, `on_route`, etc.) with hot-reload, timers, HTTP client, cross-runtime pub/sub
 - **Cluster mode**:Multi-daemon discovery via shared directory, `@group` backend routing, Lua cluster API
 - **Sharding**:`--shards N` runs one runtime across N worker processes behind a single port via `SO_REUSEPORT`, on servers, proxies and caches — a sharded cache keeps one keyspace, so `mget`, `dbsize` and `publish` still answer for the whole runtime. On a **cache** add `--cluster` and point a cluster-aware client at it: behind one address the shard a connection lands on relays every key it does not own, which measured 1.75× for 3.95 cores at four shards against 2.80× slot-routed — see **Sharding a cache** under Performance
@@ -483,6 +483,25 @@ the mechanism is that a batch is where this tree does its work:
 
 None of the three has anything to bundle at depth 1, which is exactly why the
 advantage is absent there.
+
+**Streams**, measured 2026-09-28 against a private redis-server 7.0.15: four
+`redis-benchmark` processes of 50 connections per arm, 7 interleaved passes,
+server CPU per operation from `/proc` beside the rate. The reads run over a
+stream preloaded with the operation count in entries, from a random id; XACK
+acks a random id of that stream after every entry has been delivered once.
+
+| Operation | depth 1 | Redis | ratio | depth 16 | Redis | ratio |
+|-----------|---------|-------|-------|----------|-------|-------|
+| XADD *                   | 291 K | 235 K | 1.23× | 2.88 M | 1.12 M | 2.59× |
+| XADD MAXLEN ~ 10000 *    | 259 K | 222 K | 1.13× | 2.28 M | 0.91 M | 2.48× |
+| XRANGE COUNT 10          | 218 K | 115 K | 1.89× | 713 K  | 205 K  | 3.52× |
+| XREAD COUNT 10           | 187 K | 103 K | 1.82× | 580 K  | 186 K  | 3.23× |
+| XREADGROUP > COUNT 1     | 224 K | 125 K | 1.87× | 907 K  | 232 K  | 3.87× |
+| XACK                     | 221 K | 195 K | 1.09× | 719 K  | 728 K  | 1.01× |
+
+XACK is level: both walk a tree of 800,000 pending entries to a random one, and
+the miss is the cost on either side. A million entries of one short field hold
+24 bytes each in resident memory against Redis's 25.
 
 ### Sharding a cache
 
