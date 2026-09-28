@@ -196,8 +196,7 @@ Takes
 here shaping the ring this daemon is about to create rather than stating what a
 runtime requires of one. It is the command-line spelling of
 .BR SOCKETLEY_CPUS ,
-and the flag wins when both are given. It also takes the experimental
-.B \-\-raft\-*
+and the flag wins when both are given. It also takes the experimental Raft
 flags described under
 .BR "CLUSTER MODE" .
 Any other argument is refused: this
@@ -9647,6 +9646,20 @@ once at start.
 .B socketley.http()
 was the exception: it resolved on every call, and neither the call's own
 deadline nor the callback budget covers a resolver.
+.TP
+.B SOCKETLEY_RAFT_TICK_MS
+The Raft tick of a daemon started with
+.BR \-\-raft\-listen ,
+in milliseconds. Default
+.BR 100 ;
+the election timeout is ten ticks to twenty, and a heartbeat is sent every
+tick, so every member of one cluster should use the same value.
+.TP
+.B SOCKETLEY_RAFT_COMPACT_EVERY
+How many applied Raft entries go by between snapshots. Default
+.BR 1000 .
+A small value makes a joining node catch up through a snapshot, which is what
+the test suite sets it for.
 .TP
 .B SOCKETLEY_CONFIG
 Path to the daemon configuration file.
