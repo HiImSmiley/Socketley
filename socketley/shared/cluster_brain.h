@@ -21,7 +21,8 @@ struct timing
     // A node the leader has not heard a lease request from for this long is down and its replicas move.
     uint64_t down_after_ms = 4000;
 
-    // How long a granted lease lasts: long enough to carry a node through a leader change, and a quarter of down_after short of the leader moving its replicas.
+    // How long a granted lease lasts: long enough to carry a node through a leader change, and a quarter of
+    // down_after short of the leader moving its replicas.
     uint64_t lease_ms() const { return down_after_ms * 3 / 4; }
     uint64_t request_every_ms() const { return election_ms / 4 ? election_ms / 4 : 1; }
 };
@@ -48,7 +49,8 @@ struct view
     bool settled = false;
 };
 
-// The view of a Raft node the brain works from, where `applied` is what the host's state machine has applied and `last_proposed` the last index the brain had proposed in this leadership.
+// The view of a Raft node the brain works from, where `applied` is what the host's state machine has applied and
+// `last_proposed` the last index the brain had proposed in this leadership.
 view view_of(const raft::node& n, raft::index_t applied, raft::index_t last_proposed);
 
 struct frame
@@ -76,8 +78,8 @@ struct want
     {
         std::string name;
         std::string type;
-        // The args with {node} already expanded for this node.
-        std::string args;
+        // The flags with {node} already expanded for this node.
+        std::vector<std::string> args;
     };
 
     // False when the node cannot confirm it still owns what it holds, and every replica must be stopped.
@@ -128,7 +130,8 @@ private:
     std::map<node_id, uint64_t> m_last_req;
 
     uint64_t m_lease_until = 0;
-    // A lease that lapsed and was granted again counts only once this node has applied what the leader had committed, since it may have been moved from in between.
+    // A lease that lapsed and was granted again counts only once this node has applied what the leader had committed,
+    // since it may have been moved from in between.
     raft::index_t m_gate    = 0;
     raft::index_t m_applied = 0;
     uint64_t m_next_req    = 0;

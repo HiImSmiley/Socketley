@@ -35,6 +35,26 @@ std::string label(std::string_view name)
     return out;
 }
 
+void put_args(bytes::writer& w, const std::vector<std::string>& args)
+{
+    w.u32(static_cast<uint32_t>(args.size()));
+    for (const std::string& a : args)
+        w.bytes(a);
+}
+
+// The count is capped before anything is reserved, and the sum by refusal() once the command is whole.
+bool get_args(bytes::reader& r, std::vector<std::string>& args)
+{
+    uint32_t n = 0;
+    if (!r.u32(n) || n > max_arg_count)
+        return false;
+    args.resize(n);
+    for (std::string& a : args)
+        if (!r.bytes(a, max_args))
+            return false;
+    return true;
+}
+
 }   // namespace
 
 // ─── commands ───
@@ -60,21 +80,21 @@ std::string refusal(const command& c)
     {
         if (std::string why = type_refusal(c.sp.type); !why.empty())
             return why;
-        if (c.sp.args.size() > max_args)
-            return "the flags are longer than " + std::to_string(max_args) + " bytes";
-        if (!control_free(c.sp.args))
-            return "the flags carry a control character";
-        size_t pos = 0;
-        while (pos < c.sp.args.size())
+        if (c.sp.args.size() > max_arg_count)
+            return "more than " + std::to_string(max_arg_count) + " flags";
+        size_t bytes = 0;
+        for (const std::string& a : c.sp.args)
         {
-            const size_t end = c.sp.args.find_first_of(" \t", pos);
-            const std::string_view tok = std::string_view(c.sp.args).substr(pos, end == std::string::npos ? end : end - pos);
-            if (tok == "--test")
+            bytes += a.size();
+            if (a.empty())
+                return "a flag is empty";
+            if (!control_free(a))
+                return "the flags carry a control character";
+            if (a == "--test")
                 return "--test would leave every replica a dry run";
-            if (end == std::string::npos)
-                break;
-            pos = end + 1;
         }
+        if (bytes > max_args)
+            return "the flags are longer than " + std::to_string(max_args) + " bytes";
         [[fallthrough]];
     }
     case op::scale:
@@ -100,7 +120,7 @@ std::string encode(const command& c)
     {
     case op::create:
         w.bytes(c.sp.type);
-        w.bytes(c.sp.args);
+        put_args(w, c.sp.args);
         w.u32(c.sp.replicas);
         break;
     case op::scale:
@@ -135,7 +155,7 @@ bool decode(std::string_view data, command& out)
     switch (c.op)
     {
     case op::create:
-        if (!r.bytes(c.sp.type, 16) || !r.bytes(c.sp.args, max_args) || !r.u32(c.sp.replicas))
+        if (!r.bytes(c.sp.type, 16) || !get_args(r, c.sp.args) || !r.u32(c.sp.replicas))
             return false;
         break;
     case op::scale:
@@ -153,6 +173,57 @@ bool decode(std::string_view data, command& out)
     if (r.left() != 0 || !refusal(c).empty())
         return false;
     out = std::move(c);
+    return true;
+}
+
+std::vector<std::string> expand_args(const std::vector<std::string>& args, std::string_view node_name)
+{
+    std::vector<std::string> out;
+    for (const std::string& a : args)
+        out.push_back(expand_args(a, node_name));
+    return out;
+}
+
+std::string quote_arg(std::string_view arg)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : arg)
+    {
+        if (c == '%' || c <= 0x20 || c == 0x7f)
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else
+        {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
+bool unquote_arg(std::string_view word, std::string& out)
+{
+    auto nib = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    out.clear();
+    for (size_t i = 0; i < word.size(); ++i)
+    {
+        if (word[i] != '%')
+        {
+            out += word[i];
+            continue;
+        }
+        if (word.size() - i < 3)
+            return false;
+        const int hi = nib(word[i + 1]);
+        const int lo = nib(word[i + 2]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out += static_cast<char>(hi * 16 + lo);
+        i += 2;
+    }
     return true;
 }
 
@@ -276,7 +347,7 @@ std::string encode(const state& s)
     {
         w.bytes(name);
         w.bytes(sp.type);
-        w.bytes(sp.args);
+        put_args(w, sp.args);
         w.u32(sp.replicas);
         auto it = s.owners.find(name);
         const std::vector<uint64_t> held = it == s.owners.end() ? std::vector<uint64_t>{}
@@ -300,7 +371,7 @@ bool decode(std::string_view data, state& out)
         command c;
         c.op = op::create;
         std::vector<uint64_t> held;
-        if (!r.bytes(c.name, max_name) || !r.bytes(c.sp.type, 16) || !r.bytes(c.sp.args, max_args)
+        if (!r.bytes(c.name, max_name) || !r.bytes(c.sp.type, 16) || !get_args(r, c.sp.args)
             || !r.u32(c.sp.replicas) || !r.ids(held))
             return false;
         // What is stored passes through the same rules a proposal does, in the order encode writes it, so one state has one encoding.

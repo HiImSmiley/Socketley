@@ -28,7 +28,8 @@ view view_of(const raft::node& n, raft::index_t applied, raft::index_t last_prop
     if (v.role != raft::role::leader)
         return v;
     v.quorum = n.quorum_active();
-    // The plan is made on what the log says, so everything committed must be applied, an entry of this term among it, and everything this leader proposed.
+    // The plan is made on what the log says, so everything committed must be applied, an entry of this term among it,
+    // and everything this leader proposed.
     const auto term_at_commit = n.term_at(n.commit_index());
     v.stable  = term_at_commit && *term_at_commit == n.term();
     v.settled = v.stable && applied >= n.commit_index() && applied >= last_proposed;
@@ -53,7 +54,8 @@ void brain::tick(uint64_t now, const view& v, output& out)
 
     if (leading)
     {
-        // A leader's own lease is its last look at a quorum, since nobody else grants it one, and one that had lapsed is taken up again only from a state that has caught up.
+        // A leader's own lease is its last look at a quorum, since nobody else grants it one, and one that had lapsed
+        // is taken up again only from a state that has caught up.
         if (v.quorum && (now < m_lease_until || (v.stable && m_applied >= v.commit)))
             m_lease_until = std::max(m_lease_until, now + m_timing.lease_ms());
         if (v.quorum && v.settled)
@@ -100,7 +102,8 @@ void brain::on_lease_grant(node_id from, uint64_t nonce, raft::index_t index, ui
     if (it == m_sent.end())
         return;
     const uint64_t until = it->second + m_timing.lease_ms();
-    // A lease that had lapsed comes back only once this node has applied what the leader had committed, because the replicas may have moved while it was away.
+    // A lease that had lapsed comes back only once this node has applied what the leader had committed, because the
+    // replicas may have moved while it was away.
     if (now >= m_lease_until && until > now)
         m_gate = std::max(m_gate, index);
     // The lease runs from when the request left, which is never later than when the leader heard it.

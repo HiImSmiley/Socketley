@@ -1004,7 +1004,8 @@ bool raft_host::on_frame(link& l, std::string_view payload)
     case wire::kind::message:
         if (f.msg.from != l.peer || f.msg.to != m_id)
             return false;
-        // A stranger's vote request could still move this node's term, so only members and recorded nodes are heard, or anyone before this node has a membership.
+        // A stranger's vote request could still move this node's term, so only members and recorded nodes are heard,
+        // or anyone before this node has a membership.
         if (!m_node->is_member(l.peer) && !m_book.count(l.peer) && !m_node->voters().empty())
             return true;
         m_heard[l.peer] = clock::now();

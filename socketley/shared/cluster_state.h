@@ -14,15 +14,17 @@ namespace socketley::cluster
 using node_id = uint64_t;
 
 inline constexpr size_t   max_name     = 128;
+// The most bytes the flags of one spec may hold in all, and the most of them, so the create line stays under the argument limit.
 inline constexpr size_t   max_args     = 4096;
+inline constexpr size_t   max_arg_count = 90;
 inline constexpr uint32_t max_replicas = 64;
 
 // What `create` takes for a runtime, kept as the argument text every node hands to its own `create` verb.
 struct spec
 {
     std::string type;
-    // The flags after the name, space separated; "{node}" stands for the name of the node that runs the replica.
-    std::string args;
+    // The flags after the name, one argument each and never split again; "{node}" in one stands for the name of the node that runs the replica.
+    std::vector<std::string> args;
     uint32_t    replicas = 1;
 
     bool operator==(const spec&) const = default;
@@ -54,8 +56,14 @@ std::string refusal(const command& c);
 // The types that may run as a cluster runtime, and the reason for one that may not.
 std::string type_refusal(std::string_view type);
 
-// The args with "{node}" replaced by a label made of the characters a command line carries unquoted.
-std::string expand_args(std::string_view args, std::string_view node_name);
+// The argument with "{node}" replaced by a label made of letters, digits, '-', '_' and '.'.
+std::string expand_args(std::string_view arg, std::string_view node_name);
+std::vector<std::string> expand_args(const std::vector<std::string>& args, std::string_view node_name);
+
+// An argument as one word of a command line: '%', spaces and control bytes as %XX, so an argument with a space in it survives the trip.
+std::string quote_arg(std::string_view arg);
+// False on a % that is not followed by two hex digits.
+bool        unquote_arg(std::string_view word, std::string& out);
 
 struct state
 {
@@ -74,14 +82,16 @@ struct state
     bool operator==(const state&) const = default;
 };
 
-// Why a well-formed operator command would change nothing on this state, so the operator hears it instead of a silent no-op; empty when it would take effect.
+// Why a well-formed operator command would change nothing on this state, so the operator hears it instead of a silent
+// no-op; empty when it would take effect.
 std::string conflict(const state& s, const command& c);
 
 // The bytes a snapshot carries, and false from decode on anything that is not exactly what encode wrote.
 std::string encode(const state& s);
 bool        decode(std::string_view data, state& out);
 
-// The assign and unassign commands that bring the owners in line with the specs on the nodes given, a pure function so any node would choose the same.
+// The assign and unassign commands that bring the owners in line with the specs on the nodes given, a pure function
+// so any node would choose the same.
 std::vector<command> plan(const state& s, const std::vector<node_id>& live);
 
 }   // namespace socketley::cluster

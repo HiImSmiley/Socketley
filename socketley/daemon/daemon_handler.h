@@ -76,10 +76,13 @@ public:
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);
 
-    // The daemon's Raft node, when --raft-listen started one, for `cluster raft-status` and the cluster's runtimes, which it then reconciles on every Raft tick.
+    // The daemon's Raft node, when --raft-listen started one, for `cluster raft-status` and the cluster's runtimes,
+    // which it then reconciles on every Raft tick.
     void set_raft(class raft_host* host);
-    // Runs a command line as the daemon itself, with its output in `out`, which is how the cluster's reconciliation reaches create, start, stop and remove.
-    int run_internal(std::string_view line, std::string& out, bool cluster_owned);
+    // Runs a command as the daemon itself, its words exactly as given and never split again, with its output in `out`.
+    // This is how the cluster's reconciliation reaches create, start, stop and remove, and it returns once a worker
+    // is forked rather than once it is serving.
+    int run_internal(const std::vector<std::string>& words, std::string& out, bool cluster_owned);
     // The file this daemon read its settings from, so `dashboard` can say
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
@@ -124,6 +127,7 @@ private:
         const parsed_args& pa, const char* verb, ipc_connection* conn) const;
 
     int process_command(ipc_connection* conn, std::string_view line);
+    int process_parsed(ipc_connection* conn, const parsed_args& pa);
 
     // The switch, split out so process_command can read the exit code of the
     // handler it dispatched to instead of returning it straight through.
@@ -173,7 +177,8 @@ private:
     int cmd_cluster_scale(ipc_connection* conn, const parsed_args& pa);
     int cmd_cluster_has(ipc_connection* conn, const parsed_args& pa);
     int cmd_cluster_placement(ipc_connection* conn);
-    // What to say to an operator who names a cluster replica in a verb that would change it from underneath the cluster, and drops it from `names`; the number dropped.
+    // What to say to an operator who names a cluster replica in a verb that would change it from underneath the
+    // cluster, and drops it from `names`; the number dropped.
     size_t withhold_cluster_names(std::vector<std::string>& names, const char* verb, ipc_connection* conn) const;
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);

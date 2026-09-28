@@ -11,7 +11,8 @@
 #include <string>
 #include <vector>
 
-// The replicated desired state and the placement that writes it: what a command may say, what applying it does, what a snapshot keeps, and where the planner puts replicas.
+// The replicated desired state and the placement that writes it: what a command may say, what applying it does, what
+// a snapshot keeps, and where the planner puts replicas.
 
 namespace cl = socketley::cluster;
 
@@ -32,7 +33,7 @@ struct prng
 };
 
 cl::command declare(const std::string& name, uint32_t replicas, const std::string& type = "server",
-                   const std::string& args = "-p 8080")
+                   const std::vector<std::string>& args = {"-p", "8080"})
 {
     cl::command c;
     c.op   = cl::op::create;
@@ -167,9 +168,11 @@ TEST_CASE("a command the operator may not give is refused, and decode refuses it
         {declare("api", 0), "replicas must be"},
         {declare("api", cl::max_replicas + 1), "replicas must be"},
         {resize("api", 0), "replicas must be"},
-        {declare("api", 1, "server", "-p 80 --test"), "--test"},
-        {declare("api", 1, "server", "-p 80\n-p 81"), "control character"},
-        {declare("api", 1, "server", std::string(cl::max_args + 1, 'x')), "longer than"},
+        {declare("api", 1, "server", {"-p", "80", "--test"}), "--test"},
+        {declare("api", 1, "server", {"-p", "80\n81"}), "control character"},
+        {declare("api", 1, "server", {std::string(cl::max_args + 1, 'x')}), "longer than"},
+        {declare("api", 1, "server", std::vector<std::string>(cl::max_arg_count + 1, "-x")), "more than"},
+        {declare("api", 1, "server", {"-p", ""}), "empty"},
         {place("api", 0), "node 0"},
     };
     for (const row& r : rows)
@@ -183,11 +186,45 @@ TEST_CASE("a command the operator may not give is refused, and decode refuses it
     }
 }
 
+TEST_CASE("a flag with a space in it is one argument through the command codec, the snapshot, and the command line")
+{
+    const std::vector<std::string> args = {"--http", "/srv/my www", "--listen", "unix:/run/a b.sock", "50%", "ünï"};
+    cl::command c = declare("api", 2, "server", args);
+    cl::command back;
+    REQUIRE(cl::decode(cl::encode(c), back));
+    CHECK(back.sp.args == args);
+
+    cl::state s;
+    s.apply(c);
+    cl::state t;
+    REQUIRE(cl::decode(cl::encode(s), t));
+    CHECK(t.specs.at("api").args == args);
+
+    // On the command line each word is quoted, so a space never splits it and no word is empty.
+    for (const std::string& a : args)
+    {
+        const std::string word = cl::quote_arg(a);
+        CHECK(word.find_first_of(" \t\n") == std::string::npos);
+        std::string round;
+        REQUIRE(cl::unquote_arg(word, round));
+        CHECK(round == a);
+    }
+    std::string sink;
+    CHECK(cl::quote_arg("a\tb\nc") == "a%09b%0Ac");
+    CHECK_FALSE(cl::unquote_arg("100%", sink));
+    CHECK_FALSE(cl::unquote_arg("a%2", sink));
+    CHECK_FALSE(cl::unquote_arg("a%zz", sink));
+    CHECK(cl::unquote_arg("a%20b", sink));
+    CHECK(sink == "a b");
+}
+
 TEST_CASE("{node} becomes the executing node's name, made safe for a command line")
 {
     CHECK(cl::expand_args("--listen unix:/run/{node}.sock", "n1") == "--listen unix:/run/n1.sock");
     CHECK(cl::expand_args("{node} {node}", "a b") == "a_b a_b");
-    CHECK(cl::expand_args("-p 80", "n1") == "-p 80");
+    CHECK(cl::expand_args("-p", "n1") == "-p");
+    CHECK(cl::expand_args(std::vector<std::string>{"--http", "/srv/{node} www"}, "n1")
+          == std::vector<std::string>{"--http", "/srv/n1 www"});
     CHECK(cl::expand_args("{nod", "n1") == "{nod");
     CHECK(cl::expand_args("x{node}", "a;b\n") == "xa_b_");
 }
@@ -278,9 +315,9 @@ TEST_CASE("a snapshot round-trips, and replaying the log from it gives the state
 TEST_CASE("a snapshot that is not exactly what encode wrote is refused")
 {
     cl::state s;
-    s.apply(declare("api", 2, "server", "-p 80"));
+    s.apply(declare("api", 2, "server", {"-p", "80"}));
     s.apply(place("api", 5));
-    s.apply(declare("web", 1, "proxy", "--backend 127.0.0.1:1"));
+    s.apply(declare("web", 1, "proxy", {"--backend", "127.0.0.1:1"}));
     const std::string bytes = cl::encode(s);
 
     cl::state t;
@@ -295,13 +332,13 @@ TEST_CASE("a snapshot that is not exactly what encode wrote is refused")
 
     // A name that would be refused as a command is refused inside a snapshot.
     cl::state bad;
-    bad.specs["a b"]  = cl::spec{"server", "", 1};
+    bad.specs["a b"]  = cl::spec{"server", {}, 1};
     bad.owners["a b"] = {};
     CHECK_FALSE(cl::decode(cl::encode(bad), t));
 
     // Node 0 is not a node, and a node held twice is not a set.
     cl::state zero;
-    zero.specs["x"]  = cl::spec{"server", "", 2};
+    zero.specs["x"]  = cl::spec{"server", {}, 2};
     zero.owners["x"] = {0};
     CHECK_FALSE(cl::decode(cl::encode(zero), t));
     CHECK(cl::decode(cl::encode(cl::state{}), t));

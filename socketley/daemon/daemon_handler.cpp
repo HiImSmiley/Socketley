@@ -1138,14 +1138,18 @@ int daemon_handler::check_empty_names(const std::vector<std::string>& names,
 
 int daemon_handler::process_command(ipc_connection* conn, std::string_view line)
 {
+    parsed_args pa;
+    pa.parse(line);
+    return process_parsed(conn, pa);
+}
+
+int daemon_handler::process_parsed(ipc_connection* conn, const parsed_args& pa)
+{
     // ─── One guard, for every command ───────────────────────────────────────
     // The reply guard is held here rather than in each handler, because a
     // per-handler list goes stale the moment somebody adds a command -- which
     // is how four of them came to write to the daemon's own stdout.
     const cout_to_reply reply_guard(conn);
-
-    parsed_args pa;
-    pa.parse(line);
 
     if (pa.count == 0)
     {
@@ -1483,6 +1487,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
     {
         reconcile_proxy_workers();
 
+        // The cluster's reconciliation runs on the Raft tick, so it never waits for a worker: a failure shows as the runtime's state on a later tick.
+        if (m_cluster_internal)
+            return 0;
+
         // The answer waits for the process that decides it, because the script
         // runs, the port binds and the TLS pair is checked in the worker --
         // and the runtime is left `failed` rather than removed, so the
@@ -1720,6 +1728,10 @@ int daemon_handler::cmd_start(ipc_connection* conn, const parsed_args& pa)
     // done here rather than on the health timer so `start` followed
     // immediately by a request works.
     reconcile_proxy_workers();
+
+    // As in create: the Raft tick does not wait for a worker.
+    if (m_cluster_internal)
+        return failed > 0 ? 1 : 0;
 
     // `start` waits for the answer exactly as `create -s` does, because it was
     // reporting success for a start that did not happen -- one child's startup
@@ -6655,15 +6667,27 @@ void daemon_handler::set_raft(class raft_host* host)
     host->set_on_tick([this] { m_reconciler->tick(); });
 }
 
-int daemon_handler::run_internal(std::string_view line, std::string& out, bool cluster_owned)
+int daemon_handler::run_internal(const std::vector<std::string>& words, std::string& out, bool cluster_owned)
 {
+    if (words.empty() || words.size() > MAX_ARGS - 1)
+    {
+        out = "too many arguments\n";
+        return 1;
+    }
+    parsed_args pa;
+    for (const std::string& w : words)
+    {
+        pa.args[pa.count]   = w;
+        pa.hashes[pa.count] = fnv1a(w);
+        ++pa.count;
+    }
     ipc_connection scratch{};
     scratch.fd = -1;
     const bool was_internal = m_cluster_internal;
     const bool was_creating = m_cluster_creating;
     m_cluster_internal = true;
     m_cluster_creating = cluster_owned;
-    const int rc = process_command(&scratch, line);
+    const int rc = process_parsed(&scratch, pa);
     m_cluster_internal = was_internal;
     m_cluster_creating = was_creating;
     out = std::move(scratch.write_buf);
@@ -6736,18 +6760,32 @@ int daemon_handler::cmd_cluster_create(ipc_connection* conn, const parsed_args& 
 
     cl::command c;
     c.op          = cl::op::create;
-    c.sp.type     = std::string(pa.args[1]);
-    c.name        = std::string(pa.args[2]);
     c.sp.replicas = 1;
+    // Every word arrives quoted (the CLI's quote_arg), so a flag with a space in it is one argument here as on the command line.
+    auto word = [&](size_t i, std::string& out) { return cl::unquote_arg(pa.args[i], out); };
+    if (!word(1, c.sp.type) || !word(2, c.name))
+    {
+        conn->write_buf = "a word of the command is not correctly quoted\n";
+        return 1;
+    }
     for (size_t i = 3; i < pa.count; ++i)
     {
-        if (pa.args[i] != "--replicas")
+        std::string arg;
+        if (!word(i, arg))
         {
-            c.sp.args += (c.sp.args.empty() ? "" : " ") + std::string(pa.args[i]);
+            conn->write_buf = "a word of the command is not correctly quoted\n";
+            return 1;
+        }
+        if (arg != "--replicas")
+        {
+            c.sp.args.push_back(std::move(arg));
             continue;
         }
         uint32_t n = 0;
-        const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+        std::string count;
+        if (i + 1 < pa.count)
+            word(i + 1, count);
+        const std::string_view v = count;
         const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
         if (v.empty() || ec != std::errc{} || end != v.data() + v.size())
         {
@@ -6776,8 +6814,10 @@ int daemon_handler::cmd_cluster_create(ipc_connection* conn, const parsed_args& 
     }
     // The flags are run through `create --test` as this node would run them, so a typo is refused here and not on every node at once.
     std::string out;
-    const std::string dry = "create " + c.sp.type + " " + c.name + " " + cl::expand_args(c.sp.args, m_raft->node_name(m_raft->self()))
-                          + " --test";
+    std::vector<std::string> dry = {"create", c.sp.type, c.name};
+    for (std::string& a : cl::expand_args(c.sp.args, m_raft->node_name(m_raft->self())))
+        dry.push_back(std::move(a));
+    dry.push_back("--test");
     if (const int rc = run_internal(dry, out, false); rc != 0)
     {
         conn->write_buf = out.empty() ? "the flags were refused\n" : out;

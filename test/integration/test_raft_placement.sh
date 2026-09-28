@@ -31,6 +31,8 @@
 #  blocked         the reconciler taking over, or removing, a local runtime of
 #                  the same name
 #  a proxy         a spec type other than a server that does not run
+#  quoting         a flag value with a space in it split in two on its way to
+#                  create, and a relative path left relative for the nodes
 #  failover        a killed node's replica not running on a survivor within the
 #                  bound, or running on three nodes at once at any poll
 #  rejoin          a node that comes back and starts what moved away
@@ -247,6 +249,19 @@ check 'wait_for 20 "[ \$(count_of \"\$(holders px a b c)\") = 2 ]"' "the proxy d
 out=$(as b cluster remove px 2>&1) && rc=0 || rc=$?
 check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster remove px: exit $rc, output: $out"
 check 'wait_for 20 "[ -z \"\$(holders px a b c)\" ]"' "the proxy still serves after cluster remove"
+
+# ─── a flag with a space in it stays one argument, and a relative path is made absolute ─────
+mkdir -p "$T/my www"
+echo "cluster-page" >"$T/my www/index.html"
+out=$(as a cluster create server sp --listen "unix:$T/sp-{node}.sock" --http "$T/my www" --replicas 2 2>&1) && rc=0 || rc=$?
+check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster create with a space in --http: exit $rc, output: $out"
+check 'wait_for 20 "[ \$(count_of \"\$(holders sp a b c)\") = 2 ]"' "a replica whose --http path has a space in it does not serve on two nodes: [$(holders sp a b c)]"
+out=$(cd "$T" && as b cluster create server rel --listen "unix:$T/rel-{node}.sock" --http "my www" --replicas 2 2>&1) && rc=0 || rc=$?
+check '[ "$rc" = 0 ] && [ -z "$out" ]' "cluster create with a relative --http: exit $rc, output: $out"
+check 'wait_for 20 "[ \$(count_of \"\$(holders rel a b c)\") = 2 ]"' "a replica whose --http path was relative does not serve on two nodes: [$(holders rel a b c)]"
+as c cluster remove sp >/dev/null 2>&1 || true
+as c cluster remove rel >/dev/null 2>&1 || true
+check 'wait_for 20 "[ -z \"\$(holders sp a b c)\" ] && [ -z \"\$(holders rel a b c)\" ]"' "the quoting runtimes still serve after cluster remove"
 
 # ─── failover: kill -9 a node that holds a replica ──────────────────────────
 declare -a TIMES=()

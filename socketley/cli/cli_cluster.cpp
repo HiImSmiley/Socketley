@@ -2,6 +2,7 @@
 #include "ipc_client.h"
 #include "command_hashing.h"
 #include "../shared/cluster_discovery.h"
+#include "../shared/cluster_state.h"
 
 #include <iostream>
 #include <fstream>
@@ -469,9 +470,15 @@ int cluster_raft_verb(int argc, char** argv)
         std::string replicas = "1";
         for (int i = 3; i < argc; ++i)
         {
+            if (argv[i][0] == '\0')
+            {
+                std::cout << "an empty argument cannot be part of a cluster runtime's flags\n";
+                return 1;
+            }
             command += ' ';
-            // The flags that name a file are made absolute here, because the daemon on each node resolves them against its own directory.
-            command += i > 4 ? cli_caller_path(argv[i - 1], argv[i]) : std::string(argv[i]);
+            // A flag that names a file is made absolute here, because the daemon on each node resolves it against its own directory,
+            // and every word travels quoted so a path with a space in it stays one argument all the way to `create`.
+            command += socketley::cluster::quote_arg(i > 4 ? cli_caller_path(argv[i - 1], argv[i]) : std::string(argv[i]));
             if (std::string_view(argv[i - 1]) == "--replicas")
                 replicas = argv[i];
         }

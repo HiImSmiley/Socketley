@@ -9468,8 +9468,8 @@ and the flags
 takes, plus
 .B \-\-replicas
 (default 1). It is a server, a proxy or a client: a cache is refused, because
-nothing promotes a follower when its node dies yet. The flags are stored as
-typed and run as they are on every node that holds a replica, so a file they
+nothing promotes a follower when its node dies yet. The flags are stored as a list of arguments, so a value with a space in it
+stays one argument, and run as they are on every node that holds a replica, so a file they
 name must exist on each node (a relative path is made absolute against the
 caller's directory, as for
 .BR create ),
@@ -9535,7 +9535,10 @@ and stops, starts and removes it with
 .B start
 and
 .BR remove :
-the same code as the CLI, and nothing else spawns a replica. A replica that
+the same code as the CLI, and nothing else spawns a replica. It never waits
+for a worker to come up and runs at most four commands a tick, so a replica
+whose startup hangs, or fifty arriving at once, cannot stall the Raft loop; a
+failure shows as the replica's state on a later tick. A replica that
 fails to start is tried again every three seconds and its reason is logged once
 and shown by
 .BR "cluster placement" .

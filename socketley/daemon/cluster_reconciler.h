@@ -17,7 +17,11 @@ public:
     cluster_reconciler(daemon_handler& handler, runtime_manager& manager, raft_host& raft);
 
     // Once per Raft tick: creates and starts what this node owns and holds a lease for, stops what it cannot confirm, removes what it lost.
+    // It never waits for a worker and does at most a few commands a tick, so the Raft loop keeps its heartbeats however many replicas arrive or hang.
     void tick();
+
+    // The most commands one tick runs; the rest are said to be queued and go on the next tick.
+    static constexpr unsigned per_tick = 4;
 
     struct row
     {
@@ -36,6 +40,8 @@ private:
     void begin(const socketley::cluster::want::item& item);
     void fail(const std::string& name, const std::string& why);
     void note(const std::string& name, const char* state, const std::string& detail = {});
+    bool spend();
+    int  act(const std::vector<std::string>& words, std::string& out, bool cluster_owned);
     std::vector<std::string> local_replicas() const;
 
     daemon_handler&  m_handler;
@@ -43,6 +49,7 @@ private:
     raft_host&       m_raft;
 
     bool m_busy = false;
+    unsigned m_budget = 0;
     std::vector<row> m_rows;
     // The type and flags each running replica was created from, so a spec that changed under it is recreated.
     std::map<std::string, std::string> m_made;

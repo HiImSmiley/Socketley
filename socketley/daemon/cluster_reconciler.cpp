@@ -24,7 +24,10 @@ std::string first_line(const std::string& text)
 
 std::string signature(const cl::want::item& item)
 {
-    return item.type + " " + item.args;
+    std::string s = item.type;
+    for (const std::string& a : item.args)
+        s += '\x1f' + a;
+    return s;
 }
 
 }   // namespace
@@ -44,6 +47,19 @@ std::vector<std::string> cluster_reconciler::local_replicas() const
     return out;
 }
 
+bool cluster_reconciler::spend()
+{
+    if (m_budget == 0)
+        return false;
+    --m_budget;
+    return true;
+}
+
+int cluster_reconciler::act(const std::vector<std::string>& words, std::string& out, bool cluster_owned)
+{
+    return m_handler.run_internal(words, out, cluster_owned);
+}
+
 void cluster_reconciler::note(const std::string& name, const char* state, const std::string& detail)
 {
     m_rows.push_back(row{name, state, detail});
@@ -59,15 +75,17 @@ void cluster_reconciler::fail(const std::string& name, const std::string& why)
     // A half-made runtime is removed, so the next try starts from nothing.
     std::string out;
     if (m_manager.get(name))
-        m_handler.run_internal("remove " + name, out, false);
+        act({"remove", name}, out, false);
     m_made.erase(name);
 }
 
 void cluster_reconciler::begin(const cl::want::item& item)
 {
     std::string out;
-    const std::string line = "create " + item.type + " " + item.name + (item.args.empty() ? "" : " " + item.args) + " -s";
-    if (m_handler.run_internal(line, out, true) != 0)
+    std::vector<std::string> words = {"create", item.type, item.name};
+    words.insert(words.end(), item.args.begin(), item.args.end());
+    words.push_back("-s");
+    if (act(words, out, true) != 0)
         return fail(item.name, first_line(out).empty() ? "the create was refused" : first_line(out));
     m_made[item.name] = signature(item);
     m_error.erase(item.name);
@@ -88,6 +106,8 @@ void cluster_reconciler::reconcile_one(const cl::want::item& item, bool serving)
             return note(item.name, "waiting", "no lease: this node cannot confirm it still owns the replica");
         if (waiting)
             return note(item.name, "failed", m_error[item.name]);
+        if (!spend())
+            return note(item.name, "waiting", "queued: this node is starting other replicas first");
         begin(item);
         if (m_error.count(item.name))
             note(item.name, "failed", m_error[item.name]);
@@ -101,8 +121,9 @@ void cluster_reconciler::reconcile_one(const cl::want::item& item, bool serving)
     {
         if (inst->get_state() == runtime_running)
         {
+            // Not budgeted: a lapsed lease must stop what it fences at once, and a stop returns as soon as the worker is signalled.
             std::string out;
-            m_handler.run_internal("stop " + item.name, out, false);
+            act({"stop", item.name}, out, false);
             LOG_INFO(("cluster: stopped replica " + item.name + ", no lease").c_str());
         }
         return note(item.name, "waiting", "no lease: this node cannot confirm it still owns the replica");
@@ -117,8 +138,10 @@ void cluster_reconciler::reconcile_one(const cl::want::item& item, bool serving)
     // A replica stopped for want of a lease comes back through `start`, and one that failed is made again from nothing.
     if (inst->get_state() == runtime_stopped)
     {
+        if (!spend())
+            return note(item.name, "waiting", "queued: this node is starting other replicas first");
         std::string out;
-        if (m_handler.run_internal("start " + item.name, out, false) == 0)
+        if (act({"start", item.name}, out, false) == 0)
         {
             LOG_INFO(("cluster: restarted replica " + item.name).c_str());
             return note(item.name, "running");
@@ -126,7 +149,7 @@ void cluster_reconciler::reconcile_one(const cl::want::item& item, bool serving)
         fail(item.name, first_line(out).empty() ? "the start was refused" : first_line(out));
         return note(item.name, "failed", m_error[item.name]);
     }
-    fail(item.name, "the runtime is " + std::string(inst->get_state() == runtime_failed ? "failed" : "not running"));
+    fail(item.name, inst->get_state() == runtime_failed ? "the worker did not come up (the daemon log says why)" : "the runtime is not running");
     note(item.name, "failed", m_error[item.name]);
 }
 
@@ -134,7 +157,8 @@ void cluster_reconciler::tick()
 {
     if (m_busy)
         return;
-    m_busy = true;
+    m_busy   = true;
+    m_budget = per_tick;
 
     const cl::want want = m_raft.desired();
     std::map<std::string, const cl::want::item*> owned;
@@ -147,8 +171,11 @@ void cluster_reconciler::tick()
         auto it = owned.find(name);
         if (it != owned.end() && (!m_made.count(name) || m_made[name] == signature(*it->second)))
             continue;
+        // A removal is only budgeted to keep one tick short: the port it frees is what the next replica waits for.
+        if (!spend())
+            continue;
         std::string out;
-        m_handler.run_internal("remove " + name, out, false);
+        act({"remove", name}, out, false);
         m_made.erase(name);
         m_retry_at.erase(name);
         m_error.erase(name);

@@ -15,7 +15,8 @@
 #include <string>
 #include <vector>
 
-// Whole clusters of the real Raft core and the real brain in virtual time, where a node dies, a link is cut in one direction, a message arrives late, and no runtime may ever run on more nodes than it has replicas.
+// Whole clusters of the real Raft core and the real brain in virtual time, where a node dies, a link is cut in one
+// direction, a message arrives late, and no runtime may ever run on more nodes than it has replicas.
 
 namespace raft = socketley::raft;
 namespace cl   = socketley::cluster;
@@ -521,7 +522,7 @@ cl::command declare(const std::string& name, uint32_t replicas)
     cl::command c;
     c.op   = cl::op::create;
     c.name = name;
-    c.sp   = cl::spec{"server", "-p 8080", replicas};
+    c.sp   = cl::spec{"server", {"-p", "8080"}, replicas};
     return c;
 }
 
@@ -626,7 +627,8 @@ TEST_CASE("a leader change alone moves nothing, and stops what the survivors hol
         bounced += bounce;
         CHECK(w.violation().empty());
     }
-    // A leader change takes one to two election timeouts, more after a split vote, and the lease covers three; a lease shorter than an election bounces every kill.
+    // A leader change takes one to two election timeouts, more after a split vote, and the lease covers three; a
+    // lease shorter than an election bounces every kill.
     CHECK(bounced * 5 < runs);
     std::printf("  %llu of %llu leader kills bounced a survivor's replica\n", static_cast<unsigned long long>(bounced),
                 static_cast<unsigned long long>(runs));
@@ -1070,7 +1072,7 @@ TEST_CASE("the placement is planned only by a settled leader that holds a quorum
     cl::command c;
     c.op   = cl::op::create;
     c.name = "api";
-    c.sp   = cl::spec{"server", "", 2};
+    c.sp   = cl::spec{"server", {}, 2};
     b.apply(c);
 
     cl::output out;
@@ -1096,7 +1098,7 @@ TEST_CASE("a node serves exactly the replicas the state gives it, with {node} sp
     cl::command c;
     c.op   = cl::op::create;
     c.name = "api";
-    c.sp   = cl::spec{"server", "--listen unix:/run/{node}.sock", 1};
+    c.sp   = cl::spec{"server", {"--listen", "unix:/run/{node} x.sock"}, 1};
     b.apply(c);
     c.name = "web";
     b.apply(c);
@@ -1111,7 +1113,7 @@ TEST_CASE("a node serves exactly the replicas the state gives it, with {node} sp
     const cl::want w = b.desired(1);
     REQUIRE(w.owned.size() == 1);
     CHECK(w.owned[0].name == "api");
-    CHECK(w.owned[0].args == "--listen unix:/run/edge-1.sock");
+    CHECK(w.owned[0].args == std::vector<std::string>{"--listen", "unix:/run/edge-1 x.sock"});
     CHECK_FALSE(w.serving);
 }
 
