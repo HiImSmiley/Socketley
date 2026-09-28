@@ -2,11 +2,20 @@
 
 #include <linux/bpf.h>
 #include <linux/magic.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <linux/inet_diag.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/vfs.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstddef>
@@ -14,7 +23,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace socketley {
@@ -23,8 +36,47 @@ namespace socketley {
 static constexpr int SKL_SK_PASS = 1;
 // 127.0.0.1 as the context fields hold it.
 static constexpr int32_t LO4 = 0x0100007f;
+static constexpr int32_t SKL_TCP_ESTABLISHED = 1;
 static constexpr int32_t SKL_TCP_LISTEN = 10;
 static constexpr int32_t SKL_TCP_CLOSE = 7;
+
+// The socket key is four network-order fields; a v6 key would be 40 bytes and
+// this is the one place the width is named.
+static constexpr uint32_t SKL_KEY = 16;
+
+// A state value: count is the pair's unread redirected backlog as the program
+// last knew it, mark the count at which it next asks the reconciler for the
+// truth, and ask the count at which the check in flight was asked, which names
+// that check.  A count of SKL_TAINT pins the pair to TCP for its life; a mark
+// of SKL_PENDING says a check is in flight.
+struct state_val
+{
+    uint64_t count;
+    uint64_t mark;
+    uint64_t ask;
+};
+static constexpr uint64_t SKL_TAINT = UINT64_MAX;
+static constexpr uint64_t SKL_PENDING = UINT64_MAX;
+
+// What the program puts in the ring to ask: the socket's key and its ask.
+struct ask_rec
+{
+    uint8_t key[SKL_KEY];
+    uint64_t ask;
+};
+
+// The reconciler's answer, which only the program applies, so it alone ever
+// writes a state value and a taint can never be overwritten: the peer's true
+// backlog, and the ask it answers, so an answer to an earlier check is thrown
+// away rather than applied to a later one.
+struct snap_val
+{
+    uint64_t rmem;
+    uint64_t ask;
+};
+
+// Big enough for thousands of checks in flight at 24 bytes a record.
+static constexpr uint32_t SKL_RING_BYTES = 256u << 10;
 
 bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out)
 {
@@ -33,21 +85,64 @@ bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out)
     return false;
 }
 
+bool parse_fast_lo_limit(std::string_view v, fast_lo_limits& out)
+{
+    const size_t comma = v.find(',');
+    if (comma == std::string_view::npos)
+        return false;
+    auto to_mib = [](std::string_view s, uint64_t& bytes) {
+        if (s.empty())
+            return false;
+        uint64_t mib = 0;
+        for (char c : s)
+        {
+            if (c < '0' || c > '9')
+                return false;
+            mib = mib * 10 + static_cast<uint64_t>(c - '0');
+            if (mib > (1ull << 20))       // a terabyte of MiB is a typo, not a bound
+                return false;
+        }
+        if (mib == 0)
+            return false;
+        bytes = mib << 20;
+        return true;
+    };
+    fast_lo_limits parsed;
+    if (!to_mib(v.substr(0, comma), parsed.pair_bytes) ||
+        !to_mib(v.substr(comma + 1), parsed.global_bytes))
+        return false;
+    if (parsed.global_bytes < parsed.pair_bytes)
+        return false;
+    out = parsed;
+    return true;
+}
+
 static long sys_bpf(int cmd, union bpf_attr* attr)
 {
     return syscall(__NR_bpf, cmd, attr, sizeof(*attr));
 }
 
 static int map_create(uint32_t type, uint32_t key, uint32_t value, uint32_t entries,
-                      const char* name)
+                      const char* name, uint32_t flags = 0)
 {
     union bpf_attr a{};
     a.map_type = type;
     a.key_size = key;
     a.value_size = value;
     a.max_entries = entries;
+    a.map_flags = flags;
     std::strncpy(a.map_name, name, sizeof(a.map_name) - 1);
     return static_cast<int>(sys_bpf(BPF_MAP_CREATE, &a));
+}
+
+static void map_put(int fd, const void* key, const void* value, uint64_t flags)
+{
+    union bpf_attr a{};
+    a.map_fd = static_cast<uint32_t>(fd);
+    a.key = reinterpret_cast<uint64_t>(key);
+    a.value = reinterpret_cast<uint64_t>(value);
+    a.flags = flags;
+    if (sys_bpf(BPF_MAP_UPDATE_ELEM, &a) != 0) {}
 }
 
 // A few instructions and forward labels, enough to write the two programs
@@ -67,10 +162,13 @@ public:
     void mov(uint8_t dst, uint8_t src) { op(BPF_ALU64 | BPF_MOV | BPF_X, dst, src, 0, 0); }
     void movi(uint8_t dst, int32_t imm) { op(BPF_ALU64 | BPF_MOV | BPF_K, dst, 0, 0, imm); }
     void addi(uint8_t dst, int32_t imm) { op(BPF_ALU64 | BPF_ADD | BPF_K, dst, 0, 0, imm); }
+    void add(uint8_t dst, uint8_t src) { op(BPF_ALU64 | BPF_ADD | BPF_X, dst, src, 0, 0); }
+    void sub(uint8_t dst, uint8_t src) { op(BPF_ALU64 | BPF_SUB | BPF_X, dst, src, 0, 0); }
     void rshi(uint8_t dst, int32_t imm) { op(BPF_ALU64 | BPF_RSH | BPF_K, dst, 0, 0, imm); }
     void be32(uint8_t dst) { op(BPF_ALU | BPF_END | BPF_TO_BE, dst, 0, 0, 32); }
     void ldw(uint8_t dst, uint8_t src, size_t off) { op(BPF_LDX | BPF_MEM | BPF_W, dst, src, static_cast<int16_t>(off), 0); }
     void lddw(uint8_t dst, uint8_t src, long off) { op(BPF_LDX | BPF_MEM | BPF_DW, dst, src, static_cast<int16_t>(off), 0); }
+    void stx8(uint8_t dst, int off, uint8_t src) { op(BPF_STX | BPF_MEM | BPF_DW, dst, src, static_cast<int16_t>(off), 0); }
     void stw(int16_t fp_off, uint8_t src) { op(BPF_STX | BPF_MEM | BPF_W, BPF_REG_10, src, fp_off, 0); }
     void stwi(int16_t fp_off, int32_t imm) { op(BPF_ST | BPF_MEM | BPF_W, BPF_REG_10, 0, fp_off, imm); }
     void fp_ptr(uint8_t dst, int16_t fp_off) { mov(dst, BPF_REG_10); addi(dst, fp_off); }
@@ -92,6 +190,9 @@ public:
     void jeqi(uint8_t r, int32_t imm, int l) { fix(l); op(BPF_JMP | BPF_JEQ | BPF_K, r, 0, 0, imm); }
     void jnei(uint8_t r, int32_t imm, int l) { fix(l); op(BPF_JMP | BPF_JNE | BPF_K, r, 0, 0, imm); }
     void jne(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JNE | BPF_X, r, s, 0, 0); }
+    void jeq(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JEQ | BPF_X, r, s, 0, 0); }
+    void jge(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JGE | BPF_X, r, s, 0, 0); }
+    void jgt(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JGT | BPF_X, r, s, 0, 0); }
 
     // Map helpers with the key and value on the stack.
     void lookup(int map, int16_t key)
@@ -129,6 +230,9 @@ private:
     std::vector<std::pair<int, int>> m_fix;
 };
 
+// The last verifier log, kept so a rejected program is debuggable.
+static char g_verifier_log[16384];
+
 static int prog_load(const bpf_asm& a, uint32_t type, const char* name)
 {
     union bpf_attr at{};
@@ -136,6 +240,10 @@ static int prog_load(const bpf_asm& a, uint32_t type, const char* name)
     at.insns = reinterpret_cast<uint64_t>(a.code().data());
     at.insn_cnt = static_cast<uint32_t>(a.code().size());
     at.license = reinterpret_cast<uint64_t>("Apache-2.0");
+    at.log_level = 1;
+    at.log_size = sizeof(g_verifier_log);
+    at.log_buf = reinterpret_cast<uint64_t>(g_verifier_log);
+    g_verifier_log[0] = '\0';
     std::strncpy(at.prog_name, name, sizeof(at.prog_name) - 1);
     return static_cast<int>(sys_bpf(BPF_PROG_LOAD, &at));
 }
@@ -147,20 +255,35 @@ static constexpr int16_t K_SELF = -24;   // this socket's key
 static constexpr int16_t K_PEER = -40;   // the peer's key
 static constexpr int16_t K_VAL  = -44;   // u32 map value
 static constexpr int16_t K_TGID = -48;   // u32 tgid, the pids map's key
+static constexpr int16_t K_INIT = -72;   // state_val, a fresh socket's counter
 
 // The sockops program, which sorts sockets at four moments: a listen or a
-// connect by one of this daemon's processes is remembered, and an established
-// loopback pair to one of its ports enters the sockhash.
-static int load_ops(int socks, int ports, int mine, int taint, int pids, bool all)
+// connect by one of this daemon's processes is remembered, an established
+// loopback pair to one of its ports enters the sockhash with a zeroed backlog
+// counter, and the close of such a socket deletes what it left in the maps.
+static int load_ops(int socks, int ports, int mine, int state, int snap, int pids,
+                    bool all, uint64_t pair_bytes)
 {
     bpf_asm a;
-    const int out = a.label(), listen = a.label(), state = a.label(), connect = a.label();
+    const int out = a.label(), listen = a.label(), st = a.label(), connect = a.label();
     const int active = a.label(), enter = a.label(), not_passive = a.label();
+    const int active_notours = a.label();
 
     // Ours: the calling process is one of this daemon's workers.
     auto ours = [&] {
         a.call(BPF_FUNC_get_current_pid_tgid); a.rshi(BPF_REG_0, 32); a.stw(K_TGID, BPF_REG_0);
         a.lookup(pids, K_TGID); a.jeqi(BPF_REG_0, 0, out);
+    };
+    // Both keys from the four address fields; r8 is the local port and r9 the
+    // remote, and this is the only spelling of the key layout in this program.
+    auto keys = [&] {
+        a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_port)); a.rshi(BPF_REG_9, 16);
+        a.stwi(K_SELF, LO4); a.stwi(K_SELF + 4, LO4); a.stw(K_SELF + 8, BPF_REG_8); a.stw(K_SELF + 12, BPF_REG_9);
+        a.stwi(K_PEER, LO4); a.stwi(K_PEER + 4, LO4); a.stw(K_PEER + 8, BPF_REG_9); a.stw(K_PEER + 12, BPF_REG_8);
+    };
+    auto set_state_cb = [&] {
+        a.mov(BPF_REG_1, BPF_REG_6); a.movi(BPF_REG_2, BPF_SOCK_OPS_STATE_CB_FLAG);
+        a.call(BPF_FUNC_sock_ops_cb_flags_set);
     };
 
     a.mov(BPF_REG_6, BPF_REG_1);
@@ -169,7 +292,7 @@ static int load_ops(int socks, int ports, int mine, int taint, int pids, bool al
     a.be32(BPF_REG_8); a.rshi(BPF_REG_8, 16);
     a.stw(K_PORT, BPF_REG_8);
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_TCP_LISTEN_CB, listen);
-    a.jeqi(BPF_REG_7, BPF_SOCK_OPS_STATE_CB, state);
+    a.jeqi(BPF_REG_7, BPF_SOCK_OPS_STATE_CB, st);
 
     // A child inherits its listener's state callback, which only the listener needs.
     a.jnei(BPF_REG_7, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, not_passive);
@@ -178,9 +301,7 @@ static int load_ops(int socks, int ports, int mine, int taint, int pids, bool al
 
     a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, local_ip4));  a.jnei(BPF_REG_1, LO4, out);
     a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_ip4)); a.jnei(BPF_REG_1, LO4, out);
-    a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_port)); a.rshi(BPF_REG_9, 16);
-    a.stwi(K_SELF, LO4); a.stwi(K_SELF + 4, LO4); a.stw(K_SELF + 8, BPF_REG_8); a.stw(K_SELF + 12, BPF_REG_9);
-    a.stwi(K_PEER, LO4); a.stwi(K_PEER + 4, LO4); a.stw(K_PEER + 8, BPF_REG_9); a.stw(K_PEER + 12, BPF_REG_8);
+    keys();
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_TCP_CONNECT_CB, connect);
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, active);
     a.jnei(BPF_REG_7, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, out);
@@ -197,17 +318,31 @@ static int load_ops(int socks, int ports, int mine, int taint, int pids, bool al
     }
     a.jmp(enter);
 
-    // Active: to a port of ours, and in own mode from a connect of ours.
+    // Active: to a port of ours, and in own mode from a connect of ours; a
+    // connect whose peer is not ours will never see passive, so drop its mark.
     a.bind(active);
     a.stw(K_PORT, BPF_REG_9);
-    a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, out);
+    a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, active_notours);
     if (!all)
     {
         a.lookup(mine, K_SELF); a.jeqi(BPF_REG_0, 0, out);
     }
+    a.jmp(enter);
 
+    a.bind(active_notours);
+    if (!all)
+        a.erase(mine, K_SELF);
+    a.jmp(out);
+
+    // Enter: a zero backlog whose first check falls at the per-pair bound, the
+    // state callback that deletes it on close, and the sockhash.
     a.bind(enter);
-    a.erase(taint, K_SELF);
+    a.movi(BPF_REG_1, 0);
+    a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, count)), BPF_REG_1);
+    a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ask)), BPF_REG_1);
+    a.ld64(BPF_REG_1, pair_bytes); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, mark)), BPF_REG_1);
+    a.update(state, K_SELF, K_INIT, BPF_ANY);
+    set_state_cb();
     a.mov(BPF_REG_1, BPF_REG_6); a.ld_map(BPF_REG_2, socks); a.fp_ptr(BPF_REG_3, K_SELF);
     a.movi(BPF_REG_4, BPF_ANY); a.call(BPF_FUNC_sock_hash_update);
     a.jmp(out);
@@ -225,13 +360,19 @@ static int load_ops(int socks, int ports, int mine, int taint, int pids, bool al
     a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, out);
     a.movi(BPF_REG_1, 1);
     a.op(BPF_STX | BPF_ATOMIC | BPF_W, BPF_REG_0, BPF_REG_1, 0, BPF_ADD);
-    a.mov(BPF_REG_1, BPF_REG_6); a.movi(BPF_REG_2, BPF_SOCK_OPS_STATE_CB_FLAG);
-    a.call(BPF_FUNC_sock_ops_cb_flags_set);
+    set_state_cb();
     a.jmp(out);
 
-    a.bind(state);
-    a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, args[0])); a.jnei(BPF_REG_1, SKL_TCP_LISTEN, out);
+    // State change: on the close of a socket that carried the flag, delete its
+    // counter, any unapplied answer and its connect-mark; a listener's close
+    // also uncounts its port.
+    a.bind(st);
     a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, args[1])); a.jnei(BPF_REG_1, SKL_TCP_CLOSE, out);
+    keys();
+    a.erase(state, K_SELF);
+    a.erase(snap, K_SELF);
+    a.erase(mine, K_SELF);
+    a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, args[0])); a.jnei(BPF_REG_1, SKL_TCP_LISTEN, out);
     a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, out);
     a.movi(BPF_REG_1, -1);
     a.op(BPF_STX | BPF_ATOMIC | BPF_W, BPF_REG_0, BPF_REG_1, 0, BPF_ADD | BPF_FETCH);
@@ -247,28 +388,98 @@ static int load_ops(int socks, int ports, int mine, int taint, int pids, bool al
     return prog_load(a, BPF_PROG_TYPE_SOCK_OPS, "skl_fastlo_ops");
 }
 
-// The sk_msg program: a send goes to the peer's receive queue when the peer is
-// in the sockhash, and a socket that once sent by TCP stays on TCP, so no byte
-// can overtake one still queued the slow way.
-static int load_msg(int socks, int taint)
+// The sk_msg program: a send goes to the peer's receive queue and is counted
+// toward the pair's unread backlog.  Crossing the mark asks the reconciler,
+// through the ring, for the peer's true queue, and the answer is applied on the
+// next send; a reader that keeps up is snapped back long before the hard
+// ceiling (twice the bound), while a stalled one is not and the pair is tainted
+// to TCP for good -- real backpressure, and order kept because tcp_bpf_recvmsg
+// drains the redirect queue before the TCP receive queue.
+static int load_msg(int socks, int state, int snap, int ring, int budget, uint64_t pair_bytes)
 {
     bpf_asm a;
-    const int pass = a.label();
-    constexpr int16_t self = -16, peer = -32, val = -36;
+    const int pass = a.label(), do_redir = a.label(), taint_pass = a.label();
+    const int no_snap = a.label(), stale = a.label(), counted = a.label();
+    const int delta = a.label(), applied = a.label();
+    // The ask record is laid out on the stack as the ring carries it, key first,
+    // so this socket's key is where the record starts.
+    constexpr int16_t rec = -40, peer = -16, k0 = -44, rsave = -56;
+    constexpr int16_t self = rec + static_cast<int16_t>(offsetof(ask_rec, key));
+    constexpr int16_t rec_ask = rec + static_cast<int16_t>(offsetof(ask_rec, ask));
+    const uint64_t hard = pair_bytes * 2;
+
+    // r6 = ctx, r7 = this message's size, r8 = the state value, r9 = its count;
+    // all four are kept across the helper calls.
+    auto keys = [&] {
+        a.ldw(BPF_REG_7, BPF_REG_6, offsetof(struct sk_msg_md, local_ip4));
+        a.ldw(BPF_REG_8, BPF_REG_6, offsetof(struct sk_msg_md, remote_ip4));
+        a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct sk_msg_md, local_port)); a.be32(BPF_REG_9); a.rshi(BPF_REG_9, 16);
+        a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct sk_msg_md, remote_port)); a.rshi(BPF_REG_1, 16);
+        a.stw(self, BPF_REG_7); a.stw(self + 4, BPF_REG_8); a.stw(self + 8, BPF_REG_9); a.stw(self + 12, BPF_REG_1);
+        a.stw(peer, BPF_REG_8); a.stw(peer + 4, BPF_REG_7); a.stw(peer + 8, BPF_REG_1); a.stw(peer + 12, BPF_REG_9);
+    };
 
     a.mov(BPF_REG_6, BPF_REG_1);
-    a.ldw(BPF_REG_7, BPF_REG_6, offsetof(struct sk_msg_md, local_ip4));
-    a.ldw(BPF_REG_8, BPF_REG_6, offsetof(struct sk_msg_md, remote_ip4));
-    a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct sk_msg_md, local_port)); a.be32(BPF_REG_9); a.rshi(BPF_REG_9, 16);
-    a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct sk_msg_md, remote_port)); a.rshi(BPF_REG_1, 16);
-    a.stw(self, BPF_REG_7); a.stw(self + 4, BPF_REG_8); a.stw(self + 8, BPF_REG_9); a.stw(self + 12, BPF_REG_1);
-    a.stw(peer, BPF_REG_8); a.stw(peer + 4, BPF_REG_7); a.stw(peer + 8, BPF_REG_1); a.stw(peer + 12, BPF_REG_9);
+    keys();
+    a.ldw(BPF_REG_7, BPF_REG_6, offsetof(struct sk_msg_md, size));
 
-    a.lookup(taint, self); a.jnei(BPF_REG_0, 0, pass);
+    // A socket with no counter is not on the shortcut; leave it on TCP.
+    a.lookup(state, self); a.jeqi(BPF_REG_0, 0, pass);
+    a.mov(BPF_REG_8, BPF_REG_0);
+    a.lddw(BPF_REG_9, BPF_REG_8, offsetof(state_val, count));
+    a.ld64(BPF_REG_2, SKL_TAINT); a.jeq(BPF_REG_9, BPF_REG_2, pass);
+
+    // A check in flight whose answer has arrived: the count becomes the peer's
+    // true queue plus what was sent since the check was asked.
+    a.lddw(BPF_REG_1, BPF_REG_8, offsetof(state_val, mark));
+    a.ld64(BPF_REG_2, SKL_PENDING); a.jne(BPF_REG_1, BPF_REG_2, no_snap);
+    a.lookup(snap, self); a.jeqi(BPF_REG_0, 0, no_snap);
+    a.lddw(BPF_REG_1, BPF_REG_0, offsetof(snap_val, rmem));
+    a.lddw(BPF_REG_2, BPF_REG_0, offsetof(snap_val, ask));
+    a.lddw(BPF_REG_3, BPF_REG_8, offsetof(state_val, ask));
+    a.jne(BPF_REG_2, BPF_REG_3, stale);
+    a.stx8(BPF_REG_10, rsave, BPF_REG_1);
+    a.jgt(BPF_REG_9, BPF_REG_2, delta);
+    a.mov(BPF_REG_9, BPF_REG_1); a.jmp(applied);
+    a.bind(delta);
+    a.sub(BPF_REG_9, BPF_REG_2); a.add(BPF_REG_9, BPF_REG_1);
+    a.bind(applied);
+    a.stx8(BPF_REG_8, offsetof(state_val, count), BPF_REG_9);
+    a.erase(snap, self);
+    a.mov(BPF_REG_1, BPF_REG_9); a.ld64(BPF_REG_2, pair_bytes / 2); a.add(BPF_REG_1, BPF_REG_2);
+    a.stx8(BPF_REG_8, offsetof(state_val, mark), BPF_REG_1);
+    // The peer really holds the bound or more: a stalled reader.
+    a.lddw(BPF_REG_1, BPF_REG_10, rsave); a.ld64(BPF_REG_2, pair_bytes); a.jge(BPF_REG_1, BPF_REG_2, taint_pass);
+    a.jmp(no_snap);
+    // An answer to an earlier check than the one in flight: drop it and wait.
+    a.bind(stale);
+    a.erase(snap, self);
+    a.bind(no_snap);
+
+    // The global budget is a single flag the reconciler raises.
+    a.stwi(k0, 0); a.lookup(budget, k0); a.jeqi(BPF_REG_0, 0, counted);
+    a.lddw(BPF_REG_2, BPF_REG_0, 0); a.jnei(BPF_REG_2, 0, taint_pass);
+    a.bind(counted);
+
+    a.add(BPF_REG_9, BPF_REG_7); a.stx8(BPF_REG_8, offsetof(state_val, count), BPF_REG_9);
+    a.ld64(BPF_REG_1, hard); a.jge(BPF_REG_9, BPF_REG_1, taint_pass);
+    // Below the mark (a pending mark is above every count): nothing to ask.
+    a.lddw(BPF_REG_1, BPF_REG_8, offsetof(state_val, mark)); a.jgt(BPF_REG_1, BPF_REG_9, do_redir);
+    a.ld64(BPF_REG_1, SKL_PENDING); a.stx8(BPF_REG_8, offsetof(state_val, mark), BPF_REG_1);
+    a.stx8(BPF_REG_8, offsetof(state_val, ask), BPF_REG_9);
+    a.stx8(BPF_REG_10, rec_ask, BPF_REG_9);
+    a.ld_map(BPF_REG_1, ring); a.fp_ptr(BPF_REG_2, rec); a.movi(BPF_REG_3, sizeof(ask_rec));
+    a.movi(BPF_REG_4, 0); a.call(BPF_FUNC_ringbuf_output);
+
+    a.bind(do_redir);
     a.mov(BPF_REG_1, BPF_REG_6); a.ld_map(BPF_REG_2, socks); a.fp_ptr(BPF_REG_3, peer);
     a.movi(BPF_REG_4, BPF_F_INGRESS); a.call(BPF_FUNC_msg_redirect_hash);
     a.jeqi(BPF_REG_0, SKL_SK_PASS, pass);
-    a.stwi(val, 1); a.update(taint, self, val, BPF_ANY);
+
+    // Redirect failed (peer gone) or a bound was crossed: pin to TCP for good.
+    a.bind(taint_pass);
+    a.lookup(state, self); a.jeqi(BPF_REG_0, 0, pass);
+    a.ld64(BPF_REG_1, SKL_TAINT); a.stx8(BPF_REG_0, offsetof(state_val, count), BPF_REG_1);
 
     a.bind(pass);
     a.movi(BPF_REG_0, SKL_SK_PASS);
@@ -313,7 +524,372 @@ static void mark(int pid, bool on)
 void fast_lo_adopt(int pid) { mark(pid, true); }
 void fast_lo_release(int pid) { mark(pid, false); }
 
-bool fast_lo::start(fast_lo_mode mode)
+// ---- the reconciler ---------------------------------------------------------
+//
+// Two threads rather than the io_uring loop, because they block in poll,
+// netlink and map syscalls that must never sit on the daemon's hot path; they
+// touch only the BPF maps, never the data path.  One answers checks and waits
+// on nothing but the ring, so an idle daemon costs it nothing and no slow job
+// delays an answer; the other is the once-a-second safety net.  Every fd they
+// hold is O_CLOEXEC so a worker the daemon forks meanwhile does not inherit it.
+
+namespace {
+
+struct recon_args
+{
+    int state{-1};
+    int snap{-1};
+    int ring{-1};
+    int budget{-1};
+    int stop_fd{-1};
+    uint64_t global_bytes{0};
+};
+
+// The safety net's period: it recomputes the global sum from the pairs that
+// hold anything and re-asks for any check whose ring record was lost.
+static constexpr int SWEEP_MS = 1000;
+// A pair whose count is below this is not looked up by the sweep: the count
+// bounds its unread backlog from above, and an idle pair must cost nothing.
+static constexpr uint64_t SWEEP_FLOOR = 64u << 10;
+
+// One receiver's committed receive memory, which on this kernel includes the
+// redirected ingress backlog (sk_rmem_alloc), by an exact INET_DIAG lookup of
+// its 4-tuple: about a microsecond, where a dump walks the kernel's whole
+// established table and takes milliseconds however few sockets match.  A
+// socket that has gone answers with an error and reads as an empty queue.
+static bool diag_exact(int nl, std::vector<uint8_t>& buf, const uint8_t* key, uint64_t& rmem)
+{
+    struct
+    {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 req;
+    } m{};
+    m.nlh.nlmsg_len = sizeof(m);
+    m.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    m.nlh.nlmsg_flags = NLM_F_REQUEST;
+    m.req.sdiag_family = AF_INET;
+    m.req.sdiag_protocol = IPPROTO_TCP;
+    m.req.idiag_states = ~0u;
+    m.req.idiag_ext = 1u << (INET_DIAG_SKMEMINFO - 1);
+    // The receiver is the key's peer: its local end is the key's remote one.
+    std::memcpy(&m.req.id.idiag_src[0], key + 4, 4);
+    std::memcpy(&m.req.id.idiag_dst[0], key + 0, 4);
+    std::memcpy(&m.req.id.idiag_sport, key + 12, 2);
+    std::memcpy(&m.req.id.idiag_dport, key + 8, 2);
+    m.req.id.idiag_cookie[0] = INET_DIAG_NOCOOKIE;
+    m.req.id.idiag_cookie[1] = INET_DIAG_NOCOOKIE;
+    if (::send(nl, &m, sizeof(m), 0) < 0)
+        return false;
+    const ssize_t got = ::recv(nl, buf.data(), buf.size(), 0);
+    if (got < 0)
+        return false;
+    rmem = 0;
+    auto len = static_cast<unsigned int>(got);
+    const struct nlmsghdr* h = reinterpret_cast<const struct nlmsghdr*>(buf.data());
+    if (!NLMSG_OK(h, len) || h->nlmsg_type != SOCK_DIAG_BY_FAMILY ||
+        h->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg)))
+        return true;
+    const auto* d = reinterpret_cast<const struct inet_diag_msg*>(NLMSG_DATA(h));
+    int rem = static_cast<int>(h->nlmsg_len) - static_cast<int>(NLMSG_LENGTH(sizeof(*d)));
+    const struct nlattr* na = reinterpret_cast<const struct nlattr*>(
+        reinterpret_cast<const uint8_t*>(d) + NLMSG_ALIGN(sizeof(*d)));
+    for (; rem >= static_cast<int>(sizeof(*na)) && na->nla_len >= sizeof(*na) &&
+           static_cast<int>(na->nla_len) <= rem;
+         rem -= NLA_ALIGN(na->nla_len),
+         na = reinterpret_cast<const struct nlattr*>(
+             reinterpret_cast<const uint8_t*>(na) + NLA_ALIGN(na->nla_len)))
+    {
+        if ((na->nla_type & NLA_TYPE_MASK) != INET_DIAG_SKMEMINFO)
+            continue;
+        const uint32_t* sk = reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const uint8_t*>(na) + NLA_HDRLEN);
+        const size_t need = (static_cast<size_t>(SK_MEMINFO_RMEM_ALLOC) + 1) * sizeof(uint32_t);
+        if (static_cast<size_t>(na->nla_len) >= NLA_HDRLEN + need)
+            rmem = sk[SK_MEMINFO_RMEM_ALLOC];
+    }
+    return true;
+}
+
+// The consumer side of a BPF ring buffer, read in place from its mapping.
+class ring_reader
+{
+public:
+    bool open(int fd)
+    {
+        m_page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+        m_cons = ::mmap(nullptr, m_page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m_cons == MAP_FAILED)
+        {
+            m_cons = nullptr;
+            return false;
+        }
+        // The data pages are mapped twice back to back, so a record that wraps
+        // reads as one contiguous span.
+        m_prod = ::mmap(nullptr, m_page + 2 * SKL_RING_BYTES, PROT_READ, MAP_SHARED, fd,
+                        static_cast<off_t>(m_page));
+        if (m_prod == MAP_FAILED)
+        {
+            m_prod = nullptr;
+            return false;
+        }
+        return true;
+    }
+    ~ring_reader()
+    {
+        if (m_cons)
+            ::munmap(m_cons, m_page);
+        if (m_prod)
+            ::munmap(m_prod, m_page + 2 * SKL_RING_BYTES);
+    }
+
+    // Every committed ask record, appended to `asks`.  The producer wakes the
+    // consumer only when it finds it caught up, so a record committed while
+    // this ran sent no wakeup: the producer position is read again after each
+    // pass, until a pass finds nothing new.
+    void drain(std::vector<ask_rec>& asks)
+    {
+        auto* cons_pos = static_cast<unsigned long*>(m_cons);
+        auto* prod_pos = static_cast<unsigned long*>(m_prod);
+        const uint8_t* data = static_cast<const uint8_t*>(m_prod) + m_page;
+        unsigned long c = __atomic_load_n(cons_pos, __ATOMIC_ACQUIRE);
+        bool more = true;
+        while (more)
+        {
+            more = false;
+            // Orders the consumer position just published before this read.
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            const unsigned long p = __atomic_load_n(prod_pos, __ATOMIC_ACQUIRE);
+            while (c < p)
+            {
+                const auto* hdr = reinterpret_cast<const uint32_t*>(data + (c & (SKL_RING_BYTES - 1)));
+                const uint32_t len = __atomic_load_n(hdr, __ATOMIC_ACQUIRE);
+                if (len & BPF_RINGBUF_BUSY_BIT)
+                    return;   // still being written; its commit wakes the consumer
+                const uint32_t body = len & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
+                if (!(len & BPF_RINGBUF_DISCARD_BIT) && body == sizeof(ask_rec))
+                {
+                    ask_rec r;
+                    std::memcpy(&r, reinterpret_cast<const uint8_t*>(hdr) + BPF_RINGBUF_HDR_SZ, sizeof(r));
+                    asks.push_back(r);
+                }
+                c += (body + BPF_RINGBUF_HDR_SZ + 7) & ~7ul;
+                __atomic_store_n(cons_pos, c, __ATOMIC_RELEASE);
+                more = true;
+            }
+        }
+    }
+
+private:
+    size_t m_page{0};
+    void* m_cons{nullptr};
+    void* m_prod{nullptr};
+};
+
+// The held-memory sum across pairs, kept current by both threads, and the
+// over-budget flag the program reads.
+class ledger
+{
+public:
+    explicit ledger(const recon_args& a) : m_a(a) {}
+
+    // One pair's backlog as just measured.
+    void note(const uint8_t* key, uint64_t rm)
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        uint64_t& held = m_held[std::string(reinterpret_cast<const char*>(key), SKL_KEY)];
+        m_sum = m_sum - held + rm;
+        held = rm;
+        publish_locked(m_sum >= m_a.global_bytes ? 1 : 0);
+    }
+
+    // Every pair at once, from a sweep; a sweep that failed raises the flag.
+    void replace(std::unordered_map<std::string, uint64_t>&& held, uint64_t sum, bool failed)
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_held = std::move(held);
+        m_sum = sum;
+        publish_locked(failed || m_sum >= m_a.global_bytes ? 1 : 0);
+    }
+
+private:
+    void publish_locked(uint64_t over)
+    {
+        if (over == m_over)
+            return;
+        uint32_t zero = 0;
+        map_put(m_a.budget, &zero, &over, BPF_ANY);
+        m_over = over;
+    }
+
+    const recon_args m_a;
+    std::mutex m_mu;
+    std::unordered_map<std::string, uint64_t> m_held;
+    uint64_t m_sum{0};
+    uint64_t m_over{UINT64_MAX};   // unknown, so the first publish always writes
+};
+
+// Answers the checks the program asks for.  It never writes the state map, so a
+// taint the program sets cannot be overwritten: it leaves the peer's true queue
+// in the snap map, named by the check's ask, for the program to apply on its
+// next send.
+static void answer_loop(const recon_args& a, ledger& book)
+{
+    const int nl = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    ring_reader ring;
+    if (nl < 0 || !ring.open(a.ring))
+    {
+        if (nl >= 0)
+            ::close(nl);
+        return;   // the sweep still answers, once a second
+    }
+    std::vector<uint8_t> buf(8192);
+    std::vector<ask_rec> asks;
+    struct pollfd pfd[2]{};
+    pfd[0].fd = a.stop_fd;
+    pfd[0].events = POLLIN;
+    pfd[1].fd = a.ring;
+    pfd[1].events = POLLIN;
+    while (true)
+    {
+        if (::poll(pfd, 2, -1) > 0 && (pfd[0].revents & POLLIN))
+            break;
+        asks.clear();
+        ring.drain(asks);
+        for (const ask_rec& r : asks)
+        {
+            uint64_t rm = 0;
+            if (!diag_exact(nl, buf, r.key, rm))
+                continue;   // the sweep re-asks for anything left pending
+            const snap_val ans{rm, r.ask};
+            map_put(a.snap, r.key, &ans, BPF_ANY);
+            book.note(r.key, rm);
+        }
+    }
+    ::close(nl);
+}
+
+// Once a second: the global sum from every pair that holds anything, a tainted
+// pair's frozen queue included, and a fresh answer to any check still pending.
+static void sweep_loop(const recon_args& a, ledger& book)
+{
+    const int nl = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    std::vector<uint8_t> buf(8192);
+    constexpr uint32_t BATCH = 4096;
+    std::vector<uint8_t> keys(static_cast<size_t>(BATCH) * SKL_KEY);
+    std::vector<state_val> vals(BATCH);
+    struct pollfd pfd{};
+    pfd.fd = a.stop_fd;
+    pfd.events = POLLIN;
+    while (::poll(&pfd, 1, SWEEP_MS) == 0)
+    {
+        std::unordered_map<std::string, uint64_t> held;
+        uint64_t sum = 0;
+        bool failed = nl < 0;
+        uint8_t in_batch[SKL_KEY], out_batch[SKL_KEY];
+        bool first = true;
+        while (!failed)
+        {
+            union bpf_attr b{};
+            b.batch.map_fd = static_cast<uint32_t>(a.state);
+            b.batch.keys = reinterpret_cast<uint64_t>(keys.data());
+            b.batch.values = reinterpret_cast<uint64_t>(vals.data());
+            b.batch.count = BATCH;
+            b.batch.out_batch = reinterpret_cast<uint64_t>(out_batch);
+            if (!first)
+                b.batch.in_batch = reinterpret_cast<uint64_t>(in_batch);
+            const long rc = sys_bpf(BPF_MAP_LOOKUP_BATCH, &b);
+            const int err = errno;
+            for (uint32_t i = 0; i < b.batch.count && !failed; ++i)
+            {
+                const uint8_t* key = keys.data() + static_cast<size_t>(i) * SKL_KEY;
+                const state_val& v = vals[i];
+                uint64_t rm = v.count;
+                if (v.count == SKL_TAINT || v.count >= SWEEP_FLOOR)
+                {
+                    if (!diag_exact(nl, buf, key, rm))
+                        failed = true;
+                    else if (v.count != SKL_TAINT && v.mark == SKL_PENDING)
+                    {
+                        const snap_val ans{rm, v.ask};
+                        map_put(a.snap, key, &ans, BPF_ANY);
+                    }
+                }
+                if (rm)
+                {
+                    held[std::string(reinterpret_cast<const char*>(key), SKL_KEY)] = rm;
+                    sum += rm;
+                }
+            }
+            if (rc != 0)
+            {
+                failed = failed || err != ENOENT;   // a partial read under-counts the sum
+                break;
+            }
+            std::memcpy(in_batch, out_batch, SKL_KEY);
+            first = false;
+        }
+        book.replace(std::move(held), sum, failed);
+    }
+    if (nl >= 0)
+        ::close(nl);
+}
+
+static void* recon_main(void* arg)
+{
+    recon_args* a = static_cast<recon_args*>(arg);
+    {
+        ledger book(*a);
+        std::thread sweeper(sweep_loop, std::cref(*a), std::ref(book));
+        answer_loop(*a, book);
+        // The answer loop leaves on the stop signal, which the sweeper sees too;
+        // if the ring could not be opened it leaves at once, so wait for stop.
+        struct pollfd pfd{};
+        pfd.fd = a->stop_fd;
+        pfd.events = POLLIN;
+        while (::poll(&pfd, 1, -1) <= 0) {}
+        sweeper.join();
+    }
+    delete a;
+    return nullptr;
+}
+
+}  // namespace
+
+bool fast_lo::start_reconciler()
+{
+    m_stop_fd = ::eventfd(0, EFD_CLOEXEC);
+    if (m_stop_fd < 0)
+        return false;
+    recon_args* a = new recon_args{m_state, m_snap, m_ring, m_budget, m_stop_fd, m_limits.global_bytes};
+    pthread_t t;
+    if (pthread_create(&t, nullptr, recon_main, a) != 0)
+    {
+        delete a;
+        ::close(m_stop_fd);
+        m_stop_fd = -1;
+        return false;
+    }
+    m_recon = static_cast<unsigned long>(t);
+    return true;
+}
+
+void fast_lo::stop_reconciler()
+{
+    if (m_recon)
+    {
+        const uint64_t one = 1;
+        if (::write(m_stop_fd, &one, sizeof(one)) < 0) {}
+        pthread_join(static_cast<pthread_t>(m_recon), nullptr);
+        m_recon = 0;
+    }
+    if (m_stop_fd >= 0)
+    {
+        ::close(m_stop_fd);
+        m_stop_fd = -1;
+    }
+}
+
+bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
 {
     // Each refusal names the step and keeps its errno for the daemon's log line.
     auto fail = [this](const char* why, int err) {
@@ -326,6 +902,8 @@ bool fast_lo::start(fast_lo_mode mode)
     if (mode == fast_lo_mode::off)
         return fail("off", 0);
 
+    m_limits = limits;
+
     struct statfs sf{};
     if (::statfs("/sys/fs/cgroup", &sf) < 0 || sf.f_type != CGROUP2_SUPER_MAGIC)
         return fail("needs cgroup v2 mounted at /sys/fs/cgroup", 0);
@@ -333,19 +911,27 @@ bool fast_lo::start(fast_lo_mode mode)
     if (!own_cgroup(own_cg))
         return fail("could not read this process's cgroup", 0);
 
-    m_pids  = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "skl_fastlo_pids");
-    m_socks = map_create(BPF_MAP_TYPE_SOCKHASH, 16, sizeof(uint64_t), 65536, "skl_fastlo_socks");
-    m_ports = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "skl_fastlo_ports");
-    m_mine  = map_create(BPF_MAP_TYPE_LRU_HASH, 16, 4, 65536, "skl_fastlo_mine");
-    m_taint = map_create(BPF_MAP_TYPE_LRU_HASH, 16, 4, 65536, "skl_fastlo_taint");
-    if (m_pids < 0 || m_socks < 0 || m_ports < 0 || m_mine < 0 || m_taint < 0)
+    // The per-socket maps are not preallocated and are pruned as sockets
+    // close, so at rest they cost their bucket arrays; the sockhash sizes the
+    // pair ceiling.
+    m_pids   = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "skl_fastlo_pids");
+    m_socks  = map_create(BPF_MAP_TYPE_SOCKHASH, SKL_KEY, sizeof(uint64_t), 65536, "skl_fastlo_socks");
+    m_ports  = map_create(BPF_MAP_TYPE_HASH, 4, 4, 1024, "skl_fastlo_ports");
+    m_mine   = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, 4, 16384, "skl_fastlo_mine", BPF_F_NO_PREALLOC);
+    m_state  = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(state_val), 65536, "skl_fastlo_state", BPF_F_NO_PREALLOC);
+    m_snap   = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(snap_val), 65536, "skl_fastlo_snap", BPF_F_NO_PREALLOC);
+    m_ring   = map_create(BPF_MAP_TYPE_RINGBUF, 0, 0, SKL_RING_BYTES, "skl_fastlo_ring");
+    m_budget = map_create(BPF_MAP_TYPE_ARRAY, 4, sizeof(uint64_t), 1, "skl_fastlo_bdgt");
+    if (m_pids < 0 || m_socks < 0 || m_ports < 0 || m_mine < 0 || m_state < 0 ||
+        m_snap < 0 || m_ring < 0 || m_budget < 0)
         return fail(denied(errno)
             ? "no CAP_BPF (run the daemon as root or setcap cap_bpf,cap_net_admin+ep)"
             : "map creation failed", errno);
 
-    m_ops = load_ops(m_socks, m_ports, m_mine, m_taint, m_pids, mode == fast_lo_mode::all);
+    m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids,
+                     mode == fast_lo_mode::all, m_limits.pair_bytes);
     if (m_ops >= 0)
-        m_msg = load_msg(m_socks, m_taint);
+        m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_limits.pair_bytes);
     if (m_ops < 0 || m_msg < 0)
         return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
                                   : "programs could not be loaded", errno);
@@ -375,6 +961,9 @@ bool fast_lo::start(fast_lo_mode mode)
                                        : "attach of the sockops program to the cgroup failed",
                     link_errno);
 
+    if (!start_reconciler())
+        return fail("could not start the backlog reconciler", errno);
+
     g_pids = m_pids;
     m_reason = "ok";
     return true;
@@ -382,10 +971,13 @@ bool fast_lo::start(fast_lo_mode mode)
 
 fast_lo::~fast_lo()
 {
+    // Join the reconciler before the maps it reads and writes are closed.
+    stop_reconciler();
     // Everything is anonymous, so the last close detaches and frees it.
     if (g_pids == m_pids)
         g_pids = -1;
-    for (int fd : { m_link, m_ops, m_msg, m_pids, m_socks, m_ports, m_mine, m_taint })
+    for (int fd : { m_link, m_ops, m_msg, m_pids, m_socks, m_ports, m_mine, m_state, m_snap,
+                    m_ring, m_budget })
         if (fd >= 0)
             ::close(fd);
 }
@@ -424,3 +1016,34 @@ bool fast_lo_covers(int fd)
 }
 
 }  // namespace socketley
+
+#ifdef SKL_FASTLO_SELFTEST
+// A standalone check that both hand-assembled programs pass the kernel verifier
+// on this box, so a rejection is caught in seconds, not a daemon build.  Build:
+//   g++ -std=c++2b -DSKL_FASTLO_SELFTEST socketley/shared/fast_lo.cpp -o /tmp/skl_selftest
+#include <cstdio>
+int main()
+{
+    using namespace socketley;
+    const int socks = map_create(BPF_MAP_TYPE_SOCKHASH, SKL_KEY, 8, 4096, "socks");
+    const int ports = map_create(BPF_MAP_TYPE_HASH, 4, 4, 1024, "ports");
+    const int pids = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "pids");
+    const int mine = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, 4, 4096, "mine", BPF_F_NO_PREALLOC);
+    const int state = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(state_val), 4096, "state", BPF_F_NO_PREALLOC);
+    const int snap = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(snap_val), 4096, "snap", BPF_F_NO_PREALLOC);
+    const int ring = map_create(BPF_MAP_TYPE_RINGBUF, 0, 0, SKL_RING_BYTES, "ring");
+    const int budget = map_create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "budget");
+    std::printf("maps socks=%d ports=%d pids=%d mine=%d state=%d snap=%d ring=%d budget=%d\n",
+                socks, ports, pids, mine, state, snap, ring, budget);
+    for (bool all : { false, true })
+    {
+        const int ops = load_ops(socks, ports, mine, state, snap, pids, all, 4ull << 20);
+        std::printf("load_ops(all=%d) = %d errno=%d\n", all, ops, errno);
+        if (ops < 0) std::printf("%s\n", g_verifier_log);
+    }
+    const int msg = load_msg(socks, state, snap, ring, budget, 4ull << 20);
+    std::printf("load_msg = %d errno=%d\n", msg, errno);
+    if (msg < 0) std::printf("%s\n", g_verifier_log);
+    return 0;
+}
+#endif

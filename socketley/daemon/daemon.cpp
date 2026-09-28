@@ -517,7 +517,8 @@ static void restore_runtimes(state_persistence& persistence,
 // ignored.
 static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                                bool& saw_cpus, raft_host_config& raft,
-                               socketley::fast_lo_mode& lo_mode)
+                               socketley::fast_lo_mode& lo_mode,
+                               socketley::fast_lo_limits& lo_limits)
 {
     // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
     // no arguments decides nothing and leaves the environment in charge.
@@ -564,6 +565,18 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                     std::cout << "invalid --fast-lo value: " << argv[i] << "\n"
                               << "  own: between this daemon's runtimes; all: also local "
                                  "clients of other processes\n";
+                    return false;
+                }
+                break;
+
+            // The two memory bounds a redirected backlog is held under, so the
+            // shortcut cannot put the host's TCP memory under pressure.
+            case fnv1a("--fast-lo-limit"):
+                if (i + 1 >= argc ||
+                    !socketley::parse_fast_lo_limit(argv[++i], lo_limits))
+                {
+                    std::cout << "--fast-lo-limit takes <per-pair-MiB>,<global-MiB>, "
+                                 "two positive integers with global >= per-pair\n";
                     return false;
                 }
                 break;
@@ -627,7 +640,8 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     bool saw_cpus = false;
     raft_host_config raft_cfg;
     socketley::fast_lo_mode lo_mode = socketley::fast_lo_mode::off;
-    if (!parse_daemon_flags(argc, argv, loop, saw_cpus, raft_cfg, lo_mode))
+    socketley::fast_lo_limits lo_limits;
+    if (!parse_daemon_flags(argc, argv, loop, saw_cpus, raft_cfg, lo_mode, lo_limits))
         return 1;
     if (const std::string why = raft_config_refusal(raft_cfg); !why.empty())
     {
@@ -722,7 +736,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     ::unsetenv(socketley::fast_lo_env);
     if (lo_mode != socketley::fast_lo_mode::off)
     {
-        if (lo_shortcut.start(lo_mode))
+        if (lo_shortcut.start(lo_mode, lo_limits))
             ::setenv(socketley::fast_lo_env,
                      lo_mode == socketley::fast_lo_mode::all ? "all" : "own", 1);
         else

@@ -155,16 +155,19 @@ cli_commands() {
     echo -e "  ${CYAN}./bin/Release/socketley daemon &${NC}  # dev mode"
     echo -e "  ${CYAN}./bin/Release/socketley daemon --cpus 0-3 &${NC}"
     echo ""
-    echo -e "${BOLD}daemon --fast-lo [own|all]${NC}"
+    echo -e "${BOLD}daemon --fast-lo [own|all] [--fast-lo-limit P,G]${NC}"
     echo "  Put TCP pairs with both ends on 127.0.0.1 on a kernel shortcut: a"
     echo "  send lands straight in the peer's receive queue, skipping TCP/IP."
     echo "  all (default): any local client of a runtime's port; own: only this"
     echo "  daemon's runtimes among themselves. Cache GET ~2.5x, 45% less CPU."
-    echo "  Needs CAP_BPF and CAP_NET_ADMIN; without them it logs"
-    echo "  and serves as usual. No backpressure: a peer that stops reading lets"
-    echo "  the sender fill the kernel's TCP memory. Bypasses nftables on lo and"
-    echo "  tcpdump. Use it where readers keep up."
-    echo -e "  ${CYAN}sudo socketley daemon --fast-lo &${NC}"
+    echo "  Needs CAP_BPF and CAP_NET_ADMIN; without them it logs and serves as"
+    echo "  usual. The redirected backlog is bounded: a pair whose reader really"
+    echo "  holds the per-pair bound (--fast-lo-limit P,G in MiB, default 4,64)"
+    echo "  is tainted to TCP for real backpressure, a reader that keeps up never"
+    echo "  is, and the sum across pairs is capped at the global budget; the"
+    echo "  taint is permanent, which keeps bytes in order. Bypasses nftables on"
+    echo "  lo and tcpdump."
+    echo -e "  ${CYAN}sudo socketley daemon --fast-lo --fast-lo-limit 4,64 &${NC}"
     echo ""
     echo -e "${BOLD}daemon --raft-listen <ip:port> (--raft-init | --raft-join <ip:port>) [...]${NC}"
     echo "  Experimental, opt-in: run a Raft node on this daemon. Mutual TLS"
@@ -2932,7 +2935,7 @@ socketley — a daemon for long-living network runtimes (server, client, proxy, 
 
 USAGE
   socketley <command> [options]
-  socketley daemon [--cpus <set>] [--fast-lo [own|all]] [--name <name>]
+  socketley daemon [--cpus <set>] [--fast-lo [own|all]] [--fast-lo-limit P,G] [--name <name>]
   socketley --lua <file>
 
 RUNTIMES

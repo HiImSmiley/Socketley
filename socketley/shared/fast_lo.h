@@ -3,6 +3,7 @@
 // the loopback device and its softirq.
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 namespace socketley {
@@ -11,8 +12,21 @@ namespace socketley {
 // all: also a local client of any process connecting to a runtime's port.
 enum class fast_lo_mode { off, own, all };
 
+// The two memory bounds, in bytes, that keep a redirected backlog from growing
+// without limit: a per-pair ceiling on the unread backlog and a global budget
+// across every pair.
+struct fast_lo_limits
+{
+    uint64_t pair_bytes{4ull << 20};
+    uint64_t global_bytes{64ull << 20};
+};
+
 // Parses the value of `daemon --fast-lo`; false on anything but own or all.
 bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out);
+
+// Parses `--fast-lo-limit <pair-MiB>,<global-MiB>` into bytes; false on a value
+// that is not two positive integers with the global at least the per-pair one.
+bool parse_fast_lo_limit(std::string_view v, fast_lo_limits& out);
 
 // Loads the maps and the two programs and attaches them for as long as this
 // object lives; the daemon holds it, and closing it detaches everything.
@@ -25,20 +39,29 @@ public:
     fast_lo& operator=(const fast_lo&) = delete;
 
     // True when the shortcut is attached; false with reason() set when not.
-    bool start(fast_lo_mode mode);
+    bool start(fast_lo_mode mode, fast_lo_limits limits = {});
     const char* reason() const { return m_reason; }
     // The errno of the step that failed, 0 when none did.
     int error() const { return m_errno; }
 
 private:
+    bool start_reconciler();
+    void stop_reconciler();
+
     int m_pids{-1};
     int m_socks{-1};
     int m_ports{-1};
     int m_mine{-1};
-    int m_taint{-1};
+    int m_state{-1};
+    int m_snap{-1};
+    int m_ring{-1};
+    int m_budget{-1};
     int m_ops{-1};
     int m_msg{-1};
     int m_link{-1};
+    int m_stop_fd{-1};          // eventfd the reconciler waits on, wakes it to exit
+    unsigned long m_recon{0};   // pthread_t of the reconciler, 0 when none runs
+    fast_lo_limits m_limits;
     const char* m_reason{"not started"};
     int m_errno{0};
 };

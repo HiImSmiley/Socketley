@@ -16,6 +16,8 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .IR set ]
 .RB [ \-\-fast\-lo
 .RB [ own | all ]]
+.RB [ \-\-fast\-lo\-limit
+.IR P , G ]
 .br
 .B socketley
 .B daemon
@@ -269,18 +271,37 @@ when the daemon exits.
 What it costs:
 .RS
 .IP \(bu 2
-No backpressure. A redirected send never waits for the receiver, so a peer that
-stops reading lets the sender push until the kernel's global TCP memory
+The redirected backlog is bounded, by
+.BR "daemon \-\-fast\-lo\-limit " "\fIper\-pair\-MiB\fR,\fIglobal\-MiB\fR (default 4,64)."
+A redirected send does not wait for the receiver, so the program counts each
+pair's sends and, each time the count passes a mark, asks a reconciler thread
+through a BPF ring buffer for the peer's true queue, which the thread reads
+with one exact
+.B sock_diag
+lookup and hands back within tens of microseconds. A reader that keeps up is
+snapped back and its pair stays on the shortcut however much it moves; a pair
+whose peer really holds the per-pair bound, or whose count reaches twice it
+unanswered, is tainted to TCP \(em which then gives the ordinary
+.B EAGAIN
+backpressure. A flag taints new sends once the sum across pairs reaches the
+global budget; a sweep once a second recomputes that sum and re-asks any check
+whose answer was lost, and an idle pair costs nothing. Without the bound a peer
+that stopped reading took 731 MiB before the kernel's global TCP memory
 .RB ( tcp_mem )
-is exhausted \(em measured, 731 MiB accepted into a receiver that read nothing,
-where TCP stops at 2.5 MiB \(em and the sender then gets
-.B ENOMEM
-rather than
-.BR EAGAIN .
-By then every TCP socket on the host is under memory pressure. Use it where the
-readers keep up: a client that pipelines without reading its replies, a slow
-pub/sub subscriber or a proxy holding back a backend for a slow client can each
-fill that memory.
+ran out; with the default it stays near 4 MiB per pair.
+.IP \(bu 2
+The taint is permanent for the pair's life. This is what keeps bytes in order,
+since
+.B tcp_bpf_recvmsg
+drains the redirect queue before the TCP receive queue, so a byte sent by TCP
+after the taint is still read after the ones already redirected.
+.IP \(bu 2
+Two edges the bound does not catch tightly: a pair moving gigabytes a second
+whose answer is held up for more than about a millisecond (the reconciler
+starved of CPU) reaches the hard ceiling and is tainted, which costs speed and
+not bytes; and many pairs stalling in the same instant can each hold their
+per-pair bound before the global flag is raised, which then holds the sum
+there.
 .IP \(bu 2
 Shortcut bytes skip netfilter, conntrack and the loopback device: nftables rules
 on

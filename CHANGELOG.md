@@ -47,17 +47,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   detached when the daemon exits. Measured with redis-benchmark (50
   connections, 4 threads, 3 alternating passes) against a cache: GET 210-285K
   -> 592-695K requests/s, SET 267-276K -> 500-667K, GET pipelined 16 3.4-3.6M
-  -> 6.4-7.1M, with 45% less system CPU per request unpipelined. It has **no
-  backpressure**: a redirected send never waits for the receiver, so a peer
-  that stops reading lets the sender push until the kernel's global TCP memory
-  is exhausted (measured: 731 MiB accepted into a receiver that read nothing,
-  where TCP stops at 2.5 MiB), and the sender then gets ENOMEM. It also skips
-  netfilter, conntrack and the loopback device, so nftables rules on `lo` and
-  `tcpdump -i lo` do not see those bytes. A socket that sent a byte by TCP
-  stays on TCP for its lifetime, so order is kept when one end enters late.
-  The proxy's splice path reads a queue a socket on the shortcut does not
-  fill, so a proxied pair with a 127.0.0.1 leg stays on the copy path while
-  `--fast-lo` is on.
+  -> 6.4-7.1M, with 45% less system CPU per request unpipelined. The
+  redirected backlog is **bounded**, by `--fast-lo-limit <per-pair-MiB>,`
+  `<global-MiB>` (default 4,64): the `sk_msg` program counts each pair's sends
+  in a BPF map and, each time the count passes a mark, asks a reconciler
+  thread through a BPF ring buffer for the peer's true queue, which the thread
+  reads with one exact `sock_diag` lookup (`INET_DIAG_SKMEMINFO`, which counts
+  the psock ingress backlog on this kernel) and hands back in tens of
+  microseconds. A reader that keeps up is snapped back, so a pair moving 3 GB/s
+  stays on the shortcut; a pair whose peer really holds the per-pair bound, or
+  whose count reaches twice it unanswered, is tainted to TCP -- which then
+  gives the ordinary `EAGAIN` backpressure -- and a flag taints new sends once
+  the sum across pairs reaches the global budget. A sweep once a second
+  recomputes the sum and re-asks any check whose answer was lost; an idle pair
+  costs nothing. Without a bound a receiver that read nothing took 731 MiB
+  before the kernel's global TCP memory ran out; with the default it stays near
+  4 MiB per pair (measured 4.2-4.4 MiB). The taint is permanent for the pair,
+  which is what keeps bytes in order: `tcp_bpf_recvmsg` drains the redirect
+  queue before the TCP receive queue. Two edges stay coarse: a pair moving
+  gigabytes a second whose answer is held up for more than about a
+  millisecond (the reconciler starved of CPU) reaches the hard ceiling and is
+  tainted, which costs speed and not bytes, and many pairs stalling in the same
+  instant can each hold their per-pair bound before the global flag is raised.
+  It also skips netfilter, conntrack
+  and the loopback device, so nftables rules on `lo` and `tcpdump -i lo` do not
+  see those bytes. The proxy's splice path reads a queue a socket on the
+  shortcut does not fill, so a proxied pair with a 127.0.0.1 leg stays on the
+  copy path while `--fast-lo` is on. The per-socket state is a
+  non-preallocated hash pruned when a socket closes and the taint LRUs are
+  gone, so the maps cost 3.9 MiB at rest rather than 12.6.
 
 ### Changed
 
