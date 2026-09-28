@@ -156,6 +156,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connections, HAProxy with splicing -- never sees those bytes; under `all`
   that now includes a local backend a runtime connects to, so such a setup
   wants `own`.
+- **`--fast-lo` takes ::1 pairs**, keeping 127.0.0.1 and 127.0.0.1
+  IPv4-mapped on a dual-stack socket. The whole address is checked on entry,
+  after which its last 32 bits are all that tell 127.0.0.1 from ::1, so the
+  key stays 16 bytes and GET -P1 against a cache stays within noise of the
+  IPv4-only build (533-606K against 519-615K requests/s). Runtimes listen and
+  proxy and client runtimes connect over IPv4, so a ::1 pair here is a Lua
+  `socketley.http()` to a local service on ::1 (`redis-benchmark -h ::1`
+  against a cache is refused: its listener is IPv4). Both ends entered, 3
+  alternating passes, round trips per second off / on: 64 B one connection
+  93-96K / 123-125K, eight 363-406K / 469-529K; 16 KB one 71-73K / 84-86K,
+  eight 253-278K / 326-340K (127.0.0.1 alongside: 80-93K / 125-128K,
+  378-387K / 524-532K, 62-69K / 85-86K, 279-282K / 386-391K). A Lua call
+  that opens a connection per request gains nothing (14.9K / 14.4K calls/s at
+  64 B): entering and leaving the sockhash costs what the request saves.
 
 ### Changed
 

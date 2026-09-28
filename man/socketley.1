@@ -233,7 +233,7 @@ runtimes, and creating one took the same fourteen milliseconds at five as at
 fifty, so neither of those is the thing to watch.
 .TP
 .BR "daemon \-\-fast\-lo " [ own | all ]
-Put TCP pairs whose both ends are 127.0.0.1 on a kernel shortcut. A BPF
+Put TCP pairs whose both ends are 127.0.0.1 or ::1 on a kernel shortcut. A BPF
 .B sockops
 program enters both sockets in a sockhash when the connection is established,
 and an
@@ -323,8 +323,16 @@ and the byte counters in
 .B ss
 do not see them.
 .IP \(bu 2
-IPv4 127.0.0.1 only, including IPv4\-mapped addresses on a dual\-stack socket;
-::1 and the rest of 127/8 stay on TCP.
+127.0.0.1 and ::1, including 127.0.0.1 IPv4\-mapped on a dual\-stack socket;
+the rest of 127/8 stays on TCP. A runtime listens and a proxy or client runtime
+connects over IPv4, so a ::1 pair here is a Lua
+.B socketley.http()
+call to a local service on ::1, or to a name that resolves there first. With
+both ends entered a ::1 pair gains about what a 127.0.0.1 pair does (64 B round
+trips 1.3x against 1.4x, 16 KB 1.2x against 1.3x); a call that opens a
+connection per request gains
+nothing, since entering and leaving the sockhash costs about what the request
+saves (\-3% at 64 B).
 .IP \(bu 2
 A pair enters only when both ends are in the map before its first byte, and a
 socket that sent a byte by TCP stays on TCP for its lifetime, so no byte

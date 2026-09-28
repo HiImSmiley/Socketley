@@ -36,13 +36,22 @@ namespace socketley {
 static constexpr int SKL_SK_PASS = 1;
 // 127.0.0.1 as the context fields hold it.
 static constexpr int32_t LO4 = 0x0100007f;
+// The last two words of ::1 and of an IPv4-mapped address, as loaded from memory.
+static constexpr int32_t LO6_W3 = 0x01000000;
+static constexpr int32_t MAPPED_W2 = static_cast<int32_t>(0xffff0000u);
 static constexpr int32_t SKL_TCP_ESTABLISHED = 1;
 static constexpr int32_t SKL_TCP_LISTEN = 10;
 static constexpr int32_t SKL_TCP_CLOSE = 7;
 
-// The socket key is four network-order fields; a v6 key would be 40 bytes and
-// this is the one place the width is named.
+// The socket key is {local address, remote address, local port, remote port},
+// four u32s, ports in network order in the low half; an address is its last 32
+// bits, which is all that tells 127.0.0.1 (LO4, plain or IPv4-mapped) from ::1
+// (LO6_W3) once the whole address was checked on entry, and this is the one
+// place the width is named.
 static constexpr uint32_t SKL_KEY = 16;
+static constexpr int16_t KEY_REMOTE = 4;
+static constexpr int16_t KEY_LPORT = 8;
+static constexpr int16_t KEY_RPORT = 12;
 
 // A state value: count is the pair's unread redirected backlog as the program
 // last knew it, mark the count at which it next asks the reconciler for the
@@ -75,7 +84,7 @@ struct snap_val
     uint64_t ask;
 };
 
-// Big enough for thousands of checks in flight at 24 bytes a record.
+// Big enough for thousands of checks in flight at 32 bytes a record.
 static constexpr uint32_t SKL_RING_BYTES = 256u << 10;
 
 bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out)
@@ -189,6 +198,8 @@ public:
     void jmp(int l) { fix(l); op(BPF_JMP | BPF_JA, 0, 0, 0, 0); }
     void jeqi(uint8_t r, int32_t imm, int l) { fix(l); op(BPF_JMP | BPF_JEQ | BPF_K, r, 0, 0, imm); }
     void jnei(uint8_t r, int32_t imm, int l) { fix(l); op(BPF_JMP | BPF_JNE | BPF_K, r, 0, 0, imm); }
+    // A 32-bit compare, for an immediate with its top bit set.
+    void jnei32(uint8_t r, int32_t imm, int l) { fix(l); op(BPF_JMP32 | BPF_JNE | BPF_K, r, 0, 0, imm); }
     void jne(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JNE | BPF_X, r, s, 0, 0); }
     void jeq(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JEQ | BPF_X, r, s, 0, 0); }
     void jge(uint8_t r, uint8_t s, int l) { fix(l); op(BPF_JMP | BPF_JGE | BPF_X, r, s, 0, 0); }
@@ -256,8 +267,8 @@ static int prog_load(const bpf_asm& a, uint32_t type, const char* name)
     }
 }
 
-// A socket's key is {local ip, remote ip, local port, remote port}, ports in
-// network order in the low half; the peer's key is the same four swapped.
+// The peer's key is this socket's with the addresses swapped and the ports
+// swapped.
 static constexpr int16_t K_PORT = -4;    // u32 port, the ports map's key
 static constexpr int16_t K_SELF = -24;   // this socket's key
 static constexpr int16_t K_PEER = -40;   // the peer's key
@@ -283,12 +294,51 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
         a.call(BPF_FUNC_get_current_pid_tgid); a.rshi(BPF_REG_0, 32); a.stw(K_TGID, BPF_REG_0);
         a.lookup(pids, K_TGID); a.jeqi(BPF_REG_0, 0, out);
     };
-    // Both keys from the four address fields; r8 is the local port and r9 the
+    // Both keys from the addresses' last words, an AF_INET socket's IPv4
+    // field being an IPv4-mapped address's; r8 is the local port and r9 the
     // remote, and this is the only spelling of the key layout in this program.
     auto keys = [&] {
+        const int v4 = a.label(), store = a.label();
         a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_port)); a.rshi(BPF_REG_9, 16);
-        a.stwi(K_SELF, LO4); a.stwi(K_SELF + 4, LO4); a.stw(K_SELF + 8, BPF_REG_8); a.stw(K_SELF + 12, BPF_REG_9);
-        a.stwi(K_PEER, LO4); a.stwi(K_PEER + 4, LO4); a.stw(K_PEER + 8, BPF_REG_9); a.stw(K_PEER + 12, BPF_REG_8);
+        a.ldw(BPF_REG_3, BPF_REG_6, offsetof(struct bpf_sock_ops, family));
+        a.jeqi(BPF_REG_3, AF_INET, v4);
+        a.jnei(BPF_REG_3, AF_INET6, out);
+        a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, local_ip6[3]));
+        a.ldw(BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_ip6[3]));
+        a.jmp(store);
+        a.bind(v4);
+        a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, local_ip4));
+        a.ldw(BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_ip4));
+        a.bind(store);
+        a.stw(K_SELF, BPF_REG_1); a.stw(K_SELF + KEY_REMOTE, BPF_REG_2);
+        a.stw(K_SELF + KEY_LPORT, BPF_REG_8); a.stw(K_SELF + KEY_RPORT, BPF_REG_9);
+        a.stw(K_PEER, BPF_REG_2); a.stw(K_PEER + KEY_REMOTE, BPF_REG_1);
+        a.stw(K_PEER + KEY_LPORT, BPF_REG_9); a.stw(K_PEER + KEY_RPORT, BPF_REG_8);
+    };
+    // Both whole addresses are 127.0.0.1 (plain or IPv4-mapped) or ::1, else out.
+    auto loopback = [&] {
+        const int v4 = a.label(), done = a.label();
+        a.ldw(BPF_REG_3, BPF_REG_6, offsetof(struct bpf_sock_ops, family));
+        a.jeqi(BPF_REG_3, AF_INET, v4);
+        for (size_t base : { offsetof(struct bpf_sock_ops, local_ip6),
+                             offsetof(struct bpf_sock_ops, remote_ip6) })
+        {
+            const int mapped = a.label(), ok = a.label();
+            a.ldw(BPF_REG_1, BPF_REG_6, base); a.jnei(BPF_REG_1, 0, out);
+            a.ldw(BPF_REG_1, BPF_REG_6, base + 4); a.jnei(BPF_REG_1, 0, out);
+            a.ldw(BPF_REG_1, BPF_REG_6, base + 8); a.ldw(BPF_REG_2, BPF_REG_6, base + 12);
+            a.jnei(BPF_REG_1, 0, mapped);
+            a.jeqi(BPF_REG_2, LO6_W3, ok);
+            a.jmp(out);
+            a.bind(mapped);
+            a.jnei32(BPF_REG_1, MAPPED_W2, out); a.jnei(BPF_REG_2, LO4, out);
+            a.bind(ok);
+        }
+        a.jmp(done);
+        a.bind(v4);
+        a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, local_ip4)); a.jnei(BPF_REG_1, LO4, out);
+        a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_ip4)); a.jnei(BPF_REG_1, LO4, out);
+        a.bind(done);
     };
     auto set_state_cb = [&] {
         a.mov(BPF_REG_1, BPF_REG_6); a.movi(BPF_REG_2, BPF_SOCK_OPS_STATE_CB_FLAG);
@@ -308,12 +358,17 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.mov(BPF_REG_1, BPF_REG_6); a.movi(BPF_REG_2, 0); a.call(BPF_FUNC_sock_ops_cb_flags_set);
     a.bind(not_passive);
 
-    a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, local_ip4));  a.jnei(BPF_REG_1, LO4, out);
-    a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, remote_ip4)); a.jnei(BPF_REG_1, LO4, out);
+    // Only the three moments below build keys, since every TCP socket under
+    // the cgroup passes through here at its other callbacks too.
+    const int sorted = a.label();
+    a.jeqi(BPF_REG_7, BPF_SOCK_OPS_TCP_CONNECT_CB, sorted);
+    a.jeqi(BPF_REG_7, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, sorted);
+    a.jnei(BPF_REG_7, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, out);
+    a.bind(sorted);
     keys();
+    loopback();
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_TCP_CONNECT_CB, connect);
     a.jeqi(BPF_REG_7, BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, active);
-    a.jnei(BPF_REG_7, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, out);
 
     // Passive: a listener of ours, and nothing received yet -- bytes that came
     // by TCP before the shortcut would be read after the ones that come by it.
@@ -440,13 +495,24 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, uint64
 
     // r6 = ctx, r7 = this message's size, r8 = the state value, r9 = its count;
     // all four are kept across the helper calls.
+    // The key as the sockops program builds it: the addresses' last words.
     auto keys = [&] {
+        const int v4 = a.label(), store = a.label();
+        a.ldw(BPF_REG_2, BPF_REG_6, offsetof(struct sk_msg_md, family));
+        a.jeqi(BPF_REG_2, AF_INET, v4);
+        a.ldw(BPF_REG_7, BPF_REG_6, offsetof(struct sk_msg_md, local_ip6[3]));
+        a.ldw(BPF_REG_8, BPF_REG_6, offsetof(struct sk_msg_md, remote_ip6[3]));
+        a.jmp(store);
+        a.bind(v4);
         a.ldw(BPF_REG_7, BPF_REG_6, offsetof(struct sk_msg_md, local_ip4));
         a.ldw(BPF_REG_8, BPF_REG_6, offsetof(struct sk_msg_md, remote_ip4));
+        a.bind(store);
         a.ldw(BPF_REG_9, BPF_REG_6, offsetof(struct sk_msg_md, local_port)); a.be32(BPF_REG_9); a.rshi(BPF_REG_9, 16);
         a.ldw(BPF_REG_1, BPF_REG_6, offsetof(struct sk_msg_md, remote_port)); a.rshi(BPF_REG_1, 16);
-        a.stw(self, BPF_REG_7); a.stw(self + 4, BPF_REG_8); a.stw(self + 8, BPF_REG_9); a.stw(self + 12, BPF_REG_1);
-        a.stw(peer, BPF_REG_8); a.stw(peer + 4, BPF_REG_7); a.stw(peer + 8, BPF_REG_1); a.stw(peer + 12, BPF_REG_9);
+        a.stw(self, BPF_REG_7); a.stw(self + KEY_REMOTE, BPF_REG_8);
+        a.stw(self + KEY_LPORT, BPF_REG_9); a.stw(self + KEY_RPORT, BPF_REG_1);
+        a.stw(peer, BPF_REG_8); a.stw(peer + KEY_REMOTE, BPF_REG_7);
+        a.stw(peer + KEY_LPORT, BPF_REG_1); a.stw(peer + KEY_RPORT, BPF_REG_9);
     };
 
     a.mov(BPF_REG_6, BPF_REG_1);
@@ -597,15 +663,22 @@ static bool diag_exact(int nl, std::vector<uint8_t>& buf, const uint8_t* key, ui
     m.nlh.nlmsg_len = sizeof(m);
     m.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
     m.nlh.nlmsg_flags = NLM_F_REQUEST;
-    m.req.sdiag_family = AF_INET;
+    // AF_INET6 for every key, since the kernel looks an IPv4-mapped pair up in
+    // the IPv4 table, where an AF_INET socket and a dual-stack one both live.
+    m.req.sdiag_family = AF_INET6;
     m.req.sdiag_protocol = IPPROTO_TCP;
     m.req.idiag_states = ~0u;
     m.req.idiag_ext = 1u << (INET_DIAG_SKMEMINFO - 1);
-    // The receiver is the key's peer: its local end is the key's remote one.
-    std::memcpy(&m.req.id.idiag_src[0], key + 4, 4);
-    std::memcpy(&m.req.id.idiag_dst[0], key + 0, 4);
-    std::memcpy(&m.req.id.idiag_sport, key + 12, 2);
-    std::memcpy(&m.req.id.idiag_dport, key + 8, 2);
+    // The receiver is the key's peer: its local end is the key's remote one,
+    // and each whole address is rebuilt from its last word.
+    auto whole = [key](int16_t at, __be32* out) {
+        std::memcpy(&out[3], key + at, 4);
+        out[2] = out[3] == static_cast<__be32>(LO4) ? htonl(0xffff) : 0;
+    };
+    whole(KEY_REMOTE, m.req.id.idiag_src);
+    whole(0, m.req.id.idiag_dst);
+    std::memcpy(&m.req.id.idiag_sport, key + KEY_RPORT, 2);
+    std::memcpy(&m.req.id.idiag_dport, key + KEY_LPORT, 2);
     m.req.id.idiag_cookie[0] = INET_DIAG_NOCOOKIE;
     m.req.id.idiag_cookie[1] = INET_DIAG_NOCOOKIE;
     if (::send(nl, &m, sizeof(m), 0) < 0)
@@ -1021,8 +1094,8 @@ bool fast_lo_active()
     return on;
 }
 
-// Both ends 127.0.0.1, as AF_INET or as an IPv4-mapped AF_INET6 address.
-static bool loopback4(const sockaddr_storage& ss)
+// 127.0.0.1 as AF_INET or as an IPv4-mapped AF_INET6 address, or ::1.
+static bool loopback(const sockaddr_storage& ss)
 {
     if (ss.ss_family == AF_INET)
         return reinterpret_cast<const sockaddr_in&>(ss).sin_addr.s_addr == htonl(INADDR_LOOPBACK);
@@ -1030,7 +1103,7 @@ static bool loopback4(const sockaddr_storage& ss)
     {
         const auto& a = reinterpret_cast<const sockaddr_in6&>(ss).sin6_addr;
         static constexpr uint8_t mapped[16] = { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff, 127,0,0,1 };
-        return std::memcmp(a.s6_addr, mapped, 16) == 0;
+        return std::memcmp(a.s6_addr, mapped, 16) == 0 || IN6_IS_ADDR_LOOPBACK(&a);
     }
     return false;
 }
@@ -1042,7 +1115,7 @@ bool fast_lo_covers(int fd)
     if (fd < 0 || ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &la) < 0 ||
         ::getpeername(fd, reinterpret_cast<sockaddr*>(&b), &lb) < 0)
         return false;
-    return loopback4(a) && loopback4(b);
+    return loopback(a) && loopback(b);
 }
 
 }  // namespace socketley
@@ -1074,6 +1147,94 @@ int main()
     const int msg = load_msg(socks, state, snap, ring, budget, 4ull << 20);
     std::printf("load_msg = %d errno=%d\n", msg, errno);
     if (msg < 0) std::printf("%s\n", g_verifier_log);
+
+    // The reconciler's exact lookup, for each loopback kind: a sender's key
+    // must find its receiver's unread 100000 bytes.
+    auto addr16 = [](const sockaddr_storage& ss, uint8_t* out, uint16_t& port) {
+        if (ss.ss_family == AF_INET)
+        {
+            const auto& a = reinterpret_cast<const sockaddr_in&>(ss);
+            std::memset(out, 0, 10); out[10] = 0xff; out[11] = 0xff;
+            std::memcpy(out + 12, &a.sin_addr, 4);
+            port = a.sin_port;
+        }
+        else
+        {
+            const auto& a = reinterpret_cast<const sockaddr_in6&>(ss);
+            std::memcpy(out, &a.sin6_addr, 16);
+            port = a.sin6_port;
+        }
+    };
+    auto fill = [](sockaddr_storage& ss, int fam, const char* ip, uint16_t port) -> socklen_t {
+        if (fam == AF_INET)
+        {
+            auto& a = reinterpret_cast<sockaddr_in&>(ss);
+            a.sin_family = AF_INET; inet_pton(AF_INET, ip, &a.sin_addr); a.sin_port = port;
+            return sizeof(a);
+        }
+        auto& a = reinterpret_cast<sockaddr_in6&>(ss);
+        a.sin6_family = AF_INET6; inet_pton(AF_INET6, ip, &a.sin6_addr); a.sin6_port = port;
+        return sizeof(a);
+    };
+    struct kind { const char* name; int lfam; const char* lip; int cfam; const char* cip; };
+    for (const kind& k : { kind{"127.0.0.1", AF_INET, "127.0.0.1", AF_INET, "127.0.0.1"},
+                           kind{"v4-mapped", AF_INET6, "::", AF_INET, "127.0.0.1"},
+                           kind{"::1", AF_INET6, "::1", AF_INET6, "::1"} })
+    {
+        sockaddr_storage la{}, ca{};
+        const int l = ::socket(k.lfam, SOCK_STREAM, 0);
+        const int off = 0;
+        if (k.lfam == AF_INET6)
+            ::setsockopt(l, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        socklen_t ll = fill(la, k.lfam, k.lip, 0);
+        if (::bind(l, reinterpret_cast<sockaddr*>(&la), ll) < 0 || ::listen(l, 1) < 0 ||
+            ::getsockname(l, reinterpret_cast<sockaddr*>(&la), &ll) < 0)
+        {
+            std::printf("%s: listen failed\n", k.name);
+            continue;
+        }
+        const uint16_t lport = k.lfam == AF_INET ? reinterpret_cast<sockaddr_in&>(la).sin_port
+                                                 : reinterpret_cast<sockaddr_in6&>(la).sin6_port;
+        const socklen_t cl = fill(ca, k.cfam, k.cip, lport);
+        const int c = ::socket(k.cfam, SOCK_STREAM, 0);
+        if (::connect(c, reinterpret_cast<sockaddr*>(&ca), cl) < 0)
+        {
+            std::printf("%s: connect failed\n", k.name);
+            continue;
+        }
+        const int srv = ::accept(l, nullptr, nullptr);
+        std::vector<char> junk(100000, 'j');
+        size_t sent = 0;
+        while (sent < junk.size())
+        {
+            const ssize_t w = ::send(c, junk.data() + sent, junk.size() - sent, 0);
+            if (w <= 0) break;
+            sent += static_cast<size_t>(w);
+        }
+        ::usleep(20000);
+        sockaddr_storage self{}, peer{};
+        socklen_t sl = sizeof(self), pl = sizeof(peer);
+        uint8_t key[SKL_KEY]{};
+        uint8_t a16[16];
+        uint16_t sp = 0, pp = 0;
+        if (::getsockname(c, reinterpret_cast<sockaddr*>(&self), &sl) == 0 &&
+            ::getpeername(c, reinterpret_cast<sockaddr*>(&peer), &pl) == 0)
+        {
+            addr16(self, a16, sp);
+            std::memcpy(key, a16 + 12, 4);
+            addr16(peer, a16, pp);
+            std::memcpy(key + KEY_REMOTE, a16 + 12, 4);
+            std::memcpy(key + KEY_LPORT, &sp, 2);
+            std::memcpy(key + KEY_RPORT, &pp, 2);
+        }
+        const int nl = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+        std::vector<uint8_t> buf(8192);
+        uint64_t rmem = 0;
+        const bool ok = diag_exact(nl, buf, key, rmem);
+        std::printf("diag %-9s lookup=%d receiver rmem=%llu (%s)\n", k.name, ok,
+                    static_cast<unsigned long long>(rmem), ok && rmem >= 100000 ? "ok" : "WRONG");
+        ::close(nl); ::close(srv); ::close(c); ::close(l);
+    }
     return 0;
 }
 #endif

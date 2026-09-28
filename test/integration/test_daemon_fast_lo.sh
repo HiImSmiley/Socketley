@@ -24,14 +24,18 @@
 #     case) left on TCP -- the backend's own socket acks the echo -- or the
 #     echo corrupted on the way
 #   * own: that backend pair put on the shortcut
+#   * all: a runtime's Lua HTTP call to a local service on ::1 left on TCP --
+#     the service's socket acks the 1 MiB body -- or the body corrupted; and a
+#     dual-stack service reached at 127.0.0.1 (both ends IPv4-mapped on its
+#     side) lost from the shortcut when the keys learned IPv6
 #   * own: that same client put on it anyway -- own is for pairs whose both ends
 #     are this daemon's runtimes -- or a client runtime's pair to a server
 #     runtime not put on it
 #   * splice taking a pair with a leg on the shortcut, which loses the bytes and
 #     hangs the exchange
 #
-# The last three need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
-# with `sudo -n setcap`; without sudo they are skipped.
+# Everything past the uncapped case needs CAP_BPF and CAP_NET_ADMIN, given to a
+# copy of the binary with `sudo -n setcap`; without sudo it is skipped.
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -54,8 +58,8 @@ daemon_isolate fastlo
 # The probes and the capped copy outlive each daemon's TMPD, which daemon_stop deletes.
 WORK=$(mktemp -d /tmp/socketley-fastlo-work-XXXXXX)
 daemon_watch "$WORK"
-ECHOPID=""
-cleanup(){ [ -n "$ECHOPID" ] && { kill -9 "$ECHOPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; }
+ECHOPID=""; ORIGINPID=""
+cleanup(){ for p in "$ECHOPID" "$ORIGINPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done; daemon_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1811))
@@ -63,6 +67,8 @@ PXSPLICE=$((SL_PORT_BASE + 1812))
 EPORT=$((SL_PORT_BASE + 1814))
 SPORT=$((SL_PORT_BASE + 1815))
 PXFOREIGN=$((SL_PORT_BASE + 1817))
+ORIGIN6=$((SL_PORT_BASE + 1818))
+CALLER6=$((SL_PORT_BASE + 1819))
 
 # A foreign client: pipelined SETs and GETs of 300 KB values, then the
 # sender's tcpi_bytes_acked (offset 120 of struct tcp_info).
@@ -145,6 +151,33 @@ for i, ln in enumerate(out):
     acked[side] = int(m.group(1)) if m else 0   # ss leaves a zero out
 print("ok" if got == data else "bad got=%d want=%d" % (len(got), len(data)),
       acked.get("backend", -1), acked.get("proxy", -1))
+PY
+
+# A local HTTP service on an IPv6 socket that answers each request with a 1 MiB
+# body, waits for the client to close, and appends its own socket's
+# tcpi_bytes_acked to OUT; bound to ::1, or to :: dual-stack.
+cat >"$WORK/origin6.py" <<'PY'
+import socket, struct, sys
+host, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+body = bytes(range(256)) * 4096
+l = socket.socket(socket.AF_INET6); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+l.bind((host, port)); l.listen(8)
+open(out, "a").close()
+while True:
+    c, _ = l.accept(); c.settimeout(10); req = b""
+    try:
+        while b"\r\n\r\n" not in req:
+            d = c.recv(4096)
+            if not d: break
+            req += d
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        while c.recv(4096): pass
+        acked = struct.unpack_from("Q", c.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256), 120)[0]
+        with open(out, "a") as f: f.write("%d\n" % acked)
+    except Exception as e:
+        with open(out, "a") as f: f.write("error %s\n" % e)
+    c.close()
 PY
 
 wait_port(){ local i; for i in $(seq 1 50); do python3 -c "import socket,sys;socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=1)" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
@@ -244,7 +277,46 @@ else
     not_asserted "all: foreign backend" "ss not available"
 fi
 
-# ─── (f) own: this daemon's runtimes only ───────────────────────────────────
+# ─── (f) all: a runtime's Lua HTTP call to a local IPv6 service ─────────────
+# The call is the runtime's connect, so its pair enters like the proxy's above;
+# ::1 is the address, and a dual-stack service reached at 127.0.0.1 is the
+# regression guard for IPv4-mapped keys on the service's side.
+v6_call(){  # $1 tag, $2 bind address, $3 url host; the verdict in R, not a subshell, so cleanup sees ORIGINPID
+    local out="$WORK/origin6-$1.out" i
+    python3 "$WORK/origin6.py" "$2" "$ORIGIN6" "$out" >/dev/null 2>&1 & ORIGINPID=$!; disown
+    for i in $(seq 1 50); do [ -f "$out" ] && break; sleep 0.1; done
+    cat >"$WORK/call6-$1.lua" <<LUA
+function on_start()
+    local t = {}
+    for i = 0, 255 do t[#t + 1] = string.char(i) end
+    local want = string.rep(table.concat(t), 4096)
+    local r = socketley.http({ url = "http://$3:$ORIGIN6/", timeout_ms = 5000 })
+    socketley.log("FASTLO6 $1 ok=" .. tostring(r.ok) .. " same=" .. tostring(r.body == want))
+end
+LUA
+    "$BIN" create server "c6$1" -p "$CALLER6" --lua "$WORK/call6-$1.lua" -s >/dev/null 2>&1 || true
+    for i in $(seq 1 50); do grep -q "FASTLO6 $1 " "$SOCKETLEY_DLOG" 2>/dev/null && [ -s "$out" ] && break; sleep 0.1; done
+    "$BIN" remove "c6$1" >/dev/null 2>&1 || true
+    kill -9 "$ORIGINPID" 2>/dev/null || true; ORIGINPID=""
+    R="$({ grep -oE "FASTLO6 $1 .*" "$SOCKETLEY_DLOG" || true; } | tail -1) acked=$(tail -1 "$out" 2>/dev/null || true)"
+}
+if python3 -c "import socket; s=socket.socket(socket.AF_INET6); s.bind(('::1', 0))" 2>/dev/null; then
+    restart "$CAPBIN" --fast-lo
+    attached
+    v6_call lo6 "::1" "[::1]"
+    if grep -q "ok=true same=true acked=[01]$" <<<"$R"; then pass
+    else fail "all: ::1" "a runtime's HTTP call to a local service on ::1 is on the shortcut, body intact" \
+        "got: $R (acked 0..1 is the shortcut)"; fi
+    v6_call map "::" "127.0.0.1"
+    if grep -q "ok=true same=true acked=[01]$" <<<"$R"; then pass
+    else fail "all: v4-mapped" "a dual-stack service reached at 127.0.0.1 stays on the shortcut" \
+        "got: $R (acked 0..1 is the shortcut)"; fi
+else
+    not_asserted "all: ::1" "no IPv6 loopback here"
+    not_asserted "all: v4-mapped" "no IPv6 loopback here"
+fi
+
+# ─── (g) own: this daemon's runtimes only ───────────────────────────────────
 restart "$CAPBIN" --fast-lo own
 attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null

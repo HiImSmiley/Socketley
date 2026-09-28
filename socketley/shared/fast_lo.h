@@ -1,4 +1,4 @@
-// The loopback shortcut: a TCP pair with both ends on 127.0.0.1 hands each
+// The loopback shortcut: a TCP pair with both ends on 127.0.0.1 or ::1 hands each
 // send straight to the peer's receive queue in the kernel, skipping TCP/IP,
 // the loopback device and its softirq.
 #pragma once
@@ -78,7 +78,7 @@ inline constexpr const char* fast_lo_env = "SOCKETLEY_FAST_LO";
 // Whether this process's daemon attached the shortcut.
 bool fast_lo_active();
 
-// Whether a connected socket may be on the shortcut: both ends 127.0.0.1.
+// Whether a connected socket may be on the shortcut: both ends 127.0.0.1 or ::1.
 bool fast_lo_covers(int fd);
 
 }  // namespace socketley

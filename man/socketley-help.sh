@@ -156,7 +156,7 @@ cli_commands() {
     echo -e "  ${CYAN}./bin/Release/socketley daemon --cpus 0-3 &${NC}"
     echo ""
     echo -e "${BOLD}daemon --fast-lo [own|all] [--fast-lo-limit P,G]${NC}"
-    echo "  Put TCP pairs with both ends on 127.0.0.1 on a kernel shortcut: a"
+    echo "  Put TCP pairs with both ends on 127.0.0.1 or ::1 on a kernel shortcut: a"
     echo "  send lands straight in the peer's receive queue, skipping TCP/IP."
     echo "  all (default): any local client of a runtime's port, and a runtime's"
     echo "  own connects to any local listener (a proxy's 127.0.0.1 backend: 64 B"
