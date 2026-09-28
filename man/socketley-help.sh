@@ -2241,6 +2241,20 @@ architecture() {
     echo "    real NIC, where zero copy could still pay. Never used on a TLS leg"
     echo "    or with an on_proxy_request/on_proxy_response hook."
     echo ""
+
+    echo -e "  ${CYAN}SOCKETLEY_PROXY_SOCKMAP${NC}       unset (off)"
+    echo "    Relay --protocol tcp traffic inside the kernel with a BPF sockhash"
+    echo "    and an sk_skb stream-verdict program: an established pair's sockets"
+    echo "    go in a map and the kernel redirects bytes each way, so steady-state"
+    echo "    relaying needs no userspace read, copy or send. Needs CAP_BPF and"
+    echo "    CAP_NET_ADMIN (setcap cap_bpf,cap_net_admin+ep on the binary); with-"
+    echo "    out them, or on any load failure, the proxy logs once and uses the"
+    echo "    copy path. Ignored when SOCKETLEY_PROXY_SPLICE is on. TLS, unix and"
+    echo "    hooked pairs stay on the copy path. The kernel buffers a slow"
+    echo "    reader's backlog unbounded and a map removal would drop it, so a"
+    echo "    pair whose backlog passes --write-buffer is dropped, not paced."
+    echo "    Redirected bytes are counted from TCP_INFO at close, not as moved."
+    echo ""
     echo ""
 
     read -p "Press Enter to continue..." || true

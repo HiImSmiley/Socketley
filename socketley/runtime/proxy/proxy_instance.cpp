@@ -122,7 +122,10 @@ static inline bool client_op_in_flight(const proxy_client_connection* c)
 static inline bool backend_op_in_flight(const proxy_backend_connection* b)
 {
     return b->read_pending || b->write_pending ||
-           b->splice_in_pending || b->splice_out_pending;
+           b->splice_in_pending || b->splice_out_pending ||
+           // The kernel-relay abort watch is armed on the descriptor and
+           // cancellable, exactly like the client's, so a teardown defers on it.
+           b->abort_watch_pending;
 }
 
 // Whether a response can start with these bytes, false only once they rule
@@ -152,6 +155,20 @@ static bool splice_opt_in()
 {
     static const bool on = [] {
         const char* e = std::getenv("SOCKETLEY_PROXY_SPLICE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// The kernel relay is off unless SOCKETLEY_PROXY_SOCKMAP says otherwise,
+// because it needs CAP_BPF/CAP_NET_ADMIN and, once a pair is in the map, the
+// kernel buffers a slow backend's backlog with no bound of its own -- the
+// sweep pulls a pair back to the copy path when its backlog passes the write
+// bound, which is where that backpressure lives.
+static bool sockmap_opt_in()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("SOCKETLEY_PROXY_SOCKMAP");
         return e && *e && *e != '0';
     }();
     return on;
@@ -279,6 +296,13 @@ void proxy_client_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
+    sockmap_active = false;
+    sockmap_pending = false;
+    sockmap_client_eof = false;
+    sockmap_backend_eof = false;
+    sockmap_up = {};
+    sockmap_down = {};
+    sockmap_seen = 0;
     header_parsed = false;
     response_started = false;
     client_conn_close = false;
@@ -363,6 +387,9 @@ void proxy_backend_connection::reset(int new_fd)
     splice_active = false;
     splice_in_pending = false;
     splice_out_pending = false;
+    sockmap_active = false;
+    abort_watch_pending = false;
+    abort_req = {};
     pool_draining = false;
     recv_withdrawing = false;
     sent_to_client = false;
@@ -1905,6 +1932,25 @@ bool proxy_instance::setup(event_loop& loop)
     }
     m_splice_enabled = m_splice_supported && splice_opt_in();
 
+    // The kernel relay loads once here, so a load that needs privileges this
+    // process lacks is reported at startup rather than on the first pair, and
+    // every later pair just checks m_sockmap_enabled.  Splice wins if both are
+    // asked for, because it needs no privilege.
+    if (sockmap_opt_in() && !m_splice_enabled)
+    {
+        m_sockmap = std::make_unique<socketley::sockmap_relay>();
+        if (m_sockmap->init())
+            m_sockmap_enabled = true;
+        else
+        {
+            LOG_WARN(("proxy \"" + std::string(get_name()) +
+                      "\": SOCKETLEY_PROXY_SOCKMAP set but the kernel relay is "
+                      "unavailable (" + m_sockmap->unavailable_reason() +
+                      "); using the copy path").c_str());
+            m_sockmap.reset();
+        }
+    }
+
     // Pre-build prefix once to avoid per-request allocation
     m_prefix = "/" + std::string(get_name()) + "/";
 
@@ -2079,6 +2125,10 @@ void proxy_instance::teardown(event_loop& /*loop*/)
     trace_unregister(this);
 #endif
     m_backends_resolved = false;
+    // The kernel-relay pair list is dropped here; the sockets themselves are
+    // shut and closed below, and the maps die with m_sockmap, so the stale
+    // entries an unclean stop leaves behind are freed with the anonymous map.
+    m_sockmap_pairs.clear();
     // Everything here is closed and handed to the release path, which holds
     // what the ring is still working on -- nulling the owners only holds while
     // there is an object left to read the null out of.
@@ -2324,7 +2374,12 @@ void proxy_instance::on_cqe(struct io_uring_cqe* cqe)
             handle_connect(cqe, req);
             break;
         case op_poll_abort:
-            handle_client_abort(cqe, req);
+            // The same op on either side of a kernel-relayed pair; the backend
+            // watch is the mirror the sockmap path adds.
+            if (req->fd >= 0 && req->fd < MAX_FDS && m_conn_idx[req->fd].side == conn_backend)
+                handle_backend_abort(cqe, req);
+            else
+                handle_client_abort(cqe, req);
             break;
         case op_health_check:
             handle_health_cqe(cqe, req);
@@ -2618,7 +2673,9 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
         c.in_flight = cconn->read_pending || cconn->write_pending ||
                       cconn->splice_in_pending ||
                       cconn->splice_out_pending || cconn->connect_pending ||
-                      cconn->abort_watch_pending;
+                      cconn->abort_watch_pending ||
+                      // A kernel-relayed pair is driven by the 250 ms sweep.
+                      cconn->sockmap_active;
         c.queued    = !cconn->write_queue.empty();
         c.closing   = cconn->closing;
         c.fd        = cconn->fd;
@@ -2628,7 +2685,8 @@ void proxy_instance::inv_check_pair(int fd, const char* where)
         b.present   = true;
         b.in_flight = bconn->read_pending || bconn->write_pending ||
                       bconn->splice_in_pending ||
-                      bconn->splice_out_pending;
+                      bconn->splice_out_pending || bconn->abort_watch_pending ||
+                      bconn->sockmap_active;
         b.queued    = !bconn->write_queue.empty();
         b.closing   = bconn->closing;
         b.fd        = bconn->fd;
@@ -6189,6 +6247,20 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         m_conn_idx[bfd].side = conn_backend;
         m_conn_idx[bfd].backend = ptr;
 
+        // The kernel relay, tried before splice; see handle_connect.
+        if (m_sockmap_enabled && m_protocol == protocol_tcp &&
+            !m_cb_on_proxy_request && !m_cb_on_proxy_response)
+        {
+#ifndef SOCKETLEY_NO_LUA
+            auto* slctx = lua();
+            bool sk_hooks = slctx && (slctx->has_on_proxy_request() || slctx->has_on_proxy_response());
+#else
+            bool sk_hooks = false;
+#endif
+            if (!sk_hooks && try_enter_sockmap(conn, ptr))
+                return true;
+        }
+
         // Set up splice for TCP mode
         if (m_protocol == protocol_tcp && m_splice_enabled &&
             !m_cb_on_proxy_request && !m_cb_on_proxy_response)
@@ -6378,6 +6450,241 @@ void proxy_instance::start_splice_forwarding(proxy_client_connection* conn, prox
             return;
         }
     }
+}
+
+// The mirror of the client's abort watch, on the backend of a kernel-relayed
+// pair, watching for reset (POLLERR|POLLHUP) and half-close (POLLRDHUP)
+// because nothing else is armed on that socket.
+bool proxy_instance::arm_backend_abort(proxy_backend_connection* bconn)
+{
+    if (!m_loop || bconn->fd < 0)
+        return false;
+    if (bconn->abort_watch_pending)
+        return true;
+    bconn->abort_req = { this, nullptr, bconn->fd, 0, op_poll_abort, bconn->generation };
+    if (m_loop->submit_poll_add(bconn->fd, POLLERR | POLLHUP | POLLRDHUP, &bconn->abort_req))
+    {
+        bconn->abort_watch_pending = true;
+        return true;
+    }
+    return false;
+}
+
+// The client-side equivalent, with POLLRDHUP added to the reset watch so a
+// kernel-relayed pair notices the client's FIN with no read armed.
+static bool arm_client_sockmap_abort(proxy_instance* self, event_loop* loop,
+                                     proxy_client_connection* conn)
+{
+    if (!loop || conn->fd < 0 || conn->abort_watch_pending)
+        return conn->abort_watch_pending;
+    conn->abort_req = { self, nullptr, conn->fd, 0, op_poll_abort, conn->generation };
+    if (loop->submit_poll_add(conn->fd, POLLERR | POLLHUP | POLLRDHUP, &conn->abort_req))
+    {
+        conn->abort_watch_pending = true;
+        return true;
+    }
+    return false;
+}
+
+// The kernel moves the bytes, so a FIN issued before the peer has sent them all
+// overtakes them -- the standalone measurement showed 10-13 of 20 transfers cut
+// short.  So each direction's FIN waits until the destination has taken every
+// byte of it, and the pair is torn down only once both FINs are passed on AND
+// both send queues are empty: closing a socket with bytes still queued to the
+// far end discards them, which cut a 12.6 MB answer to 11.5 MB.
+void proxy_instance::sockmap_try_advance(proxy_client_connection* conn,
+                                         proxy_backend_connection* bconn)
+{
+    if (!conn->sockmap_active || conn->closing)
+        return;
+
+    if (conn->sockmap_client_eof && !conn->backend_half_closed)
+    {
+        if (socketley::sockmap_relay::drained(conn->fd, bconn->fd, conn->sockmap_up, true))
+        {
+            if (shutdown(bconn->fd, SHUT_WR) < 0) {}
+            conn->backend_half_closed = true;
+        }
+    }
+    if (conn->sockmap_backend_eof && !conn->wr_shutdown)
+    {
+        if (socketley::sockmap_relay::drained(bconn->fd, conn->fd, conn->sockmap_down, true))
+        {
+            if (shutdown(conn->fd, SHUT_WR) < 0) {}
+            conn->wr_shutdown = true;
+        }
+    }
+
+    // Both senders have finished, both FINs are passed on, and nothing is left
+    // in either direction's send path -- `drained` counts bytes sitting in the
+    // destination's send queue as taken, which is right for issuing the FIN but
+    // not for closing, so the queues are re-checked empty here.
+    if (conn->sockmap_client_eof && conn->backend_half_closed &&
+        conn->sockmap_backend_eof && conn->wr_shutdown &&
+        socketley::sockmap_relay::held(conn->fd, bconn->fd, conn->sockmap_up, true) == 0 &&
+        socketley::sockmap_relay::held(bconn->fd, conn->fd, conn->sockmap_down, true) == 0)
+        close_pair(conn->fd, bconn->fd, close_reason::force);
+}
+
+// Once per 250 ms sweep: pass on any FIN whose direction has now drained, and
+// pull a pair off the kernel path when its backlog passes the copy path's
+// write bound, so the userspace backpressure the kernel path lacks applies
+// again.  Snapshots the list because close_pair mutates it.
+void proxy_instance::sockmap_backlog_sweep()
+{
+    if (m_sockmap_pairs.empty())
+        return;
+    const size_t bound = write_buffer_bytes();
+    std::vector<int> pairs = m_sockmap_pairs;
+    for (int cfd : pairs)
+    {
+        if (cfd < 0 || cfd >= MAX_FDS || m_conn_idx[cfd].side != conn_client)
+            continue;
+        auto* conn = m_conn_idx[cfd].client;
+        if (!conn->sockmap_active || conn->closing)
+            continue;
+        const int bfd = conn->backend_fd;
+        if (bfd < 0 || bfd >= MAX_FDS || m_conn_idx[bfd].side != conn_backend)
+            continue;
+        auto* bconn = m_conn_idx[bfd].backend;
+
+        // The redirect never touches last_activity, so the idle sweep would
+        // close a busy kernel-relayed pair; bytes moved since the last tick
+        // are what counts as activity here.
+        const uint64_t seen =
+            socketley::sockmap_relay::relayed(cfd, conn->sockmap_up, conn->sockmap_client_eof) +
+            socketley::sockmap_relay::relayed(bfd, conn->sockmap_down, conn->sockmap_backend_eof);
+        if (seen != conn->sockmap_seen)
+        {
+            conn->sockmap_seen = seen;
+            conn->last_activity = std::chrono::steady_clock::now();
+        }
+
+        // A reader that stops makes the kernel hold the sender's bytes with no
+        // bound of its own, and the copy path cannot take them back: deleting a
+        // socket from the map drops whatever is queued in the redirect's own
+        // backlog -- measured, 1.5 MB of 4 MB lost.  So an over-bound pair is
+        // dropped, the same terminal answer the copy path gives at
+        // --write-buffer, rather than handed over losslessly, which sockmap
+        // cannot do.  The bound is coarse: between two sweeps a stalled reader
+        // lets through roughly the interval times the link, so this caps the
+        // hold at that plus --write-buffer, not at --write-buffer.
+        const uint64_t fwd = socketley::sockmap_relay::held(cfd, bfd, conn->sockmap_up,
+                                                            conn->sockmap_client_eof);
+        const uint64_t rev = socketley::sockmap_relay::held(bfd, cfd, conn->sockmap_down,
+                                                            conn->sockmap_backend_eof);
+        if (fwd > bound || rev > bound)
+        {
+            close_pair(cfd, bfd, close_reason::force);
+            continue;
+        }
+
+        // A FIN that was waiting on this direction to drain.
+        if (conn->sockmap_client_eof || conn->sockmap_backend_eof)
+            sockmap_try_advance(conn, bconn);
+    }
+}
+
+// The kernel-moved bytes the redirect never counted, added once when the pair
+// leaves the map: each source's receive total less its base, so the bytes the
+// copy path already counted are not counted twice.
+void proxy_instance::sockmap_account_at_close(int client_fd, int backend_fd)
+{
+    if (client_fd < 0 || client_fd >= MAX_FDS || m_conn_idx[client_fd].side != conn_client)
+        return;
+    auto* conn = m_conn_idx[client_fd].client;
+    if (!conn->sockmap_active)
+        return;
+    stat_add(m_stat_bytes_in, socketley::sockmap_relay::relayed(
+                                  client_fd, conn->sockmap_up, conn->sockmap_client_eof));
+    if (backend_fd >= 0)
+        stat_add(m_stat_bytes_out, socketley::sockmap_relay::relayed(
+                                       backend_fd, conn->sockmap_down, conn->sockmap_backend_eof));
+}
+
+void proxy_instance::leave_sockmap(proxy_client_connection* conn)
+{
+    if (!conn->sockmap_active && !conn->sockmap_pending)
+        return;
+    const int bfd = conn->backend_fd;
+    if (m_sockmap)
+        m_sockmap->leave(conn->fd, bfd);
+    conn->sockmap_active = false;
+    conn->sockmap_pending = false;
+    if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
+        m_conn_idx[bfd].backend->sockmap_active = false;
+    auto it = std::find(m_sockmap_pairs.begin(), m_sockmap_pairs.end(), conn->fd);
+    if (it != m_sockmap_pairs.end())
+    {
+        *it = m_sockmap_pairs.back();
+        m_sockmap_pairs.pop_back();
+    }
+}
+
+// The map insertion itself, once the last saved bytes are on the wire, with the
+// abort watches that are the pair's only armed operations.  False leaves the
+// pair on the copy path.
+bool proxy_instance::enter_sockmap_now(proxy_client_connection* conn,
+                                       proxy_backend_connection* bconn)
+{
+    conn->sockmap_pending = false;
+    if (!m_sockmap_enabled || !m_sockmap || conn->closing || bconn->closing)
+        return false;
+
+    const int cfd = conn->fd, bfd = bconn->fd;
+    conn->sockmap_up = socketley::sockmap_relay::base(cfd, bfd);
+    conn->sockmap_down = socketley::sockmap_relay::base(bfd, cfd);
+
+    if (!m_sockmap->enter(cfd, bfd))
+        return false;
+
+    conn->sockmap_active = true;
+    bconn->sockmap_active = true;
+
+    // The client's own read is never armed on this pair, so this watch is the
+    // one operation that keeps the client half reachable and reports its FIN.
+    if (!arm_client_sockmap_abort(this, m_loop, conn) || !arm_backend_abort(bconn))
+    {
+        leave_sockmap(conn);
+        return false;
+    }
+
+    m_sockmap_pairs.push_back(cfd);
+    // The sweep is this pair's only periodic tick, for backlog and half-close.
+    arm_response_deadline_sweep();
+    return true;
+}
+
+// Move a plain TCP pair into the kernel relay: forward whatever the client sent
+// before the backend existed, then enter once it has drained so nothing
+// overtakes it.  False keeps the pair on the copy path.
+bool proxy_instance::try_enter_sockmap(proxy_client_connection* conn,
+                                       proxy_backend_connection* bconn)
+{
+    if (!m_sockmap_enabled || m_protocol != protocol_tcp)
+        return false;
+    if (conn->ssl || bconn->ssl || conn->fd < 0 || bconn->fd < 0)
+        return false;
+    if (conn->closing || bconn->closing || conn->client_eof)
+        return false;
+
+    conn->backend_fd = bconn->fd;
+    if (!conn->saved_request.empty())
+    {
+        forward_to_backend(conn, conn->saved_request);
+        conn->saved_request.clear();
+    }
+    // A forward that overflowed the queue marked the pair closing; the copy
+    // path's teardown owns it from here.
+    if (conn->closing || bconn->closing)
+        return false;
+
+    conn->sockmap_pending = true;
+    if (!bconn->write_pending && bconn->write_queue.empty())
+        return enter_sockmap_now(conn, bconn);
+    // The saved bytes are still draining; handle_backend_write enters the map
+    // when its queue empties.
+    return true;
 }
 
 void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
@@ -6842,6 +7149,23 @@ void proxy_instance::shutdown_client_write(proxy_client_connection* conn)
 
 void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reason)
 {
+    // A kernel-relayed pair is counted and taken out of the map before either
+    // socket is touched, because a closed socket's cookie no longer resolves
+    // and the map would keep a dangling entry.  Done here rather than at the
+    // call sites so every teardown -- reset, idle sweep, stop -- inherits it.
+    if (client_fd >= 0 && client_fd < MAX_FDS &&
+        m_conn_idx[client_fd].side == conn_client &&
+        m_conn_idx[client_fd].client->sockmap_active)
+    {
+        auto* skc = m_conn_idx[client_fd].client;
+        const int skb = skc->backend_fd >= 0 ? skc->backend_fd : backend_fd;
+        sockmap_account_at_close(client_fd, skb);
+        leave_sockmap(skc);
+        if (skb >= 0 && skb < MAX_FDS && m_conn_idx[skb].side == conn_backend &&
+            m_conn_idx[skb].backend->abort_watch_pending && m_loop)
+            m_loop->submit_poll_remove(&m_conn_idx[skb].backend->abort_req);
+    }
+
     // This checks rather than decides, because close_pair cannot tell a polite
     // half-close from a connection torn out from under its client -- so the
     // hold stays where the knowledge is and the invariant fires at 86 call
@@ -6896,6 +7220,7 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
             // that cannot reach the ring falls through.
             bool defer = bconn->read_pending || bconn->write_pending ||
                          bconn->splice_in_pending || bconn->splice_out_pending ||
+                         bconn->abort_watch_pending ||
                          !bconn->write_queue.empty() ||
                          // The record layer's own bytes: the alert that says
                          // why a handshake failed is the only diagnosis the
@@ -6914,6 +7239,10 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                 // as an operation in flight, because closing throws away bytes
                 // the client considers delivered.
                 bconn->closing = true;
+                // The kernel-relay abort watch is withdrawn by request, its
+                // -ECANCELED finishing this teardown once nothing else is owed.
+                if (bconn->abort_watch_pending && m_loop)
+                    m_loop->submit_poll_remove(&bconn->abort_req);
                 // This one earns its keep, because a backend socket is
                 // ESTABLISHED at teardown and 7054 of 7054 shutdowns succeeded
                 // -- which is why the resulting res == 0 must not be charged
@@ -6975,10 +7304,13 @@ void proxy_instance::close_pair(int client_fd, int backend_fd, close_reason reas
                     // Same list as above.
                     bool defer2 = bconn2->read_pending || bconn2->write_pending ||
                                   bconn2->splice_in_pending || bconn2->splice_out_pending ||
+                                  bconn2->abort_watch_pending ||
                                   !bconn2->write_queue.empty() || tls_owes_output(bconn2);
                     if (defer2)
                     {
                         bconn2->closing = true;
+                        if (bconn2->abort_watch_pending && m_loop)
+                            m_loop->submit_poll_remove(&bconn2->abort_req);
                         // Same as the backend block above and on the same
                         // reasoning, not separately measured because the proxy
                         // group never reached this arm.
@@ -8434,6 +8766,22 @@ void proxy_instance::handle_connect(struct io_uring_cqe* cqe, io_request* req)
     m_conn_idx[bfd].side = conn_backend;
     m_conn_idx[bfd].backend = ptr;
 
+    // The kernel relay, tried before splice for a plain TCP pair with no
+    // per-message hook; the two never coexist, since sockmap loads only when
+    // splice is off.
+    if (m_sockmap_enabled && m_protocol == protocol_tcp &&
+        !m_cb_on_proxy_request && !m_cb_on_proxy_response)
+    {
+#ifndef SOCKETLEY_NO_LUA
+        auto* slctx = lua();
+        bool sk_hooks = slctx && (slctx->has_on_proxy_request() || slctx->has_on_proxy_response());
+#else
+        bool sk_hooks = false;
+#endif
+        if (!sk_hooks && try_enter_sockmap(conn, ptr))
+            return;
+    }
+
     // Set up splice for TCP mode
     if (m_protocol == protocol_tcp && m_splice_enabled &&
         !m_cb_on_proxy_request && !m_cb_on_proxy_response)
@@ -8549,9 +8897,24 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     conn->abort_watch_pending = false;
 
     // Negative is the withdrawal (-ECANCELED) that handle_connect or close_pair
-    // asked for, and nothing beyond clearing the flag is owed for it.
+    // asked for; on a pair being torn down this may be the last operation owed,
+    // so it must finish the close the copy path's read normally would.
     if (cqe->res < 0)
+    {
+        if (conn->closing)
+        {
+            if (!client_op_in_flight(conn))
+                close_pair(client_fd, conn->backend_fd, close_reason::force);
+            return;
+        }
+        // The connect watch withdrawn by handle_connect lands after the pair
+        // entered the kernel relay, whose own watch could not be armed while
+        // this one was still owed -- missed, the client's FIN went unseen and
+        // the pair outlived both peers.
+        if (conn->sockmap_active && !conn->sockmap_client_eof)
+            arm_client_sockmap_abort(this, m_loop, conn);
         return;
+    }
 
     const int revents = cqe->res;
 
@@ -8559,6 +8922,39 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     // closed on the strength of this.
     if (SOCKETLEY_UNLIKELY(revents & POLLNVAL))
         return;
+
+    // On a kernel-relayed pair this watch is the only thing on the client
+    // socket: POLLERR|POLLHUP is a reset and tears the pair down, POLLRDHUP is
+    // the client's FIN, held until its direction has drained (see
+    // sockmap_try_advance) and re-armed so the eventual full close is seen too.
+    if (conn->sockmap_active)
+    {
+        if (conn->closing)
+            return;
+        const int bfd = conn->backend_fd;
+        proxy_backend_connection* bconn = (bfd >= 0 && bfd < MAX_FDS &&
+                                           m_conn_idx[bfd].side == conn_backend)
+                                          ? m_conn_idx[bfd].backend : nullptr;
+        // POLLERR is a reset with nothing left to deliver, so the pair goes;
+        // POLLHUP and POLLRDHUP are the client's FIN, whose direction may still
+        // have redirected bytes in flight -- recorded here and drained by the
+        // sweep, which then passes the FIN on (sockmap_try_advance).  The watch
+        // is not re-armed once the FIN is seen, because POLLHUP is level and
+        // would spin; the sweep and the peer's watch keep the pair reachable.
+        if ((revents & POLLERR) || !bconn)
+        {
+            close_pair(client_fd, bfd, close_reason::force);
+            return;
+        }
+        if (revents & (POLLHUP | POLLRDHUP))
+        {
+            conn->sockmap_client_eof = true;
+            sockmap_try_advance(conn, bconn);
+            return;
+        }
+        arm_client_sockmap_abort(this, m_loop, conn);
+        return;
+    }
 
     if (!(revents & (POLLERR | POLLHUP)))
         return;
@@ -8576,6 +8972,61 @@ void proxy_instance::handle_client_abort(struct io_uring_cqe* cqe, io_request* r
     // force: POLLERR/POLLHUP means the peer is gone, so holding would keep the
     // pair for a reply nobody will read.
     close_pair(client_fd, conn->backend_fd, close_reason::force);
+}
+
+// The backend of a kernel-relayed pair, whose only armed operation is this
+// watch: reset tears the pair down, half-close is held until its direction has
+// drained, and a withdrawal finishes a deferred teardown.
+void proxy_instance::handle_backend_abort(struct io_uring_cqe* cqe, io_request* req)
+{
+    int bfd = req->fd;
+    if (SOCKETLEY_UNLIKELY(bfd < 0 || bfd >= MAX_FDS))
+        return;
+
+    auto& entry = m_conn_idx[bfd];
+    if (SOCKETLEY_UNLIKELY(entry.side != conn_backend))
+        return;
+
+    auto* bconn = entry.backend;
+    if (SOCKETLEY_UNLIKELY(req->generation != bconn->generation))
+        return;
+    if (SOCKETLEY_UNLIKELY(!bconn->abort_watch_pending))
+        return;
+    bconn->abort_watch_pending = false;
+
+    if (cqe->res < 0)
+    {
+        if (bconn->closing && !backend_op_in_flight(bconn))
+            close_pair(bconn->client_fd, bfd, close_reason::force);
+        return;
+    }
+
+    const int revents = cqe->res;
+    if (SOCKETLEY_UNLIKELY(revents & POLLNVAL))
+        return;
+    if (bconn->closing)
+        return;
+
+    const int cfd = bconn->client_fd;
+    proxy_client_connection* conn = (cfd >= 0 && cfd < MAX_FDS &&
+                                     m_conn_idx[cfd].side == conn_client)
+                                    ? m_conn_idx[cfd].client : nullptr;
+
+    // The client-side rule: POLLERR is a reset, POLLHUP/POLLRDHUP a FIN whose
+    // downstream bytes may still be in flight -- tearing down on POLLHUP cut a
+    // backend that closed straight after its answer to 644 KB of 12.6 MB.
+    if ((revents & POLLERR) || !conn || !conn->sockmap_active)
+    {
+        close_pair(cfd, bfd, close_reason::force);
+        return;
+    }
+    if (revents & (POLLHUP | POLLRDHUP))
+    {
+        conn->sockmap_backend_eof = true;
+        sockmap_try_advance(conn, bconn);
+        return;
+    }
+    arm_backend_abort(bconn);
 }
 
 void proxy_instance::arm_response_deadline(proxy_client_connection* conn)
@@ -8770,7 +9221,11 @@ void proxy_instance::response_deadline_sweep()
             send_error(conn, "504 Gateway Timeout", "Gateway Timeout\n");
     }
 
-    if (still_waiting)
+    // The kernel-relayed pairs have no armed read, so this sweep is the only
+    // periodic look at their backlog and their held half-closes.
+    sockmap_backlog_sweep();
+
+    if (still_waiting || !m_sockmap_pairs.empty())
         arm_response_deadline_sweep();
 }
 
@@ -10298,6 +10753,29 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         if (se.side == conn_client && se.client->splice_active && conn->splice_active &&
             !se.client->client_eof)
             start_splice_forwarding(se.client, conn);
+    }
+
+    // The kernel relay was held back for the same reason as splice: the saved
+    // request had to reach the backend first.  Now that its queue is empty the
+    // pair enters the map; a failure to enter falls back to arming reads.
+    if (conn->write_queue.empty() && !conn->write_pending &&
+        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
+    {
+        auto& se = m_conn_idx[conn->client_fd];
+        if (se.side == conn_client && se.client->sockmap_pending && !se.client->sockmap_active &&
+            se.client->backend_fd == conn->fd)
+        {
+            if (!enter_sockmap_now(se.client, conn))
+            {
+                if ((!se.client->client_eof && !arm_read(se.client->fd, se.client)) ||
+                    !arm_read(conn->fd, conn))
+                {
+                    close_pair(se.client->fd, conn->fd, close_reason::force);
+                    return;
+                }
+            }
+            return;
+        }
     }
 
     // The client's half-close, held back for exactly the same reason and let go

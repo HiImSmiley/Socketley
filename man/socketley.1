@@ -9522,6 +9522,54 @@ or
 .B on_proxy_response
 hook \(em the kernel moves those bytes without the script ever seeing them.
 .TP
+.B SOCKETLEY_PROXY_SOCKMAP
+Relay
+.B \-\-protocol tcp
+proxy traffic inside the kernel with a BPF sockhash and an
+.B sk_skb
+stream\-verdict program: once a pair is established the two sockets are put in a
+map and the kernel redirects bytes from each to the other, so steady\-state
+relaying needs no userspace read, copy or send. Unset (off) by default; any
+value other than
+.B 0
+turns it on. Read once per process and inherited by worker processes.
+.IP
+Requires
+.B CAP_BPF
+and
+.B CAP_NET_ADMIN
+(run the daemon binary with
+.B setcap cap_bpf,cap_net_admin+ep
+or under a launcher that grants them). Without them the proxy logs once and
+uses the copy path, and any failure to load or attach the program falls back
+the same way. Ignored when
+.B SOCKETLEY_PROXY_SPLICE
+is on, since splice needs no privilege. TLS pairs, unix\-socket pairs and pairs
+with an
+.B on_proxy_request
+or
+.B on_proxy_response
+hook always stay on the copy path.
+.IP
+The proxy keeps doing accept, backend selection, connect and teardown. Because
+the redirected bytes never enter userspace, the kernel buffers a slow reader's
+backlog with no bound of its own, and unlike the copy path the kernel path
+cannot pace: removing a socket from the map drops whatever is queued in the
+redirect's own backlog, so a backed\-up pair cannot be handed to the copy path
+without loss. The proxy watches each kernel\-relayed pair from its 250 ms sweep
+and, when a direction's backlog passes the
+.B \-\-write\-buffer
+bound, drops the pair \(em the same terminal answer the copy path gives when its
+write queue passes that bound. The cap is coarse: between two sweeps a stalled
+reader lets through about the interval times the link. Byte counters do not see redirected bytes as they
+move; the kernel\-moved total is read from
+.B TCP_INFO
+and added to
+.B bytes_in
+and
+.B bytes_out
+when the pair closes. Message counts do not include redirected messages.
+.TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US
 Enable io_uring NAPI busy polling with this timeout in microseconds. Unset by
 default. Trades CPU for lower receive latency on busy links.

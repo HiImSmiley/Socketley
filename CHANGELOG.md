@@ -32,6 +32,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **SDK:** `cache_store` holds streams (`stream_get`, `stream_find`,
   `stream_make`, `stream_admit`, `stream_change`) as `stream_log`, which is
   usable on its own from `socketley/runtime/cache/stream_log.h`.
+- **A TCP proxy can relay a pair's bytes inside the kernel** with
+  `SOCKETLEY_PROXY_SOCKMAP=1`. Once a plain `--protocol tcp` pair is
+  established, both sockets go into a BPF sockhash and an `sk_skb`
+  stream-verdict program redirects bytes from each socket to the other, so
+  steady-state relaying needs no userspace read, copy or send per message. The
+  proxy still does accept, backend selection, connect and teardown. Needs
+  `CAP_BPF` and `CAP_NET_ADMIN` (`setcap cap_bpf,cap_net_admin+ep` on the
+  binary); without them, or on any load or attach failure, the proxy logs once
+  and uses the copy path. The program is hand-assembled and loaded with a raw
+  `bpf(2)`, so there is no build or runtime dependency on clang or libbpf.
+  Ignored when `SOCKETLEY_PROXY_SPLICE` is on. TLS pairs, unix-socket pairs and
+  pairs with an `on_proxy_request`/`on_proxy_response` hook always stay on the
+  copy path. Because the redirected bytes never enter userspace, the kernel
+  buffers a slow reader's backlog with no bound of its own, and unlike the copy
+  path the kernel path cannot pace: removing a socket from the map drops
+  whatever is queued in the redirect's own backlog (measured, 1.5 MB of 4 MB
+  lost), so there is no lossless way to hand a backed-up pair to the copy path.
+  The 250 ms sweep therefore drops a pair whose in-kernel backlog passes the
+  `--write-buffer` bound -- the same terminal answer the copy path gives when
+  its write queue passes that bound. The cap is coarse: between two sweeps a
+  stalled reader lets through roughly the interval times the link, so it holds
+  at about that plus `--write-buffer`, not at `--write-buffer`. A half-close is held until
+  its direction has drained, since a FIN issued early overtakes redirected
+  bytes the kernel has not yet sent. Byte counters do not see redirected bytes
+  as they move; the kernel-moved total is read from `TCP_INFO` and added to
+  `bytes_in`/`bytes_out` at teardown, and message counts exclude redirected
+  messages.
 
 ### Changed
 
