@@ -30,6 +30,11 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .RI [ ls | ps | group | show | stats | watch ]
 .br
 .B socketley
+.B cluster
+.RB { raft\-status | placement | create | scale | remove }
+.I ...
+.br
+.B socketley
 .B create
 .I type name
 .RI [ flags ]
@@ -9341,10 +9346,14 @@ Container restart	File overwritten	Immediate
 A daemon started with
 .B \-\-raft\-listen
 runs one Raft node on its own loop, and nothing else changes: the cluster
-directory above, runtimes, proxies and caches behave exactly as without it.
-This milestone forms the cluster, elects a leader, replicates a log to disk and
-keeps membership; the state machine behind the log is still empty, so no
-runtime, placement or cache failover goes through it yet.
+directory above, and every runtime, proxy and cache that is not declared as a
+cluster runtime, behave exactly as without it. The cluster elects a leader,
+replicates a log to disk and keeps membership, and the state machine behind the
+log holds the cluster's runtimes (see
+.B Cluster runtimes
+below): a stateless runtime is declared once, placed on distinct nodes by the
+leader, and started on a survivor when its node dies. Cache placement and
+promoting a follower to primary do not go through it yet.
 .PP
 .B Flags
 (on the command line that starts the daemon, like
@@ -9387,6 +9396,22 @@ known yet, is held to the address that was dialled.
 .B \-\-raft\-insecure
 Run Raft in cleartext. Refused beside the certificate flags; without it and
 without them the daemon refuses to start.
+.TP
+.BI \-\-raft\-down\-after " duration"
+How long the leader waits for a node's lease request before it declares the
+node down and moves its replicas: seconds, or with an
+.B s
+or
+.B ms
+suffix (\c
+.BR 4 ,
+.BR 4s ,
+.BR 3500ms ).
+Default four election timeouts (4 s). Refused below three election timeouts,
+because a leader change would then look like a node loss. Every member of one
+cluster should use the same value; see
+.B Cluster runtimes
+for what depends on it.
 .PP
 A daemon whose state directory already holds Raft state ignores
 .B \-\-raft\-init
@@ -9422,10 +9447,170 @@ heard from within an election timeout, and the transport and WAL counters. It
 exits 0 with a leader and a reachable quorum, 2 without (saying so on its last
 line), and 1 on a daemon not in Raft mode.
 .PP
+.B Cluster runtimes.
+A cluster runtime is declared once, for the cluster, and every node applies the
+same log:
+.PP
+.nf
+socketley cluster create server api \-p 8080 \-\-replicas 2
+socketley cluster create server api \-\-listen unix:/run/api\-{node}.sock
+socketley cluster scale api 3
+socketley cluster remove api
+socketley cluster placement
+.fi
+.PP
+.B cluster create
+takes
+.IR type ,
+.I name
+and the flags
+.B create
+takes, plus
+.B \-\-replicas
+(default 1). It is a server, a proxy or a client: a cache is refused, because
+nothing promotes a follower when its node dies yet. The flags are stored as
+typed and run as they are on every node that holds a replica, so a file they
+name must exist on each node (a relative path is made absolute against the
+caller's directory, as for
+.BR create ),
+and
+.B {node}
+in them is replaced by the name of the node running the replica
+.RB ( \-\-raft\-name ,
+with anything but letters, digits,
+.BR \- ,
+.B _
+and
+.B .
+made
+.BR _ ).
+That is what lets several nodes of a test share one host: two replicas that
+both ask for
+.B \-p 8080
+would collide, and
+.B \-\-listen unix:/run/api\-{node}.sock
+does not. On separate hosts each node binds its own
+.B \-p
+and needs no placeholder. The flags are also run through
+.B create \-\-test
+on the node that takes the command, so a typo is refused there, with exit 1,
+and not found on every node at once; \c
+.B \-\-test
+itself is refused in a spec.
+.PP
+A command may be given to any node: a follower hands it to the leader. Success
+is silent, and the command has taken effect on the node that took it when it
+returns, or the CLI says it did not within five seconds and exits 2. Exit 1 is a
+refusal (a duplicate, an unknown name, a replica count outside 1 to 64, a
+runtime of that name already on this node, bad flags), exit 2 a cluster with no
+leader that can take it. On a daemon that is not in Raft mode every verb says so
+and exits 1.
+.PP
+.B cluster scale
+changes the replica count, taking a replica from the most loaded node when it
+shrinks. A runtime has no edit: remove it and declare it again.
+.PP
+.B Placement.
+The leader alone decides, and writes each assignment to the log, so every node
+agrees on it. The replicas of one runtime go to distinct nodes, one to the node
+that holds the fewest replicas and the lowest node id on a tie. When a node is
+declared down its replicas are moved to live nodes, and a node that comes back,
+or joins, is not given work back: nothing is rebalanced, so a running replica
+is never moved for tidiness. Asking for more replicas than there are live nodes
+runs what fits;
+.B cluster placement
+says how many replicas are unplaced. It prints the runtimes with their
+replicas, where each is placed and how many are unplaced, the nodes with the
+number of replicas each holds and, on the leader, whether the leader counts each
+up and when it last heard from it, and this node's replicas with what each is
+doing (running, waiting for a lease, failed with the reason, or blocked by a
+local runtime of the same name).
+.PP
+.B On each node,
+a reconciliation runs at the end of every Raft tick and compares what the log
+says the node owns with what it runs. It creates a replica with
+.B create \-s
+and stops, starts and removes it with
+.BR stop ,
+.B start
+and
+.BR remove :
+the same code as the CLI, and nothing else spawns a replica. A replica that
+fails to start is tried again every three seconds and its reason is logged once
+and shown by
+.BR "cluster placement" .
+A local runtime with the same name is never touched. A replica is marked
+.B [cluster]
+in
+.B ls
+and
+.B ps
+after its state,
+.B \(dqcluster\(dq:true
+in
+.BR "\-\-json" ,
+and
+.B cluster:replica
+in
+.BR stats ;
+it has no state file, so a node that restarts does not bring back what has moved
+away, and
+.BR stop ,
+.BR start ,
+.B remove
+and
+.B edit
+refuse it by name, since the next tick would undo them.
+.PP
+.B Liveness and the lease.
+A follower asks the leader, every quarter election timeout, to count it alive,
+and the leader answers when it holds a quorum. The leader declares a node down
+when it has not heard a request for
+.B \-\-raft\-down\-after
+(a new leader starts every node's clock at its own election). A node may run its
+replicas only while it holds a lease, which lasts three quarters of that time
+counted from when the request was sent, so a late answer shortens it and a
+stalled loop cannot extend it. The leader's own lease is its last look at a
+quorum. The margin between the lease and the failure timeout, a quarter of it (1 s
+by default), is what a node has to stop its replicas in before the leader gives
+them to another node. A lease that had lapsed is used again only once the node has
+applied the end of the leader's log as it stood when it was granted, so a node that
+comes back does not run a replica that moved while it was away.
+.PP
+.B Partitions and duplicates.
+A node that cannot reach a quorum stops serving its replicas within its lease
+(measured 2.9\(en3.8 s after the last answer at the defaults) and keeps them
+defined, so they start again the moment a lease is granted; the majority moves
+them after the failure timeout, at least a quarter of it later. So a minority never serves what it
+cannot confirm it owns, a minority holding the old leader included, and a healed
+node runs only what the log still gives it. The same holds for a leader that loses its quorum,
+and it means that a cluster that loses its quorum stops serving every cluster
+replica, on every node, until it has one again: the cluster chooses one copy or
+none over two. A leader change that takes longer than the lease
+(a split vote; about one in ten kills of a leader in simulation) stops a
+survivor's replicas until the new leader has granted a lease, a few hundred
+milliseconds after it is elected. The lease is enforced by the daemon's loop,
+so a daemon that is hung and not dead (SIGSTOP, a blocked disk) cannot stop
+its workers, which are separate processes; and whatever a replica does on
+its way down (a
+.B \-\-drain
+that flushes its connections) spends part of the margin.
+.PP
+.B Failover time,
+kill \-9 of a node to its replica running on a survivor, at the defaults on one
+host with a real daemon, and 60 seeds of a simulation of the same logic:
+about 3.9\(en4.3 s when the node was a follower (the failure timeout and a
+commit), about 5.1\(en6.0 s when it was the leader (an election first), and up
+to 8.7 s in the simulation when a split vote stretched the election.
+.PP
 .B Not yet:
 removing a member, snapshots sent in chunks (a snapshot goes in one frame of
-at most 16 MiB), a cluster id that keeps two clusters from mixing, and any
-state machine behind the log.
+at most 16 MiB), a cluster id that keeps two clusters from mixing, cache
+placement and promoting a follower to primary, editing a cluster runtime in
+place, moving a replica off a node before it is stopped for maintenance (a
+node stopped with SIGTERM keeps its assignments until the failure timeout), a
+worker that fences itself when its daemon is hung, and a replica that fails
+to start on one node being tried on another.
 .SH INSTALLATION
 .SS Quick Install
 .nf

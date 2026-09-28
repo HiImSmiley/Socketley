@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Cluster runtimes: on a daemon in Raft mode the cluster heals itself.**
+  `socketley cluster create server api -p 8080 --replicas 2` declares a
+  runtime once for the whole cluster; the leader places each replica on a
+  different node (fewest replicas first, lowest id on a tie) and writes the
+  assignment to the Raft log, and every node starts, stops and removes its
+  replicas through the same `create`, `start`, `stop` and `remove` an operator
+  uses. When a node dies its replicas run on survivors with no operator action:
+  measured at the defaults on one host with real daemons and `kill -9`, a
+  follower's replica was serving again on a survivor after 3.9-4.3 s, a
+  leader's after 5.1-6.0 s (an election first). Also `cluster scale <name> <n>`,
+  `cluster remove <name>` and `cluster placement`, which shows the runtimes,
+  where each is placed and what is unplaced, the leader's view of every node,
+  and this node's replicas. A server, a proxy or a client; a cache is refused
+  because nothing promotes a follower yet. `{node}` in the flags is the name of
+  the node running the replica, which is how several nodes share one host
+  (`--listen unix:/run/api-{node}.sock`). Replicas are marked `[cluster]` in
+  `ls` and `ps` (`"cluster":true` in `--json`, `cluster:replica` in `stats`),
+  have no state file, and refuse `stop`, `start`, `remove` and `edit` by name.
+  A replica count above the node count runs what fits and `placement` says how
+  many are unplaced; nothing is rebalanced when a node returns.
+- **A node serves its replicas only while it holds a lease from the leader.**
+  A follower asks for one every quarter election timeout; the leader answers
+  when it holds a quorum, and calls a node down when it has heard no request for
+  `--raft-down-after` (default four election timeouts, at least three). A lease
+  runs from when the request was sent and lasts three quarters of that time, so
+  a node the leader cannot reach stops serving a quarter of the timeout before
+  its replicas move: a minority, an isolated node and a leader that lost its
+  quorum stop, and a healed node runs only what the log still gives it. A lease
+  that had lapsed is taken up again only after the node has applied the leader's
+  log as it stood at the grant. Losing the quorum stops every cluster replica
+  on every node until there is one again. A hung daemon (not a dead one) cannot
+  stop its workers, and a leader change longer than the lease restarts the
+  survivors' replicas; both are in the manual, with what is not built yet.
+  Tested in a simulation of the real Raft core and the real placement logic
+  (300 seeds of loss, delay, one-way cuts, splits, kills and reboots in the
+  suite, 6000 run once) that checks after every tick that no runtime runs on
+  more nodes than it has replicas, and with three real daemons and `kill -9`.
 - **Streams in the cache**, wire-compatible with Redis 7.0: XADD (NOMKSTREAM,
   MAXLEN/MINID with `=` and `~`, LIMIT, `*`, `ms-*` and explicit ids), XLEN,
   XRANGE, XREVRANGE, XREAD with BLOCK, XDEL, XTRIM, XSETID, XGROUP (CREATE with
