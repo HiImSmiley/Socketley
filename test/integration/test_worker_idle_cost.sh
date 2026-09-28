@@ -195,15 +195,25 @@ lag_once() {                       # -> milliseconds, or 9999 if it never moved
 LAGS=""
 for _ in $(seq 1 10); do LAGS="$LAGS $(lag_once)"; done
 MEDIAN=$(printf '%s\n' $LAGS | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS )"
+# A lag is at least one `stats` round trip, and under Sanitize on a slow box
+# that round trip alone reached the old flat bound: medians of 103 ms failed it
+# with live figures.  So the round trip is timed, as a median of ten, and the
+# bound is on what the lag adds to it, as test_worker_stats_live.sh does.
+CLI=""
+for _ in $(seq 1 10); do
+    t0=$(date +%s%3N); conns >/dev/null
+    CLI="$CLI $(( $(date +%s%3N) - t0 ))"
+done
+CLI_MS=$(printf '%s\n' $CLI | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+echo "  lag from connection to stats reporting it: median ${MEDIAN} ms ($LAGS ), one stats round trip ${CLI_MS} ms"
 
-# 100 ms is ten times the worst correct reading and under half the median a 250
-# ms publish produces, because this separates two mechanisms rather than timing
-# a fast path.
-if [ "$MEDIAN" -le 100 ] 2>/dev/null; then
-    ok "a new connection is visible in ${MEDIAN} ms (bound 100; a 250 ms publish reads ~200)"
+# 100 ms past one round trip is ten times the worst correct reading and under
+# half what a 250 ms publish adds, because this separates two mechanisms rather
+# than timing a fast path.
+if [ "$MEDIAN" -le $(( CLI_MS + 100 )) ] 2>/dev/null; then
+    ok "a new connection is visible in ${MEDIAN} ms (bound ${CLI_MS} + 100; a 250 ms publish reads ~200 more)"
 else
-    bad "a new connection took ${MEDIAN} ms to become visible, over the bound of 100." \
+    bad "a new connection took ${MEDIAN} ms to become visible, over the bound of ${CLI_MS} + 100." \
         " Publishing less often is the cheap way to pass sections 1-3, and this"
     echo "         is what it costs.  See runtime_instance::worker_figures()."
 fi
