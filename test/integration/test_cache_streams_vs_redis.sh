@@ -122,8 +122,10 @@ def norm(v):
                 out += [v[i], '<t>']; i += 2; continue
             out.append(norm(v[i])); i += 1
         return out
+    # An id made from the clock has a sequence that says only whether the
+    # call before it fell in the same millisecond, so neither half compares.
     if isinstance(v, str) and MS_ID.match(v):
-        return '<ms>-' + v.split('-')[1]
+        return '<ms>-<seq>'
     return v
 
 def pend(v):
