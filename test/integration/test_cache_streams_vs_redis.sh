@@ -292,7 +292,7 @@ SCENARIOS = [
    'XCLAIM s nog carol 0 4-1', 'XCLAIM nokey g carol 0 4-1', 'XCLAIM s g carol 0 abc', 'XCLAIM s g carol 0 - 4-1',
    'XACK s g 1-1', 'XCLAIM s g dave 0 1-1', 'XCLAIM s g dave 0 1-1 FORCE JUSTID', (pend, 'XPENDING s g - + 10'),
    'XDEL s 2-1', 'XCLAIM s g dave 0 2-1', 'XPENDING s g', 'XCLAIM s g erin 0 3-1 LASTID 50-1 JUSTID', 'XINFO GROUPS s',
-   'XCLAIM s g erin 0 3-1 IDLE 1000 JUSTID', 'XPENDING s g IDLE 900 - + 10', 'XPENDING s g IDLE 5000 - + 10',
+   'XCLAIM s g erin 0 3-1 IDLE 1000 JUSTID', (pend, 'XPENDING s g IDLE 900 - + 10'), (pend, 'XPENDING s g IDLE 5000 - + 10'),
    'XCLAIM s g erin 0 3-1 IDLE -5 JUSTID', 'XINFO CONSUMERS s g', 'XCLAIM s g erin -5 3-1 JUSTID',
    'XCLAIM s g erin 0 3-1 TIME 1 JUSTID', (pend, 'XPENDING s g - + 10'),
  ]),
