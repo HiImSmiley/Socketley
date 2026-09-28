@@ -259,8 +259,9 @@ static constexpr int16_t K_INIT = -72;   // state_val, a fresh socket's counter
 
 // The sockops program, which sorts sockets at four moments: a listen or a
 // connect by one of this daemon's processes is remembered, an established
-// loopback pair to one of its ports enters the sockhash with a zeroed backlog
-// counter, and the close of such a socket deletes what it left in the maps.
+// loopback pair to one of its ports -- or in all mode from one of its connects
+// to any local listener -- enters the sockhash with a zeroed backlog counter,
+// and the close of such a socket deletes what it left in the maps.
 static int load_ops(int socks, int ports, int mine, int state, int snap, int pids,
                     bool all, uint64_t pair_bytes)
 {
@@ -310,16 +311,25 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     // by TCP before the shortcut would be read after the ones that come by it.
     a.lddw(BPF_REG_1, BPF_REG_6, offsetof(struct bpf_sock_ops, bytes_received));
     a.jnei(BPF_REG_1, 0, out);
-    a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, out);
+    a.lookup(ports, K_PORT);
     if (!all)
     {
+        a.jeqi(BPF_REG_0, 0, out);
+        a.lookup(mine, K_PEER); a.jeqi(BPF_REG_0, 0, out);
+        a.erase(mine, K_PEER);
+    }
+    else
+    {
+        // In all mode a foreign listener's child enters when a connect of ours made it.
+        a.jnei(BPF_REG_0, 0, enter);
         a.lookup(mine, K_PEER); a.jeqi(BPF_REG_0, 0, out);
         a.erase(mine, K_PEER);
     }
     a.jmp(enter);
 
-    // Active: to a port of ours, and in own mode from a connect of ours; a
-    // connect whose peer is not ours will never see passive, so drop its mark.
+    // Active: to a port of ours, and in own mode from a connect of ours; in
+    // all mode a connect of ours to any local listener enters too, and keeps
+    // its mark for that listener's passive side to find.
     a.bind(active);
     a.stw(K_PORT, BPF_REG_9);
     a.lookup(ports, K_PORT); a.jeqi(BPF_REG_0, 0, active_notours);
@@ -329,10 +339,19 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     }
     a.jmp(enter);
 
+    // In own mode a connect whose peer is not ours will never see passive, so
+    // its mark goes.
     a.bind(active_notours);
     if (!all)
+    {
         a.erase(mine, K_SELF);
-    a.jmp(out);
+        a.jmp(out);
+    }
+    else
+    {
+        a.lookup(mine, K_SELF); a.jeqi(BPF_REG_0, 0, out);
+        a.jmp(enter);
+    }
 
     // Enter: a zero backlog whose first check falls at the per-pair bound, the
     // state callback that deletes it on close, and the sockhash.
@@ -347,9 +366,12 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.movi(BPF_REG_4, BPF_ANY); a.call(BPF_FUNC_sock_hash_update);
     a.jmp(out);
 
+    // A connect of ours is marked, and asks for the state callback so a
+    // connect that never establishes still deletes its mark on close.
     a.bind(connect);
     ours();
     a.stwi(K_VAL, 1); a.update(mine, K_SELF, K_VAL, BPF_ANY);
+    set_state_cb();
     a.jmp(out);
 
     // A listener counts its port, since reuseport listeners share one, and

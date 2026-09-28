@@ -9,7 +9,8 @@
 namespace socketley {
 
 // own: only pairs whose both ends are this daemon's runtimes.
-// all: also a local client of any process connecting to a runtime's port.
+// all: also a local client of any process connecting to a runtime's port, and a
+// runtime's own connect to any local listener.
 enum class fast_lo_mode { off, own, all };
 
 // The two memory bounds, in bytes, that keep a redirected backlog from growing

@@ -20,6 +20,10 @@
 #     counts the whole exchange), or its pipelined replies out of order
 #   * all: a runtime of another daemon -- same binary, same cgroup, no
 #     --fast-lo -- taken for one of this daemon's
+#   * all: a proxy's pair to a local backend of another process (the sidecar
+#     case) left on TCP -- the backend's own socket acks the echo -- or the
+#     echo corrupted on the way
+#   * own: that backend pair put on the shortcut
 #   * own: that same client put on it anyway -- own is for pairs whose both ends
 #     are this daemon's runtimes -- or a client runtime's pair to a server
 #     runtime not put on it
@@ -58,6 +62,7 @@ CPORT=$((SL_PORT_BASE + 1811))
 PXSPLICE=$((SL_PORT_BASE + 1812))
 EPORT=$((SL_PORT_BASE + 1814))
 SPORT=$((SL_PORT_BASE + 1815))
+PXFOREIGN=$((SL_PORT_BASE + 1817))
 
 # A foreign client: pipelined SETs and GETs of 300 KB values, then the
 # sender's tcpi_bytes_acked (offset 120 of struct tcp_info).
@@ -111,6 +116,35 @@ def serve(c):
 while True:
     c, _ = srv.accept()
     threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+
+# 1 MB echoed through a proxy while the connection is held, then the
+# tcpi_bytes_acked of both ends of the proxy's pair to the backend: the
+# backend's accepted socket (source port EPORT) and the proxy's connect to it.
+cat >"$WORK/backend_probe.py" <<'PY'
+import os, re, socket, subprocess, sys, threading
+port, ep = int(sys.argv[1]), int(sys.argv[2])
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+data = os.urandom(1 << 20)
+threading.Thread(target=s.sendall, args=(data,), daemon=True).start()
+got = b""
+try:
+    while len(got) < len(data):
+        d = s.recv(1 << 20)
+        if not d: break
+        got += d
+except socket.timeout:
+    pass
+out = subprocess.run(["ss", "-tinH", "( sport = :%d or dport = :%d )" % (ep, ep)],
+                     capture_output=True, text=True).stdout.splitlines()
+acked = {}
+for i, ln in enumerate(out):
+    if not ln.startswith("ESTAB"): continue
+    side = "backend" if ln.split()[3].endswith(":%d" % ep) else "proxy"
+    m = re.search(r"bytes_acked:(\d+)", out[i + 1] if i + 1 < len(out) else "")
+    acked[side] = int(m.group(1)) if m else 0   # ss leaves a zero out
+print("ok" if got == data else "bad got=%d want=%d" % (len(got), len(data)),
+      acked.get("backend", -1), acked.get("proxy", -1))
 PY
 
 wait_port(){ local i; for i in $(seq 1 50); do python3 -c "import socket,sys;socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=1)" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
@@ -192,7 +226,25 @@ R=$(timeout 20 python3 "$WORK/echo_probe.py" "$PXSPLICE" 2>&1 || echo "hung")
 if [ "$R" = ok ]; then pass
 else fail "splice" "a proxied pair with a leg on the shortcut stays on the copy path" "probe: $R"; fi
 
-# ─── (e) own: this daemon's runtimes only ───────────────────────────────────
+# ─── (e) all: a proxy's pair to a local backend of another process ──────────
+# The backend is the python echo server, not a runtime, so its port is in no
+# map: the pair enters because the proxy's connect is this daemon's.
+if command -v ss >/dev/null 2>&1; then
+    restart "$CAPBIN" --fast-lo
+    attached
+    "$BIN" create proxy pf -p "$PXFOREIGN" --backend "127.0.0.1:$EPORT" --protocol tcp -s >/dev/null
+    wait_port "$PXFOREIGN" || true
+    R=$(timeout 20 python3 "$WORK/backend_probe.py" "$PXFOREIGN" "$EPORT" 2>&1 || echo "hung")
+    read -r VERDICT BACKEND PROXY <<<"$R"
+    if [ "$VERDICT" = ok ] && [ "${BACKEND:--1}" -ge 0 ] && [ "${BACKEND:--1}" -le 1 ] &&
+       [ "${PROXY:--1}" -ge 0 ] && [ "${PROXY:--1}" -le 1 ]; then pass
+    else fail "all: foreign backend" "a proxy's pair to a local backend of another process is on the shortcut, echo intact" \
+        "probe: $R (verdict, backend acked, proxy acked; 0..1 is the shortcut, -1 no connection)"; fi
+else
+    not_asserted "all: foreign backend" "ss not available"
+fi
+
+# ─── (f) own: this daemon's runtimes only ───────────────────────────────────
 restart "$CAPBIN" --fast-lo own
 attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null
@@ -201,6 +253,18 @@ R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
 read -r VERDICT ACKED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -gt 1000 ]; then pass
 else fail "own: foreign client" "a client of another process stays on TCP under own" "probe: $R (acked > 1000 is TCP)"; fi
+
+if command -v ss >/dev/null 2>&1; then
+    "$BIN" create proxy pf -p "$PXFOREIGN" --backend "127.0.0.1:$EPORT" --protocol tcp -s >/dev/null
+    wait_port "$PXFOREIGN" || true
+    R=$(timeout 20 python3 "$WORK/backend_probe.py" "$PXFOREIGN" "$EPORT" 2>&1 || echo "hung")
+    read -r VERDICT BACKEND PROXY <<<"$R"
+    if [ "$VERDICT" = ok ] && [ "${BACKEND:-0}" -gt 1000 ]; then pass
+    else fail "own: foreign backend" "under own a proxy's pair to a backend of another process stays on TCP" \
+        "probe: $R (backend acked > 1000 is TCP)"; fi
+else
+    not_asserted "own: foreign backend" "ss not available"
+fi
 
 if command -v ss >/dev/null 2>&1; then
     "$BIN" create server s -p "$SPORT" -s >/dev/null

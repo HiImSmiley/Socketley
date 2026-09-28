@@ -26,6 +26,11 @@
 #   * a fast pair whose reader keeps up tainted anyway, because its count was
 #     corrected too late or not at all -- red on a limiter that corrects on a
 #     timer (f6b10a60 sent 3.7 of its 4.3 GB by TCP)
+#   * a proxy's pair to a stalled local backend of another process -- which is
+#     on the shortcut because the proxy's connect is this daemon's -- left
+#     unbounded; its red is the same backend under a 64 MiB bound holding more
+#     than TCP gives a reader that never read (tcp_rmem default), which shows the
+#     pair was on the shortcut at all
 #
 # The bound cases need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
 # with `sudo -n setcap`; without sudo they are skipped.
@@ -52,10 +57,40 @@ fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "
 daemon_isolate fastlolim
 WORK=$(mktemp -d /tmp/socketley-fastlolim-work-XXXXXX)
 daemon_watch "$WORK"
-cleanup(){ daemon_stop; rm -rf "$WORK"; }
+SINKPID=""
+cleanup(){ [ -n "$SINKPID" ] && { kill -9 "$SINKPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1831))
+PXPORT=$((SL_PORT_BASE + 1836))
+SINKPORT=$((SL_PORT_BASE + 1837))
+
+# A local backend of another process that accepts and never reads.
+cat >"$WORK/sink.py" <<'PY'
+import socket, sys
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(8)
+held = []
+while True:
+    c, _ = l.accept(); held.append(c)
+PY
+
+# Pushes through a proxy for 2 s and samples the backend's rmem (its accepted
+# socket, source port SINKPORT), which includes the psock backlog.
+cat >"$WORK/push.py" <<'PY'
+import socket, subprocess, sys, time
+pp, ep = int(sys.argv[1]), int(sys.argv[2])
+s = socket.create_connection(("127.0.0.1", pp), timeout=10); s.setblocking(False)
+buf = b"y" * 65536; peak = 0; t0 = time.time(); last = 0
+def rmem():
+    out = subprocess.run(["ss", "-tmnH", "( sport = :%d )" % ep], capture_output=True, text=True).stdout
+    return max([int(x.split("skmem:(r", 1)[1].split(",", 1)[0]) for x in out.splitlines() if "skmem:(r" in x] or [0])
+while time.time() - t0 < 2:
+    try: s.send(buf)
+    except BlockingIOError: time.sleep(0.001)
+    if time.time() - last > 0.05: peak = max(peak, rmem()); last = time.time()
+print("peak_mib=%.2f" % (peak / 1048576.0))
+PY
 
 # A stalled reader: pipeline GETs of a big value and never read the replies;
 # sample our own socket's rmem (which includes the psock backlog on this
@@ -213,6 +248,25 @@ R=$(python3 "$WORK/fast.py" "$CPORT")
 read -r MV AK RC <<<"$R"
 if [ "${MV#moved_mib=}" -gt 256 ] && [ "${AK#acked=}" -le 1 ] && [ "${RC#rcvd=}" = 0 ]; then pass
 else fail "fast pair" "a reader that keeps up keeps its pair on the shortcut (nothing received by TCP)" "probe: $R (moved>256 MiB, acked<=1, rcvd=0)"; fi
+
+# ─── (f) a proxy's pair to a stalled local backend of another process ───────
+python3 "$WORK/sink.py" "$SINKPORT" >/dev/null 2>&1 & SINKPID=$!; disown
+wait_port "$SINKPORT" || true
+restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,64
+attached
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$SINKPORT" --protocol tcp -s >/dev/null
+wait_port "$PXPORT" || true
+BOUNDED=$(python3 "$WORK/push.py" "$PXPORT" "$SINKPORT"); BV=${BOUNDED#peak_mib=}
+
+restart "$CAPBIN" --fast-lo all --fast-lo-limit 64,256
+attached
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$SINKPORT" --protocol tcp -s >/dev/null
+wait_port "$PXPORT" || true
+OPEN=$(python3 "$WORK/push.py" "$PXPORT" "$SINKPORT"); OV=${OPEN#peak_mib=}
+
+if awk "BEGIN{exit !($BV <= 6 && $OV > 12)}"; then pass
+else fail "foreign backend bound" "a stalled backend of another process stays near the 4 MiB bound, and holds past TCP's buffer under 64" \
+    "bounded=$BV MiB open=$OV MiB (bounded<=6 and open>12)"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ]

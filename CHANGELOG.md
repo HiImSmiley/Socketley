@@ -138,6 +138,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   branches on what happened; and `socketley.pipe` across two runtimes and
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
+- **`--fast-lo all` also takes a runtime's own connections to local
+  services:** a connect one of the daemon's workers makes to any listener on
+  127.0.0.1 -- a tcp proxy with `--backend 127.0.0.1:8080` in front of a local
+  application, a client runtime, a Lua HTTP call -- puts both ends on the
+  shortcut, the foreign listener's end found by the connect's mark. `own` is
+  unchanged. The per-pair and global bounds cover these pairs as any other: a
+  proxy's pair to a local backend that stopped reading held 4.3 MiB under the
+  default bound. A tcp proxy in front of a local C echo backend, 3 alternating
+  passes, round trips per second without the shortcut / with only the client
+  leg on it (before) / with both legs: 64 B one connection 37-42K / 44-55K /
+  63-80K, 32 connections 66-101K / 78-132K / 120-176K; 16 KB one connection
+  28-30K / 29-34K / 34-39K, 32 connections 37-68K / 44-77K / 69-97K. A connect
+  that never establishes now deletes its mark on close, where it used to stay
+  in the map for the daemon's life. A process that reads a socket on the
+  shortcut with `splice(2)` -- a Go relay using `io.Copy` between two TCP
+  connections, HAProxy with splicing -- never sees those bytes; under `all`
+  that now includes a local backend a runtime connects to, so such a setup
+  wants `own`.
 
 ### Changed
 

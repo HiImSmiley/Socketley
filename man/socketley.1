@@ -243,8 +243,15 @@ TCP/IP, the loopback device and its softirq. Off unless given.
 .IP
 .B all
 (the default when no mode is given) takes any local client connecting to a port
-one of this daemon's runtimes listens on, as well as the runtimes among
-themselves.
+one of this daemon's runtimes listens on, the runtimes among themselves, and
+every connection a runtime makes to a listener on 127.0.0.1 whoever owns it: a
+proxy with
+.B \-\-backend 127.0.0.1:8080
+in front of a local application, a client runtime or a Lua HTTP call to a local
+service. A tcp proxy in front of a local C echo backend, 3 alternating passes:
+64 B round trips 37\(en42K/s without it and 63\(en80K/s with it (44\(en55K/s
+when only the client leg was taken), 32 connections 66\(en101K/s and
+120\(en176K/s; 16 KB 28\(en30K/s and 34\(en39K/s.
 .B own
 takes only pairs whose both ends are this daemon's runtimes, such as a client
 runtime connected to a server runtime; a proxy already reaches a local runtime's
@@ -327,6 +334,19 @@ The proxy's
 .B SOCKETLEY_PROXY_SPLICE
 path reads a queue a socket on the shortcut does not fill, so a proxied pair
 with a 127.0.0.1 leg stays on the copy path while it is on.
+.IP \(bu 2
+The same holds for any other process: one that reads a socket on the shortcut
+with
+.BR splice (2)
+waits for bytes that never reach the queue splice reads. That is a relay copying
+between two TCP connections with Go's
+.BR io.Copy ,
+or HAProxy with splicing on. Under
+.B all
+such a process is reached as a client of a runtime's port and as a local
+backend a runtime connects to; use
+.B own
+where one sits on either end.
 .RE
 .RS
 .PP
