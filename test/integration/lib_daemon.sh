@@ -53,7 +53,9 @@ daemon_watch() {
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
             [ "$p" = "$$" ] && continue
-            { tr "\0" "\n" <"$d/environ"; } 2>/dev/null | grep -q "^SOCKETLEY_SOCKET=$tmpd/" || continue
+            # A binary with file capabilities hides its environ, not its argv[0].
+            { tr "\0" "\n" <"$d/environ"; } 2>/dev/null | grep -q "^SOCKETLEY_SOCKET=$tmpd/" ||
+                { head -z -n1 "$d/cmdline" | tr -d "\0"; } 2>/dev/null | grep -q "^$tmpd/" || continue
             kill -9 "$p" 2>/dev/null && killed=1
         done
         # Only after a kill: a test that ended through its own trap may keep what it chose to.
