@@ -6,9 +6,9 @@
 # With --fast-lo a send on a 127.0.0.1 pair is placed straight into the peer's
 # receive queue, so the bytes never pass through TCP: the sender's
 # tcpi_bytes_acked stays at the 1 its SYN took.  That counter is how this file
-# tells a pair on the shortcut from one off it.  The proxy's splice path and
-# kernel relay read the TCP receive queue, which a socket on the shortcut does
-# not fill, so a pair with a leg on it must stay on the copy path.
+# tells a pair on the shortcut from one off it.  The proxy's splice path reads
+# the TCP receive queue, which a socket on the shortcut does not fill, so a
+# pair with a leg on it must stay on the copy path.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
@@ -23,8 +23,8 @@
 #   * own: that same client put on it anyway -- own is for pairs whose both ends
 #     are this daemon's runtimes -- or a client runtime's pair to a server
 #     runtime not put on it
-#   * splice or the kernel relay taking a pair with a leg on the shortcut, which
-#     loses the bytes and hangs the exchange
+#   * splice taking a pair with a leg on the shortcut, which loses the bytes and
+#     hangs the exchange
 #
 # The last three need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
 # with `sudo -n setcap`; without sudo they are skipped.
@@ -56,7 +56,6 @@ trap cleanup EXIT
 
 CPORT=$((SL_PORT_BASE + 1811))
 PXSPLICE=$((SL_PORT_BASE + 1812))
-PXRELAY=$((SL_PORT_BASE + 1813))
 EPORT=$((SL_PORT_BASE + 1814))
 SPORT=$((SL_PORT_BASE + 1815))
 
@@ -179,7 +178,7 @@ read -r VERDICT ACKED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -gt 1000 ]; then pass
 else fail "all: another daemon" "a daemon without --fast-lo, same binary, same cgroup, stays on TCP" "probe: $R (acked > 1000 is TCP)"; fi
 
-# ─── (d) splice and the kernel relay stay off a pair on the shortcut ───────
+# ─── (d) splice stays off a pair on the shortcut ────────────────────────────
 python3 "$WORK/echo_server.py" "$EPORT" >/dev/null 2>&1 & ECHOPID=$!; disown
 wait_port "$EPORT" || true
 
@@ -192,16 +191,6 @@ wait_port "$PXSPLICE" || true
 R=$(timeout 20 python3 "$WORK/echo_probe.py" "$PXSPLICE" 2>&1 || echo "hung")
 if [ "$R" = ok ]; then pass
 else fail "splice" "a proxied pair with a leg on the shortcut stays on the copy path" "probe: $R"; fi
-
-export SOCKETLEY_PROXY_SOCKMAP=1
-restart "$CAPBIN" --fast-lo
-unset SOCKETLEY_PROXY_SOCKMAP
-attached
-"$BIN" create proxy pr -p "$PXRELAY" --backend "127.0.0.1:$EPORT" --protocol tcp -s >/dev/null
-wait_port "$PXRELAY" || true
-R=$(timeout 20 python3 "$WORK/echo_probe.py" "$PXRELAY" 2>&1 || echo "hung")
-if [ "$R" = ok ]; then pass
-else fail "kernel relay" "a proxied pair with a leg on the shortcut stays out of the relay" "probe: $R"; fi
 
 # ─── (e) own: this daemon's runtimes only ───────────────────────────────────
 restart "$CAPBIN" --fast-lo own

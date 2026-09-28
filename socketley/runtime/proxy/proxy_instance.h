@@ -20,7 +20,6 @@
 #include "../../shared/trace.h"
 #include "../../shared/invariants.h"
 #include "../../shared/http_framing.h"
-#include "../../shared/sockmap_relay.h"
 
 struct runtime_endpoint;
 
@@ -119,14 +118,6 @@ struct alignas(64) proxy_client_connection
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
-    // This pair's bytes move inside the kernel, so no read or splice is armed
-    // and only the abort poll watches the socket.
-    bool sockmap_active{false};
-    // The client half-closed on a kernel-relayed pair, so the sweep may pass
-    // the FIN on once the backend has sent everything the client sent.
-    bool sockmap_client_eof{false};
-    // The backend half-closed on a kernel-relayed pair, its mirror.
-    bool sockmap_backend_eof{false};
     bool header_parsed{false};
     bool response_started{false};
     bool client_conn_close{false};  // client sent Connection: close
@@ -203,14 +194,6 @@ struct alignas(64) proxy_client_connection
     // same ban list, because a filter that could remove Content-Length would
     // change how the message is framed.
     std::vector<std::string> filter_removed_headers;
-
-    // Each direction's counters when this pair entered the kernel relay, which
-    // the FIN drain, the backlog bound and the teardown byte count read against.
-    socketley::sockmap_relay::direction_base sockmap_up{};
-    socketley::sockmap_relay::direction_base sockmap_down{};
-    // Bytes relayed both ways at the last sweep, so a kernel-relayed pair that
-    // moved bytes counts as active for --idle-timeout.
-    uint64_t sockmap_seen{0};
 
     std::chrono::steady_clock::time_point last_activity{};
     int retries_remaining{0};
@@ -312,12 +295,6 @@ struct alignas(64) proxy_backend_connection
     bool splice_active{false};
     bool splice_in_pending{false};
     bool splice_out_pending{false};
-    // See the client side: this backend's bytes move inside the kernel.
-    bool sockmap_active{false};
-    // A poll for POLLERR|POLLHUP|POLLRDHUP on the backend of a kernel-relayed
-    // pair, the mirror of the client's abort watch, because with no armed read
-    // nothing else reports the backend's reset or half-close.
-    bool abort_watch_pending{false};
     // The response is finished and this connection is on its way to the pool
     // with a cancelled read still owed, so nothing may touch the fd until that
     // completion lands.
@@ -354,8 +331,6 @@ struct alignas(64) proxy_backend_connection
     // === WARM fields ===
     io_request splice_in_req;
     io_request splice_out_req;
-    // The backend abort watch's request, see abort_watch_pending.
-    io_request abort_req;
     // Where the record layer puts decrypted plaintext on the way to the
     // client, unused on a cleartext backend, which forwards straight out of
     // the read buffer.
@@ -798,33 +773,6 @@ private:
     // per idle connection.
     bool arm_splice_in_poll(int src_fd, io_request* req);
 
-    // Move a plain TCP pair into the kernel relay, false when it cannot (not
-    // enabled, TLS, a hook, or the load failed) so the caller uses the copy
-    // path.  Returns true once the pair is entering, including the deferred
-    // case where saved bytes are still draining to the backend.
-    bool try_enter_sockmap(proxy_client_connection* conn, proxy_backend_connection* bconn);
-    // The actual map insertion and abort-poll arming, once the backend queue is
-    // empty; false leaves the pair on the copy path.
-    bool enter_sockmap_now(proxy_client_connection* conn, proxy_backend_connection* bconn);
-    // Take a pair back out of the kernel path and drop it from m_sockmap_pairs;
-    // reads are not re-armed because teardown or the copy path follows.
-    void leave_sockmap(proxy_client_connection* conn);
-    // Arm the backend's POLLERR|POLLHUP|POLLRDHUP watch, the mirror of the
-    // client's, false on refusal.
-    bool arm_backend_abort(proxy_backend_connection* bconn);
-    // Pass on a kernel-relayed pair's held FIN(s) once each direction has
-    // drained, and tear the pair down once both FINs are through.
-    void sockmap_try_advance(proxy_client_connection* conn, proxy_backend_connection* bconn);
-    // Walk the kernel-relayed pairs from the 250 ms sweep: pass on a held FIN
-    // once its direction has drained, and pull a pair off the kernel path when
-    // its backlog passes the copy path's write bound so backpressure applies.
-    void sockmap_backlog_sweep();
-    // Charge a kernel-relayed pair's bytes, read from TCP_INFO, to the byte
-    // counters the redirect never touched, once at teardown.
-    void sockmap_account_at_close(int client_fd, int backend_fd);
-    // The backend side of op_poll_abort on a kernel-relayed pair.
-    void handle_backend_abort(struct io_uring_cqe* cqe, io_request* req);
-
     // Both take the endpoint as well as the index, and `want_tls` is part of
     // the key rather than a preference, because an encrypted socket handed a
     // plaintext request sends it as an unreadable record.
@@ -1245,15 +1193,6 @@ private:
     bool m_splice_supported{false};
     // And it is switched on for this instance, off by default.
     bool m_splice_enabled{false};
-
-    // The in-kernel TCP relay, off by default and shared by every pair on this
-    // instance; null until SOCKETLEY_PROXY_SOCKMAP asks for it and it loads.
-    std::unique_ptr<socketley::sockmap_relay> m_sockmap;
-    bool m_sockmap_enabled{false};
-    bool m_sockmap_warned{false};
-    // Pairs the kernel is relaying, one client fd each, walked by the 250 ms
-    // sweep for backlog and half-close because these legs have no armed read.
-    std::vector<int> m_sockmap_pairs;
 
     // Connection pool for backend reuse (avoids connect() per request)
     static constexpr size_t MAX_POOL_PER_BACKEND = 32;

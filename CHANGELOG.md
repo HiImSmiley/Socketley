@@ -32,46 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **SDK:** `cache_store` holds streams (`stream_get`, `stream_find`,
   `stream_make`, `stream_admit`, `stream_change`) as `stream_log`, which is
   usable on its own from `socketley/runtime/cache/stream_log.h`.
-- **A TCP proxy can relay a pair's bytes inside the kernel** with
-  `SOCKETLEY_PROXY_SOCKMAP=1`. Once a plain `--protocol tcp` pair is
-  established, both sockets go into a BPF sockhash and an `sk_skb`
-  stream-verdict program redirects bytes from each socket to the other, so
-  steady-state relaying needs no userspace read, copy or send per message. The
-  proxy still does accept, backend selection, connect and teardown. Needs
-  `CAP_BPF` and `CAP_NET_ADMIN` (`setcap cap_bpf,cap_net_admin+ep` on the
-  binary); without them, or on any load or attach failure, the proxy logs once
-  and uses the copy path. The program is hand-assembled and loaded with a raw
-  `bpf(2)`, so there is no build or runtime dependency on clang or libbpf.
-  Ignored when `SOCKETLEY_PROXY_SPLICE` is on. TLS pairs, unix-socket pairs and
-  pairs with an `on_proxy_request`/`on_proxy_response` hook always stay on the
-  copy path. Because the redirected bytes never enter userspace, the kernel
-  buffers a slow reader's backlog with no bound of its own, and unlike the copy
-  path the kernel path cannot pace: removing a socket from the map drops
-  whatever is queued in the redirect's own backlog (measured, 1.5 MB of 4 MB
-  lost), so there is no lossless way to hand a backed-up pair to the copy path.
-  The 250 ms sweep therefore drops a pair whose in-kernel backlog passes the
-  `--write-buffer` bound -- the same terminal answer the copy path gives when
-  its write queue passes that bound. The cap is coarse: between two sweeps a
-  stalled reader lets through roughly the interval times the link, so it holds
-  at about that plus `--write-buffer`, not at `--write-buffer`. A half-close is held until
-  its direction has drained, since a FIN issued early overtakes redirected
-  bytes the kernel has not yet sent. Byte counters do not see redirected bytes
-  as they move; the kernel-moved total is read from `TCP_INFO` and added to
-  `bytes_in`/`bytes_out` at teardown, and message counts exclude redirected
-  messages. Measured interleaved against HAProxy (loopback, 3 pairs, 4 passes,
-  ratio = socketley rate / HAProxy rate; sk_cores = socketley CPU cores): the
-  win is small messages, where the copy path's per-message read/send is what the
-  kernel now skips. TCP-64 1.12x copy vs 1.26x sockmap; TCP-16K 1.22x vs 1.52x.
-  socketley's own process falls from ~0.52 cores to ~0.00, but the work does
-  not disappear: every redirected skb is sent from the psock backlog workqueue,
-  one kworker hop per skb, so it moves into kernel threads. Counted over the
-  whole machine the system CPU changed by -12% at 64 B, -2% at 64 KB and +50%
-  at 32 connections. It does not pay for bulk or fan-out: TCP-64K 1.33x copy vs
-  1.19x sockmap and TCP-c32 1.17x vs 0.89x, where the workqueue hop moves fewer
-  bytes per second than batched copies do. So the kernel path wins on a single
-  connection of small messages and loses on concurrent traffic; it stays
-  opt-in.
-
 - **`socketley daemon --fast-lo [own|all]`** puts TCP pairs whose both ends
   are 127.0.0.1 on a kernel shortcut: a BPF sockops program enters both
   sockets in a sockhash when the connection is established, and an `sk_msg`
@@ -95,9 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   netfilter, conntrack and the loopback device, so nftables rules on `lo` and
   `tcpdump -i lo` do not see those bytes. A socket that sent a byte by TCP
   stays on TCP for its lifetime, so order is kept when one end enters late.
-  The proxy's splice and kernel-relay paths read a queue a socket on the
-  shortcut does not fill, so a proxied pair with a 127.0.0.1 leg stays on the
-  copy path while `--fast-lo` is on.
+  The proxy's splice path reads a queue a socket on the shortcut does not
+  fill, so a proxied pair with a 127.0.0.1 leg stays on the copy path while
+  `--fast-lo` is on.
 
 ### Changed
 
