@@ -246,6 +246,18 @@ inline socklen_t fill_addr(std::string_view path, struct sockaddr_un& out)
                                   path.size() + 1);
 }
 
+// The send buffer of every data-path unix stream socket, accepted or dialed,
+// which the kernel doubles to a 1 MiB ceiling on unsent bytes.
+inline constexpr int stream_sndbuf = 512 * 1024;
+
+// Called on each such socket because an accepted one does not inherit its
+// listener's buffers and only the sender's SO_SNDBUF throttles unix stream.
+inline void tune_stream(int fd)
+{
+    const int v = stream_sndbuf;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v)) < 0) {}
+}
+
 // fd >= 0 is a listening socket the caller owns and must unlink on teardown;
 // fd < 0 carries the reason for the caller to prefix and log.
 struct bind_result

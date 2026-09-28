@@ -2019,6 +2019,28 @@ which this flag refuses \(em see below \(em so a runtime on a unix socket is
 one core. Reach for it for a local sidecar, and for TCP with shards when one
 core is not enough.
 .PP
+.B Every unix stream socket on the data path has a 1 MiB send buffer.
+That is each one accepted off a
+.B \-\-listen unix:
+node or a companion node, the one a proxy dials to a
+.BI \-\-backend " unix:"
+or to a local runtime's node, and the one a client dials with
+.BR "\-t unix:" .
+On a unix stream socket the sender's buffer is the whole of the flow control,
+an accepted socket inherits nothing from its listener, and the kernel's default
+is 208 KB. socketley asks
+for 512 KiB, which the kernel doubles; the request is capped at
+.IR net.core.wmem_max ,
+which is 212992 on a stock kernel, so there the buffer is 416 KB. Measured on
+one connection of pipelined 64 KB GETs: a reader that pays for each read (a
+Python client reading 4 MiB at a time) went from 2.2 to 3.0 GB/s, with the
+cache spending 41% less CPU per byte; a TCP proxy in front of a local cache,
+reaching it over its node, 10% more; a reader that reads cheaply was already
+at about 10 GB/s, bound by the cache's core, and is unchanged, as are small
+requests. It is a ceiling and not an allocation: an idle connection holds
+nothing in it, and a connection whose reader has stopped holds at most 1 MiB in
+the kernel, where it held 208 KB.
+.PP
 Mutually exclusive with
 .BR \-p ,
 with

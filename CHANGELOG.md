@@ -79,6 +79,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Unix stream sockets get a 1 MiB send buffer** (512 KiB asked, doubled by
+  the kernel, capped at `net.core.wmem_max`): every socket accepted off
+  `--listen unix:` or a companion node by a server, cache or proxy, a proxy's
+  connection to a `--backend unix:` or a local runtime's node, and a client's
+  `-t unix:`. The sender's buffer is all the flow control a unix stream has,
+  and an accepted one inherits nothing from its listener, so these ran at the
+  208 KB default. One connection of pipelined 64 KB GETs, both builds up at
+  once and alternating: a Python reader taking 4 MiB a read 2.21–2.33 →
+  2.88–3.09 GB/s (1.32×, per-pass 1.27–1.38, n=11) with the cache worker at
+  0.57 → 0.44 cores, 41% less CPU per byte; a TCP proxy in front of a cache
+  reached over its node 3.21–3.82 → 3.53–4.26 GB/s (1.10×, 1.00–1.27, n=11);
+  a proxy on `--listen unix:` 1.10× (0.86–1.38). A C reader and a Python
+  reader taking 64 KB a read were at ~10 GB/s with the worker's core as the
+  ceiling, and stay there (1.02×, 1.05×). `redis-benchmark -c 50 --threads 4`
+  GET and SET at `-P 1` and `-P 16`: 0.96–1.00× per-pass medians, inside one
+  tick of its ~0.125 s completion check. 512 KiB is the knee: 256 KiB gave less than
+  half the gain and 1–4 MiB none more. Memory: 1000 idle connections
+  hold 0 bytes of send buffer either way and the worker's RSS is unchanged; a
+  connection whose reader stopped holds 1.07 MB in the kernel instead of
+  223 KB. The server's per-accept 128 KB `SO_RCVBUF` on unix clients is gone:
+  a unix stream receiver's buffer does not limit anything (4 KB and 4 MB read
+  the same).
 - XACK finds a pending entry through a hash index instead of walking an
   ordered tree of every pending entry: 50% more XACKs on a group with
   200,000 pending (level with Redis before, 1.48× after), at about 20 bytes

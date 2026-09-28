@@ -3268,16 +3268,8 @@ bool server_instance::adopt_client(int client_fd, bool from_unix)
 
     // Nothing for a TCP client: setup_tcp_listener() carries TCP_NODELAY, the
     // keepalive trio and the receive buffer, and accept clones all of them.
-    //
-    // A unix client is not the same and keeps its own call: an accepted
-    // AF_UNIX socket takes the DEFAULT receive buffer whatever its listener
-    // holds -- measured, 212992 either way -- so this is the one of the six
-    // that a unix listener cannot hand down.
     if (from_unix)
-    {
-        int rcvbuf = 131072;  // 128KB, fewer kernel-to-user copies
-        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {}
-    }
+        socketley::unix_sock::tune_stream(client_fd);
 
     auto conn = pool_acquire(client_fd);
     // Grown on demand: eight kilobytes charged at accept, before the client

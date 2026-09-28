@@ -1577,6 +1577,8 @@ bool cache_instance::adopt_client(int client_fd, bool from_cluster, bool from_un
         // subscriber table -- for ever.
         socket_tuning::keepalive_dead_peer(client_fd);
     }
+    else
+        socketley::unix_sock::tune_stream(client_fd);
 
     stat_add(m_stat_total_connections, 1);
 

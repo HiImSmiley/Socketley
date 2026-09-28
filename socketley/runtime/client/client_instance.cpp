@@ -118,6 +118,7 @@ bool client_instance::try_connect()
         m_conn->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (m_conn->fd < 0)
             return false;
+        socketley::unix_sock::tune_stream(m_conn->fd);
 
         struct sockaddr_un uaddr{};
         const socklen_t ulen = socketley::unix_sock::fill_addr(upath, uaddr);

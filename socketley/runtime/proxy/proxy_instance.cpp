@@ -2852,10 +2852,10 @@ void proxy_instance::handle_accept(struct io_uring_cqe* cqe)
             }
         }
 
-        // Nothing here any more: the listener carries all seven, and accept
-        // hands them down.  A client accepted off a unix listener never had
-        // them -- everything tune_socket sets is TCP-level -- and still does
-        // not.
+        // A TCP client needs nothing here, because the listener carries all
+        // seven and accept hands them down.
+        if (!m_bound_listen_path.empty())
+            socketley::unix_sock::tune_stream(client_fd);
 
         // Auth check: reject before allocating connection state
         if (!invoke_on_auth(client_fd))
@@ -6172,10 +6172,11 @@ bool proxy_instance::connect_to_backend(proxy_client_connection* conn, const bac
         return false;
     }
 
-    // Everything tune_socket sets is TCP-level, so on another family it would
-    // be four failing setsockopts per connect spent on nothing.
+    // tune_socket is TCP's, and a unix backend takes the unix send buffer instead.
     if (addr.ss_family == AF_INET)
         tune_socket(bfd);
+    else
+        socketley::unix_sock::tune_stream(bfd);
 
     // Try a synchronous connect first, which on loopback often succeeds
     // instantly, falling back to the async io_uring connect on EINPROGRESS.
