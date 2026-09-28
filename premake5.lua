@@ -1249,6 +1249,29 @@ project "fuzz_ws_frame"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: the Raft wire codec and the frame splitting in front of it ───
+--
+-- Reachable by whoever can open a TCP connection to --raft-listen, before the
+-- sender is known to be a member.  Two translation units of the tree and no
+-- libraries, so it is as cheap as the parser targets.
+
+project "fuzz_raft_msg"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_raft_msg.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/raft_codec.cpp",
+        "socketley/shared/raft.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: cache_store as an operation sequence ───
 --
 -- Not a parser target.  It decodes the fuzzer's bytes into a program —
@@ -1651,7 +1674,8 @@ project "test_raft"
     files {
         "test/unit/test_raft.cpp",
         "socketley/shared/raft.cpp",
-        "socketley/shared/raft.h"
+        "socketley/shared/raft.h",
+        "socketley/shared/raft_codec.cpp"
     }
 
     filter "configurations:Debug"

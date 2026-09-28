@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "../../socketley/shared/raft.h"
+#include "../../socketley/shared/raft_codec.h"
 
 #include <algorithm>
 #include <chrono>
@@ -591,8 +592,18 @@ private:
         }
     }
 
-    void send(const raft::message& m)
+    void send(const raft::message& sent)
     {
+        // Every message crosses the wire codec, so the sweep proves the encoding along with the core.
+        raft::message m;
+        std::string why;
+        const std::string payload = raft::wire::encode(sent);
+        raft::wire::frame f;
+        if (!raft::wire::decode(payload, f, &why) || f.kind != raft::wire::kind::message || !raft::wire::same(sent, f.msg))
+            return fail("wire codec", std::string(type_name(sent.type)) + " from node " + std::to_string(sent.from)
+                        + " did not survive encoding: " + (why.empty() ? "decoded to something else" : why));
+        m = std::move(f.msg);
+
         if (m_rng.permille(m_p.loss))
         {
             ++m_stats.dropped;

@@ -2214,6 +2214,88 @@ def eventloop_seeds():
     return s
 
 
+# ─────────────────────────────── Raft wire ───────────────────────────────────
+# socketley/shared/raft_codec.cpp, re-stated here so a seed is an independent
+# statement of the format rather than a copy of whatever the encoder does.
+
+RAFT_TYPES = ["pre_vote", "pre_vote_resp", "vote", "vote_resp", "append", "append_resp",
+              "heartbeat", "heartbeat_resp", "snapshot", "read_index", "read_index_resp",
+              "timeout_now"]
+
+
+def rw_bytes(b):
+    return struct.pack("<I", len(b)) + b
+
+
+def rw_ids(ids):
+    return struct.pack("<I", len(ids)) + b"".join(struct.pack("<Q", i) for i in ids)
+
+
+def raft_msg(kind, frm=1, to=2, term=3, index=0, log_term=0, commit=0, reject=False,
+             hint_index=0, hint_term=0, context=0, entries=(), snap=None):
+    out = struct.pack("<BBB", 1, 1, RAFT_TYPES.index(kind))
+    out += struct.pack("<QQQQQQ", frm, to, term, index, log_term, commit)
+    out += struct.pack("<B", 1 if reject else 0)
+    out += struct.pack("<QQQ", hint_index, hint_term, context)
+    out += struct.pack("<I", len(entries))
+    for (eterm, eindex, etype, data) in entries:
+        out += struct.pack("<QQB", eterm, eindex, etype) + rw_bytes(data)
+    if snap is None:
+        out += b"\x00"
+    else:
+        (sindex, sterm, voters, learners, data) = snap
+        out += b"\x01" + struct.pack("<QQ", sindex, sterm) + rw_ids(voters) + rw_ids(learners) + rw_bytes(data)
+    return out
+
+
+def raft_hello(node, name, addr):
+    return struct.pack("<BBQ", 1, 2, node) + rw_bytes(name) + rw_bytes(addr)
+
+
+def raft_join(node, name, addr, voter=True):
+    return struct.pack("<BBQ", 1, 3, node) + rw_bytes(name) + rw_bytes(addr) + struct.pack("<B", 1 if voter else 0)
+
+
+def ipc(payload):
+    return b"\x00" + struct.pack("<I", len(payload)) + payload
+
+
+def raftmsg_seeds():
+    s = {}
+    config = struct.pack("<QQQ", 1, 2, 3) + struct.pack("<QQ", 0, 4)
+    msgs = {
+        "prevote": raft_msg("pre_vote", term=5, index=10, log_term=4),
+        "vote_transfer": raft_msg("vote", term=5, index=10, log_term=4, context=1),
+        "vote_resp_reject": raft_msg("vote_resp", reject=True),
+        "append_empty": raft_msg("append", index=7, log_term=2, commit=6, context=9),
+        "append_three": raft_msg("append", index=7, log_term=2, commit=6, entries=[
+            (3, 8, 1, b""), (3, 9, 0, b"payload"), (3, 10, 2, config)]),
+        "append_resp_hint": raft_msg("append_resp", reject=True, index=9, hint_index=5, hint_term=2),
+        "heartbeat": raft_msg("heartbeat", commit=12, context=4),
+        "snapshot": raft_msg("snapshot", snap=(40, 3, [1, 2, 3], [4], b"book")),
+        "read_index": raft_msg("read_index", context=77),
+        "read_index_resp": raft_msg("read_index_resp", index=40, context=77),
+        "timeout_now": raft_msg("timeout_now"),
+        "hello": raft_hello(0x1122334455667788, b"node-a", b"127.0.0.1:19999"),
+        "join_voter": raft_join(0x99, b"node-d", b"127.0.0.1:19998"),
+        "join_learner": raft_join(0x99, b"node-d", b"127.0.0.1:19998", voter=False),
+    }
+    for label, payload in msgs.items():
+        s["one_" + label] = b"\x00" + payload
+    # Refusals: each must be rejected, and none may crash.
+    s["bad_version"] = b"\x00" + b"\x02" + msgs["heartbeat"][1:]
+    s["trailing_byte"] = b"\x00" + msgs["heartbeat"] + b"\x00"
+    s["torn_append"] = b"\x00" + msgs["append_three"][:-5]
+    s["snapshot_on_append"] = b"\x00" + raft_msg("append", snap=(1, 1, [1], [], b""))
+    s["entries_out_of_order"] = b"\x00" + raft_msg("append", index=7, entries=[(3, 9, 0, b"")])
+    s["huge_entry_count"] = b"\x00" + msgs["heartbeat"][:-5] + struct.pack("<I", 0xFFFFFFFF) + b"\x00"
+    # Streams, as the host's read path splits them.
+    s["stream_hello_then_append"] = b"\x01" + ipc(msgs["hello"]) + ipc(msgs["append_three"])
+    s["stream_torn_second"] = b"\x01" + ipc(msgs["hello"]) + ipc(msgs["heartbeat"])[:-3]
+    s["stream_oversize_length"] = b"\x01" + b"\x00" + struct.pack("<I", 0x7FFFFFFF)
+    return s
+
+
 # ─────────────────────────────────── driver ──────────────────────────────────
 
 
@@ -2233,6 +2315,7 @@ KEPT_BUDGET = {
     "client": 8,       # 0 kept
     "proxy": 8,        # 0 kept
     "proxytunnel": 8,  # 0 kept
+    "raftmsg": 8,      # 0 kept
 }
 
 
@@ -2266,7 +2349,8 @@ def main(argv):
                         ("cache", cache_seeds()), ("server", server_seeds()),
                         ("client", client_seeds()), ("proxy", proxy_seeds()),
                         ("proxytunnel", proxytunnel_seeds()),
-                        ("eventloop", eventloop_seeds())):
+                        ("eventloop", eventloop_seeds()),
+                        ("raftmsg", raftmsg_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

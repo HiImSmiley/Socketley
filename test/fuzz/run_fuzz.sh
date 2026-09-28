@@ -166,9 +166,10 @@ declare -A CORPUS=(
     [fuzz_server_ops]=server
     [fuzz_client_ops]=client
     [fuzz_proxy_ops]=proxy
+    [fuzz_raft_msg]=raftmsg
 )
 
-read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops}"
+read -r -a TARGETS <<< "${FUZZ_TARGETS:-fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg}"
 
 # The pinned configurations the proxy seed corpus is replayed over, on top of
 # the default run.  ';' separated because the values themselves are comma

@@ -17,7 +17,7 @@ REQUIRE="${REQUIRE_LIBFUZZER:-0}"
 # because the SDK-linking targets drag in fifteen translation units -- and
 # narrowing is always the caller's explicit decision, never a target dropped
 # because building it failed.
-ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops"
+ALL_TARGETS="fuzz_resp fuzz_ws_frame fuzz_cache_ops fuzz_http_response fuzz_event_loop fuzz_http_request fuzz_server_ops fuzz_client_ops fuzz_proxy_ops fuzz_raft_msg"
 WANT="${LIBFUZZER_TARGETS:-$ALL_TARGETS}"
 
 want() {
@@ -90,6 +90,8 @@ build() {
 
 want fuzz_resp     && build fuzz_resp "$ROOT/test/fuzz/fuzz_resp.cpp"
 want fuzz_ws_frame && build fuzz_ws_frame "$ROOT/test/fuzz/fuzz_ws_frame.cpp" -lssl -lcrypto
+want fuzz_raft_msg && build fuzz_raft_msg "$ROOT/test/fuzz/fuzz_raft_msg.cpp" \
+    "$ROOT/socketley/shared/raft_codec.cpp" "$ROOT/socketley/shared/raft.cpp"
 
 # fuzz_cache_ops needs one .cpp out of the runtime rather than the whole SDK,
 # because cache_store.cpp includes nothing but libc headers.
