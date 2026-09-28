@@ -247,6 +247,26 @@ runtime is no longer confined to the daemon's process or to one core.
 
 ### Added
 
+#### Raft between daemons (experimental, opt-in)
+
+- **`socketley daemon --raft-listen <ip:port>` runs a Raft node on the daemon.**
+  Off unless asked for; nothing else about the daemon changes, and the cluster
+  directory keeps working as before. This release forms the cluster and keeps
+  it: leader election with pre-vote and check-quorum, a replicated log on disk,
+  membership, and graceful handover. No runtime, placement or cache failover
+  goes through it yet.
+- `--raft-init` founds a cluster; `--raft-join <ip:port>` joins one, first as a
+  learner and then promoted to voter once caught up. Both apply to the first
+  start only; afterwards the node comes back from its own state.
+- Mutual TLS between members is required (`--raft-cert`, `--raft-key`,
+  `--raft-ca`, `--raft-name`); a certificate that does not name the member it
+  speaks for is refused. `--raft-insecure` runs it in cleartext on purpose.
+- The log is a CRC32C-checked WAL under the state directory, 0600, every write
+  fsynced through io_uring before anything that depends on it is sent; a torn
+  tail is cut back on restart. A SIGTERM'd leader hands leadership over first.
+- `socketley cluster raft-status` shows role, term, leader, commit/applied,
+  voters, learners and whether a quorum is reachable, and exits 2 without one.
+
 #### Multi-process runtimes and sharding
 
 - **Every runtime now runs in its own supervised worker process.** One runtime

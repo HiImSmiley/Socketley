@@ -1,4 +1,5 @@
 #include "daemon_handler.h"
+#include "raft_host.h"
 #include "flag_handlers.h"
 #include "type_manifest.h"
 #include "../shared/command_usage.h"
@@ -1213,6 +1214,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("daemon-stop"): return cmd_daemon_stop(conn);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("cluster-status"): return cmd_cluster_status(conn);
+        case fnv1a("raft-status"):    return cmd_raft_status(conn);
         case fnv1a("daemon-name"):    return cmd_daemon_name(conn, pa);
         case fnv1a("daemon-cluster"): return cmd_daemon_cluster(conn, pa);
         case fnv1a("dashboard"):     return cmd_dashboard(conn);
@@ -6600,6 +6602,18 @@ int daemon_handler::cmd_cluster_status(ipc_connection* conn)
 
     conn->write_buf = std::move(out);
     return 0;
+}
+
+int daemon_handler::cmd_raft_status(ipc_connection* conn)
+{
+    if (!m_raft)
+    {
+        conn->write_buf = "raft is not enabled on this daemon (start it with socketley daemon --raft-listen <ip:port> ...)\n";
+        return 1;
+    }
+    int code = 0;
+    conn->write_buf = m_raft->status(code);
+    return code;
 }
 
 void daemon_handler::stop_cluster()

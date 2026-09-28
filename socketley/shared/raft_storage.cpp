@@ -688,8 +688,13 @@ bool wal::persist(const ready& r, const node& n, done_fn done)
             append_entry(m_buf, e);
         if (m_buf.empty())
             return false;
+        // Refusing here, rather than writing nothing, is what keeps the caller from sending what was never made durable.
         if (!m_loop->reserve_sqes(2))
+        {
+            m_failed = true;
+            m_error  = "the ring has no room for a WAL write";
             return false;
+        }
         m_loop->submit_file_write(m_fd, m_buf.data(), static_cast<uint32_t>(m_buf.size()), m_off,
                                   chain_req(op_file_write), true);
         m_loop->submit_fsync(m_fd, true, chain_req(op_fsync), false);

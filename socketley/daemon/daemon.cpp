@@ -2,6 +2,7 @@
 #include <unordered_set>
 #include "daemon_handler.h"
 #include "metrics_endpoint.h"
+#include "raft_host.h"
 #include "type_manifest.h"
 #include "../shared/event_loop.h"
 #include "../shared/runtime_manager.h"
@@ -513,7 +514,7 @@ static void restore_runtimes(state_persistence& persistence,
 // reach init() in time -- and unknown arguments are refused rather than
 // ignored.
 static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
-                               bool& saw_cpus)
+                               bool& saw_cpus, raft_host_config& raft)
 {
     // argv[0] is the binary and argv[1] is "daemon", so a daemon started with
     // no arguments decides nothing and leaves the environment in charge.
@@ -545,9 +546,44 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                 break;
             }
 
+            case fnv1a("--raft-init"):
+                raft.init = true;
+                break;
+
+            case fnv1a("--raft-insecure"):
+                raft.insecure = true;
+                break;
+
+            case fnv1a("--raft-listen"):
+            case fnv1a("--raft-advertise"):
+            case fnv1a("--raft-name"):
+            case fnv1a("--raft-join"):
+            case fnv1a("--raft-cert"):
+            case fnv1a("--raft-key"):
+            case fnv1a("--raft-ca"):
+            {
+                if (i + 1 >= argc || argv[i + 1][0] == '-')
+                {
+                    std::cout << arg << " requires a value\n";
+                    return false;
+                }
+                const std::string v = argv[++i];
+                switch (fnv1a(arg))
+                {
+                    case fnv1a("--raft-listen"):    raft.listen    = v; break;
+                    case fnv1a("--raft-advertise"): raft.advertise = v; break;
+                    case fnv1a("--raft-name"):      raft.name      = v; break;
+                    case fnv1a("--raft-join"):      raft.join      = v; break;
+                    case fnv1a("--raft-cert"):      raft.cert      = v; break;
+                    case fnv1a("--raft-key"):       raft.key       = v; break;
+                    default:                        raft.ca        = v; break;
+                }
+                break;
+            }
+
             default:
                 std::cout << "unknown daemon flag: " << arg << "\n"
-                          << "  socketley daemon takes --cpus <set>.\n"
+                          << "  socketley daemon takes --cpus <set> and the --raft-* flags.\n"
                           << "  Runtime flags belong on `create`; this command "
                              "configures the process's ring.\n";
                 return false;
@@ -570,8 +606,14 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // command line the daemon cannot honour is worth an exit code whether or
     // not this process was going to be the one serving the socket.
     bool saw_cpus = false;
-    if (!parse_daemon_flags(argc, argv, loop, saw_cpus))
+    raft_host_config raft_cfg;
+    if (!parse_daemon_flags(argc, argv, loop, saw_cpus, raft_cfg))
         return 1;
+    if (const std::string why = raft_config_refusal(raft_cfg); !why.empty())
+    {
+        std::cout << why;
+        return 1;
+    }
 
     // Resolve paths (system vs dev mode)
     auto paths = socketley_paths::resolve();
@@ -653,6 +695,27 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Experimental and opt-in: a daemon given --raft-listen that cannot run Raft
+    // refuses to start rather than serve without the cluster it was asked for.
+    std::unique_ptr<raft_host> raft;
+    if (raft_cfg.enabled())
+    {
+        raft_cfg.dir = (paths.state_dir / "raft").string();
+        if (const char* t = std::getenv("SOCKETLEY_RAFT_TICK_MS"); t && std::atoi(t) > 0)
+            raft_cfg.tick_ms = static_cast<uint32_t>(std::atoi(t));
+        if (const char* c = std::getenv("SOCKETLEY_RAFT_COMPACT_EVERY"); c && std::atoll(c) > 0)
+            raft_cfg.compact_every = static_cast<uint64_t>(std::atoll(c));
+        raft = std::make_unique<raft_host>(raft_cfg);
+        std::string err;
+        if (!raft->start(loop, err))
+        {
+            std::cout << "raft: " << err << (err.empty() || err.back() != '\n' ? "\n" : "");
+            raft->stop();
+            loop.shutdown_ring();
+            return 2;
+        }
+    }
+
     // Give the cross-runtime request channel its ring before any runtime is
     // restored, because a server with --cache posts on its first message and
     // that message can arrive inside restore.
@@ -679,6 +742,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     daemon_handler handler(manager, loop);
     handler.set_state_persistence(&persistence);
+    handler.set_raft(raft.get());
 
     if (!handler.setup())
     {
@@ -734,6 +798,10 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
 
     loop.run();
 
+    // First, while the peers are still reachable, so the cluster elects nobody new by timeout.
+    if (raft)
+        raft->hand_over(loop);
+
     // Still with a live ring, because every teardown submits, and run() ending
     // the ring on its way out was a segfault on every SIGTERM that found a
     // runtime running.
@@ -743,6 +811,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     // because a request left queued is an origin waiting on a wakeup the
     // unmapped ring can no longer produce.
     manager.requests().detach();
+
+    if (raft)
+        raft->stop();
 
     // Nothing more will be submitted, so the ring goes before anything is
     // freed, which is the one point we can prove is safe to release the

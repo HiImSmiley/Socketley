@@ -74,6 +74,9 @@ public:
     // Both, because a configured port and a bound one are different answers
     // and `dashboard` was giving the first when it meant the second.
     void set_metrics_port(uint16_t port, bool bound);
+
+    // The daemon's Raft node, when --raft-listen started one, for `cluster raft-status`.
+    void set_raft(class raft_host* host) { m_raft = host; }
     // The file this daemon read its settings from, so `dashboard` can say
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
@@ -161,6 +164,7 @@ private:
     int cmd_daemon_stop(ipc_connection* conn);
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_cluster_status(ipc_connection* conn);
+    int cmd_raft_status(ipc_connection* conn);
     int cmd_daemon_name(ipc_connection* conn, const parsed_args& pa);
     int cmd_daemon_cluster(ipc_connection* conn, const parsed_args& pa);
     int cmd_dashboard(ipc_connection* conn);
@@ -224,6 +228,7 @@ private:
     // clustering off can say so rather than reporting the same as one never
     // asked to join.
     std::string m_cluster_error;
+    class raft_host* m_raft = nullptr;
     std::string m_cluster_want_dir;
 
     // Health monitoring for managed runtimes, and the periodic reap of retired

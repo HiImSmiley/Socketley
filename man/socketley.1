@@ -196,7 +196,11 @@ Takes
 here shaping the ring this daemon is about to create rather than stating what a
 runtime requires of one. It is the command-line spelling of
 .BR SOCKETLEY_CPUS ,
-and the flag wins when both are given. Any other argument is refused: this
+and the flag wins when both are given. It also takes the experimental
+.B \-\-raft\-*
+flags described under
+.BR "CLUSTER MODE" .
+Any other argument is refused: this
 command used to ignore its command line entirely, so
 .B socketley daemon \-\-cpus 0\-1
 started an unpinned daemon and exited 0.
@@ -9202,6 +9206,96 @@ Graceful shutdown	File deleted	Immediate
 Container killed	Stale heartbeat	~10 seconds
 Container restart	File overwritten	Immediate
 .TE
+.SS Raft mode (experimental, opt-in)
+.B Experimental.
+A daemon started with
+.B \-\-raft\-listen
+runs one Raft node on its own loop, and nothing else changes: the cluster
+directory above, runtimes, proxies and caches behave exactly as without it.
+This milestone forms the cluster, elects a leader, replicates a log to disk and
+keeps membership; the state machine behind the log is still empty, so no
+runtime, placement or cache failover goes through it yet.
+.PP
+.B Flags
+(on the command line that starts the daemon, like
+.BR \-\-cpus ;
+refused beside
+.B \-\-name
+and
+.BR \-\-cluster ):
+.TP
+.BI \-\-raft\-listen " ip:port"
+Enable Raft mode and accept peer connections here. Numeric only: a peer's
+address travels through the replicated log and is dialled without a DNS
+lookup.
+.TP
+.BI \-\-raft\-advertise " ip:port"
+The address peers dial, when it is not the listening one. Required when
+.B \-\-raft\-listen
+is a wildcard.
+.TP
+.BI \-\-raft\-name " name"
+This node's name in the membership, and the name its certificate must carry
+(as a DNS subjectAltName or common name). Defaults to the advertised address.
+.TP
+.B \-\-raft\-init
+Found a new single-voter cluster, on first start only.
+.TP
+.BI \-\-raft\-join " ip:port"
+Join the cluster a member at this address belongs to, on first start only. The
+node is added as a learner, receives the log without voting, and is promoted
+to voter by a single-server change once its log has caught up to the leader's
+commit index. A member that is not the leader passes the request on.
+.TP
+.BI "\-\-raft\-cert " file " \-\-raft\-key " file " \-\-raft\-ca " file
+Mutual TLS between members, which is required. Every member's certificate is
+signed by the CA; a connection whose certificate does not name the member it
+introduces itself as \(em by the name membership records for its id, or for a
+newcomer the name it claims \(em is closed. The join target, whose id is not
+known yet, is held to the address that was dialled.
+.TP
+.B \-\-raft\-insecure
+Run Raft in cleartext. Refused beside the certificate flags; without it and
+without them the daemon refuses to start.
+.PP
+A daemon whose state directory already holds Raft state ignores
+.B \-\-raft\-init
+and
+.B \-\-raft\-join
+and comes back as the member it was. One with no state and neither flag
+refuses to start. A daemon that cannot bind the port or read its state exits 2
+rather than serve without the cluster it was asked for.
+.PP
+.B On disk:
+.IR state-dir /raft/
+holds
+.B node\-id
+(a random 64-bit id, generated once),
+.BI wal\- seq .log
+(CRC32C-checked records: hard state, entries, truncations) and
+.BI snap\- index \- term
+files, all 0600. Every write is followed by an fsync linked behind it in
+io_uring, and nothing a node says to a peer leaves before the fsync reports.
+Recovery cuts a torn tail at the first bad record. The log is compacted every
+1000 applied entries.
+.PP
+.B Timing:
+100 ms ticks measured from elapsed monotonic time, an election timeout of
+1\(en2 s, heartbeats every tick, pre-vote and check-quorum. A leader stopped by
+SIGTERM hands leadership to its most up-to-date voter (TimeoutNow) before it
+exits, so the cluster does not wait out an election timeout.
+.PP
+.B "socketley cluster raft\-status"
+prints this node's id and name, role, term, leader, commit and applied
+indexes, the log's range, voters, learners, whether a quorum of voters was
+heard from within an election timeout, and the transport and WAL counters. It
+exits 0 with a leader and a reachable quorum, 2 without (saying so on its last
+line), and 1 on a daemon not in Raft mode.
+.PP
+.B Not yet:
+removing a member, snapshots sent in chunks (a snapshot goes in one frame of
+at most 16 MiB), a cluster id that keeps two clusters from mixing, and any
+state machine behind the log.
 .SH INSTALLATION
 .SS Quick Install
 .nf

@@ -728,6 +728,30 @@ bool tls_context::has_pending_out(SSL* ssl)
 #endif
 }
 
+bool tls_context::peer_name_matches(SSL* ssl, std::string_view name)
+{
+#if SOCKETLEY_HAS_TLS
+    if (!ssl || name.empty() || SSL_get_verify_result(ssl) != X509_V_OK)
+        return false;
+    X509* cert = SSL_get1_peer_certificate(ssl);
+    if (!cert)
+        return false;
+    const std::string n(name);
+    unsigned char ip_probe[16];
+    const bool is_ip = inet_pton(AF_INET,  n.c_str(), ip_probe) == 1 ||
+                       inet_pton(AF_INET6, n.c_str(), ip_probe) == 1;
+    const bool ok = is_ip ? X509_check_ip_asc(cert, n.c_str(), 0) == 1
+                          : X509_check_host(cert, n.c_str(), n.size(),
+                                            X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nullptr) == 1;
+    X509_free(cert);
+    return ok;
+#else
+    (void)ssl;
+    (void)name;
+    return false;
+#endif
+}
+
 void tls_context::free_ssl(SSL* ssl)
 {
 #if SOCKETLEY_HAS_TLS

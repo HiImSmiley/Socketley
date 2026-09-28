@@ -429,6 +429,17 @@ std::string status_field(std::string_view body, std::string_view key)
 
 int cli_cluster(int argc, char** argv)
 {
+    // Raft mode has its own source of truth, so it is asked before the directory-mode gate below.
+    if (argc > 2 && std::string_view(argv[2]) == "raft-status")
+    {
+        std::string data;
+        const int rc = ipc_send("raft-status", data);
+        if (rc < 0)
+            return ipc_report_failure(rc);
+        std::cout << data;
+        return rc;
+    }
+
     // Ask the daemon about itself rather than the directory about the daemon,
     // because "not in cluster mode" covers both never asked and asked and
     // refused.

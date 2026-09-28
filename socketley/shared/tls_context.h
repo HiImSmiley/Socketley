@@ -119,6 +119,11 @@ public:
     // Free an SSL connection
     static void free_ssl(SSL* ssl);
 
+    // Whether the certificate the peer presented names `name` (a DNS name or an
+    // IP address), for a server that learns whom to expect only from what the
+    // peer says after the handshake.
+    static bool peer_name_matches(SSL* ssl, std::string_view name);
+
     bool is_initialized() const { return m_ctx != nullptr; }
 
     // OpenSSL bounds a memory BIO nowhere, so without this a peer that never

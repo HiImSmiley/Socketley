@@ -76,6 +76,7 @@ public:
     bool open(event_loop& loop, const std::string& dir, const recovery& rec, std::string& err);
 
     // Writes hard state, snapshot, truncation and entries of `r`, and calls `done` once all of it is fsynced; one at a time.
+    // False with failed() unset means `r` had nothing to write; false with it set means nothing may be sent.
     // A snapshot starts a new segment holding `n`'s whole log, after which the older segments and snapshots are deleted.
     bool persist(const ready& r, const node& n, done_fn done);
 
