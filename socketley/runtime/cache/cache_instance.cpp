@@ -1706,6 +1706,9 @@ void cache_instance::handle_accept(struct io_uring_cqe* cqe, io_request* req)
 
 void cache_instance::on_loop_turn()
 {
+    // Readers an XADD has woken this turn, served now the commands are done.
+    if (SOCKETLEY_UNLIKELY(!m_stream_ready.empty()))
+        serve_stream_ready();
     // A direct send has no completion, so what one would have run runs here,
     // once the turn has settled what the connection wants.
     if (m_direct_fd >= 0)
@@ -5288,6 +5291,45 @@ void cache_instance::process_command(client_connection* conn, std::string_view l
         // Every key here: the interpreter below is the right one.
     }
 
+    // XREAD's streams, which the line names after STREAMS: one shard's or
+    // refused, and a blocking one only at home -- the RESP router's rule.
+    if (SOCKETLEY_UNLIKELY(h == fnv1a("xread") || h == fnv1a("xreadgroup")))
+    {
+        std::vector<std::string_view> words{ parts.cmd };
+        for (std::string_view rest = parts.args; !rest.empty();)
+        {
+            const size_t sp = rest.find(' ');
+            if (sp != 0) words.push_back(rest.substr(0, sp));
+            if (sp == std::string_view::npos) break;
+            rest.remove_prefix(sp + 1);
+        }
+        const stream_read_keys k = find_stream_read_keys(words.data(), static_cast<int>(words.size()));
+        const int away = k.count > 0 ? first_foreign_key(words.data(), k.first, k.count, 1) : -1;
+        if (away >= 0)
+        {
+            const uint32_t owner = cache_shard_of(words[static_cast<size_t>(away)], m_shard_n);
+            const bool one = std::all_of(words.begin() + k.first, words.begin() + k.first + k.count,
+                [&](std::string_view w) { return cache_shard_of(w, m_shard_n) == owner; });
+            if (conn->cluster_port)
+            {
+                run_in_reply_order(conn, [&] { emit_moved(conn, words[static_cast<size_t>(away)], owner, false); });
+                return;
+            }
+            if (!one || k.blocks || SOCKETLEY_UNLIKELY(!can_cross(conn)))
+            {
+                run_in_reply_order(conn, [&] {
+                    emit_unrouted(conn, parts.cmd, false,
+                                  "names streams another shard owns, and a read of several "
+                                  "shards or one that blocks cannot cross to them");
+                });
+                return;
+            }
+            const uint32_t slot = slot_open(conn, false, cache_merge::single, 1);
+            route_part(conn, owner, slot, 0, line, false);
+            return;
+        }
+    }
+
     switch (cache_classify_text(h))
     {
         case cache_cmd_class::single_key:
@@ -7592,6 +7634,16 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             rb.append(info);
             break;
         }
+        // Streams answer in RESP and are turned into this protocol's words in
+        // one place, since their replies nest where every other one is a list.
+        case fnv1a("xadd"):      case fnv1a("xrange"):     case fnv1a("xrevrange"):
+        case fnv1a("xlen"):      case fnv1a("xread"):      case fnv1a("xreadgroup"):
+        case fnv1a("xdel"):      case fnv1a("xtrim"):      case fnv1a("xgroup"):
+        case fnv1a("xsetid"):    case fnv1a("xack"):       case fnv1a("xpending"):
+        case fnv1a("xclaim"):    case fnv1a("xautoclaim"): case fnv1a("xinfo"):
+        case fnv1a("xapply"):
+            stream_text(conn, cmd, args);
+            break;
         default:
             rb.append("failed: unknown command\n", 24);
             break;
@@ -8422,6 +8474,11 @@ int cache_instance::resp_first_foreign_key(uint32_t h, std::string_view* args, i
             return first_foreign_key(args, 3, static_cast<int>(nkeys), 1);
         return -1;
     }
+    if (h == fnv1a("xread") || h == fnv1a("xreadgroup"))
+    {
+        const stream_read_keys k = find_stream_read_keys(args, argc);
+        return k.count > 0 ? first_foreign_key(args, k.first, k.count, 1) : -1;
+    }
     if (cache_needs_one_shard(h) && argc >= 2)
     {
         const bool two = h == fnv1a("smove") || h == fnv1a("rename") ||
@@ -8434,7 +8491,7 @@ int cache_instance::resp_first_foreign_key(uint32_t h, std::string_view* args, i
         case cache_cmd_class::unknown:
             return -1;
         case cache_cmd_class::single_key:
-            return argc >= 2 ? first_foreign_key(args, 1, 1, 1) : -1;
+            return argc > cache_key_arg(h) ? first_foreign_key(args, cache_key_arg(h), 1, 1) : -1;
         case cache_cmd_class::multi_key:
             if (h == fnv1a("mset") || h == fnv1a("msetnx"))
                 return first_foreign_key(args, 1, argc - 1, 2);
@@ -8537,13 +8594,42 @@ void cache_instance::process_resp_command(client_connection* conn,
     }
 #endif
 
+    // XREAD answers several streams as one reply, so its streams have to be
+    // one shard's, the rule EVAL and set algebra follow; a BLOCK waits where it
+    // is served and a crossing is answered once, so it is served only at home.
+    if (SOCKETLEY_UNLIKELY(h == fnv1a("xread") || h == fnv1a("xreadgroup")))
+    {
+        const stream_read_keys k = find_stream_read_keys(args, argc);
+        if (k.count > 0)
+        {
+            if (!k.blocks)
+            {
+                if (route_all_keys_one_shard(conn, args, argc, k.first, k.count))
+                    return;
+            }
+            else if (const int away = first_foreign_key(args, k.first, k.count, 1); away >= 0)
+            {
+                run_in_reply_order(conn, [&] {
+                    if (conn->cluster_port)
+                        emit_moved(conn, args[away], cache_shard_of(args[away], m_shard_n), true);
+                    else
+                        resp::encode_error_code_into(conn->response_buf,
+                            "ERR a blocking read waits on the shard that owns its streams -- "
+                            "connect to that shard's --cluster port to block on them");
+                });
+                return;
+            }
+        }
+    }
+
     switch (cache_classify_resp(h, argc))
     {
         case cache_cmd_class::single_key:
         {
-            if (argc >= 2 && !args[1].empty())
+            const int ki = cache_key_arg(h);
+            if (argc > ki && !args[ki].empty())
             {
-                const uint32_t owner = cache_shard_of(args[1], m_shard_n);
+                const uint32_t owner = cache_shard_of(args[ki], m_shard_n);
                 if (owner != m_shard_i)
                 {
                     // The per-shard port's answer, because this client chose
@@ -8552,7 +8638,7 @@ void cache_instance::process_resp_command(client_connection* conn,
                     if (conn->cluster_port)
                     {
                         run_in_reply_order(conn, [&] {
-                            emit_moved(conn, args[1], owner, true);
+                            emit_moved(conn, args[ki], owner, true);
                         });
                         return;
                     }
@@ -8769,16 +8855,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (a[i].find(' ') != std::string_view::npos) return false;
         return true;
     };
-    auto repl_refuse = [&](std::string_view key) {
-        ++m_repl_unfaithful;
-        if (m_repl_unfaithful == 1 || (m_repl_unfaithful % 1000) == 0)
-            LOG_ERROR(("cache \"" + std::string(get_name()) + "\": a key with a "
-                       "space in it cannot be written to the replication log or "
-                       "the journal, because both are re-split on spaces -- \""
-                       + std::string(key) + "\" is on this cache and will not be "
-                       "on a follower; " + std::to_string(m_repl_unfaithful)
-                       + " command(s) have now been held back").c_str());
-    };
+    auto repl_refuse = [&](std::string_view key) { repl_unfaithful(key); };
 
     // Helper: build text command from RESP args for replication
     auto repl = [&](std::string_view* a, int n) {
@@ -11144,7 +11221,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 // that wraps it.  Anything without a code gets one.
                 static constexpr std::string_view codes[] = {
                     "ERR ", "WRONGTYPE ", "NOSCRIPT ", "CROSSSLOT ", "MOVED ",
-                    "NOPROTO ", "OOM ", "BUSYGROUP ", "NOTBUSY "
+                    "NOPROTO ", "OOM ", "BUSYGROUP ", "NOTBUSY ", "NOGROUP "
                 };
                 bool coded = false;
                 for (const auto& c : codes)
@@ -11340,6 +11417,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (gone > 0) repl(args, argc);
             break;
         }
+        case fnv1a("xadd"):      case fnv1a("xrange"):     case fnv1a("xrevrange"):
+        case fnv1a("xlen"):      case fnv1a("xread"):      case fnv1a("xreadgroup"):
+        case fnv1a("xdel"):      case fnv1a("xtrim"):      case fnv1a("xgroup"):
+        case fnv1a("xsetid"):    case fnv1a("xack"):       case fnv1a("xpending"):
+        case fnv1a("xclaim"):    case fnv1a("xautoclaim"): case fnv1a("xinfo"):
+            stream_command(conn, cmd_hash, args, argc, rb);
+            break;
         default:
         {
             rb.append("-ERR unknown command '", 22);
@@ -11351,6 +11435,18 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 }
 
 #ifndef SOCKETLEY_NO_LUA
+void cache_instance::repl_unfaithful(std::string_view key)
+{
+    ++m_repl_unfaithful;
+    if (m_repl_unfaithful == 1 || (m_repl_unfaithful % 1000) == 0)
+        LOG_ERROR(("cache \"" + std::string(get_name()) + "\": a key with a "
+                   "space in it cannot be written to the replication log or "
+                   "the journal, because both are re-split on spaces -- \""
+                   + std::string(key) + "\" is on this cache and will not be "
+                   "on a follower; " + std::to_string(m_repl_unfaithful)
+                   + " command(s) have now been held back").c_str());
+}
+
 // ─── EVAL's way into the cache ──────────────────────────────────────────────
 //
 // One command, run through the same local dispatch every other command takes,
@@ -11465,9 +11561,11 @@ void cache_instance::note_write_for_watch(uint32_t h, std::string_view* args, in
 
     // A single-key write names its key, which is the case worth being exact
     // about: two clients on two different keys must not abort each other.
-    if (argc >= 2 && cache_classify(h) == cache_cmd_class::single_key)
+    if (cache_classify(h) == cache_cmd_class::single_key)
     {
-        auto it = m_watchers.find(args[1]);
+        const int ki = cache_key_arg(h);
+        if (argc <= ki) return;             // a usage error changes nothing
+        auto it = m_watchers.find(args[ki]);
         if (it != m_watchers.end()) dirty(it->second);
         return;
     }
@@ -11539,12 +11637,13 @@ void cache_instance::forget_waiter(uint64_t seq)
     if (it == m_blocked.end())
         return;
     const blocked_pop& w = it->second;
+    auto& queues = w.stream ? m_stream_wait_key : m_wait_key;
     for (size_t i = 0; i < w.keys.size() && i < w.slots.size(); ++i)
     {
-        auto ki = m_wait_key.find(w.keys[i]);
-        if (ki == m_wait_key.end()) continue;
+        auto ki = queues.find(w.keys[i]);
+        if (ki == queues.end()) continue;
         ki->second.erase(w.slots[i]);
-        if (ki->second.empty()) m_wait_key.erase(ki);
+        if (ki->second.empty()) queues.erase(ki);
     }
     auto fi = m_wait_fd.find(w.fd);
     if (fi != m_wait_fd.end() && fi->second == seq) m_wait_fd.erase(fi);
@@ -11634,9 +11733,22 @@ void cache_instance::sweep_blocked()
     const auto now = std::chrono::steady_clock::now();
     // Collected first: forget_waiter rehashes the map it is walking.
     std::vector<uint64_t> expired;
+    std::vector<std::pair<uint64_t, std::string>> orphaned;
     for (const auto& [seq, w] : m_blocked)
+    {
+        // A group reader whose stream was deleted or replaced waits for a
+        // group that cannot come back, and Redis unblocks it with an error.
+        if (w.stream && !w.group.empty())
+        {
+            const auto gone = std::find_if(w.keys.begin(), w.keys.end(),
+                [&](const std::string& k) { return !m_store.stream_find(k); });
+            if (gone != w.keys.end()) { orphaned.emplace_back(seq, *gone); continue; }
+        }
         if (w.deadline.time_since_epoch().count() != 0 && now >= w.deadline)
             expired.push_back(seq);
+    }
+    for (const auto& [seq, key] : orphaned)
+        serve_stream_waiter(seq, key);
 
     for (const uint64_t seq : expired)
     {

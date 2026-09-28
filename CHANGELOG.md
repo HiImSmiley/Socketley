@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Streams in the cache**, wire-compatible with Redis 7.0: XADD (NOMKSTREAM,
+  MAXLEN/MINID with `=` and `~`, LIMIT, `*`, `ms-*` and explicit ids), XLEN,
+  XRANGE, XREVRANGE, XREAD with BLOCK, XDEL, XTRIM, XSETID, XGROUP (CREATE with
+  MKSTREAM and ENTRIESREAD, SETID, DESTROY, CREATECONSUMER, DELCONSUMER),
+  XREADGROUP with BLOCK and NOACK, XACK, XPENDING, XCLAIM, XAUTOCLAIM and XINFO
+  (STREAM with FULL, GROUPS, CONSUMERS); `TYPE` answers `stream` and
+  `SCAN`/`DBSIZE` take `TYPE stream`. Replies and error texts are compared
+  against a redis-server command by command. A stream is kept in blocks of up
+  to a hundred packed entries, cut where Redis cuts its nodes so `MAXLEN ~`
+  trims what it trims there; a million short entries hold 24 bytes each
+  against Redis's 25. Readers blocked on a stream are woken by the XADD they
+  wait for. The dump, the journal and a follower carry entries, counters,
+  groups, consumers and every pending entry with its delivery time and count;
+  an XADD with `*` replicates the id it got. XADD, XGROUP CREATE and
+  CREATECONSUMER are refused at `--maxmemory`, as Redis refuses its denyoom
+  commands. On a sharded cache XREAD's streams must belong to one shard, and a
+  blocking read is served by the shard that owns them (its `--cluster` port).
+  Against Redis 7.0.15 over four `redis-benchmark` clients: XADD 1.23× at
+  depth 1 and 2.59× at depth 16, XRANGE and XREAD about 1.85× and 3.2–3.5×,
+  XREADGROUP 1.87× and 3.87×, XACK level.
+- **SDK:** `cache_store` holds streams (`stream_get`, `stream_find`,
+  `stream_make`, `stream_admit`, `stream_change`) as `stream_log`, which is
+  usable on its own from `socketley/runtime/cache/stream_log.h`.
+
 ### Changed
 
 - **A cache serves only this machine unless told otherwise.** A TCP peer whose

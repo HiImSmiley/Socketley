@@ -238,6 +238,16 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
         case fnv1a("zcount"):          case fnv1a("zpopmin"):
         case fnv1a("zpopmax"):         case fnv1a("zremrangebyrank"):
         case fnv1a("zremrangebyscore"):
+        // ── streams, with XGROUP and XINFO naming theirs second; see cache_key_arg ──
+        case fnv1a("xadd"):       case fnv1a("xlen"):
+        case fnv1a("xrange"):     case fnv1a("xrevrange"):
+        case fnv1a("xdel"):       case fnv1a("xtrim"):
+        case fnv1a("xack"):       case fnv1a("xpending"):
+        case fnv1a("xclaim"):     case fnv1a("xautoclaim"):
+        case fnv1a("xsetid"):     case fnv1a("xgroup"):
+        case fnv1a("xinfo"):
+        // A stream write as the replication log carries it, keyed first.
+        case fnv1a("xapply"):
             return cache_cmd_class::single_key;
 
         case fnv1a("del"):        case fnv1a("exists"):
@@ -292,6 +302,41 @@ constexpr cache_cmd_class cache_classify(uint32_t h)
     }
 }
 
+// Where XREAD's and XREADGROUP's keys are, the first half of what follows
+// STREAMS, and whether the call blocks.
+struct stream_read_keys
+{
+    int  first{0};
+    int  count{0};
+    bool blocks{false};
+};
+
+constexpr stream_read_keys find_stream_read_keys(const std::string_view* a, int argc)
+{
+    stream_read_keys k;
+    for (int i = 1; i < argc; ++i)
+    {
+        const uint32_t w = fnv1a_lower(a[i]);
+        if (w == fnv1a("block") && i + 1 < argc) { k.blocks = true; ++i; }
+        else if (w == fnv1a("count") && i + 1 < argc) ++i;
+        else if (w == fnv1a("group") && i + 2 < argc) i += 2;
+        else if (w == fnv1a("streams"))
+        {
+            const int rest = argc - i - 1;
+            if (rest > 0 && rest % 2 == 0) { k.first = i + 1; k.count = rest / 2; }
+            return k;
+        }
+    }
+    return k;
+}
+
+// Which argument holds a single-key command's key: the first, except where a
+// subcommand comes before it.
+constexpr int cache_key_arg(uint32_t h)
+{
+    return (h == fnv1a("xgroup") || h == fnv1a("xinfo")) ? 2 : 1;
+}
+
 // Whether a command can be trusted not to change anything, asked by WATCH and
 // by nothing else.
 //
@@ -324,6 +369,9 @@ constexpr bool cache_is_read_only(uint32_t h)
         case fnv1a("zrange"):     case fnv1a("zrevrange"):
         case fnv1a("zrangebyscore"): case fnv1a("zrevrangebyscore"):
         case fnv1a("zcount"):
+        case fnv1a("xrange"):     case fnv1a("xrevrange"):
+        case fnv1a("xlen"):       case fnv1a("xread"):
+        case fnv1a("xpending"):   case fnv1a("xinfo"):
         case fnv1a("scan"):       case fnv1a("hscan"):
         case fnv1a("sscan"):      case fnv1a("zscan"):
         case fnv1a("keys"):       case fnv1a("dbsize"):
@@ -413,6 +461,11 @@ constexpr std::string_view cache_text_key(uint32_t h, std::string_view args)
 {
     if (cache_text_key_is_whole_args(h))
         return args;
+    if (cache_key_arg(h) == 2)
+    {
+        const size_t sub = args.find(' ');
+        args = sub == std::string_view::npos ? std::string_view{} : args.substr(sub + 1);
+    }
     const size_t sp = args.find(' ');
     return sp == std::string_view::npos ? args : args.substr(0, sp);
 }

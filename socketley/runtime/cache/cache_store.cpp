@@ -273,6 +273,7 @@ bool cache_store::has_type_conflict_for_string(std::string_view key) const
     if (__builtin_expect(!m_sets.empty() && m_sets.count(key), 0)) return true;
     if (__builtin_expect(!m_hashes.empty() && m_hashes.count(key), 0)) return true;
     if (__builtin_expect(!m_zsets.empty() && m_zsets.count(key), 0)) return true;
+    if (__builtin_expect(!m_streams.empty() && m_streams.count(key), 0)) return true;
     return false;
 }
 
@@ -282,6 +283,7 @@ bool cache_store::has_type_conflict_for_list(std::string_view key) const
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
     if (!m_zsets.empty() && m_zsets.count(key)) return true;
+    if (!m_streams.empty() && m_streams.count(key)) return true;
     return false;
 }
 
@@ -291,6 +293,7 @@ bool cache_store::has_type_conflict_for_set(std::string_view key) const
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
     if (!m_zsets.empty() && m_zsets.count(key)) return true;
+    if (!m_streams.empty() && m_streams.count(key)) return true;
     return false;
 }
 
@@ -300,6 +303,7 @@ bool cache_store::has_type_conflict_for_hash(std::string_view key) const
     if (!m_lists.empty() && m_lists.count(key)) return true;
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_zsets.empty() && m_zsets.count(key)) return true;
+    if (!m_streams.empty() && m_streams.count(key)) return true;
     return false;
 }
 
@@ -311,7 +315,42 @@ bool cache_store::has_type_conflict_for_zset(std::string_view key) const
     if (!m_lists.empty()  && m_lists.count(key))  return true;
     if (!m_sets.empty()   && m_sets.count(key))   return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
+    if (!m_streams.empty() && m_streams.count(key)) return true;
     return false;
+}
+
+bool cache_store::has_type_conflict_for_stream(std::string_view key) const
+{
+    return holds_other_type(key, 'x');
+}
+
+// ─── Streams ────────────────────────────────────────────────────────────────
+
+const stream_inner* cache_store::stream_get(std::string_view key) const
+{
+    auto it = m_streams.find(key);
+    if (it == m_streams.end())
+        return nullptr;
+    const_cast<cache_store*>(this)->touch_lru(key);
+    return &it->second;
+}
+
+stream_inner* cache_store::stream_find(std::string_view key)
+{
+    auto it = m_streams.find(key);
+    return it == m_streams.end() ? nullptr : &it->second;
+}
+
+stream_inner* cache_store::stream_make(std::string_view key, size_t growth)
+{
+    if (has_type_conflict_for_stream(key))
+        return nullptr;
+    if (!check_memory(new_key_cost(key.size()) + stream_entry_extra + growth, key))
+        return nullptr;
+    auto it = m_streams.emplace(std::string(key), stream_inner{}).first;
+    track_add(entry_cost(it->first, it->second));
+    touch_lru(key);
+    return &it->second;
 }
 
 // ─── Strings ───
@@ -799,6 +838,7 @@ size_t cache_store::value_cost(std::string_view key) const
     if (auto it = m_sets.find(key);   it != m_sets.end())   return value(it, set_elem_overhead);
     if (auto it = m_hashes.find(key); it != m_hashes.end()) return value(it, hash_field_overhead);
     if (auto it = m_zsets.find(key);  it != m_zsets.end())  return value(it, zset_member_overhead);
+    if (auto it = m_streams.find(key); it != m_streams.end()) return value(it, 0);
     return 0;
 }
 
@@ -837,7 +877,8 @@ int cache_store::rename_key(std::string_view src, std::string_view dst, bool nx)
      && !move_one(m_lists,  &m_list_elems,   src, dst, false)
      && !move_one(m_sets,   &m_set_elems,    src, dst, false)
      && !move_one(m_hashes, &m_hash_fields,  src, dst, false)
-     && !move_one(m_zsets,  &m_zset_members, src, dst, false))
+     && !move_one(m_zsets,  &m_zset_members, src, dst, false)
+     && !move_one(m_streams, nullptr,        src, dst, false))
         return -2;
 
     // The deadline travels with the key, which is what Redis does: renaming is
@@ -876,7 +917,8 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
      && !move_one(m_lists,  &m_list_elems,   src, dst, true)
      && !move_one(m_sets,   &m_set_elems,    src, dst, true)
      && !move_one(m_hashes, &m_hash_fields,  src, dst, true)
-     && !move_one(m_zsets,  &m_zset_members, src, dst, true))
+     && !move_one(m_zsets,  &m_zset_members, src, dst, true)
+     && !move_one(m_streams, nullptr,        src, dst, true))
         return -2;
     // The deadline is copied too.  This first read "COPY copies the value, not
     // the deadline", which sounded right and is not what redis-server does --
@@ -895,6 +937,7 @@ std::string_view cache_store::random_key() const
     if (!m_sets.empty())   return m_sets.begin()->first;
     if (!m_hashes.empty()) return m_hashes.begin()->first;
     if (!m_zsets.empty())  return m_zsets.begin()->first;
+    if (!m_streams.empty()) return m_streams.begin()->first;
     return {};
 }
 
@@ -1491,7 +1534,8 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
                               : idx == 1 ? scan_shape(m_lists)
                               : idx == 2 ? scan_shape(m_sets)
                               : idx == 3 ? scan_shape(m_hashes)
-                                         : scan_shape(m_zsets));
+                              : idx == 4 ? scan_shape(m_zsets)
+                                         : scan_shape(m_streams));
             start = (in_buckets == (now & 0x7FFFFF)) ? in_bucket : 0;
         }
 
@@ -1502,7 +1546,8 @@ uint64_t cache_store::scan(uint64_t cursor, std::string_view pattern,
             case 1:  next = walk(m_lists,  1, start); break;
             case 2:  next = walk(m_sets,   2, start); break;
             case 3:  next = walk(m_hashes, 3, start); break;
-            default: next = walk(m_zsets,  4, start); break;
+            case 4:  next = walk(m_zsets,  4, start); break;
+            default: next = walk(m_streams, 5, start); break;
         }
         if (next != 0)
             return next;
@@ -2302,6 +2347,7 @@ bool cache_store::holds_other_type(std::string_view key, char expect) const
     if (expect != 't' && !m_sets.empty()   && m_sets.count(key))   return true;
     if (expect != 'h' && !m_hashes.empty() && m_hashes.count(key)) return true;
     if (expect != 'z' && !m_zsets.empty()  && m_zsets.count(key))  return true;
+    if (expect != 'x' && !m_streams.empty() && m_streams.count(key)) return true;
     return false;
 }
 
@@ -2322,6 +2368,7 @@ int cache_store::scan_map_of_type(std::string_view name)
     if (eq(name, "set"))    return 2;
     if (eq(name, "hash"))   return 3;
     if (eq(name, "zset"))   return 4;
+    if (eq(name, "stream")) return 5;
     return -1;
 }
 
@@ -2332,6 +2379,7 @@ std::string_view cache_store::type(std::string_view key) const
     if (!m_sets.empty() && m_sets.count(key)) return "set";
     if (!m_hashes.empty() && m_hashes.count(key)) return "hash";
     if (!m_zsets.empty()  && m_zsets.count(key))  return "zset";
+    if (!m_streams.empty() && m_streams.count(key)) return "stream";
     return "none";
 }
 
@@ -2352,6 +2400,8 @@ void cache_store::keys(std::string_view pattern, std::vector<std::string_view>& 
     for (const auto& [key, _] : m_zsets)
         if (match(key)) out.push_back(key);
     for (const auto& [key, _] : m_hashes)
+        if (match(key)) out.push_back(key);
+    for (const auto& [key, _] : m_streams)
         if (match(key)) out.push_back(key);
 }
 
@@ -2401,6 +2451,12 @@ bool cache_store::drop_value(std::string_view key)
         m_zsets.erase(it);
         return true;
     }
+    if (auto it = m_streams.find(key); it != m_streams.end())
+    {
+        track_sub(entry_cost(it->first, it->second));
+        m_streams.erase(it);
+        return true;
+    }
     return false;
 }
 
@@ -2422,6 +2478,7 @@ uint32_t cache_store::size_of_type(int map) const
         case 2:  return static_cast<uint32_t>(m_sets.size());
         case 3:  return static_cast<uint32_t>(m_hashes.size());
         case 4:  return static_cast<uint32_t>(m_zsets.size());
+        case 5:  return static_cast<uint32_t>(m_streams.size());
         default: return 0;          // a name no type has holds no keys
     }
 }
@@ -2429,7 +2486,7 @@ uint32_t cache_store::size_of_type(int map) const
 uint32_t cache_store::size() const
 {
     return static_cast<uint32_t>(m_data.size() + m_lists.size() + m_sets.size()
-                              + m_hashes.size() + m_zsets.size());
+                              + m_hashes.size() + m_zsets.size() + m_streams.size());
 }
 
 bool cache_store::exists(std::string_view key) const
@@ -2440,6 +2497,7 @@ bool cache_store::exists(std::string_view key) const
     if (!m_sets.empty() && m_sets.count(key)) return true;
     if (!m_hashes.empty() && m_hashes.count(key)) return true;
     if (!m_zsets.empty() && m_zsets.count(key)) return true;
+    if (!m_streams.empty() && m_streams.count(key)) return true;
     return false;
 }
 
@@ -2541,6 +2599,58 @@ void cache_store::dump_commands(std::string& buf) const
         }
     }
 
+    // Streams, as the records their writes replicate as: the entries, the
+    // counters XSETID carries, and every group with its consumers and pending
+    // entries, with the empty stream made by XADD MAXLEN 0 as Redis's own
+    // rewrite makes it.
+    for (const auto& [key, st] : m_streams)
+    {
+        const auto record = [&](std::initializer_list<std::string_view> a) {
+            cmd.append("xapply ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            stream_args_encode(cmd, a.begin(), a.size());
+            emit();
+        };
+        std::vector<std::string_view> xa;
+        std::string ids;
+        st.walk({}, stream_id::max(), false, [&](const stream_inner::entry& e) {
+            xa.assign({ "XADD", std::string_view(key) });
+            ids = e.id.str();
+            xa.push_back(ids);
+            e.each([&](std::string_view f, std::string_view v) { xa.push_back(f); xa.push_back(v); });
+            cmd.append("xapply ");
+            cmd.append(key);
+            cmd.push_back(' ');
+            stream_args_encode(cmd, xa.data(), xa.size());
+            emit();
+            return true;
+        });
+        if (st.empty())
+            record({ "XADD", key, "MAXLEN", "0", "0-1", "x", "y" });
+        const std::string last = st.last_id().str(), maxdel = st.max_deleted().str(),
+                          added = std::to_string(st.entries_added());
+        record({ "XSETID", key, last, "ENTRIESADDED", added, "MAXDELETEDID", maxdel });
+        if (!st.groups()) continue;
+        for (const auto& [gname, g] : *st.groups())
+        {
+            const std::string gl = g.last.str(), er = std::to_string(g.entries_read);
+            record({ "XGROUP", "CREATE", key, gname, gl, "ENTRIESREAD", er });
+            for (const auto& [cname, c] : g.consumers)
+            {
+                const std::string seen = std::to_string(c.seen_ms), active = std::to_string(c.active_ms);
+                record({ "XCONSUMER", key, gname, cname, seen, active });
+            }
+            for (const auto& [id, n] : g.pel)
+            {
+                if (!n.owner) continue;
+                const std::string idt = id.str(), when = std::to_string(n.delivery_ms),
+                                  count = std::to_string(n.count);
+                record({ "XNACK", key, gname, n.owner->name, idt, when, count });
+            }
+        }
+    }
+
     // ─── TTLs, in milliseconds ──────────────────────────────────────────────
     // pexpire rather than expire, because the cast truncated a key with 500 ms
     // left to `expire key 0`, which the `> 0` test then dropped and the key
@@ -2580,7 +2690,7 @@ static int64_t wall_clock_ms()
 // Append-only: an older build reads a dump it does not know the types in,
 // which is why a new one goes on the end and never in the middle.
 enum : uint8_t { TYPE_STRING = 0, TYPE_LIST = 1, TYPE_SET = 2, TYPE_HASH = 3,
-                 TYPE_ZSET = 4 };
+                 TYPE_ZSET = 4, TYPE_STREAM = 5 };
 
 void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
                               uint32_t shard_count)
@@ -2631,6 +2741,13 @@ void cache_store::adopt_owned(cache_store& other, uint32_t shard_index,
         {
             carry_expiry(it->first);
             adopt_loaded_zset(std::string(it->first), std::move(it->second));
+        }
+
+    for (auto it = other.m_streams.begin(); it != other.m_streams.end(); ++it)
+        if (mine(it->first))
+        {
+            carry_expiry(it->first);
+            adopt_loaded_stream(std::string(it->first), std::move(it->second));
         }
 }
 
@@ -2683,6 +2800,17 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
     {
         total_size += entry_overhead(key) + 4;
         for (const auto& [sc, member] : z.order) total_size += string_size(member) + 8;
+    }
+
+    // A stream is its own serialisation behind a u64 length, made here once
+    // because its size is only known by making it.
+    std::vector<std::string> stream_blobs;
+    stream_blobs.reserve(m_streams.size());
+    for (const auto& [key, st] : m_streams)
+    {
+        stream_blobs.emplace_back();
+        st.serialize(stream_blobs.back());
+        total_size += entry_overhead(key) + 8 + stream_blobs.back().size();
     }
 
     // Phase 2: mmap temp file and serialize directly into mapped region
@@ -2804,6 +2932,16 @@ bool cache_store::save_v2(std::string_view path, std::string_view prefix) const
         emit_expiry(key);
     }
 
+    size_t blob_i = 0;
+    for (const auto& [key, st] : m_streams)
+    {
+        const std::string& blob = stream_blobs[blob_i++];
+        emit_key(TYPE_STREAM, key);
+        emit_i64(static_cast<int64_t>(blob.size()));
+        emit(blob.data(), blob.size());
+        emit_expiry(key);
+    }
+
     if (msync(map, total_size, MS_SYNC) < 0) {}
     munmap(map, total_size);
     fsync(fd_raw);
@@ -2896,6 +3034,7 @@ void cache_store::flush_all()
     m_sets.clear();
     m_hashes.clear();
     m_zsets.clear();
+    m_streams.clear();
     m_list_elems   = 0;
     m_set_elems    = 0;
     m_hash_fields  = 0;
@@ -3050,6 +3189,18 @@ bool cache_store::load_v2(const char* data, size_t size)
                     adopt_loaded_zset(std::move(key), std::move(z));
                 break;
             }
+            case TYPE_STREAM:
+            {
+                int64_t len = 0;
+                if (!read_i64(len) || len < 0 || remaining() < static_cast<size_t>(len)) return false;
+                stream_inner st;
+                if (!st.deserialize(std::string_view(p, static_cast<size_t>(len)))) return false;
+                p += len;
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
+                    adopt_loaded_stream(std::move(key), std::move(st));
+                break;
+            }
             default:
                 return false;
         }
@@ -3061,18 +3212,7 @@ bool cache_store::load_v2(const char* data, size_t size)
 bool cache_store::load_v2_stream(std::ifstream& file)
 {
     // Legacy ifstream-based parser (fallback when mmap fails)
-    m_data.clear();
-    m_lists.clear();
-    m_sets.clear();
-    m_hashes.clear();
-    m_zsets.clear();
-    m_list_elems = 0;
-    m_set_elems = 0;
-    m_hash_fields = 0;
-    m_expiry.clear();
-    m_current_memory = 0;
-    m_lru_order.clear();
-    m_lru_map.clear();
+    flush_all();
 
     auto now = std::chrono::steady_clock::now();
     const int64_t wall_now_ms = wall_clock_ms();
@@ -3198,6 +3338,21 @@ bool cache_store::load_v2_stream(std::ifstream& file)
                     adopt_loaded_zset(std::move(key), std::move(z));
                 break;
             }
+            case TYPE_STREAM:
+            {
+                int64_t len = 0;
+                file.read(reinterpret_cast<char*>(&len), sizeof(len));
+                if (!file || len < 0 || len > (int64_t{1} << 40)) return false;
+                std::string blob(static_cast<size_t>(len), '\0');
+                file.read(blob.data(), len);
+                if (!file) return false;
+                stream_inner st;
+                if (!st.deserialize(blob)) return false;
+                if (!read_expiry(key, expired)) return false;
+                if (!expired)
+                    adopt_loaded_stream(std::move(key), std::move(st));
+                break;
+            }
             default:
                 return false;
         }
@@ -3208,18 +3363,7 @@ bool cache_store::load_v2_stream(std::ifstream& file)
 
 bool cache_store::load_v1(std::ifstream& file, uint32_t first_key_len)
 {
-    m_data.clear();
-    m_lists.clear();
-    m_sets.clear();
-    m_hashes.clear();
-    m_zsets.clear();
-    m_list_elems = 0;
-    m_set_elems = 0;
-    m_hash_fields = 0;
-    m_expiry.clear();
-    m_current_memory = 0;
-    m_lru_order.clear();
-    m_lru_map.clear();
+    flush_all();
 
     // Process the first entry (key_len already read)
     uint32_t key_len = first_key_len;
@@ -3307,6 +3451,13 @@ void cache_store::adopt_loaded_zset(std::string&& key, zset_inner&& members)
     touch_lru(it->first);
 }
 
+void cache_store::adopt_loaded_stream(std::string&& key, stream_inner&& s)
+{
+    auto it = m_streams.insert_or_assign(std::move(key), std::move(s)).first;
+    track_add(entry_cost(it->first, it->second));
+    touch_lru(it->first);
+}
+
 void cache_store::rebuild_lru()
 {
     for (const auto& e : m_data)   touch_lru(e.first);
@@ -3317,6 +3468,7 @@ void cache_store::rebuild_lru()
     // after the fact could never evict a sorted set, because nothing had put
     // one in the LRU.
     for (const auto& e : m_zsets)  touch_lru(e.first);
+    for (const auto& e : m_streams) touch_lru(e.first);
 }
 
 void cache_store::drop_lru(std::string_view key)
@@ -3443,6 +3595,11 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
             track_sub(entry_cost(it->first, it->second));
             m_zset_members -= it->second.size();
             m_zsets.erase(it);
+        }
+        else if (auto it = m_streams.find(victim); it != m_streams.end())
+        {
+            track_sub(entry_cost(it->first, it->second));
+            m_streams.erase(it);
         }
     }
 

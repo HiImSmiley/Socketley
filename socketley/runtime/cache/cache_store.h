@@ -17,6 +17,8 @@
 #include "list_items.h"
 #include "key_table.h"
 #include "zskiplist.h"
+#include "stream_log.h"
+#include "heap_cost.h"
 
 #include "../../shared/transparent_string.h"
 
@@ -103,6 +105,8 @@ public:
 };
 static_assert(sizeof(zset_inner) == 24);
 using zset_map = key_table<zset_inner>;
+using stream_inner = stream_log;
+using stream_map = key_table<stream_inner>;
 using expiry_map = key_table<std::chrono::steady_clock::time_point>;
 using channel_map = std::unordered_map<std::string, std::unordered_set<int>, string_hash, string_equal>;
 
@@ -294,7 +298,7 @@ public:
     // The cursor packs [map index : 8][bucket count : 24][bucket index : 32],
     // and the top six bits are free for a shard tag only while the map index
     // fits in the two below them.
-    static constexpr uint8_t scan_last_map = 4;   // m_data, m_lists, m_sets, m_hashes, m_zsets
+    static constexpr uint8_t scan_last_map = 5;   // m_data, m_lists, m_sets, m_hashes, m_zsets, m_streams
     // `value_pattern` is a pointer and not an empty string_view because absent
     // and empty are different requests, the same distinction MATCH "" makes.
     // What one scan call was asked for, beside the cursor and the page size.
@@ -523,12 +527,41 @@ public:
     size_t zremrangebyscore(std::string_view key, double min, double max,
                             bool min_incl, bool max_incl);
 
+    // --- Streams ---
+    // The stream at `key` or null, touched in the eviction order as a read is.
+    const stream_inner* stream_get(std::string_view key) const;
+    // The same stream to change, which only stream_change() may do.
+    stream_inner* stream_find(std::string_view key);
+    // An empty stream made at a `key` that holds nothing, with room admitted
+    // for `growth` more, or null when the room is refused.
+    stream_inner* stream_make(std::string_view key, size_t growth);
+    // Room for the stream at `key` to grow by `growth`, which eviction may not take it for.
+    bool stream_admit(std::string_view key, size_t growth) { return check_memory(growth, key); }
+
+    // `f` run on the stream at `key` with whatever its heap moved by charged,
+    // the one way a stream changes so the books cannot miss a change.
+    template <class F>
+    decltype(auto) stream_change(std::string_view key, stream_inner& s, F&& f)
+    {
+        struct settle
+        {
+            cache_store& st; stream_inner& s; std::string_view key; size_t before;
+            ~settle() { st.reshape(before, s.heap_bytes()); st.touch_lru(key); }
+        } guard{ *this, s, key, s.heap_bytes() };
+        return f(s);
+    }
+
+    // What a stream costs beside the key entry a string would have, the part
+    // of it that is not heap.
+    static constexpr size_t stream_entry_extra =
+        sizeof(stream_inner) > sizeof(std::string) ? sizeof(stream_inner) - sizeof(std::string) : 0;
+
     // The difference between "not there" and "there as something else", asked
     // only when a read has already MISSED its own container -- so a hit pays
     // nothing and a pure single-type store pays four empty() tests.
     //
     // `expect` is the container the caller looked in: 's' string, 'l' list,
-    // 't' set, 'h' hash, 'z' sorted set.
+    // 't' set, 'h' hash, 'z' sorted set, 'x' stream.
     bool holds_other_type(std::string_view key, char expect) const;
 
     // --- Type / Keys ---
@@ -628,6 +661,7 @@ private:
     bool has_type_conflict_for_set(std::string_view key) const;
     bool has_type_conflict_for_hash(std::string_view key) const;
     bool has_type_conflict_for_zset(std::string_view key) const;
+    bool has_type_conflict_for_stream(std::string_view key) const;
 
     bool save_v2(std::string_view path, std::string_view prefix) const;
     bool load_v2(const char* data, size_t size);
@@ -642,6 +676,7 @@ private:
     void adopt_loaded_set(std::string&& key, set_inner&& members);
     void adopt_loaded_hash(std::string&& key, hash_inner&& fields);
     void adopt_loaded_zset(std::string&& key, zset_inner&& members);
+    void adopt_loaded_stream(std::string&& key, stream_inner&& s);
 
     // Populate the eviction order from data already resident, needed when a
     // limit is switched on after the fact.
@@ -710,12 +745,7 @@ private:
 
     // Bytes glibc malloc actually spends on a request, header and rounding
     // included, because those are resident memory like any other.
-    static constexpr size_t malloc_chunk(size_t request)
-    {
-        constexpr size_t header = 8, align = 16, min_chunk = 32;
-        const size_t chunk = (request + header + align - 1) & ~(align - 1);
-        return chunk < min_chunk ? min_chunk : chunk;
-    }
+    static constexpr size_t malloc_chunk(size_t request) { return malloc_chunk_bytes(request); }
 
     // What one stored string costs given its length, where inside the SSO
     // limit only the length is added and past it the separate block is the
@@ -779,6 +809,11 @@ private:
     static size_t entry_cost(std::string_view key, const set_inner& members);
     static size_t entry_cost(std::string_view key, const hash_inner& fields);
     static size_t entry_cost(std::string_view key, const zset_inner& members);
+    // A stream counts its own heap, so this is O(1) where the others walk.
+    static size_t entry_cost(std::string_view key, const stream_inner& s)
+    {
+        return stored_string(key) + stream_entry_extra + s.heap_bytes();
+    }
 
     // One open-addressed slot, of which every per-element overhead above
     // includes at least one.
@@ -870,7 +905,7 @@ private:
     size_t structural_overhead() const
     {
         return (m_data.size() + m_lists.size() + m_sets.size() + m_hashes.size()
-                + m_zsets.size()) * key_entry_overhead
+                + m_zsets.size() + m_streams.size()) * key_entry_overhead
              + m_lru_map.size() * lru_entry_overhead
              + m_expiry.size()  * expiry_entry_overhead
              + m_list_elems     * list_elem_overhead
@@ -894,6 +929,7 @@ private:
     set_map m_sets;
     hash_map m_hashes;
     zset_map m_zsets;
+    stream_map m_streams;
     expiry_map m_expiry;
 
     // Eviction / Memory

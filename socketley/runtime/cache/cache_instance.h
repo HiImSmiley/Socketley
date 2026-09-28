@@ -852,6 +852,14 @@ private:
         // Where this waiter sits in each of its keys' queues, so leaving one
         // is an erase at a known node and not a search through the queue.
         std::vector<std::list<uint64_t>::iterator> slots;
+
+        // An XREAD or XREADGROUP parks here too, queued in m_stream_wait_key.
+        bool                     stream{false};
+        std::vector<stream_id>   after;             // per key, the id past which it reads
+        std::string              group;             // empty for XREAD
+        std::string              consumer;
+        uint64_t                 count{0};
+        bool                     noack{false};
     };
 
     // It stopped being true.  The linear walk that used to live here compared
@@ -869,6 +877,44 @@ private:
                        string_hash, string_equal>          m_wait_key;
     std::unordered_map<int, uint64_t>                     m_wait_fd;
     uint64_t                 m_block_seq{0};
+
+    // ─── Streams ────────────────────────────────────────────────────────────
+    // Stream readers by key in arrival order, apart from the list waiters so a
+    // push never hands an element to a reader that wants entries.
+    std::unordered_map<std::string, std::list<uint64_t>,
+                       string_hash, string_equal>          m_stream_wait_key;
+    // Keys an XADD or a group's destruction has touched this turn, served once
+    // the turn's commands are done, as Redis serves them after the command.
+    std::vector<std::string> m_stream_ready;
+    // Set while a replication record is applied, the only door to the two
+    // verbs that restore a group exactly.
+    bool m_stream_internal{false};
+    // A reply's body built before its count is known, kept so a range reuses its room.
+    std::string m_stream_scratch;
+
+    friend struct stream_commands;
+    // Every stream command, answered in RESP into `rb` whichever protocol asked.
+    void stream_command(client_connection* conn, uint32_t h, std::string_view* args, int argc,
+                        std::string& rb);
+    // The line protocol's door to the same commands, answered in its words.
+    void stream_text(client_connection* conn, std::string_view cmd, std::string_view args);
+    // One stream write for the followers and the journal, as the record the
+    // text interpreter replays.
+    void stream_repl(std::string_view key, const std::string_view* a, size_t n);
+    void stream_repl(std::string_view key, std::initializer_list<std::string_view> a)
+    { stream_repl(key, a.begin(), a.size()); }
+    // A key an XADD or XGROUP DESTROY changed, for the readers parked on it.
+    void stream_signal(std::string_view key);
+    void serve_stream_ready();
+    void serve_stream_waiter(uint64_t seq, std::string_view key);
+    bool block_stream(client_connection* conn, const std::string_view* keys, const stream_id* ids,
+                      size_t n, std::string_view group, std::string_view consumer,
+                      uint64_t count, bool noack, int64_t timeout_ms);
+    // A reply that did not come from this connection's own command, put on its
+    // wire, and what it pipelined behind the wait run.
+    void deliver_late(client_connection* c, std::string_view resp_reply);
+    // A write refused a place in the replication log, counted and said.
+    void repl_unfaithful(std::string_view key);
 
     // Drops one waiter from all three, and is the only way any of them shrink.
     void forget_waiter(uint64_t seq);
