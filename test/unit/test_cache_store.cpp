@@ -1313,7 +1313,9 @@ TEST_CASE("cache_store scan restricted to one type")
         // Spelled however the caller likes, because the names are all letters.
         CHECK(cache_store::scan_map_of_type("HASH")   == 3);
         CHECK(cache_store::scan_map_of_type("ZSet")   == 4);
-        CHECK(cache_store::scan_map_of_type("stream") == -1);
+        CHECK(cache_store::scan_map_of_type("stream") == 5);
+        CHECK(cache_store::scan_map_of_type("STREAM") == 5);
+        CHECK(cache_store::scan_map_of_type("module") == -1);
         CHECK(cache_store::scan_map_of_type("")       == -1);
     }
 
@@ -1452,6 +1454,7 @@ TEST_CASE("cache_store counts one type without walking it")
     for (int i = 0; i < 2; i++)  store.sadd("t:" + std::to_string(i), "m");
     for (int i = 0; i < 11; i++) store.hset("h:" + std::to_string(i), "f", "v");
     for (int i = 0; i < 5; i++)  store.zadd("z:" + std::to_string(i), 1.0, "m");
+    for (int i = 0; i < 4; i++)  REQUIRE(store.stream_make("x:" + std::to_string(i), 0));
 
     SUBCASE("each map is counted on its own")
     {
@@ -1460,28 +1463,29 @@ TEST_CASE("cache_store counts one type without walking it")
         CHECK(store.size_of_type(2) == 2);
         CHECK(store.size_of_type(3) == 11);
         CHECK(store.size_of_type(4) == 5);
+        CHECK(store.size_of_type(5) == 4);
     }
 
     SUBCASE("a map no type names counts nothing")
     {
         CHECK(store.size_of_type(-1) == 0);
-        CHECK(store.size_of_type(5)  == 0);
+        CHECK(store.size_of_type(6)  == 0);
         CHECK(store.size_of_type(99) == 0);
     }
 
-    SUBCASE("and the five of them are the whole keyspace")
+    SUBCASE("and the six of them are the whole keyspace")
     {
-        // The invariant that makes the five answers trustworthy together: a map
+        // The invariant that makes the six answers trustworthy together: a map
         // counted twice or missed entirely shows up here and nowhere else.
         uint32_t sum = 0;
-        for (int m = 0; m <= 4; m++) sum += store.size_of_type(m);
+        for (int m = 0; m <= 5; m++) sum += store.size_of_type(m);
         CHECK(sum == store.size());
-        CHECK(sum == 28);
+        CHECK(sum == 32);
     }
 
     SUBCASE("it agrees with what a walk of the same map returns")
     {
-        for (int m = 0; m <= 4; m++)
+        for (int m = 0; m <= 5; m++)
         {
             std::vector<std::string_view> out;
             CHECK(store.scan(0, "*", 1000000, out, cache_store::scan_filter::one(nullptr, m)) == 0);
@@ -3531,4 +3535,569 @@ TEST_CASE("every change to a collection is given back exactly when the key goes"
             }
         }
     }
+}
+
+// ─── Streams ────────────────────────────────────────────────────────────────
+
+namespace
+{
+    // An XADD the way the command layer makes one: a stream found or made,
+    // room admitted for what the append will grow it by, the change charged.
+    bool store_xadd(cache_store& st, std::string_view key, stream_id id,
+                    const std::vector<std::string>& fv)
+    {
+        std::vector<std::string_view> v(fv.begin(), fv.end());
+        stream_inner* s = st.stream_find(key);
+        const size_t pairs = v.size() / 2;
+        const size_t growth = s ? s->append_growth(id, v.data(), pairs)
+                                : stream_inner{}.append_growth(id, v.data(), pairs);
+        if (!s) s = st.stream_make(key, growth);
+        else if (st.stream_admit(key, growth)) s = st.stream_find(key);
+        else s = nullptr;
+        if (!s) return false;
+        st.stream_change(key, *s, [&](stream_inner& x) { x.append(id, v.data(), pairs); });
+        return true;
+    }
+
+    using model_entry = std::pair<stream_id, std::vector<std::string>>;
+
+    std::vector<model_entry> read_all(const stream_log& s, stream_id lo = {},
+                                      stream_id hi = stream_id::max(), bool rev = false)
+    {
+        std::vector<model_entry> out;
+        s.walk(lo, hi, rev, [&](const stream_log::entry& e) {
+            std::vector<std::string> fv;
+            e.each([&](std::string_view f, std::string_view v) { fv.emplace_back(f); fv.emplace_back(v); });
+            out.emplace_back(e.id, std::move(fv));
+            return true;
+        });
+        return out;
+    }
+
+    std::string serialized(const stream_log& s)
+    {
+        std::string out;
+        s.serialize(out);
+        return out;
+    }
+}
+
+TEST_CASE("stream ids parse as Redis parses them and print as it prints them")
+{
+    stream_id id;
+    bool given = true;
+    CHECK(stream_parse_id("5-3", id, 0, true, nullptr));
+    CHECK(id == stream_id{5, 3});
+    CHECK(stream_parse_id("5", id, 7, true, nullptr));
+    CHECK(id == stream_id{5, 7});
+    CHECK(stream_parse_id("-", id, 0, false, nullptr));
+    CHECK(id == stream_id{});
+    CHECK(stream_parse_id("+", id, 0, false, nullptr));
+    CHECK(id == stream_id::max());
+    CHECK_FALSE(stream_parse_id("-", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("+", id, 0, true, nullptr));
+    CHECK(stream_parse_id("9-*", id, 0, true, &given));
+    CHECK_FALSE(given);
+    CHECK(id == stream_id{9, 0});
+    CHECK(stream_parse_id("9-1", id, 0, true, &given));
+    CHECK(given);
+    CHECK_FALSE(stream_parse_id("9-*", id, 0, true, nullptr));
+    // strtoull's reading after the strict one, as string2ull has it.
+    CHECK(stream_parse_id("007", id, 0, true, nullptr));
+    CHECK(id.ms == 7);
+    CHECK(stream_parse_id("18446744073709551615-18446744073709551615", id, 0, true, nullptr));
+    CHECK(id == stream_id::max());
+    CHECK_FALSE(stream_parse_id("18446744073709551616", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("-5", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("1-", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("1-x", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id("abc", id, 0, true, nullptr));
+    CHECK_FALSE(stream_parse_id(std::string(128, '1'), id, 0, true, nullptr));
+    CHECK(stream_parse_id(std::string_view("4-2\0junk", 8), id, 0, true, nullptr));
+    CHECK(id == stream_id{4, 2});
+
+    stream_id top = stream_id::max();
+    CHECK_FALSE(top.incr());
+    CHECK(top == stream_id{});
+    CHECK_FALSE(top.decr());
+    CHECK(top == stream_id::max());
+    stream_id a{3, UINT64_MAX};
+    CHECK(a.incr());
+    CHECK(a == stream_id{4, 0});
+    CHECK(a.decr());
+    CHECK(a == stream_id{3, UINT64_MAX});
+    CHECK(stream_id{12, 0}.str() == "12-0");
+    CHECK(stream_id::max().str() == "18446744073709551615-18446744073709551615");
+    CHECK(stream_id{1, 2} < stream_id{2, 0});
+    CHECK(stream_id{2, 1} > stream_id{2, 0});
+}
+
+TEST_CASE("a stream record's arguments come back as they went in, spaces and newlines included")
+{
+    const std::string_view in[] = { "XADD", "k y", "1-1", "", "a\r\nb", std::string_view("\0:3", 3) };
+    std::string rec;
+    stream_args_encode(rec, in, std::size(in));
+    std::vector<std::string_view> out;
+    REQUIRE(stream_args_decode(rec, out));
+    REQUIRE(out.size() == std::size(in));
+    for (size_t i = 0; i < out.size(); ++i) CHECK(out[i] == in[i]);
+    out.clear();
+    CHECK_FALSE(stream_args_decode("3:ab", out));
+    out.clear();
+    CHECK_FALSE(stream_args_decode("x:ab", out));
+    out.clear();
+    CHECK_FALSE(stream_args_decode("3", out));
+}
+
+TEST_CASE("stream_log agrees with a model through appends, deletions and trims")
+{
+    uint32_t r = 4242;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    const std::vector<std::vector<std::string>> shapes = {
+        { "f", "v" }, { "name", "", "age", "" }, { "a", "", "b", "", "c", "" }, { "payload", "" },
+    };
+    for (int round = 0; round < 6; ++round)
+    {
+        CAPTURE(round);
+        stream_log s;
+        std::map<stream_id, std::vector<std::string>> model;
+        stream_id last;
+        stream_id maxdel;
+        uint64_t added = 0;
+        for (int step = 0; step < 4000; ++step)
+        {
+            const uint32_t op = rnd() % 100;
+            if (op < 60)
+            {
+                // Same millisecond now and then, a jump now and then.
+                stream_id id = last;
+                if (rnd() % 3 == 0) id.seq += 1 + rnd() % 3;
+                else { id.ms += 1 + rnd() % (rnd() % 10 == 0 ? 100000 : 3); id.seq = rnd() % 2; }
+                if (id <= last) id = { last.ms, last.seq + 1 };
+                std::vector<std::string> fv = shapes[rnd() % shapes.size()];
+                for (size_t i = 1; i < fv.size(); i += 2)
+                    fv[i] = std::string(rnd() % 7 == 0 ? 300 + rnd() % 900 : rnd() % 20, char('a' + rnd() % 26));
+                if (rnd() % 11 == 0) fv[0] = "odd" + std::to_string(rnd() % 3);
+                std::vector<std::string_view> v(fv.begin(), fv.end());
+                const size_t before = s.heap_bytes();
+                const size_t predicted = s.append_growth(id, v.data(), v.size() / 2);
+                s.append(id, v.data(), v.size() / 2);
+                CHECK(s.heap_bytes() <= before + predicted);
+                model[id] = fv;
+                last = id;
+                ++added;
+            }
+            else if (op < 75 && !model.empty())
+            {
+                auto it = std::next(model.begin(), static_cast<long>(rnd() % model.size()));
+                const stream_id id = rnd() % 5 ? it->first : stream_id{ it->first.ms, it->first.seq + 1 };
+                const bool had = model.erase(id) > 0;
+                CHECK(s.erase(id) == had);
+                if (had && id > maxdel) maxdel = id;
+            }
+            else if (op < 85)
+            {
+                stream_log::trim_spec t;
+                t.by = stream_log::trim_by::maxlen;
+                t.approx = rnd() % 2;
+                t.maxlen = model.size() > 3 ? rnd() % model.size() : 0;
+                t.limit = t.approx && rnd() % 2 ? static_cast<int64_t>(rnd() % 300) : 0;
+                const uint64_t gone = s.trim(t);
+                // Whatever went is the oldest `gone`, never more than was asked.
+                CHECK(gone <= (model.size() > t.maxlen ? model.size() - t.maxlen : 0));
+                for (uint64_t i = 0; i < gone; ++i) model.erase(model.begin());
+                if (!t.approx && !t.limit) CHECK(model.size() <= std::max<uint64_t>(t.maxlen, 0));
+            }
+            else if (op < 92 && !model.empty())
+            {
+                stream_log::trim_spec t;
+                t.by = stream_log::trim_by::minid;
+                t.approx = rnd() % 2;
+                t.minid = std::next(model.begin(), static_cast<long>(rnd() % model.size()))->first;
+                const uint64_t gone = s.trim(t);
+                uint64_t below = 0;
+                for (const auto& [id, fv] : model) if (id < t.minid) ++below;
+                CHECK(gone <= below);
+                for (uint64_t i = 0; i < gone; ++i) model.erase(model.begin());
+                if (!t.approx) CHECK(gone == below);
+            }
+            else
+            {
+                // A range read, forwards and backwards, against the model.
+                if (model.empty()) continue;
+                auto a = std::next(model.begin(), static_cast<long>(rnd() % model.size()))->first;
+                auto b = std::next(model.begin(), static_cast<long>(rnd() % model.size()))->first;
+                if (b < a) std::swap(a, b);
+                if (rnd() % 2) a.seq = a.seq ? a.seq - 1 : 0;
+                std::vector<model_entry> want(model.lower_bound(a), model.upper_bound(b));
+                CHECK(read_all(s, a, b) == want);
+                std::reverse(want.begin(), want.end());
+                CHECK(read_all(s, a, b, true) == want);
+            }
+
+            REQUIRE(s.size() == model.size());
+            CHECK(s.entries_added() == added);
+            CHECK(s.last_id() == last);
+            CHECK(s.max_deleted() == maxdel);
+            if (!model.empty())
+            {
+                CHECK(s.first_id() == model.begin()->first);
+                CHECK(s.last_live() == model.rbegin()->first);
+            }
+            else
+                CHECK(s.first_id() == stream_id{});
+            if (step % 500 == 0 || step == 3999)
+            {
+                const std::vector<model_entry> all(model.begin(), model.end());
+                REQUIRE(read_all(s) == all);
+                for (const auto& [id, fv] : model)
+                    CHECK(s.contains(id));
+                // The persisted form and a copy both hold the same stream.
+                stream_log back;
+                REQUIRE(back.deserialize(serialized(s)));
+                CHECK(serialized(back) == serialized(s));
+                CHECK(read_all(back) == all);
+                stream_log copy(s);
+                CHECK(serialized(copy) == serialized(s));
+                stream_log moved(std::move(copy));
+                CHECK(read_all(moved) == all);
+                CHECK(copy.size() == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("a stream is cut into blocks where Redis cuts its nodes")
+{
+    stream_log s;
+    const std::string_view fv[] = { "f", "v" };
+    for (uint64_t i = 1; i <= 250; ++i) s.append({ i, 1 }, fv, 1);
+    CHECK(s.block_count() == 3);
+
+    // MAXLEN ~ takes whole blocks only, and LIMIT stops before a block that
+    // would cross it.
+    stream_log::trim_spec t;
+    t.by = stream_log::trim_by::maxlen;
+    t.approx = true;
+    t.maxlen = 120;
+    t.limit = 10000;
+    CHECK(s.trim(t) == 100);
+    CHECK(s.size() == 150);
+    t.maxlen = 0;
+    t.limit = 50;
+    CHECK(s.trim(t) == 0);
+
+    // An exact trim leaves the tail block's slots taken, so the next block
+    // opens where Redis's next node would.
+    t.approx = false;
+    t.limit = 0;
+    t.maxlen = 10;
+    CHECK(s.trim(t) == 140);
+    CHECK(s.block_count() == 1);
+    for (uint64_t i = 251; i <= 300; ++i) s.append({ i, 1 }, fv, 1);
+    CHECK(s.block_count() == 1);
+    s.append({ 301, 1 }, fv, 1);
+    CHECK(s.block_count() == 2);
+
+    // A node's byte bound cuts a stream of large entries before its count
+    // does, at four of a thousand bytes as Redis's listpack does.
+    stream_log big;
+    const std::string v(1000, 'x');
+    const std::string_view bfv[] = { "f", v };
+    for (uint64_t i = 1; i <= 12; ++i) big.append({ i, 0 }, bfv, 1);
+    CHECK(big.block_count() == 3);
+
+    // An XDEL that empties a block takes the block with it.
+    stream_log d;
+    for (uint64_t i = 1; i <= 150; ++i) d.append({ i, 0 }, fv, 1);
+    for (uint64_t i = 1; i <= 100; ++i) REQUIRE(d.erase({ i, 0 }));
+    CHECK(d.block_count() == 1);
+    CHECK(d.first_id() == stream_id{ 101, 0 });
+    CHECK(d.max_deleted() == stream_id{ 100, 0 });
+}
+
+TEST_CASE("a group's pending entries agree with a model through deliveries, claims and acks")
+{
+    uint32_t r = 99;
+    auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    stream_log s;
+    const std::string_view fv[] = { "f", "v" };
+    for (uint64_t i = 1; i <= 300; ++i) s.append({ i, 0 }, fv, 1);
+    REQUIRE(s.create_group("g", {}, 0));
+    CHECK_FALSE(s.create_group("g", {}, 0));
+    stream_log::group* g = s.find_group("g");
+    REQUIRE(g);
+
+    struct pend { std::string owner; int64_t when; uint64_t count; };
+    std::map<stream_id, pend> model;
+    std::set<std::string> consumers;
+    const auto consumer = [&](const std::string& n) {
+        stream_log::consumer* c = s.find_consumer(*g, n);
+        if (!c) { c = s.create_consumer(*g, n, 1); consumers.insert(n); }
+        return c;
+    };
+    for (int step = 0; step < 20000; ++step)
+    {
+        const std::string who = "c" + std::to_string(rnd() % 6) + (rnd() % 4 ? "" : std::string(20, 'x'));
+        const stream_id id{ 1 + rnd() % 300, 0 };
+        const uint32_t op = rnd() % 10;
+        if (op < 4)
+        {
+            stream_log::nack& n = s.deliver(*g, id, *consumer(who), step);
+            CHECK(n.count == 1);
+            model[id] = { who, step, 1 };
+        }
+        else if (op < 6)
+        {
+            CHECK(s.ack(*g, id) == (model.erase(id) > 0));
+        }
+        else if (op < 8)
+        {
+            // A claim: an entry already pending moves to another consumer.
+            stream_log::nack* n = s.find_nack(*g, id);
+            CHECK((n != nullptr) == (model.count(id) > 0));
+            if (n)
+            {
+                s.move_nack(id, *n, *consumer(who));
+                ++n->count;
+                model[id].owner = who;
+                ++model[id].count;
+            }
+        }
+        else if (op < 9)
+        {
+            const int64_t had = s.delete_consumer(*g, who);
+            uint64_t owned = 0;
+            for (auto it = model.begin(); it != model.end();)
+                if (it->second.owner == who) { ++owned; it = model.erase(it); } else ++it;
+            CHECK(had == (consumers.erase(who) ? static_cast<int64_t>(owned) : -1));
+        }
+        else
+        {
+            stream_log::nack& n = s.force_nack(*g, id, 5);
+            if (!model.count(id)) { CHECK(n.count == 1); CHECK(n.delivery_ms == 5); }
+            s.move_nack(id, n, *consumer(who));
+            model[id] = { who, n.delivery_ms, n.count };
+        }
+
+        if (step % 1000 == 0)
+        {
+            REQUIRE(g->pel.size() == model.size());
+            size_t viewed = 0;
+            for (const auto& [id, n] : g->pel)
+            {
+                REQUIRE(model.count(id));
+                REQUIRE(n.owner);
+                CHECK(std::string(n.owner->name) == model[id].owner);
+                CHECK(n.count == model[id].count);
+                CHECK(n.owner->pel.count(id) == 1);
+            }
+            for (const auto& [name, c] : g->consumers)
+            {
+                CHECK(consumers.count(name) == 1);
+                CHECK(c.name == name);
+                viewed += c.pel.size();
+            }
+            CHECK(viewed == model.size());
+            CHECK(g->consumers.size() == consumers.size());
+            // The persisted form carries every pending entry and its owner.
+            stream_log back;
+            REQUIRE(back.deserialize(serialized(s)));
+            CHECK(serialized(back) == serialized(s));
+            CHECK(back.heap_bytes() == s.heap_bytes());
+        }
+    }
+    // Destroying the group gives every byte its entries held back.
+    const size_t with = s.heap_bytes();
+    REQUIRE(s.destroy_group("g"));
+    CHECK(s.heap_bytes() < with);
+    stream_log bare;
+    for (uint64_t i = 1; i <= 300; ++i) bare.append({ i, 0 }, fv, 1);
+    CHECK(s.heap_bytes() == bare.heap_bytes());
+}
+
+TEST_CASE("a group's lag and read counter follow Redis's rules")
+{
+    stream_log s;
+    const std::string_view fv[] = { "f", "v" };
+    for (uint64_t i = 1; i <= 5; ++i) s.append({ i, 1 }, fv, 1);
+    stream_log::group* g = s.create_group("g", {}, 0);
+    int64_t lag = -1;
+    CHECK(s.lag(*g, lag));
+    CHECK(lag == 5);
+    s.advance(*g, { 1, 1 });
+    s.advance(*g, { 2, 1 });
+    CHECK(g->entries_read == 2);
+    CHECK(s.lag(*g, lag));
+    CHECK(lag == 3);
+    // A hole ahead of the group makes the counter unknowable.
+    REQUIRE(s.erase({ 4, 1 }));
+    CHECK_FALSE(s.lag(*g, lag));
+    s.advance(*g, { 3, 1 });
+    CHECK(g->entries_read == -1);
+    s.advance(*g, { 5, 1 });
+    CHECK(g->entries_read == 5);
+    CHECK(s.lag(*g, lag));
+    CHECK(lag == 0);
+    stream_log::group* h = s.create_group("h", { 5, 1 }, -1);
+    CHECK(s.lag(*h, lag));
+    CHECK(lag == 0);
+    CHECK(s.estimate_read({ 0, 1 }) == -1);
+    stream_log e;
+    CHECK(e.estimate_read({ 7, 7 }) == 0);
+}
+
+TEST_CASE("a stream is one more type to the store")
+{
+    cache_store store;
+    REQUIRE(store_xadd(store, "x", { 1, 1 }, { "f", "v" }));
+    CHECK(store.type("x") == "stream");
+    CHECK(store.exists("x"));
+    CHECK(store.holds_other_type("x", 's'));
+    CHECK_FALSE(store.holds_other_type("x", 'x'));
+    CHECK_FALSE(store.set("x", "v"));
+    CHECK_FALSE(store.lpush("x", "v"));
+    CHECK(store.sadd("x", "m") < 0);
+    CHECK_FALSE(store.hset("x", "f", "v"));
+    CHECK(store.zadd("x", 1, "m") < 0);
+    REQUIRE(store.set("str", "v"));
+    CHECK(store.stream_make("str", 0) == nullptr);
+    CHECK(store.size() == 2);
+
+    std::vector<std::string_view> ks;
+    store.keys("*", ks);
+    CHECK(ks.size() == 2);
+    ks.clear();
+    CHECK(store.scan(0, "*", 100, ks, cache_store::scan_filter::one(nullptr, 5)) == 0);
+    REQUIRE(ks.size() == 1);
+    CHECK(ks[0] == "x");
+
+    CHECK(store.copy_key("x", "y", false) == 1);
+    CHECK(serialized(*store.stream_get("y")) == serialized(*store.stream_get("x")));
+    CHECK(store.rename_key("y", "z", false) == 1);
+    CHECK(store.type("z") == "stream");
+    CHECK_FALSE(store.exists("y"));
+    CHECK(store.set_expiry_ms("z", 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    store.check_expiry("z");
+    CHECK_FALSE(store.exists("z"));
+    CHECK(store.del("x"));
+    CHECK(store.type("x") == "none");
+}
+
+TEST_CASE("a stream survives save and load, and a dump names it as records")
+{
+    cache_store store;
+    for (uint64_t i = 1; i <= 150; ++i)
+        REQUIRE(store_xadd(store, "s", { i, 0 }, { "n", std::to_string(i), "sp", "a b\r\nc" }));
+    stream_inner* s = store.stream_find("s");
+    store.stream_change("s", *s, [](stream_inner& x) {
+        stream_log::group* g = x.create_group("g", {}, -1);
+        stream_log::consumer* c = x.create_consumer(*g, "alice", 77);
+        for (uint64_t i = 1; i <= 20; ++i) x.deliver(*g, { i, 0 }, *c, 1000 + static_cast<int64_t>(i));
+        x.erase({ 5, 0 });
+    });
+    REQUIRE(store.stream_make("empty", 0));
+
+    char path[] = "/tmp/socketley-stream-XXXXXX";
+    const int fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    close(fd);
+    REQUIRE(store.save(path));
+    cache_store back;
+    REQUIRE(back.load(path));
+    unlink(path);
+    REQUIRE(back.stream_get("s"));
+    CHECK(serialized(*back.stream_get("s")) == serialized(*store.stream_get("s")));
+    CHECK(back.type("empty") == "stream");
+    CHECK(back.get_memory_used() == store.get_memory_used());
+
+    std::string dump;
+    store.dump_commands(dump);
+    size_t records = 0;
+    for (size_t at = dump.find("xapply s "); at != std::string::npos; at = dump.find("xapply s ", at + 1))
+        ++records;
+    // 149 entries, the counters, the group, its consumer and 20 pending, the
+    // deleted entry's among them.
+    CHECK(records == 149 + 1 + 1 + 1 + 20);
+    CHECK(dump.find("xapply empty ") != std::string::npos);
+}
+
+TEST_CASE("a stream is charged for what it holds and gives it all back")
+{
+    const std::string v(200, 'v');
+    SUBCASE("entries, trims and groups against the heap")
+    {
+        cache_store store;
+        check_charged(store, [&] {
+            for (uint64_t i = 1; i <= 5000; ++i)
+                REQUIRE(store_xadd(store, "big", { i, 0 }, { "field", v }));
+            stream_inner* s = store.stream_find("big");
+            store.stream_change("big", *s, [&](stream_inner& x) {
+                stream_log::group* g = x.create_group("g", {}, 0);
+                for (int c = 0; c < 50; ++c)
+                {
+                    stream_log::consumer* k = x.create_consumer(*g, "consumer-with-a-long-name-" + std::to_string(c), 1);
+                    for (uint64_t i = 1; i <= 40; ++i) x.deliver(*g, { static_cast<uint64_t>(c) * 40 + i, 0 }, *k, 1);
+                }
+            });
+        });
+    }
+
+    for (int limit = 0; limit < 2; ++limit)
+    {
+        CAPTURE(limit);
+        cache_store store;
+        if (limit) { store.set_max_memory(size_t(1) << 30); store.set_eviction(evict_allkeys_lru); }
+        REQUIRE(store.set("base", std::string(5000, 'b')));
+        const size_t base = store.get_memory_used();
+        for (uint64_t i = 1; i <= 700; ++i)
+            REQUIRE(store_xadd(store, "s", { i, i % 3 }, { i % 5 ? "a" : "b", std::string(i % 60, 'x') }));
+        stream_inner* s = store.stream_find("s");
+        store.stream_change("s", *s, [&](stream_inner& x) {
+            stream_log::group* g = x.create_group("g", {}, 0);
+            stream_log::consumer* c = x.create_consumer(*g, std::string(40, 'c'), 1);
+            for (uint64_t i = 1; i <= 300; ++i) x.deliver(*g, { i, i % 3 }, *c, 1);
+            for (uint64_t i = 1; i <= 100; ++i) x.ack(*g, { i, i % 3 });
+            for (uint64_t i = 200; i <= 260; ++i) x.erase({ i, i % 3 });
+            stream_log::trim_spec t;
+            t.by = stream_log::trim_by::maxlen;
+            t.maxlen = 333;
+            x.trim(t);
+        });
+        CHECK(store.copy_key("s", "t", false) == 1);
+        CHECK(store.rename_key("t", "u", false) == 1);
+        REQUIRE(store.del("u"));
+        REQUIRE(store.del("s"));
+        CHECK(store.get_memory_used() == base);
+    }
+}
+
+TEST_CASE("a stream write refused for room leaves the stream as it was")
+{
+    cache_store store;
+    for (uint64_t i = 1; i <= 50; ++i) REQUIRE(store_xadd(store, "s", { i, 0 }, { "f", "v" }));
+    const std::string before = serialized(*store.stream_get("s"));
+    // The limit switched on first, because doing so charges the eviction order.
+    store.set_max_memory(size_t(1) << 30);
+    store.set_max_memory(store.get_memory_used() + 64);
+    size_t refused = 0;
+    for (uint64_t i = 51; i <= 400; ++i)
+        if (!store_xadd(store, "s", { i, 0 }, { "f", std::string(100, 'z') })) ++refused;
+    CHECK(refused > 0);
+    CHECK(store.get_memory_used() <= store.get_max_memory());
+    CHECK(serialized(*store.stream_get("s")).size() >= before.size());
+    CHECK_FALSE(store_xadd(store, "fresh", { 1, 0 }, { "f", std::string(1000, 'z') }));
+    CHECK_FALSE(store.exists("fresh"));
+
+    // Under LRU the stream being written is never what is evicted for it.
+    cache_store lru;
+    lru.set_max_memory(size_t(1) << 20);
+    lru.set_eviction(evict_allkeys_lru);
+    for (int i = 0; i < 200; ++i) REQUIRE(lru.set("k" + std::to_string(i), std::string(2000, 'v')));
+    for (uint64_t i = 1; i <= 3000; ++i)
+        REQUIRE(store_xadd(lru, "s", { i, 0 }, { "f", std::string(300, 'y') }));
+    CHECK(lru.stream_get("s")->size() == 3000);
+    CHECK(lru.get_memory_used() <= lru.get_max_memory());
 }

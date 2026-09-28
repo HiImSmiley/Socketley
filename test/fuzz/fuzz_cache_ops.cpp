@@ -270,6 +270,7 @@ enum op_code : uint8_t
     OP_ZADD, OP_ZREM, OP_ZINCRBY,
     OP_COPY, OP_RENAME, OP_SMOVE, OP_LMOVE,
     OP_LTRIM, OP_LSET, OP_LREM, OP_LINSERT,
+    OP_XADD, OP_XDEL, OP_XTRIM, OP_XGROUP,
     OP_COUNT
 };
 
@@ -410,6 +411,14 @@ void print_program()
                                             keybuf, (s.b & 1) ? "true" : "false",
                                             pivot_str(s.b).size(),
                                             pivot_str(s.b).empty() ? '-' : pivot_str(s.b)[0], valbuf); break;
+            case OP_XADD:      std::fprintf(stderr, "xadd(store, %s, step %u/%u, \"f\", %s);\n", keybuf,
+                                            s.a, s.b, valbuf); break;
+            case OP_XDEL:      std::fprintf(stderr, "/* xdel(store, %s, entry %u) */\n", keybuf, s.a); break;
+            case OP_XTRIM:     std::fprintf(stderr, "/* xtrim(store, %s, maxlen %u%s) */\n", keybuf,
+                                            s.a % 4, (s.b & 1) ? " ~" : ""); break;
+            case OP_XGROUP:    std::fprintf(stderr, "/* group g on %s: %s entry %u, consumer %s */\n", keybuf,
+                                            s.b % 3 == 0 ? "deliver" : s.b % 3 == 1 ? "ack" : "delconsumer",
+                                            s.a, membuf); break;
             default:           std::fprintf(stderr, "/* op %u */\n", s.op); break;
         }
     }
@@ -534,7 +543,7 @@ constexpr size_t string_floor(size_t len)
 
 // ─────────────────────────── the shadow model ───────────────────────────────
 
-enum val_type { T_NONE = 0, T_STRING, T_LIST, T_SET, T_HASH, T_ZSET };
+enum val_type { T_NONE = 0, T_STRING, T_LIST, T_SET, T_HASH, T_ZSET, T_STREAM };
 enum ttl_state { TTL_NONE = 0, TTL_LONG, TTL_ELAPSED };
 
 struct shadow_entry
@@ -545,6 +554,12 @@ struct shadow_entry
     std::set<std::string>              members;
     std::map<std::string, std::string> fields;
     std::map<std::string, double>      zmembers;
+    // A stream's entries with their one value, its last id, and group g's
+    // pending entries by the consumer that holds each.
+    std::map<stream_id, std::string>   xentries;
+    stream_id                          xlast;
+    bool                               xgroup = false;
+    std::map<stream_id, std::string>   xpel;
     ttl_state                          ttl = TTL_NONE;
 
     void clear()
@@ -556,6 +571,10 @@ struct shadow_entry
         members.clear();
         fields.clear();
         zmembers.clear();
+        xentries.clear();
+        xlast = {};
+        xgroup = false;
+        xpel.clear();
     }
 };
 
@@ -657,6 +676,7 @@ void check_structure(cache_store& s)
     for (const auto& e : s.m_sets)   count_live(e.first);
     for (const auto& e : s.m_hashes) count_live(e.first);
     for (const auto& e : s.m_zsets)  count_live(e.first);
+    for (const auto& e : s.m_streams) count_live(e.first);
 
     for (int i = 0; i < NKEYS; i++)
     {
@@ -723,6 +743,15 @@ void check_structure(cache_store& s)
         floor_bytes += key_floor(e.first);
         for (const auto& [sc, m] : e.second.order) floor_bytes += m.size();
     }
+    // A stream's values sit in its blocks, one byte each at least.
+    for (const auto& e : s.m_streams)
+    {
+        floor_bytes += key_floor(e.first);
+        e.second.walk({}, stream_id::max(), false, [&](const stream_log::entry& en) {
+            en.each([&](std::string_view f, std::string_view v) { floor_bytes += f.size() + v.size(); });
+            return true;
+        });
+    }
 
     // set_detail() runs vsnprintf, so it is only reached on the failing branch:
     // this walk happens after every step and formatting a message nobody reads
@@ -742,7 +771,7 @@ void check_structure(cache_store& s)
 
     // --- 2b: an empty store owes nothing ---
     if (s.m_data.empty() && s.m_lists.empty() && s.m_sets.empty() && s.m_hashes.empty() && s.m_zsets.empty()
-        && s.m_lru_map.empty())
+        && s.m_streams.empty() && s.m_lru_map.empty())
     {
         CACHE_FINDING("mem-baseline", s.m_current_memory == 0,
                       "every key is gone but the store still believes it holds payload — "
@@ -849,6 +878,38 @@ void verify_model(world& w, bool evict_possible)
                     CACHE_CHECK(*got == f.second, "a hash field holds a value that was never written to it");
                 }
                 CACHE_CHECK(static_cast<size_t>(s.hlen(k)) == e.fields.size(), "hlen disagrees with the hash");
+                break;
+            }
+            case T_STREAM:
+            {
+                CACHE_CHECK(t == "stream", "a key the model wrote as a stream has another type");
+                const stream_inner* x = s.stream_get(k);
+                CACHE_CHECK(x != nullptr, "type() says stream but stream_get() returns nothing");
+                CACHE_CHECK(x->size() == e.xentries.size(), "the stream has a different length than was written");
+                auto want = e.xentries.begin();
+                bool same = true;
+                x->walk({}, stream_id::max(), false, [&](const stream_log::entry& en) {
+                    if (want == e.xentries.end() || en.id != want->first) { same = false; return false; }
+                    en.each([&](std::string_view f, std::string_view v) {
+                        if (f != "f" || v != want->second) same = false;
+                    });
+                    ++want;
+                    return same;
+                });
+                CACHE_CHECK(same && want == e.xentries.end(), "a stream entry is not what was added, or is out of order");
+                CACHE_CHECK(x->last_id() == e.xlast, "the stream's last id is not the last one added");
+                const stream_log::group* g = x->find_group("g");
+                CACHE_CHECK((g != nullptr) == e.xgroup, "the stream's group is there when the model's is not, or the reverse");
+                if (g)
+                {
+                    CACHE_CHECK(g->pel.size() == e.xpel.size(), "the group holds a different number of pending entries");
+                    for (const auto& [id, n] : g->pel)
+                    {
+                        const auto m = e.xpel.find(id);
+                        CACHE_CHECK(m != e.xpel.end() && n.owner && n.owner->name == m->second,
+                                    "a pending entry is not held by the consumer it was delivered to");
+                    }
+                }
                 break;
             }
             case T_ZSET:
@@ -1082,6 +1143,13 @@ void check_save_load(world& w)
                 CACHE_CHECK(got && *got == f.second, "a hash field did not survive save/load");
             }
         }
+        else if (t == "stream")
+        {
+            std::string a, b;
+            src.stream_get(k)->serialize(a);
+            dst.stream_get(k)->serialize(b);
+            CACHE_CHECK(a == b, "a stream did not survive save/load intact, entries, counters or groups");
+        }
         else if (t == "zset")
         {
             CACHE_CHECK(src.zcard(k) == dst.zcard(k), "a sorted set changed size across save/load");
@@ -1139,6 +1207,7 @@ void check_save_load(world& w)
                           + dst.m_sets.size() + dst.m_hashes.size() + dst.m_zsets.size()
                           + dst.m_list_elems + dst.m_set_elems + dst.m_hash_fields * 2
                           + dst.m_zset_members * 2;
+    for (const auto& e : dst.m_streams) loaded_strings += 2 + e.second.size();
     CACHE_FINDING("load-usage",
                   dst.get_memory_used() <= src.get_memory_used() + 16 * loaded_strings,
                   "a store reports far more memory after save/load than the store it was written "
@@ -1175,6 +1244,21 @@ void check_failed_write_kept_ttl(world& w, int ki, const char* what)
                   !(e.ttl != TTL_NONE && ttl == -1), what);
     if (ttl == -1)
         e.ttl = TTL_NONE;   // resync, so the generic TTL check does not re-fire
+}
+
+// An XADD as the command layer makes one: found or made, room admitted for
+// what the append will grow it by, and the change charged.
+bool harness_xadd(cache_store& st, const std::string& key, stream_id id, std::string_view val)
+{
+    const std::string_view fv[] = { "f", val };
+    stream_inner* x = st.stream_find(key);
+    const size_t growth = x ? x->append_growth(id, fv, 1) : stream_inner{}.append_growth(id, fv, 1);
+    if (!x) x = st.stream_make(key, growth);
+    else if (st.stream_admit(key, growth)) x = st.stream_find(key);
+    else x = nullptr;
+    if (!x) return false;
+    st.stream_change(key, *x, [&](stream_inner& s) { s.append(id, fv, 1); });
+    return true;
 }
 
 // Returns true when the harness declined to run the step (see MAX_ELEMS).
@@ -2093,6 +2177,126 @@ bool run_step(world& w, const step& s)
                     CACHE_FINDING("write-refused", refusal_excusable(),
                                   "an LINSERT was refused that there was room for after eviction");
             }
+            break;
+        }
+
+        case OP_XADD:
+        {
+            w.store.check_expiry(k);
+            model_expire(w, ki);
+            if ((e.type == T_STREAM && e.xentries.size() >= 4 * MAX_ELEMS) || avoid_collection_uaf(w))
+                return true;
+            const bool conflict = type_conflicts(T_STREAM);
+            // The same millisecond now and then, a jump now and then.
+            stream_id id = e.xlast;
+            if (s.a % 3 == 0) id.seq++;
+            else { id.ms += 1 + s.b % 5; id.seq = 0; }
+            wrote_key       = ki;
+            is_memory_write = true;
+            evict_possible  = can_evict;
+            target_existed  = (e.type != T_NONE);
+            target_ttl_before = e.ttl;
+            const bool ok = !w.store.holds_other_type(k, 'x') && harness_xadd(w.store, k, id, val);
+            wrote_ok = ok;
+            if (ok)
+            {
+                CACHE_CHECK(!conflict, "a stream write went to a key that is not a stream");
+                e.type = T_STREAM;
+                e.xentries[id] = val;
+                e.xlast = id;
+            }
+            else
+                CACHE_FINDING("write-refused", conflict || refusal_excusable(),
+                              "a stream entry was refused that there was room for after eviction");
+            break;
+        }
+        case OP_XDEL:
+        case OP_XTRIM:
+        {
+            w.store.check_expiry(k);
+            model_expire(w, ki);
+            stream_inner* x = w.store.stream_find(k);
+            CACHE_CHECK((x != nullptr) == (e.type == T_STREAM), "stream_find() disagrees with the model");
+            if (!x)
+                break;
+            if (s.op == OP_XDEL)
+            {
+                // An entry that is there, or one past it that is not.
+                stream_id id = e.xentries.empty() ? stream_id{ s.a, s.b }
+                             : std::next(e.xentries.begin(), static_cast<long>(s.a % e.xentries.size()))->first;
+                if (s.b & 1) id.seq++;
+                bool gone = false;
+                w.store.stream_change(k, *x, [&](stream_inner& st) { gone = st.erase(id); });
+                CACHE_CHECK(gone == (e.xentries.erase(id) > 0), "erase() disagrees with the model about an entry");
+                break;
+            }
+            stream_log::trim_spec t;
+            t.by = stream_log::trim_by::maxlen;
+            t.maxlen = s.a % 4;
+            t.approx = (s.b & 1) != 0;
+            uint64_t gone = 0;
+            w.store.stream_change(k, *x, [&](stream_inner& st) { gone = st.trim(t); });
+            CACHE_CHECK(gone <= (e.xentries.size() > t.maxlen ? e.xentries.size() - t.maxlen : 0),
+                        "trim() removed more entries than were over the length asked for");
+            for (uint64_t i = 0; i < gone; ++i) e.xentries.erase(e.xentries.begin());
+            if (!t.approx)
+                CACHE_CHECK(e.xentries.size() <= t.maxlen, "an exact trim left the stream over its length");
+            break;
+        }
+        case OP_XGROUP:
+        {
+            w.store.check_expiry(k);
+            model_expire(w, ki);
+            stream_inner* x = w.store.stream_find(k);
+            if (!x)
+                break;
+            if (!e.xgroup)
+            {
+                // XGROUP CREATE is admitted like any write, so eviction may run.
+                wrote_key       = ki;
+                is_memory_write = true;
+                evict_possible  = can_evict;
+                target_existed  = true;
+                target_ttl_before = e.ttl;
+                if (!w.store.stream_admit(k, x->group_growth("g")))
+                {
+                    CACHE_FINDING("write-refused", refusal_excusable(),
+                                  "a group was refused that there was room for after eviction");
+                    break;
+                }
+                wrote_ok = true;
+                x = w.store.stream_find(k);
+                w.store.stream_change(k, *x, [&](stream_inner& st) { st.create_group("g", {}, 0); });
+                e.xgroup = true;
+                // A delivery is not admitted, as XREADGROUP is not refused for
+                // room in Redis, so it is a step of its own.
+                break;
+            }
+            const std::string& who = mem;
+            w.store.stream_change(k, *x, [&](stream_inner& st) {
+                stream_log::group* g = st.find_group("g");
+                if (s.b % 3 == 0 && !e.xentries.empty())
+                {
+                    const stream_id id = std::next(e.xentries.begin(),
+                                                   static_cast<long>(s.a % e.xentries.size()))->first;
+                    stream_log::consumer* c = st.find_consumer(*g, who);
+                    if (!c) c = st.create_consumer(*g, who, 1);
+                    st.deliver(*g, id, *c, 2);
+                    e.xpel[id] = who;
+                }
+                else if (s.b % 3 == 1 && !e.xpel.empty())
+                {
+                    const stream_id id = std::next(e.xpel.begin(), static_cast<long>(s.a % e.xpel.size()))->first;
+                    CACHE_CHECK(st.ack(*g, id), "ack() did not find an entry the model has pending");
+                    e.xpel.erase(id);
+                }
+                else if (s.b % 3 == 2)
+                {
+                    st.delete_consumer(*g, who);
+                    for (auto it = e.xpel.begin(); it != e.xpel.end();)
+                        if (it->second == who) it = e.xpel.erase(it); else ++it;
+                }
+            });
             break;
         }
 

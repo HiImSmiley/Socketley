@@ -164,7 +164,8 @@ seed() {   # port
       $'RPUSH\x1fl:1\x1fberlin' \
       $'SADD\x1fs:1\x1fberlin' \
       $'HSET\x1fh:1\x1fcity\x1fberlin' \
-      $'ZADD\x1fz:1\x1f1\x1fberlin' >/dev/null
+      $'ZADD\x1fz:1\x1f1\x1fberlin' \
+      $'XADD\x1fx:1\x1f*\x1fcity\x1fberlin' >/dev/null
 }
 scan() {   # port args...
     local port=$1; shift
@@ -188,13 +189,14 @@ EXP="l:1";                          check "TYPE list returns the list keys"     
 EXP="s:1";                          check "TYPE set returns the set keys"        TYPE set
 EXP="h:1";                          check "TYPE hash returns the hash keys"      TYPE hash
 EXP="z:1";                          check "TYPE zset returns the zset keys"      TYPE zset
+EXP="x:1";                          check "TYPE stream returns the stream keys"  TYPE stream
 
 echo "--- 2. the name is not the client's to spell exactly ---"
 EXP="h:1"; check "TYPE HASH is TYPE hash"  TYPE HASH
 
 echo "--- 3. a name no type has matches nothing, not everything ---"
-R=$(scan "$P" COUNT 10000 TYPE stream)
-if [ -z "$(keys_of "$R")" ]; then ok "TYPE stream returns nothing"
+R=$(scan "$P" COUNT 10000 TYPE nosuchtype)
+if [ -z "$(keys_of "$R")" ]; then ok "TYPE nosuchtype returns nothing"
 else bad "a type name no type has returns nothing" \
         "got '$(keys_of "$R")'" \
         "-- the whole keyspace here means the name fell through to no filter"; fi
@@ -213,7 +215,7 @@ else bad "TYPE hash with a value predicate matches nothing" \
         "   the KEY holds, and a hash holds no single value"; fi
 
 echo "--- 6. the plain scan it shares a function with ---"
-EXP="empty:1 h:1 l:1 other:1 s:1 u:1 u:2 u:3 z:1"; check "SCAN without the option is unchanged"
+EXP="empty:1 h:1 l:1 other:1 s:1 u:1 u:2 u:3 x:1 z:1"; check "SCAN without the option is unchanged"
 
 echo "--- 7. paging inside one restriction ---"
 R=$(CNT=1 scan "$P" COUNT 1 TYPE string)
@@ -242,16 +244,16 @@ fi
 echo "--- 9. counting a type, which the maps answer by existing ---"
 cmd() { python3 "$SCAN_PY" "$1" cmd "${@:2}" 2>/dev/null; }
 COUNT_OK=1
-for pair in "string 5" "list 1" "set 1" "hash 1" "zset 1"; do
+for pair in "string 5" "list 1" "set 1" "hash 1" "zset 1" "stream 1"; do
     set -- $pair
     GOT=$(cmd "$P" DBSIZE TYPE "$1")
     [ "$GOT" = "$2" ] || { bad "DBSIZE TYPE $1 counts its own map" "got '$GOT', wanted $2"; COUNT_OK=0; }
 done
-[ "$COUNT_OK" = 1 ] && ok "DBSIZE TYPE counts each of the five maps"
+[ "$COUNT_OK" = 1 ] && ok "DBSIZE TYPE counts each of the six maps"
 
 echo "--- 10. a name no type has counts nothing, not everything ---"
-GOT=$(cmd "$P" DBSIZE TYPE stream)
-if [ "$GOT" = 0 ]; then ok "DBSIZE TYPE stream is 0"
+GOT=$(cmd "$P" DBSIZE TYPE nosuchtype)
+if [ "$GOT" = 0 ]; then ok "DBSIZE TYPE nosuchtype is 0"
 else bad "a type name no type has counts nothing" "got '$GOT'" \
         "-- the whole keyspace here means the name fell through to no filter"; fi
 
@@ -259,7 +261,7 @@ echo "--- 11. the O(1) answer and the O(n) one have to agree ---"
 TOTAL_KEYS=$(cmd "$P" DBSIZE)
 SUM=0
 AGREE=1
-for t in string list set hash zset; do
+for t in string list set hash zset stream; do
     C=$(cmd "$P" DBSIZE TYPE "$t")
     SUM=$(( SUM + C ))
     W=$(scan "$P" COUNT 10000 TYPE "$t")
@@ -267,9 +269,9 @@ for t in string list set hash zset; do
     [ "$C" = "$N" ] || { bad "the count of $t agrees with a walk of it" "count $C, walk $N"; AGREE=0; }
 done
 if [ "$AGREE" = 1 ] && [ "$SUM" = "$TOTAL_KEYS" ]; then
-    ok "the five counts sum to DBSIZE ($SUM) and each agrees with its own walk"
+    ok "the six counts sum to DBSIZE ($SUM) and each agrees with its own walk"
 else
-    bad "the five counts sum to DBSIZE and each agrees with its own walk" \
+    bad "the six counts sum to DBSIZE and each agrees with its own walk" \
         "sum $SUM against DBSIZE $TOTAL_KEYS" \
         "-- a map counted twice or missed entirely shows up here and nowhere else"
 fi
