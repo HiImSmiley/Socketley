@@ -1851,7 +1851,7 @@ int cache_store::lset(std::string_view key, int64_t idx, std::string_view val)
         const size_t want = stored_string(val.size())
                           + std::max(shape, shape_cost(dq.after_set(static_cast<size_t>(idx), val.size())));
         if (want > held && !check_memory(want - held, key))
-            return -2;
+            return -3;
         it = m_lists.find(key);
         if (it == m_lists.end() || idx >= static_cast<int64_t>(it->second.size()))
             return -1;

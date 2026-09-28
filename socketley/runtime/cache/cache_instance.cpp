@@ -2723,6 +2723,25 @@ static void append_score_bare(std::string& rb, double sc)
 static constexpr std::string_view wrongtype_msg =
     "WRONGTYPE Operation against a key holding the wrong kind of value";
 
+static constexpr std::string_view oom_msg =
+    "OOM command not allowed when used memory > 'maxmemory'";
+
+// A write the store refused, told apart by what the key holds: another type is
+// WRONGTYPE, and otherwise it was room, which Redis answers -OOM and which went
+// out as WRONGTYPE from every push, add and move -- a client then treated a
+// full store as a key of the wrong type.  `absent` is the answer when nothing
+// is there and nothing was being made.
+static void encode_refusal(std::string& rb, std::string_view held, std::string_view own,
+                           std::string_view absent = {})
+{
+    if (held != "none" && held != own)
+        resp::encode_error_code_into(rb, wrongtype_msg);
+    else if (held == "none" && !absent.empty())
+        resp::encode_error_code_into(rb, absent);
+    else
+        resp::encode_error_code_into(rb, oom_msg);
+}
+
 // The three-element confirmation every subscribe verb answers on Redis: the
 // verb, the channel or pattern, and how many this connection now holds.  A
 // client counts down from that number to know when its own batch is done, and
@@ -7163,6 +7182,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             const int rc = m_store.lset(key, idx, v);
             if (rc == 0)       { rb.append("ok\n", 3); replicate_command(line); }
             else if (rc == -1) rb.append("nil\n", 4);
+            else if (rc == -3) rb.append("error: out of memory\n", 21);
             else               rb.append("error: index out of range\n", 26);
             break;
         }
@@ -9669,7 +9689,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         // A refusal after the first element is the store out of
                         // room, and what has been logged stands rather than
                         // being taken back.
-                        resp::encode_error_code_into(rb, wrongtype_msg);
+                        encode_refusal(rb, m_store.type(args[1]), "list");
                         return;
                     }
                 }
@@ -9699,7 +9719,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                         // A refusal after the first element is the store out of
                         // room, and what has been logged stands rather than
                         // being taken back.
-                        resp::encode_error_code_into(rb, wrongtype_msg);
+                        encode_refusal(rb, m_store.type(args[1]), "list");
                         return;
                     }
                 }
@@ -9864,7 +9884,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 // A refusal this late is the store out of room, and whatever
                 // was logged below stands rather than diverging.
                 if (zn < 0)
-                { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+                { encode_refusal(rb, m_store.type(args[1]), "zset"); return; }
                 zadded += (zch && zhad && zcur != zscores[zi]) ? 1 : zn;
                 // One pair per record, like DEL and MSET and like
                 // dump_commands, because the text interpreter takes the whole
@@ -10020,7 +10040,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     resp::encode_error_into(rb, "resulting score is not a number (NaN)");
                     return;
                 case cache_store::zincr_result::type_conflict:
-                    resp::encode_error_code_into(rb, wrongtype_msg); return;
+                    encode_refusal(rb, m_store.type(args[1]), "zset"); return;
             }
             repl(args, argc);
             std::string zs;
@@ -10042,7 +10062,7 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                     r = m_store.sadd(args[1], args[i]);
                     // A refusal after the first member is the store out of
                     // room, and what has been logged stands.
-                    if (r < 0) { resp::encode_error_code_into(rb, wrongtype_msg); return; }
+                    if (r < 0) { encode_refusal(rb, m_store.type(args[1]), "set"); return; }
                 }
                 added += r;
                 if (r > 0)
@@ -10897,7 +10917,8 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             { resp::encode_error_code_into(rb, "ERR value is not an integer or out of range"); break; }
             const int rc = m_store.lset(args[1], idx, args[3]);
             if (rc == 0)       { resp::encode_ok_into(rb); repl(args, argc); }
-            else if (rc == -1) resp::encode_error_code_into(rb, "ERR no such key");
+            else if (rc == -1) encode_refusal(rb, m_store.type(args[1]), "list", "ERR no such key");
+            else if (rc == -3) encode_refusal(rb, "list", "list");
             else               resp::encode_error_code_into(rb, "ERR index out of range");
             break;
         }
@@ -11053,12 +11074,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
                 // Absent source and wrong type are two different answers, and
                 // the store says false to both.
                 const std::string_view st = m_store.type(args[1]);
-                if (st != "none" && st != "list")
+                const std::string_view dt = m_store.type(args[2]);
+                if ((st != "none" && st != "list") || (dt != "none" && dt != "list"))
                     resp::encode_error_code_into(rb, wrongtype_msg);
-                else if (m_store.type(args[2]) != "none" && m_store.type(args[2]) != "list")
-                    resp::encode_error_code_into(rb, wrongtype_msg);
-                else
+                else if (st == "none")
                     resp::encode_null_into(rb);
+                else
+                    resp::encode_error_code_into(rb, oom_msg);   // a list to move from, and no room
                 break;
             }
             resp::encode_bulk_into(rb, moved);

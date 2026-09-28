@@ -470,7 +470,7 @@ public:
     bool   getdel(std::string_view key, std::string& out);
 
     // --- Lists, the positional spellings ---
-    // 0 ok, -1 no such key, -2 index past the end.
+    // 0 ok, -1 no list at the key, -2 index past the end, -3 refused for room.
     int  lset(std::string_view key, int64_t idx, std::string_view val);
     // Removes count occurrences from the head, or from the tail when negative,
     // or every one when zero, and answers how many went.

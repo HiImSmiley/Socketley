@@ -18,6 +18,8 @@
 #                 an exception saw a generic error
 #   COPY          past maxmemory answered 0, which reads as "the destination
 #                 exists", where Redis refuses it with -OOM
+#   RPUSH, SADD, ZADD, LSET past maxmemory answered WRONGTYPE (LSET "index
+#                 out of range"), so a full store read as a key of another type
 #   EVAL          loaded precompiled chunks, and LuaJIT runs bytecode unverified
 #
 # ─── WHAT KEEPS IT HONEST ───────────────────────────────────────────────────
@@ -187,6 +189,16 @@ case "$R" in
     OOM*) ok yes yes "a COPY past maxmemory is refused with the OOM code" ;;
     *) ok "$R" "OOM command not allowed ..." "COPY's OOM code" ;;
 esac
+# And every collection write, which answered WRONGTYPE for want of room, so a
+# client treated a full store as a key of the wrong type.
+redis-cli -p "$P" rpush oomlist a >/dev/null 2>&1
+for w in "rpush oomlist2" "sadd oomset" "zadd oomz 1" "lset oomlist 0"; do
+    R=$(printf '%s' "$BIGV" | redis-cli -p "$P" -x $w 2>&1)
+    case "$R" in
+        OOM*) ok yes yes "${w%% *} past maxmemory is refused with the OOM code" ;;
+        *) ok "$R" "OOM command not allowed ..." "${w%% *}'s OOM code" ;;
+    esac
+done
 redis-cli -p "$P" flushall >/dev/null 2>&1
 
 # ── EVAL and bytecode ───────────────────────────────────────────────────────

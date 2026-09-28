@@ -2114,7 +2114,7 @@ bool run_step(world& w, const step& s)
             if (wrote_ok)
                 e.list[static_cast<size_t>(at)] = val;
             else if (in_range)
-                CACHE_FINDING("write-refused", r == -2 && refusal_excusable(),
+                CACHE_FINDING("write-refused", r == -3 && refusal_excusable(),
                               "an LSET was refused that there was room for after eviction");
             break;
         }

@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- LPUSH, RPUSH, SADD, ZADD, ZINCRBY and LSET past `--maxmemory` answer `-OOM`
+  instead of `WRONGTYPE` (LSET: `index out of range`), and LMOVE instead of
+  nil, so a client no longer treats a full store as a key of another type.
+  LSET on a key of another type answers `WRONGTYPE`, as Redis does, not
+  `no such key`.
 - COPY past `--maxmemory` answers `-OOM`, as Redis does, instead of `0`, which
   a client reads as "the destination exists"; the text protocol answers
   `error: out of memory`.
