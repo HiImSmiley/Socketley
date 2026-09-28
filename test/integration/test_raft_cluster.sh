@@ -44,6 +44,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 
 PASS=0; FAIL=0; TOTAL=0
 T=$(mktemp -d /tmp/socketley-raft-XXXXXX)
+daemon_watch "$T"   # its processes go with it if it is killed
 PB=$((SL_PORT_BASE + 1700))
 NODES=()
 

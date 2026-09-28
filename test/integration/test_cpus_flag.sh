@@ -11,6 +11,8 @@ BIN=$(readlink -f "$BIN")
 . "$(dirname "$0")/lib_ports.sh"
 WORK=$(mktemp -d /tmp/socketley-cpus-XXXXXX)
 export SOCKETLEY_SOCKET="$WORK/s.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$WORK"   # its processes go with it if it is killed
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 

@@ -22,6 +22,8 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 TMPD=$(mktemp -d /tmp/socketley-failover-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 
 # Ports come off one base so two runs can share a machine -- the socket and the

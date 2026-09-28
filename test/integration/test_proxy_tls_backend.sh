@@ -36,6 +36,8 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 TMPD=$(mktemp -d /tmp/socketley-tls-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 
 TLS_BE=$((SL_PORT_BASE+591)); PX_UP=$((SL_PORT_BASE+592)); PLAIN_BE=$((SL_PORT_BASE+593)); PX_DOWN=$((SL_PORT_BASE+594))

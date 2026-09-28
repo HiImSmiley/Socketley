@@ -29,6 +29,7 @@ fi
 TMPDIR_T=$(mktemp -d /tmp/socketley-restart-XXXXXX)
 export HOME="$TMPDIR_T/home"
 export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
+daemon_watch "$TMPDIR_T"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 DPID=""
 BEPID=""

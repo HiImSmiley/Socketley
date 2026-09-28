@@ -26,6 +26,8 @@ BIN=$(readlink -f "$BIN")
 
 WORK=$(mktemp -d /tmp/socketley-routeid-XXXXXX)
 export SOCKETLEY_SOCKET="$WORK/s.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$WORK"   # its processes go with it if it is killed
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 

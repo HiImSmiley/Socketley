@@ -17,6 +17,8 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 TMPD=$(mktemp -d /tmp/socketley-tlsresume-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 
 PEER=$((SL_PORT_BASE+787))

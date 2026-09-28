@@ -185,6 +185,8 @@ fi
 export HOME="$WORK/home"; mkdir -p "$HOME"
 export SOCKETLEY_SOCKET="$WORK/d.sock"
 
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$WORK"   # its processes go with it if it is killed
 queries()  { cat "$WORK/queries"  2>/dev/null || echo 0; }
 requests() { cat "$WORK/requests" 2>/dev/null || echo 0; }
 

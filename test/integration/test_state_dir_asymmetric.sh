@@ -50,6 +50,8 @@ SOCK_PREEXISTING=0
 [ -e "$DEFAULT_SOCK" ] && SOCK_PREEXISTING=1
 
 TMPD=$(mktemp -d /tmp/socketley-asym-XXXXXX)
+
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 export HOME="$TMPD/home"; mkdir -p "$HOME"
 SOCK_B="$TMPD/b.sock"
 APID=""; BPID=""

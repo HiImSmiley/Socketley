@@ -23,6 +23,45 @@ daemon_isolate() {
     # Set here so a file that never calls daemon_start still clears any value
     # inherited from the environment.
     SOCKETLEY_DBIN=""
+    daemon_watch "$SOCKETLEY_TMPD"
+}
+
+# ─── A TEST THAT DIES TAKES ITS PROCESSES WITH IT ───────────────────────────
+# daemon_stop runs from a trap, and a test killed with SIGKILL runs no trap:
+# a run stopped from outside left its daemons, their workers and its peers
+# serving for hours.  So a watcher in a session of its own waits for this
+# test's shell to go and then kills every process whose SOCKETLEY_SOCKET lies
+# under this test's TMPD -- its daemons, their workers and whatever the test
+# started with the variable exported -- and then removes TMPD.  After a normal end the test's
+# own trap has done both and the watcher finds nothing to kill.  Its descriptors are closed so a
+# runner reading this test's output does not wait on it.
+#
+# daemon_watch TMPD  -- for a file that does not use daemon_isolate, whose
+# daemons' sockets all lie under TMPD, exported or given per command.
+daemon_watch() {
+    local tmpd=$1
+    [ -n "$tmpd" ] && [ -d "$tmpd" ] || return 0
+    local me=$$ born
+    born=$(awk '{print $22}' "/proc/$me/stat" 2>/dev/null) || born=""
+    # Without the variable itself, so the watcher and its helpers never match it.
+    env -u SOCKETLEY_SOCKET setsid -f bash -c '
+        me=$1 born=$2 tmpd=$3 keep=$4
+        # The same pid with the same start time, so a reused pid is not mistaken for the test.
+        alive() { [ "$(awk "{print \$22}" "/proc/$me/stat" 2>/dev/null)" = "$born" ]; }
+        while alive; do sleep 1; done
+        killed=0
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            [ "$p" = "$$" ] && continue
+            { tr "\0" "\n" <"$d/environ"; } 2>/dev/null | grep -q "^SOCKETLEY_SOCKET=$tmpd/" || continue
+            kill -9 "$p" 2>/dev/null && killed=1
+        done
+        # Only after a kill: a test that ended through its own trap may keep what it chose to.
+        [ "$killed" = 1 ] && [ -z "$keep" ] && rm -rf "$tmpd"
+        exit 0
+    ' daemon-watch "$me" "$born" "$tmpd" "${SOCKETLEY_KEEP_TMPD:-}" \
+        </dev/null >/dev/null 2>&1
+    return 0
 }
 
 # Wait on the daemon's own "daemon started" line, which is printed after the

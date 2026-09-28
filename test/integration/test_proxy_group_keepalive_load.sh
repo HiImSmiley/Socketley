@@ -20,6 +20,7 @@ BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
 TMPD=$(mktemp -d /tmp/socketley-grpka-XXXXXX)
 export HOME="$TMPD/home"
 export SOCKETLEY_SOCKET="$TMPD/daemon.sock"
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 
 # Ports come off one base so two runs can share a machine, because a collision

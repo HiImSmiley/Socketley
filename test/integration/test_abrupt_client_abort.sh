@@ -28,6 +28,8 @@ fi
 TMPDIR_T=$(mktemp -d /tmp/socketley-abort-XXXXXX)
 export HOME="$TMPDIR_T/home"
 export SOCKETLEY_SOCKET="$TMPDIR_T/daemon.sock"
+. "$(dirname "$0")/lib_daemon.sh"
+daemon_watch "$TMPDIR_T"   # its processes go with it if it is killed
 mkdir -p "$HOME"
 DPID=""
 BEPID=""

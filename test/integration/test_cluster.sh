@@ -15,6 +15,8 @@ BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 PASS=0; FAIL=0; TOTAL=0
 
 TMPD=$(mktemp -d /tmp/socketley-cluster-XXXXXX)
+
+daemon_watch "$TMPD"   # its processes go with it if it is killed
 export HOME="$TMPD/home"
 mkdir -p "$HOME"
 CLUSTER_DIR="$TMPD/cluster"
