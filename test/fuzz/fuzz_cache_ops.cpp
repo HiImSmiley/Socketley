@@ -1963,12 +1963,12 @@ bool run_step(world& w, const step& s)
             const int r = w.store.copy_key(k, k2, flag);
             if (!src)         CACHE_CHECK(r == -2, "copy_key() of a key that is not there did not answer -2");
             else if (!copies) CACHE_CHECK(r == 0, "copy_key() copied onto itself or over a key without REPLACE");
-            else              CACHE_CHECK(r == 1 || r == 0, "copy_key() answered neither 1 nor a refusal");
+            else              CACHE_CHECK(r == 1 || r == -3, "copy_key() answered neither 1 nor a refusal for room");
             wrote_ok = (r == 1);
             if (r == 1)
                 e2 = e;
             else if (copies)
-                CACHE_FINDING("write-refused", r == 0 && refusal_excusable(),
+                CACHE_FINDING("write-refused", r == -3 && refusal_excusable(),
                               "a COPY was refused that there was room for after eviction");
             break;
         }

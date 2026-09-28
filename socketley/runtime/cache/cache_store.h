@@ -238,8 +238,8 @@ public:
     // for COPY, does not.
     //
     // 1 done, 0 refused because the destination exists (the NX forms), -2 the
-    // source is not there.
-    // COPY answers 0 for want of room too, where RENAME is not refused for it.
+    // source is not there, and for COPY -3 refused for want of room, which
+    // RENAME never is.
     int rename_key(std::string_view src, std::string_view dst, bool nx);
     int copy_key(std::string_view src, std::string_view dst, bool replace);
 

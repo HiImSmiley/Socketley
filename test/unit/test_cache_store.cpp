@@ -3339,7 +3339,7 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
     {
         store.set_eviction(evict_none);
         REQUIRE(store.set("k", std::string(600000, 'v')));
-        CHECK(store.copy_key("k", "k2", false) == 0);
+        CHECK(store.copy_key("k", "k2", false) == -3);
         CHECK_FALSE(store.exists("k2"));
         CHECK(store.get_memory_used() <= store.get_max_memory());
     }
@@ -3361,7 +3361,7 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
         store.set_eviction(evict_none);
         REQUIRE(store.set("k2", std::string(100000, 'd')));
         REQUIRE(store.set("k", std::string(600000, 'v')));
-        CHECK(store.copy_key("k", "k2", true) == 0);
+        CHECK(store.copy_key("k", "k2", true) == -3);
         CHECK(store.strlen_key("k2") == 100000);
         CHECK(store.get_memory_used() <= store.get_max_memory());
     }

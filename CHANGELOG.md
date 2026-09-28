@@ -147,6 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- COPY past `--maxmemory` answers `-OOM`, as Redis does, instead of `0`, which
+  a client reads as "the destination exists"; the text protocol answers
+  `error: out of memory`.
 - Under a memory limit with an eviction policy, `LMOVE` and `RPOPLPUSH` could
   evict their own source list to make room in the destination, answering nil
   with the element in neither list; `SMOVE` could likewise evict the rest of

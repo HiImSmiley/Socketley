@@ -6320,6 +6320,7 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
             else
                 r = m_store.rename_key(ks[0], ks[1], th == fnv1a("renamenx"));
             if (r == -2)      rb.append("error: no such key\n", 19);
+            else if (r == -3) rb.append("error: out of memory\n", 21);
             else if (r == 0)  rb.append("no\n", 3);
             else            { rb.append("ok\n", 3); replicate_command(line); }
             break;
@@ -10145,7 +10146,13 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
             if (m_has_ttl_keys) { m_store.check_expiry(args[1]); m_store.check_expiry(args[2]); }
             const int r = m_store.copy_key(args[1], args[2], replace);
             // A missing source is 0 here and not an error: COPY answers whether
-            // it copied, which is the shape a client tests.
+            // it copied, which is the shape a client tests.  Want of room is
+            // the error Redis gives a denyoom command.
+            if (r == -3)
+            {
+                resp::encode_error_code_into(rb, "OOM command not allowed when used memory > 'maxmemory'");
+                break;
+            }
             if (r > 0) repl(args, argc);
             resp::encode_integer_into(rb, r > 0 ? 1 : 0);
             break;

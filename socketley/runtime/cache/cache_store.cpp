@@ -898,18 +898,18 @@ int cache_store::copy_key(std::string_view src, std::string_view dst, bool repla
     const bool taken = exists(dst);
     if (taken && !replace)
         return 0;
-    // Refused for room before REPLACE deletes anything, as a copy that was not
-    // made, which is the answer the callers give for a destination in the way.
+    // Refused for room before REPLACE deletes anything, answered apart from a
+    // destination in the way because Redis refuses COPY with -OOM.
     if (m_max_memory != 0)
     {
         const size_t need  = new_key_cost(dst.size()) + value_cost(src)
                            + (m_expiry.count(src) ? expiry_entry_overhead : 0);
         const size_t freed = taken ? key_cost(dst) : 0;   // what REPLACE gives back
         if (need > freed && !check_memory(need - freed, src))
-            return 0;
+            return -3;
         // Eviction may have taken the destination, whose room was then counted twice.
         if (taken && !exists(dst) && !check_memory(need, src))
-            return 0;
+            return -3;
     }
     if (taken)
         del(dst);

@@ -16,6 +16,8 @@
 #                 connection they open, were unknown commands
 #   OOM           went out as -ERR OOM, so a client mapping the first word to
 #                 an exception saw a generic error
+#   COPY          past maxmemory answered 0, which reads as "the destination
+#                 exists", where Redis refuses it with -OOM
 #   EVAL          loaded precompiled chunks, and LuaJIT runs bytecode unverified
 #
 # ─── WHAT KEEPS IT HONEST ───────────────────────────────────────────────────
@@ -177,6 +179,13 @@ done
 case "$R" in
     OOM*) ok yes yes "a write past maxmemory is refused with the OOM code" ;;
     *) ok "$R" "OOM command not allowed ..." "the OOM code" ;;
+esac
+# COPY is a write Redis refuses the same way; it answered 0 here, which reads
+# as "the destination exists".
+R=$(redis-cli -p "$P" copy big1 bigcopy 2>&1)
+case "$R" in
+    OOM*) ok yes yes "a COPY past maxmemory is refused with the OOM code" ;;
+    *) ok "$R" "OOM command not allowed ..." "COPY's OOM code" ;;
 esac
 redis-cli -p "$P" flushall >/dev/null 2>&1
 
