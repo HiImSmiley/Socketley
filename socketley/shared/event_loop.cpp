@@ -1978,6 +1978,73 @@ bool event_loop::submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t
     return true;
 }
 
+bool event_loop::submit_file_write(int fd, const char* buf, uint32_t len, uint64_t offset,
+                                   io_request* req, bool link)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_write(sqe, fd, buf, len, offset);
+    if (link)
+        sqe->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_file_write;
+    arm(req, raw_target(fd));
+    return true;
+}
+
+bool event_loop::submit_fsync(int fd, bool datasync, io_request* req, bool link)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_fsync(sqe, fd, datasync ? IORING_FSYNC_DATASYNC : 0);
+    if (link)
+        sqe->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_fsync;
+    arm(req, raw_target(fd));
+    return true;
+}
+
+bool event_loop::submit_renameat(int olddir, const char* oldpath, int newdir, const char* newpath,
+                                 io_request* req, bool link)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_renameat(sqe, olddir, oldpath, newdir, newpath, 0);
+    if (link)
+        sqe->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_rename;
+    arm(req, raw_target(olddir), raw_target(newdir));
+    return true;
+}
+
+bool event_loop::submit_unlinkat(int dir, const char* path, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_unlinkat(sqe, dir, path, 0);
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_unlink;
+    arm(req, raw_target(dir));
+    return true;
+}
+
+bool event_loop::reserve_sqes(unsigned n)
+{
+    if (!m_ring_open)
+        return false;
+    if (io_uring_sq_space_left(&m_ring) >= n)
+        return true;
+    io_uring_submit(&m_ring);
+    m_pending_submissions = 0;
+    return io_uring_sq_space_left(&m_ring) >= n;
+}
+
 bool event_loop::submit_poll_add(int fd, unsigned mask, io_request* req)
 {
     struct io_uring_sqe* sqe = get_sqe();

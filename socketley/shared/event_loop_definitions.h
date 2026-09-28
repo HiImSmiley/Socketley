@@ -241,10 +241,15 @@ enum op_type : uint8_t
     op_splice_poll           = 21,
     // One completion may carry SEVERAL buffers; the CQE names only the first,
     // and the rest are known to the loop's cursor.
-    op_recv_multishot_bundle = 22
+    op_recv_multishot_bundle = 22,
+    // Disk operations behind a durable log, usually linked into one chain.
+    op_file_write            = 23,
+    op_fsync                 = 24,
+    op_rename                = 25,
+    op_unlink                = 26
 };
 
-inline constexpr uint8_t op_type_count = 23;
+inline constexpr uint8_t op_type_count = 27;
 
 // For diagnostics only, because a count says an owner cannot be released yet
 // and the kind says where to look.
@@ -273,6 +278,10 @@ inline const char* io_op_name(uint8_t t)
         case op_poll_abort:              return "poll-abort";
         case op_splice_poll:             return "splice-poll";
         case op_recv_multishot_bundle:   return "recv-multishot-bundle";
+        case op_file_write:              return "file-write";
+        case op_fsync:                   return "fsync";
+        case op_rename:                  return "rename";
+        case op_unlink:                  return "unlink";
         default:                         return "unknown";
     }
 }

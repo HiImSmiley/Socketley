@@ -279,6 +279,20 @@ public:
     // for CQE dispatch routing.
     bool submit_file_read(int file_fd, char* buf, uint32_t len, uint64_t offset, io_request* req);
 
+    // Disk operations for a durable log, where `link` makes the next submission
+    // start only once this one has succeeded (IOSQE_IO_LINK), and a chain must
+    // be preceded by reserve_sqes() so no submit falls inside it.
+    bool submit_file_write(int fd, const char* buf, uint32_t len, uint64_t offset,
+                           io_request* req, bool link);
+    bool submit_fsync(int fd, bool datasync, io_request* req, bool link);
+    bool submit_renameat(int olddir, const char* oldpath, int newdir, const char* newpath,
+                         io_request* req, bool link);
+    bool submit_unlinkat(int dir, const char* path, io_request* req);
+
+    // Room for `n` submissions without a submit in between, flushing what is
+    // queued first when there is not, and false only when the ring is smaller.
+    bool reserve_sqes(unsigned n);
+
     // Async connect, whose completion is 0 on success and a negative errno on
     // failure.
     bool submit_connect(int fd, const struct sockaddr* addr, socklen_t len, io_request* req);
