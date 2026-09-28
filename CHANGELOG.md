@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- XACK finds a pending entry through a hash index instead of walking an
+  ordered tree of every pending entry: 50% more XACKs on a group with
+  200,000 pending (level with Redis before, 1.48× after), at about 20 bytes
+  more per pending entry.
 - **A cache serves only this machine unless told otherwise.** A TCP peer whose
   address is not loopback is answered `-DENIED` and closed. A cache has no
   password and answers every client with everything it holds, so reaching one

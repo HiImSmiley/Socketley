@@ -201,14 +201,117 @@ public:
         int64_t   delivery_ms{0};
         uint64_t  count{0};
         consumer* owner{nullptr};
+        std::set<stream_id>::iterator in_owner;   // this id in owner->pel, valid while owner is set
     };
     using pel_map      = std::map<stream_id, nack>;
     using consumer_map = std::map<std::string, consumer, std::less<>>;
+
+    // A group's pending entries by id beside the map that keeps them in order,
+    // so an ack or a claim finds its entry in a probe instead of a walk down a
+    // tree of every pending entry: that walk was 64% of XACK's worker on a
+    // group with a million pending, level with Redis where XREADGROUP is 3.9x.
+    class pel_index
+    {
+    public:
+        static constexpr size_t npos = static_cast<size_t>(-1);
+
+        // Written out because a nested class's member initialisers are not usable before its enclosing class ends.
+        pel_index() noexcept : m_cap(0), m_size(0), m_tombs(0) {}
+
+        size_t size() const { return m_size; }
+        size_t heap_bytes() const { return m_cap ? malloc_chunk_bytes(m_cap * sizeof(pel_map::iterator)) + malloc_chunk_bytes(m_cap) : 0; }
+        pel_map::iterator at(size_t i) const { return m_slots[i]; }
+
+        size_t locate(stream_id id) const
+        {
+            if (m_size == 0) return npos;
+            const size_t mask = m_cap - 1;
+            for (size_t i = hash(id) & mask;; i = (i + 1) & mask)
+            {
+                if (m_state[i] == empty) return npos;
+                if (m_state[i] == full && m_slots[i]->first == id) return i;
+            }
+        }
+
+        void insert(pel_map::iterator it)
+        {
+            if (m_cap == 0 || (m_size + m_tombs + 1) * 4 > m_cap * 3)
+            {
+                size_t want = 16;
+                while (want < (m_size + 1) * 2) want <<= 1;
+                rebuild(want < m_cap ? m_cap : want);
+            }
+            const size_t mask = m_cap - 1;
+            size_t i = hash(it->first) & mask;
+            while (m_state[i] == full) i = (i + 1) & mask;
+            if (m_state[i] == tomb) --m_tombs;
+            m_slots[i] = it;
+            m_state[i] = full;
+            ++m_size;
+        }
+
+        // As key_table::vacate: a tombstone only where a probe may pass it.
+        void erase_at(size_t i)
+        {
+            const size_t mask = m_cap - 1;
+            --m_size;
+            if (m_state[(i + 1) & mask] == empty)
+            {
+                m_state[i] = empty;
+                for (size_t j = (i - 1) & mask; m_state[j] == tomb; j = (j - 1) & mask)
+                {
+                    m_state[j] = empty;
+                    --m_tombs;
+                }
+            }
+            else
+            {
+                m_state[i] = tomb;
+                ++m_tombs;
+            }
+        }
+
+    private:
+        static constexpr uint8_t empty = 0, tomb = 1, full = 2;
+
+        static uint64_t hash(stream_id id)
+        {
+            uint64_t h = id.ms * 0x9E3779B97F4A7C15ull ^ (id.seq + 0x632BE59BD9B4E019ull);
+            h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+            return h;
+        }
+
+        void rebuild(size_t cap)
+        {
+            std::vector<pel_map::iterator> slots(cap);
+            std::vector<uint8_t> state(cap, empty);
+            for (size_t i = 0; i < m_cap; ++i)
+            {
+                if (m_state[i] != full) continue;
+                size_t j = hash(m_slots[i]->first) & (cap - 1);
+                while (state[j] == full) j = (j + 1) & (cap - 1);
+                slots[j] = m_slots[i];
+                state[j] = full;
+            }
+            m_slots.swap(slots);
+            m_state.swap(state);
+            m_cap = cap;
+            m_tombs = 0;
+        }
+
+        std::vector<pel_map::iterator> m_slots;
+        std::vector<uint8_t>           m_state;
+        size_t m_cap;
+        size_t m_size;
+        size_t m_tombs;
+    };
+
     struct group
     {
         stream_id    last;
         int64_t      entries_read{-1};     // -1 is Redis's "not known"
         pel_map      pel;
+        pel_index    ix;                   // pel by id, see pel_index
         consumer_map consumers;
     };
     using group_map = std::map<std::string, group, std::less<>>;
@@ -284,6 +387,15 @@ public:
     size_t    block_count()   const { return m_blocks.size() - m_head; }
     // Every byte of heap the stream holds, its blocks, index and groups.
     size_t    heap_bytes()    const { return m_heap; }
+    // The part of heap_bytes() the groups' pending indexes hold, which follows
+    // their peak rather than their size, so a reloaded copy may hold less.
+    size_t pending_index_bytes() const
+    {
+        size_t n = 0;
+        if (m_groups)
+            for (const auto& [name, g] : *m_groups) n += g.ix.heap_bytes();
+        return n;
+    }
 
     // Redis's recorded first id, which is the first live entry or 0-0.
     stream_id first_id() const { return m_length ? m_blocks[m_head].first : stream_id{}; }
@@ -557,7 +669,7 @@ public:
         auto it = m_groups->find(name);
         if (it == m_groups->end()) return false;
         group& g = it->second;
-        m_heap -= g.pel.size() * nack_node_bytes;
+        m_heap -= g.pel.size() * nack_node_bytes + g.ix.heap_bytes();
         for (const auto& [cn, c] : g.consumers)
             m_heap -= consumer_node_bytes + name_bytes(cn.size()) + c.pel.size() * cpel_node_bytes;
         m_heap -= group_node_bytes + name_bytes(it->first.size());
@@ -599,9 +711,16 @@ public:
         auto it = g.consumers.find(name);
         if (it == g.consumers.end()) return -1;
         const size_t n = it->second.pel.size();
+        const size_t ix_before = g.ix.heap_bytes();
         for (const stream_id& id : it->second.pel)
-            g.pel.erase(id);
+        {
+            const size_t k = g.ix.locate(id);
+            const auto at = g.ix.at(k);
+            g.ix.erase_at(k);
+            g.pel.erase(at);
+        }
         m_heap -= n * (nack_node_bytes + cpel_node_bytes);
+        m_heap -= ix_before - g.ix.heap_bytes();
         m_heap -= consumer_node_bytes + name_bytes(it->first.size());
         g.consumers.erase(it);
         return static_cast<int64_t>(n);
@@ -609,17 +728,15 @@ public:
 
     nack* find_nack(group& g, stream_id id)
     {
-        auto it = g.pel.find(id);
-        return it == g.pel.end() ? nullptr : &it->second;
+        const size_t k = g.ix.locate(id);
+        return k == pel_index::npos ? nullptr : &g.ix.at(k)->second;
     }
 
     // `id` delivered to `c`: a new pending entry, or the one there moved to `c`
     // and restarted, as XREADGROUP does it.
     nack& deliver(group& g, stream_id id, consumer& c, int64_t now_ms)
     {
-        auto [it, fresh] = g.pel.try_emplace(id);
-        if (fresh) m_heap += nack_node_bytes;
-        nack& n = it->second;
+        nack& n = pending_entry(g, id);
         move_nack(id, n, c);
         n.delivery_ms = now_ms;
         n.count = 1;
@@ -630,14 +747,14 @@ public:
     // once, now, as Redis's streamCreateNACK does.
     nack& force_nack(group& g, stream_id id, int64_t now_ms)
     {
-        auto [it, fresh] = g.pel.try_emplace(id);
-        if (fresh)
+        const size_t before = g.pel.size();
+        nack& n = pending_entry(g, id);
+        if (g.pel.size() != before)
         {
-            m_heap += nack_node_bytes;
-            it->second.delivery_ms = now_ms;
-            it->second.count = 1;
+            n.delivery_ms = now_ms;
+            n.count = 1;
         }
-        return it->second;
+        return n;
     }
 
     // `n`, pending under `id`, handed to `c`.
@@ -646,25 +763,30 @@ public:
         if (n.owner == &c) return;
         if (n.owner)
         {
-            n.owner->pel.erase(id);
+            n.owner->pel.erase(n.in_owner);
             m_heap -= cpel_node_bytes;
         }
-        c.pel.insert(id);
+        // Deliveries come in id order, so the new id is usually the owner's last.
+        n.in_owner = (c.pel.empty() || *c.pel.rbegin() < id) ? c.pel.emplace_hint(c.pel.end(), id)
+                                                             : c.pel.insert(id).first;
         m_heap += cpel_node_bytes;
         n.owner = &c;
     }
 
     bool ack(group& g, stream_id id)
     {
-        auto it = g.pel.find(id);
-        if (it == g.pel.end()) return false;
+        const size_t k = g.ix.locate(id);
+        if (k == pel_index::npos) return false;
+        const auto it = g.ix.at(k);
         if (consumer* o = it->second.owner)
         {
-            o->pel.erase(id);
+            o->pel.erase(it->second.in_owner);
             m_heap -= cpel_node_bytes;
         }
+        const size_t ix_before = g.ix.heap_bytes();
+        g.ix.erase_at(k);
         g.pel.erase(it);
-        m_heap -= nack_node_bytes;
+        m_heap -= nack_node_bytes + (ix_before - g.ix.heap_bytes());
         return true;
     }
 
@@ -779,7 +901,7 @@ public:
                 if (!get_id(p, end, id) || !get_u32(p, end, owner) || !get_u64(p, end, when)
                     || !get_u64(p, end, count))
                     return false;
-                if (owner >= cons.size() || g->pel.count(id)) return false;
+                if (owner >= cons.size() || g->ix.locate(id) != pel_index::npos) return false;
                 nack& nk = force_nack(*g, id, static_cast<int64_t>(when));
                 move_nack(id, nk, *cons[owner]);
                 nk.delivery_ms = static_cast<int64_t>(when);
@@ -790,6 +912,20 @@ public:
     }
 
 private:
+    // The pending entry for `id`, made when there is none and indexed with it.
+    nack& pending_entry(group& g, stream_id id)
+    {
+        const size_t k = g.ix.locate(id);
+        if (k != pel_index::npos) return g.ix.at(k)->second;
+        // Deliveries come in id order, so the new id is usually past every pending one.
+        const auto it = (g.pel.empty() || g.pel.rbegin()->first < id) ? g.pel.emplace_hint(g.pel.end(), id, nack{})
+                                                                     : g.pel.emplace(id, nack{}).first;
+        const size_t ix_before = g.ix.heap_bytes();
+        g.ix.insert(it);
+        m_heap += nack_node_bytes + (g.ix.heap_bytes() - ix_before);
+        return it->second;
+    }
+
     struct block
     {
         stream_id base;       // the id the block was opened with, which each entry's ms is stored against

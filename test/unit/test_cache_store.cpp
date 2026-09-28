@@ -3905,7 +3905,8 @@ TEST_CASE("a group's pending entries agree with a model through deliveries, clai
             stream_log back;
             REQUIRE(back.deserialize(serialized(s)));
             CHECK(serialized(back) == serialized(s));
-            CHECK(back.heap_bytes() == s.heap_bytes());
+            CHECK(back.heap_bytes() - back.pending_index_bytes() == s.heap_bytes() - s.pending_index_bytes());
+            CHECK(back.pending_index_bytes() <= s.pending_index_bytes());
         }
     }
     // Destroying the group gives every byte its entries held back.
