@@ -120,10 +120,8 @@ struct alignas(64) proxy_client_connection
     bool splice_in_pending{false};
     bool splice_out_pending{false};
     // This pair's bytes move inside the kernel, so no read or splice is armed
-    // and only the abort poll watches the socket.  sockmap_pending is set while
-    // the last saved bytes drain to the backend and cleared when it enters.
+    // and only the abort poll watches the socket.
     bool sockmap_active{false};
-    bool sockmap_pending{false};
     // The client half-closed on a kernel-relayed pair, so the sweep may pass
     // the FIN on once the backend has sent everything the client sent.
     bool sockmap_client_eof{false};

@@ -32,6 +32,11 @@ public:
     // socket that is not in the map.
     void leave(int fd_a, int fd_b);
 
+    // Whether a socket is AF_INET/AF_INET6, the only families the redirect
+    // relays correctly -- a TCP/unix pair loses bytes, so the caller checks
+    // both sockets before entering.
+    static bool is_inet(int fd);
+
     // One direction's counters when a pair entered the map: what the source
     // had received and userspace already relayed, and what the destination had
     // queued to send, so later totals are read against them.

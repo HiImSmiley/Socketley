@@ -297,7 +297,6 @@ void proxy_client_connection::reset(int new_fd)
     splice_in_pending = false;
     splice_out_pending = false;
     sockmap_active = false;
-    sockmap_pending = false;
     sockmap_client_eof = false;
     sockmap_backend_eof = false;
     sockmap_up = {};
@@ -6604,13 +6603,12 @@ void proxy_instance::sockmap_account_at_close(int client_fd, int backend_fd)
 
 void proxy_instance::leave_sockmap(proxy_client_connection* conn)
 {
-    if (!conn->sockmap_active && !conn->sockmap_pending)
+    if (!conn->sockmap_active)
         return;
     const int bfd = conn->backend_fd;
     if (m_sockmap)
         m_sockmap->leave(conn->fd, bfd);
     conn->sockmap_active = false;
-    conn->sockmap_pending = false;
     if (bfd >= 0 && bfd < MAX_FDS && m_conn_idx[bfd].side == conn_backend)
         m_conn_idx[bfd].backend->sockmap_active = false;
     auto it = std::find(m_sockmap_pairs.begin(), m_sockmap_pairs.end(), conn->fd);
@@ -6621,17 +6619,24 @@ void proxy_instance::leave_sockmap(proxy_client_connection* conn)
     }
 }
 
-// The map insertion itself, once the last saved bytes are on the wire, with the
-// abort watches that are the pair's only armed operations.  False leaves the
-// pair on the copy path.
+// The map insertion, with the abort watches that are the pair's only armed
+// operations, and then the client's already-read request delivered to the
+// backend.  Both sockets enter the map BEFORE the request is sent, so the
+// backend's answer lands on a socket already in the map and is redirected at
+// once -- sending first raced the answer onto a not-yet-inserted socket and
+// left it stuck in the receive queue, stalling ~8% of pairs under churn, since
+// a ping-pong client sends nothing more to re-trigger the verdict.  False
+// leaves the pair on the copy path.
 bool proxy_instance::enter_sockmap_now(proxy_client_connection* conn,
                                        proxy_backend_connection* bconn)
 {
-    conn->sockmap_pending = false;
     if (!m_sockmap_enabled || !m_sockmap || conn->closing || bconn->closing)
         return false;
 
     const int cfd = conn->fd, bfd = bconn->fd;
+    // Before the request is sent, so the backend's receive baseline is zero and
+    // the client's already-read request is excluded from the kernel-relayed
+    // count (it is charged to bytes_out by the send below instead).
     conn->sockmap_up = socketley::sockmap_relay::base(cfd, bfd);
     conn->sockmap_down = socketley::sockmap_relay::base(bfd, cfd);
 
@@ -6652,12 +6657,28 @@ bool proxy_instance::enter_sockmap_now(proxy_client_connection* conn,
     m_sockmap_pairs.push_back(cfd);
     // The sweep is this pair's only periodic tick, for backlog and half-close.
     arm_response_deadline_sweep();
+
+    // Now the request the client sent before the backend existed, written
+    // straight to the backend socket -- a userspace send on a mapped socket is
+    // fine, the verdict only intercepts the receive side.  Blocking, because
+    // saved_request is bounded (<= RETRY_KEEP_BYTES) and this is the one point
+    // where nothing may be left queued; a short write is our own failure, and
+    // the pair is already in the map, so it is torn down rather than fallen back.
+    if (!conn->saved_request.empty())
+    {
+        if (!socketley::write_all(bfd, conn->saved_request.data(),
+                                  conn->saved_request.size()))
+        {
+            close_pair(cfd, bfd, close_reason::force);
+            return true;
+        }
+        stat_add(m_stat_bytes_out, conn->saved_request.size());
+        conn->saved_request.clear();
+    }
     return true;
 }
 
-// Move a plain TCP pair into the kernel relay: forward whatever the client sent
-// before the backend existed, then enter once it has drained so nothing
-// overtakes it.  False keeps the pair on the copy path.
+// Move a plain TCP pair into the kernel relay.  False keeps it on the copy path.
 bool proxy_instance::try_enter_sockmap(proxy_client_connection* conn,
                                        proxy_backend_connection* bconn)
 {
@@ -6667,24 +6688,18 @@ bool proxy_instance::try_enter_sockmap(proxy_client_connection* conn,
         return false;
     if (conn->closing || bconn->closing || conn->client_eof)
         return false;
-
-    conn->backend_fd = bconn->fd;
-    if (!conn->saved_request.empty())
-    {
-        forward_to_backend(conn, conn->saved_request);
-        conn->saved_request.clear();
-    }
-    // A forward that overflowed the queue marked the pair closing; the copy
-    // path's teardown owns it from here.
-    if (conn->closing || bconn->closing)
+    // A unix backend (or listener) is AF_UNIX, and the redirect between a TCP
+    // and a unix socket loses bytes, so both ends must be AF_INET/AF_INET6.
+    if (!socketley::sockmap_relay::is_inet(conn->fd) ||
+        !socketley::sockmap_relay::is_inet(bconn->fd))
+        return false;
+    // Anything already queued to the backend by an earlier path means a
+    // completion is owed; leave such a pair on the copy path.
+    if (bconn->write_pending || !bconn->write_queue.empty())
         return false;
 
-    conn->sockmap_pending = true;
-    if (!bconn->write_pending && bconn->write_queue.empty())
-        return enter_sockmap_now(conn, bconn);
-    // The saved bytes are still draining; handle_backend_write enters the map
-    // when its queue empties.
-    return true;
+    conn->backend_fd = bconn->fd;
+    return enter_sockmap_now(conn, bconn);
 }
 
 void proxy_instance::handle_splice(struct io_uring_cqe* cqe, io_request* req)
@@ -10753,29 +10768,6 @@ void proxy_instance::handle_backend_write(struct io_uring_cqe* cqe, io_request* 
         if (se.side == conn_client && se.client->splice_active && conn->splice_active &&
             !se.client->client_eof)
             start_splice_forwarding(se.client, conn);
-    }
-
-    // The kernel relay was held back for the same reason as splice: the saved
-    // request had to reach the backend first.  Now that its queue is empty the
-    // pair enters the map; a failure to enter falls back to arming reads.
-    if (conn->write_queue.empty() && !conn->write_pending &&
-        conn->client_fd >= 0 && conn->client_fd < MAX_FDS)
-    {
-        auto& se = m_conn_idx[conn->client_fd];
-        if (se.side == conn_client && se.client->sockmap_pending && !se.client->sockmap_active &&
-            se.client->backend_fd == conn->fd)
-        {
-            if (!enter_sockmap_now(se.client, conn))
-            {
-                if ((!se.client->client_eof && !arm_read(se.client->fd, se.client)) ||
-                    !arm_read(conn->fd, conn))
-                {
-                    close_pair(se.client->fd, conn->fd, close_reason::force);
-                    return;
-                }
-            }
-            return;
-        }
     }
 
     // The client's half-close, held back for exactly the same reason and let go

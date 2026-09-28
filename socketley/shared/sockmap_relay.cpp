@@ -23,6 +23,17 @@ static long sys_bpf(int cmd, union bpf_attr* attr)
     return syscall(__NR_bpf, cmd, attr, sizeof(*attr));
 }
 
+bool sockmap_relay::is_inet(int fd)
+{
+    int dom = 0;
+    socklen_t len = sizeof(dom);
+    if (fd < 0 || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &len) < 0)
+        return false;
+    // The redirect between a TCP and a unix socket loses bytes (measured), so
+    // the kernel path is for AF_INET/AF_INET6 pairs only.
+    return dom == AF_INET || dom == AF_INET6;
+}
+
 static uint64_t sock_cookie(int fd)
 {
     uint64_t c = 0;
