@@ -425,19 +425,102 @@ std::string status_field(std::string_view body, std::string_view key)
 
 } // namespace
 
+// ─── Raft mode: the cluster's runtimes ───
+
+namespace {
+
+// Asks the daemon until it has applied what was just sent, since the command travels through the log and the leader before this node sees it.
+int wait_applied(const std::string& question)
+{
+    for (int i = 0; i < 100; ++i)
+    {
+        std::string data;
+        const int rc = ipc_send(question, data);
+        if (rc < 0)
+            return ipc_report_failure(rc);
+        if (rc == 0)
+            return 0;
+        usleep(50 * 1000);
+    }
+    std::cout << "the cluster accepted the command but this node has not applied it after 5 s\n"
+                 "  `socketley cluster raft-status` says whether the cluster has a leader and a quorum\n";
+    return 2;
+}
+
+// The verbs that go to the Raft node: they are answered from the replicated state and not from the directory below.
+int cluster_raft_verb(int argc, char** argv)
+{
+    const std::string_view sub = argv[2];
+    std::string command;
+    std::string applied;
+
+    if (sub == "raft-status" || sub == "placement")
+    {
+        command = sub == "placement" ? "cluster-placement" : "raft-status";
+    }
+    else if (sub == "create")
+    {
+        if (argc < 5)
+        {
+            std::cout << "usage: cluster create <type> <name> [flags] [--replicas <n>]\n";
+            return 1;
+        }
+        command = "cluster-create";
+        std::string replicas = "1";
+        for (int i = 3; i < argc; ++i)
+        {
+            command += ' ';
+            // The flags that name a file are made absolute here, because the daemon on each node resolves them against its own directory.
+            command += i > 4 ? cli_caller_path(argv[i - 1], argv[i]) : std::string(argv[i]);
+            if (std::string_view(argv[i - 1]) == "--replicas")
+                replicas = argv[i];
+        }
+        applied = std::string("cluster-has ") + argv[4] + " " + replicas;
+    }
+    else if (sub == "remove")
+    {
+        if (argc != 4)
+        {
+            std::cout << "usage: cluster remove <name>\n";
+            return 1;
+        }
+        command = std::string("cluster-remove ") + argv[3];
+        applied = std::string("cluster-has ") + argv[3] + " absent";
+    }
+    else
+    {
+        if (argc != 5)
+        {
+            std::cout << "usage: cluster scale <name> <replicas>\n";
+            return 1;
+        }
+        command = std::string("cluster-scale ") + argv[3] + " " + argv[4];
+        applied = std::string("cluster-has ") + argv[3] + " " + argv[4];
+    }
+
+    std::string data;
+    const int rc = ipc_send(command, data);
+    if (rc < 0)
+        return ipc_report_failure(rc);
+    if (!data.empty())
+        std::cout << data;
+    if (rc != 0 || applied.empty())
+        return rc;
+    return wait_applied(applied);
+}
+
+} // namespace
+
 // ─── Main dispatch ───
 
 int cli_cluster(int argc, char** argv)
 {
     // Raft mode has its own source of truth, so it is asked before the directory-mode gate below.
-    if (argc > 2 && std::string_view(argv[2]) == "raft-status")
+    if (argc > 2)
     {
-        std::string data;
-        const int rc = ipc_send("raft-status", data);
-        if (rc < 0)
-            return ipc_report_failure(rc);
-        std::cout << data;
-        return rc;
+        const std::string_view sub = argv[2];
+        if (sub == "raft-status" || sub == "placement" || sub == "create" || sub == "remove" || sub == "scale")
+            return cluster_raft_verb(argc, argv);
     }
 
     // Ask the daemon about itself rather than the directory about the daemon,

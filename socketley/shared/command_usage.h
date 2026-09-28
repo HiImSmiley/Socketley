@@ -37,7 +37,9 @@ inline constexpr std::string_view for_verb(std::string_view verb)
     if (verb == "ps")     return "ps [-a|--all] [--json|-j|--format json] [--silent|-s] [columns...]";
     if (verb == "ping")   return "ping";
     if (verb == "dashboard") return "dashboard";
-    if (verb == "cluster") return "cluster [ls|ps|group <name>|stats|watch|show <daemon>]";
+    if (verb == "cluster")
+        return "cluster [ls|ps|group <name>|stats|watch|show <daemon>|raft-status|placement|"
+               "create <type> <name> [flags] [--replicas <n>]|scale <name> <n>|remove <name>]";
     return {};
 }
 

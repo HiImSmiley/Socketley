@@ -682,7 +682,7 @@ int cli_dispatch(int argc, char** argv)
 // A relative path in a flag the daemon opens, made absolute against the
 // caller's directory, because the daemon resolves it against its own -- which
 // is "/" under systemd -- and `--lua example.lua` loaded /example.lua.
-static std::string caller_path(std::string_view flag, std::string_view value)
+std::string cli_caller_path(std::string_view flag, std::string_view value)
 {
     static constexpr std::string_view path_flags[] = {
         "--lua", "--log", "-w", "--persistent", "--http",
@@ -716,7 +716,7 @@ int cli_forward(int argc, char** argv)
     {
         if (i > 1) command += ' ';
         if (opens_files && i > 2)
-            command += caller_path(argv[i - 1], argv[i]);
+            command += cli_caller_path(argv[i - 1], argv[i]);
         else
             command += argv[i];
     }
