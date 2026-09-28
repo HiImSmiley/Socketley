@@ -11,27 +11,44 @@
 namespace socketley::raft
 {
 
-std::string encode_voters(const std::vector<node_id>& voters)
+std::string encode_config(const std::vector<node_id>& voters, const std::vector<node_id>& learners)
 {
     std::string out;
-    out.reserve(voters.size() * 8);
-    for (node_id v : voters)
+    out.reserve((voters.size() + learners.size() + 1) * 8);
+    auto put = [&out](node_id v)
+    {
         for (int b = 0; b < 8; ++b)
             out += static_cast<char>((v >> (8 * b)) & 0xFF);
+    };
+    for (node_id v : voters)
+        put(v);
+    if (!learners.empty())
+    {
+        put(no_node);
+        for (node_id l : learners)
+            put(l);
+    }
     return out;
 }
 
-std::vector<node_id> decode_voters(const std::string& data)
+membership decode_config(const std::string& data)
 {
-    std::vector<node_id> out;
+    membership out;
+    bool learners = false;
     for (size_t off = 0; off + 8 <= data.size(); off += 8)
     {
         node_id v = 0;
         for (int b = 0; b < 8; ++b)
             v |= static_cast<node_id>(static_cast<unsigned char>(data[off + b])) << (8 * b);
-        out.push_back(v);
+        if (v == no_node)
+            learners = true;
+        else
+            (learners ? out.learners : out.voters).push_back(v);
     }
-    std::sort(out.begin(), out.end());
+    std::sort(out.voters.begin(), out.voters.end());
+    std::sort(out.learners.begin(), out.learners.end());
+    // A node is a voter or a learner, never both.
+    std::erase_if(out.learners, [&out](node_id l) { return std::binary_search(out.voters.begin(), out.voters.end(), l); });
     return out;
 }
 
@@ -47,6 +64,7 @@ node::node(const options& opts, persisted state)
         m_opts.max_append_entries = 1;
 
     std::sort(state.snap.voters.begin(), state.snap.voters.end());
+    std::sort(state.snap.learners.begin(), state.snap.learners.end());
     m_snap = std::make_shared<const snapshot>(std::move(state.snap));
 
     // A log that does not continue the snapshot contiguously is cut at the first gap.
@@ -117,6 +135,11 @@ bool node::is_voter(node_id id) const
     return std::binary_search(m_voters.begin(), m_voters.end(), id);
 }
 
+bool node::is_learner(node_id id) const
+{
+    return std::binary_search(m_learners.begin(), m_learners.end(), id);
+}
+
 bool node::in_lease() const
 {
     if (RAFT_FAULT(fault_no_check_quorum))
@@ -141,6 +164,8 @@ void node::reset(term_t term)
     m_progress.clear();
     m_pending_reads.clear();
     m_deferred_reads.clear();
+    m_transferee       = no_node;
+    m_transfer_elapsed = 0;
 }
 
 void node::become_follower(term_t term, node_id leader)
@@ -169,7 +194,7 @@ void node::become_leader()
     bcast_append();
 }
 
-void node::campaign(bool pre)
+void node::campaign(bool pre, bool transfer)
 {
     if (pre)
     {
@@ -193,7 +218,10 @@ void node::campaign(bool pre)
         return;
     }
 
-    for (node_id v : m_voters)
+    std::vector<node_id> electorate = m_voters;
+    if (RAFT_FAULT(fault_learner_votes))
+        electorate.insert(electorate.end(), m_learners.begin(), m_learners.end());
+    for (node_id v : electorate)
     {
         if (v == m_opts.id)
             continue;
@@ -203,6 +231,8 @@ void node::campaign(bool pre)
             m.term = m_term + 1;
         m.index    = last_index();
         m.log_term = last_term();
+        if (transfer)
+            m.context = transfer_context;
         send(std::move(m));
     }
 }
@@ -211,14 +241,14 @@ size_t node::count_votes(bool granted) const
 {
     size_t n = 0;
     for (const auto& [id, g] : m_votes)
-        if (g == granted && is_voter(id))
+        if (g == granted && (is_voter(id) || (RAFT_FAULT(fault_learner_votes) && is_learner(id))))
             ++n;
     return n;
 }
 
 void node::tally(const message& m)
 {
-    if (!is_voter(m.from))
+    if (!is_voter(m.from) && !(RAFT_FAULT(fault_learner_votes) && is_learner(m.from)))
         return;
     m_votes.emplace(m.from, !m.reject);
 
@@ -257,6 +287,13 @@ void node::tick_leader()
     ++m_heartbeat_elapsed;
     ++m_election_elapsed;
 
+    // A transfer the target never finished gives the cluster back its leader after one election timeout.
+    if (m_transferee != no_node && ++m_transfer_elapsed >= m_opts.election_ticks)
+    {
+        m_transferee       = no_node;
+        m_transfer_elapsed = 0;
+    }
+
     if (m_election_elapsed >= m_opts.election_ticks)
     {
         m_election_elapsed = 0;
@@ -292,13 +329,16 @@ void node::step(const message& m)
 
     const bool from_leader = m.type == msg_type::append
                           || m.type == msg_type::heartbeat
-                          || m.type == msg_type::snapshot;
+                          || m.type == msg_type::snapshot
+                          || m.type == msg_type::timeout_now;
 
     if (m.term > m_term)
     {
         const bool vote_request = m.type == msg_type::vote || m.type == msg_type::pre_vote;
-        // A node that heard from a live leader within an election timeout will not help depose it.
-        if (vote_request && in_lease())
+        const bool handed_over  = m.type == msg_type::vote && m.context == transfer_context
+                               && !RAFT_FAULT(fault_transfer_in_lease);
+        // A node that heard from a live leader within an election timeout will not help depose it, unless that leader asked.
+        if (vote_request && in_lease() && !handed_over)
             return;
 
         const bool keeps_term = m.type == msg_type::pre_vote
@@ -378,6 +418,12 @@ void node::step(const message& m)
         if (m_role == role::follower && m.from == m_leader)
             m_reads.push_back(read_state{m.context, m.index});
         return;
+
+    case msg_type::timeout_now:
+        // Pre-vote is skipped because the leader that would have made it fail is the one asking.
+        if (m_role != role::leader && promotable())
+            campaign(false, true);
+        return;
     }
 }
 
@@ -386,7 +432,8 @@ void node::handle_vote_request(const message& m)
     const bool pre = m.type == msg_type::pre_vote;
     const bool can_vote = m_vote == m.from
                        || (m_vote == no_node && m_leader == no_node)
-                       || (pre && m.term > m_term);
+                       || (pre && m.term > m_term)
+                       || (RAFT_FAULT(fault_transfer_revotes) && m.context == transfer_context);
     const bool up_to_date = m.log_term > last_term()
                          || (m.log_term == last_term() && m.index >= last_index());
 
@@ -582,8 +629,55 @@ void node::handle_append_resp(const message& m)
 
     // The commit may have changed the voter set, so the progress is looked up again.
     it = m_progress.find(m.from);
-    if (it != m_progress.end() && it->second.next <= last_index())
+    if (it == m_progress.end())
+        return;
+    if (m.from == m_transferee && it->second.match == last_index())
+        send_timeout_now(m.from);
+    else if (it->second.next <= last_index())
         send_append(m.from, it->second);
+}
+
+void node::send_timeout_now(node_id to)
+{
+    send(make(msg_type::timeout_now, to));
+}
+
+bool node::transfer_leadership(node_id to)
+{
+    if (m_role != role::leader || to == m_opts.id || !is_voter(to))
+        return false;
+    auto it = m_progress.find(to);
+    if (it == m_progress.end())
+        return false;
+
+    m_transferee       = to;
+    m_transfer_elapsed = 0;
+    if (it->second.match == last_index())
+        send_timeout_now(to);
+    else
+        send_append(to, it->second);
+    return true;
+}
+
+index_t node::match_index(node_id id) const
+{
+    if (m_role != role::leader)
+        return 0;
+    if (id == m_opts.id)
+        return last_index();
+    auto it = m_progress.find(id);
+    return it == m_progress.end() ? 0 : it->second.match;
+}
+
+bool node::quorum_active() const
+{
+    if (m_role != role::leader)
+        return false;
+    size_t active = is_voter(m_opts.id) ? 1 : 0;
+    for (const auto& [id, p] : m_progress)
+        if (p.recent_active && is_voter(id))
+            ++active;
+    return active >= quorum();
 }
 
 void node::handle_heartbeat_resp(const message& m)
@@ -607,6 +701,14 @@ void node::handle_heartbeat_resp(const message& m)
 
     if (m.context)
         ack_read(m.from, m.context);
+
+    // A lost TimeoutNow is sent again, since nothing else would bring the transfer to an end before it expires.
+    if (m.from == m_transferee && m_role == role::leader)
+    {
+        auto t = m_progress.find(m.from);
+        if (t != m_progress.end() && t->second.match == last_index())
+            send_timeout_now(m.from);
+    }
 }
 
 // ─── replication ───
@@ -692,10 +794,8 @@ void node::append_entry(entry e)
     m_log.push_back(std::move(e));
     if (config)
     {
-        m_voters     = decode_voters(m_log.back().data);
+        install(decode_config(m_log.back().data));
         m_conf_index = m_log.back().index;
-        if (m_role == role::leader)
-            sync_progress();
     }
 }
 
@@ -725,7 +825,10 @@ bool node::maybe_commit()
 
     std::vector<index_t> match;
     match.reserve(m_voters.size());
-    for (node_id v : m_voters)
+    std::vector<node_id> counted = m_voters;
+    if (RAFT_FAULT(fault_learner_in_quorum))
+        counted.insert(counted.end(), m_learners.begin(), m_learners.end());
+    for (node_id v : counted)
     {
         if (v == m_opts.id)
         {
@@ -772,52 +875,65 @@ void node::after_commit()
 
 // ─── configuration ───
 
+void node::install(const membership& m)
+{
+    m_voters   = m.voters;
+    m_learners = m.learners;
+    if (m_transferee != no_node && !is_voter(m_transferee))
+        m_transferee = no_node;
+    if (m_role == role::leader)
+        sync_progress();
+}
+
 void node::refresh_config()
 {
-    m_voters     = m_snap->voters;
+    membership m{m_snap->voters, m_snap->learners};
     m_conf_index = m_snap->index;
     for (auto it = m_log.rbegin(); it != m_log.rend(); ++it)
     {
         if (it->type == entry_type::config)
         {
-            m_voters     = decode_voters(it->data);
+            m            = decode_config(it->data);
             m_conf_index = it->index;
             break;
         }
     }
-    if (m_role == role::leader)
-        sync_progress();
+    install(m);
 }
 
 void node::sync_progress()
 {
-    for (node_id v : m_voters)
+    auto track = [this](node_id v)
     {
         if (v == m_opts.id || m_progress.count(v))
-            continue;
+            return;
         progress p;
         p.next          = last_index() + 1;
         p.recent_active = true;
         m_progress.emplace(v, p);
-    }
+    };
+    for (node_id v : m_voters)
+        track(v);
+    for (node_id l : m_learners)
+        track(l);
     for (auto it = m_progress.begin(); it != m_progress.end();)
     {
-        if (is_voter(it->first))
+        if (is_member(it->first))
             ++it;
         else
             it = m_progress.erase(it);
     }
 }
 
-std::vector<node_id> node::voters_at(index_t i) const
+membership node::config_at(index_t i) const
 {
     for (index_t j = std::min(i, last_index()); j > m_snap->index; --j)
     {
         const entry* e = entry_at(j);
         if (e->type == entry_type::config)
-            return decode_voters(e->data);
+            return decode_config(e->data);
     }
-    return m_snap->voters;
+    return membership{m_snap->voters, m_snap->learners};
 }
 
 // ─── client API ───
@@ -831,6 +947,8 @@ proposal node::propose(std::string data)
 {
     if (m_role != role::leader)
         return proposal{propose_status::not_leader, 0, 0, m_leader};
+    if (m_transferee != no_node)
+        return proposal{propose_status::transferring, 0, 0, m_leader};
     if (backlogged())
         return proposal{propose_status::busy, 0, 0, m_leader};
 
@@ -847,10 +965,12 @@ proposal node::propose(std::string data)
     return out;
 }
 
-proposal node::propose_config(std::vector<node_id> voters)
+proposal node::propose_config(std::vector<node_id> voters, std::vector<node_id> learners)
 {
     if (m_role != role::leader)
         return proposal{propose_status::not_leader, 0, 0, m_leader};
+    if (m_transferee != no_node)
+        return proposal{propose_status::transferring, 0, 0, m_leader};
 
     // One change at a time, and only once this leader has committed in its term (Ongaro, raft-dev 2015).
     const bool pending = m_conf_index > m_commit || m_commit < m_term_start;
@@ -860,14 +980,15 @@ proposal node::propose_config(std::vector<node_id> voters)
         return proposal{propose_status::busy, 0, 0, m_leader};
 
     std::sort(voters.begin(), voters.end());
-    if (voters == m_voters || voters.empty())
+    std::sort(learners.begin(), learners.end());
+    if ((voters == m_voters && learners == m_learners) || voters.empty())
         return proposal{propose_status::no_change, 0, 0, m_leader};
 
     entry e;
     e.term  = m_term;
     e.index = last_index() + 1;
     e.type  = entry_type::config;
-    e.data  = encode_voters(voters);
+    e.data  = encode_config(voters, learners);
     const proposal out{propose_status::ok, e.index, e.term, m_opts.id};
     append_entry(std::move(e));
 
@@ -879,20 +1000,33 @@ proposal node::propose_config(std::vector<node_id> voters)
 
 proposal node::propose_add(node_id id)
 {
-    if (is_voter(id))
+    if (is_voter(id) || id == no_node)
         return proposal{propose_status::no_change, 0, 0, m_leader};
     std::vector<node_id> v = m_voters;
+    std::vector<node_id> l = m_learners;
     v.push_back(id);
-    return propose_config(std::move(v));
+    std::erase(l, id);
+    return propose_config(std::move(v), std::move(l));
+}
+
+proposal node::propose_add_learner(node_id id)
+{
+    if (is_member(id) || id == no_node)
+        return proposal{propose_status::no_change, 0, 0, m_leader};
+    std::vector<node_id> l = m_learners;
+    l.push_back(id);
+    return propose_config(m_voters, std::move(l));
 }
 
 proposal node::propose_remove(node_id id)
 {
-    if (!is_voter(id))
+    if (!is_member(id))
         return proposal{propose_status::no_change, 0, 0, m_leader};
     std::vector<node_id> v = m_voters;
-    v.erase(std::find(v.begin(), v.end(), id));
-    return propose_config(std::move(v));
+    std::vector<node_id> l = m_learners;
+    std::erase(v, id);
+    std::erase(l, id);
+    return propose_config(std::move(v), std::move(l));
 }
 
 // ─── ReadIndex ───
@@ -995,8 +1129,10 @@ bool node::compact(index_t index, std::string data)
     auto s = std::make_shared<snapshot>();
     s->index  = index;
     s->term   = *term_at(index);
-    s->voters = voters_at(index);
-    s->data   = std::move(data);
+    membership m = config_at(index);
+    s->voters    = std::move(m.voters);
+    s->learners  = std::move(m.learners);
+    s->data      = std::move(data);
 
     while (!m_log.empty() && m_log.front().index <= index)
         m_log.pop_front();

@@ -26,18 +26,20 @@ struct entry
     term_t      term  = 0;
     index_t     index = 0;
     entry_type  type  = entry_type::normal;
-    // A config entry's data is the whole voter set it installs, see encode_voters().
+    // A config entry's data is the whole membership it installs, see encode_config().
     std::string data;
 
     bool operator==(const entry&) const = default;
 };
 
-// The state machine as of `index`, plus the voter set in force at that index.
+// The state machine as of `index`, plus the membership in force at that index.
 struct snapshot
 {
     index_t              index = 0;
     term_t               term  = 0;
     std::vector<node_id> voters;
+    // Members that receive the log but neither vote nor count toward a quorum.
+    std::vector<node_id> learners;
     std::string          data;
 };
 
@@ -57,7 +59,11 @@ enum class msg_type : uint8_t
     heartbeat, heartbeat_resp,
     snapshot,
     read_index, read_index_resp,
+    timeout_now,
 };
+
+// A vote request's context when a leader handed over, which lifts the lease that would otherwise refuse it.
+inline constexpr uint64_t transfer_context = 1;
 
 struct message
 {
@@ -77,7 +83,7 @@ struct message
     index_t  hint_index = 0;
     term_t   hint_term  = 0;
 
-    // The leader's read round on append and heartbeat traffic, the request id on read_index traffic.
+    // The leader's read round on append and heartbeat traffic, the request id on read_index traffic, transfer_context on a handed-over vote.
     uint64_t context = 0;
 
     std::shared_ptr<const raft::snapshot> snap;
@@ -120,7 +126,7 @@ struct ready
     std::optional<soft_state> soft;
 };
 
-enum class propose_status : uint8_t { ok, not_leader, change_pending, no_change, busy };
+enum class propose_status : uint8_t { ok, not_leader, change_pending, no_change, busy, transferring };
 
 struct proposal
 {
@@ -142,6 +148,10 @@ enum fault : uint32_t
     fault_concurrent_config   = 1u << 5,
     fault_skip_pre_vote       = 1u << 6,
     fault_no_check_quorum     = 1u << 7,
+    fault_learner_in_quorum   = 1u << 8,
+    fault_learner_votes       = 1u << 9,
+    fault_transfer_revotes    = 1u << 10,
+    fault_transfer_in_lease   = 1u << 11,
 };
 #endif
 
@@ -160,7 +170,7 @@ struct options
 #endif
 };
 
-// What the host read back from disk; a new cluster member starts from an index-0 snapshot naming the voters.
+// What the host read back from disk; a new cluster member starts from an index-0 snapshot naming the members.
 struct persisted
 {
     hard_state         hard;
@@ -168,8 +178,17 @@ struct persisted
     std::vector<entry> log;
 };
 
-std::string          encode_voters(const std::vector<node_id>& voters);
-std::vector<node_id> decode_voters(const std::string& data);
+struct membership
+{
+    std::vector<node_id> voters;
+    std::vector<node_id> learners;
+
+    bool operator==(const membership&) const = default;
+};
+
+// Voters, then a zero id and the learners when there are any, eight little-endian bytes each.
+std::string encode_config(const std::vector<node_id>& voters, const std::vector<node_id>& learners = {});
+membership  decode_config(const std::string& data);
 
 class node
 {
@@ -180,8 +199,20 @@ public:
     void step(const message& m);
 
     proposal propose(std::string data);
+    // Adds a voter, or promotes a learner, through one single-server change.
     proposal propose_add(node_id id);
+    proposal propose_add_learner(node_id id);
+    // Removes a voter or a learner.
     proposal propose_remove(node_id id);
+
+    // The leader stops taking proposals, brings `to` up to date and tells it to campaign at once; false when it cannot start.
+    bool transfer_leadership(node_id to);
+    node_id transferee() const { return m_transferee; }
+
+    // The leader's view of how far a member's log matches its own; zero anywhere else.
+    index_t match_index(node_id id) const;
+    // Whether a quorum of voters answered this leader within the current election timeout.
+    bool quorum_active() const;
 
     // False when no leader is known; otherwise a read_state for `request` arrives in a later ready, or never.
     bool read_index(uint64_t request);
@@ -205,6 +236,10 @@ public:
     std::optional<term_t> term_at(index_t i) const;
     const entry* entry_at(index_t i) const;
     const std::vector<node_id>& voters() const { return m_voters; }
+    const std::vector<node_id>& learners() const { return m_learners; }
+    bool is_voter(node_id id) const;
+    bool is_learner(node_id id) const;
+    bool is_member(node_id id) const { return is_voter(id) || is_learner(id); }
     const snapshot& current_snapshot() const { return *m_snap; }
 
 private:
@@ -234,7 +269,6 @@ private:
     uint32_t random_below(uint32_t bound);
     message make(msg_type type, node_id to) const;
 
-    bool is_voter(node_id id) const;
     size_t quorum() const { return m_voters.size() / 2 + 1; }
     bool promotable() const { return is_voter(m_opts.id); }
     bool in_lease() const;
@@ -242,7 +276,7 @@ private:
     void reset(term_t term);
     void become_follower(term_t term, node_id leader);
     void become_leader();
-    void campaign(bool pre);
+    void campaign(bool pre, bool transfer = false);
     void tally(const message& m);
     size_t count_votes(bool granted) const;
     void tick_election();
@@ -261,6 +295,7 @@ private:
     void handle_append_resp(const message& m);
     void handle_heartbeat_resp(const message& m);
     void handle_leader_read(node_id from, uint64_t request);
+    void send_timeout_now(node_id to);
 
     void append_entry(entry e);
     void truncate_from(index_t i);
@@ -269,8 +304,9 @@ private:
     void after_commit();
     void refresh_config();
     void sync_progress();
-    std::vector<node_id> voters_at(index_t i) const;
-    proposal propose_config(std::vector<node_id> voters);
+    membership config_at(index_t i) const;
+    void install(const membership& m);
+    proposal propose_config(std::vector<node_id> voters, std::vector<node_id> learners);
     bool backlogged() const;
 
     void ack_read(node_id from, uint64_t round);
@@ -291,7 +327,8 @@ private:
     index_t m_applied = 0;
 
     std::vector<node_id> m_voters;
-    // Index of the entry that installed m_voters, or the snapshot's index.
+    std::vector<node_id> m_learners;
+    // Index of the entry that installed the membership, or the snapshot's index.
     index_t m_conf_index = 0;
 
     uint32_t m_election_elapsed   = 0;
@@ -302,6 +339,9 @@ private:
     std::map<node_id, progress> m_progress;
     // First index of the leader's own term, so "committed an entry of this term" is one comparison.
     index_t m_term_start = 0;
+
+    node_id  m_transferee = no_node;
+    uint32_t m_transfer_elapsed = 0;
 
     uint64_t m_read_round = 0;
     std::deque<pending_read> m_pending_reads;
