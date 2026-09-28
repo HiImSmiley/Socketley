@@ -248,21 +248,55 @@ every connection a runtime makes to a listener on 127.0.0.1 whoever owns it: a
 proxy with
 .B \-\-backend 127.0.0.1:8080
 in front of a local application, a client runtime or a Lua HTTP call to a local
-service. A tcp proxy in front of a local C echo backend, 3 alternating passes:
-64 B round trips 37\(en42K/s without it and 63\(en80K/s with it (44\(en55K/s
-when only the client leg was taken), 32 connections 66\(en101K/s and
-120\(en176K/s; 16 KB 28\(en30K/s and 34\(en39K/s.
+service.
 .B own
 takes only pairs whose both ends are this daemon's runtimes, such as a client
-runtime connected to a server runtime; a proxy already reaches a local runtime's
-published nodes over unix sockets, so
-.B own
-reaches less than it sounds.
+runtime connected to a server runtime.
 .IP
-Measured on one laptop with redis\-benchmark (50 connections, 4 threads) against
-a cache: GET 210\(en285K requests/s without it and 592\(en695K with it, SET
-267\(en276K and 500\(en667K, GET pipelined 16 deep 3.4\(en3.6M and 6.4\(en7.1M,
-with 45% less system CPU per request unpipelined.
+A send is redirected only when the socket that will
+.I receive
+it is one of this daemon's workers' \(em a runtime that connects (its socket is
+marked when it does) or one that accepts on a runtime's listener. A send whose
+receiver is a foreign socket goes by ordinary TCP, and each direction of a pair
+is decided by its own receiver. This is because a socket that receives through
+the kernel's ingress queue can only be read with
+.BR recvmsg :
+a foreign reader using
+.BR splice (2),
+.BR sendfile (2),
+Go's
+.B io.Copy
+between two TCP connections, or HAProxy's splicing would lose the redirected
+bytes, and those readers cannot be told apart from the outside. This bounds the
+shortcut to what it can accelerate safely: into a runtime always, out to a
+foreign peer never.
+.IP
+What that means for the common shapes, measured on one box with 3 alternating
+passes:
+.RS
+.IP \(bu 2
+Runtime to runtime (a client runtime to a server runtime, both ends this
+daemon's) is accelerated in both directions: 64 B round trips 1.3\(en1.4x
+one connection and eight, 16 KB about 1.2\(en1.5x. This is where the shortcut
+earns most.
+.IP \(bu 2
+A foreign client of a cache is accelerated only on the request it sends in;
+the reply comes back by TCP. So a small request/large reply workload gains
+little \(em
+.B redis\-benchmark
+GET is within noise of no shortcut (245\(en272K against 235\(en266K
+requests/s), and a bulk reader is a touch slower for the split path (bulk 64
+KiB GET 1490 MB/s against 1350). A request that carries the payload does gain:
+64 KiB
+.B SET
+pipelined 8 deep, 49.9K against 59.1K, 1.18x.
+.IP \(bu 2
+A proxy in front of a foreign local backend accelerates the two legs that end
+in the proxy and leaves the two that end in a foreign socket on TCP, so a
+foreign backend that reads with
+.B splice
+keeps every byte.
+.RE
 .IP
 Needs
 .B CAP_BPF
@@ -277,7 +311,14 @@ with the reason, and serves on the ordinary path.
 attaches to the daemon's cgroup and
 .B all
 to the root cgroup; the daemon's own processes are the workers its supervisor
-forked, whose pids it keeps in a map. The programs and maps are anonymous and detached
+forked, whose pids it keeps in a map. Under
+.B all
+the program fires for every process on the host, so it takes only sockets in
+the daemon's own network namespace \(em its netns cookie is baked in at load,
+and a container's identical 127.0.0.1 tuple is left alone. This needs
+.B SO_NETNS_COOKIE
+in the kernel; without it the shortcut refuses to attach rather than serve
+across namespaces. The programs and maps are anonymous and detached
 when the daemon exits.
 .IP
 What it costs:
@@ -345,18 +386,15 @@ The proxy's
 path reads a queue a socket on the shortcut does not fill, so a proxied pair
 with a 127.0.0.1 leg stays on the copy path while it is on.
 .IP \(bu 2
-The same holds for any other process: one that reads a socket on the shortcut
-with
-.BR splice (2)
-waits for bytes that never reach the queue splice reads. That is a relay copying
-between two TCP connections with Go's
-.BR io.Copy ,
-or HAProxy with splicing on. Under
-.B all
-such a process is reached as a client of a runtime's port and as a local
-backend a runtime connects to; use
+A process that is not this daemon's is never redirected into \(em only its
+sends into one of our workers are, and our workers read with
+.BR recvmsg .
+So a foreign relay copying between two TCP connections with Go's
+.B io.Copy
+or HAProxy with splicing on keeps every byte on the leg it receives, and needs
+no
 .B own
-where one sits on either end.
+to be safe. This is the receiver rule above.
 .RE
 .RS
 .PP

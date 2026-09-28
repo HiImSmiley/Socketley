@@ -3,39 +3,43 @@
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
 #
-# A redirected send lands straight in the peer's ingress queue and never waits
-# for the reader, so without a bound one stalled reader can hold hundreds of
-# MiB of the host's TCP memory (measured: 731 MiB before the kernel's tcp_mem
-# ran out).  The limiter counts each pair's sends in a BPF map; past a mark it
-# asks a reconciler thread, through a ring buffer, for the peer's true queue,
-# and the answer snaps the count back.  A pair whose peer really holds the
-# per-pair bound, or whose count reaches twice it unanswered, is tainted to TCP
-# -- which then gives real backpressure -- and the sum across pairs is capped at
-# the global budget.  The taint is permanent for the pair, which is what keeps
-# bytes in order: tcp_bpf_recvmsg drains the redirect queue before the TCP
-# receive queue.
+# A redirected send lands straight in the receiver's ingress queue and never
+# waits for the reader, so without a bound a receiver that stops reading can
+# hold hundreds of MiB of the host's TCP memory (measured: 731 MiB before the
+# kernel's tcp_mem ran out).  The limiter counts each pair's sends in a BPF
+# map; past a mark it asks a reconciler thread, through a ring buffer, for the
+# receiver's true queue, and the answer snaps the count back.  A pair whose
+# receiver really holds the per-pair bound, or whose count reaches twice it
+# unanswered, is tainted to TCP -- which then gives real backpressure -- and
+# the sum across pairs is capped at the global budget.  The taint is permanent
+# for the pair, which is what keeps bytes in order: tcp_bpf_recvmsg drains the
+# redirect queue before the TCP receive queue.
+#
+# Since the receiver rule (redirect only into a socket we own), the receiver
+# whose backlog can grow is always one of our workers.  The controllable case
+# is a proxy (ours) flooded by a client while its foreign backend pauses: the
+# client -> proxy direction is on the shortcut (into the proxy, which we own),
+# and while the proxy cannot drain to the paused backend the client's
+# redirected bytes pile in the proxy's client-facing ingress queue.  That is
+# the ours-receiver stall the limiter is for.
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
 #   * a --fast-lo-limit value that is not two positive MiB integers accepted
-#   * a stalled reader holding far more than the per-pair ceiling (the bound
-#     not enforced) -- shown red by raising the ceiling to 512 MiB
-#   * a byte delivered out of order once the reader resumes
+#   * a proxy's client-facing socket holding far more than the per-pair ceiling
+#     (the bound not enforced) -- shown red by raising the ceiling to 512 MiB
+#   * a byte delivered out of order once the backend resumes and the proxy
+#     drains
 #   * the sum across many stalled pairs exceeding the global budget -- shown red
 #     by raising the budget
-#   * a fast pair whose reader keeps up tainted anyway, because its count was
+#   * a fast pair whose backend keeps up tainted anyway, because its count was
 #     corrected too late or not at all -- red on a limiter that corrects on a
 #     timer (f6b10a60 sent 3.7 of its 4.3 GB by TCP)
-#   * a proxy's pair to a stalled local backend of another process -- which is
-#     on the shortcut because the proxy's connect is this daemon's -- left
-#     unbounded; its red is the same backend under a 64 MiB bound holding more
-#     than TCP gives a reader that never read (tcp_rmem default), which shows the
-#     pair was on the shortcut at all
 #   * `daemon stats` and the metrics endpoint not showing what the shortcut
-#     did: a stalled reader's pair tainted for its bound, held and counted as
-#     on TCP while it lasts; a pair tainted by the global budget; a fast pair
-#     entered and never tainted -- red with the sk_msg program's taint count
-#     removed, and with the sockops program's entry count removed
+#     did: a stalled pair tainted for its bound, held and counted as on TCP
+#     while it lasts; a pair tainted by the global budget; a fast pair entered
+#     and never tainted -- red with the sk_msg program's taint count removed,
+#     and with the sockops program's entry count removed
 #
 # The bound cases need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
 # with `sudo -n setcap`; without sudo they are skipped.
@@ -62,13 +66,12 @@ fail(){ TOTAL=$((TOTAL+1)); FAIL=$((FAIL+1)); echo "  FAIL [$1]: $2"; for l in "
 daemon_isolate fastlolim
 WORK=$(mktemp -d /tmp/socketley-fastlolim-work-XXXXXX)
 daemon_watch "$WORK"
-SINKPID=""
-cleanup(){ [ -n "$SINKPID" ] && { kill -9 "$SINKPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; }
+BEPID=""
+cleanup(){ [ -n "$BEPID" ] && { kill -9 "$BEPID" 2>/dev/null || true; }; daemon_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-CPORT=$((SL_PORT_BASE + 1831))
 PXPORT=$((SL_PORT_BASE + 1836))
-SINKPORT=$((SL_PORT_BASE + 1837))
+BEPORT=$((SL_PORT_BASE + 1837))
 MPORT=$((SL_PORT_BASE + 1838))
 cat >"$WORK/metrics.lua" <<LUA
 daemon = { metrics_port = $MPORT }
@@ -77,126 +80,148 @@ LUA
 # One figure out of `daemon stats`.
 figure(){ { grep -oE "^$1:[0-9]+" <<<"$2" || echo "$1:-1"; } | head -1 | cut -d: -f2; }
 
-# A local backend of another process that accepts and never reads.
+# A foreign backend that accepts and never reads: the proxy can never drain to
+# it, so a client's redirected bytes pile in the proxy's ingress queue.
 cat >"$WORK/sink.py" <<'PY'
 import socket, sys
 l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(8)
+l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(16)
 held = []
 while True:
     c, _ = l.accept(); held.append(c)
 PY
 
-# Pushes through a proxy for 2 s and samples the backend's rmem (its accepted
-# socket, source port SINKPORT), which includes the psock backlog.
-cat >"$WORK/push.py" <<'PY'
-import socket, subprocess, sys, time
-pp, ep = int(sys.argv[1]), int(sys.argv[2])
-s = socket.create_connection(("127.0.0.1", pp), timeout=10); s.setblocking(False)
-buf = b"y" * 65536; peak = 0; t0 = time.time(); last = 0
-def rmem():
-    out = subprocess.run(["ss", "-tmnH", "( sport = :%d )" % ep], capture_output=True, text=True).stdout
-    return max([int(x.split("skmem:(r", 1)[1].split(",", 1)[0]) for x in out.splitlines() if "skmem:(r" in x] or [0])
-while time.time() - t0 < 2:
-    try: s.send(buf)
-    except BlockingIOError: time.sleep(0.001)
-    if time.time() - last > 0.05: peak = max(peak, rmem()); last = time.time()
-print("peak_mib=%.2f" % (peak / 1048576.0))
+# A foreign backend that pauses `hold` seconds without reading, then echoes:
+# the pause builds the backlog, the echo lets the client check order on resume.
+cat >"$WORK/pecho.py" <<'PY'
+import socket, sys, threading, time
+port, hold = int(sys.argv[1]), float(sys.argv[2])
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("127.0.0.1", port)); l.listen(16)
+def serve(c):
+    if hold > 0: time.sleep(hold)
+    while True:
+        d = c.recv(1 << 16)
+        if not d: break
+        c.sendall(d)
+    c.close()
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 PY
 
-# A stalled reader: pipeline GETs of a big value and never read the replies;
-# sample our own socket's rmem (which includes the psock backlog on this
-# kernel); then read everything and check it arrived, in order.
-cat >"$WORK/stall.py" <<'PY'
-import socket, sys, time, subprocess, os
-port, val_kib, ngets, hold = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
-s = socket.create_connection(("127.0.0.1", port), timeout=10)
-v = os.urandom(val_kib << 10)
-s.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n%s\r\n" % (len(v), v))
-assert s.recv(100).startswith(b"+OK"), "SET failed"
-s.setblocking(False)
-sent = 0
-for _ in range(ngets):
-    try: s.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"); sent += 1
-    except BlockingIOError: break
+# Floods a proxy for `hold` s, sampling the proxy's client-facing socket rmem
+# (its accepted socket, source port PXPORT, which includes the psock backlog).
+# Then, if the backend echoes, drains and checks the stream came back in order
+# and whole.  Prints the client's tcpi_bytes_acked too: 1 while its sends are
+# redirected (client -> proxy on the shortcut), large once the pair is tainted.
+cat >"$WORK/flood.py" <<'PY'
+import socket, struct, subprocess, sys, time
+pp, hold, maxmib, sport = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+blk = bytes(((i * 131 + 7) & 0xff) for i in range(65536)); blk2 = blk + blk
+maxb = maxmib << 20
+s = socket.create_connection(("127.0.0.1", pp), timeout=10); s.setblocking(False)
 def rmem():
-    lp = s.getsockname()[1]
-    out = subprocess.run(["ss","-tmn","( sport = :%d or dport = :%d )" % (lp, lp)],
-                         capture_output=True, text=True).stdout
-    return max([int(x.split("skmem:(r",1)[1].split(",",1)[0]) for x in out.splitlines() if "skmem:(r" in x] or [0])
-peak = 0; t0 = time.time()
+    out = subprocess.run(["ss", "-tmnH", "( sport = :%d )" % sport], capture_output=True, text=True).stdout
+    return max([int(x.split("skmem:(r", 1)[1].split(",", 1)[0]) for x in out.splitlines() if "skmem:(r" in x] or [0])
+sent = 0; soff = 0; got = bytearray(); peak = 0; t0 = time.time(); last = 0.0
 while time.time() - t0 < hold:
-    peak = max(peak, rmem()); time.sleep(0.05)
+    if sent < maxb:
+        try:
+            n = s.send(blk2[soff:soff + 65536]); sent += n; soff = (soff + n) % 65536
+        except BlockingIOError:
+            time.sleep(0.001)
+    else:
+        time.sleep(0.005)
+    try:
+        while True:
+            d = s.recv(1 << 20)
+            if not d: break
+            got += d
+    except BlockingIOError:
+        pass
+    if time.time() - last > 0.05:
+        peak = max(peak, rmem()); last = time.time()
 s.setblocking(True); s.settimeout(30)
-want = (b"$%d\r\n%s\r\n" % (len(v), v)) * sent
-got = bytearray()
 try:
-    while len(got) < len(want):
+    while len(got) < sent:
         d = s.recv(1 << 20)
         if not d: break
         got += d
-except socket.timeout: pass
-print("peak_mib=%.2f in_order=%d complete=%d" %
-      (peak/1048576.0, int(bytes(got) == want[:len(got)]), int(len(got) == len(want))))
+except socket.timeout:
+    pass
+exp = (blk2 * ((len(got) // 65536) + 2))[:len(got)]
+acked = struct.unpack_from("Q", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256), 120)[0]
+print("peak_mib=%.2f in_order=%d complete=%d sent_mib=%.1f acked=%d" %
+      (peak / 1048576.0, int(bytes(got) == exp), int(len(got) == sent), sent / 1048576.0, acked))
 PY
 
-# Many stalled readers at once; report the summed rmem across them all.
-cat >"$WORK/stall_many.py" <<'PY'
-import socket, sys, time, subprocess, os
-port, k, val_kib, ngets, hold = (int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]),
-                                 int(sys.argv[4]), float(sys.argv[5]))
-v = os.urandom(val_kib << 10)
+# A client that keeps a bounded window of bytes in flight through the proxy for
+# `dur` seconds, draining the echo as it goes, so the backlog never nears the
+# bound: the pair should stay on the shortcut and never be tainted.  Prints
+# what it moved, whether the echo came back in order, and its bytes_acked.
+cat >"$WORK/windowed.py" <<'PY'
+import socket, struct, sys, time
+pp, dur, win_mib = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+blk = bytes(((i * 131 + 7) & 0xff) for i in range(65536)); blk2 = blk + blk
+win = win_mib << 20
+s = socket.create_connection(("127.0.0.1", pp), timeout=10); s.setblocking(False)
+sent = 0; soff = 0; recvd = 0; ok = True; roff = 0; t0 = time.time()
+while time.time() - t0 < dur:
+    while sent - recvd < win:
+        try:
+            n = s.send(blk2[soff:soff + 65536]); sent += n; soff = (soff + n) % 65536
+        except BlockingIOError:
+            break
+    try:
+        d = s.recv(1 << 20)
+        if d:
+            need = roff + len(d)
+            exp = (blk * ((need // 65536) + 2))[roff:need]
+            if d != exp: ok = False
+            recvd += len(d); roff = need % 65536
+    except BlockingIOError:
+        time.sleep(0.001)
+acked = struct.unpack_from("Q", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256), 120)[0]
+print("moved_mib=%d in_order=%d acked=%d" % (recvd >> 20, int(ok), acked))
+PY
+
+# Many clients flooding one proxy into a paused backend; the summed rmem across
+# the proxy's client-facing sockets, which the global budget caps.
+cat >"$WORK/flood_many.py" <<'PY'
+import socket, subprocess, sys, time
+pp, k, hold, maxmib, sport = (int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]),
+                              int(sys.argv[4]), int(sys.argv[5]))
+blk = bytes(((i * 131 + 7) & 0xff) for i in range(65536)); blk2 = blk + blk
+maxb = maxmib << 20
 conns = []
-# Stagger the stalls across reconcile ticks: the global budget cannot reclaim a
-# backlog already frozen, only stop new ones once the reconciler has seen the
-# sum cross the budget, so a synchronized burst would all commit before it acts.
+# Stagger the stalls across reconcile ticks: the global budget stops new sends
+# once the reconciler has seen the sum cross it, so a synchronized burst all
+# commits before it acts.
 for _ in range(k):
-    s = socket.create_connection(("127.0.0.1", port), timeout=10)
-    s.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n%s\r\n" % (len(v), v)); s.recv(100)
-    s.setblocking(False)
-    for _ in range(ngets):
-        try: s.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
-        except BlockingIOError: break
-    conns.append(s)
+    s = socket.create_connection(("127.0.0.1", pp), timeout=10); s.setblocking(False)
+    conns.append([s, 0, 0])
     time.sleep(0.25)
 def sum_rmem():
-    out = subprocess.run(["ss","-tmn","dst 127.0.0.1"], capture_output=True, text=True).stdout
-    tot, ports = 0, {c.getsockname()[1] for c in conns}
-    lines = out.splitlines()
-    for i, ln in enumerate(lines):
-        if ":" in ln and "skmem" not in ln:
-            try: lp = int(ln.split()[3].rsplit(":",1)[1])
-            except Exception: continue
-            if lp in ports and i+1 < len(lines) and "skmem:(r" in lines[i+1]:
-                tot += int(lines[i+1].split("skmem:(r",1)[1].split(",",1)[0])
-    return tot
-peak = 0; t0 = time.time()
+    out = subprocess.run(["ss", "-tmnH", "( sport = :%d )" % sport], capture_output=True, text=True).stdout
+    return sum(int(x.split("skmem:(r", 1)[1].split(",", 1)[0]) for x in out.splitlines() if "skmem:(r" in x)
+peak = 0; t0 = time.time(); last = 0.0
 while time.time() - t0 < hold:
-    peak = max(peak, sum_rmem()); time.sleep(0.05)
-print("sum_mib=%.2f" % (peak/1048576.0))
-PY
-
-# A fast pair whose reader keeps up: pipelined GETs of a 64 KiB value, 32 in
-# flight (about 2 MiB unread at most), for 2 s; then the client's own TCP
-# counters -- received bytes are what the cache sent by TCP, 0 on the shortcut.
-cat >"$WORK/fast.py" <<'PY'
-import socket, struct, sys, time
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
-v = b"z" * 65536
-s.sendall(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$65536\r\n" + v + b"\r\n"); s.recv(100)
-req = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n" * 32
-want = 32 * (len(b"$65536\r\n") + 65536 + 2)
-t0 = time.time(); n = 0
-while time.time() - t0 < 2:
-    s.sendall(req); got = 0
-    while got < want: got += len(s.recv(1 << 22))
-    n += want
-acked, rcvd = struct.unpack_from("QQ", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256), 120)
-print("moved_mib=%d acked=%d rcvd=%d" % (n >> 20, acked, rcvd))
+    for st in conns:
+        s, sent, soff = st
+        if sent < maxb:
+            try:
+                n = s.send(blk2[soff:soff + 65536]); st[1] = sent + n; st[2] = (soff + n) % 65536
+            except BlockingIOError:
+                pass
+    if time.time() - last > 0.05:
+        peak = max(peak, sum_rmem()); last = time.time()
+    time.sleep(0.001)
+print("sum_mib=%.2f" % (peak / 1048576.0))
 PY
 
 wait_port(){ local i; for i in $(seq 1 50); do python3 -c "import socket,sys;socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=1)" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 restart(){ daemon_stop; daemon_isolate fastlolim; daemon_watch "$WORK"; daemon_start "$@"; }
+backend(){ [ -n "$BEPID" ] && { kill -9 "$BEPID" 2>/dev/null || true; }; python3 "$1" "${@:2}" >/dev/null 2>&1 & BEPID=$!; disown; wait_port "$BEPORT" || true; }
 
 # ─── (a) the flag's value ───────────────────────────────────────────────────
 for bad in "" "4" "4,0" "0,64" "4," "x,y" "4,2"; do
@@ -218,25 +243,26 @@ attached(){ if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
     echo "  SKIP: the shortcut did not attach: $(grep fast-lo "$SOCKETLEY_DLOG")"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; [ "$FAIL" = 0 ] && exit 0 || exit 1; fi; }
 
-# ─── (b) per-pair bound holds a stalled reader, and order survives resume ────
+# ─── (b) per-pair bound holds the proxy's backlog, order survives resume ─────
 SOCKETLEY_CONFIG="$WORK/metrics.lua" restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,256
 attached
-"$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-python3 "$WORK/stall.py" "$CPORT" 256 24 3 >"$WORK/stall.out" 2>&1 & STALLPID=$!
+backend "$WORK/pecho.py" "$BEPORT" 3
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+python3 "$WORK/flood.py" "$PXPORT" 3 64 "$PXPORT" >"$WORK/flood.out" 2>&1 & FLPID=$!
 # Mid-stall, after at least one sweep: the figures an operator would read.
 sleep 2
 MID=$("$BIN" daemon stats 2>&1 || true)
 SCRAPE=$(python3 -c "import sys,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:%s/metrics' % sys.argv[1], timeout=5).read().decode())" "$MPORT" 2>&1 || true)
-wait "$STALLPID" || true
-R=$(cat "$WORK/stall.out")
-read -r PK IO CO <<<"$R"; PKV=${PK#peak_mib=}
-if awk "BEGIN{exit !($PKV <= 6)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
-else fail "per-pair bound" "a stalled reader stays near the 4 MiB ceiling and resumes in order" "probe: $R (peak<=6, in_order, complete)"; fi
+wait "$FLPID" || true
+R=$(cat "$WORK/flood.out")
+read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
+if awk "BEGIN{exit !($PKV <= 8)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
+else fail "per-pair bound" "the proxy's backlog stays near the 4 MiB ceiling and drains in order" "probe: $R (peak<=8, in_order, complete)"; fi
 
 if grep -q '^fast_lo:all$' <<<"$MID" && [ "$(figure fast_lo_entered "$MID")" -ge 2 ] &&
    [ "$(figure fast_lo_tainted_bound "$MID")" -ge 1 ] && [ "$(figure fast_lo_sockets_tcp "$MID")" -ge 1 ] &&
    [ "$(figure fast_lo_held_bytes "$MID")" -ge 3145728 ]; then pass
-else fail "stats: stalled" "daemon stats shows the stalled pair entered, tainted for its bound, on TCP, and ~4 MiB held" \
+else fail "stats: stalled" "daemon stats shows the pair entered, tainted for its bound, on TCP, and ~4 MiB held" \
     "$(tr '\n' ' ' <<<"$MID")"; fi
 if grep -q 'socketley_fast_lo_info{mode="all"} 1' <<<"$SCRAPE" &&
    grep -qE 'socketley_fast_lo_tainted_total\{reason="bound"\} [1-9]' <<<"$SCRAPE" &&
@@ -244,66 +270,52 @@ if grep -q 'socketley_fast_lo_info{mode="all"} 1' <<<"$SCRAPE" &&
 else fail "metrics: stalled" "the metrics endpoint carries the mode, the bound taint and the socket on TCP" \
     "$(grep fast_lo <<<"$SCRAPE" | grep -v '^#' | tr '\n' ' ')"; fi
 
-# ─── (c) red: with the ceiling raised the same reader holds far more ─────────
+# ─── (c) red: with the ceiling raised the same flood holds far more ──────────
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 512,1024
 attached
-"$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-R=$(python3 "$WORK/stall.py" "$CPORT" 256 60 3)
-read -r PK IO CO <<<"$R"; PKV=${PK#peak_mib=}
-if awk "BEGIN{exit !($PKV > 6)}"; then pass
-else fail "per-pair red" "a 512 MiB ceiling must let the backlog exceed 6 MiB (else the bound is untested)" "probe: $R"; fi
+backend "$WORK/sink.py" "$BEPORT"
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+R=$(python3 "$WORK/flood.py" "$PXPORT" 4 256 "$PXPORT")
+read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
+if awk "BEGIN{exit !($PKV > 8)}"; then pass
+else fail "per-pair red" "a 512 MiB ceiling must let the backlog exceed 8 MiB (else the bound is untested)" "probe: $R"; fi
 
 # ─── (d) global budget caps the sum across many stalled pairs ───────────────
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,12
 attached
-"$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-BOUNDED=$(python3 "$WORK/stall_many.py" "$CPORT" 8 256 60 3); BV=${BOUNDED#sum_mib=}
+backend "$WORK/sink.py" "$BEPORT"
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+BOUNDED=$(python3 "$WORK/flood_many.py" "$PXPORT" 8 6 16 "$PXPORT"); BV=${BOUNDED#sum_mib=}
 AFTER=$("$BIN" daemon stats 2>&1 || true)
 if [ "$(figure fast_lo_tainted_budget "$AFTER")" -ge 1 ]; then pass
 else fail "stats: budget" "daemon stats counts the pairs the global budget tainted" "$(tr '\n' ' ' <<<"$AFTER")"; fi
 
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,4096
 attached
-"$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-OPEN=$(python3 "$WORK/stall_many.py" "$CPORT" 8 256 60 3); OV=${OPEN#sum_mib=}
+backend "$WORK/sink.py" "$BEPORT"
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+OPEN=$(python3 "$WORK/flood_many.py" "$PXPORT" 8 6 16 "$PXPORT"); OV=${OPEN#sum_mib=}
 
 if awk "BEGIN{exit !($BV <= 20 && $OV > $BV + 4)}"; then pass
 else fail "global budget" "the summed backlog stays near the 12 MiB budget and grows without it" "bounded=$BV MiB open=$OV MiB (bounded<=20 and open>bounded+4)"; fi
 
-# ─── (e) a fast pair whose reader keeps up is never tainted ─────────────────
-# It moves far more than the per-pair bound in total while its unread backlog
-# stays near 2 MiB, so a counter that is not corrected in time taints it.
+# ─── (e) a fast pair whose backend keeps up is never tainted ────────────────
+# The backend echoes at once, so the proxy drains and the backlog stays small
+# while the client streams megabytes; a counter corrected too late would taint
+# it, and its client -> proxy sends must stay redirected (acked ~ 1).
 restart "$CAPBIN" --fast-lo all
 attached
-"$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-R=$(python3 "$WORK/fast.py" "$CPORT")
-read -r MV AK RC <<<"$R"
-if [ "${MV#moved_mib=}" -gt 256 ] && [ "${AK#acked=}" -le 1 ] && [ "${RC#rcvd=}" = 0 ]; then pass
-else fail "fast pair" "a reader that keeps up keeps its pair on the shortcut (nothing received by TCP)" "probe: $R (moved>256 MiB, acked<=1, rcvd=0)"; fi
+backend "$WORK/pecho.py" "$BEPORT" 0
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+R=$(python3 "$WORK/windowed.py" "$PXPORT" 3 1)
+read -r MV IO AK <<<"$R"
+if [ "${MV#moved_mib=}" -gt 64 ] && [ "$IO" = in_order=1 ] && [ "${AK#acked=}" -le 1 ]; then pass
+else fail "fast pair" "a backend that keeps up keeps the pair on the shortcut (client sends redirected, in order)" "probe: $R (moved>64 MiB, in_order, acked<=1)"; fi
 AFTER=$("$BIN" daemon stats 2>&1 || true)
 TAINTS=$(( $(figure fast_lo_tainted_bound "$AFTER") + $(figure fast_lo_tainted_unanswered "$AFTER") +
            $(figure fast_lo_tainted_budget "$AFTER") + $(figure fast_lo_tainted_peer_off "$AFTER") ))
 if [ "$(figure fast_lo_entered "$AFTER")" -ge 2 ] && [ "$TAINTS" = 0 ]; then pass
 else fail "stats: fast pair" "daemon stats shows the fast pair entered and no taint of any kind" "$(tr '\n' ' ' <<<"$AFTER")"; fi
-
-# ─── (f) a proxy's pair to a stalled local backend of another process ───────
-python3 "$WORK/sink.py" "$SINKPORT" >/dev/null 2>&1 & SINKPID=$!; disown
-wait_port "$SINKPORT" || true
-restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,64
-attached
-"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$SINKPORT" --protocol tcp -s >/dev/null
-wait_port "$PXPORT" || true
-BOUNDED=$(python3 "$WORK/push.py" "$PXPORT" "$SINKPORT"); BV=${BOUNDED#peak_mib=}
-
-restart "$CAPBIN" --fast-lo all --fast-lo-limit 64,256
-attached
-"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$SINKPORT" --protocol tcp -s >/dev/null
-wait_port "$PXPORT" || true
-OPEN=$(python3 "$WORK/push.py" "$PXPORT" "$SINKPORT"); OV=${OPEN#peak_mib=}
-
-if awk "BEGIN{exit !($BV <= 6 && $OV > 12)}"; then pass
-else fail "foreign backend bound" "a stalled backend of another process stays near the 4 MiB bound, and holds past TCP's buffer under 64" \
-    "bounded=$BV MiB open=$OV MiB (bounded<=6 and open>12)"; fi
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ]

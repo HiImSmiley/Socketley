@@ -21,9 +21,11 @@
 #     counts the whole exchange), or its pipelined replies out of order
 #   * all: a runtime of another daemon -- same binary, same cgroup, no
 #     --fast-lo -- taken for one of this daemon's
-#   * all: a proxy's pair to a local backend of another process (the sidecar
-#     case) left on TCP -- the backend's own socket acks the echo -- or the
-#     echo corrupted on the way
+#   * all: the two directions of a proxy's pair to a local backend of another
+#     process decided by different receivers -- backend->proxy on the shortcut
+#     (into our socket), proxy->backend on TCP (into a foreign one)
+#   * all: a foreign backend that reads with splice(2) behind a proxy losing
+#     bytes, because a redirect into it lands in a queue splice never reads
 #   * own: that backend pair put on the shortcut
 #   * all: a pair in another netns with our tuple entering (a container's
 #     127.0.0.1 pair overwriting our socket's entry) -- red without the guard
@@ -72,6 +74,8 @@ PXSPLICE=$((SL_PORT_BASE + 1812))
 EPORT=$((SL_PORT_BASE + 1814))
 SPORT=$((SL_PORT_BASE + 1815))
 PXFOREIGN=$((SL_PORT_BASE + 1817))
+PXSPLREAD=$((SL_PORT_BASE + 1820))
+SPLPORT=$((SL_PORT_BASE + 1821))
 ORIGIN6=$((SL_PORT_BASE + 1818))
 CALLER6=$((SL_PORT_BASE + 1819))
 NSA=$((SL_PORT_BASE + 1822))
@@ -186,6 +190,42 @@ while True:
     c.close()
 PY
 
+# A foreign backend that reads its socket with splice(2) into a pipe and
+# echoes what it read.  A redirect into it would land in the psock ingress
+# queue, which splice never reads, so a redirected byte is lost to it -- which
+# is why our proxy -> foreign backend must stay on TCP.
+cat >"$WORK/splice_backend.py" <<'PY'
+import os, socket, sys, threading
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(8)
+open(sys.argv[2], "a").close()
+def serve(c):
+    r, w = os.pipe()
+    while True:
+        n = os.splice(c.fileno(), w, 65536)
+        if n == 0: break
+        off = 0
+        while off < n: off += os.write(c.fileno(), os.read(r, n - off))
+    c.close()
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+
+cat >"$WORK/splice_client.py" <<'PY'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10); s.settimeout(5)
+want = (b"abcdefghij" * 100) * 20   # 20 KiB, several splice reads
+s.sendall(want); got = b""
+try:
+    while len(got) < len(want):
+        d = s.recv(65536)
+        if not d: break
+        got += d
+except socket.timeout:
+    pass
+print("ok" if got == want else "lost got=%d of %d" % (len(got), len(want)))
+PY
+
 wait_port(){ local i; for i in $(seq 1 50); do python3 -c "import socket,sys;socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=1)" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 restart(){ daemon_stop; daemon_isolate fastlo; daemon_start "$@"; }
@@ -273,8 +313,11 @@ if [ "$R" = ok ]; then pass
 else fail "splice" "a proxied pair with a leg on the shortcut stays on the copy path" "probe: $R"; fi
 
 # ─── (e) all: a proxy's pair to a local backend of another process ──────────
-# The backend is the python echo server, not a runtime, so its port is in no
-# map: the pair enters because the proxy's connect is this daemon's.
+# Each direction is decided by its own receiver.  Backend -> proxy (into our
+# socket, which reads with recvmsg) is on the shortcut, so the backend's
+# tcpi_bytes_acked stays at its SYN's 1.  Proxy -> backend (into a foreign
+# socket, which might read with splice) stays on TCP, so the proxy's acked
+# grows: this is the receiver rule, not a pair off the shortcut.
 if command -v ss >/dev/null 2>&1; then
     restart "$CAPBIN" --fast-lo
     attached
@@ -283,12 +326,27 @@ if command -v ss >/dev/null 2>&1; then
     R=$(timeout 20 python3 "$WORK/backend_probe.py" "$PXFOREIGN" "$EPORT" 2>&1 || echo "hung")
     read -r VERDICT BACKEND PROXY <<<"$R"
     if [ "$VERDICT" = ok ] && [ "${BACKEND:--1}" -ge 0 ] && [ "${BACKEND:--1}" -le 1 ] &&
-       [ "${PROXY:--1}" -ge 0 ] && [ "${PROXY:--1}" -le 1 ]; then pass
-    else fail "all: foreign backend" "a proxy's pair to a local backend of another process is on the shortcut, echo intact" \
-        "probe: $R (verdict, backend acked, proxy acked; 0..1 is the shortcut, -1 no connection)"; fi
+       [ "${PROXY:--1}" -gt 1000 ]; then pass
+    else fail "all: foreign backend" "backend->proxy on the shortcut (into our socket), proxy->backend on TCP (into a foreign one), echo intact" \
+        "probe: $R (verdict, backend acked <=1, proxy acked >1000)"; fi
 else
     not_asserted "all: foreign backend" "ss not available"
 fi
+
+# ─── (e2) all: a foreign backend that reads with splice keeps every byte ─────
+# The receiver rule keeps proxy -> foreign backend on TCP; without it the
+# redirect lands in the ingress queue splice never reads and the echo is lost.
+restart "$CAPBIN" --fast-lo
+attached
+SPLREADY="$WORK/splice_ready"
+python3 "$WORK/splice_backend.py" "$SPLPORT" "$SPLREADY" >/dev/null 2>&1 & ECHOPID=$!; disown
+for _ in $(seq 1 50); do [ -f "$SPLREADY" ] && break; sleep 0.1; done
+"$BIN" create proxy psr -p "$PXSPLREAD" --backend "127.0.0.1:$SPLPORT" --protocol tcp -s >/dev/null
+wait_port "$PXSPLREAD" || true
+R=$(timeout 15 python3 "$WORK/splice_client.py" "$PXSPLREAD" 2>&1 || echo "hung")
+kill -9 "$ECHOPID" 2>/dev/null || true; ECHOPID=""
+if [ "$R" = ok ]; then pass
+else fail "all: splice backend" "a foreign backend reading with splice behind a proxy must get every byte" "probe: $R"; fi
 
 # ─── (f) all: a runtime's Lua HTTP call to a local IPv6 service ─────────────
 # The call is the runtime's connect, so its pair enters like the proxy's above;

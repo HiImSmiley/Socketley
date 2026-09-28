@@ -183,6 +183,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once-a-second sweep that already read every pair. GET -P1 against a cache,
   10M requests, 3 alternating passes: 512-635K requests/s against 588-625K
   without it, the spread two arms of the same binary show (533-635K).
+- **`--fast-lo` redirects a send only when the receiving socket is one of this
+  daemon's workers'** (a runtime that connected, or one that accepted on a
+  runtime's listener); a send whose receiver is a foreign socket goes by
+  ordinary TCP, each direction of a pair decided by its own receiver. A socket
+  that receives through the kernel's ingress queue can only be read with
+  `recvmsg`, so a foreign reader using `splice(2)`/`sendfile(2)`, Go's
+  `io.Copy` between two TCP connections, or HAProxy splicing would lose the
+  redirected bytes and cannot be told apart from outside; this keeps them
+  whole. Runtime-to-runtime pairs (both ends ours) are unchanged and
+  accelerated both ways (64 B round trips 1.3-1.4x, 16 KB 1.2-1.5x). A foreign
+  cache client is now accelerated only on the request it sends in, not on the
+  reply: `redis-benchmark` GET falls to within noise of no shortcut (245-272K
+  vs 235-266K req/s, was ~666K when both directions were redirected), a bulk
+  reader is slightly slower for the split path (64 KiB GET 1490 vs 1350 MB/s),
+  while a request that carries the payload still gains (64 KiB `SET` -P8 49.9K
+  -> 59.1K, 1.18x). Ownership is a flag stored in the state map at entry and
+  read once on the send path; enabling kTLS (`TCP_ULP tls`) on a foreign socket
+  that is in the sockhash still succeeds.
+
+### Fixed
+
+- **`--fast-lo all` is fenced to the daemon's own network namespace.** The
+  program is attached at the root cgroup, where it fires for containers too;
+  its keys carried no namespace and entries went in unconditionally, so a
+  container's `127.0.0.1:A<->127.0.0.1:B` pair on a port number a runtime
+  listens on shared the daemon's tuple space and could overwrite our socket's
+  map entries or receive a host sender's redirected bytes. The daemon now bakes
+  its netns cookie (`SO_NETNS_COOKIE`) into the program and takes only sockets
+  that match, and every map insert at entry is `BPF_NOEXIST` so a live entry is
+  never overwritten (the close callback deletes, so a reused tuple finds its
+  key free). Measured: a pair in another namespace with the same ports as a
+  host pair no longer enters (the entered counter stays at the host pair's
+  two, was four), and the host pair keeps working. Needs `SO_NETNS_COOKIE`;
+  without it the shortcut refuses to attach rather than serve unfenced. `own`
+  was never exposed to this (a foreign namespace's sockets are not in the
+  daemon's cgroup).
 
 ### Changed
 

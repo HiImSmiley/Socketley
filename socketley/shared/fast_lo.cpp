@@ -63,6 +63,7 @@ struct state_val
     uint64_t count;
     uint64_t mark;
     uint64_t ask;
+    uint64_t ours;   // 1 when this socket is one of our workers' (see load_ops)
 };
 static constexpr uint64_t SKL_TAINT = UINT64_MAX;
 static constexpr uint64_t SKL_PENDING = UINT64_MAX;
@@ -287,7 +288,8 @@ static constexpr int16_t K_SELF = -24;   // this socket's key
 static constexpr int16_t K_PEER = -40;   // the peer's key
 static constexpr int16_t K_VAL  = -44;   // u32 map value
 static constexpr int16_t K_TGID = -48;   // u32 tgid, the pids map's key
-static constexpr int16_t K_INIT = -72;   // state_val, a fresh socket's counter
+static constexpr int16_t K_OURS = -52;   // u32 ownership flag on the way to enter
+static constexpr int16_t K_INIT = -88;   // state_val (32 bytes), a fresh socket's counter
 
 // The sockops program, which sorts sockets at four moments: a listen or a
 // connect by one of this daemon's processes is remembered, an established
@@ -380,7 +382,8 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.bind(sorted);
     // Only ever a socket in the daemon's own network namespace: at the root
     // cgroup this program fires for containers too, whose 127.0.0.1 pairs share
-    // our tuple space and would otherwise overwrite our entries.
+    // our tuple space and would otherwise overwrite our entries and be
+    // redirected into.
     a.mov(BPF_REG_1, BPF_REG_6); a.call(BPF_FUNC_get_netns_cookie);
     a.ld64(BPF_REG_1, netns_cookie); a.jne(BPF_REG_0, BPF_REG_1, out);
     keys();
@@ -398,13 +401,19 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
         a.jeqi(BPF_REG_0, 0, out);
         a.lookup(mine, K_PEER); a.jeqi(BPF_REG_0, 0, out);
         a.erase(mine, K_PEER);
+        a.stwi(K_OURS, 1);   // accepted on our listener, peer our connect: ours
     }
     else
     {
-        // In all mode a foreign listener's child enters when a connect of ours made it.
-        a.jnei(BPF_REG_0, 0, enter);
+        // In all mode our listener accepting is ours; a foreign listener's
+        // child, entered because a connect of ours made it, is not.
+        const int foreign_child = a.label();
+        a.jeqi(BPF_REG_0, 0, foreign_child);
+        a.stwi(K_OURS, 1); a.jmp(enter);
+        a.bind(foreign_child);
         a.lookup(mine, K_PEER); a.jeqi(BPF_REG_0, 0, out);
         a.erase(mine, K_PEER);
+        a.stwi(K_OURS, 0);
     }
     a.jmp(enter);
 
@@ -417,6 +426,18 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     if (!all)
     {
         a.lookup(mine, K_SELF); a.jeqi(BPF_REG_0, 0, out);
+        a.stwi(K_OURS, 1);   // own mode: our connect to our listener
+    }
+    else
+    {
+        // Connecting to our listener; ours iff this socket is our own connect,
+        // else a foreign client of it.
+        a.lookup(mine, K_SELF);
+        a.stwi(K_OURS, 0);
+        const int notmine = a.label();
+        a.jeqi(BPF_REG_0, 0, notmine);
+        a.stwi(K_OURS, 1);
+        a.bind(notmine);
     }
     a.jmp(enter);
 
@@ -431,6 +452,7 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     else
     {
         a.lookup(mine, K_SELF); a.jeqi(BPF_REG_0, 0, out);
+        a.stwi(K_OURS, 1);   // our connect to a foreign listener
         a.jmp(enter);
     }
 
@@ -441,6 +463,7 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, count)), BPF_REG_1);
     a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ask)), BPF_REG_1);
     a.ld64(BPF_REG_1, pair_bytes); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, mark)), BPF_REG_1);
+    a.ldw(BPF_REG_1, BPF_REG_10, K_OURS); a.stx8(BPF_REG_10, K_INIT + static_cast<int>(offsetof(state_val, ours)), BPF_REG_1);
     // NOEXIST: a live entry with our tuple must not be overwritten -- the close
     // callback deletes, so a reused tuple finds the key free.
     a.update(state, K_SELF, K_INIT, BPF_NOEXIST); a.jnei(BPF_REG_0, 0, out);
@@ -549,6 +572,14 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, int co
     a.mov(BPF_REG_8, BPF_REG_0);
     a.lddw(BPF_REG_9, BPF_REG_8, offsetof(state_val, count));
     a.ld64(BPF_REG_2, SKL_TAINT); a.jeq(BPF_REG_9, BPF_REG_2, pass);
+
+    // Redirect only into a socket we own: a foreign receiver reached through the
+    // psock ingress queue breaks any reader that is not recvmsg (splice, Go
+    // io.Copy, HAProxy splicing), which we cannot enumerate.  The peer's own
+    // state entry says whether it is ours; a peer not on the shortcut, or not
+    // ours, keeps this direction on TCP without a taint.
+    a.lookup(state, peer); a.jeqi(BPF_REG_0, 0, pass);
+    a.lddw(BPF_REG_1, BPF_REG_0, offsetof(state_val, ours)); a.jeqi(BPF_REG_1, 0, pass);
 
     // A check in flight whose answer has arrived: the count becomes the peer's
     // true queue plus what was sent since the check was asked.
