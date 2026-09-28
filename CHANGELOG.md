@@ -170,6 +170,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   378-387K / 524-532K, 62-69K / 85-86K, 279-282K / 386-391K). A Lua call
   that opens a connection per request gains nothing (14.9K / 14.4K calls/s at
   64 B): entering and leaving the sockhash costs what the request saves.
+- **`socketley daemon stats`** prints the daemon's own figures as `key:value`
+  lines, and the metrics endpoint carries them as `socketley_fast_lo_*`:
+  whether `--fast-lo` is off, own, all or unavailable (with the reason),
+  sockets on the shortcut and pinned to TCP, sockets entered, taints by reason
+  (`bound`: the peer really held the per-pair bound; `unanswered`: no answer
+  before twice the bound; `budget`: the global budget; `peer_off`: the peer
+  was not on the shortcut), bytes held against the budget and whether it is
+  reached -- the bytes `tcpdump -i lo` and nftables never see. Events are
+  counted in a per-CPU BPF array, one atomic add per entered socket and per
+  taint and never per send; the gauges come from the reconciler's
+  once-a-second sweep that already read every pair. GET -P1 against a cache,
+  10M requests, 3 alternating passes: 512-635K requests/s against 588-625K
+  without it, the spread two arms of the same binary show (533-635K).
 
 ### Changed
 

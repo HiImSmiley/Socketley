@@ -31,6 +31,11 @@
 #     unbounded; its red is the same backend under a 64 MiB bound holding more
 #     than TCP gives a reader that never read (tcp_rmem default), which shows the
 #     pair was on the shortcut at all
+#   * `daemon stats` and the metrics endpoint not showing what the shortcut
+#     did: a stalled reader's pair tainted for its bound, held and counted as
+#     on TCP while it lasts; a pair tainted by the global budget; a fast pair
+#     entered and never tainted -- red with the sk_msg program's taint count
+#     removed, and with the sockops program's entry count removed
 #
 # The bound cases need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
 # with `sudo -n setcap`; without sudo they are skipped.
@@ -64,6 +69,13 @@ trap cleanup EXIT
 CPORT=$((SL_PORT_BASE + 1831))
 PXPORT=$((SL_PORT_BASE + 1836))
 SINKPORT=$((SL_PORT_BASE + 1837))
+MPORT=$((SL_PORT_BASE + 1838))
+cat >"$WORK/metrics.lua" <<LUA
+daemon = { metrics_port = $MPORT }
+LUA
+
+# One figure out of `daemon stats`.
+figure(){ { grep -oE "^$1:[0-9]+" <<<"$2" || echo "$1:-1"; } | head -1 | cut -d: -f2; }
 
 # A local backend of another process that accepts and never reads.
 cat >"$WORK/sink.py" <<'PY'
@@ -207,13 +219,30 @@ attached(){ if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"; [ "$FAIL" = 0 ] && exit 0 || exit 1; fi; }
 
 # ─── (b) per-pair bound holds a stalled reader, and order survives resume ────
-restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,256
+SOCKETLEY_CONFIG="$WORK/metrics.lua" restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,256
 attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
-R=$(python3 "$WORK/stall.py" "$CPORT" 256 24 3)
+python3 "$WORK/stall.py" "$CPORT" 256 24 3 >"$WORK/stall.out" 2>&1 & STALLPID=$!
+# Mid-stall, after at least one sweep: the figures an operator would read.
+sleep 2
+MID=$("$BIN" daemon stats 2>&1 || true)
+SCRAPE=$(python3 -c "import sys,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:%s/metrics' % sys.argv[1], timeout=5).read().decode())" "$MPORT" 2>&1 || true)
+wait "$STALLPID" || true
+R=$(cat "$WORK/stall.out")
 read -r PK IO CO <<<"$R"; PKV=${PK#peak_mib=}
 if awk "BEGIN{exit !($PKV <= 6)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
 else fail "per-pair bound" "a stalled reader stays near the 4 MiB ceiling and resumes in order" "probe: $R (peak<=6, in_order, complete)"; fi
+
+if grep -q '^fast_lo:all$' <<<"$MID" && [ "$(figure fast_lo_entered "$MID")" -ge 2 ] &&
+   [ "$(figure fast_lo_tainted_bound "$MID")" -ge 1 ] && [ "$(figure fast_lo_sockets_tcp "$MID")" -ge 1 ] &&
+   [ "$(figure fast_lo_held_bytes "$MID")" -ge 3145728 ]; then pass
+else fail "stats: stalled" "daemon stats shows the stalled pair entered, tainted for its bound, on TCP, and ~4 MiB held" \
+    "$(tr '\n' ' ' <<<"$MID")"; fi
+if grep -q 'socketley_fast_lo_info{mode="all"} 1' <<<"$SCRAPE" &&
+   grep -qE 'socketley_fast_lo_tainted_total\{reason="bound"\} [1-9]' <<<"$SCRAPE" &&
+   grep -qE 'socketley_fast_lo_sockets\{path="tcp"\} [1-9]' <<<"$SCRAPE"; then pass
+else fail "metrics: stalled" "the metrics endpoint carries the mode, the bound taint and the socket on TCP" \
+    "$(grep fast_lo <<<"$SCRAPE" | grep -v '^#' | tr '\n' ' ')"; fi
 
 # ─── (c) red: with the ceiling raised the same reader holds far more ─────────
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 512,1024
@@ -229,6 +258,9 @@ restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,12
 attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null; wait_port "$CPORT" || true
 BOUNDED=$(python3 "$WORK/stall_many.py" "$CPORT" 8 256 60 3); BV=${BOUNDED#sum_mib=}
+AFTER=$("$BIN" daemon stats 2>&1 || true)
+if [ "$(figure fast_lo_tainted_budget "$AFTER")" -ge 1 ]; then pass
+else fail "stats: budget" "daemon stats counts the pairs the global budget tainted" "$(tr '\n' ' ' <<<"$AFTER")"; fi
 
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,4096
 attached
@@ -248,6 +280,11 @@ R=$(python3 "$WORK/fast.py" "$CPORT")
 read -r MV AK RC <<<"$R"
 if [ "${MV#moved_mib=}" -gt 256 ] && [ "${AK#acked=}" -le 1 ] && [ "${RC#rcvd=}" = 0 ]; then pass
 else fail "fast pair" "a reader that keeps up keeps its pair on the shortcut (nothing received by TCP)" "probe: $R (moved>256 MiB, acked<=1, rcvd=0)"; fi
+AFTER=$("$BIN" daemon stats 2>&1 || true)
+TAINTS=$(( $(figure fast_lo_tainted_bound "$AFTER") + $(figure fast_lo_tainted_unanswered "$AFTER") +
+           $(figure fast_lo_tainted_budget "$AFTER") + $(figure fast_lo_tainted_peer_off "$AFTER") ))
+if [ "$(figure fast_lo_entered "$AFTER")" -ge 2 ] && [ "$TAINTS" = 0 ]; then pass
+else fail "stats: fast pair" "daemon stats shows the fast pair entered and no taint of any kind" "$(tr '\n' ' ' <<<"$AFTER")"; fi
 
 # ─── (f) a proxy's pair to a stalled local backend of another process ───────
 python3 "$WORK/sink.py" "$SINKPORT" >/dev/null 2>&1 & SINKPID=$!; disown

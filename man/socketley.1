@@ -321,7 +321,9 @@ on
 .B tcpdump \-i lo
 and the byte counters in
 .B ss
-do not see them.
+do not see them;
+.B socketley daemon stats
+and the metrics endpoint say what the shortcut is carrying.
 .IP \(bu 2
 127.0.0.1 and ::1, including 127.0.0.1 IPv4\-mapped on a dual\-stack socket;
 the rest of 127/8 stays on TCP. A runtime listens and a proxy or client runtime
@@ -638,6 +640,66 @@ the daemon's.
 Stops the daemon this invocation would talk to, over its socket rather than by
 pid, taking every runtime it supervises with it. It answers before it goes, and
 exits 2 when nothing is serving that socket.
+.TP
+.B daemon stats
+The daemon's own figures as
+.IB key : value
+lines, the shape
+.B stats
+gives a runtime. Today that is the loopback shortcut
+.RB ( "daemon \-\-fast\-lo" ),
+whose bytes
+.B tcpdump \-i lo
+and nftables never see:
+.B fast_lo
+is
+.BR off ,
+.BR own ,
+.BR all ,
+or
+.B unavailable
+with
+.B fast_lo_reason
+saying why. When attached:
+.B fast_lo_sockets_shortcut
+and
+.B fast_lo_sockets_tcp
+count the entered sockets that send by the shortcut and those pinned to TCP
+for good (as of the last once\-a\-second sweep; a pair is two sockets, and each
+direction is its sender's);
+.B fast_lo_entered
+counts sockets entered since start;
+.BR fast_lo_tainted_bound ,
+.BR _unanswered ,
+.B _budget
+and
+.B _peer_off
+count taints by reason \(em the peer really held the per\-pair bound, no answer
+came before twice the bound, the global budget was reached, the peer was not on
+the shortcut (it received by TCP before it could enter, or had closed);
+.B fast_lo_held_bytes
+is the unread redirected backlog summed across pairs, which the global budget
+.RB ( fast_lo_budget_bytes )
+is compared against, an upper bound for a pair below 64 KiB;
+.B fast_lo_over_budget
+is 1 while new sends are being tainted for it. The metrics endpoint carries the
+same as
+.BR socketley_fast_lo_info{mode} ,
+.BR socketley_fast_lo_sockets{path} ,
+.BR socketley_fast_lo_entered_total ,
+.BR socketley_fast_lo_tainted_total{reason} ,
+.BR socketley_fast_lo_held_bytes ,
+.BR socketley_fast_lo_budget_bytes ,
+.B socketley_fast_lo_pair_limit_bytes
+and
+.BR socketley_fast_lo_over_budget .
+The counting is one atomic add per entered socket and per taint, never per send.
+.RS
+.PP
+.nf
+socketley daemon stats
+.fi
+.RE
 .TP
 .B daemons
 Every daemon that has registered itself, with its pid, whether it still answers,

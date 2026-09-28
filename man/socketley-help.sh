@@ -169,7 +169,7 @@ cli_commands() {
     echo "  is tainted to TCP for real backpressure, a reader that keeps up never"
     echo "  is, and the sum across pairs is capped at the global budget; the"
     echo "  taint is permanent, which keeps bytes in order. Bypasses nftables on"
-    echo "  lo and tcpdump."
+    echo "  lo and tcpdump; socketley daemon stats shows what it carries."
     echo -e "  ${CYAN}sudo socketley daemon --fast-lo --fast-lo-limit 4,64 &${NC}"
     echo ""
     echo -e "${BOLD}daemon --raft-listen <ip:port> (--raft-init | --raft-join <ip:port>) [...]${NC}"
@@ -185,6 +185,15 @@ cli_commands() {
     echo -e "${BOLD}daemon stop${NC}"
     echo "  Stop the daemon this CLI talks to, over its socket rather than by"
     echo "  finding a pid. Every runtime it supervises goes with it."
+    echo ""
+    echo -e "${BOLD}daemon stats${NC}"
+    echo "  The daemon's own figures as key:value lines: whether --fast-lo is"
+    echo "  off, own, all or unavailable (and why), sockets on the shortcut and"
+    echo "  pinned to TCP, sockets entered, taints by reason (bound, unanswered,"
+    echo "  budget, peer_off), bytes held and the budget. tcpdump and nftables on"
+    echo "  lo never see shortcut bytes; this and socketley_fast_lo_* on the"
+    echo "  metrics endpoint do."
+    echo -e "  ${CYAN}socketley daemon stats${NC}"
     echo ""
 
     echo -e "${BOLD}daemons${NC}"
@@ -2958,6 +2967,7 @@ socketley — a daemon for long-living network runtimes (server, client, proxy, 
 USAGE
   socketley <command> [options]
   socketley daemon [--cpus <set>] [--fast-lo [own|all]] [--fast-lo-limit P,G] [--name <name>]
+  socketley daemon stop | stats
   socketley --lua <file>
 
 RUNTIMES

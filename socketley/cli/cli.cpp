@@ -375,6 +375,24 @@ int cli_dispatch(int argc, char** argv)
                 return rc;
             }
 
+            // A verb like `stop`: the daemon's own figures, which no runtime's
+            // `stats` carries.
+            if (argc > 2 && std::string_view(argv[2]) == "stats")
+            {
+                std::string data;
+                const int rc = ipc_send("daemon-stats", data);
+                if (rc == ipc_no_answer)
+                    return ipc_report_failure(rc);
+                if (rc < 0)
+                {
+                    std::cerr << "no daemon is serving "
+                              << daemon_handler::socket_path << "\n";
+                    return 2;
+                }
+                std::cout << data;
+                return rc;
+            }
+
             // Check for configuration flags (--name, --cluster)
             bool has_config = false;
             for (int i = 2; i < argc; ++i)

@@ -7,6 +7,7 @@
 #include "../shared/version.h"
 #include "../shared/runtime_definitions.h"
 #include "../shared/daemon_client.h"
+#include "../shared/fast_lo.h"
 #include "daemon_handler.h"
 
 #include <unistd.h>
@@ -501,6 +502,49 @@ std::string metrics_endpoint::build_metrics() const
            "socketley_bytes_sent_total ";
     json_append_uint(out, total_bytes_out);
     out += "\n\n";
+
+    // The loopback shortcut, whose bytes no counter on lo sees.
+    const socketley::fast_lo_figures lo = socketley::fast_lo_now();
+    out += "# HELP socketley_fast_lo_info The loopback shortcut's mode: off, own, all, or unavailable.\n"
+           "# TYPE socketley_fast_lo_info gauge\n"
+           "socketley_fast_lo_info{mode=\"";
+    label_escape_into(out, lo.mode);
+    out += "\"} 1\n\n";
+    if (lo.mode == "all" || lo.mode == "own")
+    {
+        auto series = [&out](const char* name, const char* type, const char* help,
+                             std::initializer_list<std::pair<const char*, uint64_t>> vals) {
+            out += "# HELP "; out += name; out += ' '; out += help;
+            out += "\n# TYPE "; out += name; out += ' '; out += type; out += '\n';
+            for (const auto& [labels, v] : vals)
+            {
+                out += name; out += labels; out += ' ';
+                json_append_uint(out, v);
+                out += '\n';
+            }
+            out += '\n';
+        };
+        series("socketley_fast_lo_sockets", "gauge",
+               "Sockets entered in the shortcut, by how they send now (as of the last sweep).",
+               { { "{path=\"shortcut\"}", lo.sockets_shortcut }, { "{path=\"tcp\"}", lo.sockets_tcp } });
+        series("socketley_fast_lo_entered_total", "counter", "Sockets entered in the shortcut.",
+               { { "", lo.entered } });
+        series("socketley_fast_lo_tainted_total", "counter",
+               "Sockets pinned to TCP for good, by reason.",
+               { { "{reason=\"bound\"}", lo.tainted_bound },
+                 { "{reason=\"unanswered\"}", lo.tainted_unanswered },
+                 { "{reason=\"budget\"}", lo.tainted_budget },
+                 { "{reason=\"peer_off\"}", lo.tainted_peer_off } });
+        series("socketley_fast_lo_held_bytes", "gauge",
+               "Unread bytes redirected into receivers, summed across pairs.", { { "", lo.held_bytes } });
+        series("socketley_fast_lo_budget_bytes", "gauge", "The global bound on held bytes.",
+               { { "", lo.budget_bytes } });
+        series("socketley_fast_lo_pair_limit_bytes", "gauge", "The per-pair bound on held bytes.",
+               { { "", lo.pair_bytes } });
+        series("socketley_fast_lo_over_budget", "gauge",
+               "1 while held bytes are at the global budget and new sends are tainted.",
+               { { "", lo.over_budget ? 1u : 0u } });
+    }
 
     // Per-runtime metrics
     out += "# HELP socketley_runtime_connections Active connections per runtime.\n"

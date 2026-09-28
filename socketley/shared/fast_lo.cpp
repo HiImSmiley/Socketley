@@ -84,6 +84,10 @@ struct snap_val
     uint64_t ask;
 };
 
+// The per-CPU event counters, each bumped once per socket: an entry at the
+// sockops program, a taint (by its reason) at the sk_msg program.
+enum : uint32_t { C_ENTERED, C_BOUND, C_UNANSWERED, C_BUDGET, C_PEER_OFF, C_COUNT };
+
 // Big enough for thousands of checks in flight at 32 bytes a record.
 static constexpr uint32_t SKL_RING_BYTES = 256u << 10;
 
@@ -219,6 +223,15 @@ public:
         ld_map(BPF_REG_1, map); fp_ptr(BPF_REG_2, key); fp_ptr(BPF_REG_3, value);
         movi(BPF_REG_4, flags); call(BPF_FUNC_map_update_elem);
     }
+    // Adds one to a u64 array slot whose u32 index is on the stack at `key`.
+    void bump(int map, int16_t key)
+    {
+        const int none = label();
+        lookup(map, key); jeqi(BPF_REG_0, 0, none);
+        movi(BPF_REG_1, 1);
+        op(BPF_STX | BPF_ATOMIC | BPF_DW, BPF_REG_0, BPF_REG_1, 0, BPF_ADD);
+        bind(none);
+    }
 
     // Resolves every jump; false if a label was never bound.
     bool finish()
@@ -282,7 +295,7 @@ static constexpr int16_t K_INIT = -72;   // state_val, a fresh socket's counter
 // to any local listener -- enters the sockhash with a zeroed backlog counter,
 // and the close of such a socket deletes what it left in the maps.
 static int load_ops(int socks, int ports, int mine, int state, int snap, int pids,
-                    bool all, uint64_t pair_bytes)
+                    int counters, bool all, uint64_t pair_bytes)
 {
     bpf_asm a;
     const int out = a.label(), listen = a.label(), st = a.label(), connect = a.label();
@@ -427,6 +440,7 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
     set_state_cb();
     a.mov(BPF_REG_1, BPF_REG_6); a.ld_map(BPF_REG_2, socks); a.fp_ptr(BPF_REG_3, K_SELF);
     a.movi(BPF_REG_4, BPF_ANY); a.call(BPF_FUNC_sock_hash_update);
+    a.stwi(K_VAL, C_ENTERED); a.bump(counters, K_VAL);
     a.jmp(out);
 
     // A connect of ours is marked, and asks for the state callback so a
@@ -480,12 +494,14 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
 // ceiling (twice the bound), while a stalled one is not and the pair is tainted
 // to TCP for good -- real backpressure, and order kept because tcp_bpf_recvmsg
 // drains the redirect queue before the TCP receive queue.
-static int load_msg(int socks, int state, int snap, int ring, int budget, uint64_t pair_bytes)
+static int load_msg(int socks, int state, int snap, int ring, int budget, int counters,
+                    uint64_t pair_bytes)
 {
     bpf_asm a;
     const int pass = a.label(), do_redir = a.label(), taint_pass = a.label();
     const int no_snap = a.label(), stale = a.label(), counted = a.label();
     const int delta = a.label(), applied = a.label();
+    const int t_bound = a.label(), t_unanswered = a.label(), t_budget = a.label();
     // The ask record is laid out on the stack as the ring carries it, key first,
     // so this socket's key is where the record starts.
     constexpr int16_t rec = -40, peer = -16, k0 = -44, rsave = -56;
@@ -493,8 +509,10 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, uint64
     constexpr int16_t rec_ask = rec + static_cast<int16_t>(offsetof(ask_rec, ask));
     const uint64_t hard = pair_bytes * 2;
 
-    // r6 = ctx, r7 = this message's size, r8 = the state value, r9 = its count;
-    // all four are kept across the helper calls.
+    // r6 = ctx, r7 = this message's size, r8 = the state value, r9 = its count
+    // (on the way to a taint, its reason); all four are kept across the helper
+    // calls.
+
     // The key as the sockops program builds it: the addresses' last words.
     auto keys = [&] {
         const int v4 = a.label(), store = a.label();
@@ -545,7 +563,7 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, uint64
     a.mov(BPF_REG_1, BPF_REG_9); a.ld64(BPF_REG_2, pair_bytes / 2); a.add(BPF_REG_1, BPF_REG_2);
     a.stx8(BPF_REG_8, offsetof(state_val, mark), BPF_REG_1);
     // The peer really holds the bound or more: a stalled reader.
-    a.lddw(BPF_REG_1, BPF_REG_10, rsave); a.ld64(BPF_REG_2, pair_bytes); a.jge(BPF_REG_1, BPF_REG_2, taint_pass);
+    a.lddw(BPF_REG_1, BPF_REG_10, rsave); a.ld64(BPF_REG_2, pair_bytes); a.jge(BPF_REG_1, BPF_REG_2, t_bound);
     a.jmp(no_snap);
     // An answer to an earlier check than the one in flight: drop it and wait.
     a.bind(stale);
@@ -554,11 +572,11 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, uint64
 
     // The global budget is a single flag the reconciler raises.
     a.stwi(k0, 0); a.lookup(budget, k0); a.jeqi(BPF_REG_0, 0, counted);
-    a.lddw(BPF_REG_2, BPF_REG_0, 0); a.jnei(BPF_REG_2, 0, taint_pass);
+    a.lddw(BPF_REG_2, BPF_REG_0, 0); a.jnei(BPF_REG_2, 0, t_budget);
     a.bind(counted);
 
     a.add(BPF_REG_9, BPF_REG_7); a.stx8(BPF_REG_8, offsetof(state_val, count), BPF_REG_9);
-    a.ld64(BPF_REG_1, hard); a.jge(BPF_REG_9, BPF_REG_1, taint_pass);
+    a.ld64(BPF_REG_1, hard); a.jge(BPF_REG_9, BPF_REG_1, t_unanswered);
     // Below the mark (a pending mark is above every count): nothing to ask.
     a.lddw(BPF_REG_1, BPF_REG_8, offsetof(state_val, mark)); a.jgt(BPF_REG_1, BPF_REG_9, do_redir);
     a.ld64(BPF_REG_1, SKL_PENDING); a.stx8(BPF_REG_8, offsetof(state_val, mark), BPF_REG_1);
@@ -571,11 +589,21 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, uint64
     a.mov(BPF_REG_1, BPF_REG_6); a.ld_map(BPF_REG_2, socks); a.fp_ptr(BPF_REG_3, peer);
     a.movi(BPF_REG_4, BPF_F_INGRESS); a.call(BPF_FUNC_msg_redirect_hash);
     a.jeqi(BPF_REG_0, SKL_SK_PASS, pass);
+    // The peer is not in the sockhash: it received by TCP before it could
+    // enter, or it has closed.
+    a.movi(BPF_REG_9, C_PEER_OFF);
+    a.jmp(taint_pass);
 
-    // Redirect failed (peer gone) or a bound was crossed: pin to TCP for good.
+    // A bound was crossed, named off the hot path where the jump lands.
+    a.bind(t_bound); a.movi(BPF_REG_9, C_BOUND); a.jmp(taint_pass);
+    a.bind(t_unanswered); a.movi(BPF_REG_9, C_UNANSWERED); a.jmp(taint_pass);
+    a.bind(t_budget); a.movi(BPF_REG_9, C_BUDGET);
+
+    // Pin to TCP for good, and count why.
     a.bind(taint_pass);
     a.lookup(state, self); a.jeqi(BPF_REG_0, 0, pass);
     a.ld64(BPF_REG_1, SKL_TAINT); a.stx8(BPF_REG_0, offsetof(state_val, count), BPF_REG_1);
+    a.stw(k0, BPF_REG_9); a.bump(counters, k0);
 
     a.bind(pass);
     a.movi(BPF_REG_0, SKL_SK_PASS);
@@ -639,6 +667,7 @@ struct recon_args
     int budget{-1};
     int stop_fd{-1};
     uint64_t global_bytes{0};
+    fast_lo_gauges* gauges{nullptr};
 };
 
 // The safety net's period: it recomputes the global sum from the pairs that
@@ -803,6 +832,7 @@ public:
         m_sum = m_sum - held + rm;
         held = rm;
         publish_locked(m_sum >= m_a.global_bytes ? 1 : 0);
+        m_a.gauges->held.store(m_sum, std::memory_order_relaxed);
     }
 
     // Every pair at once, from a sweep; a sweep that failed raises the flag.
@@ -812,6 +842,7 @@ public:
         m_held = std::move(held);
         m_sum = sum;
         publish_locked(failed || m_sum >= m_a.global_bytes ? 1 : 0);
+        m_a.gauges->held.store(m_sum, std::memory_order_relaxed);
     }
 
 private:
@@ -822,6 +853,7 @@ private:
         uint32_t zero = 0;
         map_put(m_a.budget, &zero, &over, BPF_ANY);
         m_over = over;
+        m_a.gauges->over.store(over, std::memory_order_relaxed);
     }
 
     const recon_args m_a;
@@ -886,7 +918,7 @@ static void sweep_loop(const recon_args& a, ledger& book)
     while (::poll(&pfd, 1, SWEEP_MS) == 0)
     {
         std::unordered_map<std::string, uint64_t> held;
-        uint64_t sum = 0;
+        uint64_t sum = 0, on = 0, tcp = 0;
         bool failed = nl < 0;
         uint8_t in_batch[SKL_KEY], out_batch[SKL_KEY];
         bool first = true;
@@ -906,6 +938,7 @@ static void sweep_loop(const recon_args& a, ledger& book)
             {
                 const uint8_t* key = keys.data() + static_cast<size_t>(i) * SKL_KEY;
                 const state_val& v = vals[i];
+                ++(v.count == SKL_TAINT ? tcp : on);
                 uint64_t rm = v.count;
                 if (v.count == SKL_TAINT || v.count >= SWEEP_FLOOR)
                 {
@@ -932,6 +965,11 @@ static void sweep_loop(const recon_args& a, ledger& book)
             first = false;
         }
         book.replace(std::move(held), sum, failed);
+        if (!failed)
+        {
+            a.gauges->on_shortcut.store(on, std::memory_order_relaxed);
+            a.gauges->on_tcp.store(tcp, std::memory_order_relaxed);
+        }
     }
     if (nl >= 0)
         ::close(nl);
@@ -963,7 +1001,8 @@ bool fast_lo::start_reconciler()
     m_stop_fd = ::eventfd(0, EFD_CLOEXEC);
     if (m_stop_fd < 0)
         return false;
-    recon_args* a = new recon_args{m_state, m_snap, m_ring, m_budget, m_stop_fd, m_limits.global_bytes};
+    recon_args* a = new recon_args{m_state, m_snap, m_ring, m_budget, m_stop_fd,
+                                   m_limits.global_bytes, &m_gauges};
     pthread_t t;
     if (pthread_create(&t, nullptr, recon_main, a) != 0)
     {
@@ -992,6 +1031,11 @@ void fast_lo::stop_reconciler()
     }
 }
 
+// The daemon's one shortcut object, for fast_lo_now(); the mutex keeps a
+// snapshot from reading one that is being torn down.
+static std::mutex g_live_mu;
+static const fast_lo* g_live = nullptr;
+
 bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
 {
     // Each refusal names the step and keeps its errno for the daemon's log line.
@@ -1006,6 +1050,11 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
         return fail("off", 0);
 
     m_limits = limits;
+    m_mode = mode;
+    {
+        std::lock_guard<std::mutex> g(g_live_mu);
+        g_live = this;
+    }
 
     struct statfs sf{};
     if (::statfs("/sys/fs/cgroup", &sf) < 0 || sf.f_type != CGROUP2_SUPER_MAGIC)
@@ -1025,16 +1074,17 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
     m_snap   = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(snap_val), 65536, "skl_fastlo_snap", BPF_F_NO_PREALLOC);
     m_ring   = map_create(BPF_MAP_TYPE_RINGBUF, 0, 0, SKL_RING_BYTES, "skl_fastlo_ring");
     m_budget = map_create(BPF_MAP_TYPE_ARRAY, 4, sizeof(uint64_t), 1, "skl_fastlo_bdgt");
+    m_counters = map_create(BPF_MAP_TYPE_PERCPU_ARRAY, 4, sizeof(uint64_t), C_COUNT, "skl_fastlo_cnt");
     if (m_pids < 0 || m_socks < 0 || m_ports < 0 || m_mine < 0 || m_state < 0 ||
-        m_snap < 0 || m_ring < 0 || m_budget < 0)
+        m_snap < 0 || m_ring < 0 || m_budget < 0 || m_counters < 0)
         return fail(denied(errno)
             ? "no CAP_BPF (run the daemon as root or setcap cap_bpf,cap_net_admin+ep)"
             : "map creation failed", errno);
 
-    m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids,
+    m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids, m_counters,
                      mode == fast_lo_mode::all, m_limits.pair_bytes);
     if (m_ops >= 0)
-        m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_limits.pair_bytes);
+        m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_counters, m_limits.pair_bytes);
     if (m_ops < 0 || m_msg < 0)
         return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
                                   : "programs could not be loaded", errno);
@@ -1069,20 +1119,82 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
 
     g_pids = m_pids;
     m_reason = "ok";
+    std::lock_guard<std::mutex> g(g_live_mu);
+    m_attached = true;
     return true;
 }
 
 fast_lo::~fast_lo()
 {
+    {
+        std::lock_guard<std::mutex> g(g_live_mu);
+        if (g_live == this)
+            g_live = nullptr;
+    }
     // Join the reconciler before the maps it reads and writes are closed.
     stop_reconciler();
     // Everything is anonymous, so the last close detaches and frees it.
     if (g_pids == m_pids)
         g_pids = -1;
     for (int fd : { m_link, m_ops, m_msg, m_pids, m_socks, m_ports, m_mine, m_state, m_snap,
-                    m_ring, m_budget })
+                    m_ring, m_budget, m_counters })
         if (fd >= 0)
             ::close(fd);
+}
+
+// The kernel's count of possible CPUs, which sizes a per-CPU map value.
+static unsigned possible_cpus()
+{
+    static const unsigned n = [] {
+        std::ifstream f("/sys/devices/system/cpu/possible");
+        std::string s;
+        unsigned hi = 0;
+        if (std::getline(f, s))
+        {
+            const size_t at = s.find_last_of("-,");
+            hi = static_cast<unsigned>(std::strtoul(s.c_str() + (at == std::string::npos ? 0 : at + 1),
+                                                    nullptr, 10));
+        }
+        return hi + 1;
+    }();
+    return n;
+}
+
+fast_lo_figures fast_lo_now()
+{
+    fast_lo_figures f;
+    std::lock_guard<std::mutex> g(g_live_mu);
+    const fast_lo* lo = g_live;
+    if (!lo)
+        return f;
+    if (!lo->m_attached)
+    {
+        f.mode = "unavailable";
+        f.reason = lo->m_reason;
+        return f;
+    }
+    f.mode = lo->m_mode == fast_lo_mode::all ? "all" : "own";
+    f.sockets_shortcut = lo->m_gauges.on_shortcut.load(std::memory_order_relaxed);
+    f.sockets_tcp = lo->m_gauges.on_tcp.load(std::memory_order_relaxed);
+    f.held_bytes = lo->m_gauges.held.load(std::memory_order_relaxed);
+    f.over_budget = lo->m_gauges.over.load(std::memory_order_relaxed) != 0;
+    f.budget_bytes = lo->m_limits.global_bytes;
+    f.pair_bytes = lo->m_limits.pair_bytes;
+    uint64_t* const slots[C_COUNT] = { &f.entered, &f.tainted_bound, &f.tainted_unanswered,
+                                       &f.tainted_budget, &f.tainted_peer_off };
+    std::vector<uint64_t> per_cpu(possible_cpus());
+    for (uint32_t k = 0; k < C_COUNT; ++k)
+    {
+        union bpf_attr a{};
+        a.map_fd = static_cast<uint32_t>(lo->m_counters);
+        a.key = reinterpret_cast<uint64_t>(&k);
+        a.value = reinterpret_cast<uint64_t>(per_cpu.data());
+        if (sys_bpf(BPF_MAP_LOOKUP_ELEM, &a) != 0)
+            continue;
+        for (uint64_t v : per_cpu)
+            *slots[k] += v;
+    }
+    return f;
 }
 
 bool fast_lo_active()
@@ -1136,15 +1248,16 @@ int main()
     const int snap = map_create(BPF_MAP_TYPE_HASH, SKL_KEY, sizeof(snap_val), 4096, "snap", BPF_F_NO_PREALLOC);
     const int ring = map_create(BPF_MAP_TYPE_RINGBUF, 0, 0, SKL_RING_BYTES, "ring");
     const int budget = map_create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "budget");
+    const int counters = map_create(BPF_MAP_TYPE_PERCPU_ARRAY, 4, 8, C_COUNT, "counters");
     std::printf("maps socks=%d ports=%d pids=%d mine=%d state=%d snap=%d ring=%d budget=%d\n",
                 socks, ports, pids, mine, state, snap, ring, budget);
     for (bool all : { false, true })
     {
-        const int ops = load_ops(socks, ports, mine, state, snap, pids, all, 4ull << 20);
+        const int ops = load_ops(socks, ports, mine, state, snap, pids, counters, all, 4ull << 20);
         std::printf("load_ops(all=%d) = %d errno=%d\n", all, ops, errno);
         if (ops < 0) std::printf("%s\n", g_verifier_log);
     }
-    const int msg = load_msg(socks, state, snap, ring, budget, 4ull << 20);
+    const int msg = load_msg(socks, state, snap, ring, budget, counters, 4ull << 20);
     std::printf("load_msg = %d errno=%d\n", msg, errno);
     if (msg < 0) std::printf("%s\n", g_verifier_log);
 

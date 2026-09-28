@@ -3,7 +3,9 @@
 // the loopback device and its softirq.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace socketley {
@@ -29,6 +31,17 @@ bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out);
 // that is not two positive integers with the global at least the per-pair one.
 bool parse_fast_lo_limit(std::string_view v, fast_lo_limits& out);
 
+struct fast_lo_figures;
+
+// What the reconciler's threads last measured, read by fast_lo_now().
+struct fast_lo_gauges
+{
+    std::atomic<uint64_t> on_shortcut{0};
+    std::atomic<uint64_t> on_tcp{0};
+    std::atomic<uint64_t> held{0};
+    std::atomic<uint64_t> over{0};
+};
+
 // Loads the maps and the two programs and attaches them for as long as this
 // object lives; the daemon holds it, and closing it detaches everything.
 class fast_lo
@@ -46,6 +59,7 @@ public:
     int error() const { return m_errno; }
 
 private:
+    friend fast_lo_figures fast_lo_now();
     bool start_reconciler();
     void stop_reconciler();
 
@@ -57,15 +71,41 @@ private:
     int m_snap{-1};
     int m_ring{-1};
     int m_budget{-1};
+    int m_counters{-1};         // per-CPU event counts, indexed by the C_* reasons
     int m_ops{-1};
     int m_msg{-1};
     int m_link{-1};
     int m_stop_fd{-1};          // eventfd the reconciler waits on, wakes it to exit
     unsigned long m_recon{0};   // pthread_t of the reconciler, 0 when none runs
     fast_lo_limits m_limits;
+    fast_lo_mode m_mode{fast_lo_mode::off};
+    bool m_attached{false};
+    fast_lo_gauges m_gauges;
     const char* m_reason{"not started"};
     int m_errno{0};
 };
+
+// The shortcut as an operator sees it: the socket gauges and the held bytes
+// are as of the reconciler's last measurement, the event counts since start.
+struct fast_lo_figures
+{
+    std::string mode{"off"};      // off, own, all, or unavailable
+    std::string reason;           // why it is unavailable
+    uint64_t sockets_shortcut{0};
+    uint64_t sockets_tcp{0};      // tainted, and sending by TCP for good
+    uint64_t entered{0};
+    uint64_t tainted_bound{0};    // the peer really held the per-pair bound
+    uint64_t tainted_unanswered{0};
+    uint64_t tainted_budget{0};
+    uint64_t tainted_peer_off{0}; // the peer was not on the shortcut
+    uint64_t held_bytes{0};
+    uint64_t budget_bytes{0};
+    uint64_t pair_bytes{0};
+    bool over_budget{false};
+};
+
+// A snapshot of this daemon's shortcut, safe from any thread.
+fast_lo_figures fast_lo_now();
 
 // The workers the program counts as this daemon's, marked when the supervisor
 // forks one and unmarked when it lets one go; no-ops while nothing is attached.

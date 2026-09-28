@@ -15,7 +15,8 @@
 #   * a mode other than own or all accepted, or --fast-lo taken by the cli
 #     together with --name, where it would configure nothing
 #   * a daemon without the capabilities refusing to serve, rather than saying
-#     so once and serving on the ordinary path
+#     so once and serving on the ordinary path; `daemon stats` not saying it
+#     is unavailable and why, or not saying off when it was never asked for
 #   * all: a local client of another process not put on the shortcut (acked
 #     counts the whole exchange), or its pipelined replies out of order
 #   * all: a runtime of another daemon -- same binary, same cgroup, no
@@ -203,6 +204,13 @@ else
     R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
     if grep -q 'fast-lo: unavailable, serving without it' "$SOCKETLEY_DLOG" && [ "${R%% *}" = ok ]; then pass
     else fail "uncapped" "a daemon that cannot attach says so and serves" "probe: $R" "$(grep -i fast-lo "$SOCKETLEY_DLOG" || echo 'no fast-lo line in the log')"; fi
+    OUT=$("$BIN" daemon stats 2>&1 || true)
+    if grep -q '^fast_lo:unavailable$' <<<"$OUT" && grep -q '^fast_lo_reason:.' <<<"$OUT"; then pass
+    else fail "uncapped stats" "daemon stats says the shortcut is unavailable, and why" "out: $OUT"; fi
+    restart "$BIN"
+    OUT=$("$BIN" daemon stats 2>&1 || true)
+    if [ "$OUT" = "fast_lo:off" ]; then pass
+    else fail "off stats" "daemon stats says the shortcut is off when it was not asked for" "out: $OUT"; fi
 fi
 
 # ─── the capped copy ────────────────────────────────────────────────────────

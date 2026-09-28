@@ -169,6 +169,9 @@ private:
     // Ends this daemon, answered before it goes so the caller learns it was
     // heard rather than seeing the socket close under the reply.
     int cmd_daemon_stop(ipc_connection* conn);
+    // The daemon's own figures, not a runtime's: today the loopback shortcut,
+    // whose bytes tcpdump and nftables on lo never see.
+    int cmd_daemon_stats(ipc_connection* conn);
     int cmd_cluster_dir(ipc_connection* conn);
     int cmd_cluster_status(ipc_connection* conn);
     int cmd_raft_status(ipc_connection* conn);

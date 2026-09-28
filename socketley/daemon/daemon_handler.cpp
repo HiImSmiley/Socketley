@@ -10,6 +10,7 @@
 #include "../shared/runtime_definitions.h"
 #include "../shared/time_format.h"
 #include "../shared/state_persistence.h"
+#include "../shared/fast_lo.h"
 #include "../cli/runtime_type_parser.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/cache/cache_instance.h"
@@ -1223,6 +1224,7 @@ int daemon_handler::dispatch_command(ipc_connection* conn, const parsed_args& pa
         case fnv1a("attach"):    return cmd_attach(conn, pa);
         case fnv1a("add"):       return cmd_add(conn, pa);
         case fnv1a("daemon-stop"): return cmd_daemon_stop(conn);
+        case fnv1a("daemon-stats"): return cmd_daemon_stats(conn);
         case fnv1a("cluster-dir"): return cmd_cluster_dir(conn);
         case fnv1a("cluster-status"): return cmd_cluster_status(conn);
         case fnv1a("raft-status"):    return cmd_raft_status(conn);
@@ -6595,6 +6597,35 @@ void daemon_handler::check_managed_health()
             m_persistence->save_runtime(inst.get());
         return;  // restart one at a time per health check cycle
     }
+}
+
+// One key:value line per figure, the shape `stats` gives a runtime, so a
+// script reads both the same way.
+int daemon_handler::cmd_daemon_stats(ipc_connection* conn)
+{
+    if (!conn)
+        return 0;
+    const socketley::fast_lo_figures f = socketley::fast_lo_now();
+    std::ostringstream out;
+    out << "fast_lo:" << f.mode << '\n';
+    if (!f.reason.empty())
+        out << "fast_lo_reason:" << f.reason << '\n';
+    if (f.mode == "all" || f.mode == "own")
+    {
+        out << "fast_lo_sockets_shortcut:" << f.sockets_shortcut << '\n'
+            << "fast_lo_sockets_tcp:" << f.sockets_tcp << '\n'
+            << "fast_lo_entered:" << f.entered << '\n'
+            << "fast_lo_tainted_bound:" << f.tainted_bound << '\n'
+            << "fast_lo_tainted_unanswered:" << f.tainted_unanswered << '\n'
+            << "fast_lo_tainted_budget:" << f.tainted_budget << '\n'
+            << "fast_lo_tainted_peer_off:" << f.tainted_peer_off << '\n'
+            << "fast_lo_held_bytes:" << f.held_bytes << '\n'
+            << "fast_lo_budget_bytes:" << f.budget_bytes << '\n'
+            << "fast_lo_pair_limit_bytes:" << f.pair_bytes << '\n'
+            << "fast_lo_over_budget:" << (f.over_budget ? 1 : 0) << '\n';
+    }
+    conn->write_buf = out.str();
+    return 0;
 }
 
 // The same route a SIGTERM takes, because that path already stops every
