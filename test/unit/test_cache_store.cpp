@@ -3367,6 +3367,70 @@ TEST_CASE("a renamed key can still be evicted, and a refused COPY copies nothing
     }
 }
 
+TEST_CASE("a two-key move does not evict its own source to make room in the destination")
+{
+    // The source is the least recently used key, so it is LRU's first pick unless it is kept.
+    cache_store store;
+    store.set_max_memory(size_t(1) << 20);
+    store.set_eviction(evict_allkeys_lru);
+    const std::string job(40, 'j'), next(40, 'n');
+
+    SUBCASE("LMOVE and RPOPLPUSH evict another key and move the element")
+    {
+        REQUIRE(store.rpush("src", job));
+        REQUIRE(store.rpush("src", next));
+        REQUIRE(store.set("other1", std::string(40, 'o')));
+        REQUIRE(store.set("other2", std::string(40, 'p')));
+        store.set_max_memory(store.get_memory_used());
+
+        std::string out;
+        CHECK(store.lmove("src", "dst", false, true, out));   // RPOPLPUSH src dst
+        CHECK(out == next);
+        CHECK(store.llen("src") == 1);
+        CHECK(store.llen("dst") == 1);
+        CHECK(store.lindex("dst", 0) == std::optional<std::string_view>(next));
+        CHECK_FALSE(store.exists("other1"));
+    }
+
+    SUBCASE("an LMOVE with nothing else to evict is refused and the element stays in the source")
+    {
+        REQUIRE(store.rpush("src", job));
+        REQUIRE(store.rpush("src", next));
+        store.set_max_memory(store.get_memory_used());
+
+        std::string out;
+        CHECK_FALSE(store.lmove("src", "dst", true, false, out));
+        CHECK(store.llen("src") == 2);
+        CHECK_FALSE(store.exists("dst"));
+    }
+
+    SUBCASE("SMOVE evicts another key and leaves the rest of the source")
+    {
+        REQUIRE(store.sadd("src", job) == 1);
+        REQUIRE(store.sadd("src", next) == 1);
+        REQUIRE(store.set("other1", std::string(40, 'o')));
+        REQUIRE(store.set("other2", std::string(40, 'p')));
+        store.set_max_memory(store.get_memory_used());
+
+        CHECK(store.smove("src", "dst", job) == 1);
+        CHECK(store.sismember("dst", job));
+        CHECK_FALSE(store.sismember("src", job));
+        CHECK(store.sismember("src", next));
+        CHECK_FALSE(store.exists("other1"));
+    }
+
+    SUBCASE("an SMOVE with nothing else to evict is refused and the source keeps both members")
+    {
+        REQUIRE(store.sadd("src", job) == 1);
+        REQUIRE(store.sadd("src", next) == 1);
+        store.set_max_memory(store.get_memory_used());
+
+        CHECK(store.smove("src", "dst", job) == 0);
+        CHECK(store.scard("src") == 2);
+        CHECK_FALSE(store.exists("dst"));
+    }
+}
+
 TEST_CASE("a renamed key is charged as the same key made under its new name")
 {
     // RENAME moves the value whole, so only the name's cost may change.

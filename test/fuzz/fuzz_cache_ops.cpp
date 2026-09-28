@@ -1051,14 +1051,15 @@ void check_evictable(world& w, const lru_snapshot& snap, int wrote_key)
 // have come apart, which is exactly the bug that dropped a live,
 // most-recently-used key.  The key the step itself wrote is excluded: it is
 // touched to the back after eviction runs, so its own position says nothing.
-void check_eviction_order(world& w, const lru_snapshot& snap, int wrote_key)
+// A move's source is excluded too, because it survives by being kept, not by being newer.
+void check_eviction_order(world& w, const lru_snapshot& snap, int wrote_key, int kept_key)
 {
     int newest_victim   = -1;
     int oldest_survivor = INT_MAX;
 
     for (int i = 0; i < NKEYS; i++)
     {
-        if (!snap.present[i] || i == wrote_key || snap.pos[i] < 0)
+        if (!snap.present[i] || i == wrote_key || i == kept_key || snap.pos[i] < 0)
             continue;
         if (w.store.type(key_str(i)) != "none")
             oldest_survivor = std::min(oldest_survivor, snap.pos[i]);
@@ -1296,12 +1297,13 @@ bool run_step(world& w, const step& s)
     // the eviction order held nothing but that key; anything else still in it
     // is room the store was allowed to take and did not.
     // `named` is the key the write names to check_memory(): the one it writes,
-    // or for COPY the source and for SMOVE and LMOVE the destination.
-    auto refusal_excusable_for = [&](const std::string& named) -> bool {
+    // or for COPY the source and for SMOVE and LMOVE the destination, whose
+    // source `kept` is out of eviction's reach as well.
+    auto refusal_excusable_for = [&](const std::string& named, const std::string* kept = nullptr) -> bool {
         if (!had_limit)  return false;   // nothing may be refused for memory at all
         if (!can_evict)  return true;    // nothing may be freed to make room
         for (const std::string& lk : w.store.m_lru_order)
-            if (lk != named)
+            if (lk != named && (kept == nullptr || lk != *kept))
                 return false;            // a candidate was still standing there
         return true;
     };
@@ -1315,6 +1317,7 @@ bool run_step(world& w, const step& s)
     // Set by the write handlers: the key this step wrote, and whether the store
     // reported the write as accepted.
     int  wrote_key       = -1;
+    int  kept_key        = -1;   // an SMOVE or LMOVE source, which eviction may not take either
     bool wrote_ok        = false;
     bool is_memory_write = false;
     bool evict_possible  = false;
@@ -1989,6 +1992,7 @@ bool run_step(world& w, const step& s)
             if (moves)
             {
                 wrote_key       = kj;     // sadd() names the destination
+                kept_key        = ki;
                 is_memory_write = true;
                 evict_possible  = can_evict;
                 target_existed  = (e2.type != T_NONE);
@@ -2013,7 +2017,7 @@ bool run_step(world& w, const step& s)
             else if (moves)
             {
                 CACHE_CHECK(r == 0, "a refused smove() answered other than 0");
-                CACHE_FINDING("write-refused", refusal_excusable_for(k2),
+                CACHE_FINDING("write-refused", refusal_excusable_for(k2, &k),
                               "an SMOVE was refused that there was room for after eviction");
             }
             break;
@@ -2035,6 +2039,7 @@ bool run_step(world& w, const step& s)
             if (moves)
             {
                 wrote_key       = kj;     // named to check_memory() as the destination
+                kept_key        = ki;
                 is_memory_write = true;
                 evict_possible  = can_evict;
                 target_existed  = (e2.type != T_NONE);
@@ -2059,7 +2064,7 @@ bool run_step(world& w, const step& s)
                 }
             }
             else if (moves)
-                CACHE_FINDING("write-refused", refusal_excusable_for(k2),
+                CACHE_FINDING("write-refused", refusal_excusable_for(k2, &k),
                               "an LMOVE was refused that there was room for after eviction");
             break;
         }
@@ -2413,9 +2418,15 @@ bool run_step(world& w, const step& s)
         g_detail[0] = 0;
     }
 
+    // ── a move's source is not what its destination's room is made of ──
+    // The model clears a source the move emptied, so one it still holds has to be in the store.
+    if (kept_key >= 0 && w.sh[kept_key].type != T_NONE)
+        CACHE_FINDING("evict-move-source", w.store.type(key_str(kept_key)) != "none",
+                      "a move evicted its own source to make room in its destination");
+
     // ── invariant 4, second half ──
     if (lru_policy && is_memory_write)
-        check_eviction_order(w, snap, wrote_key);
+        check_eviction_order(w, snap, wrote_key, kept_key);
 
     // ── invariants 1, 2 and 4 ──
     verify_model(w, evict_possible);

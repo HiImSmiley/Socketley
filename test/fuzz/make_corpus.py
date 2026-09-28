@@ -713,6 +713,19 @@ def cache_seeds():
         op("HSET", K7, M2, V100), op("HSET", K7, M6, V192),
     )
 
+    # ── a move whose destination needs room, with its source first in the LRU ──
+    # Eviction took the source, so LMOVE answered nil with the element in neither list.
+    s["lmove_evicts_source"] = prog(
+        op("MAXMEM", a=L800), op("EVICTION", a=E_LRU),
+        op("RPUSH", K7, V64, 4), op("RPUSH", K7, V64, 5), op("SET", K14, V64, 6),
+        op("LMOVE", K7, 0, K16),
+    )
+    s["smove_evicts_source"] = prog(
+        op("MAXMEM", a=L800), op("EVICTION", a=E_LRU),
+        op("SADD", K7, M2), op("SADD", K7, M6), op("SET", K14, V64, 6),
+        op("SMOVE", K7, M2, K16),
+    )
+
     # ── a refused write on a key that carries a TTL ──
     s["refused_write_with_ttl"] = prog(
         op("HSET", K7, M0, V5), op("EXPIRE", K7, T_LONG),

@@ -692,6 +692,16 @@ private:
     // one the calling write is about to touch.
     bool try_evict(size_t needed, const std::string_view* protect);
 
+    // Keeps a two-key write's source out of try_evict()'s reach for as long as it is in scope.
+    struct pin_source
+    {
+        cache_store& store;
+        pin_source(cache_store& s, const std::string_view& key) : store(s) { store.m_pinned = &key; }
+        ~pin_source() { store.m_pinned = nullptr; }
+        pin_source(const pin_source&) = delete;
+        pin_source& operator=(const pin_source&) = delete;
+    };
+
     // Drop the key's expiry, as Redis specifies for SET without KEEPTTL,
     // called at the point a write is known to be going ahead -- doing it on
     // the way in stripped the TTL off keys whose write was then refused.
@@ -947,6 +957,8 @@ private:
     eviction_policy m_eviction = evict_none;
     std::list<std::string> m_lru_order;
     std::unordered_map<std::string, std::list<std::string>::iterator, string_hash, string_equal> m_lru_map;
+    // The key a pin_source holds, which try_evict() skips as it skips `protect`.
+    const std::string_view* m_pinned = nullptr;
 
     // Pub/Sub
     channel_map m_channels;

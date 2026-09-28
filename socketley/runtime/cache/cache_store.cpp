@@ -788,8 +788,8 @@ int cache_store::smove(std::string_view src, std::string_view dst,
     if (src == dst) return 1;     // Redis's no-op, where the removal below took it out
     // Taken from the source only once the destination has it, so a failure
     // between the two cannot lose the member.
+    const pin_source keep(*this, src);
     if (sadd(dst, member) < 0) return 0;
-    // sadd() may have evicted the source to make room, which srem() finds gone.
     srem(src, member);
     return 1;
 }
@@ -1987,6 +1987,7 @@ bool cache_store::lmove(std::string_view src, std::string_view dst,
     // Charged before the pop, for the same reason: a refusal after it would
     // have taken the element out of the queue and dropped it.
     const size_t head_len = (from_head ? sit->second.front() : sit->second.back()).size();
+    const pin_source keep(*this, src);
     if (src != dst && !check_memory(stored_string(head_len) + new_key_cost(dst.size()) + list_elem_overhead
                                     + push_growth(dfound == m_lists.end() ? nullptr : &dfound->second,
                                                   head_len, to_head), dst))
@@ -3522,7 +3523,10 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
         // only thing left the write is refused rather than paid for with its
         // own data.
         const bool protect_resident = (protect != nullptr && m_lru_map.count(*protect) != 0);
-        const size_t candidates = m_lru_order.size() - (protect_resident ? 1 : 0);
+        const bool pinned_resident  = (m_pinned != nullptr && m_lru_map.count(*m_pinned) != 0
+                                       && !(protect_resident && *m_pinned == *protect));
+        const size_t candidates = m_lru_order.size() - (protect_resident ? 1 : 0)
+                                                     - (pinned_resident ? 1 : 0);
         if (candidates == 0)
             break;
 
@@ -3537,12 +3541,13 @@ bool cache_store::try_evict(size_t needed, const std::string_view* protect)
         }
 
         // The LRU policy takes the front of the order and the random one the
-        // skip'th candidate, both stepping over the protected key if it is in
-        // their path.
+        // skip'th candidate, both stepping over the protected keys if they are
+        // in their path.
         auto node = m_lru_order.end();
         for (auto n = m_lru_order.begin(); n != m_lru_order.end(); ++n)
         {
-            if (protect_resident && std::string_view(*n) == *protect)
+            if ((protect_resident && std::string_view(*n) == *protect)
+             || (pinned_resident && std::string_view(*n) == *m_pinned))
                 continue;
             if (skip == 0)
             {

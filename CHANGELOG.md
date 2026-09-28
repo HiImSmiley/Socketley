@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Under a memory limit with an eviction policy, `LMOVE` and `RPOPLPUSH` could
+  evict their own source list to make room in the destination, answering nil
+  with the element in neither list; `SMOVE` could likewise evict the rest of
+  its source set. The source is now never an eviction candidate for its own
+  move: another key is evicted, or the move is refused with nothing lost.
 - A server now fails a WebSocket connection whose text message is not valid
   UTF-8, with close code 1007, as RFC 6455 8.1 requires. Such a message used
   to be handed to `on_message` and `on_client_message` as it was, and with no
