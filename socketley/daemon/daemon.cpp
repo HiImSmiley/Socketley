@@ -22,6 +22,7 @@
 
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <iostream>
 #include <fstream>
@@ -726,7 +727,9 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
                      lo_mode == socketley::fast_lo_mode::all ? "all" : "own", 1);
         else
             LOG_WARN((std::string("fast-lo: unavailable, serving without it: ") +
-                      lo_shortcut.reason()).c_str());
+                      lo_shortcut.reason() +
+                      (lo_shortcut.error() ? std::string(" (") + std::strerror(lo_shortcut.error()) + ")"
+                                           : std::string())).c_str());
     }
 
     // Experimental and opt-in: a daemon given --raft-listen that cannot run Raft

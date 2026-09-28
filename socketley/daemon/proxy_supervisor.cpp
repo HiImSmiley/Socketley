@@ -1,4 +1,5 @@
 #include "proxy_supervisor.h"
+#include "../shared/fast_lo.h"
 #include "../shared/worker_env.h"
 
 #include "../shared/peer_link.h"
@@ -732,6 +733,7 @@ bool proxy_supervisor::spawn(const runtime_config& cfg)
     if (lv[1] >= 0)
         ::close(lv[1]);
     m_pid          = child;
+    socketley::fast_lo_adopt(child);
     m_control_fd   = sv[0];
     m_map_fd       = mv[0];
     m_link_chan_fd = lv[0];
@@ -1030,6 +1032,7 @@ void proxy_supervisor::shutdown()
         close_control();
 
         ::kill(m_pid, SIGTERM);
+        socketley::fast_lo_release(m_pid);
 
         // Reaped here if it has already gone and otherwise by the health
         // timer, because the daemon's event-loop thread does not block on a
@@ -1644,6 +1647,7 @@ bool proxy_supervisor::check_liveness()
     if (r <= 0)
         return false;      // still running, or not ours to reap
 
+    socketley::fast_lo_release(m_pid);
     m_pid = 0;
     // The placeholder's copy goes with it: `stats` prints this number, and a pid
     // that has been reaped is worse than no pid at all — it is a number the

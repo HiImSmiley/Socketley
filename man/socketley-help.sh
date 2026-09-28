@@ -160,7 +160,7 @@ cli_commands() {
     echo "  send lands straight in the peer's receive queue, skipping TCP/IP."
     echo "  all (default): any local client of a runtime's port; own: only this"
     echo "  daemon's runtimes among themselves. Cache GET ~2.5x, 45% less CPU."
-    echo "  Needs CAP_BPF, CAP_NET_ADMIN and CAP_PERFMON; without them it logs"
+    echo "  Needs CAP_BPF and CAP_NET_ADMIN; without them it logs"
     echo "  and serves as usual. No backpressure: a peer that stops reading lets"
     echo "  the sender fill the kernel's TCP memory. Bypasses nftables on lo and"
     echo "  tcpdump. Use it where readers keep up."

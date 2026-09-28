@@ -8,6 +8,7 @@
 #include "../../shared/lua_context.h"
 #include "../../shared/logging.h"
 #include "../../shared/invariants.h"
+#include "../../shared/fast_lo.h"
 #include "../../shared/unix_listener.h"
 
 #include <unistd.h>

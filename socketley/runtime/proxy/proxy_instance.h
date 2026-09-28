@@ -21,7 +21,6 @@
 #include "../../shared/invariants.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/sockmap_relay.h"
-#include "../../shared/fast_lo.h"
 
 struct runtime_endpoint;
 

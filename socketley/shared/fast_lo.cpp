@@ -4,7 +4,6 @@
 #include <linux/magic.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -147,29 +146,21 @@ static constexpr int16_t K_PORT = -4;    // u32 port, the ports map's key
 static constexpr int16_t K_SELF = -24;   // this socket's key
 static constexpr int16_t K_PEER = -40;   // the peer's key
 static constexpr int16_t K_VAL  = -44;   // u32 map value
-static constexpr int16_t K_COMM = -64;   // 16-byte comm
-
-struct identity
-{
-    uint64_t comm[2]{0, 0};
-    uint64_t cgroup{0};
-};
+static constexpr int16_t K_TGID = -48;   // u32 tgid, the pids map's key
 
 // The sockops program, which sorts sockets at four moments: a listen or a
 // connect by one of this daemon's processes is remembered, and an established
 // loopback pair to one of its ports enters the sockhash.
-static int load_ops(int socks, int ports, int mine, int taint, const identity& id, bool all)
+static int load_ops(int socks, int ports, int mine, int taint, int pids, bool all)
 {
     bpf_asm a;
     const int out = a.label(), listen = a.label(), state = a.label(), connect = a.label();
     const int active = a.label(), enter = a.label(), not_passive = a.label();
 
-    // Ours: the process is this daemon's binary and sits in its cgroup.
+    // Ours: the calling process is one of this daemon's workers.
     auto ours = [&] {
-        a.fp_ptr(BPF_REG_1, K_COMM); a.movi(BPF_REG_2, 16); a.call(BPF_FUNC_get_current_comm);
-        a.lddw(BPF_REG_1, BPF_REG_10, K_COMM);     a.ld64(BPF_REG_2, id.comm[0]); a.jne(BPF_REG_1, BPF_REG_2, out);
-        a.lddw(BPF_REG_1, BPF_REG_10, K_COMM + 8); a.ld64(BPF_REG_2, id.comm[1]); a.jne(BPF_REG_1, BPF_REG_2, out);
-        a.call(BPF_FUNC_get_current_cgroup_id);    a.ld64(BPF_REG_1, id.cgroup);  a.jne(BPF_REG_0, BPF_REG_1, out);
+        a.call(BPF_FUNC_get_current_pid_tgid); a.rshi(BPF_REG_0, 32); a.stw(K_TGID, BPF_REG_0);
+        a.lookup(pids, K_TGID); a.jeqi(BPF_REG_0, 0, out);
     };
 
     a.mov(BPF_REG_6, BPF_REG_1);
@@ -288,101 +279,90 @@ static int load_msg(int socks, int taint)
     return prog_load(a, BPF_PROG_TYPE_SK_MSG, "skl_fastlo_msg");
 }
 
-// Workers exec the binary /proc/self/exe names, so that basename is their comm.
-static bool own_identity(identity& id, std::string& cgroup_dir)
+// The daemon's own cgroup, where every socket of its workers is born.
+static bool own_cgroup(std::string& dir)
 {
-    char buf[4096];
-    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0)
-        return false;
-    buf[n] = '\0';
-    const char* base = std::strrchr(buf, '/');
-    base = base ? base + 1 : buf;
-    char comm[16]{};
-    std::strncpy(comm, base, 15);
-    std::memcpy(id.comm, comm, sizeof(comm));
-
     std::ifstream f("/proc/self/cgroup");
     std::string line;
     while (std::getline(f, line))
     {
         if (line.rfind("0::", 0) == 0)
         {
-            cgroup_dir = "/sys/fs/cgroup" + line.substr(3);
-            struct stat st{};
-            if (::stat(cgroup_dir.c_str(), &st) < 0)
-                return false;
-            id.cgroup = st.st_ino;
+            dir = "/sys/fs/cgroup" + line.substr(3);
             return true;
         }
     }
     return false;
 }
 
+static int g_pids = -1;
+
+static void mark(int pid, bool on)
+{
+    if (g_pids < 0 || pid <= 0)
+        return;
+    uint32_t key = static_cast<uint32_t>(pid), one = 1;
+    union bpf_attr a{};
+    a.map_fd = static_cast<uint32_t>(g_pids);
+    a.key = reinterpret_cast<uint64_t>(&key);
+    a.value = reinterpret_cast<uint64_t>(&one);
+    a.flags = BPF_ANY;
+    if (sys_bpf(on ? BPF_MAP_UPDATE_ELEM : BPF_MAP_DELETE_ELEM, &a) < 0) {}
+}
+
+void fast_lo_adopt(int pid) { mark(pid, true); }
+void fast_lo_release(int pid) { mark(pid, false); }
+
 bool fast_lo::start(fast_lo_mode mode)
 {
-    if (mode == fast_lo_mode::off)
-    {
-        m_reason = "off";
+    // Each refusal names the step and keeps its errno for the daemon's log line.
+    auto fail = [this](const char* why, int err) {
+        m_reason = why;
+        m_errno = err;
         return false;
-    }
+    };
+    const auto denied = [](int err) { return err == EPERM || err == EACCES; };
+
+    if (mode == fast_lo_mode::off)
+        return fail("off", 0);
 
     struct statfs sf{};
     if (::statfs("/sys/fs/cgroup", &sf) < 0 || sf.f_type != CGROUP2_SUPER_MAGIC)
-    {
-        m_reason = "needs cgroup v2 mounted at /sys/fs/cgroup";
-        return false;
-    }
-    identity id;
+        return fail("needs cgroup v2 mounted at /sys/fs/cgroup", 0);
     std::string own_cg;
-    if (!own_identity(id, own_cg))
-    {
-        m_reason = "could not read this process's binary name or cgroup";
-        return false;
-    }
+    if (!own_cgroup(own_cg))
+        return fail("could not read this process's cgroup", 0);
 
+    m_pids  = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "skl_fastlo_pids");
     m_socks = map_create(BPF_MAP_TYPE_SOCKHASH, 16, sizeof(uint64_t), 65536, "skl_fastlo_socks");
     m_ports = map_create(BPF_MAP_TYPE_HASH, 4, 4, 4096, "skl_fastlo_ports");
     m_mine  = map_create(BPF_MAP_TYPE_LRU_HASH, 16, 4, 65536, "skl_fastlo_mine");
     m_taint = map_create(BPF_MAP_TYPE_LRU_HASH, 16, 4, 65536, "skl_fastlo_taint");
-    if (m_socks < 0 || m_ports < 0 || m_mine < 0 || m_taint < 0)
-    {
-        m_reason = (errno == EPERM || errno == EACCES)
-            ? "no CAP_BPF (run the daemon as root or setcap cap_bpf,cap_net_admin,cap_perfmon+ep)"
-            : "map creation failed";
-        return false;
-    }
+    if (m_pids < 0 || m_socks < 0 || m_ports < 0 || m_mine < 0 || m_taint < 0)
+        return fail(denied(errno)
+            ? "no CAP_BPF (run the daemon as root or setcap cap_bpf,cap_net_admin+ep)"
+            : "map creation failed", errno);
 
-    m_ops = load_ops(m_socks, m_ports, m_mine, m_taint, id, mode == fast_lo_mode::all);
-    m_msg = load_msg(m_socks, m_taint);
+    m_ops = load_ops(m_socks, m_ports, m_mine, m_taint, m_pids, mode == fast_lo_mode::all);
+    if (m_ops >= 0)
+        m_msg = load_msg(m_socks, m_taint);
     if (m_ops < 0 || m_msg < 0)
-    {
-        m_reason = (errno == EPERM || errno == EACCES)
-            ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
-            : "programs rejected by the verifier (it also needs CAP_PERFMON to name the "
-              "daemon's processes)";
-        return false;
-    }
+        return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
+                                  : "programs could not be loaded", errno);
 
     union bpf_attr a{};
     a.target_fd = static_cast<uint32_t>(m_socks);
     a.attach_bpf_fd = static_cast<uint32_t>(m_msg);
     a.attach_type = BPF_SK_MSG_VERDICT;
     if (sys_bpf(BPF_PROG_ATTACH, &a) < 0)
-    {
-        m_reason = "attach of the sk_msg program to the sockhash failed";
-        return false;
-    }
+        return fail("attach of the sk_msg program to the sockhash failed", errno);
 
     // own needs only the daemon's cgroup, where every socket of its runtimes
     // is born; all needs the root, where a foreign client's socket is.
     const std::string where = mode == fast_lo_mode::all ? "/sys/fs/cgroup" : own_cg;
     const int cg = ::open(where.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (cg < 0)
-    {
-        m_reason = "could not open the cgroup to attach to";
-        return false;
-    }
+        return fail("could not open the cgroup to attach to", errno);
     union bpf_attr l{};
     l.link_create.prog_fd = static_cast<uint32_t>(m_ops);
     l.link_create.target_fd = static_cast<uint32_t>(cg);
@@ -391,13 +371,11 @@ bool fast_lo::start(fast_lo_mode mode)
     const int link_errno = errno;
     ::close(cg);
     if (m_link < 0)
-    {
-        m_reason = (link_errno == EPERM || link_errno == EACCES)
-            ? "no CAP_NET_ADMIN to attach to the cgroup"
-            : "attach of the sockops program to the cgroup failed";
-        return false;
-    }
+        return fail(denied(link_errno) ? "no CAP_NET_ADMIN to attach to the cgroup"
+                                       : "attach of the sockops program to the cgroup failed",
+                    link_errno);
 
+    g_pids = m_pids;
     m_reason = "ok";
     return true;
 }
@@ -405,7 +383,9 @@ bool fast_lo::start(fast_lo_mode mode)
 fast_lo::~fast_lo()
 {
     // Everything is anonymous, so the last close detaches and frees it.
-    for (int fd : { m_link, m_ops, m_msg, m_socks, m_ports, m_mine, m_taint })
+    if (g_pids == m_pids)
+        g_pids = -1;
+    for (int fd : { m_link, m_ops, m_msg, m_pids, m_socks, m_ports, m_mine, m_taint })
         if (fd >= 0)
             ::close(fd);
 }

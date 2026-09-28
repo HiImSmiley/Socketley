@@ -80,8 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   local client connecting to a port one of the daemon's runtimes listens on;
   `own` only pairs whose both ends are the daemon's runtimes, such as a client
   runtime to a server runtime (a proxy already reaches a local runtime's
-  published nodes over unix sockets). Off unless given. Needs `CAP_BPF`,
-  `CAP_NET_ADMIN` and `CAP_PERFMON` and cgroup v2; without them the daemon logs
+  published nodes over unix sockets). Off unless given. Needs `CAP_BPF` and
+  `CAP_NET_ADMIN` and cgroup v2; without them the daemon logs
   `fast-lo: unavailable, serving without it` and serves on the ordinary path.
   The programs are hand-assembled and loaded with a raw `bpf(2)`, and are
   detached when the daemon exits. Measured with redis-benchmark (50

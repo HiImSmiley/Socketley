@@ -27,8 +27,11 @@ public:
     // True when the shortcut is attached; false with reason() set when not.
     bool start(fast_lo_mode mode);
     const char* reason() const { return m_reason; }
+    // The errno of the step that failed, 0 when none did.
+    int error() const { return m_errno; }
 
 private:
+    int m_pids{-1};
     int m_socks{-1};
     int m_ports{-1};
     int m_mine{-1};
@@ -37,7 +40,13 @@ private:
     int m_msg{-1};
     int m_link{-1};
     const char* m_reason{"not started"};
+    int m_errno{0};
 };
+
+// The workers the program counts as this daemon's, marked when the supervisor
+// forks one and unmarked when it lets one go; no-ops while nothing is attached.
+void fast_lo_adopt(int pid);
+void fast_lo_release(int pid);
 
 // Exported by a daemon whose shortcut is attached, so its workers know.
 inline constexpr const char* fast_lo_env = "SOCKETLEY_FAST_LO";

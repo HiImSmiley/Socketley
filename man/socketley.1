@@ -251,20 +251,19 @@ a cache: GET 210\(en285K requests/s without it and 592\(en695K with it, SET
 with 45% less system CPU per request unpipelined.
 .IP
 Needs
-.BR CAP_BPF ,
-.B CAP_NET_ADMIN
+.B CAP_BPF
 and
-.B CAP_PERFMON
+.B CAP_NET_ADMIN
 (root, or
-.B setcap cap_bpf,cap_net_admin,cap_perfmon+ep
+.B setcap cap_bpf,cap_net_admin+ep
 on the binary) and cgroup v2 at /sys/fs/cgroup. Without them the daemon logs
 .B fast\-lo: unavailable, serving without it
 with the reason, and serves on the ordinary path.
 .B own
 attaches to the daemon's cgroup and
 .B all
-to the root cgroup; the daemon's processes are recognised by the binary name and
-cgroup its workers run under. The programs and maps are anonymous and detached
+to the root cgroup; the daemon's own processes are the workers its supervisor
+forked, whose pids it keeps in a map. The programs and maps are anonymous and detached
 when the daemon exits.
 .IP
 What it costs:
@@ -304,11 +303,6 @@ and
 .B SOCKETLEY_PROXY_SOCKMAP
 paths read a queue a socket on the shortcut does not fill, so a proxied pair
 with a 127.0.0.1 leg stays on the copy path while it is on.
-.IP \(bu 2
-A connect or listen issued from an SQPOLL thread or an io\-wq worker is not made
-under the binary's name, so under
-.B own
-that pair stays on TCP.
 .RE
 .RS
 .PP

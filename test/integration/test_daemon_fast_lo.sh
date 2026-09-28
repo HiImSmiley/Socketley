@@ -18,17 +18,16 @@
 #     so once and serving on the ordinary path
 #   * all: a local client of another process not put on the shortcut (acked
 #     counts the whole exchange), or its pipelined replies out of order
+#   * all: a runtime of another daemon -- same binary, same cgroup, no
+#     --fast-lo -- taken for one of this daemon's
 #   * own: that same client put on it anyway -- own is for pairs whose both ends
 #     are this daemon's runtimes -- or a client runtime's pair to a server
 #     runtime not put on it
 #   * splice or the kernel relay taking a pair with a leg on the shortcut, which
 #     loses the bytes and hangs the exchange
 #
-# The last three need CAP_BPF, CAP_NET_ADMIN and CAP_PERFMON, given to a copy of
-# the binary with `sudo -n setcap`; without sudo they are skipped.  The copy has
-# a name of its own because the shortcut recognises its daemon's processes by
-# binary name and cgroup, and a daemon of another test beside this one shares
-# the cgroup.
+# The last three need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
+# with `sudo -n setcap`; without sudo they are skipped.
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -143,8 +142,8 @@ fi
 # ─── the capped copy ────────────────────────────────────────────────────────
 CAPBIN="$WORK/socketley-fastlo"
 cp "$BIN" "$CAPBIN"
-if ! sudo -n setcap cap_bpf,cap_net_admin,cap_perfmon+ep "$CAPBIN" 2>/dev/null; then
-    echo "  SKIP: the shortcut itself (no sudo -n setcap for CAP_BPF/CAP_NET_ADMIN/CAP_PERFMON)"
+if ! sudo -n setcap cap_bpf,cap_net_admin+ep "$CAPBIN" 2>/dev/null; then
+    echo "  SKIP: the shortcut itself (no sudo -n setcap for CAP_BPF/CAP_NET_ADMIN)"
     echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
     [ "$FAIL" = 0 ] && exit 0 || exit 1
 fi
@@ -166,6 +165,19 @@ R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
 read -r VERDICT ACKED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -le 1 ]; then pass
 else fail "all: foreign client" "pipelined replies intact and the client's bytes off TCP" "probe: $R (acked <= 1 is the shortcut)"; fi
+
+# Another daemon of the same binary in the same cgroup is not this daemon.
+OTHERSOCK="$WORK/other.sock"
+OTHERPORT=$((SL_PORT_BASE + 1816))
+SOCKETLEY_SOCKET="$OTHERSOCK" HOME="$WORK" "$CAPBIN" daemon >"$WORK/other.log" 2>&1 & OTHERPID=$!
+for _ in $(seq 1 50); do [ -S "$OTHERSOCK" ] && break; sleep 0.1; done
+SOCKETLEY_SOCKET="$OTHERSOCK" HOME="$WORK" "$BIN" create cache oc -p "$OTHERPORT" -s >/dev/null 2>&1 || true
+wait_port "$OTHERPORT" || true
+R=$(python3 "$WORK/cache_probe.py" "$OTHERPORT" 2>&1 || true)
+{ kill -9 "$OTHERPID"; wait "$OTHERPID"; } 2>/dev/null || true
+read -r VERDICT ACKED <<<"$R"
+if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -gt 1000 ]; then pass
+else fail "all: another daemon" "a daemon without --fast-lo, same binary, same cgroup, stays on TCP" "probe: $R (acked > 1000 is TCP)"; fi
 
 # ─── (d) splice and the kernel relay stay off a pair on the shortcut ───────
 python3 "$WORK/echo_server.py" "$EPORT" >/dev/null 2>&1 & ECHOPID=$!; disown
