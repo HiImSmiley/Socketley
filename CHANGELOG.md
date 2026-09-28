@@ -58,7 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes the kernel has not yet sent. Byte counters do not see redirected bytes
   as they move; the kernel-moved total is read from `TCP_INFO` and added to
   `bytes_in`/`bytes_out` at teardown, and message counts exclude redirected
-  messages.
+  messages. Measured interleaved against HAProxy (loopback, 3 pairs, 4 passes,
+  ratio = socketley rate / HAProxy rate; sk_cores = socketley CPU cores): the
+  win is small messages, where the copy path's per-message read/send is what the
+  kernel now skips. TCP-64 1.12x copy vs 1.26x sockmap; TCP-16K 1.22x vs 1.52x;
+  in both, socketley's cores fall from ~0.52 to ~0.00 because steady-state
+  relaying leaves userspace entirely. It does not pay for bulk or fan-out:
+  TCP-64K 1.33x copy vs 1.19x sockmap and TCP-c32 1.17x vs 0.89x, where the
+  redirect moves fewer bytes per second than batched copies do even though
+  socketley's cores still fall to ~0.00. So the kernel path trades throughput
+  for CPU on large or concurrent traffic and wins outright on small serial
+  messages; it stays opt-in.
 
 ### Changed
 
