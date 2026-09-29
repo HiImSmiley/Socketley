@@ -230,7 +230,7 @@ cli_commands() {
     echo ""
 
     echo -e "${BOLD}create <type> <name> [flags]${NC}"
-    echo "  Create a new runtime: server, client, proxy, cache, or a type"
+    echo "  Create a new runtime: server, client, proxy, cache, storage, or a type"
     echo "  registered by a manifest in the daemon's types directory"
     echo "  (/etc/socketley/types/ or ~/.config/socketley/types/), whose"
     echo "  schema keys become --<key> flags. See REGISTERED TYPES in man."
@@ -636,6 +636,30 @@ runtime_types() {
     echo -e "${CYAN}│${NC} Access: echo \"set foo bar\" | nc localhost 9000                ${CYAN}│${NC}"
     echo -e "${CYAN}│${NC}         redis-cli -p 9000 SET foo bar  (RESP mode)             ${CYAN}│${NC}"
     echo -e "${CYAN}└─────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    echo -e "${GREEN}┌─────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${GREEN}│${NC} ${BOLD}STORAGE${NC}                                                       ${GREEN}│${NC}"
+    echo -e "${GREEN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${GREEN}│${NC} S3-compatible object storage over one directory                ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Default port: 9000                                             ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Flags: --dir path (required), --anonymous (required for now),  ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}        --max-bytes size, --listen unix:path                    ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Example: socketley create storage media -p 9000 \\              ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}            --dir /srv/objects --anonymous -s                   ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}                                                                 ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Works with boto3, the AWS CLI, rclone: path-style URLs,        ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   aws --endpoint-url http://localhost:9000 s3 ls               ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Operations: ListBuckets, Create/Delete/HeadBucket, PutObject,  ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   GetObject (Range, If-*), HeadObject, DeleteObject,           ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   DeleteObjects, CopyObject, ListObjectsV2 and V1. Multipart,  ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   ACLs, versioning: 501 NotImplemented.                        ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}                                                                 ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Durable: a put is synced (file, directory, journal) before it  ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   answers 200; a crash leaves the old object or the new one.   ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Streams: a body is never held whole; a GET of 64 KiB or more   ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   is spliced file to socket (stats: zero_copy_bytes).          ${GREEN}│${NC}"
+    echo -e "${GREEN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
     read -p "Press Enter to continue..." || true
@@ -1192,6 +1216,18 @@ lua_config() {
     echo "            max_connections, rate_limit, global_rate_limit,"
     echo "            idle_timeout, drain, test, tls, cert, key, ca, reconnect,"
     echo "            config/lua, bash, start."
+    echo -e "${BOLD}Storage Flags:${NC}"
+    echo "┌────────────────────────┬─────────────────────────────────────┐"
+    echo "│ --dir <path>           │ Where the buckets live (required)   │"
+    echo "│ --anonymous            │ Accept requests without credentials │"
+    echo "│                        │ (required: never open by omission)  │"
+    echo "│ --max-bytes <size>     │ Quota on bytes held (100M, 1G);     │"
+    echo "│                        │ a put past it is 507 StorageFull    │"
+    echo "│ --listen unix:<path>   │ Serve on an AF_UNIX socket, not -p  │"
+    echo "└────────────────────────┴─────────────────────────────────────┘"
+    echo "  edit cannot change these; import can (dir and anonymous only"
+    echo "  while stopped). --tls and --shards are refused for now."
+    echo ""
     echo "  server:   mode, send_to, udp, http, http_cache, master_pw,"
     echo "            cache, upstreams."
     echo "  client:   target, mode, udp."
@@ -1202,6 +1238,7 @@ lua_config() {
     echo "            sidecar."
     echo "  cache:    persistent, persistent_interval, maxmemory, eviction,"
     echo "            resp, replicate, cluster."
+    echo "  storage:  dir, anonymous, max_bytes."
     echo "  daemon_process was in this list and is REFUSED now, naming the line,"
     echo "  rather than ignored: every call it used to be required for -"
     echo "  socketley.create/.start/.stop/.remove/.send/.list/.get/.pipe, all of"
@@ -2982,7 +3019,7 @@ sdk_cross() {
 # stdout with a live stdin still cannot show a menu worth drawing.
 plain_help() {
     cat <<'EOF'
-socketley — a daemon for long-living network runtimes (server, client, proxy, cache)
+socketley — a daemon for long-living network runtimes (server, client, proxy, cache, storage)
 
 USAGE
   socketley <command> [options]
@@ -2991,7 +3028,7 @@ USAGE
   socketley --lua <file>
 
 RUNTIMES
-  create <type> <name> [flags]   create a server, client, proxy, cache, or a
+  create <type> <name> [flags]   create a server, client, proxy, cache, storage, or a
                                  manifest-registered type (man: REGISTERED TYPES)
   start|stop|restart <name>      lifecycle
   remove <name>                  remove a runtime

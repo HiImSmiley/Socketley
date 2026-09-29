@@ -103,6 +103,11 @@ constexpr config_key config_keys[] = {
     { "replicate",          "--replicate",          key_kind::text    },
     { "cluster",            "--cluster",            key_kind::boolean },
     { "public",             "--public",             key_kind::boolean },
+
+    // ── Storage ─────────────────────────────────────────────────────────────
+    { "dir",                "--dir",                key_kind::text    },
+    { "anonymous",          "--anonymous",          key_kind::boolean },
+    { "max_bytes",          "--max-bytes",          key_kind::scalar  },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be
@@ -547,7 +552,7 @@ int cli_config(int argc, char** argv)
         if (!type_opt || type_opt->empty())
         {
             std::cerr << "runtime \"" << *name_opt << "\" has no type "
-                         "(server, client, proxy, cache, or a registered type)\n";
+                         "(server, client, proxy, cache, storage, or a registered type)\n";
             ++failed;
             continue;
         }

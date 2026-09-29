@@ -1066,7 +1066,7 @@ void storage_run::begin_put_body(const std::shared_ptr<conn>& c, std::shared_ptr
     // The bytes that came with the head.
     std::string pre;
     pre.swap(c->in);
-    if (!c->req.chunked && !c->hook && c->body_left == 0 && pre.empty())
+    if (!c->req.chunked && c->body_left == 0 && pre.empty())
     {
         put_body_complete(c);
         return;

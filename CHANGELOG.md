@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A `storage` runtime: an S3 endpoint over one directory.**
+  `socketley create storage media -p 9000 --dir /srv/objects --anonymous -s`
+  is a fifth built-in type that unmodified S3 clients (boto3, the AWS CLI,
+  rclone) can use with path-style URLs: ListBuckets, CreateBucket, DeleteBucket,
+  HeadBucket, PutObject, GetObject (Range and the four `If-*` conditions),
+  HeadObject, DeleteObject, DeleteObjects, CopyObject (`x-amz-metadata-directive`,
+  within or across buckets) and ListObjectsV2 and V1 (prefix, delimiter,
+  continuation token, max-keys, start-after, `encoding-type=url`), with S3's XML
+  bodies and error codes, `x-amz-request-id` on every reply, Content-MD5
+  checked, and the content headers and `x-amz-meta-*` stored and returned. An
+  object is a file with a checksummed header at `<bucket>/data/ab/cd/<sha256 of
+  the key>`, and each bucket keeps an append-only journal of puts and deletes
+  that is compacted when garbage passes the live objects. A put is written to a
+  temporary file, synced, renamed, the directory synced, the journal appended and
+  synced, and only then answered; a fork-and-`SIGKILL` test over 300 rounds finds
+  only whole objects at final paths and nothing acknowledged undone, and a start
+  after any crash removes temporary files and rebuilds a lost or damaged journal
+  from the object headers. A body is never held whole (a 1 GiB put and get moved
+  the worker's peak RSS from 9 to 13 MiB), a GET of 64 KiB or more is spliced
+  from the file to the socket and counted as `zero_copy_bytes`, and nothing but
+  the startup reconciliation blocks the loop. `--anonymous` is required until
+  credentials exist, `--max-bytes` sets a quota answered with 507, a chunk-signed
+  upload is refused rather than stored with its framing, and multipart, ACLs and
+  versioning answer 501. `--tls`, `--shards`, SigV4 and the Lua surface are not
+  built yet. `type_registry::first_registered` is now 5.
+
 - **Cluster runtimes: on a daemon in Raft mode the cluster heals itself.**
   `socketley cluster create server api -p 8080 --replicas 2` declares a
   runtime once for the whole cluster; the leader places each replica on a

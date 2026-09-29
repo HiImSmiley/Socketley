@@ -4,7 +4,7 @@
 .\"
 .TH SOCKETLEY 1 "2026" "socketley" "User Commands"
 .SH NAME
-socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches) in Docker-like style
+socketley \- manage network runtimes (servers, clients, proxies, Redis-compatible caches, S3 object storage) in Docker-like style
 .SH SYNOPSIS
 .B socketley
 .I command
@@ -117,7 +117,7 @@ socketley \- manage network runtimes (servers, clients, proxies, Redis-compatibl
 .SH DESCRIPTION
 .B socketley
 is a high-performance Linux daemon and CLI that manages network runtimes
-(servers, clients, proxies, Redis-compatible caches) in a Docker-like style \(em
+(servers, clients, proxies, Redis-compatible caches, S3 object storage) in a Docker-like style \(em
 with clustering, WebSocket, Lua scripting, and io_uring async I/O.
 .PP
 .B "TLS terminates on a server or cache listener, on both of a proxy's legs, and on a client's dial."
@@ -1162,7 +1162,7 @@ name	Runtime name \fB(requires restart)\fR
 id	6-char hex identifier (read-only, ignored on import)
 type	T{
 .ad l
-Runtime type: server, client, proxy, cache (read-only, ignored on import)
+Runtime type: server, client, proxy, cache, storage (read-only, ignored on import)
 T}
 was_running	Internal daemon state (ignored on import)
 .TE
@@ -1308,6 +1308,22 @@ are the config-file keys. There is no
 .B sidecar
 field: it is a flag and a config key that sets several of the fields above, and
 nothing writes or reads it in a state document.
+.PP
+.B Storage fields:
+.TS
+l l lw(42).
+Field	Type	Description
+_
+dir	string	T{
+.ad l
+Directory holding the buckets, as \fB\-\-dir\fR \fB(requires restart)\fR
+T}
+anonymous	bool	Accept requests without credentials, as \fB\-\-anonymous\fR \fB(requires restart)\fR
+max_bytes	number	T{
+.ad l
+Quota on the bytes held, as \fB\-\-max\-bytes\fR (0 = none); takes effect on a serving runtime
+T}
+.TE
 .PP
 .B Cache fields:
 .TS
@@ -6081,8 +6097,182 @@ echo "hset user:1 name alice" | nc localhost 9000
 echo "expire user:1 300" | nc localhost 9000
 echo "subscribe news" | nc localhost 9000
 .fi
+.SH STORAGE FLAGS
+A
+.B storage
+runtime serves the S3 API over one directory, so that unmodified S3 clients
+(boto3, the AWS CLI, rclone, SDKs) can put, get, list and delete objects on this
+machine's disk:
+.PP
+.nf
+socketley create storage media \-p 9000 \-\-dir /srv/objects \-\-anonymous \-s
+.fi
+.PP
+It runs in a worker process of its own like every other runtime, speaks
+HTTP/1.1 with path\-style addressing (\fB/bucket/key\fR), answers errors as S3 XML
+(\fB<Error><Code>\fR\|.\|.\|.) and stamps every reply with an
+.BR x\-amz\-request\-id .
+The flags below are the runtime's own;
+.BR \-p ,
+.BR \-\-listen ,
+.BR \-\-max\-connections ,
+.B \-\-idle\-timeout
+and the common flags apply as documented under
+.BR "COMMON FLAGS" .
+.TP
+.BI \-\-dir " path"
+Where the buckets live. Required, created if it does not exist, and made
+absolute against the caller's directory. A runtime is one process on one
+directory: two runtimes on one path would append to each other's journals.
+.TP
+.B \-\-anonymous
+Accept every request without authentication. Required until credentials exist:
+a runtime made with neither is refused, so an endpoint is never open by
+omission. A client that signs its requests works against an anonymous runtime
+\(em the signature is ignored \(em except that a payload signed in chunks
+(\fBSTREAMING\-AWS4\-HMAC\-SHA256\-PAYLOAD\fR, which the AWS CLI and recent SDKs send
+for uploads) is refused with
+.B NotImplemented
+rather than stored with its framing.
+.TP
+.BI \-\-max\-bytes " size"
+A quota on the bytes the runtime holds, with the
+.BR K / M / G
+suffixes of
+.BR \-\-maxmemory .
+A put that would pass it is answered
+.B "507 StorageFull"
+and stores nothing, and the quota can be changed on a serving runtime with
+.BR import .
+0, the default, is no quota.
+.PP
+.B edit
+does not change these three; \fBimport\fR does, as it does for a cache, and
+refuses to move \fBdir\fR or \fBanonymous\fR while the runtime is running.
+\fB\-\-tls\fR and \fB\-\-shards\fR are refused: the shards would share one directory
+and one journal without an owner for each key.
+.SS Supported S3 operations
+.TS
+l l lw(40).
+Operation	Request	Notes
+_
+ListBuckets	GET /	T{
+.ad l
+Sorted by name, with creation dates.
+T}
+CreateBucket	PUT /bucket	T{
+.ad l
+BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S3 would refuse.
+T}
+DeleteBucket	DELETE /bucket	T{
+.ad l
+BucketNotEmpty (409) while it holds objects.
+T}
+HeadBucket	HEAD /bucket	T{
+.ad l
+200, or 404 with no body.
+T}
+GetBucketLocation	GET /bucket?location	T{
+.ad l
+An empty LocationConstraint.
+T}
+ListObjectsV2	GET /bucket?list\-type=2	T{
+.ad l
+prefix, delimiter, continuation\-token, max\-keys (at most 1000), start\-after, encoding\-type=url, fetch\-owner; CommonPrefixes count against max\-keys.
+T}
+ListObjects (V1)	GET /bucket	T{
+.ad l
+marker and NextMarker.
+T}
+PutObject	PUT /bucket/key	T{
+.ad l
+Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite.
+T}
+GetObject	GET /bucket/key	T{
+.ad l
+Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides.
+T}
+HeadObject	HEAD /bucket/key	T{
+.ad l
+The headers of a GET, from memory.
+T}
+DeleteObject	DELETE /bucket/key	T{
+.ad l
+204 whether or not the key existed.
+T}
+DeleteObjects	POST /bucket?delete	T{
+.ad l
+Up to 1000 keys, Quiet, Content\-MD5 checked.
+T}
+CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
+.ad l
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE.
+T}
+.TE
+.PP
+Anything else \(em multipart uploads, ACLs, versioning, tagging, lifecycle \(em is
+answered
+.B "501 NotImplemented"
+and never mistaken for the plain operation. A single put is at most 5 GiB and a
+key at most 1024 bytes.
+.SS How objects are stored
+An object is one file at
+.IB dir / bucket /data/ ab / cd / sha256(key)
+whose first bytes are a checksummed header carrying the key, size, ETag, content
+type, user metadata and time, so the file says what it is and any byte sequence is
+a valid key. Each bucket also keeps an append\-only journal of puts and deletes
+(\fBindex.0\fR, CRC32C\-framed, rewritten when garbage passes the live objects),
+from which listings are answered out of memory.
+.PP
+A put writes a temporary file, syncs it, renames it into place, syncs the
+directory, appends and syncs the journal, and only then answers 200; a delete
+removes the file, syncs the directory and then records it. A crash at any point
+leaves the old object or the new one and never a torn one. A start after a clean
+stop trusts the journals; any other start removes temporary files and reads every
+object header to reconcile the journals with the files, so a journal that is lost
+or damaged is rebuilt from the objects. That reading happens before the listener
+opens and is the only place the loop blocks on the disk: every request is served
+on the runtime's io_uring.
+.PP
+A body is never held whole: it streams from the socket into a megabyte staging
+buffer, is hashed as it passes and written while the next bytes arrive, so a
+gigabyte upload costs a few megabytes of memory. A GET of 64 KiB or more is sent
+by
+.BR splice (2)
+from the file through a pipe to the socket without entering the process, and the
+bytes that took that path are counted as
+.B zero_copy_bytes
+in
+.BR stats ;
+smaller objects are read once, with their header, and sent from memory with the
+response headers in one write.
+.PP
+.B stats
+reports
+.BR buckets ,
+.BR objects ,
+.BR bytes ,
+.BR requests ,
+.BR gets ,
+.BR heads ,
+.BR puts ,
+.BR deletes ,
+.BR copies ,
+.BR lists ,
+.BR client_errors ,
+.BR server_errors ,
+.BR zero_copy_gets ,
+.BR copied_gets ,
+.BR zero_copy_bytes ,
+.BR journal_records ,
+.BR journal_compactions ,
+.B fsyncs
+and
+.BR timeouts .
+A connection with a request head unfinished after ten seconds, or a body that
+has not moved for a minute, is closed and its temporary file removed.
 .SH REGISTERED TYPES
-A runtime type beyond the built-in four is delivered as a manifest plus a
+A runtime type beyond the built-in five is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
 code \(em to learn the type's name, its worker executable, and the schema of
 its configuration keys; the behaviour lives in the binary, which the daemon
@@ -10147,6 +10337,18 @@ Together with the size this bounds how much concurrent traffic the runtime can
 absorb before the pool runs dry and reads fall back to a slower per-read path;
 the pool costs count times size of memory per cache runtime.
 .TP
+.B SOCKETLEY_STORAGE_SPLICE_MIN
+The size in bytes from which a storage GET is sent by splice from the file to
+the socket instead of being read into memory and written. Default
+.BR 65536 ;
+.B 0
+splices every body. Below the default a read and a write cost less than the
+pipe a splice needs, so this changes what
+.B zero_copy_bytes
+counts and how much CPU a GET takes, never what it returns.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_CACHE_TTL_SWEEP_MS
 Interval between periodic sweeps for expired cache keys, in milliseconds.
 Default
@@ -11310,6 +11512,15 @@ The state file's write and
 on a runtime's state changing. Rare, and on the daemon's loop rather than a
 worker's, so what it holds up is every runtime at once.
 .RE
+.PP
+.B "A storage runtime blocks twice, and never while it serves."
+On start, before its listener exists, it reads the directory, removes temporary
+files and, after any stop that was not clean, reads every object's header to
+reconcile the journals \(em a start that takes as long as the object count
+makes it. On stop it syncs a marker file saying the stop was clean. Between the
+two every read and write of a file is an io_uring operation, so a slow disk is
+latency on the requests waiting for it and not a runtime that stopped answering
+its other connections.
 .PP
 .B "What is NOT on this list, having been suspected and measured."
 A static file server spends 7.3 per cent of its worker in the kernel clearing
