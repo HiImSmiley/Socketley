@@ -690,14 +690,19 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    // The copy source's own conditions.
-    const std::string etag = src_meta->etag();
-    if (const auto v = r.header("x-amz-copy-source-if-match"); !v.empty() && !etag_list_matches(v, etag))
-    {
-        send_error(c, make_error("PreconditionFailed"));
-        return;
-    }
-    if (const auto v = r.header("x-amz-copy-source-if-none-match"); !v.empty() && etag_list_matches(v, etag))
+    // The copy source's own conditions, a date counting only when its ETag header is absent.
+    const std::string etag    = src_meta->etag();
+    const int64_t     mtime_s = src_meta->mtime_ms / 1000;
+    bool              refuse  = false;
+    if (const auto v = r.header("x-amz-copy-source-if-match"); !v.empty())
+        refuse = !etag_list_matches(v, etag);
+    else if (const int64_t t = parse_http_date(r.header("x-amz-copy-source-if-unmodified-since")); t >= 0)
+        refuse = mtime_s > t;
+    if (const auto v = r.header("x-amz-copy-source-if-none-match"); !v.empty())
+        refuse = refuse || etag_list_matches(v, etag);
+    else if (const int64_t t = parse_http_date(r.header("x-amz-copy-source-if-modified-since")); t >= 0)
+        refuse = refuse || mtime_s <= t;
+    if (refuse)
     {
         send_error(c, make_error("PreconditionFailed"));
         return;
