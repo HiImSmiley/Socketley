@@ -18,6 +18,7 @@ and exit with the number of failures.
                                    then one more key put
   equiv    -- NODES4... -- NODES1... a listing through each of the first nodes is
                                    the listing of the last, page for page
+  owner    BUCKET KEY N            the shard that owns the key, printed
   slow_put NODE BUCKET KEY BYTES READY RELEASE
                                    a put whose body is sent in two halves
 """
@@ -172,6 +173,7 @@ def mode_storm(binary, nodes):
     rounds, per_node = 25, 4
     torn = 0
     disagreements = 0
+    index_disagrees = 0
     unknown = 0
     for rnd in range(rounds):
         bodies = {}
@@ -208,12 +210,20 @@ def mode_storm(binary, nodes):
             if md5 not in bodies or b != bodies[md5]:
                 unknown += 1
             seen.append(md5)
+            # The listing is the owner's index and the GET is the file, and they name one object.
+            ls, _, lb = req(node, "GET", "/%s?list-type=2&prefix=contended" % bucket)
+            etags = [c.findtext(NS + "ETag").strip('"') for c in ET.fromstring(lb).findall(NS + "Contents")] \
+                if ls == 200 else []
+            if etags != [md5]:
+                index_disagrees += 1
         if len(set(seen)) != 1:
             disagreements += 1
     check("no read was torn: the ETag is the MD5 of the bytes read", torn == 0, "%d torn reads" % torn)
     check("every read was one of the bodies written, whole", unknown == 0, "%d unknown bodies" % unknown)
     check("in every round all four shards served the same object", disagreements == 0,
           "%d rounds disagreed" % disagreements)
+    check("and every listing named the object the GET returned, once", index_disagrees == 0,
+          "%d listings disagreed" % index_disagrees)
 
     pages = list_pages(nodes[-1], bucket)
     check("the key is listed exactly once through the last shard", pages and pages[0][0] == ["contended"], pages)
@@ -370,6 +380,9 @@ def main():
         mode_verify(sys.argv[2], sys.argv[3:])
     elif mode == "equiv":
         mode_equiv(sys.argv[1:])
+    elif mode == "owner":
+        print(owner(sys.argv[2], sys.argv[3], int(sys.argv[4])))
+        return
     elif mode == "slow_put":
         mode_slow_put(*sys.argv[2:8])
         return
