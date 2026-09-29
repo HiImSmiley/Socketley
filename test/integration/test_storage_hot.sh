@@ -18,6 +18,9 @@
 #     answer the last PUT); the read that races a commit is too narrow a window
 #     to hit from here and is pinned in test_object_store instead
 #   * SOCKETLEY_STORAGE_HOT_BYTES=0 not turning it off
+#   * the headers kept with a copy answering what a plain GET does not ask: a
+#     response-content-type override, a Range, an If-None-Match, or the headers
+#     of an object whose metadata was replaced by an overwrite
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -61,6 +64,27 @@ if mode == "basic":
     s, e, d = req("GET", "/hotb/k"); out.append("copy %d %d" % (s, d == b"c" * 3000))
     req("DELETE", "/hotb/k")
     s, e, d = req("GET", "/hotb/k"); out.append("delete %d" % s)
+elif mode == "headers":
+    def full(method, path, body=None, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request(method, path, body=body, headers=headers or {})
+        r = c.getresponse(); data = r.read(); hs = {k.lower(): v for k, v in r.getheaders()}; c.close()
+        return r.status, hs, data
+    body = b"h" * 3000
+    etag = hashlib.md5(body).hexdigest()
+    full("PUT", "/hotb/hk", body, {"Content-Type": "text/x", "x-amz-meta-a": "1"})
+    for _ in range(3): s, h, d = full("GET", "/hotb/hk")
+    out.append("plain %d %d %d %d %d" % (s, h.get("etag") == '"%s"' % etag, h.get("content-type") == "text/x",
+                                         h.get("x-amz-meta-a") == "1", d == body))
+    s, h, d = full("GET", "/hotb/hk?response-content-type=image/png")
+    out.append("override %d %d" % (s, h.get("content-type") == "image/png"))
+    s, h, d = full("GET", "/hotb/hk", headers={"Range": "bytes=0-9"})
+    out.append("range %d %d %d" % (s, h.get("content-range") == "bytes 0-9/3000", d == body[:10]))
+    s, h, d = full("GET", "/hotb/hk", headers={"If-None-Match": '"%s"' % etag})
+    out.append("condition %d" % s)
+    full("PUT", "/hotb/hk", body, {"Content-Type": "text/y", "x-amz-meta-a": "2"})
+    for _ in range(2): s, h, d = full("GET", "/hotb/hk")
+    out.append("replaced %d %d %d" % (s, h.get("content-type") == "text/y", h.get("x-amz-meta-a") == "2"))
 else:
     stop = False; bad = [0]; last = [None]; lock = threading.Lock()
     def w():
@@ -106,6 +130,12 @@ if grep -q 'copy 200 1' <<<"$R"; then pass
 else fail "copy" "a GET after a copy onto the key answers the copied bytes" "probe: $R"; fi
 if grep -q 'delete 404' <<<"$R"; then pass
 else fail "delete" "a GET after a delete is NoSuchKey" "probe: $R"; fi
+
+R=$(python3 "$WORK/hot.py" "$PORT" headers)
+for W in "plain 200 1 1 1 1" "override 200 1" "range 206 1 1" "condition 304" "replaced 200 1 1"; do
+    if grep -q "$W" <<<"$R"; then pass
+    else fail "headers-${W%% *}" "a GET of a held object answers its headers (${W%% *})" "probe: $R"; fi
+done
 
 R=$(python3 "$WORK/hot.py" "$PORT" storm)
 if grep -q 'storm mismatched 0 final 1' <<<"$R"; then pass

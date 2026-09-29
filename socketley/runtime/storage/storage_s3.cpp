@@ -1027,6 +1027,20 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         r.headers.emplace_back("x-amz-mp-parts-count", std::to_string(m.parts));
 }
 
+// The headers of an object's plain answer as the lines they are sent as.
+void render_object_headers(const s3_request& q, const object_meta& m, std::string& out)
+{
+    response r;
+    object_headers(q, m, r, false);
+    for (const auto& [k, v] : r.headers)
+    {
+        out += k;
+        out += ": ";
+        out += v;
+        out += "\r\n";
+    }
+}
+
 enum class cond { proceed, not_modified, precondition_failed };
 
 // RFC 9110 13.2.2 in the order it fixes: If-Match, If-Unmodified-Since,
@@ -1227,6 +1241,19 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     if (held)
     {
         ++m_c.hot_gets;
+        // A GET that asks for nothing but the object gets the headers kept with the copy.
+        if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
+            evaluate(q, *mem) == cond::proceed)
+        {
+            if (hot.head->empty())
+                render_object_headers(q, *mem, *hot.head);
+            response r;
+            r.headers_raw = *hot.head;
+            r.body_view   = *hot.body;
+            ++m_c.copied_gets;
+            send_response(c, std::move(r));
+            return;
+        }
         answer(*mem, -1, 0, *hot.body);
         return;
     }

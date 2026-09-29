@@ -299,6 +299,8 @@ struct response
     std::string body;
     // A body the caller holds until send_response returns, sent instead of `body`.
     std::string_view body_view;
+    // Header lines already rendered, "Name: value\r\n" each, sent after `headers`.
+    std::string_view headers_raw;
     // A HEAD or a 304 carries the headers a body would have and no body.
     bool        head_only{false};
     // The Content-Length to send when it is not the body's own.

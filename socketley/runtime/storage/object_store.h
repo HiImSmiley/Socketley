@@ -397,6 +397,8 @@ public:
     {
         const object_meta* meta{nullptr};
         const std::string* body{nullptr};
+        // The response headers of this version as text, empty until a reader renders them.
+        std::string*       head{nullptr};
     };
     bool hot_find(std::string_view bucket, std::string_view key, hot_hit& out);
     // Keeps what a read brought in, when `read` is still the indexed version.
@@ -586,6 +588,7 @@ private:
         std::string id;        // bucket, a NUL, key
         std::string body;
         object_meta meta;
+        std::string head;
         // The index's record of the key, null for another shard's: valid until hot_drop, which every change to that record makes first.
         const object_meta* live;
     };

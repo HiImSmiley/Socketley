@@ -1054,6 +1054,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     size_t need = 200 + reason.size() + cached_date.size() + 2 * c.req.request_id.size();
     for (const auto& [k, v] : r.headers)
         need += k.size() + v.size() + 4;
+    need += r.headers_raw.size();
     std::string h;
     h.reserve(need + room);
     auto number = [&h](uint64_t n)
@@ -1079,6 +1080,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
         h += v;
         h += "\r\n";
     }
+    h += r.headers_raw;
     if (r.status != 204 && r.status != 304 && r.status != 100)
     {
         h += "Content-Length: ";

@@ -138,6 +138,7 @@ bool object_store::hot_find(std::string_view bucket_name, std::string_view key, 
     m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
     out.meta = e.live;
     out.body = &e.body;
+    out.head = &e.head;
     return true;
 }
 
@@ -158,7 +159,7 @@ void object_store::hot_insert(const std::string& id, const object_meta& read, st
 {
     if (m_hot_index.count(id))
         return;
-    m_hot_lru.push_front(hot_entry{id, std::string(body), read, live});
+    m_hot_lru.push_front(hot_entry{id, std::string(body), read, {}, live});
     m_hot_index.emplace(m_hot_lru.front().id, m_hot_lru.begin());
     m_hot_bytes += body.size() + m_hot_lru.front().id.size();
     while (m_hot_bytes > m_hot_budget && !m_hot_lru.empty())
