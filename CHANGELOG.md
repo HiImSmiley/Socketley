@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A storage runtime shares what the other runtimes have, and can be scripted.**
+  `--tls --cert --key [--ca]` terminate TLS on the listener (sessions are made
+  before the first byte is read, so a plaintext client is refused, certificates
+  are read at every start so `reload` installs a new one, downloads are encrypted
+  rather than spliced, and a peer that never finishes its handshake is dropped
+  after thirty seconds). A runtime with a port has the node beside it that a
+  server or cache has, and a proxy naming it or its group dials that node.
+  `stats` counts answers by S3 code (`error_NoSuchKey`), TLS handshakes and
+  failures, and the metrics endpoint carries `socketley_storage_*` series.
+  Idle timeouts, `--max-connections`, `--cpus`, state persistence, a proxy in
+  front (tcp mode by name and by `@group`, http mode under its prefix) and
+  `daemon --fast-lo` are held down by tests. In Lua a storage runtime's script may
+  define `on_request(req)`, which runs after authentication and before the
+  operation and may refuse (`false`, an S3 error code, or a table with code,
+  message and status; a raise refuses too), and `on_put` / `on_delete` after a
+  commit; and every runtime's script has `socketley.storage.put/get/head/delete/list`
+  to use a storage runtime by name -- waiting in callbacks that can wait (the
+  server's connection is kept open for the answer), and with a last-argument
+  callback elsewhere, such as a cache's `on_write` or a proxy filter. A script
+  moves at most 1 MiB per call.
+
 - **A `storage` runtime: an S3 endpoint over one directory.**
   `socketley create storage media -p 9000 --dir /srv/objects --anonymous -s`
   is a fifth built-in type that unmodified S3 clients (boto3, the AWS CLI,
@@ -33,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   credentials (below), `--max-bytes` sets a quota answered with 507, and ACLs
   and versioning answer 501. `--tls`, `--shards` and the Lua surface are not
   built yet. `type_registry::first_registered` is now 5.
+  the startup reconciliation blocks the loop. `--anonymous` is required until
+  credentials exist, `--max-bytes` sets a quota answered with 507, a chunk-signed
+  upload is refused rather than stored with its framing, and multipart, ACLs and
+  versioning answer 501. `--shards` and SigV4 are not built yet. `type_registry::first_registered` is now 5.
 
 - **A storage runtime authenticates with SigV4, takes multipart uploads and
   checks checksums.** `--access-key K --secret-key S` gives one pair and
@@ -263,6 +288,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
 ### Fixed
+
+- **`stop` then `start` of a server, cache or storage runtime could leave it with
+  no node beside its port.** The stopped worker's destructor unlinked the node
+  path when the process exited, tens of milliseconds after the stop, which could
+  be after the next worker had bound it.
 
 ### Changed
 

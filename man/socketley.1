@@ -6116,6 +6116,11 @@ HTTP/1.1 with path\-style addressing (\fB/bucket/key\fR), answers errors as S3 X
 The flags below are the runtime's own;
 .BR \-p ,
 .BR \-\-listen ,
+.BR \-\-tls ,
+.BR \-\-cert ,
+.BR \-\-key ,
+.BR \-\-ca ,
+.BR \-\-cpus ,
 .BR \-\-max\-connections ,
 .B \-\-idle\-timeout
 and the common flags apply as documented under
@@ -6198,6 +6203,66 @@ file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
 \fB\-\-tls\fR and \fB\-\-shards\fR are refused: the shards would share one directory
 and one journal without an owner for each key.
+does not change these three; \fBimport\fR does, as it does for a cache, and
+refuses to move \fBdir\fR or \fBanonymous\fR while the runtime is running.
+\fB\-\-shards\fR is refused: the shards would share one directory and one journal
+without an owner for each key.
+.SS What it shares with the other runtimes
+.TP
+.B TLS
+.B \-\-tls \-\-cert \-\-key
+terminate TLS on the listener and
+.B \-\-ca
+asks every client for a certificate that CA signed, as for a server or a cache.
+The certificates are read when the runtime starts, so
+.B reload
+installs a replaced one. Every accepted connection is given a session before its
+first byte is read, so a plaintext client meets the handshake and is refused,
+never served in the clear, and a peer that sits in the handshake for thirty
+seconds is dropped. A download over TLS is read from the file and encrypted; only
+plain TCP is sent by splice, so
+.B zero_copy_bytes
+stays 0 for it. TLS and
+.B \-\-listen unix:
+cannot be combined.
+.TP
+.B The node beside the port
+A runtime with a port also listens on
+.IB <daemon\ socket>.rt/ name .sock
+for callers on this machine, and a proxy given
+.B \-\-backend
+.I name
+or a group the runtime belongs to dials that node and not the port. A proxy in
+front carries GETs and PUTs of any size: with
+.B \-\-protocol tcp
+the request reaches the runtime exactly as signed, which is the form to use once
+requests are signed, and with the default
+.B http
+mode the client's path carries the proxy's own
+.BI / name /
+prefix, which is stripped before it is forwarded.
+.TP
+.B Limits and timeouts
+.B \-\-max\-connections
+closes a connection past the limit and
+.B \-\-idle\-timeout
+closes a keep\-alive connection that has sat idle between requests, counted in
+.BR timeouts .
+.TP
+.B \-\-cpus
+is checked against the daemon's ring and shown by
+.B stats
+as it is for every type.
+.TP
+.B Persistence
+The configuration is saved with the runtime, and a daemon restart starts a
+runtime that was running with its objects, TLS settings and limits.
+.TP
+.B daemon \-\-fast\-lo
+A storage runtime reads every body with a receive and only splices from a file to
+a socket, never from a socket, so the loopback shortcut needs no exception for
+it: clients on the shortcut, directly or through a proxy, put and get byte for
+byte.
 .SS Supported S3 operations
 .TS
 l l lw(40).
@@ -6431,10 +6496,187 @@ reports
 .BR multipart_created ,
 .BR multipart_completed ,
 .B multipart_aborted
+.BR timeouts ,
+.B tls
+(1 when the listener is TLS),
+.B tls_handshakes
 and
-.BR timeouts .
+.BR tls_failures ,
+and one line
+.BI error_ Code
+for every S3 error code the runtime has answered, such as
+.BR error_NoSuchKey .
+Bytes in and out and
+.B total_messages
+(requests) are the common fields.
 A connection with a request head unfinished after ten seconds, or a body that
 has not moved for a minute, is closed and its temporary file removed.
+.SS Metrics
+With the metrics endpoint on, each running storage runtime adds
+.BR socketley_storage_buckets ,
+.BR socketley_storage_objects ,
+.BR socketley_storage_bytes_stored ,
+.BR socketley_storage_bytes_received_total ,
+.BR socketley_storage_bytes_sent_total ,
+.BR socketley_storage_zero_copy_bytes_total ,
+.B socketley_storage_tls_handshakes_total
+and
+.BR socketley_storage_tls_failures_total ,
+all labelled
+.BR name ,
+and
+.B socketley_storage_requests_total
+(label
+.B op
+= get, head, put, delete, list, copy) and
+.B socketley_storage_errors_total
+(label
+.B code
+= the S3 error code).
+.SS Lua
+A script attached with
+.B \-\-lua
+may define three hooks on a storage runtime.
+.TP
+.B on_request(req) \(-> nil | true | false | string | table
+Called for every request after it is authenticated and before anything is done,
+on a coroutine, so it may wait for another runtime (see
+.B socketley.storage
+below); the connection is not read from until it answers, so a refused upload is
+answered before its body is read and its connection closed.
+.I req
+has
+.BR method ,
+.B operation
+(the name S3 gives it: GetObject, PutObject, DeleteObjects, ListObjectsV2, .\|.\|.),
+.BR bucket ,
+.BR key ,
+.B path
+and
+.B query
+(as sent),
+.BR host ,
+.BR request_id ,
+.BR principal ,
+.B tls
+(boolean),
+.B client
+(\fBip:port\fR, or \fBunix\fR),
+.B content_length
+(absent for a chunked body) and
+.B headers
+(lowercase names). Returning nothing or
+.B true
+lets the request go on;
+.B false
+refuses it as AccessDenied (403); a string refuses it as that S3 error, with the
+status S3 gives that code (403 for a code the runtime does not know); a table
+.B {deny="Code", message="...", status=403}
+names all three. A raise, and a value of any other type, are refusals answered
+500 InternalError and logged, because a hook whose failure lets requests through
+is not a hook.
+.TP
+.B on_put(bucket, key, meta)
+Called after an object is committed, for a put, for the destination of a copy
+and for an object a script put with
+.BR socketley.storage.put ,
+and never for one that was refused.
+.I meta
+has
+.BR size ,
+.BR etag ,
+.BR content_type ,
+.B mtime_ms
+and
+.B metadata
+(the user metadata, without its prefix). It is called after the client's answer is
+on its way.
+.TP
+.B on_delete(bucket, key)
+Called after an object that was there is removed, from DeleteObject, DeleteObjects
+and
+.BR socketley.storage.delete ,
+and not for a key that was not.
+.PP
+A script that writes in
+.B on_put
+is called again for what it wrote.
+.SS socketley.storage
+Any runtime's script may use a storage runtime by name, in this daemon or in
+another process, without stopping the daemon while it waits:
+.PP
+.nf
+socketley.storage.put(runtime, bucket, key, data [, {content_type=, metadata={}}] [, callback])
+socketley.storage.get(runtime, bucket, key [, callback])
+socketley.storage.head(runtime, bucket, key [, callback])
+socketley.storage.delete(runtime, bucket, key [, callback])
+socketley.storage.list(runtime, bucket [, prefix] [, {delimiter=, max_keys=, start_after=}] [, callback])
+.fi
+.PP
+In a callback that can stop \(em
+.BR on_message ,
+.BR on_client_message ,
+and the storage hooks above \(em a call without a callback waits and returns the
+answer, and the connection a server handler is answering is kept open for it, as
+it is for a linked cache. Anywhere else (an
+.BR on_tick ,
+a cache's
+.BR on_write ,
+a proxy's filter) the last argument is a function, the call returns
+.B true
+at once, and the function is called with the answer on a later turn. A call that
+must wait, made where it cannot and with no function, returns
+.B nil
+and a message saying so.
+.PP
+The answers are:
+.B put
+and
+.B head
+a table with
+.BR size ,
+.BR etag ,
+.BR content_type ,
+.B mtime_ms
+and
+.BR metadata ;
+.B get
+the data and that table;
+.B delete
+.B true
+(also for a key that was not there, as S3 answers);
+.B list
+a table with
+.B objects
+(each with
+.BR key ,
+.BR size ,
+.BR etag ,
+.BR content_type ,
+.BR mtime_ms ),
+.BR prefixes ,
+.B truncated
+and, when truncated,
+.B next
+\(em pass it as
+.B start_after
+for the following page. A failure is
+.B nil
+and the S3 error code and message
+.RB ( NoSuchKey ,
+.BR NoSuchBucket ,
+.BR InvalidBucketName ,
+.BR EntityTooLarge ),
+or
+.B nil
+and a reason when the request did not reach the runtime
+.RB ( "no such runtime" ,
+the request channel is full). Metadata names are lowercased and stored as
+.BR x\-amz\-meta\-* .
+Buckets are made with the S3 API. An object moves whole in memory and the
+request crosses a process boundary in a frame that waits in a 4 MiB queue, so a
+script may put or get at most 1 MiB per call, and at most 1024 calls may be
+waiting on one runtime; larger objects are for the S3 port.
 .SH REGISTERED TYPES
 A runtime type beyond the built-in five is delivered as a manifest plus a
 worker binary. The daemon reads the manifest \(em a declarative file, never
