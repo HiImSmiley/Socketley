@@ -9862,8 +9862,11 @@ port, which is what
 .B {node}
 is for: named 1, 2 and 3, the nodes run
 .B \-p 630{node}
-as ports 6301, 6302 and 6303. A cache with one replica has a primary and
-nothing to promote. The first primary is the replica on the lowest node id,
+as ports 6301, 6302 and 6303. On separate hosts a follower is a peer on another
+machine, which a cache serves only with
+.BR \-\-public :
+put it in the spec (the tests here ran on one host and did not try it). A cache
+with one replica has a primary and nothing to promote. The first primary is the replica on the lowest node id,
 chosen once every replica has said it exists (or after an election timeout). A
 replica is a process the log can name (its
 .BR incarnation ),

@@ -446,6 +446,7 @@ cli_commands() {
     echo "  primary acknowledged and no follower had yet are lost (the manual, under"
     echo "  Cluster caches, says how many). A proxy with --backend @<cache> follows"
     echo "  the primary. A replica without a lease, or told nothing, answers nobody."
+    echo "  On separate hosts the followers are remote peers: the spec needs --public."
     echo -e "  ${CYAN}socketley cluster create server api -p 8080 --replicas 2${NC}"
     echo -e "  ${CYAN}socketley cluster create server api --listen unix:/run/api-{node}.sock${NC}"
     echo -e "  ${CYAN}socketley cluster create cache db -p 6379 --replicas 3${NC}"
