@@ -24,6 +24,8 @@
 #                 works, a key taken out stops, a file that stops parsing keeps
 #                 the keys in force
 #   proxy         a proxy in front of a sharded runtime carries puts and gets
+#   script API    socketley.storage put, get, head, list and delete against a
+#                 sharded runtime, for keys every shard owns
 set -uo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -40,6 +42,7 @@ P4=$((SL_PORT_BASE+1576))
 PC=$((SL_PORT_BASE+1577))
 PB=$((SL_PORT_BASE+1578))
 PP=$((SL_PORT_BASE+1579))
+PS=$((SL_PORT_BASE+1580))
 T="$SOCKETLEY_TMPD"
 CERTS="$T/certs"
 AK="AKIAE2EACCESSKEY01"
@@ -59,9 +62,9 @@ has() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
 expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"; fi; }
 
 cleanup() {
-    for r in e2e1 e2e4 e2ecr e2ebk e2epx; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in e2e1 e2e4 e2ecr e2ebk e2epx e2esv; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
-    for r in e2e1 e2e4 e2ecr e2ebk e2epx; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
+    for r in e2e1 e2e4 e2ecr e2ebk e2epx e2esv; do "$BIN" remove "$r" >/dev/null 2>&1 || true; done
     daemon_stop
 }
 trap cleanup EXIT
@@ -161,6 +164,16 @@ arm() {   # shards port
     done
     if grep -q '^req|[A-Z]*|Unknown|' "$SL_HOOKLOG"; then bad "no request the tests made is named Unknown" "$(grep -m3 '|Unknown|' "$SL_HOOKLOG")"; else ok "no request the tests made is named Unknown"; fi
 
+    # ── what an upload leaves on the disk ──
+    local left=1
+    for _ in $(seq 1 40); do
+        left=$(find "$T/data$n/e2ebkt/mpu" -mindepth 1 2>/dev/null | wc -l)
+        [ "$left" = 0 ] && break
+        sleep 0.25
+    done
+    expect "no upload directory or part file is left on the disk" "$left" 0
+    expect "and nothing is left in tmp/" "$(ls "$T/data$n/e2ebkt/tmp" | wc -l)" 0
+
     # ── stats and metrics ──
     local uniq
     uniq=$(sort -u "$T/expect$n" | wc -l)
@@ -210,6 +223,58 @@ done
 expect "thirty puts through the proxy all land" "$badp" 0
 expect "and read back through the proxy and straight" "$badg" 0
 expect "the listing through the proxy has them all" "$(curl -s "http://127.0.0.1:$PP/pxb?list-type=2" | grep -o '<Key>' | wc -l)" 30
+
+echo "== socketley.storage against the sharded runtime =="
+cat > "$T/server.lua" <<'LUA'
+local function unhex(h) return (h:gsub("%x%x", function(x) return string.char(tonumber(x, 16)) end)) end
+local function hex(s) return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
+local function say(id, ...) self.send(id, table.concat({...}, " ")) end
+function on_client_message(client_id, msg)
+    local w = {}
+    for x in msg:gmatch("%S+") do w[#w + 1] = x end
+    local cmd = w[1]
+    if cmd == "put" then
+        local r, code, message = socketley.storage.put("e2ebk", "rpcb", w[2], unhex(w[3]))
+        if not r then return say(client_id, "err", tostring(code), tostring(message)) end
+        say(client_id, "ok", r.etag, r.size)
+    elseif cmd == "get" then
+        local data, meta, message = socketley.storage.get("e2ebk", "rpcb", w[2])
+        if not data then return say(client_id, "err", tostring(meta), tostring(message)) end
+        say(client_id, "data", hex(data), meta.etag)
+    elseif cmd == "getlen" then
+        local data, meta, message = socketley.storage.get("e2ebk", "rpcb", w[2])
+        if not data then return say(client_id, "err", tostring(meta), tostring(message)) end
+        say(client_id, "len", #data)
+    elseif cmd == "head" then
+        local meta, code = socketley.storage.head("e2ebk", "rpcb", w[2])
+        if not meta then return say(client_id, "err", tostring(code)) end
+        say(client_id, "head", meta.size, meta.etag)
+    elseif cmd == "del" then
+        local ok, code = socketley.storage.delete("e2ebk", "rpcb", w[2])
+        say(client_id, tostring(ok), tostring(code))
+    elseif cmd == "list" then
+        local prefix = w[2] ~= "-" and w[2] or ""
+        local opts = {}
+        if w[3] and w[3] ~= "-" then opts.delimiter = w[3] end
+        if w[4] and w[4] ~= "-" then opts.max_keys = tonumber(w[4]) end
+        if w[5] and w[5] ~= "-" then opts.start_after = w[5] end
+        local l, code = socketley.storage.list("e2ebk", "rpcb", prefix, opts)
+        if not l then return say(client_id, "err", tostring(code)) end
+        local keys = {}
+        for _, o in ipairs(l.objects) do keys[#keys + 1] = o.key end
+        say(client_id, "keys=" .. table.concat(keys, ","), "truncated=" .. tostring(l.truncated), "next=" .. tostring(l.next))
+    end
+end
+LUA
+curl -s -o /dev/null -X PUT "http://127.0.0.1:$PB/rpcb"
+"$BIN" create server e2esv -p "$PS" --lua "$T/server.lua" -s >/dev/null 2>&1
+expect "a server whose script uses socketley.storage is made" "$?" 0
+sleep 0.5
+before=$(stat_sum e2ebk shard_commits_sent)
+run_py "$PS" "$PB" rpc
+sleep 1
+after=$(stat_sum e2ebk shard_commits_sent)
+[ "$after" -gt "$before" ] && ok "puts by script crossed between shards ($((after - before)))" || bad "no put by script crossed" "$before -> $after"
 
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" -eq 0 ] && echo "  OK" || echo "  FAILED"

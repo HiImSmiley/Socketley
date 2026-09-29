@@ -9,6 +9,10 @@ MODE is
           Transfer-Encoding: chunked, and the refusals of a wrong key; the keys
           whose puts committed are written to EXPECT_FILE, one line for each
           on_put a script should have been told of
+  rpc     PORT is a server runtime whose script answers text commands with
+          socketley.storage calls against a sharded runtime (CERT is that
+          runtime's plain http port): put, get, head, list and delete of keys
+          owned by every shard, and an object too large to read
   creds   PORT is plain http and CERT is the credentials file the runtime reads:
           keys added to it work and keys taken out stop, on every shard
 
@@ -310,6 +314,15 @@ def mode_main():
             bad += 1
     check("and twenty-four with an unknown key are all InvalidAccessKeyId", bad == 0, bad)
 
+    # Everything begun was completed or aborted, so no upload is left on any shard.
+    left = []
+    for _ in range(40):
+        left = s3.list_multipart_uploads(Bucket=B).get("Uploads", [])
+        if not left:
+            break
+        time.sleep(0.25)
+    check("no upload is left open when the tests are done", not left, left)
+
     open(EXPECT, "w").write("".join(k + "\n" for k in sorted(put_keys)))
 
 
@@ -351,8 +364,86 @@ def mode_creds():
     check("and the repaired file is read", works("AKIAFOUR", "secret-four") == 16 and works("AKIATWO", "secret-two") == 0)
 
 
+def mode_rpc():
+    import http.client
+    backend = int(CERT)
+    sock = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+    f = sock.makefile("rwb", buffering=0)
+
+    def ask(line):
+        f.write((line + "\n").encode())
+        return f.readline().decode().strip()
+
+    n = 40
+    vals = {"k%02d" % i: (("v%d-" % i) * (i + 1)).encode() for i in range(n)}
+    etags = {}
+    bad = []
+    for k, v in vals.items():
+        r = ask("put %s %s" % (k, v.hex())).split()
+        if r[:1] != ["ok"] or int(r[2]) != len(v):
+            bad.append((k, r))
+        else:
+            etags[k] = r[1]
+    check("forty puts by script, of keys every shard owns, are all stored", not bad, bad[:3])
+    c = http.client.HTTPConnection("127.0.0.1", backend, timeout=30)
+    wrong = 0
+    for k, v in vals.items():
+        c.request("GET", "/rpcb/" + k)
+        resp = c.getresponse()
+        body = resp.read()
+        wrong += resp.status != 200 or body != v or resp.getheader("ETag", "").strip('"') != etags.get(k)
+    check("and read back through the S3 port, with the ETags the script was given", wrong == 0, wrong)
+    bad = []
+    for k, v in vals.items():
+        r = ask("get %s" % k).split()
+        if r[:1] != ["data"] or bytes.fromhex(r[1]) != v or r[2] != etags[k]:
+            bad.append((k, r[:1]))
+    check("a script's get of each, wherever it lives, is the object", not bad, bad[:3])
+    bad = []
+    for k, v in vals.items():
+        r = ask("head %s" % k).split()
+        if r[:1] != ["head"] or int(r[1]) != len(v) or r[2] != etags[k]:
+            bad.append((k, r))
+    check("a script's head of each is its size and ETag", not bad, bad[:3])
+    check("a get of a key that is not there is NoSuchKey", ask("get nothing").split()[:2] == ["err", "NoSuchKey"])
+    check("and a head is too", ask("head nothing").split() == ["err", "NoSuchKey"])
+    # The listing is every shard's, in pages.
+    seen, after, pages = [], "-", 0
+    while pages < 40:
+        r = ask("list - - 7 %s" % after)
+        parts = dict(x.split("=", 1) for x in r.split() if "=" in x)
+        keys = [k for k in parts.get("keys", "").split(",") if k]
+        seen += keys
+        pages += 1
+        if parts.get("truncated") != "true":
+            break
+        after = parts["next"]
+    check("a script's listing in pages of seven is all forty, once, in order", seen == sorted(vals) and pages == 6,
+          (pages, len(seen)))
+    r = ask("list k0 - - -").split()
+    check("with a prefix", any(x.startswith("keys=k00,k01") for x in r), r[:3])
+    for k in list(vals)[::2]:
+        ask("del %s" % k)
+    gone = [k for k in list(vals)[::2] if ask("get %s" % k).split()[:2] == ["err", "NoSuchKey"]]
+    check("deleted through the script, gone for the script", len(gone) == n // 2, len(gone))
+    c.request("GET", "/rpcb?list-type=2")
+    body = c.getresponse().read().decode()
+    check("and gone from the S3 listing", body.count("<Key>") == n // 2, body.count("<Key>"))
+    # An object too large for a script to read is refused, whichever shard holds it.
+    refused = 0
+    for i in range(8):
+        big = os.urandom(1200000)
+        c.request("PUT", "/rpcb/big%d" % i, body=big)
+        c.getresponse().read()
+        r = ask("getlen big%d" % i).split()
+        refused += r[:2] == ["err", "EntityTooLarge"]
+    check("eight objects over the script's limit are EntityTooLarge whichever shard holds them", refused == 8, refused)
+
+
 if MODE == "main":
     mode_main()
+elif MODE == "rpc":
+    mode_rpc()
 elif MODE == "creds":
     mode_creds()
 else:
