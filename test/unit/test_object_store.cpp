@@ -1049,6 +1049,69 @@ TEST_CASE("a bucket has its 256 object directories from the start and a put make
     CHECK(r.store->totals().fsyncs - synced <= 3u * 200u);
 }
 
+TEST_CASE("an answered put and an answered delete survive the loss of the journal behind them")
+{
+    tmpdir d;
+    uint64_t after_a = 0;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        REQUIRE(r.put("bkt", "a", "first").status == st::ok);
+        r.settle();
+        after_a = fs::file_size(journal_path(d.path, "bkt"));
+        // Answered, and the journal has not necessarily heard of them yet.
+        REQUIRE(r.put("bkt", "b", "second").status == st::ok);
+        REQUIRE(r.put("bkt", "c", "third").status == st::ok);
+        REQUIRE(r.del("bkt", "a") == st::ok);
+        r.settle();
+    }
+    // What a crash may leave: the journal as it was after the first put only.
+    fs::resize_file(journal_path(d.path, "bkt"), after_a);
+    REQUIRE_FALSE(fs::exists(d.path + "/.clean.0"));
+
+    rig again(d.path);
+    CHECK_FALSE(again.report.clean_start);
+    std::string got;
+    // The delete was answered, the file is gone, and the record that said so is not needed.
+    CHECK(again.get("bkt", "a", got) == st::no_such_key);
+    CHECK(again.get("bkt", "b", got) == st::ok);
+    CHECK(got == "second");
+    CHECK(again.get("bkt", "c", got) == st::ok);
+    CHECK(got == "third");
+    list_query q;
+    list_page p;
+    REQUIRE(again.store->list("bkt", q, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"b", "c"});
+    CHECK(again.report.dropped == 1);
+    CHECK(again.report.adopted == 2);
+}
+
+TEST_CASE("a clean stop right behind the last answer still leaves a journal the next start trusts")
+{
+    tmpdir d;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        for (int i = 0; i < 20; ++i)
+            REQUIRE(r.put("bkt", "k" + std::to_string(i), "v").status == st::ok);
+        REQUIRE(r.del("bkt", "k3") == st::ok);
+        // No settling: the records of the last answers may still be queued.
+        r.store->close(true);
+    }
+    REQUIRE(fs::exists(d.path + "/.clean.0"));
+    rig again(d.path);
+    CHECK(again.report.clean_start);
+    CHECK(again.report.adopted == 0);
+    CHECK(again.report.dropped == 0);
+    // The listing is the journal's, since nothing was walked: the last delete must be in it.
+    list_query q;
+    list_page p;
+    REQUIRE(again.store->list("bkt", q, p) == st::ok);
+    CHECK(p.objects.size() == 19);
+    CHECK(again.store->find("bkt", "k3") == nullptr);
+    CHECK(again.store->find("bkt", "k19") != nullptr);
+}
+
 TEST_CASE("an object directory that has gone is made again by the next put and by the next start")
 {
     tmpdir d;

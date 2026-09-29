@@ -36,6 +36,8 @@ st errno_status(int64_t res)
 }
 
 constexpr size_t compact_chunk = 256 * 1024;
+// Journal bytes written and unsynced that force a sync under a load that never idles.
+constexpr uint64_t journal_sync_bytes = 1u << 20;
 
 // The name of object directory `n`: the first two hex digits of a key's hash.
 std::string hex_byte(uint8_t n)
@@ -143,12 +145,22 @@ store_totals object_store::totals() const
     return t;
 }
 
-bool object_store::busy() const
+bool object_store::working() const
 {
     if (m_inflight > 0 || !m_creating.empty())
         return true;
     for (const auto& [name, b] : m_buckets)
-        if (b->j.writing || b->j.frozen || !b->j.pending.empty() || b->active_puts > 0)
+        if (b->j.frozen || b->active_puts > 0)
+            return true;
+    return false;
+}
+
+bool object_store::busy() const
+{
+    if (working())
+        return true;
+    for (const auto& [name, b] : m_buckets)
+        if (b->j.writing)
             return true;
     return false;
 }
@@ -264,9 +276,44 @@ void object_store::journal_kick(bucket& b)
 {
     if (b.j.writing || b.j.frozen)
         return;
+
+    // Records written and not synced are made durable when the queue has
+    // drained, or when they have grown past a bound under a load that never lets
+    // it drain: no put waits for this, since the object files are the truth.
+    if (b.j.dirty && (b.j.pending.empty() || b.j.dirty_bytes >= journal_sync_bytes))
+    {
+        b.j.writing = true;
+        const std::string name = b.name;
+        auto alive = m_alive;
+        auto done = [this, alive, name](int64_t r)
+        {
+            if (!*alive)
+                return;
+            bucket* bp = find_bucket(name);
+            if (!bp)
+                return;
+            ++m_totals.fsyncs;
+            if (r < 0)
+                m_journal_lost = true;
+            bp->j.dirty       = false;
+            bp->j.dirty_bytes = 0;
+            bp->j.writing     = false;
+            journal_kick(*bp);
+        };
+        if (!m_io->fsync(b.j.fd, true, done))
+            done(-EIO);
+        return;
+    }
     if (b.j.pending.empty())
     {
         maybe_compact(b);
+        if (!b.j.idle_cbs.empty() && !b.j.frozen && !b.j.writing)
+        {
+            auto cbs = std::move(b.j.idle_cbs);
+            b.j.idle_cbs.clear();
+            for (auto& c : cbs)
+                c();
+        }
         return;
     }
 
@@ -295,13 +342,18 @@ void object_store::journal_kick(bucket& b)
         {
             bp->j.off += bp->j.inflight.size();
             bp->j.records += bp->j.inflight_records;
+            bp->j.dirty = true;
+            bp->j.dirty_bytes += bp->j.inflight.size();
             m_totals.journal_records += bp->j.inflight_records;
         }
+        else
+            m_journal_lost = true;
         bp->j.inflight.clear();
         bp->j.inflight_records = 0;
         bp->j.writing = false;
         for (auto& c : cbs)
-            c(ok);
+            if (c)
+                c(ok);
         if (bucket* again = find_bucket(name))
             journal_kick(*again);
     };
@@ -312,25 +364,11 @@ void object_store::journal_kick(bucket& b)
         {
             if (!*alive)
                 return;
-            bucket* bp = find_bucket(name);
-            if (!bp)
+            if (!find_bucket(name))
                 return;
             if (r < 0)
-            {
                 LOG_WARN(("storage: appending to the journal of " + name + " failed").c_str());
-                finish(false);
-                return;
-            }
-            const bool synced = m_io->fsync(bp->j.fd, true,
-                [this, alive, finish](int64_t r2)
-                {
-                    if (!*alive)
-                        return;
-                    ++m_totals.fsyncs;
-                    finish(r2 >= 0);
-                });
-            if (!synced)
-                finish(false);
+            finish(r >= 0);
         });
     if (!queued)
         finish(false);
@@ -804,20 +842,14 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                                 done({st::io_error, meta});
                                 return;
                             }
+                            // The object is durable: its file is synced, renamed and its
+                            // directory synced.  The journal record is only the index
+                            // of it, written behind the answer and synced in a group.
                             std::string rec;
                             encode_put_record(rec, key, meta);
-                            journal_append(*bs, rec,
-                                [this, alive, bname, key, meta, done](bool ok)
-                                {
-                                    if (!*alive)
-                                        return;
-                                    // The file is in place whatever the journal
-                                    // said, and it is the truth, so the memory
-                                    // follows it and the caller hears the failure.
-                                    if (bucket* bt = find_bucket(bname))
-                                        apply_put(*bt, key, meta);
-                                    done({ok ? st::ok : st::io_error, meta});
-                                });
+                            journal_append(*bs, rec, nullptr);
+                            apply_put(*bs, key, meta);
+                            done({st::ok, meta});
                         });
                     if (!q2)
                     {
@@ -941,17 +973,13 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
                         done(st::no_such_bucket, false);
                         return;
                     }
+                    // The unlink is durable, so the object cannot come back
+                    // whatever happens to the record that says it is gone.
                     std::string rec;
                     encode_delete_record(rec, key, static_cast<int64_t>(now_ms()));
-                    journal_append(*br, rec,
-                        [this, alive, bname, key, existed, done](bool ok)
-                        {
-                            if (!*alive)
-                                return;
-                            if (bucket* bt = find_bucket(bname))
-                                apply_delete(*bt, key);
-                            done(ok ? st::ok : st::io_error, existed);
-                        });
+                    journal_append(*br, rec, nullptr);
+                    apply_delete(*br, key);
+                    done(st::ok, existed);
                 };
                 if (r == -ENOENT)
                 {
@@ -1585,8 +1613,7 @@ st object_store::drop_check(std::string_view name)
     bucket* b = find_bucket(name);
     if (!b || b->closing)
         return st::no_such_bucket;
-    if (b->active_puts || b->active_ops || b->j.writing || b->j.frozen || !b->j.pending.empty() ||
-        !b->lanes.empty())
+    if (b->active_puts || b->active_ops || b->j.frozen || !b->lanes.empty())
         return b->objects.empty() ? st::busy : st::bucket_not_empty;
     if (!b->objects.empty())
         return st::bucket_not_empty;
@@ -1638,6 +1665,14 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
         return;
     }
     b->closing = true;
+    // The records written behind the last answers are on their way to the
+    // journal, and its descriptor is closed with the bucket, so they land first.
+    if (b->j.writing || b->j.frozen || !b->j.pending.empty() || b->j.dirty)
+    {
+        b->j.idle_cbs.push_back([this, name, cb]() { drop_rename(name, cb); });
+        journal_kick(*b);
+        return;
+    }
     ++m_inflight;
     auto alive = m_alive;
     // Renamed out of the way and removed at the next start, so deleting a

@@ -40,11 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   continuation token, max-keys, start-after, `encoding-type=url`), with S3's XML
   bodies and error codes, `x-amz-request-id` on every reply, Content-MD5
   checked, and the content headers and `x-amz-meta-*` stored and returned. An
-  object is a file with a checksummed header at `<bucket>/data/ab/cd/<sha256 of
+  object is a file with a checksummed header at `<bucket>/data/ab/<sha256 of
   the key>`, and each bucket keeps an append-only journal of puts and deletes
   that is compacted when garbage passes the live objects. A put is written to a
-  temporary file, synced, renamed, the directory synced, the journal appended and
-  synced, and only then answered; a fork-and-`SIGKILL` test over 300 rounds finds
+  temporary file, synced, renamed, the directory synced, and only then answered,
+  the journal record following behind the answer and synced in a group; a fork-and-`SIGKILL` test over 300 rounds finds
   only whole objects at final paths and nothing acknowledged undone, and a start
   after any crash removes temporary files and rebuilds a lost or damaged journal
   from the object headers. A body is never held whole (a 1 GiB put and get moved

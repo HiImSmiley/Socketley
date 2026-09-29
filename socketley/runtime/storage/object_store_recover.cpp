@@ -641,6 +641,38 @@ bool object_store::rewrite_journal_sync(bucket& b, std::string& err)
     return true;
 }
 
+bool object_store::settle_journals()
+{
+    for (auto& [name, b] : m_buckets)
+    {
+        if (b->j.frozen)
+            return false;
+        // A write still in the ring is written again here at the same offset
+        // with the same bytes, which lands as it would have, so this need not
+        // wait for a ring that is being torn down.
+        std::string all = b->j.inflight + b->j.pending;
+        const char* p   = all.data();
+        size_t      n   = all.size();
+        off_t       off = static_cast<off_t>(b->j.off);
+        while (n)
+        {
+            const ssize_t w = ::pwrite(b->j.fd, p, n, off);
+            if (w < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            p += w;
+            n -= static_cast<size_t>(w);
+            off += w;
+        }
+        if ((!all.empty() || b->j.dirty) && ::fdatasync(b->j.fd) < 0)
+            return false;
+    }
+    return true;
+}
+
 void object_store::close(bool clean)
 {
     *m_alive = false;
@@ -648,7 +680,7 @@ void object_store::close(bool clean)
     // The marker only when nothing is half done, because a stop that left a
     // rename without its journal record is exactly what the next start must
     // go and look for.
-    if (clean && !busy() && m_root_fd >= 0)
+    if (clean && !working() && !m_journal_lost && settle_journals() && m_root_fd >= 0)
     {
         const std::string marker = m_opts.dir + "/.clean." + std::to_string(m_opts.shard);
         const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);

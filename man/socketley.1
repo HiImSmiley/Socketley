@@ -6425,7 +6425,7 @@ worker is killed leaves nothing behind. The upload id is 32 hex digits.
 CompleteMultipartUpload checks the list against what was uploaded, then writes
 the object's header and copies the parts into a temporary file a megabyte at a
 time on the ring, syncs it and commits it exactly as a put is committed
-(rename, directory sync, journal), so a crash during assembly leaves the upload
+(rename, directory sync; the journal record behind the answer), so a crash during assembly leaves the upload
 intact and no object; only then are the parts removed. The ETag is the md5 of the
 parts' md5s with \fB\-N\fR, as S3's. The bytes pass through the process because
 io_uring has no copy between two files; the loop never blocks on the disk, and
@@ -6439,22 +6439,28 @@ while they are held, and a bucket with an open upload cannot be deleted
 A part sent again needs room for both copies until the new one lands.
 .SS How objects are stored
 An object is one file at
-.IB dir / bucket /data/ ab / cd / sha256(key)
+.IB dir / bucket /data/ ab / sha256(key)
 whose first bytes are a checksummed header carrying the key, size, ETag, content
 type, user metadata and time, so the file says what it is and any byte sequence is
-a valid key. Each bucket also keeps an append\-only journal of puts and deletes
+a valid key; the 256 directories \fBab\fR (the first two hex digits of the hash) are made
+and synced with the bucket, so a put never makes one. Each bucket also keeps an append\-only journal of puts and deletes
 (\fBindex.0\fR, or \fBindex.\fIshard\fR for a sharded runtime; CRC32C\-framed, rewritten when garbage passes the live objects),
 from which listings are answered out of memory.
 .PP
-A put writes a temporary file, syncs it, renames it into place, syncs the
-directory, appends and syncs the journal, and only then answers 200; a delete
-removes the file, syncs the directory and then records it. A crash at any point
-leaves the old object or the new one and never a torn one. A start after a clean
-stop trusts the journals; any other start removes temporary files and reads every
-object header to reconcile the journals with the files, so a journal that is lost
-or damaged is rebuilt from the objects. That reading happens before the listener
-opens and is the only place the loop blocks on the disk: every request is served
-on the runtime's io_uring.
+A put writes a temporary file, syncs it, renames it into place and syncs the
+directory, and only then answers 200; a delete removes the file and syncs the
+directory. The journal record of either is appended behind the answer and synced
+in a group, because the object files are the truth and the journal is only the
+index of them: an answer never waits for it. A crash at any point leaves the old
+object or the new one and never a torn one, and nothing that was answered is
+undone. A start after a clean stop (which writes and syncs the journals last)
+trusts them; any other start removes temporary files and reads every object
+header to reconcile the journals with the files, so a journal that is lost,
+damaged or short of its last records is rebuilt from the objects, and a delete
+whose record was lost does not bring the object back, because its file is gone.
+That reading happens before the listener opens and takes as long as the object
+count makes it, and is the only place the loop blocks on the disk: every request
+is served on the runtime's io_uring.
 .PP
 A body is never held whole: it streams from the socket into a megabyte staging
 buffer, is hashed as it passes and written while the next bytes arrive, so a
@@ -6488,8 +6494,8 @@ key slots, and the shard is \fIslot\fR * \fIN\fR / 16384, so a client can comput
 and send a request to the owner's node and cross nothing. A put streams into a
 temporary file from whichever shard took the connection; that shard then sends the
 owner the file's name and the object's metadata over the shard link, and the owner
-renames it into place, syncs the directory and appends to its own journal
-(\fBindex.\fIi\fR, written by shard \fIi\fR alone) before answering. A delete, the
+renames it into place, syncs the directory and answers, appending to its own journal
+(\fBindex.\fIi\fR, written by shard \fIi\fR alone) behind the answer. A delete, the
 target of a copy and a create\-only put (\fBIf\-None\-Match: *\fR) go the same way,
 which is what keeps the order of changes to a key one order and lets two racing
 creators come out one refused. A listing is asked of every shard and the pages

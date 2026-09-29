@@ -15,7 +15,9 @@
 //
 // The object file is the truth and the journal is what makes a listing cheap:
 // a start after a clean stop trusts the journal, and any other start reads
-// every header and reconciles the journal against them.
+// every header and reconciles the journal against them.  So an answer waits for
+// the file, its rename and its directory, and never for the journal, which is
+// written behind it and synced in a group.
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -399,6 +401,8 @@ public:
 
     // Whether anything is still being written, which a clean stop must wait out.
     bool busy() const;
+    // Busy with anything but a journal write: what a clean stop cannot wait out.
+    bool working() const;
 
     // Bodies on their way in across every bucket, for a cap on what streaming puts hold.
     uint32_t active_puts() const { return m_puts_active; }
@@ -433,6 +437,12 @@ private:
         std::vector<std::function<void(bool)>> inflight_cbs;
         bool        writing{false};
         bool        frozen{false};
+        // Written and not yet synced: the records a crash may take, which the
+        // next start finds again by reading the object files.
+        bool        dirty{false};
+        uint64_t    dirty_bytes{0};
+        // Run once the journal has nothing queued, in flight or unsynced.
+        std::vector<std::function<void()>> idle_cbs;
         // Records the next compaction may not be attempted before.
         uint64_t    compact_after{0};
     };
@@ -469,7 +479,11 @@ private:
     bool rewrite_journal_sync(bucket& b, std::string& err);
 
     // The journal.
+    // `cb` may be empty: the object files are the truth, so a caller that has made its change
+    // durable does not wait for the record.
     void journal_append(bucket& b, std::string_view record, std::function<void(bool)> cb);
+    // Writes and syncs what is queued, blocking, for a stop; false if a journal is busy.
+    bool settle_journals();
     void journal_kick(bucket& b);
     void maybe_compact(bucket& b);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
@@ -509,6 +523,8 @@ private:
     uint32_t m_inflight{0};
     uint32_t m_puts_active{0};
     bool     m_clean_start{false};
+    // A journal write or sync failed, so a stop is not a clean one.
+    bool     m_journal_lost{false};
 };
 
 }   // namespace socketley::storage
