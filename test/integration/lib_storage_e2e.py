@@ -314,6 +314,24 @@ def mode_main():
             bad += 1
     check("and twenty-four with an unknown key are all InvalidAccessKeyId", bad == 0, bad)
 
+    # ── a bucket that holds only an open upload is not dropped, wherever the request lands ──
+    s3.create_bucket(Bucket="e2edrop")
+    uid = s3.create_multipart_upload(Bucket="e2edrop", Key="held/upload")["UploadId"]
+    refused = 0
+    for i in range(16):
+        try:
+            client().delete_bucket(Bucket="e2edrop")
+        except botocore.exceptions.ClientError as e:
+            refused += code_of(e) == "BucketNotEmpty"
+    check("sixteen deletes of a bucket that holds an open upload, on fresh connections, are all BucketNotEmpty",
+          refused == 16, refused)
+    s3.abort_multipart_upload(Bucket="e2edrop", Key="held/upload", UploadId=uid)
+    try:
+        s3.delete_bucket(Bucket="e2edrop")
+        check("and once it is aborted the bucket goes", True)
+    except botocore.exceptions.ClientError as e:
+        check("and once it is aborted the bucket goes", False, e.response["Error"])
+
     # Everything begun was completed or aborted, so no upload is left on any shard.
     left = []
     for _ in range(40):
