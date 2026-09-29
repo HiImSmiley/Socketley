@@ -19,7 +19,8 @@
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #  plain daemon    the four cluster verbs accepted, or answered in the words of
 #                  the directory mode, on a daemon that is not in Raft mode
-#  refusals        a cache or a --test spec accepted; a typo in the flags found
+#  refusals        a cache with no -p or one that sets its own replication, or a
+#                  --test spec, accepted; a typo in the flags found
 #                  on every node at once instead of at the command; a duplicate,
 #                  an unknown name or a no-op scale that exits 0
 #  declare         a spec that reaches no node, a replica count not honoured,
@@ -111,29 +112,6 @@ holders() {
     for n in "$@"; do serves "$name" "$n" && out="$out $n"; done
     echo "${out# }"
 }
-count_of() { local w=($1); echo "${#w[@]}"; }
-
-# Whether the output of a command matches a pattern, read whole first because grep -q ends early and pipefail then blames the writer.
-saw() {
-    local pat=$1 o; shift
-    o=$("$@" 2>&1) || true
-    grep -qE -- "$pat" <<<"$o"
-}
-
-ms_since() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
-
-# A node's death as a machine losing power: its daemon is killed and so are its workers, which the kernel does anyway when their parent goes.
-node_kill() {
-    local n=$1 kids
-    kids=$(pgrep -P "$(cat "$T/$n.pid")" 2>/dev/null || true)
-    kill -9 "$(cat "$T/$n.pid")" 2>/dev/null || true
-    wait "$(cat "$T/$n.pid")" 2>/dev/null || true
-    local k
-    for k in $kids; do
-        wait_for 3 "! kill -0 $k 2>/dev/null" || { echo "  NOTE: worker $k outlived its daemon; killed"; kill -9 "$k" 2>/dev/null || true; }
-    done
-}
-
 raft_port() { case $1 in a) echo $PB;; b) echo $((PB+1));; c) echo $((PB+2));; esac; }
 start_member() {   # start_member <name> [--raft-join addr | --raft-init]
     local n=$1; shift
@@ -183,7 +161,8 @@ refuse() {   # refuse <needle> <cluster args...>: exit 1, said on stdout, nothin
     err=$(cat "$T/err")
     check '[ "$rc" = 1 ] && grep -q -- "$needle" <<<"$out" && [ -z "$err" ]' "cluster $*: exit $rc, stdout: $out, stderr: $err"
 }
-refuse "cache"               create cache db --replicas 2
+refuse "needs -p"            create cache db --replicas 2
+refuse "the cluster's to set" create cache db -p 6300 --replicate 127.0.0.1:1 --replicas 2
 refuse "dry run"             create server x --test
 refuse "unknown flag"        create server x --nonsense
 refuse "replicas must be"    create server x --replicas 0

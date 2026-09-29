@@ -62,3 +62,26 @@ leader_of() {
     done
     return 1
 }
+
+count_of() { local w=($1); echo "${#w[@]}"; }
+
+# Whether the output of a command matches a pattern, read whole first because grep -q ends early and pipefail then blames the writer.
+saw() {
+    local pat=$1 o; shift
+    o=$("$@" 2>&1) || true
+    grep -qE -- "$pat" <<<"$o"
+}
+
+ms_since() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
+
+# A node's death as a machine losing power: its daemon is killed and so are its workers, which the kernel does anyway when their parent goes.
+node_kill() {
+    local n=$1 kids
+    kids=$(pgrep -P "$(cat "$T/$n.pid")" 2>/dev/null || true)
+    kill -9 "$(cat "$T/$n.pid")" 2>/dev/null || true
+    wait "$(cat "$T/$n.pid")" 2>/dev/null || true
+    local k
+    for k in $kids; do
+        wait_for 3 "! kill -0 $k 2>/dev/null" || { echo "  NOTE: worker $k outlived its daemon; killed"; kill -9 "$k" 2>/dev/null || true; }
+    done
+}
