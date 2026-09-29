@@ -71,20 +71,30 @@ struct storage_counters
     std::map<std::string, uint64_t, std::less<>> errors;
 };
 
-// The request as parsed.  Owns its strings, so what an asynchronous step
-// needs later is still here after the next read has reused the buffer.
+// The request as parsed: its head is kept whole and the fields are views into
+// it, so an asynchronous step still finds them after the next read reused the
+// input, and its buffers are reused by the next request on the connection.
 struct s3_request
 {
-    std::string method;
-    std::string version;
-    std::string raw_path;
-    std::string raw_query;
-    std::string host;
-    std::string payload_hash;
+    s3_request() = default;
+    // The views point into `head`, which a copy or a move would leave behind.
+    s3_request(const s3_request&)            = delete;
+    s3_request& operator=(const s3_request&) = delete;
+
+    // Empties every field and keeps the buffers.
+    void reset();
+
+    // The head as it arrived, with the header names lowercased.
+    std::string      head;
+    std::string_view method;
+    std::string_view version;
+    std::string_view raw_path;
+    std::string_view raw_query;
+    std::string_view host;
+    std::string_view payload_hash;
     std::string bucket;
     std::string key;
-    std::vector<std::pair<std::string, std::string>> headers;
-    std::vector<header_ref>                          refs;
+    std::vector<header_ref> headers;
     std::vector<std::pair<std::string, std::string>> query;
     std::string request_id;
 
@@ -97,14 +107,14 @@ struct s3_request
     std::string_view header(std::string_view lower) const
     {
         for (const auto& h : headers)
-            if (h.first == lower)
-                return h.second;
+            if (h.name == lower)
+                return h.value;
         return {};
     }
     bool has_header(std::string_view lower) const
     {
         for (const auto& h : headers)
-            if (h.first == lower)
+            if (h.name == lower)
                 return true;
         return false;
     }
@@ -471,7 +481,7 @@ public:
     void op_get_object(const std::shared_ptr<conn>& c, bool head);
     void op_delete_object(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
-    std::string new_request_id();
+    void new_request_id(std::string& id);
 
     std::string owner_id() const { return "socketley"; }
 
@@ -522,6 +532,8 @@ private:
 
     storage_counters m_c;
     uint64_t    m_rid_seq{0};
+    // The decoded path of the request being parsed, kept for its capacity.
+    std::string m_path_scratch;
     bool        m_stopped{false};
 
     // Calls from other runtimes' scripts still in flight, so a stop can answer them.

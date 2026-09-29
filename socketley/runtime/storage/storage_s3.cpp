@@ -103,12 +103,12 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
             continue;
         const checksum_algo a = checksum_from_header(name);
         if (a == checksum_algo::none)
-            return bad("Value for " + name + " header is invalid.");
+            return bad("Value for " + std::string(name) + " header is invalid.");
         if (!choose(a))
             return false;
         std::string raw;
         if (!base64_decode(http_trim_ows(value), raw) || raw.size() != checksum_raw_len(a))
-            return bad("Value for " + name + " header is invalid.");
+            return bad("Value for " + std::string(name) + " header is invalid.");
         out.expected_b64 = std::string(http_trim_ows(value));
     }
 
@@ -155,7 +155,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     rv.raw_query    = r.raw_query;
     rv.host         = r.host;
     rv.payload_hash = r.payload_hash;
-    rv.headers      = &r.refs;
+    rv.headers      = &r.headers;
     rv.bucket       = r.bucket;
     rv.key          = r.key;
     rv.tls          = c->ssl != nullptr;
@@ -225,7 +225,7 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         s3_request& q = c->req;
         const bool svc = q.bucket.empty();
         const bool bkt = !svc && q.key.empty();
-        const std::string& m = q.method;
+        const std::string_view m = q.method;
         if (svc)
         {
             if (m == "GET")

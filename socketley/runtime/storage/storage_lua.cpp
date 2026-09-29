@@ -54,7 +54,7 @@ std::string_view storage_run::operation_name(const s3_request& r)
 {
     const bool service = r.bucket.empty();
     const bool bucket_level = !service && r.key.empty();
-    const std::string& m = r.method;
+    const std::string_view m = r.method;
     if (service)
         return m == "GET" ? "ListBuckets" : "Unknown";
     if (bucket_level)

@@ -160,7 +160,23 @@ bool storage_run::drained() const
     return m_loop.owner_inflight(this) == 0 && !m_loop.owner_table_full();
 }
 
-std::string storage_run::new_request_id()
+void s3_request::reset()
+{
+    head.clear();
+    method = version = raw_path = raw_query = host = payload_hash = {};
+    bucket.clear();
+    key.clear();
+    headers.clear();
+    query.clear();
+    request_id.clear();
+    has_content_length = false;
+    content_length     = 0;
+    chunked            = false;
+    keep_alive         = true;
+    expect_continue    = false;
+}
+
+void storage_run::new_request_id(std::string& id)
 {
     // Sixteen hex digits, the shape S3's own have, from a counter the loop
     // steps: a syscall per request would be the most expensive thing in a HEAD.
@@ -169,10 +185,9 @@ std::string storage_run::new_request_id()
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
     x ^= x >> 31;
     static constexpr char digits[] = "0123456789ABCDEF";
-    std::string id(16, '0');
+    id.assign(16, '0');
     for (int i = 15; i >= 0; --i, x >>= 4)
         id[static_cast<size_t>(i)] = digits[x & 15];
-    return id;
 }
 
 std::shared_ptr<conn> storage_run::find(uint64_t id)
@@ -1130,7 +1145,7 @@ void storage_run::send_error_st(const std::shared_ptr<conn>& c, st s)
 
 void storage_run::reset_request(const std::shared_ptr<conn>& c)
 {
-    c->req = s3_request{};
+    c->req.reset();
     c->body.clear();
     c->body.shrink_to_fit();
     c->body_left = 0;
@@ -1190,7 +1205,7 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
     {
         if (c->in.size() > max_head_bytes)
         {
-            c->req.request_id = new_request_id();
+            new_request_id(c->req.request_id);
             c->req.keep_alive = false;
             send_error(c, make_error("InvalidRequest"), true);
             return;
@@ -1209,10 +1224,11 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
 bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
 {
     s3_request& r = c->req;
-    r = s3_request{};
-    r.request_id = new_request_id();
+    r.reset();
+    new_request_id(r.request_id);
+    r.head.assign(c->in, 0, head_len);
 
-    const std::string_view all(c->in.data(), head_len);
+    const std::string_view all(r.head);
     auto bad = [&](std::string_view code, bool close = true)
     {
         r.keep_alive = !close;
@@ -1229,9 +1245,9 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
     const size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
     if (sp2 == std::string_view::npos)
         return bad("InvalidRequest");
-    r.method  = std::string(line.substr(0, sp1));
+    r.method  = line.substr(0, sp1);
     const std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
-    r.version = std::string(line.substr(sp2 + 1));
+    r.version = line.substr(sp2 + 1);
     if (r.version != "HTTP/1.1" && r.version != "HTTP/1.0")
     {
         r.keep_alive = false;
@@ -1268,17 +1284,14 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
         const size_t colon = hl.find(':');
         if (colon == std::string_view::npos)
             return bad("InvalidRequest");
-        std::string name(hl.substr(0, colon));
-        for (char& ch : name)
-            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        r.headers.emplace_back(std::move(name), std::string(http_trim_ows(hl.substr(colon + 1))));
+        char* name = r.head.data() + (hl.data() - all.data());
+        for (size_t i = 0; i < colon; ++i)
+            name[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[i])));
+        r.headers.push_back({hl.substr(0, colon), http_trim_ows(hl.substr(colon + 1))});
     }
-    r.refs.reserve(r.headers.size());
-    for (const auto& h : r.headers)
-        r.refs.push_back({h.first, h.second});
 
-    r.host         = std::string(r.header("host"));
-    r.payload_hash = std::string(r.header("x-amz-content-sha256"));
+    r.host         = r.header("host");
+    r.payload_hash = r.header("x-amz-content-sha256");
     const std::string_view conn_hdr = r.header("connection");
     if (r.version == "HTTP/1.0")
         r.keep_alive = http_list_has_token(conn_hdr, "keep-alive", 10);
@@ -1287,16 +1300,17 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
     r.expect_continue = http_list_has_token(r.header("expect"), "100-continue", 12);
 
     const size_t q = target.find('?');
-    r.raw_path  = std::string(target.substr(0, q));
-    r.raw_query = q == std::string_view::npos ? std::string{} : std::string(target.substr(q + 1));
+    r.raw_path  = target.substr(0, q);
+    r.raw_query = q == std::string_view::npos ? std::string_view{} : target.substr(q + 1);
 
-    std::string path;
+    std::string& path = m_path_scratch;
     if (!percent_decode(r.raw_path, path, false))
         return bad("InvalidRequest");
     const std::string_view rest_path = std::string_view(path).substr(1);
     const size_t slash = rest_path.find('/');
-    r.bucket = std::string(rest_path.substr(0, slash));
-    r.key    = slash == std::string_view::npos ? std::string{} : std::string(rest_path.substr(slash + 1));
+    r.bucket.assign(rest_path.substr(0, slash));
+    if (slash != std::string_view::npos)
+        r.key.assign(rest_path.substr(slash + 1));
 
     // The query as key=value pairs, a bare key meaning an empty value -- which
     // is what marks a subresource such as ?delete.

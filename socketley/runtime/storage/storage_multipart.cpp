@@ -437,7 +437,7 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
 
     const std::string   bucket = r.bucket;
     const std::string   key    = r.key;
-    const std::string   host   = r.host;
+    const std::string   host(r.host);
     const std::string   id     = std::string(r.get_query("uploadId"));
     std::weak_ptr<conn> weak = c;
     m_node.mpu_complete(bucket, key, id, std::move(parts),
