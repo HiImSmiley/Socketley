@@ -2018,11 +2018,10 @@ only about 8 microseconds and the saving is a quarter of it; Redis, whose
 per-message work is nearer 32 microseconds, gains 1.02x and may as well not
 bother.
 .PP
-The cost is
-.BR \-\-shards ,
-which this flag refuses \(em see below \(em so a runtime on a unix socket is
-one core. Reach for it for a local sidecar, and for TCP with shards when one
-core is not enough.
+Without
+.B \-\-shards
+a runtime on a unix socket is one core; with it, each shard binds a node of its
+own, see below. Reach for it for a local sidecar.
 .PP
 .B Every unix stream socket on the data path has a 1 MiB send buffer.
 That is each one accepted off a
@@ -2061,15 +2060,14 @@ a filesystem path as a node address). Each combination is refused at start with
 the reason in the daemon
 log, rather than one of the two winning quietly.
 .PP
-.B \-\-shards is no longer among them.
+.B \-\-shards is not among them.
 A sharded runtime binds one node per shard,
 .IR name #i.sock,
-which is the rule the daemon's companion nodes already followed. The pair was
-refused for years on a reason that was true of the design nobody proposed: N
-processes binding
+which is the rule the daemon's companion nodes already follow. N processes
+binding
 .I one
-path unlink each other's node, and only the last to bind stays reachable. N
-paths are N listeners. See
+path would unlink each other's node, and only the last to bind would stay
+reachable; N paths are N listeners. See
 .B Sharding
 under
 .B SERVER FLAGS

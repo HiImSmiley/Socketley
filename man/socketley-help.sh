@@ -469,7 +469,7 @@ runtime_types() {
     echo -e "${GREEN}│${NC}   16 conns over 8 shards reads 2.54x and measures the          ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}   client, not the server.                                      ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}   --http-cache is held once PER SHARD: 8x the memory.          ${GREEN}│${NC}"
-    echo -e "${GREEN}│${NC}   Refused with --listen unix: (SO_REUSEPORT is not a path).    ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   With --listen unix: each shard binds its own base#N.sock.    ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC} Example: socketley create server api -p 9000 -s                ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}                                                                 ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC} Multi-protocol auto-detection (no flags needed):               ${GREEN}│${NC}"
