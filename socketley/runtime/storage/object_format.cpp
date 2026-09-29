@@ -307,10 +307,8 @@ std::string object_rel_path(std::string_view key)
 {
     const std::string h = key_hash(key);
     std::string p;
-    p.reserve(h.size() + 6);
+    p.reserve(h.size() + 3);
     p.append(h, 0, 2);
-    p.push_back('/');
-    p.append(h, 2, 2);
     p.push_back('/');
     p.append(h);
     return p;

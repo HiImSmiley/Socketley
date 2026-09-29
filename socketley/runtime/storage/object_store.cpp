@@ -37,6 +37,13 @@ st errno_status(int64_t res)
 
 constexpr size_t compact_chunk = 256 * 1024;
 
+// The name of object directory `n`: the first two hex digits of a key's hash.
+std::string hex_byte(uint8_t n)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    return {digits[n >> 4], digits[n & 15]};
+}
+
 }   // namespace
 
 const char* status_name(st s)
@@ -552,10 +559,10 @@ void object_store::apply_delete(bucket& b, const std::string& key)
     ++m_totals.deletes;
 }
 
-// ─── Making a directory that exists durably ─────────────────────────────────
+// ─── The directory an object goes into ──────────────────────────────────────
 
 void object_store::ensure_dirs(const std::string& bucket_name, const std::string& rel,
-                               std::function<void(int, st)> cb)
+                               std::function<void(int, st)> cb, bool repaired)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b)
@@ -563,137 +570,64 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
         cb(-1, st::no_such_bucket);
         return;
     }
-    const std::string ab   = rel.substr(0, 2);
-    const std::string abcd = rel.substr(0, 5);
+    const std::string leaf = rel.substr(0, 2);
     auto alive = m_alive;
-
-    // The leaf, which is what a rename and its sync need in hand.
-    auto open_leaf = [this, alive, bucket_name, abcd, cb]()
-    {
-        bucket* bp = find_bucket(bucket_name);
-        if (!bp)
-        {
-            cb(-1, st::no_such_bucket);
-            return;
-        }
-        if (!m_io->openat(bp->data_fd, abcd, O_RDONLY | O_DIRECTORY, 0,
-                [alive, cb](int64_t fd)
-                {
-                    if (!*alive)
-                        return;
-                    if (fd < 0)
-                        cb(-1, st::io_error);
-                    else
-                        cb(static_cast<int>(fd), st::ok);
-                }))
-            cb(-1, st::io_error);
-    };
-
-    // The second level: created, then its parent synced so the name survives.
-    auto make_cd = [this, alive, bucket_name, ab, abcd, cb, open_leaf]()
-    {
-        bucket* bp = find_bucket(bucket_name);
-        if (!bp)
-        {
-            cb(-1, st::no_such_bucket);
-            return;
-        }
-        if (bp->made_dirs.contains(abcd))
-        {
-            open_leaf();
-            return;
-        }
-        const bool q = m_io->mkdirat(bp->data_fd, abcd, 0755,
-            [this, alive, bucket_name, ab, abcd, cb, open_leaf](int64_t r)
-            {
-                if (!*alive)
-                    return;
-                bucket* bq = find_bucket(bucket_name);
-                if (!bq)
-                {
-                    cb(-1, st::no_such_bucket);
-                    return;
-                }
-                if (r < 0 && r != -EEXIST)
-                {
-                    cb(-1, errno_status(r));
-                    return;
-                }
-                const bool q2 = m_io->openat(bq->data_fd, ab, O_RDONLY | O_DIRECTORY, 0,
-                    [this, alive, bucket_name, abcd, cb, open_leaf](int64_t pfd)
-                    {
-                        if (!*alive)
-                            return;
-                        if (pfd < 0)
-                        {
-                            cb(-1, st::io_error);
-                            return;
-                        }
-                        const int parent = static_cast<int>(pfd);
-                        const bool q3 = m_io->fsync(parent, false,
-                            [this, alive, bucket_name, abcd, cb, open_leaf, parent](int64_t r3)
-                            {
-                                if (!*alive)
-                                    return;
-                                ++m_totals.fsyncs;
-                                m_loop->close_fd(parent);
-                                if (r3 < 0)
-                                {
-                                    cb(-1, st::io_error);
-                                    return;
-                                }
-                                if (bucket* bz = find_bucket(bucket_name))
-                                    bz->made_dirs.insert(abcd);
-                                open_leaf();
-                            });
-                        if (!q3)
-                        {
-                            m_loop->close_fd(parent);
-                            cb(-1, st::io_error);
-                        }
-                    });
-                if (!q2)
-                    cb(-1, st::io_error);
-            });
-        if (!q)
-            cb(-1, st::io_error);
-    };
-
-    if (b->made_dirs.contains(ab))
-    {
-        make_cd();
-        return;
-    }
-    const bool q = m_io->mkdirat(b->data_fd, ab, 0755,
-        [this, alive, bucket_name, ab, cb, make_cd](int64_t r)
+    // The 256 directories are made and synced with the bucket, so this opens
+    // one; the repair is for a directory somebody removed.
+    const bool q = m_io->openat(b->data_fd, leaf, O_RDONLY | O_DIRECTORY, 0,
+        [this, alive, bucket_name, rel, leaf, cb, repaired](int64_t fd)
         {
             if (!*alive)
                 return;
             bucket* bp = find_bucket(bucket_name);
             if (!bp)
             {
+                if (fd >= 0)
+                    m_loop->close_fd(static_cast<int>(fd));
                 cb(-1, st::no_such_bucket);
                 return;
             }
-            if (r < 0 && r != -EEXIST)
+            if (fd >= 0)
             {
-                cb(-1, errno_status(r));
+                cb(static_cast<int>(fd), st::ok);
                 return;
             }
-            const bool q2 = m_io->fsync(bp->data_fd, false,
-                [this, alive, bucket_name, ab, cb, make_cd](int64_t r2)
+            if (fd != -ENOENT || repaired)
+            {
+                cb(-1, errno_status(fd));
+                return;
+            }
+            const bool q2 = m_io->mkdirat(bp->data_fd, leaf, 0755,
+                [this, alive, bucket_name, rel, cb](int64_t r)
                 {
                     if (!*alive)
                         return;
-                    ++m_totals.fsyncs;
-                    if (r2 < 0)
+                    bucket* bq = find_bucket(bucket_name);
+                    if (!bq)
                     {
-                        cb(-1, st::io_error);
+                        cb(-1, st::no_such_bucket);
                         return;
                     }
-                    if (bucket* bz = find_bucket(bucket_name))
-                        bz->made_dirs.insert(ab);
-                    make_cd();
+                    if (r < 0 && r != -EEXIST)
+                    {
+                        cb(-1, errno_status(r));
+                        return;
+                    }
+                    const bool q3 = m_io->fsync(bq->data_fd, false,
+                        [this, alive, bucket_name, rel, cb](int64_t r3)
+                        {
+                            if (!*alive)
+                                return;
+                            ++m_totals.fsyncs;
+                            if (r3 < 0)
+                            {
+                                cb(-1, st::io_error);
+                                return;
+                            }
+                            ensure_dirs(bucket_name, rel, cb, true);
+                        });
+                    if (!q3)
+                        cb(-1, st::io_error);
                 });
             if (!q2)
                 cb(-1, st::io_error);
@@ -998,7 +932,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
                 }
                 // The unlink made durable before the journal says it happened,
                 // or a crash brings the file back and a rebuild adopts it.
-                const std::string dir = rel.substr(0, 5);
+                const std::string dir = rel.substr(0, 2);
                 auto journal_it = [this, alive, bname, key, existed, done]()
                 {
                     bucket* br = find_bucket(bname);
@@ -1439,6 +1373,8 @@ struct create_state
     int         stage{0};
     int         fd{-1};
     int64_t     created_ms{0};
+    // The next of the 256 object directories to make; 256 when they are all there.
+    int         fan{256};
     std::string text;
     std::function<void(st)> cb;
 };
@@ -1491,6 +1427,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
     // The directories and the creation stamp are shard 0's, so an adopting
     // shard begins at its own journal.
     cs->stage = adopt ? 6 : 0;
+    cs->fan   = adopt ? 256 : 0;
 
     auto alive = m_alive;
     auto step  = std::make_shared<std::function<void(int64_t)>>();
@@ -1579,7 +1516,15 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 queued = m_io->fsync(m_root_fd, false, next);
                 break;
             case 12:
-                if (res < 0) { fail(errno_status(res)); return; }
+                if (res < 0 && res != -EEXIST) { fail(errno_status(res)); return; }
+                if (cs->fan < 256)
+                {
+                    // One object directory per turn of this step, then on to the next.
+                    --cs->stage;
+                    queued = m_io->mkdirat(m_root_fd, base + "/data/" + hex_byte(static_cast<uint8_t>(cs->fan++)),
+                                           0755, next);
+                    break;
+                }
                 queued = m_io->openat(m_root_fd, base + "/data", O_RDONLY | O_DIRECTORY, 0, next);
                 break;
             case 13:
@@ -1587,9 +1532,15 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 if (res < 0) { fail(errno_status(res)); return; }
                 // Remembered on the state until the last descriptor is opened.
                 cs->text += " " + std::to_string(res);
-                queued = m_io->openat(m_root_fd, base + "/tmp", O_RDONLY | O_DIRECTORY, 0, next);
+                // The 256 names are durable once, here, and no put makes a directory.
+                queued = m_io->fsync(static_cast<int>(res), false, next);
                 break;
             }
+            case 14:
+                if (res < 0) { fail(errno_status(res)); return; }
+                ++m_totals.fsyncs;
+                queued = m_io->openat(m_root_fd, base + "/tmp", O_RDONLY | O_DIRECTORY, 0, next);
+                break;
             default:
             {
                 if (res < 0) { fail(errno_status(res)); return; }

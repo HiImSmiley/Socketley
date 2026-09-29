@@ -221,6 +221,29 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             return false;
         }
 
+    // The 256 object directories are there before the first put wants one; a
+    // bucket that lacks some is given them now and synced once.
+    {
+        bool made = false;
+        static constexpr char digits[] = "0123456789abcdef";
+        for (int i = 0; i < 256; ++i)
+        {
+            const char n[3] = {digits[i >> 4], digits[i & 15], 0};
+            if (::mkdir((base + "/data/" + n).c_str(), 0755) == 0)
+                made = true;
+            else if (errno != EEXIST)
+            {
+                err = "cannot create " + base + "/data/" + n + ": " + errstr(errno);
+                return false;
+            }
+        }
+        if (made && !fsync_dir_path(base + "/data"))
+        {
+            err = "cannot sync " + base + "/data: " + errstr(errno);
+            return false;
+        }
+    }
+
     // When the bucket came to be, kept in a file of its own because a
     // directory's mtime moves with every object written under it.
     {

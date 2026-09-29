@@ -1019,3 +1019,54 @@ TEST_CASE("prefix successor jumps over a whole rolled-up prefix even with high b
     CHECK(keys_of(p) == std::vector<std::string>{"bkt"});
     CHECK(p.prefixes == std::vector<std::string>{std::string("a\xFF") + "/"});
 }
+
+namespace {
+
+size_t count_dirs(const std::string& p)
+{
+    size_t n = 0;
+    for (const auto& e : fs::directory_iterator(p))
+        n += e.is_directory() ? 1 : 0;
+    return n;
+}
+
+}   // namespace
+
+TEST_CASE("a bucket has its 256 object directories from the start and a put makes none")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    CHECK(count_dirs(d.path + "/bkt/data") == 256);
+    const uint64_t synced = r.store->totals().fsyncs;
+    for (int i = 0; i < 200; ++i)
+        REQUIRE(r.put("bkt", "key-" + std::to_string(i), "v").status == st::ok);
+    CHECK(count_dirs(d.path + "/bkt/data") == 256);
+    // Every object is one directory down, at the first two hex digits of its hash.
+    const std::string h = key_hash("key-7");
+    CHECK(fs::exists(d.path + "/bkt/data/" + h.substr(0, 2) + "/" + h));
+    // No put synced a directory it had to make: file, directory and journal, at most.
+    CHECK(r.store->totals().fsyncs - synced <= 3u * 200u);
+}
+
+TEST_CASE("an object directory that has gone is made again by the next put and by the next start")
+{
+    tmpdir d;
+    const std::string h = key_hash("lost");
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        fs::remove(d.path + "/bkt/data/" + h.substr(0, 2));
+        // Nothing is in it, so the put has to make it.
+        REQUIRE(r.put("bkt", "lost", "body").status == st::ok);
+        std::string got;
+        REQUIRE(r.get("bkt", "lost", got) == st::ok);
+        CHECK(got == "body");
+        r.settle();
+    }
+    fs::remove_all(d.path + "/bkt/data/00");
+    rig again(d.path);
+    CHECK(count_dirs(d.path + "/bkt/data") == 256);
+    std::string got;
+    CHECK(again.get("bkt", "lost", got) == st::ok);
+}

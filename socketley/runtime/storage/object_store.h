@@ -9,7 +9,8 @@
 //   <dir>/<bucket>/created            decimal milliseconds since the epoch
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
-//   <dir>/<bucket>/data/ab/cd/<hash>  header + bytes, hash = sha256(key) in hex
+//   <dir>/<bucket>/data/ab/<hash>     header + bytes, hash = sha256(key) in hex; the 256 ab
+//                                     directories are made and synced with the bucket
 //   <dir>/.trash/                     a deleted bucket, removed at the next start
 //
 // The object file is the truth and the journal is what makes a listing cheap:
@@ -451,7 +452,6 @@ private:
         uint32_t    active_puts{0};
         uint32_t    active_ops{0};
         bool        closing{false};
-        std::unordered_set<std::string> made_dirs;
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -480,7 +480,7 @@ private:
     void lane_leave(const std::string& bucket_name, const std::string& key);
 
     void ensure_dirs(const std::string& bucket_name, const std::string& rel,
-                     std::function<void(int leaf_fd, st)> cb);
+                     std::function<void(int leaf_fd, st)> cb, bool repaired = false);
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
 
