@@ -233,6 +233,16 @@ r = request("PUT", B + "k" * 1025, body=b"x")
 check("a key of 1025 bytes is KeyTooLongError 400", r.status == 400 and r.code() == "KeyTooLongError",
       (r.status, r.body[:200]))
 
+# Limits, refused before a byte of the body is read.
+raw = raw_exchange(b"PUT /alpha-bucket/too-big HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % ((5 << 30) + 1),
+                   read_until=b"</Error>", timeout=5)
+check("a single put over 5 GiB is EntityTooLarge 400 before its body is sent",
+      status_of(raw) == 400 and b"<Code>EntityTooLarge</Code>" in raw, raw[:200])
+r = request("PUT", B + "big-meta", body=b"x", headers={"x-amz-meta-big": "v" * 2100})
+check("user metadata over 2 KB is MetadataTooLarge 400", r.status == 400 and r.code() == "MetadataTooLarge",
+      (r.status, r.body[:200]))
+check("and nothing was stored", request("GET", B + "big-meta").status == 404)
+
 r = request("PUT", "/nosuch-bucket/key", body=b"x")
 check("PutObject into a missing bucket is NoSuchBucket 404", r.status == 404 and r.code() == "NoSuchBucket")
 r = request("GET", B + "missing-key")
