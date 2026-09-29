@@ -366,10 +366,9 @@ std::string storage_instance::stats_lines() const
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)
         out << "error_" << code << ":" << n << "\n";
-    if (get_shards() > 1)
     {
         // What the shards say to one another, per shard because how the work
-        // is spread is a question a sum cannot answer.
+        // is spread is a question a sum cannot answer, and all zero at one shard.
         const auto& n = m_run->node().counters();
         out << "shard_index:" << get_shard_index() << "\n"
             << "shard_commits_sent:" << n.commits_out << "\n"

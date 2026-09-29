@@ -998,23 +998,27 @@ TEST_CASE("a listing fails whole when a shard cannot be reached, and a put whose
 TEST_CASE("a quota is an equal share for each shard")
 {
     tmpdir d;
-    // 4 MiB over four shards is a MiB each.
+    // 4 MiB over four shards is a MiB each, so one 700 KiB object fits and a second does not.
     cluster c(d.path, 4, 4u << 20);
     REQUIRE(c.make_bucket(0, "bkt") == st::ok);
     const std::string big = pattern(700 * 1024, 5);
     int accepted = 0, refused = 0;
-    for (int i = 0; i < 20; ++i)
+    // Every key is shard 1's and every put lands on shard 0, whose own bytes stay
+    // empty, so only the owner can know that its share is used.
+    for (int i = 0, made = 0; made < 8; ++i)
     {
-        const put_result r = c.put(0, "bkt", "big" + std::to_string(i), big);
+        const std::string key = "big" + std::to_string(i);
+        if (object_owner("bkt", key, 4) != 1)
+            continue;
+        ++made;
+        const put_result r = c.put(0, "bkt", key, big);
         if (r.status == st::ok)
             ++accepted;
         else if (r.status == st::storage_full)
             ++refused;
     }
-    // The owner decides, so each shard holds one 700 KiB object and refuses its second.
-    CHECK(accepted >= 1);
-    CHECK(refused >= 1);
-    CHECK(accepted <= 4);
+    CHECK(accepted == 1);
+    CHECK(refused == 7);
     CHECK(tmp_files(d.path, "bkt").empty());
     for (const auto& mb : c.m)
         CHECK(mb->store->totals().bytes <= (1u << 20));

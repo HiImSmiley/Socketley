@@ -151,15 +151,18 @@ wait_nodes "$SOCK1" && ok "and answers" || bad "one-shard node" "no answer"
 run_py equiv -- "${N4[@]}" -- "$SOCK1"
 
 echo "== one shard crosses nothing =="
+bad_one=0
 for i in $(seq 1 12); do
-    curl -s --unix-socket "$SOCK1" -X PUT --data-binary "v$i" "http://x/pop/one$i" -o /dev/null
+    [ "$(code --unix-socket "$SOCK1" -X PUT --data-binary "v$i" "http://x/pop/one$i")" = 200 ] || bad_one=$((bad_one+1))
 done
+expect "twelve puts at one shard are all answered 200" "$bad_one" 0
 curl -s --unix-socket "$SOCK1" -X PUT http://x/onebucket -o /dev/null
 curl -s --unix-socket "$SOCK1" "http://x/pop?list-type=2" -o /dev/null
 curl -s --unix-socket "$SOCK1" -X DELETE http://x/pop/one1 -o /dev/null
 curl -s --unix-socket "$SOCK1" -X DELETE http://x/onebucket -o /dev/null
 st1=$("$BIN" stats stg1 2>&1)
-has "$st1" "mesh_direct:0" && has "$st1" "mesh_relayed:0" && ! has "$st1" "shard_commits_sent" \
+has "$st1" "mesh_direct:0" && has "$st1" "mesh_relayed:0" && has "$st1" "shard_commits_sent:0" \
+    && has "$st1" "shard_deletes_sent:0" && has "$st1" "shard_list_fanouts:0" && has "$st1" "shard_peer_failures:0" \
     && ok "puts, deletes, listings and bucket changes at one shard cross nothing" \
     || bad "one shard crossed" "$st1"
 "$BIN" stop stg1 >/dev/null 2>&1
