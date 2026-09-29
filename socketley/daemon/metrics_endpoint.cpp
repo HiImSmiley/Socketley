@@ -396,6 +396,134 @@ static void json_append_uint(std::string& out, uint64_t v)
     out.append(buf, end - buf);
 }
 
+// One storage runtime's `stats` text as figures: the lines are `key:value`, and
+// the ones that are not numbers are left out.
+struct storage_row
+{
+    std::string name;
+    std::vector<std::pair<std::string, uint64_t>> figures;
+
+    bool get(std::string_view key, uint64_t& out) const
+    {
+        for (const auto& [k, v] : figures)
+            if (k == key)
+            {
+                out = v;
+                return true;
+            }
+        return false;
+    }
+};
+
+static storage_row parse_storage_row(std::string_view name, std::string_view detail)
+{
+    storage_row row;
+    row.name = std::string(name);
+    while (!detail.empty())
+    {
+        const size_t nl = detail.find('\n');
+        const std::string_view line = detail.substr(0, nl);
+        detail = nl == std::string_view::npos ? std::string_view{} : detail.substr(nl + 1);
+        const size_t colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        uint64_t v = 0;
+        const std::string_view num = line.substr(colon + 1);
+        const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), v);
+        if (ec != std::errc{} || end != num.data() + num.size())
+            continue;
+        row.figures.emplace_back(std::string(line.substr(0, colon)), v);
+    }
+    return row;
+}
+
+// The series a storage runtime has that no other type does: what it holds, what
+// it was asked, what it moved and how it answered.
+static void append_storage_series(std::string& out, const std::vector<storage_row>& rows)
+{
+    if (rows.empty())
+        return;
+
+    const auto family = [&](std::string_view metric, std::string_view type, std::string_view help,
+                            std::string_view key)
+    {
+        out += "\n# HELP ";
+        out += metric;
+        out += ' ';
+        out += help;
+        out += "\n# TYPE ";
+        out += metric;
+        out += ' ';
+        out += type;
+        out += '\n';
+        for (const auto& r : rows)
+        {
+            uint64_t v;
+            if (!r.get(key, v))
+                continue;
+            out += metric;
+            out += "{name=\"";
+            label_escape_into(out, r.name);
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+    };
+
+    family("socketley_storage_buckets", "gauge", "Buckets a storage runtime holds.", "buckets");
+    family("socketley_storage_objects", "gauge", "Objects a storage runtime holds.", "objects");
+    family("socketley_storage_bytes_stored", "gauge", "Object bytes a storage runtime holds.", "bytes");
+    family("socketley_storage_bytes_received_total", "counter",
+           "Bytes a storage runtime read from its clients, including protocol framing.", "bytes_in");
+    family("socketley_storage_bytes_sent_total", "counter",
+           "Bytes a storage runtime wrote to its clients, including protocol framing.", "bytes_out");
+    family("socketley_storage_zero_copy_bytes_total", "counter",
+           "Object bytes sent from file to socket without entering the process.", "zero_copy_bytes");
+    family("socketley_storage_tls_handshakes_total", "counter",
+           "TLS handshakes a storage runtime completed.", "tls_handshakes");
+    family("socketley_storage_tls_failures_total", "counter",
+           "TLS handshakes that failed or never finished.", "tls_failures");
+
+    out += "\n# HELP socketley_storage_requests_total Requests a storage runtime served, by operation.\n"
+           "# TYPE socketley_storage_requests_total counter\n";
+    static constexpr std::pair<const char*, const char*> ops[] = {
+        {"gets", "get"}, {"heads", "head"}, {"puts", "put"},
+        {"deletes", "delete"}, {"lists", "list"}, {"copies", "copy"},
+    };
+    for (const auto& r : rows)
+        for (const auto& [key, op] : ops)
+        {
+            uint64_t v;
+            if (!r.get(key, v))
+                continue;
+            out += "socketley_storage_requests_total{name=\"";
+            label_escape_into(out, r.name);
+            out += "\",op=\"";
+            out += op;
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+
+    // One line per code that has been answered, so a runtime that has never
+    // refused anything has no series to graph.
+    out += "\n# HELP socketley_storage_errors_total S3 errors a storage runtime answered, by code.\n"
+           "# TYPE socketley_storage_errors_total counter\n";
+    for (const auto& r : rows)
+        for (const auto& [key, v] : r.figures)
+        {
+            if (key.compare(0, 6, "error_") != 0)
+                continue;
+            out += "socketley_storage_errors_total{name=\"";
+            label_escape_into(out, r.name);
+            out += "\",code=\"";
+            label_escape_into(out, std::string_view(key).substr(6));
+            out += "\"} ";
+            json_append_uint(out, v);
+            out += '\n';
+        }
+}
+
 std::string metrics_endpoint::build_metrics() const
 {
     // Snapshot runtime data under lock
@@ -405,6 +533,9 @@ std::string metrics_endpoint::build_metrics() const
         runtime_state state;
         uint64_t total_connections, total_messages, bytes_in, bytes_out;
         size_t active_connections;
+        // What the worker last published, kept for the types whose own
+        // counters are series of their own.
+        std::string detail;
     };
     std::vector<runtime_snapshot> snapshots;
     {
@@ -423,7 +554,8 @@ std::string metrics_endpoint::build_metrics() const
                 f.total_messages,
                 f.bytes_in,
                 f.bytes_out,
-                static_cast<size_t>(f.active_connections)});
+                static_cast<size_t>(f.active_connections),
+                rt->get_type() == runtime_storage ? rt->stat_detail_snapshot() : std::string{}});
         }
     }
 
@@ -578,6 +710,19 @@ std::string metrics_endpoint::build_metrics() const
         json_append_uint(out, s.total_messages);
         out += "\n";
     }
+
+    std::vector<storage_row> storage_rows;
+    for (const auto& s : snapshots)
+        if (s.type == runtime_storage && s.state == runtime_running && !s.detail.empty())
+        {
+            storage_row row = parse_storage_row(s.name, s.detail);
+            // The byte counts are the shared table's, summed as the other
+            // runtimes' are, and not part of the published text.
+            row.figures.insert(row.figures.begin(),
+                               {{"bytes_in", s.bytes_in}, {"bytes_out", s.bytes_out}});
+            storage_rows.push_back(std::move(row));
+        }
+    append_storage_series(out, storage_rows);
 
     return out;
 }

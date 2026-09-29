@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,6 +24,7 @@
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/http_framing.h"
+#include "../../shared/tls_context.h"
 
 class storage_instance;
 
@@ -56,6 +58,11 @@ struct storage_counters
     uint64_t mpu_parts{0};
     uint64_t mpu_completed{0};
     uint64_t mpu_aborted{0};
+    // TLS handshakes that completed and that did not.
+    uint64_t tls_handshakes{0};
+    uint64_t tls_failures{0};
+    // S3 errors answered, by the code in the XML.
+    std::map<std::string, uint64_t, std::less<>> errors;
 };
 
 // The request as parsed.  Owns its strings, so what an asynchronous step
@@ -148,11 +155,30 @@ class storage_run;
 
 struct conn
 {
+    conn() = default;
+    conn(const conn&)            = delete;
+    conn& operator=(const conn&) = delete;
+    ~conn()
+    {
+        if (ssl)
+            tls_context::free_ssl(ssl);
+    }
+
     storage_run* run{nullptr};
     uint64_t     id{0};
     int          fd{-1};
     // An identity for callbacks that outlive a close.
     bool         dead{false};
+
+    // ── TLS ─────────────────────────────────────────────────────────────────
+    // Null on a cleartext connection.  With a session, `rbuf`'s job is done by
+    // `cbuf` (ciphertext), `wq` holds plaintext waiting for the record layer
+    // and `wbuf` the ciphertext the kernel is reading.
+    SSL*            ssl{nullptr};
+    tls_conn_state  tls_state{tls_conn_none};
+    bool            pulling{false};
+    std::unique_ptr<char[]> cbuf;
+    std::chrono::steady_clock::time_point accepted{};
 
     io_request rd_req{};
     io_request wr_req{};
@@ -184,6 +210,8 @@ struct conn
     std::string wbuf;
     size_t      woff{0};
     std::string wq;
+    // How much of `wq` the record layer has already taken.
+    size_t      wq_off{0};
     // Called once everything queued has been written.
     std::function<void()> after_write;
     bool        close_after_write{false};
@@ -253,6 +281,13 @@ public:
     // Opens the store, which blocks and so runs before anything is bound.
     bool open(std::string& err);
     bool listen_on(int fd);
+    // A descriptor accepted somewhere else (the companion node), which becomes a
+    // connection exactly as one of this run's own accepts does.
+    bool adopt_external(int fd);
+    // The context every accepted connection's session is made from; none means
+    // cleartext.
+    void set_tls(std::unique_ptr<tls_context> ctx) { m_tls = std::move(ctx); }
+    bool tls_enabled() const { return m_tls != nullptr; }
 
     void on_cqe(struct io_uring_cqe* cqe) override;
 
@@ -295,6 +330,12 @@ public:
     void write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void splice_out_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
+    // Plaintext, wherever it came from: the socket's bytes or a session's.
+    void plain_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
+    void tls_in(const std::shared_ptr<conn>& c, size_t n);
+    void tls_pull(const std::shared_ptr<conn>& c);
+    // Moves what the record layer has to say and what waits in `wq` into `wbuf`.
+    bool tls_encrypt(const std::shared_ptr<conn>& c);
     void close_conn(const std::shared_ptr<conn>& c);
     void maybe_release(const std::shared_ptr<conn>& c);
     void queue_write(const std::shared_ptr<conn>& c, std::string data);
@@ -309,6 +350,8 @@ public:
     void send_error(const std::shared_ptr<conn>& c, const s3_error& e, bool close = false,
                     std::string_view extra_name = {}, std::string_view extra_value = {});
     void send_error_st(const std::shared_ptr<conn>& c, st s);
+    // One more answered with this S3 error code, for `stats` and the metrics.
+    void count_error(std::string_view code);
     void finish_request(const std::shared_ptr<conn>& c);
     void reset_request(const std::shared_ptr<conn>& c);
     std::string response_head(const conn& c, const response& r) const;
@@ -383,6 +426,7 @@ private:
     anonymous_authenticator m_anon;
     uint32_t          m_mpu_expire_secs{0};
     std::chrono::steady_clock::time_point m_last_reap{};
+    std::unique_ptr<tls_context> m_tls;
 
     int         m_listen_fd{-1};
     io_request  m_accept_req{};

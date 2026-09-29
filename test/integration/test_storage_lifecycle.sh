@@ -5,8 +5,10 @@
 # ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────
 #
 #   refusals    a runtime with no --dir, or with neither --anonymous nor a way
-#               to authenticate, is not made; --tls and --shards, which the
-#               runtime does not do yet, are refused rather than stored
+#               to authenticate, is not made; --shards, which the runtime does
+#               not do yet, is refused rather than stored, and --tls with a
+#               certificate that cannot be read does not start (the TLS runtime
+#               itself is test_storage_tls.sh)
 #   durability  an object put is served after `stop` and `start`, after its
 #               worker is killed with SIGKILL, and after the daemon itself is
 #               restarted and brings the runtime back on its own; an upload cut
@@ -76,8 +78,9 @@ contains "and names --dir" "$out" "--dir"
 out=$("$BIN" create storage x2 -p "$P3" --dir "$DATA" 2>&1); rc=$?
 expect "create with neither --anonymous nor credentials is refused" "$rc" 1
 contains "and names --anonymous" "$out" "--anonymous"
-out=$("$BIN" create storage x3 -p "$P3" --dir "$DATA" --anonymous --tls --cert /x --key /y 2>&1); rc=$?
-expect "create with --tls is refused" "$rc" 1
+out=$("$BIN" create storage x3 -p "$P3" --dir "$DATA" --anonymous --tls --cert /nonexistent.pem --key /nonexistent-key.pem -s 2>&1); rc=$?
+expect "--tls with a certificate that cannot be read does not start" "$rc" 1
+"$BIN" remove x3 >/dev/null 2>&1 || true
 out=$("$BIN" create storage x4 -p "$P3" --dir "$DATA" --anonymous --shards 2 2>&1); rc=$?
 expect "create with --shards 2 is refused" "$rc" 1
 contains "and says why" "$out" "shards"

@@ -121,14 +121,14 @@ std::string tls_config_refusal(runtime_type type,
     // The mesh client-certificate options describe a backend leg, which
     // neither a server nor a cache has, so this catches a state file or an
     // imported document that carries them.
-    if ((type == runtime_server || type == runtime_cache) &&
+    if ((type == runtime_server || type == runtime_cache || type == runtime_storage) &&
         (!mesh_client_ca.empty() || !mesh_client_cert.empty() || !mesh_client_key.empty()))
     {
         std::string msg(!mesh_client_ca.empty()   ? "--client-ca"
                       : !mesh_client_cert.empty() ? "--client-cert"
                                                   : "--client-key");
         msg += ": configures a proxy's backend leg, and a ";
-        msg += type == runtime_server ? "server" : "cache";
+        msg += type == runtime_server ? "server" : type == runtime_cache ? "cache" : "storage";
         msg += " runtime has none -- it would be stored and reported and dial "
                "nothing\n";
         return msg;

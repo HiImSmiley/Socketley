@@ -205,7 +205,7 @@ inline bool wants_companion(runtime_type type, uint16_t port,
     // wired to a listener is a path published into thin air -- which a proxy
     // then dials instead of the port that works.  Measured as exactly that:
     // a cache backend, a node nobody bound, and every request unanswered.
-    if (type != runtime_server && type != runtime_cache)
+    if (type != runtime_server && type != runtime_cache && type != runtime_storage)
         return false;
 
     // Not a sharded cache: only cache_shard_of(key, N) may answer a key, so a

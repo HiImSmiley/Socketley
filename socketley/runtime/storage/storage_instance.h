@@ -11,6 +11,8 @@
 
 #include "s3_auth.h"
 #include "../../shared/runtime_instance.h"
+#include "../../shared/tls_context.h"
+#include "../../shared/unix_companion.h"
 
 namespace socketley::storage
 {
@@ -98,5 +100,8 @@ private:
     std::vector<std::unique_ptr<socketley::storage::storage_run>> m_graveyard;
     event_loop* m_loop{nullptr};
     std::string m_bound_listen_path;
+    // The node beside the port, made once and kept: it owns an io_request the
+    // ring may still be holding after a stop.
+    std::unique_ptr<socketley::unix_companion> m_companion;
     uint32_t    m_max_conns_cached{0};
 };

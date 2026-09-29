@@ -136,6 +136,19 @@ bool storage_instance::setup(event_loop& loop)
     m_loop = &loop;
     refresh_cached_limits();
 
+    // Read here, at every start, so a `reload` installs a replaced certificate.
+    std::unique_ptr<tls_context> tls;
+    if (get_tls())
+    {
+        tls = std::make_unique<tls_context>();
+        if (!tls->init_server(get_cert_path(), get_key_path(), get_ca_path()))
+        {
+            LOG_ERROR("storage: TLS listener not started -- the certificate, key or "
+                      "client CA could not be loaded");
+            return false;
+        }
+    }
+
     socketley::storage::authenticator* auth = m_auth.get();
     std::unique_ptr<socketley::storage::authenticator> signed_auth;
     if (!auth && has_credentials())
@@ -168,6 +181,7 @@ bool storage_instance::setup(event_loop& loop)
     if (signed_auth)
         run->adopt_authenticator(std::move(signed_auth));
     run->set_mpu_expire_secs(m_mpu_expire_secs);
+    run->set_tls(std::move(tls));
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -218,11 +232,33 @@ bool storage_instance::setup(event_loop& loop)
         return false;
     }
     m_run = std::move(run);
+
+    // And a node beside the port for callers already on this box.  Its failure
+    // is not this runtime's failure: the port is up either way.
+    if (socketley::unix_sock::wants_companion(get_type(), get_port(), listen_path, get_tls(),
+                                              /*udp=*/false, get_shards()) &&
+        !get_companion_path().empty())
+    {
+        if (!m_companion)
+            m_companion = std::make_unique<socketley::unix_companion>(
+                std::string(get_companion_path()),
+                [this](int fd)
+                {
+                    if (m_run)
+                        return m_run->adopt_external(fd);
+                    if (m_loop)
+                        m_loop->close_fd(fd);
+                    return false;
+                });
+        m_companion->start(loop);
+    }
     return true;
 }
 
 void storage_instance::teardown(event_loop&)
 {
+    if (m_companion)
+        m_companion->stop();
     if (m_run)
     {
         m_run->stop();
@@ -240,6 +276,8 @@ void storage_instance::on_loop_turn()
 {
     if (!m_graveyard.empty())
         std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    if (m_companion)
+        m_companion->pump();
     if (m_run)
         m_run->on_turn();
 }
@@ -277,6 +315,13 @@ std::string storage_instance::stats_lines() const
         << "multipart_bytes:" << mp.bytes << "\n"
         << "multipart_created:" << c.mpu_created << "\n"
         << "multipart_completed:" << c.mpu_completed << "\n"
-        << "multipart_aborted:" << c.mpu_aborted << "\n";
+        << "multipart_aborted:" << c.mpu_aborted << "\n"
+        << "tls:" << (m_run->tls_enabled() ? 1 : 0) << "\n"
+        << "tls_handshakes:" << c.tls_handshakes << "\n"
+        << "tls_failures:" << c.tls_failures << "\n";
+    // One line per code answered, so a client's mistakes and the runtime's own
+    // are told apart without reading a log.
+    for (const auto& [code, n] : c.errors)
+        out << "error_" << code << ":" << n << "\n";
     return out.str();
 }

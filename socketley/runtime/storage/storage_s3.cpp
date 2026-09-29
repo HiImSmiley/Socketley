@@ -158,7 +158,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     rv.headers      = &r.refs;
     rv.bucket       = r.bucket;
     rv.key          = r.key;
-    rv.tls          = false;
+    rv.tls          = c->ssl != nullptr;
 
     auth_verdict v = m_auth->authorize(rv);
     if (!v.allowed)
@@ -1089,6 +1089,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
                 e.headers.emplace_back("Content-Type", "application/xml");
                 e.headers.emplace_back("Content-Range", "bytes */" + std::to_string(m.size));
                 s3_error err = make_error("InvalidRange");
+                count_error(err.code);
                 error_context ctx;
                 ctx.bucket = rq.bucket;
                 ctx.key = rq.key;

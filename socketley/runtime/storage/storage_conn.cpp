@@ -31,6 +31,13 @@ constexpr size_t   stream_chunk        = 256 * 1024;
 // sent it hears the answer instead of a reset; beyond it the connection closes.
 constexpr uint64_t discard_limit       = 64ull << 20;
 constexpr int      body_stall_secs     = 60;
+// A TLS read is a whole record's worth at a time, so a body is not fed to the
+// record layer eight kilobytes at once.
+constexpr size_t   tls_read_bytes      = 64 * 1024;
+constexpr size_t   tls_plain_bytes     = 16 * 1024;
+// What one turn of the encryptor puts in front of the kernel.
+constexpr size_t   tls_write_slice     = 64 * 1024;
+constexpr size_t   tls_write_cap       = 512 * 1024;
 constexpr int      write_stall_secs    = 120;
 
 const char* reason_phrase(int status)
@@ -260,6 +267,19 @@ void storage_run::accept_done(struct io_uring_cqe* cqe)
         arm_accept();
 }
 
+bool storage_run::adopt_external(int fd)
+{
+    if (m_stopped)
+    {
+        m_loop.close_fd(fd);
+        return false;
+    }
+    // The companion node is a unix socket, so it is tuned as one.
+    socketley::unix_sock::tune_stream(fd);
+    adopt(fd);
+    return true;
+}
+
 void storage_run::adopt(int fd)
 {
     if (m_max_conns > 0 && m_conns.size() >= m_max_conns)
@@ -276,6 +296,20 @@ void storage_run::adopt(int fd)
     c->fd  = fd;
     c->last_progress = std::chrono::steady_clock::now();
     c->request_began = c->last_progress;
+    c->accepted      = c->last_progress;
+    // A session before the first byte is read, so a plaintext client meets the
+    // handshake and is refused, and is never served in the clear.
+    if (m_tls)
+    {
+        c->ssl = m_tls->create_ssl_server();
+        if (!c->ssl)
+        {
+            m_loop.close_fd(fd);
+            return;
+        }
+        c->tls_state = tls_conn_handshake;
+        c->cbuf      = std::make_unique<char[]>(tls_read_bytes);
+    }
     m_conns.emplace(c->id, c);
     runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
     arm_sweep();
@@ -303,6 +337,17 @@ void storage_run::sweep()
     {
         const auto quiet = std::chrono::duration_cast<std::chrono::seconds>(now - c->last_progress).count();
         bool kill = false;
+        // A peer that has not become a client is not counted as one.
+        if (c->ssl && c->tls_state == tls_conn_handshake)
+        {
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - c->accepted).count() >
+                static_cast<long>(tls_handshake_deadline_secs))
+            {
+                ++m_c.tls_failures;
+                victims.push_back(c);
+            }
+            continue;
+        }
         switch (c->ph)
         {
             case phase::head:
@@ -397,6 +442,11 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         c->file_fd = -1;
     }
     pipe_release(*c);
+    if (c->ssl)
+    {
+        tls_context::free_ssl(c->ssl);
+        c->ssl = nullptr;
+    }
     if (c->fd >= 0)
     {
         ::shutdown(c->fd, SHUT_RDWR);
@@ -428,8 +478,17 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     if (c->dead || c->rd_pending || c->fd < 0)
         return;
 
-    char*    buf = c->rbuf;
-    uint32_t len = static_cast<uint32_t>(conn::rbuf_size);
+    // What the record layer already holds is delivered before another recv is
+    // asked for, because nothing would ever complete for bytes that are here.
+    if (c->ssl && !c->pulling && c->tls_state == tls_conn_ready && c->ph != phase::respond)
+    {
+        tls_pull(c);
+        if (c->dead || c->rd_pending)
+            return;
+    }
+
+    char*    buf = c->ssl ? c->cbuf.get() : c->rbuf;
+    uint32_t len = static_cast<uint32_t>(c->ssl ? tls_read_bytes : conn::rbuf_size);
     c->rd_direct = false;
 
     switch (c->ph)
@@ -437,7 +496,14 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         case phase::respond:
             return;
         case phase::body_put:
-            if (!c->hook && !c->req.chunked && c->put && !c->put->failed() && c->put_failed == st::ok)
+            if (c->ssl)
+            {
+                // Ciphertext cannot land in the staging buffer: what the put
+                // takes is what the session decrypted.
+                if (c->park_off < c->park.size())
+                    return;   // waiting for the put to take what is parked
+            }
+            else if (!c->hook && !c->req.chunked && c->put && !c->put->failed() && c->put_failed == st::ok)
             {
                 // Straight into the staging buffer: the bytes are hashed where
                 // they land and written from there.
@@ -492,40 +558,53 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, n);
     m_c.bytes_in += n;
 
+    if (c->ssl)
+    {
+        tls_in(c, n);
+        return;
+    }
+
+    if (c->ph == phase::body_put && c->rd_direct)
+    {
+        c->rd_direct = false;
+        c->body_left -= n;
+        if (c->put && !c->put->failed())
+            c->put->staged(n);
+        if (c->dead)
+            return;
+        if (c->put_failed != st::ok || c->ph != phase::body_put)
+        {
+            arm_read(c);
+            return;
+        }
+        if (c->body_left == 0)
+            put_body_complete(c);
+        else
+            arm_read(c);
+        return;
+    }
+    plain_in(c, c->rbuf, n);
+}
+
+// What a connection's plaintext does, whether it came off the wire or out of a
+// session: the phase decides what it is.
+void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t n)
+{
     switch (c->ph)
     {
         case phase::head:
             if (c->in.empty())
                 c->request_began = c->last_progress;
-            c->in.append(c->rbuf, n);
+            c->in.append(p, n);
             process_in(c);
             return;
         case phase::body_small:
-            feed_small_body(c, c->rbuf, n);
+            feed_small_body(c, p, n);
             if (!c->dead && c->ph == phase::body_small)
                 arm_read(c);
             return;
         case phase::body_put:
-            if (c->rd_direct)
-            {
-                c->rd_direct = false;
-                c->body_left -= n;
-                if (c->put && !c->put->failed())
-                    c->put->staged(n);
-                if (c->dead)
-                    return;
-                if (c->put_failed != st::ok || c->ph != phase::body_put)
-                {
-                    arm_read(c);
-                    return;
-                }
-                if (c->body_left == 0)
-                    put_body_complete(c);
-                else
-                    arm_read(c);
-                return;
-            }
-            put_body_bytes(c, c->rbuf, n);
+            put_body_bytes(c, p, n);
             return;
         case phase::body_discard:
             if (n >= c->body_left)
@@ -534,7 +613,7 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
                 const size_t extra = n - static_cast<size_t>(c->body_left);
                 c->body_left = 0;
                 if (extra)
-                    c->in.append(c->rbuf + (n - extra), extra);
+                    c->in.append(p + (n - extra), extra);
             }
             else
                 c->body_left -= n;
@@ -551,13 +630,150 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
     }
 }
 
+// ─── TLS ────────────────────────────────────────────────────────────────────
+
+// Ciphertext in: into the session, the handshake advanced, and whatever the
+// records carry delivered.  Its own records go out before it returns.
+void storage_run::tls_in(const std::shared_ptr<conn>& c, size_t n)
+{
+    const char* data = c->cbuf.get();
+    size_t off = 0;
+    while (off < n)
+    {
+        const int k = tls_context::bio_write_in(c->ssl, data + off, static_cast<int>(n - off));
+        if (k <= 0)
+        {
+            if (c->tls_state == tls_conn_handshake)
+                ++m_c.tls_failures;
+            close_conn(c);
+            return;
+        }
+        off += static_cast<size_t>(k);
+    }
+
+    if (c->tls_state == tls_conn_handshake)
+    {
+        const int r = tls_context::do_handshake(c->ssl);
+        if (r < 0)
+        {
+            // The alert is the only diagnosis the peer gets, and a plaintext
+            // client arrives here too and is refused rather than downgraded.
+            ++m_c.tls_failures;
+            if (!c->wr_pending && tls_encrypt(c) && c->fd >= 0 && c->wbuf.size() > c->woff)
+            {
+                // One try, without waiting: the connection is going either way.
+                const ssize_t sent = ::send(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff,
+                                            MSG_NOSIGNAL | MSG_DONTWAIT);
+                if (sent < 0) {}
+            }
+            close_conn(c);
+            return;
+        }
+        if (r == 0)
+        {
+            pump_write(c);
+            arm_read(c);
+            return;
+        }
+        c->tls_state = tls_conn_ready;
+        ++m_c.tls_handshakes;
+        // The tickets a finished handshake owes go out now, and the first
+        // request may already be in the same packet.
+        pump_write(c);
+    }
+
+    tls_pull(c);
+    if (c->dead)
+        return;
+    // A session that had nothing complete to give still owes the socket a read.
+    arm_read(c);
+}
+
+// Plaintext the session holds, handed to the phase one piece at a time until
+// the phase stops taking it -- a request being answered leaves the rest where
+// it is, and arm_read() comes back for it.
+void storage_run::tls_pull(const std::shared_ptr<conn>& c)
+{
+    if (c->pulling || c->dead || c->tls_state != tls_conn_ready)
+        return;
+    c->pulling = true;
+    char plain[tls_plain_bytes];
+    while (!c->dead && c->ph != phase::respond && c->park_off >= c->park.size())
+    {
+        const int k = tls_context::ssl_read(c->ssl, plain, static_cast<int>(sizeof(plain)));
+        if (k > 0)
+        {
+            c->last_progress = std::chrono::steady_clock::now();
+            plain_in(c, plain, static_cast<size_t>(k));
+            continue;
+        }
+        // The peer's close_notify or an unusable record ends the connection
+        // the way an EOF does.
+        if (k < 0)
+        {
+            c->pulling = false;
+            close_conn(c);
+            return;
+        }
+        break;
+    }
+    c->pulling = false;
+}
+
+// Everything the session owes the wire, gathered into `wbuf`: handshake
+// records and alerts, and the record-layer form of what waits in `wq`.
+bool storage_run::tls_encrypt(const std::shared_ptr<conn>& c)
+{
+    if (c->dead || !c->ssl)
+        return false;
+    if (c->tls_state == tls_conn_ready)
+    {
+        size_t encrypted = 0;
+        while (c->wq_off < c->wq.size() && encrypted < tls_write_cap)
+        {
+            const size_t take = std::min(c->wq.size() - c->wq_off, tls_write_slice);
+            const int k = tls_context::ssl_write(c->ssl, c->wq.data() + c->wq_off, static_cast<int>(take));
+            if (k < 0)
+            {
+                close_conn(c);
+                return false;
+            }
+            if (k == 0)
+                break;
+            c->wq_off += static_cast<size_t>(k);
+            encrypted += static_cast<size_t>(k);
+        }
+        if (c->wq_off >= c->wq.size())
+        {
+            c->wq.clear();
+            c->wq_off = 0;
+        }
+    }
+    char out[16384];
+    while (c->wbuf.size() - c->woff < tls_write_cap)
+    {
+        const int k = tls_context::bio_read_out(c->ssl, out, sizeof(out));
+        if (k < 0)
+        {
+            close_conn(c);
+            return false;
+        }
+        if (k == 0)
+            break;
+        c->wbuf.append(out, static_cast<size_t>(k));
+    }
+    return true;
+}
+
 // ─── Writing ────────────────────────────────────────────────────────────────
 
 void storage_run::queue_write(const std::shared_ptr<conn>& c, std::string data)
 {
     if (c->dead || data.empty())
         return;
-    if (c->wbuf.empty() && c->wq.empty())
+    if (c->ssl)
+        c->wq += data;
+    else if (c->wbuf.empty() && c->wq.empty())
         c->wbuf = std::move(data);
     else
         c->wq += data;
@@ -572,10 +788,20 @@ void storage_run::pump_write(const std::shared_ptr<conn>& c)
     {
         c->wbuf.clear();
         c->woff = 0;
-        if (c->wq.empty())
-            return;
-        c->wbuf.swap(c->wq);
-        c->wq.clear();
+        if (c->ssl)
+        {
+            if (!tls_encrypt(c))
+                return;
+            if (c->wbuf.empty())
+                return;
+        }
+        else
+        {
+            if (c->wq.empty())
+                return;
+            c->wbuf.swap(c->wq);
+            c->wq.clear();
+        }
     }
     c->wr_req = io_request{};
     c->wr_req.owner  = this;
@@ -609,10 +835,16 @@ void storage_run::write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe
     runtime_instance::stat_add(m_owner.m_stat_bytes_out, static_cast<uint64_t>(cqe->res));
     m_c.bytes_out += static_cast<uint64_t>(cqe->res);
 
-    if (c->woff < c->wbuf.size() || !c->wq.empty())
+    if (c->woff < c->wbuf.size() || c->wq_off < c->wq.size() ||
+        (c->ssl && tls_context::has_pending_out(c->ssl)))
     {
         pump_write(c);
-        return;
+        // What that submitted, or nothing when the session had no record left
+        // to give: only then is the queue empty for the purposes of the caller.
+        if (c->dead || c->wr_pending)
+            return;
+        if (c->woff < c->wbuf.size() || c->wq_off < c->wq.size())
+            return;
     }
     c->wbuf.clear();
     c->woff = 0;
@@ -679,6 +911,7 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
 void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, bool close,
                              std::string_view extra_name, std::string_view extra_value)
 {
+    count_error(e.code);
     response r;
     r.status = e.status;
     r.close  = close;
@@ -705,6 +938,19 @@ void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, 
         r.body = error_xml(e, ctx);
     }
     send_response(c, std::move(r));
+}
+
+void storage_run::count_error(std::string_view code)
+{
+    if (code.empty())
+        return;
+    // The set of codes is the runtime's own and small; the bound is for a
+    // future code that carries something a client chose.
+    auto it = m_c.errors.find(code);
+    if (it != m_c.errors.end())
+        ++it->second;
+    else if (m_c.errors.size() < 64)
+        m_c.errors.emplace(std::string(code), 1);
 }
 
 void storage_run::send_error_st(const std::shared_ptr<conn>& c, st s)
@@ -785,6 +1031,7 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
         return;
     c->in.erase(0, end + 4);
     ++m_c.requests;
+    runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
     dispatch(c);
 }
 
@@ -1438,7 +1685,8 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     c->close_after_write = head.close;
     // A body worth the pipe goes file to socket in the kernel, and the rest is
     // read here and written from memory.
-    c->spliced = len >= m_zero_copy_min && pipe_acquire(*c);
+    // Not on a session: a splice moves bytes the record layer never sees.
+    c->spliced = !c->ssl && len >= m_zero_copy_min && pipe_acquire(*c);
     if (c->spliced)
         ++m_c.zero_copy_gets;
     else

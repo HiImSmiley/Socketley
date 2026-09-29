@@ -57,7 +57,8 @@ std::string tls_not_implemented_error(std::string_view option);
 inline bool tls_role_has_handshake(runtime_type type)
 {
     return type == runtime_server || type == runtime_proxy ||
-           type == runtime_client || type == runtime_cache;
+           type == runtime_client || type == runtime_cache ||
+           type == runtime_storage;
 }
 
 // TLS context wrapper for server/client runtimes
