@@ -394,17 +394,8 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
         b.j.records = 0;
         valid_end   = 0;
     }
-    else if (torn)
-    {
-        // The half record is cut off so the next append starts on a boundary.
-        if (::ftruncate(fd, static_cast<off_t>(valid_end)) < 0)
-        {
-            bad_why = "cannot truncate " + path + ": " + errstr(errno);
-            ::close(fd);
-            return false;
-        }
-        if (::fsync(fd) < 0) {}
-    }
+    // A torn tail is cut off by the rewrite the caller does for it, which is
+    // what puts the next append on a record boundary.
 
     b.j.fd  = fd;
     b.j.off = valid_end;

@@ -665,30 +665,35 @@ TEST_CASE("a deleted object does not come back after a crash")
 TEST_CASE("a torn journal tail is cut off and the object behind it comes back from its file")
 {
     tmpdir d;
+    // A long key, so the record is long and what is left of it after a crash
+    // is longer than the record the next append writes over it.
+    const std::string longkey(300, 'k');
     {
         rig r(d.path);
         REQUIRE(r.make_bucket("bkt") == st::ok);
         REQUIRE(r.put("bkt", "one", "1").status == st::ok);
-        REQUIRE(r.put("bkt", "two", "22").status == st::ok);
+        REQUIRE(r.put("bkt", longkey, "22").status == st::ok);
         r.settle();
     }
     const std::string j = slurp(journal_path(d.path, "bkt"));
-    // Half of the last record, as a crash in the middle of the append leaves it.
+    // The last record with its final bytes missing, as a crash in the middle of the append leaves it.
     spill(journal_path(d.path, "bkt"), j.substr(0, j.size() - 9));
 
     rig again(d.path);
     CHECK(again.report.torn_tails == 1);
     CHECK(again.store->find("bkt", "one") != nullptr);
     // The file of the second is whole, so it is not lost.
-    CHECK(again.store->find("bkt", "two") != nullptr);
+    CHECK(again.store->find("bkt", longkey) != nullptr);
 
-    // And a new append lands on a record boundary: another restart reads it.
+    // And a new append lands on a record boundary with nothing of the old tail
+    // behind it: another restart reads a journal that is whole.
     REQUIRE(again.put("bkt", "three", "333").status == st::ok);
     again.settle();
     rig third(d.path);
     CHECK(third.report.torn_tails == 0);
+    CHECK(third.report.rebuilt_journals == 0);
     CHECK(third.store->find("bkt", "three") != nullptr);
-    CHECK(third.store->find("bkt", "two") != nullptr);
+    CHECK(third.store->find("bkt", longkey) != nullptr);
 }
 
 TEST_CASE("a journal that is lost or damaged in the middle is rebuilt from the files")
