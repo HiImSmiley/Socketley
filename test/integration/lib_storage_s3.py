@@ -400,8 +400,8 @@ check("the server answers after a client abandoned a download", request("GET", B
 # Unsupported operations are refused as such.
 r = request("GET", B + "plain.bin?acl")
 check("?acl is NotImplemented 501", r.status == 501 and r.code() == "NotImplemented", (r.status, r.body[:200]))
-r = request("POST", B + "plain.bin?uploads")
-check("POST ?uploads is NotImplemented 501 until multipart exists", r.status == 501, r.status)
+r = request("POST", B + "plain.bin?restore")
+check("POST ?restore is NotImplemented 501", r.status == 501, r.status)
 r = request("PUT", B + "chunkedsigned", body=b"x", headers={"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"})
 check("an aws-chunked upload is refused rather than stored as framing", r.status == 501 and r.code() == "NotImplemented",
       (r.status, r.body[:200]))
@@ -803,8 +803,9 @@ if boto3:
             s3.upload_fileobj(f, "boto-bucket", "uploaded/fileobj.bin", Config=TransferConfig(multipart_threshold=1 << 30))
         check("boto3 upload_fileobj", s3.get_object(Bucket="boto-bucket", Key="uploaded/fileobj.bin")["Body"].read() == blob)
 
-    check("boto3 create_multipart_upload is NotImplemented until multipart lands",
-          code_of(lambda: s3.create_multipart_upload(Bucket="boto-bucket", Key="mp"))[1] == 501)
+    mp = s3.create_multipart_upload(Bucket="boto-bucket", Key="mp")
+    check("boto3 create_multipart_upload answers an upload id", len(mp.get("UploadId", "")) > 0, mp)
+    s3.abort_multipart_upload(Bucket="boto-bucket", Key="mp", UploadId=mp["UploadId"])
 
     resp = s3.list_objects_v2(Bucket="boto-bucket")
     for o in resp.get("Contents", []):
