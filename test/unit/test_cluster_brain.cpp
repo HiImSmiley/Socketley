@@ -160,7 +160,8 @@ public:
     }
     // The daemon hangs: it neither ticks nor hears anyone, and its workers run on with whatever order they last had.
     void freeze(size_t i) { m_nodes[i]->frozen = true; }
-    // The daemon wakes, and its first act is to stop what it no longer holds a lease for, at once: that is the whole of the hung daemon's gap for a server.
+    // The daemon wakes, and its first act is to stop what it no longer holds a lease for, at once: that is the whole
+    // of the hung daemon's gap for a server.
     void thaw(size_t i)
     {
         sim_node& n = *m_nodes[i];
@@ -667,7 +668,8 @@ private:
                 const uint64_t epoch = f.role.follow_epoch();
                 sim_cache* p = t < m_nodes.size() && t != sn->idx && m_nodes[t]->alive ? cache_at(t, name) : nullptr;
                 const bool link = p && m_up[t][sn->idx] && m_up[sn->idx][t];
-                // A link that stands stays while the other end is still the primary of that epoch, lease or not; a new one needs a primary that answers.
+                // A link that stands stays while the other end is still the primary of that epoch, lease or not;
+                // a new one needs a primary that answers.
                 const bool stands = link && f.attached == static_cast<long>(t) && f.attached_epoch == epoch
                                  && p->role.epoch() == epoch && !p->role.following();
                 if (!stands)

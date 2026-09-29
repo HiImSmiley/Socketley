@@ -205,6 +205,7 @@ TEST_CASE("a command the operator may not give is refused, and decode refuses it
         {declare("db", 1, "cache", {"-p", "80", "--cluster-replica", "7"}), "the cluster's to set"},
         {declare("db", 1, "cache", {"-p", "80", "--listen", "unix:/x"}), "unix socket"},
         {declare("db", 1, "cache", {"-p", "80", "--shards", "2"}), "sharded"},
+        {declare("db", 1, "cache", {"-p", "80", "--tls"}), "not encrypted"},
         {declare("db", 1, "nonsense"), "only a server"},
         {promote("db", 0, 7, 1), "node 0"},
         {promote("db", 3, 0, 1), "incarnation 0"},

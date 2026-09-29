@@ -206,7 +206,8 @@ std::vector<command> brain::promotions(const state& after, const std::vector<nod
     {
         if (!after.specs.count(name))
             continue;
-        // The clock of a record starts when this leader first sees it, so a promotion just made or a leader just elected gives the primary the whole failure timeout to show itself.
+        // The clock of a record starts when this leader first sees it, so a promotion just made or a leader just elected
+        // gives the primary the whole failure timeout to show itself.
         auto sn = m_seen.find(name);
         if (sn == m_seen.end() || !(sn->second.rec == rec))
             sn = m_seen.insert_or_assign(name, seen{rec, now}).first;

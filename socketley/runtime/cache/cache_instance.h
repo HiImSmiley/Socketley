@@ -1216,9 +1216,8 @@ private:
     bool m_resp_forced{false};
 
     // ── A replica of a cluster cache ────────────────────────────────────────
-    // Present once setup() has made this process a replica.  What it may do comes from the daemon's last order and
-    // only from it: fenced answers no client, a follower is read-only and dials the primary it is given, and the
-    // primary takes writes as the mode the operator asked for, counting each record it produces.
+    // Present once setup() has made this process a replica, whose part is only what the daemon's last order says:
+    // fenced answers no client, a follower is read-only and dials its primary, and the primary takes writes and counts them.
     uint64_t m_cluster_incarnation{0};
     std::unique_ptr<socketley::cluster::replica_role> m_role;
     socketley::cluster::replica_mode m_role_mode{socketley::cluster::replica_mode::fenced};

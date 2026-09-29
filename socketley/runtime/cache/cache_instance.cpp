@@ -571,8 +571,7 @@ bool cache_instance::setup(event_loop& loop)
     m_store.set_channel_observer(&on_channel_presence, this);
 
     // A replica of a cluster cache starts fenced and follows nobody, before it binds anything, so that no client
-    // reaches it and no follower syncs from it until the daemon says what it is.  A start after a stop is a new
-    // process's worth of data in the same object, so it is a new role too.
+    // reaches it and no follower syncs from it until the daemon says what it is.
     if (m_cluster_incarnation != 0)
     {
         m_role = std::make_unique<socketley::cluster::replica_role>(m_cluster_incarnation);

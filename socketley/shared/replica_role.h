@@ -66,7 +66,8 @@ public:
     replica_mode mode(uint64_t now) const { return now >= m_deadline ? replica_mode::fenced : m_order.mode; }
     // How long the last order still stands.
     uint64_t left_ms(uint64_t now) const { return now < m_deadline ? m_deadline - now : 0; }
-    // Whom it follows, and the epoch of that primary, which stay as they were through a fenced order and a lapse since a fenced follower keeps following.
+    // Whom it follows, and the epoch of that primary, which stay as they were through a fenced order and a lapse,
+    // since a fenced follower keeps following.
     bool following() const { return m_following; }
     const std::string& target() const { return m_target; }
     uint64_t follow_epoch() const { return m_follow_epoch; }

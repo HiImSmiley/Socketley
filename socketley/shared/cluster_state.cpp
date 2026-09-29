@@ -93,6 +93,8 @@ std::string cache_flags_refusal(const std::vector<std::string>& args)
             return "--listen is a unix socket, and the followers of a cache dial its -p port to replicate";
         if (a == "--shards")
             return "a sharded cache cannot be replicated, so it cannot be a cluster cache";
+        if (a == "--tls")
+            return "replication is not encrypted, so a cache that terminates TLS cannot be a cluster cache";
     }
     return has_port ? std::string() : "a cluster cache needs -p <port>: its followers dial it to replicate";
 }

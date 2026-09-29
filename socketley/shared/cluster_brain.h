@@ -116,7 +116,8 @@ public:
 
     // Once per Raft tick: renews this node's lease, asks the leader for one, and on a leader plans the placement.
     void tick(uint64_t now, const view& v, output& out);
-    // A follower asked to be counted alive, and said how its cache replicas stand; only a leader with a quorum answers, and only a voter is remembered.
+    // A follower asked to be counted alive, and said how its cache replicas stand; only a leader with a quorum answers,
+    // and only a voter is remembered.
     void on_lease_req(node_id from, uint64_t nonce, uint64_t now, const view& v, output& out,
                       const std::vector<replica_report>& reports = {});
     // The leader granted what this node asked for at the time `nonce` was sent, so the lease runs from then and not from now.
@@ -129,7 +130,8 @@ public:
 
     // What the cache replicas this node runs say about themselves, set by the daemon before each tick.
     void set_reports(std::vector<replica_report> reports) { m_local = std::move(reports); }
-    // What the leader last heard from `id` about the replica of `name` (this node's own for itself), and how long ago; nothing when it has heard none.
+    // What the leader last heard from `id` about the replica of `name` (this node's own for itself), and how long ago;
+    // nothing when it has heard none.
     std::optional<replica_report> report_of(node_id id, const std::string& name) const;
     std::optional<uint64_t> report_age_ms(node_id id, const std::string& name, uint64_t now) const;
 
@@ -142,9 +144,11 @@ public:
     const timing& times() const { return m_timing; }
 
 private:
-    // The promotions that give a cache a primary when nobody leads it, or when the process that did has left its node, chosen from the most up-to-date live replica.
+    // The promotions that give a cache a primary when nobody leads it, or when the process that did has left its node,
+    // chosen from the most up-to-date live replica.
     std::vector<command> promotions(const state& after, const std::vector<node_id>& alive, uint64_t now);
-    // Notes that `from` still holds the process the log names as the primary of a runtime, which is what keeps another replica from being promoted over it.
+    // Notes that `from` still holds the process the log names as the primary of a runtime, which is what keeps another
+    // replica from being promoted over it.
     void confirm(node_id from, const std::vector<replica_report>& reports, uint64_t now);
 
     node_id     m_self;
