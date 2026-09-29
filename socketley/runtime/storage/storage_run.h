@@ -231,8 +231,9 @@ struct conn
     std::string wq;
     // How much of `wq` the record layer has already taken.
     size_t      wq_off{0};
-    // Called once everything queued has been written.
-    std::function<void()> after_write;
+    // What is done once everything queued has been written.
+    enum class after_kind : uint8_t { none, finish, pump };
+    after_kind  after_write{after_kind::none};
     bool        close_after_write{false};
 
     // ── A body being collected ──────────────────────────────────────────────
@@ -241,7 +242,7 @@ struct conn
     uint64_t    body_left{0};        // bytes of Content-Length still to come
     http_chunked_decoder chunk;
     std::string chunk_in;            // chunked framing waiting for the rest of a line
-    std::function<void()> on_body;   // the small body is complete
+    bool        on_body{false};      // the small body is routed when it is complete
 
     // ── A body streaming into an object ─────────────────────────────────────
     std::shared_ptr<put_op>    put;
@@ -400,8 +401,10 @@ public:
     // The status line and headers, with room reserved for `room` more bytes behind them.
     std::string response_head(const conn& c, const response& r, size_t room = 0) const;
 
-    // A body of known small size, gathered whole and handed to `done`.
-    void collect_body(const std::shared_ptr<conn>& c, uint64_t limit, std::function<void()> done);
+    // A body of known small size, gathered whole and then routed.
+    void collect_body(const std::shared_ptr<conn>& c, uint64_t limit);
+    // The operation a request with its small body in hand asks for.
+    void route_small(const std::shared_ptr<conn>& c);
     void feed_small_body(const std::shared_ptr<conn>& c, const char* p, size_t n);
 
     // ── Streaming a body in ─────────────────────────────────────────────────

@@ -220,84 +220,86 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         return;
     }
 
-    collect_body(c, small_body_limit, [this, c]()
+    collect_body(c, small_body_limit);
+}
+
+void storage_run::route_small(const std::shared_ptr<conn>& c)
+{
+    s3_request& q = c->req;
+    const bool svc = q.bucket.empty();
+    const bool bkt = !svc && q.key.empty();
+    const std::string_view m = q.method;
+    if (svc)
     {
-        s3_request& q = c->req;
-        const bool svc = q.bucket.empty();
-        const bool bkt = !svc && q.key.empty();
-        const std::string_view m = q.method;
-        if (svc)
-        {
-            if (m == "GET")
-                op_list_buckets(c);
-            else
-                send_error(c, make_error("MethodNotAllowed"));
-            return;
-        }
-        if (bkt)
-        {
-            if (m == "GET")
-            {
-                if (q.has_query("uploads"))
-                    op_list_uploads(c);
-                else if (q.has_query("location"))
-                    op_bucket_location(c);
-                else
-                {
-                    const std::string_view lt = q.get_query("list-type");
-                    if (q.has_query("list-type") && lt != "2")
-                    {
-                        s3_error e = make_error("InvalidArgument");
-                        e.message = "Invalid Argument";
-                        send_error(c, e, false, "ArgumentName", "list-type");
-                        return;
-                    }
-                    op_list_objects(c, lt == "2");
-                }
-            }
-            else if (m == "PUT")
-                op_create_bucket(c);
-            else if (m == "DELETE")
-                op_delete_bucket(c);
-            else if (m == "HEAD")
-                op_head_bucket(c);
-            else if (m == "POST" && q.has_query("delete"))
-                op_delete_objects(c);
-            else
-                send_error(c, make_error("MethodNotAllowed"));
-            return;
-        }
-        const bool upload = q.has_query("uploadId");
         if (m == "GET")
-        {
-            if (upload)
-                op_list_parts(c);
-            else
-                op_get_object(c, false);
-        }
-        else if (m == "HEAD")
-            op_get_object(c, true);
-        else if (m == "PUT")
-        {
-            if (upload && q.has_query("partNumber"))
-                op_upload_part_copy(c);
-            else
-                op_copy_object(c);
-        }
-        else if (m == "DELETE")
-        {
-            if (upload)
-                op_abort_multipart(c);
-            else
-                op_delete_object(c);
-        }
-        else if (m == "POST" && q.has_query("uploads"))
-            op_create_multipart(c);
-        else if (m == "POST" && upload)
-            op_complete_multipart(c);
+            op_list_buckets(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
-    });
+        return;
+    }
+    if (bkt)
+    {
+        if (m == "GET")
+        {
+            if (q.has_query("uploads"))
+                op_list_uploads(c);
+            else if (q.has_query("location"))
+                op_bucket_location(c);
+            else
+            {
+                const std::string_view lt = q.get_query("list-type");
+                if (q.has_query("list-type") && lt != "2")
+                {
+                    s3_error e = make_error("InvalidArgument");
+                    e.message = "Invalid Argument";
+                    send_error(c, e, false, "ArgumentName", "list-type");
+                    return;
+                }
+                op_list_objects(c, lt == "2");
+            }
+        }
+        else if (m == "PUT")
+            op_create_bucket(c);
+        else if (m == "DELETE")
+            op_delete_bucket(c);
+        else if (m == "HEAD")
+            op_head_bucket(c);
+        else if (m == "POST" && q.has_query("delete"))
+            op_delete_objects(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    const bool upload = q.has_query("uploadId");
+    if (m == "GET")
+    {
+        if (upload)
+            op_list_parts(c);
+        else
+            op_get_object(c, false);
+    }
+    else if (m == "HEAD")
+        op_get_object(c, true);
+    else if (m == "PUT")
+    {
+        if (upload && q.has_query("partNumber"))
+            op_upload_part_copy(c);
+        else
+            op_copy_object(c);
+    }
+    else if (m == "DELETE")
+    {
+        if (upload)
+            op_abort_multipart(c);
+        else
+            op_delete_object(c);
+    }
+    else if (m == "POST" && q.has_query("uploads"))
+        op_create_multipart(c);
+    else if (m == "POST" && upload)
+        op_complete_multipart(c);
+    else
+        send_error(c, make_error("MethodNotAllowed"));
 }
 
 // ─── Buckets ────────────────────────────────────────────────────────────────
@@ -1107,16 +1109,9 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     }
 
     // Answers a request whose object is known, from a HEAD's memory or a GET's file.
-    auto answer = [this, weak = std::weak_ptr<conn>(c), head](const object_meta& m, int fd,
-                                                              uint64_t data_off, const std::string& prefetch)
+    auto answer = [this, head](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
+                               uint64_t data_off, const std::string& prefetch)
     {
-        auto cc = weak.lock();
-        if (!cc || cc->dead)
-        {
-            if (fd >= 0)
-                m_loop.close_fd(fd);
-            return;
-        }
         const s3_request& rq = cc->req;
 
         auto close_file = [&] { if (fd >= 0) m_loop.close_fd(fd); };
@@ -1214,14 +1209,14 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_file(cc, std::move(r), fd, data_off + first, len);
     };
 
-    std::weak_ptr<conn> weak = c;
     if (head)
     {
         if (mem)
         {
-            answer(*mem, -1, 0, std::string{});
+            answer(c, *mem, -1, 0, std::string{});
             return;
         }
+        std::weak_ptr<conn> weak = c;
         m_store.stat_object(q.bucket, q.key, [this, weak, answer](st s, const object_meta& m)
         {
             auto cc = weak.lock();
@@ -1232,7 +1227,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
                 send_error_st(cc, s);
                 return;
             }
-            answer(m, -1, 0, std::string{});
+            answer(cc, m, -1, 0, std::string{});
         });
         return;
     }
@@ -1254,7 +1249,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_response(c, std::move(r));
             return;
         }
-        answer(*mem, -1, 0, *hot.body);
+        answer(c, *mem, -1, 0, *hot.body);
         return;
     }
 
@@ -1266,7 +1261,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         if (m_store.hot_get_foreign(q.bucket, q.key, held_meta, held_body))
         {
             ++m_c.hot_gets;
-            answer(*held_meta, -1, 0, *held_body);
+            answer(c, *held_meta, -1, 0, *held_body);
             return;
         }
     }
@@ -1277,6 +1272,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     // a small object and only a little long for a large one.
     const size_t prefetch = mem ? (mem->size <= object_store::hot_max_object ? static_cast<size_t>(mem->size) : 0)
                                 : object_store::hot_max_object;
+    std::weak_ptr<conn> weak = c;
     m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer, mine, drop_epoch, b = q.bucket, k = q.key](open_result o)
     {
         auto cc = weak.lock();
@@ -1299,7 +1295,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             else
                 m_store.hot_put_foreign(b, k, drop_epoch, o.meta, whole);
         }
-        answer(o.meta, o.fd, o.data_off, o.prefetch);
+        answer(cc, o.meta, o.fd, o.data_off, o.prefetch);
     });
 }
 

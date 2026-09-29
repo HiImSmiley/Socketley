@@ -538,8 +538,8 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
         m_loop.close_fd(c->fd);
         c->fd = -1;
     }
-    c->after_write = nullptr;
-    c->on_body     = nullptr;
+    c->after_write = conn::after_kind::none;
+    c->on_body     = false;
 
     m_conns.erase(c->id);
     if (c->rd_pending || c->wr_pending || c->sp_in_pending || c->sp_out_pending)
@@ -1028,12 +1028,12 @@ void storage_run::write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe
     }
     c->wbuf.clear();
     c->woff = 0;
-    if (c->after_write)
-    {
-        auto f = std::move(c->after_write);
-        c->after_write = nullptr;
-        f();
-    }
+    const conn::after_kind next = c->after_write;
+    c->after_write = conn::after_kind::none;
+    if (next == conn::after_kind::finish)
+        finish_request(c);
+    else if (next == conn::after_kind::pump)
+        file_pump(c);
 }
 
 // ─── HTTP ───────────────────────────────────────────────────────────────────
@@ -1108,7 +1108,7 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
     std::string out = response_head(*c, r, body.size());
     out += body;
     c->close_after_write = r.close;
-    c->after_write = [this, c]() { finish_request(c); };
+    c->after_write = conn::after_kind::finish;
     queue_write(c, std::move(out));
 }
 
@@ -1170,7 +1170,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->body_left = 0;
     c->chunk = http_chunked_decoder{};
     c->chunk_in.clear();
-    c->on_body = nullptr;
+    c->on_body = false;
     c->put.reset();
     c->hook.reset();
     c->park.clear();
@@ -1353,12 +1353,12 @@ bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
 
 // ─── Small bodies ───────────────────────────────────────────────────────────
 
-void storage_run::collect_body(const std::shared_ptr<conn>& c, uint64_t limit, std::function<void()> done)
+void storage_run::collect_body(const std::shared_ptr<conn>& c, uint64_t limit)
 {
     c->ph         = phase::body_small;
     c->body.clear();
     c->body_limit = limit;
-    c->on_body    = std::move(done);
+    c->on_body    = true;
     c->chunk      = http_chunked_decoder{};
     c->chunk_in.clear();
 
@@ -1383,9 +1383,8 @@ void storage_run::collect_body(const std::shared_ptr<conn>& c, uint64_t limit, s
             }
             c->body += out;
         }
-        auto f = std::move(c->on_body);
-        c->on_body = nullptr;
-        f();
+        c->on_body = false;
+        route_small(c);
         return;
     }
 
@@ -1490,10 +1489,10 @@ void storage_run::feed_small_body(const std::shared_ptr<conn>& c, const char* p,
         }
         c->body += out;
     }
-    auto f = std::move(c->on_body);
-    c->on_body = nullptr;
-    if (f)
-        f();
+    const bool armed = c->on_body;
+    c->on_body = false;
+    if (armed)
+        route_small(c);
 }
 
 // ─── A body streaming into an object ────────────────────────────────────────
@@ -1904,7 +1903,7 @@ void storage_run::send_file(const std::shared_ptr<conn>& c, response head, int f
     else
         ++m_c.copied_gets;
 
-    c->after_write = [this, c]() { file_pump(c); };
+    c->after_write = conn::after_kind::pump;
     queue_write(c, response_head(*c, head));
 }
 
@@ -1958,7 +1957,7 @@ void storage_run::stream_read_done(const std::shared_ptr<conn>& c, int64_t res)
     }
     c->file_off  += static_cast<uint64_t>(res);
     c->file_left -= static_cast<uint64_t>(res);
-    c->after_write = [this, c]() { file_pump(c); };
+    c->after_write = conn::after_kind::pump;
     queue_write(c, std::string(c->sbuf.data(), static_cast<size_t>(res)));
 }
 
