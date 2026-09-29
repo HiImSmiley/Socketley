@@ -179,6 +179,8 @@ arm() {   # shards port
     uniq=$(sort -u "$T/expect$n" | wc -l)
     series_is "metrics: the runtime's objects are the sum over its shards" "socketley_storage_objects{name=\"$name\"}" "$uniq"
     series_is "metrics: its one bucket is one, not one per shard" "socketley_storage_buckets{name=\"$name\"}" 1
+    series_is "metrics: the wrong-secret answers of every shard are added up" "socketley_storage_errors_total{name=\"$name\",code=\"SignatureDoesNotMatch\"}" 24
+    series_is "metrics: and the unknown-key answers" "socketley_storage_errors_total{name=\"$name\",code=\"InvalidAccessKeyId\"}" 24
     if [ "$n" -gt 1 ]; then
         local sent served hs
         sent=$(stat_sum "$name" shard_mpu_sent); served=$(stat_sum "$name" shard_mpu_served)
