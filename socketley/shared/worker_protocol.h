@@ -76,6 +76,10 @@ enum class frame_type : uint16_t
     // worker that has never been told sends, so the frame narrows and never
     // widens what this process does on its own.
     publish_interest = 30,
+
+    // payload: a cluster::replica_order -- what a cluster cache replica is to
+    // be, sent every tick so that the daemon's silence is what fences it.
+    replica_order = 32,
 };
 
 // reload_err carries the diagnostic verbatim and is sent only when the reload

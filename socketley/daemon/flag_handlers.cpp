@@ -1213,6 +1213,26 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
             cache->set_replicate_target(pa.args[i]);
             return 0;
         }
+        // The cluster's own word for the process it makes of a replica, which it numbers so a restart is told from a survivor.
+        case fnv1a("--cluster-replica"):
+        {
+            if (!cache->is_cluster_owned())
+            {
+                std::cout << "--cluster-replica is the cluster's to set: `socketley cluster create cache ...` makes replicas\n";
+                return 1;
+            }
+            uint64_t incarnation = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), incarnation);
+            if (ec != std::errc{} || end != v.data() + v.size() || incarnation == 0)
+            {
+                std::cout << "--cluster-replica requires a nonzero number\n";
+                return 1;
+            }
+            ++i;
+            cache->set_cluster_replica(incarnation);
+            return 0;
+        }
         default:
             return -1;
     }

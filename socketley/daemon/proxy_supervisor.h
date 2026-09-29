@@ -227,6 +227,9 @@ public:
     // running runtime.  See worker_main's on_config for what a live one takes.
     void send_config(std::string_view json);
 
+    // A cluster cache replica's order, false when the frame could not be queued.
+    bool send_replica_order(std::string_view payload);
+
     // Block until this child has installed a declaration other than
     // `previous`, read before send_reload() so a frame arriving between the
     // two is not mistaken for the one waited on.

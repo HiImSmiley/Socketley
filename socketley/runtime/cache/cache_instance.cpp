@@ -413,6 +413,7 @@ uint32_t cache_instance::get_persist_interval() const
 void cache_instance::set_mode(cache_mode mode)
 {
     m_mode = mode;
+    m_mode_asked = mode;
 }
 
 cache_mode cache_instance::get_mode() const
@@ -568,6 +569,17 @@ bool cache_instance::setup(event_loop& loop)
 
     m_route_payload.assign(m_shard_n, std::string{});
     m_store.set_channel_observer(&on_channel_presence, this);
+
+    // A replica of a cluster cache starts fenced and follows nobody, before it binds anything, so that no client
+    // reaches it and no follower syncs from it until the daemon says what it is.  A start after a stop is a new
+    // process's worth of data in the same object, so it is a new role too.
+    if (m_cluster_incarnation != 0)
+    {
+        m_role = std::make_unique<socketley::cluster::replica_role>(m_cluster_incarnation);
+        m_replicate_target.clear();
+        m_repl_role = repl_none;
+        apply_role(socketley::cluster::replica_mode::fenced, false);
+    }
     m_route_slots.assign(m_shard_n, std::vector<fill_target>{});
 
     // `--persistent` with more than one shard is no longer refused: each shard
@@ -1070,6 +1082,8 @@ void cache_instance::teardown(event_loop& /*loop*/)
             withdrawn &= m_loop->submit_timeout_remove(&m_master_retry->req);
         if (m_master_sync_deadline)
             withdrawn &= m_loop->submit_timeout_remove(&m_master_sync_deadline->req);
+        if (m_role_timer_armed && m_role_timer)
+            withdrawn &= m_loop->submit_timeout_remove(&m_role_timer->req);
         m_loop->flush();
 
         if (SOCKETLEY_UNLIKELY(!withdrawn))
@@ -1122,6 +1136,13 @@ void cache_instance::teardown(event_loop& /*loop*/)
         {
             owed[0] = &m_master_sync_deadline->req;
             retire(std::shared_ptr<void>(std::move(m_master_sync_deadline)), owed, 1);
+        }
+        if (m_role_timer)
+        {
+            const size_t n = m_role_timer_armed ? 1 : 0;
+            owed[0] = &m_role_timer->req;
+            retire(std::shared_ptr<void>(std::move(m_role_timer)), owed, n);
+            m_role_timer_armed = false;
         }
     }
 
@@ -1287,6 +1308,11 @@ void cache_instance::on_cqe(struct io_uring_cqe* cqe)
                 m_master_retry.reset();
                 if (!connect_to_master())
                     schedule_master_retry();
+                break;
+            }
+            if (m_role_timer && req == &m_role_timer->req)
+            {
+                role_lapsed();
                 break;
             }
             if (m_master_sync_deadline && req == &m_master_sync_deadline->req)
@@ -5498,6 +5524,13 @@ void cache_instance::process_command_local(client_connection* conn, std::string_
     if (SOCKETLEY_UNLIKELY(line.empty()))
         return;
 
+    // A fenced replica answers no client at all, reads included, since a partitioned one is the stale copy.
+    if (SOCKETLEY_UNLIKELY(m_fenced) && conn->fd >= 0)
+    {
+        refuse_fenced(conn, false);
+        return;
+    }
+
     // Global rate limit check (across all connections)
     if (SOCKETLEY_UNLIKELY(!check_global_rate_limit()))
     {
@@ -8810,6 +8843,12 @@ void cache_instance::process_resp_command_local(client_connection* conn, std::st
 {
     if (SOCKETLEY_UNLIKELY(argc == 0))
         return;
+
+    if (SOCKETLEY_UNLIKELY(m_fenced) && conn->fd >= 0)
+    {
+        refuse_fenced(conn, true);
+        return;
+    }
 
 #ifndef SOCKETLEY_NO_LUA
     if (SOCKETLEY_UNLIKELY(m_script_depth > 0) && refused_in_script(fnv1a_lower(args[0])))
@@ -12185,6 +12224,151 @@ cache_instance::repl_role cache_instance::get_repl_role() const
     return m_repl_role;
 }
 
+// ─── A replica of a cluster cache ───
+
+namespace {
+
+// The same monotonic base every order's validity is counted from.
+uint64_t role_clock_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+}   // namespace
+
+void cache_instance::refuse_fenced(client_connection* conn, bool resp)
+{
+    static constexpr std::string_view why = "this replica holds no cluster lease: it answers nobody until the cluster tells it what it is";
+    if (resp)
+    {
+        std::string text = "CLUSTERDOWN ";
+        text.append(why);
+        resp::encode_error_code_into(conn->response_buf, text);
+        return;
+    }
+    conn->response_buf.append("error: ");
+    conn->response_buf.append(why);
+    conn->response_buf.push_back('\n');
+}
+
+void cache_instance::on_replica_order(std::string_view payload)
+{
+    if (!m_role)
+        return;
+    socketley::cluster::replica_order o;
+    if (!socketley::cluster::decode(payload, o))
+    {
+        LOG_WARN("cache: a replica order this build cannot read was ignored");
+        return;
+    }
+    const auto effect = m_role->order(o, role_clock_ms());
+    apply_role(effect.mode, effect.retarget);
+    arm_role_timer();
+}
+
+// What the replica does about the mode the order in force puts it in, where a repeated order changes nothing.
+void cache_instance::apply_role(socketley::cluster::replica_mode mode, bool retarget)
+{
+    using socketley::cluster::replica_mode;
+    if (mode != m_role_mode)
+        LOG_INFO(("cache \"" + std::string(get_name()) + "\": " + socketley::cluster::mode_name(m_role_mode) + " -> "
+                  + socketley::cluster::mode_name(mode)).c_str());
+    m_role_mode     = mode;
+    m_fenced        = mode == replica_mode::fenced;
+    m_leads_cluster = mode == replica_mode::primary;
+
+    switch (mode)
+    {
+    case replica_mode::fenced:
+        // Nothing is torn down: a copy that keeps following stays current, and the lease may come back.
+        m_mode = cache_mode_readonly;
+        return;
+
+    case replica_mode::primary:
+        m_mode = m_mode_asked;
+        if (m_repl_role == repl_follower)
+        {
+            // Promoted: it follows nobody now, and what it had copied is what it leads from.
+            m_repl_role = repl_none;
+            m_replicate_target.clear();
+            drop_master();
+        }
+        return;
+
+    case replica_mode::follower:
+        m_mode = cache_mode_readonly;
+        if (m_repl_role == repl_leader)
+        {
+            // Demoted: the followers it had were following the wrong one, and dial the right one when told.
+            for (auto& f : m_followers)
+                f->dead = true;
+            reap_followers();
+            m_repl_role = repl_none;
+        }
+        follow(std::string(m_role->target()), retarget);
+        return;
+    }
+}
+
+void cache_instance::follow(const std::string& target, bool retarget)
+{
+    if (target != m_replicate_target || m_repl_role != repl_follower)
+    {
+        set_replicate_target(target);
+        retarget = true;
+    }
+    if (retarget)
+    {
+        m_master_attempt = 0;
+        drop_master();
+    }
+    if (!m_master && !m_master_dial && !m_master_retry && m_loop)
+        if (!connect_to_master())
+            schedule_master_retry();
+}
+
+// Shut down and not torn down, for the reason the sync deadline gives: the read is still armed, and its completion with
+// zero is what walks the one drop path that already knows how to release the link and dial again.
+void cache_instance::drop_master()
+{
+    if (m_master && m_master->fd >= 0)
+        ::shutdown(m_master->fd, SHUT_RDWR);
+}
+
+// One timer at a time, armed for what the order in force has left and re-armed from its own firing, so a stream of
+// renewals costs a submission per lease and not one per order.
+void cache_instance::arm_role_timer()
+{
+    if (!m_loop || !m_role || m_role_timer_armed)
+        return;
+    const uint64_t left = m_role->left_ms(role_clock_ms());
+    if (left == 0)
+        return;
+    if (!m_role_timer)
+    {
+        m_role_timer = std::make_unique<timer_op>();
+        m_role_timer->req = { this, nullptr, -1, 0, op_timeout };
+    }
+    m_role_timer->ts.tv_sec  = static_cast<long>(left / 1000);
+    m_role_timer->ts.tv_nsec = static_cast<long>((left % 1000) * 1000000);
+    m_role_timer_armed = m_loop->submit_timeout(&m_role_timer->ts, &m_role_timer->req);
+}
+
+void cache_instance::role_lapsed()
+{
+    m_role_timer_armed = false;
+    if (!m_role)
+        return;
+    const auto mode = m_role->mode(role_clock_ms());
+    if (mode == socketley::cluster::replica_mode::fenced && m_role_mode != mode)
+    {
+        LOG_WARN(("cache \"" + std::string(get_name()) + "\": no order from the daemon within the lease, so this replica is fenced").c_str());
+        apply_role(mode, false);
+    }
+    arm_role_timer();
+}
+
 void cache_instance::follower_kick(follower_conn& f)
 {
     // fd < 0 means the client this follower was promoted from has gone, and
@@ -12357,6 +12541,11 @@ void cache_instance::replicate_command(std::string_view cmd)
     if (SOCKETLEY_UNLIKELY(m_journal.is_open() && !m_journal_replaying))
         journal_mutation(cmd);
 
+    // The position in the stream, counted whether or not anybody is listening, so that two followers that joined at
+    // different moments can be told apart by how far into it each has come.
+    if (SOCKETLEY_UNLIKELY(m_leads_cluster))
+        m_role->record();
+
     if (m_repl_role != repl_leader || m_followers.empty())
         return;
 
@@ -12397,6 +12586,14 @@ void cache_instance::handle_replicate_request(client_connection* conn)
             "error: this cache terminates TLS on its listener and replication is "
             "not encrypted -- the dump and the command stream would go out in "
             "cleartext\n", 143);
+        return;
+    }
+
+    // A replica of a cluster cache is a source only while it is the primary and holds its lease, so a follower that
+    // dialled it a moment too early, or a fenced primary, is told so and dials again.
+    if (m_role && (m_fenced || m_role_mode != socketley::cluster::replica_mode::primary))
+    {
+        conn->response_buf.append("error: this replica is not the primary\n");
         return;
     }
 
@@ -12477,6 +12674,12 @@ bool cache_instance::send_full_dump(follower_conn& f)
     m_store.dump_commands(buf);
 
     buf.append(repl_sync_done);
+    // Where in the primary's stream this dump was taken, which is what tells two followers' copies apart.
+    if (m_role)
+    {
+        buf.push_back(' ');
+        buf.append(std::to_string(m_role->offset()));
+    }
     buf.push_back('\n');
 
     // Sent even when the dump adds nothing, because a leader flushed while the
@@ -12555,6 +12758,7 @@ bool cache_instance::connect_to_master()
     auto dial = std::make_unique<master_dial>();
     dial->fd = fd;
     dial->addr = addr;
+    dial->target = m_replicate_target;
     dial->req = { this, nullptr, fd, 0, op_connect };
 
     if (!m_loop ||
@@ -12581,6 +12785,14 @@ void cache_instance::handle_master_connect(struct io_uring_cqe* cqe, io_request*
 
     auto dial = std::move(m_master_dial);
     const int fd = dial->fd;
+
+    // The daemon named another primary while this dial was out, or none at all: what connected is not who is wanted.
+    if (dial->target != m_replicate_target || m_repl_role != repl_follower)
+    {
+        close_tracked(fd);
+        schedule_master_retry();
+        return;
+    }
 
     if (cqe->res < 0)
     {
@@ -12662,8 +12874,17 @@ void cache_instance::schedule_master_retry()
     const uint32_t step = m_master_attempt < 4 ? m_master_attempt : 4;
     int delay_sec = 1 << step;              // 1, 2, 4, 8, 16
     if (delay_sec > 30) delay_sec = 30;
-    const long jitter_ms = (m_master_attempt * 137L) % 500;
+    long jitter_ms = (m_master_attempt * 137L) % 500;
     ++m_master_attempt;
+
+    // A cluster replica is dialled again in a fifth of a second however many times it has failed, because it fails
+    // for the ordinary reason that the primary it was given has not been told it is one yet, and waiting a doubling
+    // interval for that would be most of a failover.
+    if (m_role)
+    {
+        delay_sec = 0;
+        jitter_ms = 200;
+    }
 
     auto t = std::make_unique<timer_op>();
     t->ts.tv_sec = delay_sec;
@@ -12707,6 +12928,7 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
     // command would make a busy leader's batch quadratic.
     size_t scan_from = 0;
     bool   framing_broken = false;
+    bool   link_refused   = false;
     while (scan_from < link.partial.size())
     {
         std::string_view line;
@@ -12735,14 +12957,42 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
             scan_from = pos + 1;
         }
 
-        if (line == repl_sync_done)
+        // The marker, with the primary's position in its stream after it when it is a cluster cache's.
+        if (line == repl_sync_done || (line.starts_with(repl_sync_done) && line.size() > repl_sync_done.size()
+                                       && line[repl_sync_done.size()] == ' '))
         {
             link.synced = true;
             // A sync is what resets the backoff, not a connect: a leader that
             // accepts and then says nothing would otherwise be re-dialled one
             // second after every deadline, forever, at full rate.
             m_master_attempt = 0;
+            if (m_role)
+            {
+                uint64_t at = 0;
+                const std::string_view digits = line.size() > repl_sync_done.size() ? line.substr(repl_sync_done.size() + 1)
+                                                                                   : std::string_view{};
+                if (!parse_int_sv(digits, at))
+                    at = 0;
+                m_role->sync_done(at);
+            }
             continue;
+        }
+
+        // A source that is not a primary answers `replicate` with an error and nothing else, so this link is for a
+        // replica that is not, or not yet, the one to follow.
+        if (m_role && !link.synced && line.starts_with("error:"))
+        {
+            link_refused = true;
+            break;
+        }
+
+        // The copy is nothing from the first line of a dump to its end, and a position in the primary's stream after.
+        if (m_role && !line.empty())
+        {
+            if (link.synced)
+                m_role->record();
+            else if (!m_role->syncing() && line != "ok")
+                m_role->sync_started();
         }
 
         if (!line.empty())
@@ -12758,6 +13008,16 @@ void cache_instance::handle_master_read(struct io_uring_cqe* cqe)
 
             m_mode = saved;
         }
+    }
+
+    // The other end said it is not the primary; it is dialled again shortly, when the daemon has told it what it is.
+    if (link_refused)
+    {
+        if (link.fd >= 0)
+            close_tracked(link.fd);
+        m_master.reset();
+        schedule_master_retry();
+        return;
     }
 
     // A length past max_payload means the framing is wrong and no point says
@@ -12828,5 +13088,7 @@ std::string cache_instance::stats_lines() const
         // from a leader that accepts and then says nothing.
         << "master_sync_in_progress:" << ((m_master && !m_master->synced) ? 1 : 0) << "\n"
         << "followers:" << m_followers.size() << "\n";
+    if (m_role)
+        out << socketley::cluster::report_lines(*m_role, role_clock_ms());
     return out.str();
 }

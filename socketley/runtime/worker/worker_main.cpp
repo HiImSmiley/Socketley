@@ -743,6 +743,10 @@ private:
             case worker_proto::frame_type::start:     on_start();            break;
             case worker_proto::frame_type::stop:      on_stop();             break;
             case worker_proto::frame_type::reload:    on_reload(payload);    break;
+            case worker_proto::frame_type::replica_order:
+                if (m_rt)
+                    m_rt->on_replica_order(payload);
+                break;
             case worker_proto::frame_type::shutdown:  m_done = true;         break;
 
             // Anything else is a frame this build predates or one that only

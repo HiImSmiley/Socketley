@@ -895,6 +895,11 @@ void proxy_supervisor::send_reload(std::string_view lua_path)
                                          lua_path))) {}
 }
 
+bool proxy_supervisor::send_replica_order(std::string_view payload)
+{
+    return write_frame(worker_proto::frame(worker_proto::frame_type::replica_order, payload));
+}
+
 void proxy_supervisor::send_config(std::string_view json)
 {
     // Cleared at the ask for the reason send_reload() clears its own: a config

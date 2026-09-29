@@ -28,6 +28,7 @@
 #include "../../shared/direct_send.h"
 #include "../../shared/tls_context.h"
 #include "../../shared/unix_companion.h"
+#include "../../shared/replica_role.h"
 
 struct client_connection
 {
@@ -299,6 +300,12 @@ public:
 
     void set_mode(cache_mode mode);
     cache_mode get_mode() const;
+
+    // A replica of a cluster cache, which is what `--cluster-replica <incarnation>` makes: the process is that incarnation,
+    // starts fenced so it answers no client and takes no `replicate`, and is told what to be by the daemon from then on.
+    void set_cluster_replica(uint64_t incarnation) { m_cluster_incarnation = incarnation; }
+    uint64_t get_cluster_replica() const { return m_cluster_incarnation; }
+    void on_replica_order(std::string_view payload) override;
 
     void on_cqe(struct io_uring_cqe* cqe) override;
     bool setup(event_loop& loop) override;
@@ -961,7 +968,8 @@ private:
     bool mutation_log_wanted() const
     {
         return (m_repl_role == repl_leader && !m_followers.empty())
-            || (m_journal.is_open() && !m_journal_replaying);
+            || (m_journal.is_open() && !m_journal_replaying)
+            || m_leads_cluster;
     }
 
     // One Lua-facing mutation into the chokepoint, spelled as the text
@@ -1207,6 +1215,27 @@ private:
     cache_mode m_mode = cache_mode_readwrite;
     bool m_resp_forced{false};
 
+    // ── A replica of a cluster cache ────────────────────────────────────────
+    // Present once setup() has made this process a replica.  What it may do comes from the daemon's last order and
+    // only from it: fenced answers no client, a follower is read-only and dials the primary it is given, and the
+    // primary takes writes as the mode the operator asked for, counting each record it produces.
+    uint64_t m_cluster_incarnation{0};
+    std::unique_ptr<socketley::cluster::replica_role> m_role;
+    socketley::cluster::replica_mode m_role_mode{socketley::cluster::replica_mode::fenced};
+    // The mode the flags asked for, which a primary returns to after a spell as a follower or fenced.
+    cache_mode m_mode_asked{cache_mode_readwrite};
+    bool m_fenced{false};
+    bool m_leads_cluster{false};
+    std::unique_ptr<timer_op> m_role_timer;
+    bool m_role_timer_armed{false};
+    void apply_role(socketley::cluster::replica_mode mode, bool retarget);
+    void follow(const std::string& target, bool retarget);
+    void drop_master();
+    void arm_role_timer();
+    void role_lapsed();
+    // A client command that is refused because this replica holds no lease.
+    static void refuse_fenced(client_connection* conn, bool resp);
+
     // Replication
     std::string m_replicate_target;
     repl_role m_repl_role{repl_none};
@@ -1279,6 +1308,8 @@ private:
         io_request req{};
         struct sockaddr_in addr{};
         int fd{-1};
+        // Who was dialled, so an answer that arrives after the target changed is not taken for the new one's.
+        std::string target;
     };
     std::unique_ptr<master_dial> m_master_dial;
     // One retry chain at a time and the attempt it counts from, which is the

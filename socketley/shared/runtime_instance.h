@@ -302,6 +302,9 @@ public:
     std::string stats_ring() const;
     virtual std::string stats_lines() const { return {}; }
 
+    // The daemon's order to a cluster cache replica about its part, which no other runtime takes.
+    virtual void on_replica_order(std::string_view /*payload*/) {}
+
     // Atomic for the DAEMON's copy of these, not the worker's.
     //
     // Both processes hold a runtime_instance and they use these four

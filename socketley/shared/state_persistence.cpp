@@ -772,6 +772,7 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.resp_forced = cache->get_resp_forced();
             cfg.cluster = cache->get_cluster();
             cfg.replicate_target = cache->get_replicate_target();
+            cfg.cluster_replica = cache->get_cluster_replica();
             cfg.max_memory = cache->get_max_memory();
             cfg.eviction = static_cast<uint8_t>(cache->get_eviction());
             cfg.cache_public = cache->get_public();
@@ -1020,6 +1021,8 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("cluster", true);
             if (!cfg.replicate_target.empty())
                 append_str_field("replicate_target", cfg.replicate_target);
+            if (cfg.cluster_replica != 0)
+                append_str_field("cluster_replica", std::to_string(cfg.cluster_replica));
             if (cfg.max_memory > 0)
                 append_int_field("max_memory", cfg.max_memory);
             append_str_field("eviction", eviction_str(cfg.eviction));
@@ -1171,6 +1174,11 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.resp_forced = json_get_bool(json, "resp_forced");
             cfg.cluster = json_get_bool(json, "cluster");
             cfg.replicate_target = json_get_string(json, "replicate_target");
+            {
+                const std::string inc = json_get_string(json, "cluster_replica");
+                if (!inc.empty())
+                    std::from_chars(inc.data(), inc.data() + inc.size(), cfg.cluster_replica);
+            }
             cfg.max_memory = json_get_size(json, "max_memory");
             cfg.eviction = str_to_eviction(json_get_string(json, "eviction"));
             cfg.cache_public = json_get_bool(json, "public");

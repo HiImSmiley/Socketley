@@ -80,6 +80,8 @@ void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool b
         cache.set_cluster(cfg.cluster);
     if (asked("replicate_target", !cfg.replicate_target.empty()))
         cache.set_replicate_target(cfg.replicate_target);
+    if (asked("cluster_replica", cfg.cluster_replica != 0))
+        cache.set_cluster_replica(cfg.cluster_replica);
     if (asked("max_memory", cfg.max_memory > 0))
         cache.set_max_memory(cfg.max_memory);
     if (asked("eviction", true))

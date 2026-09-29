@@ -141,6 +141,8 @@ struct runtime_config
     bool resp_forced = false;
     bool cluster = false;
     std::string replicate_target;
+    // The incarnation of a cluster cache replica, zero for a cache that is not one.
+    uint64_t cluster_replica = 0;
     size_t max_memory = 0;
     uint8_t eviction = 0;    // eviction_policy
     // --public, false for every state file written before it existed, which
