@@ -156,15 +156,17 @@ private:
 
     void close_node()
     {
-        if (m_fd >= 0)
-        {
-            ::shutdown(m_fd, SHUT_RDWR);
-            if (m_loop)
-                m_loop->close_fd(m_fd);
-            else
-                ::close(m_fd);
-            m_fd = -1;
-        }
+        // Only a node this object bound is its file to remove: a stopped one's
+        // destructor runs when its process exits, which can be after the next
+        // worker of the same runtime has bound the same path.
+        if (m_fd < 0)
+            return;
+        ::shutdown(m_fd, SHUT_RDWR);
+        if (m_loop)
+            m_loop->close_fd(m_fd);
+        else
+            ::close(m_fd);
+        m_fd    = -1;
         m_armed = false;
 
         // Closing a descriptor does not remove the file, and a node left

@@ -153,13 +153,36 @@ PYEOF
     kill "$HELD" 2>/dev/null; wait "$HELD" 2>/dev/null
 fi
 
-"$BIN" stop sp_stg >/dev/null 2>&1
-for _ in $(seq 1 50); do [ -e "$NODE" ] || break; sleep 0.1; done
-if [ -e "$NODE" ]; then bad "stop removes the node" "$NODE is still there"; else ok "stop removes the node"; fi
-"$BIN" start sp_stg >/dev/null 2>&1
-wait_up "http://127.0.0.1:$B/" || bad "restart" "no answer"
-for _ in $(seq 1 50); do [ -S "$NODE" ] && break; sleep 0.1; done
-if [ -S "$NODE" ]; then ok "and start makes it again"; else bad "start makes the node again" "no socket"; fi
+# The old worker outlives its stop by a few tens of milliseconds, and the next
+# worker binds the same path.  The old one is held with SIGSTOP the moment its
+# node is gone, the runtime is started, and the old one is let go once the new
+# node is there: its exit must not take the new node with it.  A worker that has
+# already gone when it is held is tried again.
+HELDPID=""
+trap '[ -n "$HELDPID" ] && kill -CONT "$HELDPID" 2>/dev/null; cleanup' EXIT
+held_old=0
+for attempt in 1 2 3 4 5 6; do
+    oldpid=$(stat_of sp_stg pid)
+    [ -n "$oldpid" ] || { sleep 0.3; continue; }
+    "$BIN" stop sp_stg >/dev/null 2>&1
+    for _ in $(seq 1 500); do [ -e "$NODE" ] || break; sleep 0.01; done
+    if [ "$attempt" = 1 ]; then
+        if [ -e "$NODE" ]; then bad "stop removes the node" "$NODE is still there"; else ok "stop removes the node"; fi
+    fi
+    if kill -STOP "$oldpid" 2>/dev/null; then HELDPID=$oldpid; held_old=1; fi
+    "$BIN" start sp_stg >/dev/null 2>&1
+    wait_up "http://127.0.0.1:$B/" || bad "restart" "no answer"
+    for _ in $(seq 1 50); do [ -S "$NODE" ] && break; sleep 0.1; done
+    if [ "$held_old" = 1 ]; then
+        kill -CONT "$oldpid" 2>/dev/null
+        for _ in $(seq 1 100); do kill -0 "$oldpid" 2>/dev/null || break; sleep 0.05; done
+        HELDPID=""
+        sleep 0.2
+        break
+    fi
+done
+if [ "$held_old" = 1 ]; then ok "the old worker was held across the start ($attempt tries)"; else bad "holding the old worker" "it had exited every time"; fi
+if [ -S "$NODE" ]; then ok "start makes the node again, and the old worker's exit leaves it alone"; else bad "the new node survives the old worker's exit" "no socket in $(ls "$NODEDIR" 2>&1 | tr "\n" " ")"; fi
 expect "the objects are served over the new node" "$(usock http://x/nodebkt/big | md5sum | cut -d' ' -f1)" "$want"
 
 # ── --idle-timeout ──────────────────────────────────────────────────────────
