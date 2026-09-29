@@ -28,6 +28,9 @@ namespace
 constexpr size_t   max_head_bytes      = 32 * 1024;
 constexpr size_t   pipe_bytes          = 1u << 20;
 constexpr size_t   stream_chunk        = 256 * 1024;
+// What one recv brings a heavy hook, so the hop to its thread is paid per quarter megabyte.
+constexpr size_t   hook_read_bytes     = 256 * 1024;
+constexpr size_t   hook_buffers_kept   = 32;
 // What a body already refused is read and thrown away up to, so the client that
 // sent it hears the answer instead of a reset; beyond it the connection closes.
 constexpr uint64_t discard_limit       = 64ull << 20;
@@ -74,7 +77,7 @@ const char* reason_phrase(int status)
 namespace
 {
 
-// Threads that hash large bodies: two by default, none to hash on the loop.
+// Threads that hash large bodies: three by default, none to hash on the loop.
 unsigned hash_threads()
 {
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_HASH_THREADS"))
@@ -84,7 +87,7 @@ unsigned hash_threads()
         if (end != e && v >= 0 && v <= 16)
             return static_cast<unsigned>(v);
     }
-    return 2;
+    return 3;
 }
 
 }   // namespace
@@ -541,6 +544,7 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     char*    buf = c->ssl ? c->cbuf.get() : c->rbuf;
     uint32_t len = static_cast<uint32_t>(c->ssl ? tls_read_bytes : conn::rbuf_size);
     c->rd_direct = false;
+    c->rd_hook   = false;
 
     switch (c->ph)
     {
@@ -570,6 +574,20 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
                 c->rd_direct = true;
                 if (len == 0)
                     return;
+            }
+            else if (c->hook && c->hook->heavy() && !c->req.chunked && m_hash.enabled() && c->put &&
+                     !c->put->failed() && c->put_failed == st::ok)
+            {
+                // A signed body is verified on a helper thread, a quarter megabyte at a time.
+                if (c->park_off < c->park.size() || c->hook_busy)
+                    return;   // resumed when the hook has reported and the put has taken its bytes
+                if (!c->hbuf)
+                    c->hbuf = take_hook_buffer();
+                buf = c->hbuf.get();
+                len = static_cast<uint32_t>(std::min<uint64_t>(hook_read_bytes, c->body_left));
+                if (len == 0)
+                    return;
+                c->rd_hook = true;
             }
             else if (c->park_off < c->park.size())
                 return;   // waiting for the put to take what is parked
@@ -635,7 +653,83 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
             arm_read(c);
         return;
     }
+    if (c->ph == phase::body_put && c->rd_hook)
+    {
+        c->rd_hook = false;
+        c->body_left -= n;
+        hook_async(c, n);
+        return;
+    }
     plain_in(c, c->rbuf, n);
+}
+
+// What a heavy hook did with one recv: run on a helper thread, reported on the loop.
+struct storage_run::hook_job
+{
+    std::shared_ptr<body_hook> hook;
+    std::shared_ptr<char[]>    buf;
+    size_t                     n{0};
+    std::string                out;
+    s3_error                   err;
+    bool                       ok{true};
+};
+
+std::shared_ptr<char[]> storage_run::take_hook_buffer()
+{
+    if (!m_hook_buffers.empty())
+    {
+        auto b = std::move(m_hook_buffers.back());
+        m_hook_buffers.pop_back();
+        return b;
+    }
+    return std::make_shared_for_overwrite<char[]>(hook_read_bytes);
+}
+
+void storage_run::give_hook_buffer(std::shared_ptr<char[]> b)
+{
+    if (b && m_hook_buffers.size() < hook_buffers_kept)
+        m_hook_buffers.push_back(std::move(b));
+}
+
+void storage_run::hook_async(const std::shared_ptr<conn>& c, size_t n)
+{
+    auto job  = std::make_shared<hook_job>();
+    job->hook = c->hook;
+    job->buf  = std::move(c->hbuf);
+    job->n    = n;
+    c->hook_busy = true;
+    if (!c->has_lane)
+    {
+        c->hash_lane = m_hash.next_lane();
+        c->has_lane  = true;
+    }
+    // In order on this connection's lane, so the hook is never fed by two threads at once.
+    m_hash.submit(c->hash_lane,
+        [job]
+        {
+            job->ok = job->hook->feed(std::string_view(job->buf.get(), job->n), job->out, job->err);
+        },
+        [this, id = c->id, job] { hook_async_done(id, job); });
+}
+
+void storage_run::hook_async_done(uint64_t id, const std::shared_ptr<hook_job>& job)
+{
+    give_hook_buffer(std::move(job->buf));
+    auto c = find(id);
+    if (!c || c->dead)
+        return;
+    c->hook_busy = false;
+    if (!job->ok)
+    {
+        put_refused(c, job->err);
+        return;
+    }
+    if (c->park.empty())
+        c->park = std::move(job->out);
+    else
+        c->park += job->out;
+    c->put_fin_called = c->body_left == 0;
+    put_drain_park(c);
 }
 
 // What a connection's plaintext does, whether it came off the wire or out of a

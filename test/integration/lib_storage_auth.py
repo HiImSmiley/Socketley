@@ -450,6 +450,49 @@ def payload_half():
     check("a signed stream that ends before its zero-length chunk is refused", r.status == 400, (r.status, r.body[:200]))
     check("and nothing was stored for it", code_of(lambda: c.head_object(Bucket=B, Key="chunks-nofinal"))[1] == 404)
 
+    # Signed megabytes are verified a quarter megabyte at a time off the loop: a byte flipped late in a long
+    # body is still found, and a client that leaves in the middle of one leaves nothing behind.
+    mib = [os.urandom(1 << 20) for _ in range(6)]
+    long_data = b"".join(mib)
+    long_ex = {"x-amz-decoded-content-length": str(len(long_data)), "content-encoding": "aws-chunked"}
+
+    def put_long(key, mutate=None, cut_at=None):
+        s = sig.sign("PUT", path(key), "", HOST, AK, SK, S, long_ex)
+        wire = sig.signed_chunks(s, mib)
+        if mutate:
+            wire = mutate(wire)
+        if cut_at is None:
+            return raw("PUT", path(key), dict(s.headers, **long_ex), wire)
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
+        conn.putrequest("PUT", path(key), skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", HOST)
+        conn.putheader("Content-Length", str(len(wire)))
+        for k, v in dict(s.headers, **long_ex).items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        conn.send(wire[:cut_at])
+        conn.close()
+        return None
+
+    r = put_long("long-ok")
+    check("six megabytes in signed chunks are stored as sent",
+          r.status == 200 and c.get_object(Bucket=B, Key="long-ok")["Body"].read() == long_data, (r.status, r.body[:200]))
+
+    def flip_late(wire):
+        bad = bytearray(wire)
+        bad[len(wire) - (1 << 20)] ^= 1
+        return bytes(bad)
+
+    r = put_long("long-bad", flip_late)
+    check("a byte flipped in the last megabyte of a signed body is SignatureDoesNotMatch 403",
+          r.status == 403 and r.code() == "SignatureDoesNotMatch", (r.status, r.body[:200]))
+    check("and nothing was stored under that key", code_of(lambda: c.head_object(Bucket=B, Key="long-bad"))[1] == 404)
+    put_long("long-left", cut_at=3 * (1 << 20) + 1000)
+    time.sleep(0.5)
+    check("a client that leaves a signed body half sent stores nothing", code_of(lambda: c.head_object(Bucket=B, Key="long-left"))[1] == 404)
+    r = put_long("long-after")
+    check("and the runtime answers the next signed body", r.status == 200, (r.status, r.body[:200]))
+
     # aws-chunked with a checksum in the trailer, unsigned and signed.
     text = os.urandom(4000)
     crc = sig.crc32c_b64(text)

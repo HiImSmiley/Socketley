@@ -233,7 +233,15 @@ struct conn
 
     // ── A body streaming into an object ─────────────────────────────────────
     std::shared_ptr<put_op>    put;
-    std::unique_ptr<body_hook> hook;
+    // Shared with the job that is feeding it on a helper thread, which may outlive the request.
+    std::shared_ptr<body_hook> hook;
+    // A recv for a body whose hook is heavy lands here, in a buffer that the
+    // hook's job then owns until it reports.
+    std::shared_ptr<char[]> hbuf;
+    bool        rd_hook{false};
+    bool        hook_busy{false};
+    uint32_t    hash_lane{0};
+    bool        has_lane{false};
     // What the hook or the chunk decoder produced that the put could not take.
     std::string park;
     size_t      park_off{0};
@@ -385,6 +393,13 @@ public:
     void put_body_complete(const std::shared_ptr<conn>& c);
     void put_failed(const std::shared_ptr<conn>& c, st why);
     void put_refused(const std::shared_ptr<conn>& c, const s3_error& e);
+    // A heavy hook is fed the `n` bytes just received into the connection's hook buffer on a
+    // helper thread, and what it decoded goes to the put when it reports.
+    struct hook_job;
+    void hook_async(const std::shared_ptr<conn>& c, size_t n);
+    void hook_async_done(uint64_t id, const std::shared_ptr<hook_job>& job);
+    std::shared_ptr<char[]> take_hook_buffer();
+    void give_hook_buffer(std::shared_ptr<char[]> b);
     void enter_discard(const std::shared_ptr<conn>& c);
     // Answers a request that is refused before its body was read, after reading
     // and dropping the body when it is small enough, so the client hears the
@@ -488,6 +503,7 @@ private:
 
     struct pooled_pipe { int rd; int wr; uint32_t size; };
     std::vector<pooled_pipe> m_pipes;
+    std::vector<std::shared_ptr<char[]>> m_hook_buffers;
 
     struct timer
     {

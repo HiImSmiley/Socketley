@@ -90,6 +90,8 @@ public:
         return true;
     }
 
+    bool heavy() const override { return true; }
+
     bool finish(std::string&, s3_error& err) override
     {
         if (m_hash.matches(m_expected))
@@ -107,7 +109,16 @@ private:
 class stream_hook final : public body_hook
 {
 public:
-    explicit stream_hook(const s3::stream_context& ctx) : m_ctx_len(ctx.decoded_length), m_stream(ctx) {}
+    explicit stream_hook(const s3::stream_context& ctx)
+        : m_ctx_len(ctx.decoded_length),
+          m_signed(ctx.kind == s3::payload_kind::streaming_signed ||
+                   ctx.kind == s3::payload_kind::streaming_signed_trailer),
+          m_stream(ctx)
+    {
+    }
+
+    // Every chunk of a signed stream is hashed and its signature computed.
+    bool heavy() const override { return m_signed; }
 
     bool feed(std::string_view raw, std::string& out, s3_error& err) override
     {
@@ -163,6 +174,7 @@ public:
 
 private:
     uint64_t        m_ctx_len;
+    bool            m_signed;
     s3::chunk_stream m_stream;
 };
 

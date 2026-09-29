@@ -80,6 +80,11 @@ public:
     // does not match, a chunk stream that stopped short -- and nothing is stored.
     virtual bool finish(std::string& out, s3_error& err) = 0;
 
+    // Whether feeding this hook costs enough per byte (a SHA-256 of the whole
+    // body) to be worth running on a helper thread, in order and one piece at a
+    // time; a hook that only decodes framing is cheaper done in line.
+    virtual bool heavy() const { return false; }
+
     // The length of the decoded payload when the framing announces it, as
     // aws-chunked does with x-amz-decoded-content-length.
     virtual std::optional<uint64_t> decoded_length() const { return std::nullopt; }

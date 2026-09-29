@@ -6463,8 +6463,9 @@ count makes it, and is the only place the loop blocks on the disk: every request
 is served on the runtime's io_uring.
 .PP
 A body is never held whole: it streams from the socket into a megabyte staging
-buffer, is hashed as it passes and written while the next bytes arrive, so a
-gigabyte upload costs a few megabytes of memory. A GET of 64 KiB or more is sent
+buffer, is hashed as it passes (on helper threads from 256 KiB up, so that the
+loop is not the one core that hashes every upload) and written while the next
+bytes arrive, so a gigabyte upload costs a few megabytes of memory. A GET of 64 KiB or more is sent
 by
 .BR splice (2)
 from the file through a pipe to the socket without entering the process, and the
@@ -10850,9 +10851,10 @@ Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_HASH_THREADS
 How many helper threads a storage worker takes the digests of large uploads on
-(the ETag's MD5 and any \fBx\-amz\-checksum\-\fR the request asked for), so that the
-worker's loop is not the one core every upload's hashing has to fit in. Default
-.BR 2 ;
+(the ETag's MD5, any \fBx\-amz\-checksum\-\fR the request asked for, and the SHA\-256
+that verifies a signed body: a hex payload hash or aws\-chunked signatures), so
+that the worker's loop is not the one core every upload's hashing has to fit in. Default
+.BR 3 ;
 .B 0
 hashes on the loop. The threads are started by the first upload of 256 KiB or
 more (or of unknown length) and end with the runtime; smaller bodies are hashed
