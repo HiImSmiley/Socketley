@@ -1019,7 +1019,7 @@ TEST_CASE("a quota is an equal share for each shard")
     }
     CHECK(accepted == 1);
     CHECK(refused == 7);
-    CHECK(tmp_files(d.path, "bkt").empty());
+    CHECK(c.tmp_empties("bkt"));
     for (const auto& mb : c.m)
         CHECK(mb->store->totals().bytes <= (1u << 20));
 }
