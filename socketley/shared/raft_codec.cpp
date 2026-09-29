@@ -95,6 +95,15 @@ std::string encode(kind k, const lease& l)
     writer w(k);
     w.u64(l.nonce);
     w.u64(l.index);
+    w.u32(static_cast<uint32_t>(l.reports.size()));
+    for (const cluster::replica_report& rep : l.reports)
+    {
+        w.bytes(rep.name);
+        w.u64(rep.incarnation);
+        w.u64(rep.epoch);
+        w.u64(rep.offset);
+        w.u8(rep.primary ? 1 : 0);
+    }
     return w.take();
 }
 
@@ -144,10 +153,21 @@ bool decode(std::string_view payload, frame& out, std::string* why)
 
     case static_cast<uint8_t>(kind::lease_req):
     case static_cast<uint8_t>(kind::lease_grant):
+    {
         out.kind = static_cast<kind>(k);
-        if (!r.u64(out.lease.nonce) || !r.u64(out.lease.index))
+        uint32_t n = 0;
+        if (!r.u64(out.lease.nonce) || !r.u64(out.lease.index) || !r.u32(n))
             return fail(why, "malformed lease");
+        // A grant answers a request and reports nothing, and a request that reports more than a node can hold is corrupt.
+        if (n > max_reports || (out.kind == kind::lease_grant && n != 0))
+            return fail(why, "a lease carries more reports than it may");
+        out.lease.reports.resize(n);
+        for (cluster::replica_report& rep : out.lease.reports)
+            if (!r.bytes(rep.name, 128) || !r.u64(rep.incarnation) || !r.u64(rep.epoch) || !r.u64(rep.offset)
+                || !r.flag(rep.primary) || rep.name.empty() || rep.incarnation == 0)
+                return fail(why, "malformed replica report");
         break;
+    }
 
     case static_cast<uint8_t>(kind::refuse):
         out.kind = kind::refuse;

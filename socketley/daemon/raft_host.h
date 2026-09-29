@@ -74,8 +74,14 @@ public:
     // The cluster's desired state as this node has applied it.
     const socketley::cluster::state& cluster() const { return m_brain->current(); }
     const socketley::cluster::brain& brain() const { return *m_brain; }
-    // What this node should be running right now, and whether it may.
-    socketley::cluster::want desired() const { return m_brain->desired(now_ms()); }
+    // What this node should be running right now, and whether it may, with each cache follower told where its primary is.
+    socketley::cluster::want desired() const;
+    // How long the lease this node holds still has, which is how long an order to a replica may stand.
+    uint64_t lease_left_ms() const { return m_brain->lease_left_ms(now_ms()); }
+    // What this node's cache replicas say about their copies, for the next lease request.
+    void set_replica_reports(std::vector<socketley::cluster::replica_report> r) { m_brain->set_reports(std::move(r)); }
+    // Where each cache's primary is reached, as host and port, for the runtimes this node's applied state gives one.
+    std::map<std::string, std::pair<std::string, uint16_t>> primary_endpoints() const;
     // Called at the end of every Raft tick, which is where the daemon reconciles its runtimes with desired().
     void set_on_tick(std::function<void()> fn) { m_on_tick = std::move(fn); }
     uint64_t now_ms() const;
@@ -138,6 +144,8 @@ private:
     void reap();
 
     const member* lookup(socketley::raft::node_id id) const;
+    // The address the followers of cache `name` dial, from its primary's flags and the host its node advertises; empty when nobody leads it.
+    std::string primary_address(const std::string& name) const;
     void refresh_book();
     std::string describe(socketley::raft::node_id id) const;
 

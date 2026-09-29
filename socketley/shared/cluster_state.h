@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -30,7 +31,7 @@ struct spec
     bool operator==(const spec&) const = default;
 };
 
-enum class op : uint8_t { create = 1, remove = 2, scale = 3, assign = 4, unassign = 5 };
+enum class op : uint8_t { create = 1, remove = 2, scale = 3, assign = 4, unassign = 5, promote = 6 };
 
 struct command
 {
@@ -39,6 +40,9 @@ struct command
     // The whole spec on create, only the replica count on scale.
     spec        sp;
     node_id     node = 0;
+    // On promote, which incarnation of the replica on `node` leads and the epoch it leads, one past the last.
+    uint64_t    incarnation = 0;
+    uint64_t    epoch       = 0;
 
     bool operator==(const command&) const = default;
 };
@@ -55,6 +59,9 @@ bool        decode(std::string_view data, command& out);
 std::string refusal(const command& c);
 // The types that may run as a cluster runtime, and the reason for one that may not.
 std::string type_refusal(std::string_view type);
+// Why the flags of a cluster cache cannot work, empty when they can: the followers dial the primary's -p, so that is
+// what it needs, and the cluster sets the rest of replication itself.
+std::string cache_flags_refusal(const std::vector<std::string>& args);
 
 // What "{node}" stands for: the node's name with everything but letters, digits, '-', '_' and '.' turned into '_', so two names can share one label.
 std::string node_label(std::string_view name);
@@ -69,11 +76,24 @@ std::string quote_arg(std::string_view arg);
 // False on a % that is not followed by two hex digits.
 bool        unquote_arg(std::string_view word, std::string& out);
 
+// Which replica of a cache leads it: the node, the incarnation of the process there (a restarted replica is a new one
+// and holds nothing the old one did), and the epoch it leads, which only ever grows.
+struct primary_record
+{
+    node_id  node        = 0;
+    uint64_t incarnation = 0;
+    uint64_t epoch       = 0;
+
+    bool operator==(const primary_record&) const = default;
+};
+
 struct state
 {
     std::map<std::string, spec> specs;
     // Ordered, so two nodes that applied the same log walk the same replicas in the same order.
     std::map<std::string, std::set<node_id>> owners;
+    // One per cache spec and none for another type; the node is zero while nobody leads.
+    std::map<std::string, primary_record> primaries;
 
     // True when the command changed something, false when it was a repeat or named nothing, and identically on every node.
     bool apply(const command& c);
@@ -95,7 +115,24 @@ std::string encode(const state& s);
 bool        decode(std::string_view data, state& out);
 
 // The assign and unassign commands that bring the owners in line with the specs on the nodes given, a pure function
-// so any node would choose the same.
+// so any node would choose the same.  A scale-down never takes the replica that leads a cache.
 std::vector<command> plan(const state& s, const std::vector<node_id>& live);
+
+// A replica a promotion may choose: what it last said about its copy, which the leader hears on every lease request.
+struct candidate
+{
+    node_id  node        = 0;
+    uint64_t incarnation = 0;
+    // The epoch of the primary whose stream the copy came from, and how far into it; copies compare by both, in that order.
+    uint64_t epoch  = 0;
+    uint64_t offset = 0;
+};
+
+// The most up-to-date copy: the highest epoch, then the highest offset, then the lowest node; nothing when there is none.
+std::optional<candidate> best_candidate(const std::vector<candidate>& from);
+
+// Where the other replicas of a cluster cache dial the one whose flags (already expanded for its node) are `args`, on
+// the host that node is reached at; empty when the flags name no port.
+std::string replica_address(const std::vector<std::string>& args, std::string_view host);
 
 }   // namespace socketley::cluster

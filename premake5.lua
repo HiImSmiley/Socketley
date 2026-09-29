@@ -1714,7 +1714,8 @@ project "test_cluster_state"
 
     files {
         "test/unit/test_cluster_state.cpp",
-        "socketley/shared/cluster_state.cpp"
+        "socketley/shared/cluster_state.cpp",
+        "socketley/shared/replica_role.cpp"
     }
 
     filter "configurations:Debug"
@@ -1755,6 +1756,7 @@ project "test_cluster_brain"
         "test/unit/test_cluster_brain.cpp",
         "socketley/shared/cluster_brain.cpp",
         "socketley/shared/cluster_state.cpp",
+        "socketley/shared/replica_role.cpp",
         "socketley/shared/raft.cpp"
     }
 

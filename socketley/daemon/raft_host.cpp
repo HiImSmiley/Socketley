@@ -6,11 +6,13 @@
 #include "../shared/ipc_framing.h"
 #include "../shared/logging.h"
 #include "../shared/raft_codec.h"
+#include "../shared/random_id.h"
 #include "../shared/socket_tuning.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <charconv>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -51,14 +53,7 @@ const char* role_name(raft::role r)
     return "?";
 }
 
-uint64_t random_u64()
-{
-    uint64_t v = 0;
-    while (v == 0)
-        if (::getrandom(&v, sizeof v, 0) != static_cast<ssize_t>(sizeof v))
-            v = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^ ::getpid();
-    return v;
-}
+using socketley::random_u64;
 
 // A numeric host:port, because a peer's address arrives through the log and resolving a name would block the loop.
 bool parse_numeric(const std::string& addr, sockaddr_storage& out, socklen_t& len, std::string* host_out = nullptr)
@@ -715,7 +710,7 @@ void raft_host::flush_cluster(socketley::cluster::output& out)
         if (!l)
             continue;
         const wire::kind k = f.type == cl::frame::kind::lease_req ? wire::kind::lease_req : wire::kind::lease_grant;
-        enqueue(l, wire::encode(k, wire::lease{f.nonce, f.index}));
+        enqueue(l, wire::encode(k, wire::lease{f.nonce, f.index, f.reports}));
     }
     if (!out.proposals.empty())
         arm_pump();
@@ -871,6 +866,9 @@ void raft_host::apply_command(const std::string& data, raft::index_t index)
         break;
     case cl::op::unassign:
         info("cluster runtime " + c.name + " taken from " + describe(c.node));
+        break;
+    case cl::op::promote:
+        info("cache " + c.name + ": " + describe(c.node) + " leads epoch " + std::to_string(c.epoch));
         break;
     }
 }
@@ -1039,7 +1037,7 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         socketley::cluster::output out;
         const socketley::cluster::view v = make_view();
         if (f.kind == wire::kind::lease_req)
-            m_brain->on_lease_req(l.peer, f.lease.nonce, now_ms(), v, out);
+            m_brain->on_lease_req(l.peer, f.lease.nonce, now_ms(), v, out, f.lease.reports);
         else
             m_brain->on_lease_grant(l.peer, f.lease.nonce, f.lease.index, now_ms(), v);
         flush_cluster(out);
@@ -1380,6 +1378,52 @@ bool raft_host::decode_snapshot(std::string_view data, book& b, socketley::clust
     return decode_book(book_bytes, b) && socketley::cluster::decode(cluster_bytes, c);
 }
 
+// ─── cache primaries ───
+
+std::string raft_host::primary_address(const std::string& name) const
+{
+    namespace cl = socketley::cluster;
+    const cl::state& st = m_brain->current();
+    auto lead = st.primaries.find(name);
+    auto sp   = st.specs.find(name);
+    if (lead == st.primaries.end() || sp == st.specs.end() || lead->second.node == 0)
+        return {};
+    const member* mb = lookup(lead->second.node);
+    if (!mb)
+        return {};
+    const size_t colon = mb->addr.rfind(':');
+    if (colon == std::string::npos)
+        return {};
+    return cl::replica_address(cl::expand_args(sp->second.args, mb->name), mb->addr.substr(0, colon));
+}
+
+socketley::cluster::want raft_host::desired() const
+{
+    socketley::cluster::want w = m_brain->desired(now_ms());
+    for (auto& it : w.owned)
+        if (it.cache && it.role == socketley::cluster::replica_mode::follower)
+            it.target = primary_address(it.name);
+    return w;
+}
+
+std::map<std::string, std::pair<std::string, uint16_t>> raft_host::primary_endpoints() const
+{
+    std::map<std::string, std::pair<std::string, uint16_t>> out;
+    for (const auto& [name, lead] : m_brain->current().primaries)
+    {
+        const std::string addr = primary_address(name);
+        const size_t colon = addr.rfind(':');
+        if (lead.node == 0 || colon == std::string::npos)
+            continue;
+        uint16_t port = 0;
+        const std::string_view digits = std::string_view(addr).substr(colon + 1);
+        const auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), port);
+        if (ec == std::errc{} && end == digits.data() + digits.size() && port != 0)
+            out[name] = {addr.substr(0, colon), port};
+    }
+    return out;
+}
+
 // ─── shutdown and status ───
 
 std::string raft_host::placement() const
@@ -1429,6 +1473,39 @@ std::string raft_host::placement() const
 
     const uint64_t at = now_ms();
     const bool leader = m_node->current_role() == raft::role::leader;
+
+    // A cache is led by one replica, and what each copy has reached is only known where the lease requests arrive.
+    bool titled = false;
+    for (const auto& [name, lead] : st.primaries)
+    {
+        if (!titled)
+            out += "\nCACHE PRIMARIES\n";
+        titled = true;
+        out += name + "  " + (lead.node ? "primary " + node_name(lead.node) + " (epoch " + std::to_string(lead.epoch) + ")"
+                                        : "no primary yet (epoch " + std::to_string(lead.epoch) + ")") + "\n";
+        auto held = st.owners.find(name);
+        if (held == st.owners.end())
+            continue;
+        for (raft::node_id n : held->second)
+        {
+            out += "  " + node_name(n) + "  " + (n == lead.node ? "primary " : "follower");
+            if (auto rep = m_brain->report_of(n, name))
+            {
+                out += "  copy at epoch " + std::to_string(rep->epoch) + " offset " + std::to_string(rep->offset);
+                if (n != m_id)
+                    if (auto age = m_brain->report_age_ms(n, name, at))
+                        out += "  (heard " + std::to_string(*age) + " ms ago)";
+            }
+            else
+            {
+                out += "  no report from it";
+                if (!leader && n != m_id)
+                    out += " here: only the leader hears the other nodes";
+            }
+            out += "\n";
+        }
+    }
+
     const std::vector<raft::node_id> alive = m_brain->live(at, socketley::cluster::view_of(*m_node, m_applied, m_last_proposed));
     out += "\nNODE  LOAD  STATE\n";
     for (raft::node_id id : m_node->voters())

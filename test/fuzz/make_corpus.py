@@ -2256,8 +2256,11 @@ def raft_join(node, name, addr, voter=True):
     return struct.pack("<BBQ", 1, 3, node) + rw_bytes(name) + rw_bytes(addr) + struct.pack("<B", 1 if voter else 0)
 
 
-def raft_lease(grant, nonce, index=0):
-    return struct.pack("<BBQQ", 1, 6 if grant else 5, nonce, index)
+def raft_lease(grant, nonce, index=0, reports=()):
+    out = struct.pack("<BBQQ", 1, 6 if grant else 5, nonce, index) + struct.pack("<I", len(reports))
+    for (name, incarnation, epoch, offset, primary) in reports:
+        out += rw_bytes(name) + struct.pack("<QQQB", incarnation, epoch, offset, 1 if primary else 0)
+    return out
 
 
 def raft_command(data):
@@ -2289,11 +2292,18 @@ def cl_assign(name, node, on=True):
     return (b"C\x04" if on else b"C\x05") + rw_bytes(name) + struct.pack("<Q", node)
 
 
-# 'S', version 1, then per runtime: name, type, args, replicas, the nodes holding it.
+def cl_promote(name, node, incarnation, epoch):
+    return b"C\x06" + rw_bytes(name) + struct.pack("<QQQ", node, incarnation, epoch)
+
+
+# 'S', version 2, then per runtime: name, type, args, replicas, the nodes holding it, and the primary as node, incarnation, epoch.
 def cl_state(specs):
-    out = b"S\x01" + struct.pack("<I", len(specs))
-    for (name, typ, args, replicas, owners) in specs:
+    out = b"S\x02" + struct.pack("<I", len(specs))
+    for spec in specs:
+        (name, typ, args, replicas, owners) = spec[:5]
+        lead = spec[5] if len(spec) > 5 else (0, 0, 0)
         out += rw_bytes(name) + rw_bytes(typ) + rw_args(args) + struct.pack("<I", replicas) + rw_ids(owners)
+        out += struct.pack("<QQQ", *lead)
     return out
 
 
@@ -2345,13 +2355,30 @@ def raftmsg_seeds():
     s["lease_req"] = b"\x00" + raft_lease(False, 7)
     s["lease_grant"] = b"\x00" + raft_lease(True, 7, 4242)
     s["lease_torn"] = b"\x00" + raft_lease(True, 7, 4242)[:-3]
+    reports = [(b"db", 0xAABBCCDD11223344, 3, 9000, True), (b"cache-2", 5, 0, 0, False)]
+    s["lease_req_reports"] = b"\x00" + raft_lease(False, 7, 0, reports)
+    s["lease_req_reports_torn"] = b"\x00" + raft_lease(False, 7, 0, reports)[:-4]
+    s["lease_grant_with_reports"] = b"\x00" + raft_lease(True, 7, 4242, reports)
+    s["lease_report_no_incarnation"] = b"\x00" + raft_lease(False, 7, 0, [(b"db", 0, 1, 1, False)])
+    s["lease_too_many_reports"] = b"\x00" + raft_lease(False, 7, 0, [(b"r%d" % i, 1, 1, 1, False) for i in range(65)])
     s["refuse"] = b"\x00" + raft_refuse(b"--raft-name b is already node 1122334455667788 at 127.0.0.1:19001")
     s["refuse_empty"] = b"\x00" + raft_refuse(b"")
-    s["cluster_cache_type"] = b"\x80" + cl_create(b"db", b"cache", [], 1)
+    s["cluster_cache_no_port"] = b"\x80" + cl_create(b"db", b"cache", [b"--maxmemory", b"1M"], 1)
+    s["cluster_cache"] = b"\x80" + cl_create(b"db", b"cache", [b"-p", b"630{node}"], 3)
+    s["cluster_cache_replicate"] = b"\x80" + cl_create(b"db", b"cache", [b"-p", b"6300", b"--replicate", b"1.2.3.4:5"], 3)
+    s["cmd_frame_promote"] = b"\x00" + raft_command(cl_promote(b"db", 5, 0xAABBCCDD11223344, 2))
+    s["cluster_promote"] = b"\x80" + cl_promote(b"db", 5, 0xAABBCCDD11223344, 2)
+    s["cluster_promote_epoch_zero"] = b"\x80" + cl_promote(b"db", 5, 1, 0)
+    s["cluster_promote_node_zero"] = b"\x80" + cl_promote(b"db", 0, 1, 1)
     s["cluster_test_flag"] = b"\x80" + cl_create(b"api", b"server", [b"--test"], 1)
     s["cluster_zero_replicas"] = b"\x80" + cl_create(b"api", b"server", [], 0)
     s["cluster_torn_create"] = b"\x80" + cmds["create"][:-2]
     s["cluster_state"] = b"\x82" + cl_state([(b"api", b"server", [b"-p", b"8080"], 2, [5, 9]), (b"web", b"proxy", [], 1, [])])
+    s["cluster_state_cache"] = b"\x82" + cl_state([(b"db", b"cache", [b"-p", b"6300"], 3, [5, 9, 11], (9, 0xAABBCCDD11223344, 4))])
+    s["cluster_state_cache_no_primary"] = b"\x82" + cl_state([(b"db", b"cache", [b"-p", b"6300"], 3, [5, 9], (0, 0, 4))])
+    s["cluster_state_primary_not_owner"] = b"\x82" + cl_state([(b"db", b"cache", [b"-p", b"6300"], 3, [5, 9], (7, 1, 1))])
+    s["cluster_state_primary_no_incarnation"] = b"\x82" + cl_state([(b"db", b"cache", [b"-p", b"6300"], 3, [5, 9], (5, 0, 1))])
+    s["cluster_state_server_with_primary"] = b"\x82" + cl_state([(b"api", b"server", [], 2, [5, 9], (5, 1, 1))])
     s["cluster_state_empty"] = b"\x82" + cl_state([])
     s["cluster_state_node_zero"] = b"\x82" + cl_state([(b"api", b"server", [], 2, [0])])
     s["cluster_state_dup_owner"] = b"\x82" + cl_state([(b"api", b"server", [], 2, [7, 7])])

@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "raft.h"
+#include "replica_role.h"
 
 namespace socketley::raft::wire
 {
@@ -43,11 +45,16 @@ struct command
     bool operator==(const command&) const = default;
 };
 
+// The most cache replicas one node reports on a request, far above what a node holds, so a longer list is a corrupt frame.
+inline constexpr size_t max_reports = 64;
+
 // A follower asking the leader to count it alive, and the leader's answer naming the same request and carrying the leader's commit index.
 struct lease
 {
     uint64_t nonce = 0;
     uint64_t index = 0;
+    // On a request only: what each cache replica the node runs says about its copy, which is how the leader picks the most up-to-date one to promote.
+    std::vector<cluster::replica_report> reports;
 
     bool operator==(const lease&) const = default;
 };

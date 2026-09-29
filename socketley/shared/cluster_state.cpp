@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <tuple>
 
 namespace socketley::cluster
 {
@@ -15,7 +16,7 @@ namespace {
 // A cluster with more runtimes than this is refused, so a snapshot and a full log replay stay a bounded size.
 constexpr size_t max_specs = 1024;
 
-constexpr uint8_t state_version = 1;
+constexpr uint8_t state_version = 2;
 constexpr char    state_tag     = 'S';
 
 bool control_free(std::string_view s)
@@ -70,12 +71,30 @@ node_id label_holder(const std::map<node_id, std::string>& names, node_id id, st
 
 std::string type_refusal(std::string_view type)
 {
-    if (type == "server" || type == "proxy" || type == "client")
+    if (type == "server" || type == "proxy" || type == "client" || type == "cache")
         return {};
-    if (type == "cache")
-        return "a cache holds data and nothing here promotes a follower when its node dies, so it is not a cluster "
-               "runtime yet";
-    return "only a server, a proxy or a client can be a cluster runtime";
+    return "only a server, a proxy, a client or a cache can be a cluster runtime";
+}
+
+std::string cache_flags_refusal(const std::vector<std::string>& args)
+{
+    bool has_port = false;
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const std::string& a = args[i];
+        if (a == "-p")
+        {
+            has_port = i + 1 < args.size();
+            continue;
+        }
+        if (a == "--replicate" || a == "--cluster-replica")
+            return a + " is the cluster's to set: it makes one replica the primary and the others its followers";
+        if (a == "--listen")
+            return "--listen is a unix socket, and the followers of a cache dial its -p port to replicate";
+        if (a == "--shards")
+            return "a sharded cache cannot be replicated, so it cannot be a cluster cache";
+    }
+    return has_port ? std::string() : "a cluster cache needs -p <port>: its followers dial it to replicate";
 }
 
 std::string refusal(const command& c)
@@ -104,6 +123,9 @@ std::string refusal(const command& c)
         }
         if (bytes > max_args)
             return "the flags are longer than " + std::to_string(max_args) + " bytes";
+        if (c.sp.type == "cache")
+            if (std::string why = cache_flags_refusal(c.sp.args); !why.empty())
+                return why;
         [[fallthrough]];
     }
     case op::scale:
@@ -115,6 +137,12 @@ std::string refusal(const command& c)
     case op::assign:
     case op::unassign:
         return c.node == 0 ? "node 0 is not a node" : std::string();
+    case op::promote:
+        if (c.node == 0)
+            return "node 0 is not a node";
+        if (c.incarnation == 0)
+            return "incarnation 0 is not a replica";
+        return c.epoch == 0 ? "epoch 0 is nobody's" : std::string();
     }
     return "unknown command";
 }
@@ -141,6 +169,11 @@ std::string encode(const command& c)
     case op::unassign:
         w.u64(c.node);
         break;
+    case op::promote:
+        w.u64(c.node);
+        w.u64(c.incarnation);
+        w.u64(c.epoch);
+        break;
     }
     return w.take();
 }
@@ -155,7 +188,7 @@ bool decode(std::string_view data, command& out)
     bytes::reader r(data);
     uint8_t tag = 0, o = 0;
     if (!r.u8(tag) || tag != static_cast<uint8_t>(command_tag) || !r.u8(o) || o < 1
-        || o > static_cast<uint8_t>(op::unassign))
+        || o > static_cast<uint8_t>(op::promote))
         return false;
     command c;
     c.op = static_cast<op>(o);
@@ -176,6 +209,10 @@ bool decode(std::string_view data, command& out)
     case op::assign:
     case op::unassign:
         if (!r.u64(c.node))
+            return false;
+        break;
+    case op::promote:
+        if (!r.u64(c.node) || !r.u64(c.incarnation) || !r.u64(c.epoch))
             return false;
         break;
     }
@@ -264,9 +301,12 @@ bool state::apply(const command& c)
             return false;
         specs[c.name] = c.sp;
         owners[c.name];
+        if (c.sp.type == "cache")
+            primaries[c.name];
         return true;
 
     case op::remove:
+        primaries.erase(c.name);
         return specs.erase(c.name) + owners.erase(c.name) > 0;
 
     case op::scale:
@@ -293,7 +333,26 @@ bool state::apply(const command& c)
     case op::unassign:
     {
         auto it = owners.find(c.name);
-        return it != owners.end() && it->second.erase(c.node) > 0;
+        if (it == owners.end() || it->second.erase(c.node) == 0)
+            return false;
+        // A primary that no longer holds a replica leads nothing, and the epoch stays where it was so the next one is above it.
+        if (auto p = primaries.find(c.name); p != primaries.end() && p->second.node == c.node)
+        {
+            p->second.node        = 0;
+            p->second.incarnation = 0;
+        }
+        return true;
+    }
+
+    case op::promote:
+    {
+        auto p = primaries.find(c.name);
+        auto o = owners.find(c.name);
+        // Two leaders' plans racing each other both name the next epoch, and the second finds it taken.
+        if (p == primaries.end() || o == owners.end() || !o->second.count(c.node) || c.epoch != p->second.epoch + 1)
+            return false;
+        p->second = primary_record{c.node, c.incarnation, c.epoch};
+        return true;
     }
     }
     return false;
@@ -341,6 +400,7 @@ std::string conflict(const state& s, const command& c)
         return {};
     case op::assign:
     case op::unassign:
+    case op::promote:
         return {};
     }
     return {};
@@ -362,6 +422,11 @@ std::string encode(const state& s)
         const std::vector<uint64_t> held = it == s.owners.end() ? std::vector<uint64_t>{}
                                                                 : std::vector<uint64_t>(it->second.begin(), it->second.end());
         w.ids(held);
+        auto p = s.primaries.find(name);
+        const primary_record lead = p == s.primaries.end() ? primary_record{} : p->second;
+        w.u64(lead.node);
+        w.u64(lead.incarnation);
+        w.u64(lead.epoch);
     }
     return w.take();
 }
@@ -380,8 +445,9 @@ bool decode(std::string_view data, state& out)
         command c;
         c.op = op::create;
         std::vector<uint64_t> held;
+        primary_record lead;
         if (!r.bytes(c.name, max_name) || !r.bytes(c.sp.type, 16) || !get_args(r, c.sp.args)
-            || !r.u32(c.sp.replicas) || !r.ids(held))
+            || !r.u32(c.sp.replicas) || !r.ids(held) || !r.u64(lead.node) || !r.u64(lead.incarnation) || !r.u64(lead.epoch))
             return false;
         // What is stored passes through the same rules a proposal does, in the order encode writes it, so one state has one encoding.
         if (!refusal(c).empty() || (!s.specs.empty() && c.name <= s.specs.rbegin()->first) || held.size() > max_replicas)
@@ -389,8 +455,16 @@ bool decode(std::string_view data, state& out)
         if (!std::is_sorted(held.begin(), held.end(), std::less_equal<node_id>{}) || (!held.empty() && held.front() == 0))
             return false;
         std::set<node_id> owners(held.begin(), held.end());
+        // Only a cache has a primary, which is one of its owners and a process that has a number, or nobody.
+        const bool cache = c.sp.type == "cache";
+        if (!cache && (lead.node || lead.incarnation || lead.epoch))
+            return false;
+        if (lead.node ? (!owners.count(lead.node) || lead.incarnation == 0 || lead.epoch == 0) : lead.incarnation != 0)
+            return false;
         s.specs[c.name]  = c.sp;
         s.owners[c.name] = std::move(owners);
+        if (cache)
+            s.primaries[c.name] = lead;
     }
     if (r.left() != 0)
         return false;
@@ -437,13 +511,18 @@ std::vector<command> plan(const state& s, const std::vector<node_id>& live_in)
                     emit(op::unassign, name, n);
             }
 
-        // Too many, after a scale-down: the most loaded node gives one up, the highest id on a tie.
+        // Too many, after a scale-down: the most loaded node gives one up, the highest id on a tie, and never the primary of a cache.
+        node_id leads = 0;
+        if (auto lp = s.primaries.find(name); lp != s.primaries.end())
+            leads = lp->second.node;
         while (keep.size() > sp.replicas)
         {
-            node_id victim = *keep.begin();
+            node_id victim = 0;
             for (node_id n : keep)
-                if (load[n] > load[victim] || (load[n] == load[victim] && n > victim))
+                if (n != leads && (victim == 0 || load[n] > load[victim] || (load[n] == load[victim] && n > victim)))
                     victim = n;
+            if (victim == 0)
+                break;
             emit(op::unassign, name, victim);
             --load[victim];
             keep.erase(victim);
@@ -464,6 +543,24 @@ std::vector<command> plan(const state& s, const std::vector<node_id>& live_in)
         }
     }
     return out;
+}
+
+std::optional<candidate> best_candidate(const std::vector<candidate>& from)
+{
+    std::optional<candidate> best;
+    for (const candidate& c : from)
+        if (!best || std::tie(c.epoch, c.offset) > std::tie(best->epoch, best->offset)
+            || (std::tie(c.epoch, c.offset) == std::tie(best->epoch, best->offset) && c.node < best->node))
+            best = c;
+    return best;
+}
+
+std::string replica_address(const std::vector<std::string>& args, std::string_view host)
+{
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "-p")
+            return std::string(host) + ":" + args[i + 1];
+    return {};
 }
 
 }   // namespace socketley::cluster

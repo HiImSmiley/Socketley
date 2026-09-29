@@ -3,6 +3,7 @@
 
 #include "../../socketley/shared/byte_codec.h"
 #include "../../socketley/shared/cluster_state.h"
+#include "../../socketley/shared/replica_role.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -68,6 +69,23 @@ cl::command place(const std::string& name, cl::node_id n, bool on = true)
     return c;
 }
 
+cl::command promote(const std::string& name, cl::node_id n, uint64_t incarnation, uint64_t epoch)
+{
+    cl::command c;
+    c.op          = cl::op::promote;
+    c.name        = name;
+    c.node        = n;
+    c.incarnation = incarnation;
+    c.epoch       = epoch;
+    return c;
+}
+
+// A cache as an operator declares it.
+cl::command cache(const std::string& name, uint32_t replicas)
+{
+    return declare(name, replicas, "cache", {"-p", "6300"});
+}
+
 void apply_all(cl::state& s, const std::vector<cl::command>& v)
 {
     for (const cl::command& c : v)
@@ -87,6 +105,24 @@ void check_invariants(const cl::state& s)
         CHECK(s.specs.count(name) == 1);
         CHECK(held.count(0) == 0);
     }
+    // Only a cache has a primary, it is one of the owners, and a runtime nobody leads has no incarnation either.
+    for (const auto& [name, lead] : s.primaries)
+    {
+        REQUIRE(s.specs.count(name) == 1);
+        CHECK(s.specs.at(name).type == "cache");
+        if (lead.node != 0)
+        {
+            CHECK(s.owners.at(name).count(lead.node) == 1);
+            CHECK(lead.incarnation != 0);
+            CHECK(lead.epoch != 0);
+        }
+        else
+        {
+            CHECK(lead.incarnation == 0);
+        }
+    }
+    for (const auto& [name, sp] : s.specs)
+        CHECK((s.primaries.count(name) == 1) == (sp.type == "cache"));
 }
 
 // A random walk over every operator command and the assignments a planner would make, from one seed.
@@ -134,7 +170,7 @@ std::vector<cl::command> random_history(uint64_t seed, size_t steps)
 TEST_CASE("every command survives a round trip and nothing else decodes")
 {
     const std::vector<cl::command> all = {declare("api", 2), drop("api"), resize("api", 3), place("api", 77),
-                                          place("api", 77, false)};
+                                          place("api", 77, false), cache("db", 3), promote("db", 77, 0x1234567890ull, 4)};
     for (const cl::command& c : all)
     {
         const std::string bytes = cl::encode(c);
@@ -163,8 +199,16 @@ TEST_CASE("a command the operator may not give is refused, and decode refuses it
         {declare("-flag", 1), "invalid runtime name"},
         {declare("sp ace", 1), "invalid runtime name"},
         {declare(std::string(129, 'x'), 1), "invalid runtime name"},
-        {declare("db", 1, "cache"), "cache"},
+        {declare("db", 1, "cache", {"--maxmemory", "1M"}), "needs -p"},
+        {declare("db", 1, "cache", {"-p"}), "needs -p"},
+        {declare("db", 1, "cache", {"-p", "80", "--replicate", "1.2.3.4:5"}), "the cluster's to set"},
+        {declare("db", 1, "cache", {"-p", "80", "--cluster-replica", "7"}), "the cluster's to set"},
+        {declare("db", 1, "cache", {"-p", "80", "--listen", "unix:/x"}), "unix socket"},
+        {declare("db", 1, "cache", {"-p", "80", "--shards", "2"}), "sharded"},
         {declare("db", 1, "nonsense"), "only a server"},
+        {promote("db", 0, 7, 1), "node 0"},
+        {promote("db", 3, 0, 1), "incarnation 0"},
+        {promote("db", 3, 7, 0), "epoch 0"},
         {declare("api", 0), "replicas must be"},
         {declare("api", cl::max_replicas + 1), "replicas must be"},
         {resize("api", 0), "replicas must be"},
@@ -362,7 +406,7 @@ TEST_CASE("a snapshot that is not exactly what encode wrote is refused")
     {
         socketley::bytes::writer w;
         w.u8('S');
-        w.u8(1);
+        w.u8(2);
         w.u32(static_cast<uint32_t>(rows.size()));
         for (const auto& [name, owners] : rows)
         {
@@ -371,6 +415,9 @@ TEST_CASE("a snapshot that is not exactly what encode wrote is refused")
             w.bytes("");
             w.u32(3);
             w.ids(owners);
+            w.u64(0);
+            w.u64(0);
+            w.u64(0);
         }
         return w.take();
     };
@@ -519,5 +566,336 @@ TEST_CASE("planning to convergence: nothing is left on a dead node, nothing over
             }
             CHECK(cl::plan(s, live).empty());
         }
+    }
+}
+
+// ─── the worker's half of a cache replica ───
+
+namespace {
+
+cl::replica_order ordered(cl::replica_mode m, uint64_t inc, uint64_t epoch, uint32_t valid_ms, const std::string& target = {})
+{
+    return cl::replica_order{m, inc, epoch, valid_ms, target};
+}
+
+}   // namespace
+
+TEST_CASE("an order round-trips, and one that contradicts itself or is torn is refused")
+{
+    for (const cl::replica_order& o : {ordered(cl::replica_mode::fenced, 7, 0, 0), ordered(cl::replica_mode::primary, 7, 3, 2999),
+                                       ordered(cl::replica_mode::follower, 7, 3, 2999, "10.0.0.2:6301")})
+    {
+        const std::string bytes = cl::encode(o);
+        cl::replica_order back;
+        REQUIRE(cl::decode(bytes, back));
+        CHECK(back == o);
+        for (size_t cut = 0; cut < bytes.size(); ++cut)
+            CHECK_FALSE(cl::decode(std::string_view(bytes).substr(0, cut), back));
+        CHECK_FALSE(cl::decode(bytes + "x", back));
+    }
+    cl::replica_order back;
+    // A follower has somebody to follow and a primary has nobody.
+    CHECK_FALSE(cl::decode(cl::encode(ordered(cl::replica_mode::follower, 7, 3, 1000)), back));
+    CHECK_FALSE(cl::decode(cl::encode(ordered(cl::replica_mode::primary, 7, 3, 1000, "10.0.0.2:6301")), back));
+    std::string wrong_mode = cl::encode(ordered(cl::replica_mode::primary, 7, 3, 1000));
+    wrong_mode[1] = 9;
+    CHECK_FALSE(cl::decode(wrong_mode, back));
+}
+
+TEST_CASE("a replica is fenced until it is told, and fences itself when the daemon stops telling it")
+{
+    cl::replica_role role(7);
+    CHECK(role.mode(0) == cl::replica_mode::fenced);
+    CHECK(role.mode(1000) == cl::replica_mode::fenced);
+
+    const auto lead = ordered(cl::replica_mode::primary, 7, 1, 3000);
+    CHECK(role.order(lead, 1000).mode == cl::replica_mode::primary);
+    CHECK(role.mode(3999) == cl::replica_mode::primary);
+    // The order stands for what the lease had left when it was sent, and not a millisecond longer.
+    CHECK(role.mode(4000) == cl::replica_mode::fenced);
+    CHECK(role.left_ms(3000) == 1000);
+    CHECK(role.left_ms(4000) == 0);
+
+    // Each tick renews it, so a daemon that is running never lets it lapse, and one that is not does.
+    for (uint64_t t = 1100; t < 6000; t += 100)
+        role.order(ordered(cl::replica_mode::primary, 7, 1, 3000), t);
+    CHECK(role.mode(5900 + 2999) == cl::replica_mode::primary);
+    CHECK(role.mode(5900 + 3000) == cl::replica_mode::fenced);
+
+    // A renewal with no time left is a fence, and so is a fenced order.
+    CHECK(role.order(ordered(cl::replica_mode::primary, 7, 1, 0), 7000).mode == cl::replica_mode::fenced);
+    CHECK(role.order(lead, 7100).mode == cl::replica_mode::primary);
+    CHECK(role.order(ordered(cl::replica_mode::fenced, 7, 1, 3000), 7200).mode == cl::replica_mode::fenced);
+    CHECK(role.mode(7201) == cl::replica_mode::fenced);
+}
+
+TEST_CASE("an order for another incarnation reaches nobody and fences the one it finds")
+{
+    cl::replica_role role(7);
+    role.order(ordered(cl::replica_mode::primary, 7, 1, 3000), 1000);
+    REQUIRE(role.mode(1001) == cl::replica_mode::primary);
+    CHECK(role.order(ordered(cl::replica_mode::primary, 8, 2, 3000), 1002).mode == cl::replica_mode::fenced);
+    CHECK(role.mode(1003) == cl::replica_mode::fenced);
+    CHECK(role.epoch() == 1);
+}
+
+TEST_CASE("a follower's copy is nothing while a dump arrives, and is the primary's epoch and offset once it ends")
+{
+    cl::replica_role f(7);
+    auto follow = ordered(cl::replica_mode::follower, 7, 4, 3000, "10.0.0.2:6301");
+    auto e = f.order(follow, 1000);
+    CHECK(e.mode == cl::replica_mode::follower);
+    CHECK(e.retarget);
+    CHECK(f.epoch() == 0);
+    CHECK(f.offset() == 0);
+
+    f.sync_started();
+    CHECK(f.syncing());
+    f.sync_done(900);
+    CHECK_FALSE(f.syncing());
+    CHECK(f.epoch() == 4);
+    CHECK(f.offset() == 900);
+    for (int i = 0; i < 25; ++i)
+        f.record();
+    CHECK(f.offset() == 925);
+
+    // The same order again is not a reason to dial again, and a different primary or a newer epoch is.
+    CHECK_FALSE(f.order(follow, 1100).retarget);
+    CHECK(f.order(ordered(cl::replica_mode::follower, 7, 4, 3000, "10.0.0.3:6301"), 1200).retarget);
+    CHECK(f.order(ordered(cl::replica_mode::follower, 7, 5, 3000, "10.0.0.3:6301"), 1300).retarget);
+    CHECK_FALSE(f.order(ordered(cl::replica_mode::follower, 7, 5, 3000, "10.0.0.3:6301"), 1400).retarget);
+    // A spell without a lease is not a reason to sync again: the link stood through it, and the same order after it changes nothing.
+    CHECK(f.order(ordered(cl::replica_mode::fenced, 7, 5, 0), 1250).mode == cl::replica_mode::fenced);
+    CHECK(f.following());
+    CHECK_FALSE(f.order(ordered(cl::replica_mode::follower, 7, 5, 3000, "10.0.0.3:6301"), 1260).retarget);
+    // A copy is still the old primary's until the new dump lands, and empty while it is landing.
+    CHECK(f.epoch() == 4);
+    CHECK(f.offset() == 925);
+    f.sync_started();
+    CHECK(f.epoch() == 0);
+    CHECK(f.offset() == 0);
+    f.sync_done(31);
+    CHECK(f.epoch() == 5);
+    CHECK(f.offset() == 31);
+}
+
+TEST_CASE("a follower promoted keeps the offset it had reached and leads from it in the new epoch")
+{
+    cl::replica_role r(7);
+    r.order(ordered(cl::replica_mode::follower, 7, 4, 3000, "10.0.0.2:6301"), 1000);
+    r.sync_started();
+    r.sync_done(900);
+    for (int i = 0; i < 25; ++i)
+        r.record();
+    CHECK(r.order(ordered(cl::replica_mode::primary, 7, 5, 3000), 2000).mode == cl::replica_mode::primary);
+    CHECK(r.epoch() == 5);
+    CHECK(r.offset() == 925);
+    r.record();
+    CHECK(r.offset() == 926);
+
+    // And a primary demoted keeps what it wrote until the primary that replaced it sends a dump, so a copy that
+    // outranks nothing is not mistaken for one that does.
+    CHECK(r.order(ordered(cl::replica_mode::follower, 7, 6, 3000, "10.0.0.3:6301"), 3000).retarget);
+    CHECK(r.epoch() == 5);
+    CHECK(r.offset() == 926);
+}
+
+TEST_CASE("a fresh replica promoted into the first epoch leads an empty copy")
+{
+    cl::replica_role r(7);
+    CHECK(r.order(ordered(cl::replica_mode::primary, 7, 1, 3000), 1000).mode == cl::replica_mode::primary);
+    CHECK(r.epoch() == 1);
+    CHECK(r.offset() == 0);
+}
+
+TEST_CASE("the report lines survive the stats text they travel in, and a text that lacks one says nothing")
+{
+    cl::replica_role r(0xFFFFFFFFFFFFFFF1ull);
+    r.order(ordered(cl::replica_mode::primary, 0xFFFFFFFFFFFFFFF1ull, 12, 3000), 1000);
+    for (int i = 0; i < 5; ++i)
+        r.record();
+    const std::string lines = cl::report_lines(r, 1500);
+    const std::string stats = "keys:3\nmode:1\n" + lines + "followers:2\n";
+    const auto rep = cl::parse_report(stats, "db");
+    REQUIRE(rep.has_value());
+    CHECK(rep->name == "db");
+    CHECK(rep->incarnation == 0xFFFFFFFFFFFFFFF1ull);
+    CHECK(rep->epoch == 12);
+    CHECK(rep->offset == 5);
+    CHECK(rep->primary);
+    // Fenced by lapse, it says so.
+    CHECK_FALSE(cl::parse_report("x:1\n" + cl::report_lines(r, 9000), "db")->primary);
+
+    CHECK_FALSE(cl::parse_report("keys:3\n", "db").has_value());
+    CHECK_FALSE(cl::parse_report("cluster_incarnation:7\ncluster_epoch:1\ncluster_offset:2\n", "db").has_value());
+    CHECK_FALSE(cl::parse_report("cluster_incarnation:0\ncluster_epoch:1\ncluster_offset:2\ncluster_role:fenced\n", "db").has_value());
+    CHECK_FALSE(cl::parse_report("cluster_incarnation:7x\ncluster_epoch:1\ncluster_offset:2\ncluster_role:fenced\n", "db").has_value());
+}
+
+// ─── a cache and its primary ───
+
+TEST_CASE("a cache has a primary record from the moment it is declared, and no other type has one")
+{
+    cl::state s;
+    apply_all(s, {declare("api", 2), cache("db", 3)});
+    CHECK(s.primaries.count("db") == 1);
+    CHECK(s.primaries.count("api") == 0);
+    CHECK(s.primaries.at("db") == cl::primary_record{});
+    check_invariants(s);
+    CHECK(s.apply(drop("db")));
+    CHECK(s.primaries.empty());
+}
+
+TEST_CASE("a promotion names the next epoch and a node that holds a replica, and the second of two racing plans loses")
+{
+    cl::state s;
+    apply_all(s, {cache("db", 3), place("db", 1), place("db", 2), place("db", 3)});
+
+    // A node that holds no replica, a stale epoch and a skipped one change nothing.
+    CHECK_FALSE(s.apply(promote("db", 9, 100, 1)));
+    CHECK_FALSE(s.apply(promote("db", 1, 100, 2)));
+    CHECK_FALSE(s.apply(promote("ghost", 1, 100, 1)));
+    CHECK(s.primaries.at("db") == cl::primary_record{});
+
+    CHECK(s.apply(promote("db", 1, 100, 1)));
+    CHECK(s.primaries.at("db") == cl::primary_record{1, 100, 1});
+    // Two leaders that both saw epoch 1 propose epoch 2 for different replicas: the first applied wins on every node alike.
+    CHECK(s.apply(promote("db", 2, 200, 2)));
+    CHECK_FALSE(s.apply(promote("db", 3, 300, 2)));
+    CHECK(s.primaries.at("db") == cl::primary_record{2, 200, 2});
+    // A repeat of the applied promotion is not a second promotion.
+    CHECK_FALSE(s.apply(promote("db", 2, 200, 2)));
+    check_invariants(s);
+}
+
+TEST_CASE("a primary that loses its replica leads nothing, and the next promotion is still above its epoch")
+{
+    cl::state s;
+    apply_all(s, {cache("db", 2), place("db", 1), place("db", 2), promote("db", 1, 100, 1)});
+    // The follower's departure leaves the primary alone.
+    CHECK(s.apply(place("db", 2, false)));
+    CHECK(s.primaries.at("db") == cl::primary_record{1, 100, 1});
+    // The primary's own does not.
+    CHECK(s.apply(place("db", 1, false)));
+    CHECK(s.primaries.at("db") == cl::primary_record{0, 0, 1});
+    check_invariants(s);
+    apply_all(s, {place("db", 2), promote("db", 2, 200, 1)});
+    CHECK(s.primaries.at("db") == cl::primary_record{0, 0, 1});
+    CHECK(s.apply(promote("db", 2, 200, 2)));
+    CHECK(s.primaries.at("db") == cl::primary_record{2, 200, 2});
+}
+
+TEST_CASE("a snapshot keeps the primary, and refuses a primary that is not one of the owners")
+{
+    cl::state s;
+    apply_all(s, {cache("db", 2), place("db", 4), place("db", 5), promote("db", 5, 0xABCDEF0123ull, 1)});
+    const std::string bytes = cl::encode(s);
+    cl::state t;
+    REQUIRE(cl::decode(bytes, t));
+    CHECK(t == s);
+    CHECK(cl::encode(t) == bytes);
+    for (size_t cut = 0; cut < bytes.size(); ++cut)
+        CHECK_FALSE(cl::decode(std::string_view(bytes).substr(0, cut), t));
+
+    cl::state stranger = s;
+    stranger.primaries["db"] = cl::primary_record{6, 1, 1};
+    CHECK_FALSE(cl::decode(cl::encode(stranger), t));
+    cl::state nameless = s;
+    nameless.primaries["db"] = cl::primary_record{4, 0, 1};
+    CHECK_FALSE(cl::decode(cl::encode(nameless), t));
+    cl::state epochless = s;
+    epochless.primaries["db"] = cl::primary_record{4, 1, 0};
+    CHECK_FALSE(cl::decode(cl::encode(epochless), t));
+    cl::state ghost = s;
+    ghost.primaries["db"] = cl::primary_record{0, 9, 3};
+    CHECK_FALSE(cl::decode(cl::encode(ghost), t));
+    // A server that is somebody's primary is not a state.
+    cl::state sv;
+    apply_all(sv, {declare("api", 1), place("api", 4)});
+    REQUIRE(cl::decode(cl::encode(sv), t));
+    sv.primaries["api"] = cl::primary_record{4, 1, 1};
+    CHECK_FALSE(cl::decode(cl::encode(sv), t));
+}
+
+TEST_CASE("the most up-to-date copy is the highest epoch, then the highest offset, then the lowest node")
+{
+    using c = cl::candidate;
+    CHECK_FALSE(cl::best_candidate({}).has_value());
+    // The offset decides among copies of one primary's stream.
+    CHECK(cl::best_candidate({c{1, 10, 3, 500}, c{2, 20, 3, 900}, c{3, 30, 3, 700}})->node == 2);
+    // An epoch outranks any offset: offsets of two epochs are not on one scale, and a copy of the newer stream is the newer.
+    CHECK(cl::best_candidate({c{1, 10, 3, 9000}, c{2, 20, 4, 5}})->node == 2);
+    // A copy that is empty comes last, and a tie is the lowest node.
+    CHECK(cl::best_candidate({c{1, 10, 0, 0}, c{2, 20, 2, 1}})->node == 2);
+    CHECK(cl::best_candidate({c{5, 10, 2, 40}, c{3, 20, 2, 40}, c{4, 30, 2, 40}})->node == 3);
+    // The order they are listed in decides nothing.
+    CHECK(cl::best_candidate({c{4, 30, 2, 40}, c{3, 20, 2, 40}, c{5, 10, 2, 40}})->node == 3);
+    CHECK(cl::best_candidate({c{2, 20, 2, 41}, c{3, 20, 2, 40}})->incarnation == 20);
+}
+
+TEST_CASE("followers dial the primary on its own -p, at the host its node is reached at")
+{
+    CHECK(cl::replica_address({"-p", "6301", "--maxmemory", "1M"}, "10.0.0.7") == "10.0.0.7:6301");
+    CHECK(cl::replica_address({"--maxmemory", "1M", "-p", "6302"}, "127.0.0.1") == "127.0.0.1:6302");
+    CHECK(cl::replica_address({"--maxmemory", "1M"}, "127.0.0.1").empty());
+    CHECK(cl::replica_address({"-p"}, "127.0.0.1").empty());
+    CHECK(cl::replica_address(cl::expand_args(std::vector<std::string>{"-p", "630{node}"}, "3"), "127.0.0.1") == "127.0.0.1:6303");
+}
+
+TEST_CASE("scaling a cache down never takes its primary")
+{
+    for (cl::node_id lead : {cl::node_id{1}, cl::node_id{2}, cl::node_id{3}})
+    {
+        cl::state s;
+        apply_all(s, {cache("db", 3)});
+        apply_all(s, cl::plan(s, {1, 2, 3}));
+        REQUIRE(s.placed("db") == 3);
+        REQUIRE(s.apply(promote("db", lead, 50 + lead, 1)));
+        // Node 3 would give the replica up on load, and the highest id on a tie: the primary is the exception, wherever it is.
+        REQUIRE(s.apply(resize("db", 1)));
+        apply_all(s, cl::plan(s, {1, 2, 3}));
+        CHECK(s.owners.at("db") == std::set<cl::node_id>{lead});
+        CHECK(s.primaries.at("db").node == lead);
+        check_invariants(s);
+    }
+}
+
+TEST_CASE("a random history of caches, promotions and moves keeps the invariants and replays to the same state")
+{
+    for (uint64_t seed = 1; seed <= 200; ++seed)
+    {
+        prng r{seed};
+        cl::state a, b;
+        std::vector<cl::command> history;
+        std::vector<cl::node_id> live = {1, 2, 3, 4};
+        for (int step = 0; step < 100; ++step)
+        {
+            const std::string name = "c" + std::to_string(r.below(3));
+            cl::command c;
+            switch (r.below(6))
+            {
+            case 0: c = cache(name, 1 + static_cast<uint32_t>(r.below(3))); break;
+            case 1: c = drop(name); break;
+            case 2: c = resize(name, 1 + static_cast<uint32_t>(r.below(4))); break;
+            case 3: c = promote(name, 1 + r.below(4), 1 + r.below(5), a.primaries.count(name) ? a.primaries.at(name).epoch + 1 : 1); break;
+            case 4: c = place(name, 1 + r.below(4), r.below(2) != 0); break;
+            default:
+                for (const cl::command& p : cl::plan(a, live))
+                {
+                    a.apply(p);
+                    history.push_back(p);
+                }
+                check_invariants(a);
+                continue;
+            }
+            a.apply(c);
+            history.push_back(c);
+            check_invariants(a);
+        }
+        apply_all(b, history);
+        CHECK(a == b);
+        cl::state t;
+        REQUIRE(cl::decode(cl::encode(a), t));
+        CHECK(t == a);
     }
 }
