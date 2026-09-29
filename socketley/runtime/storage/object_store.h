@@ -392,6 +392,13 @@ public:
     static constexpr uint64_t hot_max_object = 60000;
     // The bytes of `key` when they are held for exactly the version `current` names.
     const std::string* hot_get(std::string_view bucket, std::string_view key, const object_meta& current);
+    // A held copy with the index's own record of the version it is a copy of, found by one lookup.
+    struct hot_hit
+    {
+        const object_meta* meta{nullptr};
+        const std::string* body{nullptr};
+    };
+    bool hot_find(std::string_view bucket, std::string_view key, hot_hit& out);
     // Keeps what a read brought in, when `read` is still the indexed version.
     void hot_put(std::string_view bucket, std::string_view key, const object_meta& read, std::string_view body);
     uint64_t hot_bytes() const { return m_hot_bytes; }
@@ -579,8 +586,10 @@ private:
         std::string id;        // bucket, a NUL, key
         std::string body;
         object_meta meta;
+        // The index's record of the key, null for another shard's: valid until hot_drop, which every change to that record makes first.
+        const object_meta* live;
     };
-    void hot_insert(const std::string& id, const object_meta& read, std::string_view body);
+    void hot_insert(const std::string& id, const object_meta& read, std::string_view body, const object_meta* live);
     void hot_drop(std::string_view bucket, std::string_view key);
     void hot_drop_bucket(std::string_view bucket);
     const std::string& hot_id(std::string_view bucket, std::string_view key);

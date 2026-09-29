@@ -116,6 +116,31 @@ const std::string* object_store::hot_get(std::string_view bucket_name, std::stri
     return &it->second->body;
 }
 
+bool object_store::hot_find(std::string_view bucket_name, std::string_view key, hot_hit& out)
+{
+    if (m_hot_index.empty())
+        return false;
+    auto it = m_hot_index.find(hot_id(bucket_name, key));
+    if (it == m_hot_index.end())
+        return false;
+    hot_entry& e = *it->second;
+    // A copy of another shard's key has no record here to be found through.
+    if (!e.live)
+        return false;
+    if (!same_version(e.meta, *e.live))
+    {
+        m_hot_bytes -= e.body.size() + e.id.size();
+        const auto lit = it->second;
+        m_hot_index.erase(it);
+        m_hot_lru.erase(lit);
+        return false;
+    }
+    m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
+    out.meta = e.live;
+    out.body = &e.body;
+    return true;
+}
+
 void object_store::hot_put(std::string_view bucket_name, std::string_view key, const object_meta& read,
                            std::string_view body)
 {
@@ -125,14 +150,15 @@ void object_store::hot_put(std::string_view bucket_name, std::string_view key, c
     const object_meta* cur = find(bucket_name, key);
     if (!cur || !same_version(*cur, read))
         return;
-    hot_insert(hot_id(bucket_name, key), read, body);
+    hot_insert(hot_id(bucket_name, key), read, body, cur);
 }
 
-void object_store::hot_insert(const std::string& id, const object_meta& read, std::string_view body)
+void object_store::hot_insert(const std::string& id, const object_meta& read, std::string_view body,
+                              const object_meta* live)
 {
     if (m_hot_index.count(id))
         return;
-    m_hot_lru.push_front(hot_entry{id, std::string(body), read});
+    m_hot_lru.push_front(hot_entry{id, std::string(body), read, live});
     m_hot_index.emplace(m_hot_lru.front().id, m_hot_lru.begin());
     m_hot_bytes += body.size() + m_hot_lru.front().id.size();
     while (m_hot_bytes > m_hot_budget && !m_hot_lru.empty())
@@ -190,7 +216,7 @@ void object_store::hot_put_foreign(std::string_view bucket_name, std::string_vie
             if (m_drop_ring[e % drop_ring_size] == 0 || m_drop_ring[e % drop_ring_size] == h)
                 return;
     }
-    hot_insert(id, read, body);
+    hot_insert(id, read, body, nullptr);
 }
 
 void object_store::hot_invalidate(std::string_view bucket_name, std::string_view key)
@@ -248,6 +274,8 @@ void object_store::hot_drop_bucket(std::string_view bucket_name)
 
 uint32_t object_store::owner_of(std::string_view bucket_name, std::string_view key) const
 {
+    if (m_opts.nshards == 1)
+        return 0;
     return object_owner(bucket_name, key, m_opts.nshards);
 }
 

@@ -1261,6 +1261,19 @@ TEST_CASE("a hot copy answers only the version the index names, and keeps within
     CHECK_FALSE(held("c"));
     CHECK(held("d"));
 
+    // The one-lookup form names the index's own record, and follows it through an overwrite.
+    r.store->hot_put("bkt", "k", *r.store->find("bkt", "k"), v2);
+    object_store::hot_hit hit;
+    REQUIRE(r.store->hot_find("bkt", "k", hit));
+    CHECK(hit.meta == r.store->find("bkt", "k"));
+    CHECK(*hit.body == v2);
+    REQUIRE(r.put("bkt", "k", v1).status == st::ok);
+    CHECK_FALSE(r.store->hot_find("bkt", "k", hit));
+    r.store->hot_put("bkt", "k", *r.store->find("bkt", "k"), v1);
+    REQUIRE(r.store->hot_find("bkt", "k", hit));
+    CHECK(hit.meta == r.store->find("bkt", "k"));
+    CHECK(*hit.body == v1);
+
     for (const char* k : {"a", "b", "c", "d", "k"})
         REQUIRE(r.del("bkt", k) == st::ok);
     CHECK(r.store->hot_bytes() == 0);

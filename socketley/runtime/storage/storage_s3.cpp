@@ -1082,7 +1082,10 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     // Memory holds this shard's keys only, so another shard's key is asked of
     // its file, which is the truth and which any shard can read.
     const bool mine = m_store.owns(q.bucket, q.key);
-    const object_meta* mem = mine ? m_store.find(q.bucket, q.key) : nullptr;
+    // A GET of a key held in memory finds the index's record through the copy, in one lookup.
+    object_store::hot_hit hot;
+    const bool held = mine && !head && m_store.hot_find(q.bucket, q.key, hot);
+    const object_meta* mem = held ? hot.meta : mine ? m_store.find(q.bucket, q.key) : nullptr;
     if (mine && !mem)
     {
         send_error_st(c, st::no_such_key);
@@ -1221,13 +1224,12 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     }
 
     // A hot small object this shard owns is answered from memory, with no file opened.
-    if (mem && mem->size > 0 && mem->size <= object_store::hot_max_object)
-        if (const std::string* hot = m_store.hot_get(q.bucket, q.key, *mem))
-        {
-            ++m_c.hot_gets;
-            answer(*mem, -1, 0, *hot);
-            return;
-        }
+    if (held)
+    {
+        ++m_c.hot_gets;
+        answer(*mem, -1, 0, *hot.body);
+        return;
+    }
 
     // Another shard's small object is answered from memory too, for as long as its owner has not said it changed.
     if (!mem)
