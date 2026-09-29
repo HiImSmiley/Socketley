@@ -9940,19 +9940,21 @@ history (replication is ordered, and the tests read every acknowledged key back
 to check that no write is lost that a later one outlived). How long the tail is
 depends on how far behind the best follower was. Measured with a client writing
 continuously and kill \-9 of the primary's node, three kills each: one
-connection writing one key at a time, about a thousand a second (4,800
+connection writing one key at a time, about a thousand a second (4,500 to 4,900
 acknowledged), none missing; 200 writes pipelined at a time as fast as one
-connection goes (700,000 acknowledged, some 230,000 a second), none missing; and
+connection goes (630,000 to 720,000 acknowledged, some 230,000 a second), none missing; and
 the same with both followers' workers stopped (SIGSTOP) for the four seconds before
 the kill, so that neither was receiving, about 1.6 million acknowledged and
-871,000 to 911,000 of them missing, which is every write the primary took while
+876,000 to 922,000 of them missing, which is every write the primary took while
 no follower had it.
-A process that dies on a machine that stays up loses only what had not left the
-primary's user space, because the kernel still delivers what it accepted from the
-primary's sockets, which is why the first two conditions lose nothing. A machine
-that loses power, or a network that is cut, loses the socket buffers as well, and
-a primary drops a follower that is 8 MiB behind; neither is bounded by anything
-short of a follower having the write, and neither could be tried without root.
+So the window is how far behind the best follower was when the primary died: a
+few writes when the followers keep up (the first two conditions lost none), and
+everything since a follower stopped reading when they do not. Only what a
+follower had already received survives (in a separate check, a stopped follower
+held about 20,000 of 925,000 acknowledged keys after its leader was killed), and a
+primary drops a follower that is 8 MiB behind, after which it keeps acknowledging
+writes that no follower is receiving until that follower dials again. A machine
+that loses power, or a network that is cut, could not be tried without root.
 There is no synchronous mode: a write that must survive its primary is written to
 two caches.
 .PP

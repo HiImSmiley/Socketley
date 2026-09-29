@@ -68,8 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is the primary again with everything it held. The old primary that comes back
   follows the new one and takes a full dump. Replication stays asynchronous, and
   the manual says what that loses, measured: with a client writing and `kill -9`
-  of the node, none of about 4,800 writes a few seconds apart, none of about
-  700,000 pipelined at 230,000 a second, and 871,000-911,000 of about 1.6
+  of the node, none of 4,500-4,900 writes a few seconds apart, none of
+  630,000-720,000 pipelined at 230,000 a second, and 876,000-922,000 of about 1.6
   million when both followers had stopped receiving four seconds before; what
   survives is always a prefix of the primary's history. Promotion compares copies
   by epoch and then a count of the records the primary produced, which rides on

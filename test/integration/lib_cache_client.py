@@ -16,9 +16,14 @@
 #   cmd <target> <line>               one command, printing the reply line or "!<why>"
 #
 # The timeouts are short on purpose: a killed primary must show as a refusal in a fraction of a second, not hang the caller.
+import os
 import socket
 import sys
 import time
+
+# Every key is PREFIX<index>, and a test that runs several rounds against one cache gives each round its own prefix, since the keys of the
+# last round are still there and would read as this round's.
+PREFIX = os.environ.get("KEY_PREFIX", "w")
 
 
 def dial(target, timeout):
@@ -50,9 +55,9 @@ def writer(acked_path, targets):
             if conn is None:
                 conn = dial(targets[at % len(targets)], 0.4)
                 f = conn.makefile("rwb", buffering=0)
-            reply = ask(f, "set w%d %d" % (i, i))
+            reply = ask(f, "set %s%d %d" % (PREFIX, i, i))
             if reply == "ok":
-                out.write("%d %d\n" % (i, time.time_ns()))
+                out.write("%d %d %s\n" % (i, time.time_ns(), targets[at % len(targets)]))
                 i += 1
                 time.sleep(0.0005)
                 continue
@@ -78,7 +83,7 @@ def burst(acked_path, batch, targets):
             if conn is None:
                 conn = dial(targets[at % len(targets)], 0.4)
                 f = conn.makefile("rwb", buffering=0)
-            f.write("".join("set w%d %d\n" % (i + k, i + k) for k in range(batch)).encode())
+            f.write("".join("set %s%d %d\n" % (PREFIX, i + k, i + k) for k in range(batch)).encode())
             good = 0
             for k in range(batch):
                 reply = f.readline()
@@ -87,7 +92,7 @@ def burst(acked_path, batch, targets):
                 if reply.rstrip(b"\r\n") == b"ok":
                     good += 1
             now = time.time_ns()
-            out.write("".join("%d %d\n" % (i + k, now) for k in range(good)))
+            out.write("".join("%d %d %s\n" % (i + k, now, targets[at % len(targets)]) for k in range(good)))
             i += good
             if good == batch:
                 continue
@@ -108,23 +113,34 @@ def check(acked_path, target, cutoff_ns, kill_ns):
     with open(acked_path) as fh:
         for line in fh:
             parts = line.split()
-            if len(parts) == 2:
-                acked.append((int(parts[0]), int(parts[1])))
+            if len(parts) == 3:
+                acked.append((int(parts[0]), int(parts[1]), parts[2]))
     conn = dial(target, 5.0)
     f = conn.makefile("rwb", buffering=0)
     missing = []
     holes = 0
+    hole_keys = []
+    hole_ats = []
+    hole_targets = set()
     for start in range(0, len(acked), 400):
         batch = acked[start:start + 400]
-        f.write("".join("get w%d\n" % i for i, _ in batch).encode())
-        for i, at in batch:
+        f.write("".join("get %s%d\n" % (PREFIX, i) for i, _, _ in batch).encode())
+        for i, at, tgt in batch:
             reply = f.readline().decode("latin1").rstrip("\r\n")
             if reply != str(i):
                 missing.append((i, at))
             elif missing and at < kill_ns:
                 holes += 1
+                hole_keys.append(i)
+                hole_ats.append(at)
+                hole_targets.add(tgt)
     early = [m for m in missing if m[1] < cutoff_ns]
     print("acked=%d missing=%d missing_before_cutoff=%d holes=%d" % (len(acked), len(missing), len(early), holes))
+    if missing:
+        print("missing_range=%d..%d" % (min(m[0] for m in missing), max(m[0] for m in missing)), file=sys.stderr)
+    if hole_keys:
+        print("hole_range=%d..%d acked %d..%d ms before the kill" % (min(hole_keys), max(hole_keys),
+              (kill_ns - min(hole_ats)) // 1000000, (kill_ns - max(hole_ats)) // 1000000) + " written to " + ",".join(sorted(hole_targets)), file=sys.stderr)
 
 
 def probe(tag, targets):

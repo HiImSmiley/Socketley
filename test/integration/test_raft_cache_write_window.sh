@@ -25,10 +25,12 @@
 #                 to reach a follower
 #  after          a cluster that does not settle and serve after each kill
 #
-# kill -9 is a process dying on a machine that stays up: the kernel still
-# delivers what it had accepted from the primary, so what is lost is what had
-# not left the primary's user space.  A machine that loses power or is cut off
-# loses the socket buffers as well, which needs netns or iptables (root) to try.
+# kill -9 is a process dying on a machine that stays up.  A follower that is
+# keeping up has everything but the last instant, and one that is not reading
+# has only what fit in its receive buffer, so the window is how far behind the
+# best follower was.  A machine that loses power or is cut off needs netns or
+# iptables (root) to try.  Each round writes its own keys (KEY_PREFIX), since the
+# keys of the last round are still in the cache.
 set -euo pipefail
 
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
@@ -84,6 +86,7 @@ round() {   # round <condition> <round number>
     local epoch; epoch=$(cstat "$P" cluster_epoch)
     check 'wait_for 60 "settled_on $P $epoch 1 2 3"' "$cond $i: the replicas did not settle on node $P before the round"
     : >"$T/acked"
+    export KEY_PREFIX="$cond$i-"
     case $cond in
         steady) python3 "$CLIENT" writer "$T/acked" "$(target 1)" "$(target 2)" "$(target 3)" >/dev/null 2>&1 & ;;
         *)      python3 "$CLIENT" burst "$T/acked" 200 "$(target 1)" "$(target 2)" "$(target 3)" >/dev/null 2>&1 & ;;
