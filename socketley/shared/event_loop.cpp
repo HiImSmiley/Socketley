@@ -2027,15 +2027,55 @@ bool event_loop::submit_renameat(int olddir, const char* oldpath, int newdir, co
     return true;
 }
 
-bool event_loop::submit_unlinkat(int dir, const char* path, io_request* req)
+bool event_loop::submit_unlinkat(int dir, const char* path, io_request* req, int flags)
 {
     struct io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
 
-    io_uring_prep_unlinkat(sqe, dir, path, 0);
+    io_uring_prep_unlinkat(sqe, dir, path, flags);
     io_uring_sqe_set_data(sqe, req);
     req->type = op_unlink;
     arm(req, raw_target(dir));
+    return true;
+}
+
+bool event_loop::submit_openat(int dir, const char* path, int flags, mode_t mode, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    // O_CLOEXEC is said here rather than by each caller, because a descriptor
+    // this loop hands out must not cross an exec whatever the caller forgot.
+    io_uring_prep_openat(sqe, dir, path, flags | O_CLOEXEC, mode);
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_openat;
+    arm(req, raw_target(dir));
+    return true;
+}
+
+bool event_loop::submit_mkdirat(int dir, const char* path, mode_t mode, io_request* req, bool link)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_mkdirat(sqe, dir, path, mode);
+    if (link)
+        sqe->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_mkdir;
+    arm(req, raw_target(dir));
+    return true;
+}
+
+bool event_loop::submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_splice(sqe, file_fd, static_cast<int64_t>(offset), pipe_wr, -1, len, SPLICE_F_MOVE);
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_splice_file;
+    arm(req, raw_target(file_fd), raw_target(pipe_wr));
     return true;
 }
 

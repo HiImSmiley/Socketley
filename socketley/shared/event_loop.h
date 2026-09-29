@@ -287,7 +287,14 @@ public:
     bool submit_fsync(int fd, bool datasync, io_request* req, bool link);
     bool submit_renameat(int olddir, const char* oldpath, int newdir, const char* newpath,
                          io_request* req, bool link);
-    bool submit_unlinkat(int dir, const char* path, io_request* req);
+    bool submit_unlinkat(int dir, const char* path, io_request* req, int flags = 0);
+    // Completes with the new descriptor or a negative errno, and the path must
+    // stay valid until it does because the kernel may read it late.
+    bool submit_openat(int dir, const char* path, int flags, mode_t mode, io_request* req);
+    bool submit_mkdirat(int dir, const char* path, mode_t mode, io_request* req, bool link = false);
+    // A regular file at `offset` into a pipe, which is what a zero-copy send
+    // starts with; the file's own position is not touched.
+    bool submit_splice_file(int file_fd, uint64_t offset, int pipe_wr, uint32_t len, io_request* req);
 
     // Room for `n` submissions without a submit in between, flushing what is
     // queued first when there is not, and false only when the ring is smaller.
