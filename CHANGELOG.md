@@ -52,12 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from the file to the socket and counted as `zero_copy_bytes`, and nothing but
   the startup reconciliation blocks the loop. A runtime needs `--anonymous` or
   credentials (below), `--max-bytes` sets a quota answered with 507, and ACLs
-  and versioning answer 501. `--tls`, `--shards` and the Lua surface are not
-  built yet. `type_registry::first_registered` is now 5.
-  the startup reconciliation blocks the loop. `--anonymous` is required until
-  credentials exist, `--max-bytes` sets a quota answered with 507, a chunk-signed
-  upload is refused rather than stored with its framing, and multipart, ACLs and
-  versioning answer 501. `--shards` and SigV4 are not built yet. `type_registry::first_registered` is now 5.
+  and versioning answer 501. `type_registry::first_registered` is now 5.
 
 - **A storage runtime authenticates with SigV4, takes multipart uploads and
   checks checksums.** `--access-key K --secret-key S` gives one pair and
@@ -85,6 +80,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (as a header or a trailer), stored, and returned by GET and HEAD with
   `x-amz-checksum-mode: ENABLED`; a multipart object carries the composite
   checksum of its parts.
+
+- **A storage runtime shards: `--shards N` splits it over N workers on one
+  directory.** Every shard serves a GET or HEAD by opening the object's own
+  file, so no object bytes cross between shards. A key's owner is the CRC16 of
+  `bucket/key` mapped to a shard the way a cache maps a slot, so a client can
+  compute it; a put streams into a temporary file from the shard that took the
+  connection and the owner is sent only its name and metadata to rename it into
+  place and append to its own journal (`index.<shard>`), and delete, copy and
+  `If-None-Match: *` take the same road, so racing puts of one key never tear
+  and every shard serves the winner. Listings fan out and merge into the page
+  one shard would give (a shard that cannot answer fails the listing), buckets
+  are made and dropped by shard 0 and told to the rest, `--listen unix:` binds a
+  node per shard, and `stats` has a section per shard with what crossed. A shard
+  killed between a rename and its journal record is repaired from the object
+  header when the supervisor restarts it, and a restarted shard removes only its
+  own temporary files. A directory started with another `--shards` is rebuilt
+  from the object headers rather than refused. `--max-bytes` becomes an equal
+  share per shard.
 
 - **Cluster runtimes: on a daemon in Raft mode the cluster heals itself.**
   `socketley cluster create server api -p 8080 --replicas 2` declares a

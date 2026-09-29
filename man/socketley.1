@@ -6201,12 +6201,9 @@ refuses to move \fBdir\fR, \fBanonymous\fR or the access key, secret key or
 credentials file while the runtime is running (the contents of a credentials
 file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
-\fB\-\-tls\fR and \fB\-\-shards\fR are refused: the shards would share one directory
-and one journal without an owner for each key.
-does not change these three; \fBimport\fR does, as it does for a cache, and
-refuses to move \fBdir\fR or \fBanonymous\fR while the runtime is running.
-\fB\-\-shards\fR is refused: the shards would share one directory and one journal
-without an owner for each key.
+.B \-\-shards
+splits the runtime over several processes on one directory, as described under
+.BR Sharding .
 .SS What it shares with the other runtimes
 .TP
 .B TLS
@@ -6306,7 +6303,7 @@ Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodifi
 T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
-The headers of a GET, from memory.
+The headers of a GET, from memory, or from the object's header when another shard owns the key.
 T}
 DeleteObject	DELETE /bucket/key	T{
 .ad l
@@ -6469,6 +6466,61 @@ in
 .BR stats ;
 smaller objects are read once, with their header, and sent from memory with the
 response headers in one write.
+.PP
+.SS Sharding
+.B \-\-shards
+.I N
+runs N worker processes on one port (\fBSO_REUSEPORT\fR) or, with
+.BR \-\-listen ,
+one node each (\fIname#i\fR.sock, as for a cache), all on the same
+.BR \-\-dir .
+Clients see one runtime. Every shard serves a GET or HEAD itself by opening the
+object's file, whose header says what it is, so object bytes never move between
+shards.
+.PP
+A key's
+.I owner
+is the shard that commits its changes: the CRC16/XMODEM of the string
+\fIbucket\fB/\fIkey\fR masked to 16384 slots, exactly the function of a cache's
+key slots, and the shard is \fIslot\fR * \fIN\fR / 16384, so a client can compute it
+and send a request to the owner's node and cross nothing. A put streams into a
+temporary file from whichever shard took the connection; that shard then sends the
+owner the file's name and the object's metadata over the shard link, and the owner
+renames it into place, syncs the directory and appends to its own journal
+(\fBindex.\fIi\fR, written by shard \fIi\fR alone) before answering. A delete, the
+target of a copy and a create\-only put (\fBIf\-None\-Match: *\fR) go the same way,
+which is what keeps the order of changes to a key one order and lets two racing
+creators come out one refused. A listing is asked of every shard and the pages
+are merged, so it is the listing one shard would give; a shard that cannot be
+reached fails the listing with a 500 rather than shortening it.
+.PP
+Buckets are made and dropped by shard 0 and told to the others before it answers;
+a bucket is dropped only when every shard agrees it holds nothing and is idle.
+Temporary files are named for the shard that wrote them, so a shard restarted by
+the supervisor removes only its own. A shard killed between a rename and its
+journal record leaves the object in the directory, and its restart adopts it from
+the header: after it every shard serves the object or none does, and a put that was
+in flight through the killed shard is answered with an error.
+.PP
+A start with a different \fB\-\-shards\fR on a directory written by another split
+is not refused, unlike a cache with a missing dump, because the object files are
+the record: each shard sees that its journal was written for another shard count,
+rebuilds its keys from the object headers filtered by owner, and shard 0 removes the
+journals of shards that no longer exist. That start reads every header once per
+shard, so it takes as long as the object count makes it. \fB\-\-max\-bytes\fR is an equal
+share per shard, judged by the shard that took the put from its own bytes and again
+by the owner, so it is approximate when keys are unevenly sized. \fBstats\fR gives a
+section per shard with
+.BR shard_commits_sent ,
+.BR shard_commits_served ,
+.BR shard_deletes_sent ,
+.BR shard_deletes_served ,
+.BR shard_list_fanouts ,
+.BR shard_list_pages_served ,
+.B shard_bucket_ops
+and
+.BR shard_peer_failures ;
+at one shard nothing is sent and they read zero.
 .PP
 .B stats
 reports
@@ -10742,6 +10794,14 @@ Number of buffers in that ring. Default
 Together with the size this bounds how much concurrent traffic the runtime can
 absorb before the pool runs dry and reads fall back to a slower per-read path;
 the pool costs count times size of memory per cache runtime.
+.TP
+.B SOCKETLEY_STORAGE_KILL_AFTER_RENAME
+A test hook: a sharded storage runtime's commit of a key that begins with this
+string kills the worker with
+.B SIGKILL
+after renaming the body into place and before the journal record, so a test can
+put a crash at the one step that leaves a file the journal does not name. Unset
+by default.
 .TP
 .B SOCKETLEY_STORAGE_SPLICE_MIN
 The size in bytes from which a storage GET is sent by splice from the file to
