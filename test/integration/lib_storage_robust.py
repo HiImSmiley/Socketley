@@ -165,6 +165,27 @@ def others():
 stall_thread = threading.Thread(target=stall_waiter, args=(stalled,))
 stall_thread.start()
 
+head_result = {}
+
+
+def head_waiter():
+    """A client that starts a request head and never finishes it, until the server lets it go."""
+    s = dial()
+    s.sendall(b"GET /upl/keep HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+    t0 = time.time()
+    s.settimeout(60)
+    try:
+        head_result["data"] = s.recv(4096)
+        head_result["closed"] = True
+    except OSError:
+        head_result["closed"] = False
+    head_result["secs"] = time.time() - t0
+    s.close()
+
+
+head_thread = threading.Thread(target=head_waiter)
+head_thread.start()
+
 lat = []
 errs = []
 for i in range(30):
@@ -276,6 +297,25 @@ check("when they all leave, their temporary files go",
 check("and their descriptors (fds %d, was %d before them)" % (fds(), base_fds),
       wait_for(lambda: fds() <= base_fds, 10), (fds(), base_fds))
 check("no key was created by any of them", not [k for k in keys_of("upl") if k.startswith(b"many")])
+
+# What an upload holds once its body is really flowing: two staging buffers of a megabyte each.
+N_FULL = 100
+socks = []
+rss_before_full = status_kib("VmRSS")
+piece = os.urandom(1 << 20)
+for i in range(N_FULL):
+    s = dial()
+    s.sendall(put_head("upl", "full%03d" % i, 8 << 20) + piece * 3)
+    socks.append(s)
+time.sleep(2.0)
+rss_full = status_kib("VmRSS")
+note("%d uploads each with 3 MiB of 8 sent: RSS %d KiB (was %d), %.2f MiB per upload" %
+     (N_FULL, rss_full, rss_before_full, (rss_full - rss_before_full) / 1024.0 / N_FULL))
+check("an upload with its body flowing holds under 3 MiB of the worker's memory (%d uploads grew it %d KiB)" %
+      (N_FULL, rss_full - rss_before_full), rss_full - rss_before_full < N_FULL * 3 * 1024, rss_full - rss_before_full)
+for s in socks:
+    s.close()
+check("they leave, and their temporary files with them", wait_for(lambda: not others(), 15), len(others()))
 
 # More uploads than the runtime admits.
 import select
@@ -411,6 +451,12 @@ check("the stalled upload's connection was closed by the runtime",
       stall_result.get("closed") is True, stall_result)
 note("the stalled upload sent 1 MiB of 8 and then nothing; the runtime let it go after %.0f s (deadline %d s)" %
      (stall_result.get("secs", -1), BODY_STALL_SECS))
+note("what the stalled upload was sent when it was let go: %r" % stall_result.get("data", b"")[:80])
+head_thread.join(timeout=30)
+note("a request head begun and never finished was let go after %.0f s (deadline 10 s), sent %r" %
+     (head_result.get("secs", -1), head_result.get("data", b"")[:60]))
+check("a request head that never finishes is closed by the runtime near its 10 s deadline",
+      head_result.get("closed") is True and 9 <= head_result.get("secs", 0) <= 15, head_result)
 check("and not before the deadline nor long after it", BODY_STALL_SECS - 1 <= stall_result.get("secs", 0) <= BODY_STALL_SECS + 5,
       stall_result.get("secs"))
 check("its temporary file is gone", wait_for(lambda: not tmp_files("upl"), 10), tmp_files("upl"))
