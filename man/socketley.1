@@ -6476,15 +6476,25 @@ in
 smaller objects are read once, with their header, and sent from memory with the
 response headers in one write.
 .PP
-An object of up to 60000 bytes is kept in memory after it is first read by the
-shard that owns its key, up to 32 MiB per shard
+An object of up to 60000 bytes is kept in memory after it is first read, by every
+shard that reads it, up to 32 MiB per shard
 (\fBSOCKETLEY_STORAGE_HOT_BYTES\fR) with the least recently read going first, and
-later GETs on that shard are answered from the copy without opening the file. A
-copy is answered only while it is the version the shard's index names, and an
-overwrite, copy or delete of the key drops it, so a GET never answers bytes that
-were replaced. With
+later GETs on that shard are answered from the copy without opening the file. On the
+shard that owns the key a copy is answered only while it is the version the index
+names. With
 .B \-\-shards
-a GET that lands on another shard reads the file as before.
+a shard that does not own the key has no index entry to compare with, so the owner
+tells every other shard to drop its copy of a key after it has committed or deleted it
+and before it answers the client (one round trip to the siblings, in parallel, against
+the milliseconds of the syncs), and a read that a drop of its key arrived during is not
+kept. A PUT, copy, multipart completion or DELETE that was answered is therefore never
+followed by a GET on any shard that returns the bytes it replaced. A sibling that is down
+is not waited for and holds nothing when it starts again. A GET of a 4 KiB object at 32
+connections on four shards took 45 us of worker CPU (summed over the shards) before the
+copy was kept on every shard and takes 30 us, and about 50 thousand requests per second
+becomes about 56 thousand; at one connection 30 to 20 us and 7100 to 8100 requests per
+second; a PUT of 4 KiB into memory-backed storage takes about 14 us longer for the round
+trip.
 .PP
 .SS Performance
 Measured with warp and boto3 over plain HTTP with SigV4 on one 16\-core VM with an
@@ -6563,7 +6573,11 @@ section per shard with
 .BR shard_bucket_ops ,
 .BR shard_mpu_sent ,
 .B shard_mpu_served
-(multipart steps) and
+(multipart steps),
+.B shard_hot_drops_sent
+and
+.B shard_hot_drops_served
+(a sibling told to drop its copy of a key, once per sibling) and
 .BR shard_peer_failures ;
 at one shard nothing is sent and they read zero.
 .PP
@@ -10889,7 +10903,8 @@ Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_HOT_BYTES
 How many bytes of small objects (up to 60000 bytes each) a storage shard keeps in
-memory to answer repeated GETs of the keys it owns without opening their files.
+memory to answer repeated GETs without opening their files, of any key, whichever
+shard owns it.
 Default
 .B 33554432
 (32 MiB);

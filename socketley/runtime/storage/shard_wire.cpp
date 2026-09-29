@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::mpu_list))
+        o > static_cast<uint8_t>(op::hot_drop))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -101,6 +101,20 @@ bool decode_remove(std::string_view payload, std::string& bucket, std::string& k
 {
     bytes::reader r(payload);
     return open_request(r, op::remove) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap);
+}
+
+std::string encode_hot_drop(std::string_view bucket, std::string_view key)
+{
+    bytes::writer w = begin(op::hot_drop);
+    w.bytes(bucket);
+    w.bytes(key);
+    return w.take();
+}
+
+bool decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key)
+{
+    bytes::reader r(payload);
+    return open_request(r, op::hot_drop) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap);
 }
 
 std::string encode_list(std::string_view bucket, const list_query& q)

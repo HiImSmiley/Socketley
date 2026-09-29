@@ -384,6 +384,8 @@ std::string storage_instance::stats_lines() const
             << "shard_bucket_ops:" << n.bucket_ops << "\n"
             << "shard_mpu_sent:" << n.mpu_out << "\n"
             << "shard_mpu_served:" << n.mpu_in << "\n"
+            << "shard_hot_drops_sent:" << n.hot_drops_out << "\n"
+            << "shard_hot_drops_served:" << n.hot_drops_in << "\n"
             << "shard_peer_failures:" << n.peer_failures << "\n";
     }
     return out.str();

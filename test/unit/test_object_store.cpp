@@ -1266,6 +1266,79 @@ TEST_CASE("a hot copy answers only the version the index names, and keeps within
     CHECK(r.store->hot_bytes() == 0);
 }
 
+TEST_CASE("a copy of another shard's key is kept unless a drop of it arrived while it was being read")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+
+    auto meta_of = [](const std::string& body) { object_meta m; m.size = body.size(); m.md5 = md5_of(body); return m; };
+    auto held = [&](const char* k, std::string* body = nullptr)
+    {
+        const object_meta* m = nullptr;
+        const std::string* b = nullptr;
+        const bool h = r.store->hot_get_foreign("bkt", k, m, b);
+        if (h && body)
+            *body = *b;
+        return h;
+    };
+    const std::string v1 = pattern(2000, 1), v2 = pattern(2000, 2);
+
+    // A read with no drop in between is kept and answered whole.
+    uint64_t e = r.store->hot_epoch();
+    r.store->hot_put_foreign("bkt", "k", e, meta_of(v1), v1);
+    std::string got;
+    REQUIRE(held("k", &got));
+    CHECK(got == v1);
+    CHECK(r.store->hot_bytes() > 0);
+
+    // The owner's word drops it, and the next read keeps the new version.
+    r.store->hot_invalidate("bkt", "k");
+    CHECK_FALSE(held("k"));
+    CHECK(r.store->hot_bytes() == 0);
+    r.store->hot_put_foreign("bkt", "k", r.store->hot_epoch(), meta_of(v2), v2);
+    REQUIRE(held("k", &got));
+    CHECK(got == v2);
+
+    // A read that began before the drop and ended after it may hold the version the drop replaced.
+    e = r.store->hot_epoch();
+    r.store->hot_invalidate("bkt", "k");
+    r.store->hot_put_foreign("bkt", "k", e, meta_of(v1), v1);
+    CHECK_FALSE(held("k"));
+
+    // A drop of another key does not spoil the read of this one.
+    e = r.store->hot_epoch();
+    r.store->hot_invalidate("bkt", "other");
+    r.store->hot_put_foreign("bkt", "k", e, meta_of(v2), v2);
+    CHECK(held("k"));
+    r.store->hot_invalidate("bkt", "k");
+
+    // A read that outlasted more drops than are remembered is not trusted.
+    e = r.store->hot_epoch();
+    r.store->hot_invalidate("bkt", "k");
+    for (int i = 0; i < 70; ++i)
+        r.store->hot_invalidate("bkt", "filler" + std::to_string(i));
+    r.store->hot_put_foreign("bkt", "k", e, meta_of(v1), v1);
+    CHECK_FALSE(held("k"));
+
+    // A bucket dropped and made again is every key's drop.
+    e = r.store->hot_epoch();
+    REQUIRE(r.drop_bucket("bkt") == st::ok);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    r.store->hot_put_foreign("bkt", "k", e, meta_of(v1), v1);
+    CHECK_FALSE(held("k"));
+    // and a bucket that is not there keeps nothing
+    e = r.store->hot_epoch();
+    r.store->hot_put_foreign("nobkt", "k", e, meta_of(v1), v1);
+    CHECK(r.store->hot_bytes() == 0);
+
+    // The budget and the size cap hold for these as for the owner's.
+    r.store->hot_put_foreign("bkt", "big", r.store->hot_epoch(), meta_of(std::string(60001, 'x')), std::string(60001, 'x'));
+    CHECK_FALSE(held("big"));
+    r.store->hot_put_foreign("bkt", "short", r.store->hot_epoch(), meta_of(v1), std::string_view(v1).substr(0, 10));
+    CHECK_FALSE(held("short"));
+}
+
 TEST_CASE("the HTTP and XML dates agree with gmtime and strftime across leap days, centuries and millis")
 {
     auto reference = [](int64_t ms, const char* fmt, bool frac)

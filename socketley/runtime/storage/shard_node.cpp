@@ -110,6 +110,20 @@ void shard_node::remove(uint32_t owner, std::string bucket, std::string key,
     });
 }
 
+void shard_node::invalidate(std::string bucket, std::string key, std::function<void()> done)
+{
+    if (m_store.shards() <= 1)
+    {
+        done();
+        return;
+    }
+    m_c.hot_drops_out += m_store.shards() - 1;
+    // A sibling that is gone holds nothing when it comes back, so it is not waited for.
+    const std::string payload = wire::encode_hot_drop(bucket, key);
+    each_peer([payload](uint32_t) { return payload; }, [](uint32_t, bool, std::string_view) {},
+              std::move(done));
+}
+
 // ─── Buckets ────────────────────────────────────────────────────────────────
 
 void shard_node::create_bucket(std::string name, std::function<void(st)> cb)
@@ -787,6 +801,19 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             ++m_c.removes_in;
             m_store.remove_local(bucket, key,
                 [reply](st s, bool existed) { reply(true, wire::encode_removed(s, existed)); });
+            return;
+        }
+        case wire::op::hot_drop:
+        {
+            std::string bucket, key;
+            if (!wire::decode_hot_drop(payload, bucket, key))
+            {
+                reply(false, {});
+                return;
+            }
+            ++m_c.hot_drops_in;
+            m_store.hot_invalidate(bucket, key);
+            reply(true, wire::encode_status(st::ok));
             return;
         }
         case wire::op::list:

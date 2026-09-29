@@ -1229,12 +1229,26 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             return;
         }
 
+    // Another shard's small object is answered from memory too, for as long as its owner has not said it changed.
+    if (!mem)
+    {
+        const object_meta* held_meta = nullptr;
+        const std::string* held_body = nullptr;
+        if (m_store.hot_get_foreign(q.bucket, q.key, held_meta, held_body))
+        {
+            ++m_c.hot_gets;
+            answer(*held_meta, -1, 0, *held_body);
+            return;
+        }
+    }
+    const uint64_t drop_epoch = m_store.hot_epoch();
+
     // Small objects are read whole with their header, in one read; a key whose
     // size is not known here is read that way too, since the read is short for
     // a small object and only a little long for a large one.
     const size_t prefetch = mem ? (mem->size <= object_store::hot_max_object ? static_cast<size_t>(mem->size) : 0)
                                 : object_store::hot_max_object;
-    m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer, mine, b = q.bucket, k = q.key](open_result o)
+    m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer, mine, drop_epoch, b = q.bucket, k = q.key](open_result o)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -1248,8 +1262,14 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_error_st(cc, o.status);
             return;
         }
-        if (mine && o.meta.size > 0 && o.prefetch.size() >= o.meta.size)
-            m_store.hot_put(b, k, o.meta, std::string_view(o.prefetch).substr(0, static_cast<size_t>(o.meta.size)));
+        if (o.meta.size > 0 && o.prefetch.size() >= o.meta.size)
+        {
+            const std::string_view whole = std::string_view(o.prefetch).substr(0, static_cast<size_t>(o.meta.size));
+            if (mine)
+                m_store.hot_put(b, k, o.meta, whole);
+            else
+                m_store.hot_put_foreign(b, k, drop_epoch, o.meta, whole);
+        }
         answer(o.meta, o.fd, o.data_off, o.prefetch);
     });
 }

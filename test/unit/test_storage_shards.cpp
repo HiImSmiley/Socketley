@@ -284,6 +284,38 @@ struct cluster : shard_transport
         return st::ok;
     }
 
+    // A read of another shard's key as a GET makes it: the drop epoch first, then the file, then the copy kept.
+    bool warm(uint32_t s, const std::string& bucket, const std::string& key)
+    {
+        const uint64_t epoch = m[s]->store->hot_epoch();
+        std::string body;
+        object_meta meta;
+        if (get(s, bucket, key, body, &meta) != st::ok)
+            return false;
+        m[s]->store->hot_put_foreign(bucket, key, epoch, meta, body);
+        return held(s, bucket, key);
+    }
+
+    bool held(uint32_t s, const std::string& bucket, const std::string& key, std::string* body = nullptr)
+    {
+        const object_meta* mm = nullptr;
+        const std::string* bb = nullptr;
+        const bool h = m[s]->store->hot_get_foreign(bucket, key, mm, bb);
+        if (h && body)
+            *body = *bb;
+        return h;
+    }
+
+    // How many shards other than the key's owner keep a copy of it.
+    uint32_t copies(const std::string& bucket, const std::string& key)
+    {
+        uint32_t n = 0;
+        for (uint32_t s = 0; s < this->n; ++s)
+            if (s != object_owner(bucket, key, this->n) && held(s, bucket, key))
+                ++n;
+        return n;
+    }
+
     st stat(uint32_t s, const std::string& bucket, const std::string& key, object_meta& meta)
     {
         st got = st::io_error;
@@ -571,6 +603,128 @@ TEST_CASE("a delete through any shard removes the object for all of them")
     c.stop(true);
     cluster back(d.path, 4);
     CHECK(back.objects_held() == 0);
+}
+
+TEST_CASE("a commit or a delete is answered only after every sibling has dropped its copy of the key")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string keep = "keep", key = "k";
+    const uint32_t owner = object_owner("bkt", key, 4);
+    const std::string v1 = pattern(3000, 1);
+    REQUIRE(c.put(0, "bkt", keep, "kept").status == st::ok);
+    REQUIRE(c.put(1, "bkt", key, v1).status == st::ok);
+
+    auto warm_all = [&](const std::string& k)
+    {
+        for (uint32_t s = 0; s < 4; ++s)
+            if (s != object_owner("bkt", k, 4))
+                REQUIRE(c.warm(s, "bkt", k));
+        CHECK(c.copies("bkt", k) == 3);
+    };
+    warm_all(key);
+    warm_all(keep);
+
+    // An overwrite, landed on the owner and on each of the others in turn.
+    for (uint32_t landing = 0; landing < 4; ++landing)
+    {
+        const std::string v = pattern(2500 + landing, 10 + landing);
+        REQUIRE(c.put(landing, "bkt", key, v).status == st::ok);
+        // Nothing is still on its way to a sibling when the client is answered.
+        CHECK(c.queue.empty());
+        CHECK(c.copies("bkt", key) == 0);
+        // The other key was not touched.
+        CHECK(c.copies("bkt", keep) == 3);
+        warm_all(key);
+        for (uint32_t s = 0; s < 4; ++s)
+            if (s != owner)
+            {
+                std::string body;
+                REQUIRE(c.held(s, "bkt", key, &body));
+                CHECK(body == v);
+            }
+    }
+
+    // A delete landed on each shard.
+    for (uint32_t landing = 0; landing < 4; ++landing)
+    {
+        REQUIRE(c.put(0, "bkt", key, pattern(900, 40 + landing)).status == st::ok);
+        warm_all(key);
+        REQUIRE(c.del(landing, "bkt", key) == st::ok);
+        CHECK(c.queue.empty());
+        CHECK(c.copies("bkt", key) == 0);
+    }
+
+    // A create-only put that lost changes nothing, so nothing is dropped for it.
+    REQUIRE(c.put(2, "bkt", key, "first", true).status == st::ok);
+    warm_all(key);
+    CHECK(c.put(3, "bkt", key, "second", true).status == st::precondition_failed);
+    CHECK(c.copies("bkt", key) == 3);
+
+    // Every crossing was counted on both sides.
+    uint64_t out = 0, in = 0;
+    for (uint32_t s = 0; s < 4; ++s)
+    {
+        out += c.m[s]->node->counters().hot_drops_out;
+        in += c.m[s]->node->counters().hot_drops_in;
+    }
+    CHECK(out == in);
+    CHECK(in > 0);
+}
+
+TEST_CASE("a read of the old file that ends after the overwrite was answered is not kept")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const uint32_t owner = object_owner("bkt", "k", 4);
+    const uint32_t reader = (owner + 1) % 4;
+    const std::string v1 = pattern(3000, 1), v2 = pattern(3000, 2);
+    REQUIRE(c.put(0, "bkt", "k", v1).status == st::ok);
+
+    // The reader has begun and read the old file...
+    const uint64_t epoch = c.m[reader]->store->hot_epoch();
+    std::string old_body;
+    object_meta old_meta;
+    REQUIRE(c.get(reader, "bkt", "k", old_body, &old_meta) == st::ok);
+    CHECK(old_body == v1);
+    // ...the overwrite is answered...
+    REQUIRE(c.put(0, "bkt", "k", v2).status == st::ok);
+    // ...and only then does the read end.
+    c.m[reader]->store->hot_put_foreign("bkt", "k", epoch, old_meta, old_body);
+    CHECK_FALSE(c.held(reader, "bkt", "k"));
+    // The next read keeps the new version.
+    REQUIRE(c.warm(reader, "bkt", "k"));
+    std::string body;
+    REQUIRE(c.held(reader, "bkt", "k", &body));
+    CHECK(body == v2);
+}
+
+TEST_CASE("a sibling that cannot be reached does not stop a commit or a delete from being answered")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    std::string key;
+    for (int i = 0; key.empty(); ++i)
+        if (object_owner("bkt", "obj" + std::to_string(i), 3) == 0)
+            key = "obj" + std::to_string(i);
+    REQUIRE(c.put(0, "bkt", key, "one").status == st::ok);
+    REQUIRE(c.warm(1, "bkt", key));
+    REQUIRE(c.warm(2, "bkt", key));
+
+    c.unreachable.insert(2);
+    uint64_t failed = c.m[0]->node->counters().peer_failures;
+    CHECK(c.put(0, "bkt", key, "two").status == st::ok);
+    CHECK(c.m[0]->node->counters().peer_failures > failed);
+    // The sibling that could be told has dropped it; the one that could not is what a restart would empty.
+    CHECK_FALSE(c.held(1, "bkt", key));
+    failed = c.m[0]->node->counters().peer_failures;
+    CHECK(c.del(0, "bkt", key) == st::ok);
+    CHECK(c.m[0]->node->counters().peer_failures > failed);
+    c.unreachable.clear();
+    CHECK(c.put(1, "bkt", key, "three").status == st::ok);
 }
 
 TEST_CASE("the same key put at once through every shard never tears and every shard serves the winner")
@@ -889,6 +1043,20 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     q.max_keys = 77;
     list_query qb;
     std::string bucket;
+
+    // A drop of a key, which no other op decodes.
+    std::string dk;
+    const std::string drop = wire::encode_hot_drop("bkt", "a/key");
+    REQUIRE(wire::decode_hot_drop(drop, bucket, dk));
+    CHECK(bucket == "bkt");
+    CHECK(dk == "a/key");
+    REQUIRE(wire::request_op(drop, o));
+    CHECK(o == wire::op::hot_drop);
+    CHECK_FALSE(wire::decode_remove(drop, bucket, dk));
+    CHECK_FALSE(wire::decode_hot_drop(wire::encode_remove("bkt", "a/key"), bucket, dk));
+    for (size_t cut = 0; cut < drop.size(); ++cut)
+        CHECK_FALSE(wire::decode_hot_drop(std::string_view(drop).substr(0, cut), bucket, dk));
+
     REQUIRE(wire::decode_list(wire::encode_list("bkt", q), bucket, qb));
     CHECK(bucket == "bkt");
     CHECK(qb.prefix == q.prefix);

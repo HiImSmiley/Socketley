@@ -125,7 +125,11 @@ void object_store::hot_put(std::string_view bucket_name, std::string_view key, c
     const object_meta* cur = find(bucket_name, key);
     if (!cur || !same_version(*cur, read))
         return;
-    const std::string& id = hot_id(bucket_name, key);
+    hot_insert(hot_id(bucket_name, key), read, body);
+}
+
+void object_store::hot_insert(const std::string& id, const object_meta& read, std::string_view body)
+{
     if (m_hot_index.count(id))
         return;
     m_hot_lru.push_front(hot_entry{id, std::string(body), read});
@@ -138,6 +142,61 @@ void object_store::hot_put(std::string_view bucket_name, std::string_view key, c
         m_hot_index.erase(old.id);
         m_hot_lru.pop_back();
     }
+}
+
+bool object_store::hot_get_foreign(std::string_view bucket_name, std::string_view key, const object_meta*& meta,
+                                   const std::string*& body)
+{
+    if (m_hot_index.empty())
+        return false;
+    auto it = m_hot_index.find(hot_id(bucket_name, key));
+    if (it == m_hot_index.end())
+        return false;
+    m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
+    meta = &it->second->meta;
+    body = &it->second->body;
+    return true;
+}
+
+// Zero stands for every key, which a dropped bucket is, so no key's hash is zero.
+static uint64_t drop_hash(std::string_view id)
+{
+    const uint64_t h = std::hash<std::string_view>{}(id);
+    return h ? h : 1;
+}
+
+void object_store::hot_note_drop(uint64_t id_hash)
+{
+    m_drop_ring[m_drop_epoch % drop_ring_size] = id_hash;
+    ++m_drop_epoch;
+}
+
+void object_store::hot_put_foreign(std::string_view bucket_name, std::string_view key, uint64_t epoch,
+                                   const object_meta& read, std::string_view body)
+{
+    if (m_hot_budget == 0 || body.size() != read.size || read.size > hot_max_object)
+        return;
+    const bucket* b = find_bucket(bucket_name);
+    if (!b || b->closing)
+        return;
+    const std::string& id = hot_id(bucket_name, key);
+    // A read that began before a drop and ended after it may hold the version the drop replaced.
+    if (m_drop_epoch != epoch)
+    {
+        if (m_drop_epoch - epoch > drop_ring_size)
+            return;
+        const uint64_t h = drop_hash(id);
+        for (uint64_t e = epoch; e != m_drop_epoch; ++e)
+            if (m_drop_ring[e % drop_ring_size] == 0 || m_drop_ring[e % drop_ring_size] == h)
+                return;
+    }
+    hot_insert(id, read, body);
+}
+
+void object_store::hot_invalidate(std::string_view bucket_name, std::string_view key)
+{
+    hot_note_drop(drop_hash(hot_id(bucket_name, key)));
+    hot_drop(bucket_name, key);
 }
 
 void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
@@ -155,6 +214,7 @@ void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
 
 void object_store::hot_drop_bucket(std::string_view bucket_name)
 {
+    hot_note_drop(0);
     for (auto it = m_hot_lru.begin(); it != m_hot_lru.end();)
     {
         if (std::string_view(it->id).substr(0, it->id.find('\0')) == bucket_name)
@@ -674,6 +734,17 @@ void object_store::apply_put(bucket& b, const std::string& key, const object_met
     ++m_totals.puts;
 }
 
+void object_store::invalidate_siblings(const std::string& bucket_name, const std::string& key,
+                                       std::function<void()> next)
+{
+    if (!m_peers || m_opts.nshards <= 1)
+    {
+        next();
+        return;
+    }
+    m_peers->invalidate(bucket_name, key, std::move(next));
+}
+
 void object_store::apply_delete(bucket& b, const std::string& key)
 {
     hot_drop(b.name, key);
@@ -939,7 +1010,7 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                             encode_put_record(rec, key, meta);
                             journal_append(*bs, rec, nullptr);
                             apply_put(*bs, key, meta);
-                            done({st::ok, meta});
+                            invalidate_siblings(bname, key, [done, meta]() { done({st::ok, meta}); });
                         });
                     if (!q2)
                     {
@@ -1069,7 +1140,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
                     encode_delete_record(rec, key, static_cast<int64_t>(now_ms()));
                     journal_append(*br, rec, nullptr);
                     apply_delete(*br, key);
-                    done(st::ok, existed);
+                    invalidate_siblings(bname, key, [done, existed]() { done(st::ok, existed); });
                 };
                 if (r == -ENOENT)
                 {

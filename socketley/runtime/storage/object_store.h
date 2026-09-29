@@ -324,6 +324,8 @@ public:
     virtual void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) = 0;
     virtual void remove(uint32_t owner, std::string bucket, std::string key,
                         std::function<void(st, bool existed)> cb) = 0;
+    // Tells every sibling to drop what it holds of the key, and `done` runs once each has answered or is gone.
+    virtual void invalidate(std::string bucket, std::string key, std::function<void()> done) = 0;
 };
 
 class object_store
@@ -381,15 +383,28 @@ public:
     const object_meta* find(std::string_view bucket, std::string_view key) const;
 
     // ── Hot small objects, kept in memory ───────────────────────────────────
-    // The bytes of small objects this shard owns, so a hot one is answered
-    // without opening its file; an entry is dropped wherever its index entry
-    // changes, and taken only while it still matches the index.
+    // The bytes of small objects, so a hot one is answered without opening its
+    // file.  A key this shard owns is dropped wherever its index entry changes
+    // and taken only while it still matches the index; another shard's key has
+    // no index entry here, so its owner tells every sibling to drop it before
+    // the commit or the delete is answered, and a read that a drop arrived
+    // during is not kept.
     static constexpr uint64_t hot_max_object = 60000;
     // The bytes of `key` when they are held for exactly the version `current` names.
     const std::string* hot_get(std::string_view bucket, std::string_view key, const object_meta& current);
     // Keeps what a read brought in, when `read` is still the indexed version.
     void hot_put(std::string_view bucket, std::string_view key, const object_meta& read, std::string_view body);
     uint64_t hot_bytes() const { return m_hot_bytes; }
+    // Read before a read of another shard's key starts, and handed back to hot_put_foreign when it ends.
+    uint64_t hot_epoch() const { return m_drop_epoch; }
+    // What is held of a key another shard owns.
+    bool hot_get_foreign(std::string_view bucket, std::string_view key, const object_meta*& meta,
+                         const std::string*& body);
+    // Keeps what a read of another shard's key brought in, unless a drop of that key or of its bucket arrived since `epoch`.
+    void hot_put_foreign(std::string_view bucket, std::string_view key, uint64_t epoch, const object_meta& read,
+                         std::string_view body);
+    // The owner's word that the key changed: drops it and refuses the reads that were in flight.
+    void hot_invalidate(std::string_view bucket, std::string_view key);
 
     // The metadata of any object, from memory when this shard owns the key and
     // from the object's own header otherwise.
@@ -534,6 +549,8 @@ private:
                      std::function<void(int leaf_fd, st)> cb, bool repaired = false);
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
+    // Runs `next` once every sibling has dropped its copy of a key this shard just changed.
+    void invalidate_siblings(const std::string& bucket_name, const std::string& key, std::function<void()> next);
 
     // What a quota lets this shard hold: an equal share, since the shards
     // cannot see each other's bytes.
@@ -561,6 +578,7 @@ private:
         std::string body;
         object_meta meta;
     };
+    void hot_insert(const std::string& id, const object_meta& read, std::string_view body);
     void hot_drop(std::string_view bucket, std::string_view key);
     void hot_drop_bucket(std::string_view bucket);
     const std::string& hot_id(std::string_view bucket, std::string_view key);
@@ -569,6 +587,11 @@ private:
     uint64_t    m_hot_bytes{0};
     uint64_t    m_hot_budget{32ull << 20};
     std::string m_hot_scratch;
+    // The keys dropped last, so a read can ask whether its own was among those that arrived while it ran.
+    static constexpr size_t drop_ring_size = 64;
+    void hot_note_drop(uint64_t id_hash);
+    uint64_t m_drop_epoch{0};
+    uint64_t m_drop_ring[drop_ring_size]{};
     uint64_t m_reserved{0};
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.

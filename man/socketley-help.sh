@@ -668,8 +668,8 @@ runtime_types() {
     echo -e "${GREEN}│${NC}   200; a crash leaves the old object or the new one.           ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC} Streams: a body is never held whole; a GET of 64 KiB or more   ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}   is spliced file to socket (stats: zero_copy_bytes).          ${GREEN}│${NC}"
-    echo -e "${GREEN}│${NC} Hot: a small object read again is answered from memory,        ${GREEN}│${NC}"
-    echo -e "${GREEN}│${NC}   never after it was replaced (stats: hot_gets).               ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC} Hot: a small object read again is answered from memory by      ${GREEN}│${NC}"
+    echo -e "${GREEN}│${NC}   any shard, never after it was replaced (stats: hot_gets).    ${GREEN}│${NC}"
     echo -e "${GREEN}└─────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
