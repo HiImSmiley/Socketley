@@ -6105,7 +6105,8 @@ runtime serves the S3 API over one directory, so that unmodified S3 clients
 machine's disk:
 .PP
 .nf
-socketley create storage media \-p 9000 \-\-dir /srv/objects \-\-anonymous \-s
+socketley create storage media \-p 9000 \-\-dir /srv/objects \\
+    \-\-access\-key AKIAEXAMPLE \-\-secret\-key wJalrXUtnFEMI \-s
 .fi
 .PP
 It runs in a worker process of its own like every other runtime, speaks
@@ -6125,15 +6126,58 @@ Where the buckets live. Required, created if it does not exist, and made
 absolute against the caller's directory. A runtime is one process on one
 directory: two runtimes on one path would append to each other's journals.
 .TP
+.BI \-\-access\-key " key"
+.TQ
+.BI \-\-secret\-key " secret"
+The one pair of credentials requests are signed with (AWS Signature Version 4). They go
+together: one without the other is refused. The pair is kept in the state file
+and printed by
+.BR show ;
+prefer
+.B \-\-credentials
+where that matters.
+.TP
+.BI \-\-credentials " file"
+A file of several pairs, one
+.IB access : secret
+per line. Blank lines and lines starting with
+.B #
+are skipped, and the secret is everything after the first colon, so it may hold
+one. The path is made absolute against the caller's directory. The file is
+read at start, refused at
+.B create
+and
+.B start
+if it does not parse or holds nothing, and read again when it changes
+(checked at most once a second, on the next request): a key added to it works at
+once, a key taken out stops, and a file that has gone, is empty or no longer
+parses leaves the keys in force until it is repaired, with a warning in the log,
+so a half\-written edit locks nobody out. A key given with
+.B \-\-access\-key
+is one of the set too.
+.TP
 .B \-\-anonymous
-Accept every request without authentication. Required until credentials exist:
-a runtime made with neither is refused, so an endpoint is never open by
-omission. A client that signs its requests works against an anonymous runtime
-\(em the signature is ignored \(em except that a payload signed in chunks
-(\fBSTREAMING\-AWS4\-HMAC\-SHA256\-PAYLOAD\fR, which the AWS CLI and recent SDKs send
-for uploads) is refused with
+Accept requests that carry no credentials at all. Required unless
+credentials are given: a runtime made with neither is refused, so an endpoint is
+never open by omission. With credentials as well, both kinds are served, and a
+request that does carry a signature is always verified \(em a wrong one is
+refused and never taken for an anonymous request. An anonymous request may send a
+body in unsigned aws\-chunked framing
+(\fBSTREAMING\-UNSIGNED\-PAYLOAD\-TRAILER\fR), which is decoded and its trailing
+checksum checked; one signed in chunks
+(\fBSTREAMING\-AWS4\-HMAC\-SHA256\-PAYLOAD\fR) is refused with
 .B NotImplemented
-rather than stored with its framing.
+because nobody is there to verify the signatures. Without
+.B \-\-anonymous
+a request with no credentials is
+.BR "403 AccessDenied" .
+.TP
+.BI \-\-mpu\-expire " duration"
+Abort a multipart upload that has been open this long (\fB24h\fR, \fB7d\fR; a bare
+number is seconds, as for every duration flag). Without it an upload is kept
+until it is completed or aborted, however old. Expiry is looked for while the
+runtime runs and once at every start, so an upload that outlived the setting
+while the runtime was stopped is gone when it comes back.
 .TP
 .BI \-\-max\-bytes " size"
 A quota on the bytes the runtime holds, with the
@@ -6147,8 +6191,11 @@ and stores nothing, and the quota can be changed on a serving runtime with
 0, the default, is no quota.
 .PP
 .B edit
-does not change these three; \fBimport\fR does, as it does for a cache, and
-refuses to move \fBdir\fR or \fBanonymous\fR while the runtime is running.
+does not change these; \fBimport\fR does, as it does for a cache, and
+refuses to move \fBdir\fR, \fBanonymous\fR or the access key, secret key or
+credentials file while the runtime is running (the contents of a credentials
+file are re\-read by themselves). The quota and the expiry move under a serving
+runtime.
 \fB\-\-tls\fR and \fB\-\-shards\fR are refused: the shards would share one directory
 and one journal without an owner for each key.
 .SS Supported S3 operations
@@ -6208,13 +6255,124 @@ CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
 Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE.
 T}
+CreateMultipartUpload	POST /bucket/key?uploads	T{
+.ad l
+Content\-Type, the stored headers and x\-amz\-meta\-* are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes.
+T}
+UploadPart	PUT /bucket/key?partNumber=N&uploadId=ID	T{
+.ad l
+Streamed like a put, Content\-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000.
+T}
+UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
+.ad l
+The whole source or x\-amz\-copy\-source\-range=bytes=first\-last.
+T}
+CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
+.ad l
+InvalidPart, InvalidPartOrder, EntityTooSmall (a part but the last under 5 MiB), NoSuchUpload, MalformedXML.
+T}
+AbortMultipartUpload	DELETE /bucket/key?uploadId=ID	T{
+.ad l
+204; NoSuchUpload afterwards.
+T}
+ListParts	GET /bucket/key?uploadId=ID	T{
+.ad l
+max\-parts, part\-number\-marker.
+T}
+ListMultipartUploads	GET /bucket?uploads	T{
+.ad l
+prefix, delimiter, key\-marker, upload\-id\-marker, max\-uploads, encoding\-type=url.
+T}
 .TE
 .PP
-Anything else \(em multipart uploads, ACLs, versioning, tagging, lifecycle \(em is
-answered
+Anything else \(em ACLs, versioning, tagging, lifecycle, the part\-number form of
+GetObject \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
+.SS Authentication
+Requests are verified as AWS Signature Version 4, in both forms: the
+.B Authorization
+header and a presigned URL (\fBX\-Amz\-Algorithm\fR and the rest in the
+query, for GET, HEAD, PUT and DELETE). Whatever region the credential scope names
+is accepted. Every
+.B x\-amz\-content\-sha256
+mode a client sends is honoured: a hex hash is checked against the body as it
+streams (a body that is not the one signed is
+.B XAmzContentSHA256Mismatch
+and is not stored),
+.B UNSIGNED\-PAYLOAD
+has nothing to check, and aws\-chunked bodies \(em
+.BR STREAMING\-AWS4\-HMAC\-SHA256\-PAYLOAD ,
+its
+.B \-TRAILER
+variant and
+.B STREAMING\-UNSIGNED\-PAYLOAD\-TRAILER
+\(em are decoded, with every chunk signature and a signed trailer verified, even
+when the aws\-chunked body is itself carried in
+.BR "Transfer\-Encoding: chunked" .
+Nothing is held whole for any of them: the body goes through the same two
+staging buffers as an unsigned put.
+.PP
+The answers are S3's:
+.B SignatureDoesNotMatch
+(403) for a wrong secret or a request changed after signing,
+.B InvalidAccessKeyId
+(403),
+.B RequestTimeTooSkewed
+(403) for a request dated more than fifteen minutes from the runtime's clock,
+.B AccessDenied
+(403) for an expired presigned URL or none at all, and
+.B AuthorizationHeaderMalformed
+(400). A denied request is answered before its body is read and the connection is
+closed.
+.SS Checksums
+.BR x\-amz\-checksum\-crc32 ,
+.BR \-crc32c ,
+.BR \-crc64nvme ,
+.B \-sha1
+and
+.B \-sha256
+are taken over the body of a PutObject or an UploadPart when the request names
+one \(em in that header, in a trailer of an aws\-chunked body (\fBx\-amz\-trailer\fR),
+or by
+.B x\-amz\-sdk\-checksum\-algorithm
+\(em and compared with the value the client gave: a mismatch is
+.B "400 BadDigest"
+and nothing is stored. The checksum is kept in the object, echoed in the
+answer, and returned by GetObject and HeadObject when the request has
+.B x\-amz\-checksum\-mode: ENABLED
+(except on a ranged read, which is not of the whole object). A multipart object
+has the checksum of its parts' checksums, and \fB\-N\fR after it for the number
+of parts, as S3 does; a part with no checksum of its own gets the upload's
+algorithm anyway.
+.SS Multipart uploads
+An upload is a directory
+.IB dir / bucket /mpu/ id
+holding a
+.B meta
+file (the object it will become, in an object header) and one file per part, each
+an object header and its bytes, so the runtime finds them again after a stop or a
+crash. A part is written like a put \(em streamed, hashed, synced \(em and renamed
+to its number, so it is whole or not there; an upload is created, and its
+directory synced, before its id is given out. A part still arriving when the
+worker is killed leaves nothing behind. The upload id is 32 hex digits.
+.PP
+CompleteMultipartUpload checks the list against what was uploaded, then writes
+the object's header and copies the parts into a temporary file a megabyte at a
+time on the ring, syncs it and commits it exactly as a put is committed
+(rename, directory sync, journal), so a crash during assembly leaves the upload
+intact and no object; only then are the parts removed. The ETag is the md5 of the
+parts' md5s with \fB\-N\fR, as S3's. The bytes pass through the process because
+io_uring has no copy between two files; the loop never blocks on the disk, and
+the worker holds two one\-megabyte buffers for it whatever the object's size.
+An upload is kept until it is completed or aborted unless
+.B \-\-mpu\-expire
+is set; its parts count against
+.B \-\-max\-bytes
+while they are held, and a bucket with an open upload cannot be deleted
+.RB ( BucketNotEmpty ).
+A part sent again needs room for both copies until the new one lands.
 .SS How objects are stored
 An object is one file at
 .IB dir / bucket /data/ ab / cd / sha256(key)
@@ -6266,7 +6424,13 @@ reports
 .BR zero_copy_bytes ,
 .BR journal_records ,
 .BR journal_compactions ,
-.B fsyncs
+.BR fsyncs ,
+.BR multipart_uploads ,
+.BR multipart_parts ,
+.BR multipart_bytes ,
+.BR multipart_created ,
+.BR multipart_completed ,
+.B multipart_aborted
 and
 .BR timeouts .
 A connection with a request head unfinished after ten seconds, or a body that

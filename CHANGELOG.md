@@ -29,11 +29,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from the object headers. A body is never held whole (a 1 GiB put and get moved
   the worker's peak RSS from 9 to 13 MiB), a GET of 64 KiB or more is spliced
   from the file to the socket and counted as `zero_copy_bytes`, and nothing but
-  the startup reconciliation blocks the loop. `--anonymous` is required until
-  credentials exist, `--max-bytes` sets a quota answered with 507, a chunk-signed
-  upload is refused rather than stored with its framing, and multipart, ACLs and
-  versioning answer 501. `--tls`, `--shards`, SigV4 and the Lua surface are not
+  the startup reconciliation blocks the loop. A runtime needs `--anonymous` or
+  credentials (below), `--max-bytes` sets a quota answered with 507, and ACLs
+  and versioning answer 501. `--tls`, `--shards` and the Lua surface are not
   built yet. `type_registry::first_registered` is now 5.
+
+- **A storage runtime authenticates with SigV4, takes multipart uploads and
+  checks checksums.** `--access-key K --secret-key S` gives one pair and
+  `--credentials FILE` several (`access:secret` per line, re-read within a
+  second of the file changing; a file that has gone or no longer parses leaves
+  the keys in force); a request with no credentials is 403 unless `--anonymous`
+  is also given, and one that carries a signature is always verified. Both the
+  Authorization header and presigned GET, HEAD, PUT and DELETE URLs are honoured,
+  and every `x-amz-content-sha256` mode boto3 sends is verified as the body
+  streams: a hex hash, `UNSIGNED-PAYLOAD`, and aws-chunked with signed chunks,
+  with a trailing checksum, or both, also inside `Transfer-Encoding: chunked`.
+  The answers are S3's (`SignatureDoesNotMatch`, `InvalidAccessKeyId`,
+  `RequestTimeTooSkewed`, `AccessDenied` for an expired URL,
+  `XAmzContentSHA256Mismatch`, `BadDigest`); 256 MiB with a hex hash and 256 MiB
+  in signed chunks left the worker's peak RSS at 13 MiB. CreateMultipartUpload,
+  UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload,
+  ListParts and ListMultipartUploads work with boto3's transfer manager and
+  `copy()`: parts are files under `<bucket>/mpu/<id>/` that survive a stop and a
+  killed worker, an object is assembled on the ring and committed as a put is
+  (six 64 MiB parts, 384 MiB, in 0.33 s with the worker at 13 MiB), its ETag is
+  md5 of the part md5s with `-N`, and the parts count against `--max-bytes`.
+  Uploads are kept until completed or aborted; `--mpu-expire 24h` aborts old
+  ones, at run time and at every start. `x-amz-checksum-crc32`, `-crc32c`,
+  `-crc64nvme`, `-sha1` and `-sha256` are checked on PutObject and UploadPart
+  (as a header or a trailer), stored, and returned by GET and HEAD with
+  `x-amz-checksum-mode: ENABLED`; a multipart object carries the composite
+  checksum of its parts.
 
 - **Cluster runtimes: on a daemon in Raft mode the cluster heals itself.**
   `socketley cluster create server api -p 8080 --replicas 2` declares a
