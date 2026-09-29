@@ -83,6 +83,9 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout "$CERTS/srv-key.pem" -
 cat > "$HOME/.config/socketley/config.lua" <<LUA
 config = { metrics_port = $MPORT }
 LUA
+# run_all.sh exports SOCKETLEY_CONFIG, which is also the daemon's config path and
+# would hide the file above: the metrics series then read empty in the suite only.
+unset SOCKETLEY_CONFIG
 
 cat > "$T/hooks.lua" <<'LUA'
 local logf = assert(io.open(os.getenv("SL_HOOKLOG"), "a"))
