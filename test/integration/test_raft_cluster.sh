@@ -120,6 +120,16 @@ check 'grep -q "refused .* (b): --raft-name b is already node" "$T/a.log"' "the 
 check '[ "$(voters a)" = 3 ]' "the refused node changed the membership"
 kill -9 "$(cat "$T/dup.pid")" 2>/dev/null || true; daemon_sweep "$(sock dup)"
 
+# ─── {node} is a node's own name before the log holds its record ────────────
+# A spec's flags are dry-run with the node's own name, and a founder's record is in the log only once it has been elected: `-p 5{node}` is a
+# port for a node named 8 and nonsense for its hex id, so the dry run in that first second says "invalid port number" if the name is not known.
+node_start 8 --raft-listen 127.0.0.1:$((PB + 21)) --raft-init --raft-insecure --raft-name 8
+out=$(as 8 cluster create server own -p "5{node}" --replicas 1 2>&1) && rc=0 || rc=$?
+check '[ "$(role 8)" != leader ]' "the founder was already the leader, so this checks nothing about the first second"
+check '! grep -q "invalid port" <<<"$out"' "a founder named 8 before its record is in the log refused -p 5{node}: exit $rc, said: $out"
+check 'grep -q "no leader is known" <<<"$out"' "the create was not stopped for want of a leader, after its flags passed: exit $rc, said: $out"
+kill -9 "$(cat "$T/8.pid")" 2>/dev/null || true; daemon_sweep "$(sock 8)"
+
 # ─── kill -9 the leader: a new one within the bound ────────────────────────
 old_id=$(myid "$L")
 old_term=$(field "$L" term)

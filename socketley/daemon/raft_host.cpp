@@ -1350,6 +1350,9 @@ bool raft_host::decode_book(std::string_view data, book& b)
 
 std::string raft_host::node_name(raft::node_id id) const
 {
+    // Its own name is known before the log holds its record, and a spec's flags are dry-run with it.
+    if (id == m_id)
+        return m_cfg.name;
     const member* mb = lookup(id);
     return mb ? mb->name : hex_id(id);
 }
