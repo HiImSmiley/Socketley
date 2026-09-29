@@ -113,6 +113,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   copy path while `--fast-lo` is on. The per-socket state is a
   non-preallocated hash pruned when a socket closes and the taint LRUs are
   gone, so the maps cost 3.9 MiB at rest rather than 12.6.
+- **`socketley daemon --raft-listen <ip:port>` runs a Raft node on the daemon.**
+  Off unless asked for; nothing else about the daemon changes, and the cluster
+  directory keeps working as before. This release forms the cluster and keeps
+  it: leader election with pre-vote and check-quorum, a replicated log on disk,
+  membership, and graceful handover. No runtime, placement or cache failover
+  goes through it yet.
+- `--raft-init` founds a cluster; `--raft-join <ip:port>` joins one, first as a
+  learner and then promoted to voter once caught up. Both apply to the first
+  start only; afterwards the node comes back from its own state.
+- Mutual TLS between members is required (`--raft-cert`, `--raft-key`,
+  `--raft-ca`, `--raft-name`); a certificate that does not name the member it
+  speaks for is refused. `--raft-insecure` runs it in cleartext on purpose.
+- The log is a CRC32C-checked WAL under the state directory, 0600, every write
+  fsynced through io_uring before anything that depends on it is sent; a torn
+  tail is cut back on restart. A SIGTERM'd leader hands leadership over first.
+- `socketley cluster raft-status` shows role, term, leader, commit/applied,
+  voters, learners and whether a quorum is reachable, and exits 2 without one.
+- **The whole cross-runtime Lua API works in a worker.** Thirteen calls were
+  refused there; the count is zero. `socketley.send/.list/.get` and
+  `socketley.cluster.*` are answered from a replica map the daemon pushes;
+  `.create/.start/.stop/.remove` are asked of the daemon over a socket of the
+  worker's own and wait for the answer, so `if socketley.create(...) then`
+  branches on what happened; and `socketley.pipe` across two runtimes and
+  `self.route()` reach a runtime in another process. Despite the name neither
+  hands a descriptor over — the origin keeps the socket and relays.
 
 ### Changed
 
@@ -247,6 +272,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as `parked_connections`, and they go to the pool when the client leaves.
   Against HAProxy on one keep-alive connection 1.30× → 1.32× the rate and
   1.51× → 1.62× per core; at 32 connections 1.32× → 1.47×.
+- **A script runs when its runtime starts, not when it is created.** `create`
+  compiles the file — one that does not parse is still refused by the command
+  that asked — and the worker runs it. Without `-s` there is no worker yet, so
+  the top level has not run, `socketley.subscribe` has not registered, and a
+  global like `tick_ms` has not been checked; all of that happens at `start`,
+  and a refusal there is reported by that command. Previously a runtime kept in
+  the daemon loaded and ran its script during `create`.
 
 ### Fixed
 
@@ -353,57 +385,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a copied list or set left the count at 16 EiB. `COPY` past the limit copies
   nothing and answers 0, counting what `REPLACE` frees, a renamed key can be
   evicted again, and `SMOVE` onto its own set leaves the member where it is.
-
-## [1.1.0] - 2026-08-27
-
-Six months of work since v1.0.9, across 581 commits. The headline is that a
-runtime is no longer confined to the daemon's process or to one core.
-
-### Added
-
-#### Raft between daemons (experimental, opt-in)
-
-- **`socketley daemon --raft-listen <ip:port>` runs a Raft node on the daemon.**
-  Off unless asked for; nothing else about the daemon changes, and the cluster
-  directory keeps working as before. This release forms the cluster and keeps
-  it: leader election with pre-vote and check-quorum, a replicated log on disk,
-  membership, and graceful handover. No runtime, placement or cache failover
-  goes through it yet.
-- `--raft-init` founds a cluster; `--raft-join <ip:port>` joins one, first as a
-  learner and then promoted to voter once caught up. Both apply to the first
-  start only; afterwards the node comes back from its own state.
-- Mutual TLS between members is required (`--raft-cert`, `--raft-key`,
-  `--raft-ca`, `--raft-name`); a certificate that does not name the member it
-  speaks for is refused. `--raft-insecure` runs it in cleartext on purpose.
-- The log is a CRC32C-checked WAL under the state directory, 0600, every write
-  fsynced through io_uring before anything that depends on it is sent; a torn
-  tail is cut back on restart. A SIGTERM'd leader hands leadership over first.
-- `socketley cluster raft-status` shows role, term, leader, commit/applied,
-  voters, learners and whether a quorum is reachable, and exits 2 without one.
-
-#### Multi-process runtimes and sharding
-
-- **Every runtime now runs in its own supervised worker process.** One runtime
-  can no longer take the daemon down with it. There is no opt-out and no flag:
-  `--daemon-process`, and the older `--out-of-process` / `--in-daemon` pair it
-  replaced, are all gone. A command line carrying one is refused as an unknown
-  flag; a configuration file with `daemon_process` in it is refused naming the
-  line.
-- **The whole cross-runtime Lua API works in a worker.** Thirteen calls were
-  refused there; the count is zero. `socketley.send/.list/.get` and
-  `socketley.cluster.*` are answered from a replica map the daemon pushes;
-  `.create/.start/.stop/.remove` are asked of the daemon over a socket of the
-  worker's own and wait for the answer, so `if socketley.create(...) then`
-  branches on what happened; and `socketley.pipe` across two runtimes and
-  `self.route()` reach a runtime in another process. Despite the name neither
-  hands a descriptor over — the origin keeps the socket and relays.
-- **A script runs when its runtime starts, not when it is created.** `create`
-  compiles the file — one that does not parse is still refused by the command
-  that asked — and the worker runs it. Without `-s` there is no worker yet, so
-  the top level has not run, `socketley.subscribe` has not registered, and a
-  global like `tick_ms` has not been checked; all of that happens at `start`,
-  and a refusal there is reported by that command. Previously a runtime kept in
-  the daemon loaded and ran its script during `create`.
 - A worker that will not accept its configuration now sends the reason up, so
   `create` says `'path' must start with '/'` rather than "the reason is in the
   daemon log".
@@ -417,6 +398,30 @@ runtime is no longer confined to the daemon's process or to one core.
   crashed or killed — every runtime on the other end is told to let go, and its
   `on_disconnect` runs. The daemon does the telling, because a killed worker
   runs no teardown of its own.
+
+### Removed
+
+- **Every runtime now runs in its own supervised worker process.** One runtime
+  can no longer take the daemon down with it. There is no opt-out and no flag:
+  `--daemon-process`, and the older `--out-of-process` / `--in-daemon` pair it
+  replaced, are all gone. A command line carrying one is refused as an unknown
+  flag; a configuration file with `daemon_process` in it is refused naming the
+  line.
+
+## [1.1.0] - 2026-08-27
+
+Six months of work since v1.0.9, across 581 commits. The headline is that a
+runtime is no longer confined to the daemon's process or to one core.
+
+### Added
+
+#### Multi-process runtimes and sharding
+
+- **Every runtime now runs in its own supervised worker process by default.**
+  One runtime can no longer take the daemon down with it. `--daemon-process`
+  opts back in to sharing the daemon's process; it replaces the older
+  `--out-of-process` and `--in-daemon` pair, which were one bit under two
+  spellings.
 - **`--shards N`** runs a single runtime across N worker processes behind one
   port via `SO_REUSEPORT`, on servers, proxies and caches.
 - A **sharded cache keeps one keyspace.** `mget`, `dbsize`, `publish` and
