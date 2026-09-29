@@ -1414,6 +1414,28 @@ TEST_CASE("a secret longer than a hash block still signs")
     CHECK(r.run().status == s3::sigv4_status::signature_mismatch);
 }
 
+TEST_CASE("a signing key kept for reuse is never served to another secret, day, region or service")
+{
+    for (const kase& c : g_cases)
+    {
+        INFO(c.name);
+        // Twice, so the second is answered from what the first left, then the same request under a changed
+        // secret and back again: a key remembered by access key alone would pass the middle one.
+        req a(c);
+        CHECK(a.run().ok());
+        CHECK(a.run().ok());
+        req rotated(c);
+        rotated.secret = c.secret == sv("rotated-secret") ? "another" : "rotated-secret";
+        CHECK(rotated.run().status == s3::sigv4_status::signature_mismatch);
+        CHECK(req(c).run().ok());
+        // The credential scope names the region, so a pinned other region is refused whatever was kept.
+        req pinned(c);
+        pinned.opts.region = "no-such-region-1";
+        CHECK_FALSE(pinned.run().ok());
+        CHECK(req(c).run().ok());
+    }
+}
+
 TEST_CASE("status names and the S3 code of each result")
 {
     CHECK(std::string(s3::default_code(s3::sigv4_status::ok)) == "");

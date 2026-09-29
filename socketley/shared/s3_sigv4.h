@@ -46,7 +46,7 @@
 //   a presigned request uses UNSIGNED-PAYLOAD unless the query gives X-Amz-Content-Sha256.
 //
 // THREADING.
-//   Nothing here holds state between calls, and every object is used from one thread at a time.
+//   Nothing here holds state between calls but a per-thread cache of derived signing keys, and every object is used from one thread at a time.
 #include <cstddef>
 #include <cstdint>
 #include <span>

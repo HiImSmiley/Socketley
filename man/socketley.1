@@ -10848,6 +10848,19 @@ counts and how much CPU a GET takes, never what it returns.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_HASH_THREADS
+How many helper threads a storage worker takes the digests of large uploads on
+(the ETag's MD5 and any \fBx\-amz\-checksum\-\fR the request asked for), so that the
+worker's loop is not the one core every upload's hashing has to fit in. Default
+.BR 2 ;
+.B 0
+hashes on the loop. The threads are started by the first upload of 256 KiB or
+more (or of unknown length) and end with the runtime; smaller bodies are hashed
+in line, since the hop costs more than their digest. This changes CPU use and
+the throughput of large puts, never what is stored.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_CACHE_TTL_SWEEP_MS
 Interval between periodic sweeps for expired cache keys, in milliseconds.
 Default

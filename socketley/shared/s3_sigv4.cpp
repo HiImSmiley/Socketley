@@ -70,6 +70,75 @@ std::string_view as_sv(const uint8_t* p, size_t n)
     return {reinterpret_cast<const char*>(p), n};
 }
 
+void hmac_sha256(std::string_view key, std::initializer_list<std::string_view> parts, uint8_t out[32]);
+
+// The signing key is HMAC over date, region, service and the terminator, seeded with "AWS4" and the secret.
+void derive_signing_key_uncached(std::string_view secret, std::string_view date, std::string_view region,
+                                 std::string_view service, uint8_t key[32])
+{
+    std::string seed = "AWS4";
+    seed.append(secret);
+    uint8_t k_date[32], k_region[32], k_service[32];
+    hmac_sha256(seed, {date}, k_date);
+    hmac_sha256(as_sv(k_date, 32), {region}, k_region);
+    hmac_sha256(as_sv(k_region, 32), {service}, k_service);
+    hmac_sha256(as_sv(k_service, 32), {"aws4_request"}, key);
+    OPENSSL_cleanse(seed.data(), seed.size());
+    OPENSSL_cleanse(k_date, sizeof(k_date));
+    OPENSSL_cleanse(k_region, sizeof(k_region));
+    OPENSSL_cleanse(k_service, sizeof(k_service));
+}
+
+// A key depends on the secret, the day, the region and the service and on nothing else, and a client signs
+// every request of a day with one of them, so the four HMACs of its derivation are done once per thread.
+struct signing_key_cache
+{
+    static constexpr size_t slots = 4;
+    struct slot
+    {
+        bool        used = false;
+        std::string secret;
+        std::string date;
+        std::string region;
+        std::string service;
+        uint8_t     key[32] = {};
+    };
+    slot   s[slots];
+    size_t next = 0;
+
+    ~signing_key_cache()
+    {
+        for (slot& e : s)
+        {
+            OPENSSL_cleanse(e.key, sizeof(e.key));
+            if (!e.secret.empty())
+                OPENSSL_cleanse(e.secret.data(), e.secret.size());
+        }
+    }
+};
+
+void derive_signing_key(std::string_view secret, std::string_view date, std::string_view region,
+                        std::string_view service, uint8_t key[32])
+{
+    thread_local signing_key_cache cache;
+    for (auto& e : cache.s)
+        if (e.used && e.date == date && e.region == region && e.service == service && e.secret == secret)
+        {
+            std::memcpy(key, e.key, 32);
+            return;
+        }
+    derive_signing_key_uncached(secret, date, region, service, key);
+    auto& e = cache.s[cache.next++ % signing_key_cache::slots];
+    if (!e.secret.empty())
+        OPENSSL_cleanse(e.secret.data(), e.secret.size());
+    e.used    = true;
+    e.secret  = std::string(secret);
+    e.date    = std::string(date);
+    e.region  = std::string(region);
+    e.service = std::string(service);
+    std::memcpy(e.key, key, 32);
+}
+
 void hmac_sha256(std::string_view key, std::initializer_list<std::string_view> parts, uint8_t out[32])
 {
     uint8_t k[64] = {};
@@ -687,15 +756,8 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         if (!parse_u64(h->value, decoded_length))
             return fail(sigv4_status::malformed, 400, "InvalidArgument", "x-amz-decoded-content-length is not a number.", a.form);
 
-    // The signing key is HMAC over date, region, service and the terminator, seeded with "AWS4" and the secret.
-    std::string seed = "AWS4";
-    seed.append(secret);
-    uint8_t k_date[32], k_region[32], k_service[32], key[32];
-    hmac_sha256(seed, {a.date}, k_date);
-    hmac_sha256(as_sv(k_date, 32), {a.region}, k_region);
-    hmac_sha256(as_sv(k_region, 32), {a.service}, k_service);
-    hmac_sha256(as_sv(k_service, 32), {"aws4_request"}, key);
-    OPENSSL_cleanse(seed.data(), seed.size());
+    uint8_t key[32];
+    derive_signing_key(secret, a.date, a.region, a.service, key);
 
     std::string scope;
     append(scope, {a.date, "/", a.region, "/", a.service, "/aws4_request"});
