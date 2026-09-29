@@ -33,6 +33,7 @@
 #include "object_format.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
+#include "../../shared/hash_pool.h"
 
 namespace socketley::storage
 {
@@ -233,16 +234,31 @@ private:
     friend class object_store;
     put_op() = default;
 
-    enum class stage_state : uint8_t { free, filling, full, writing };
+    // `hashing` is a buffer whose write is done and whose digest is not, held
+    // because a helper thread is still reading it.
+    enum class stage_state : uint8_t { free, filling, full, writing, hashing };
 
     struct stage
     {
-        std::unique_ptr<char[]> data;
+        // Shared with the digest jobs, which may outlive this operation.
+        std::shared_ptr<char[]> data;
         size_t                  fill{0};
         uint64_t                file_off{0};
         stage_state             state{stage_state::free};
+        // Digest jobs of this buffer that have not reported.
+        uint32_t                hash_out{0};
     };
 
+    // The digests of a body, which a helper thread updates while the operation
+    // is waiting for it, and which the operation reads only after they are done.
+    struct hash_state
+    {
+        md5_stream                       md5;
+        std::unique_ptr<checksum_stream> ck;
+    };
+
+    void on_hashed(int stage_index);
+    void finish_now();
     void begin(object_store* store, std::string bucket, std::string key, object_meta meta,
                uint64_t expected, bool size_known);
     void pump();
@@ -273,8 +289,14 @@ private:
     uint64_t   m_received{0};
     // Where the next buffer to be filled begins in the file.
     uint64_t   m_next_off{0};
-    md5_stream m_md5;
-    std::unique_ptr<checksum_stream> m_ck;
+    std::shared_ptr<hash_state> m_hs;
+    // Body pieces hashed on the pool's threads rather than here, when the body is big enough to be worth the hop.
+    bool        m_async{false};
+    uint32_t    m_lane{0};
+    uint32_t    m_hash_out{0};
+    bool        m_finish_wait{false};
+    md5_t       m_expect_md5{};
+    bool        m_has_expect_md5{false};
     std::string m_ck_expect;
     committer   m_committer;
     st         m_status{st::ok};
@@ -399,6 +421,9 @@ public:
     // The quota may move under a serving store; what is held stays held.
     void set_max_bytes(uint64_t bytes) { m_opts.max_bytes = bytes; }
 
+    // Where a body's digests are taken when it is big; null takes them in line.
+    void set_hash_pool(hash_pool* pool) { m_hash = pool; }
+
     // Whether anything is still being written, which a clean stop must wait out.
     bool busy() const;
     // Busy with anything but a journal write: what a clean stop cannot wait out.
@@ -512,6 +537,7 @@ private:
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     std::unordered_set<std::string> m_creating;
     shard_peers* m_peers{nullptr};
+    hash_pool*   m_hash{nullptr};
     std::function<bool(std::string_view)> m_drop_guard;
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.

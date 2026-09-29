@@ -71,8 +71,27 @@ const char* reason_phrase(int status)
 
 }   // namespace
 
+namespace
+{
+
+// Threads that hash large bodies: two by default, none to hash on the loop.
+unsigned hash_threads()
+{
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HASH_THREADS"))
+    {
+        char* end;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && v >= 0 && v <= 16)
+            return static_cast<unsigned>(v);
+    }
+    return 2;
+}
+
+}   // namespace
+
 storage_run::storage_run(storage_instance& owner, event_loop& loop, store_options opts, authenticator* auth)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_store(loop, m_io, std::move(opts)),
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_hash(hash_threads()),
+      m_store(loop, m_io, std::move(opts)),
       m_mpu(loop, m_io, m_store),
       m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
                   std::string(owner.get_name())),
@@ -83,6 +102,12 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     m_node.set_multipart(&m_mpu);
     m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_has_uploads(bucket); });
     m_rid_seq = random_u64();
+    m_store.set_hash_pool(&m_hash);
+    if (!m_hash.attach(m_io))
+    {
+        LOG_WARN("storage: the digest threads cannot be waited for, so bodies are hashed on the loop");
+        m_hash.stop();
+    }
     m_max_conns = m_owner.get_max_connections();
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_SPLICE_MIN"))
     {
@@ -436,6 +461,12 @@ void storage_run::stop()
     // No crossing is answered from here on, and none that is out will be.
     m_node.stop();
     m_transport.stop();
+
+    // The digest threads end first, so none of them writes to a descriptor the
+    // loop is about to close, and the read waiting on it is cancelled with it.
+    m_hash.stop();
+    if (const int fd = m_hash.release_wake_fd(); fd >= 0)
+        m_loop.close_fd(fd);
 
     // Marked clean only when nothing is half done, which is decided inside.
     m_store.close(true);

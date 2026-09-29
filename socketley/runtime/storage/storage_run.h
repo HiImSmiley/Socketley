@@ -26,6 +26,7 @@
 #include "storage_transport.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
+#include "../../shared/hash_pool.h"
 #include "../../shared/http_framing.h"
 #include "../../shared/tls_context.h"
 
@@ -311,6 +312,7 @@ public:
     // Nothing is owed to this run any more, so it can be freed.
     bool drained() const;
 
+
     size_t connection_count() const { return m_conns.size(); }
     const storage_counters& counters() const { return m_c; }
     object_store& store() { return m_store; }
@@ -458,6 +460,9 @@ private:
     storage_instance& m_owner;
     event_loop&       m_loop;
     file_io           m_io;
+    // Helper threads that take the digests of large bodies; declared before
+    // the store, which holds a pointer to it.
+    hash_pool         m_hash;
     object_store      m_store;
     multipart_store   m_mpu;
     // What carries a request to a sibling shard, and the logic that makes one

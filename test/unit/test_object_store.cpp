@@ -6,6 +6,7 @@
 #include "runtime/storage/s3_names.h"
 #include "shared/event_loop.h"
 #include "shared/file_io.h"
+#include "shared/hash_pool.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -52,18 +53,28 @@ struct rig : io_handler
 {
     event_loop                    loop{256};
     std::unique_ptr<file_io>      io;
+    // Declared between the ring and the store, as a runtime holds it.
+    std::unique_ptr<hash_pool>    pool;
     std::unique_ptr<object_store> store;
     recovery_report               report;
 
-    explicit rig(const std::string& dir, uint64_t compact_floor = 4096, uint64_t max_bytes = 0)
+    explicit rig(const std::string& dir, uint64_t compact_floor = 4096, uint64_t max_bytes = 0,
+                 unsigned hash_threads = 0)
     {
         REQUIRE(loop.init());
         io = std::make_unique<file_io>(loop, this);
+        if (hash_threads)
+        {
+            pool = std::make_unique<hash_pool>(hash_threads);
+            REQUIRE(pool->attach(*io));
+        }
         store_options o;
         o.dir           = dir;
         o.compact_floor = compact_floor;
         o.max_bytes     = max_bytes;
         store = std::make_unique<object_store>(loop, *io, o);
+        if (pool)
+            store->set_hash_pool(pool.get());
         std::string err;
         const bool ok = store->open(err, &report);
         INFO(err);
@@ -1132,4 +1143,72 @@ TEST_CASE("an object directory that has gone is made again by the next put and b
     CHECK(count_dirs(d.path + "/bkt/data") == 256);
     std::string got;
     CHECK(again.get("bkt", "lost", got) == st::ok);
+}
+
+TEST_CASE("a body hashed on the pool's threads stores the same bytes and the same ETag as one hashed in line")
+{
+    tmpdir d;
+    rig r(d.path, 4096, 0, 2);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    // Below, at and above the size from which a body is handed to the pool, and
+    // several buffers long, so digest jobs are outstanding when the next bytes arrive.
+    for (size_t size : {size_t{100} * 1024, size_t{256} * 1024 - 1, size_t{256} * 1024, size_t{3} * 1024 * 1024 + 17,
+                        size_t{9} * 1024 * 1024})
+    {
+        const std::string body = pattern(size, static_cast<unsigned>(size));
+        const uint64_t before = r.pool->submitted();
+        const put_result res = r.put("bkt", "k" + std::to_string(size), body, {}, 70001);
+        REQUIRE(res.status == st::ok);
+        CHECK(res.meta.md5 == md5_of(body));
+        CHECK(res.meta.size == size);
+        std::string got;
+        REQUIRE(r.get("bkt", "k" + std::to_string(size), got) == st::ok);
+        CHECK(got == body);
+        if (size >= 256 * 1024)
+            CHECK(r.pool->submitted() > before);
+        else
+            CHECK(r.pool->submitted() == before);
+    }
+}
+
+TEST_CASE("a digest that disagrees with the body refuses it after the pool has finished, and leaves nothing")
+{
+    tmpdir d;
+    rig r(d.path, 4096, 0, 2);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    const std::string body = pattern(2 * 1024 * 1024, 5);
+    const md5_t wrong = md5_of("something else");
+    CHECK(r.put("bkt", "bad", body, {}, 100000, &wrong).status == st::bad_digest);
+    std::string got;
+    CHECK(r.get("bkt", "bad", got) == st::no_such_key);
+    r.settle();
+    CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+    const md5_t right = md5_of(body);
+    CHECK(r.put("bkt", "good", body, {}, 100000, &right).status == st::ok);
+}
+
+TEST_CASE("a body given up while the pool is still reading it leaves no temporary file and a store that stops cleanly")
+{
+    tmpdir d;
+    {
+        rig r(d.path, 4096, 0, 2);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        st why = st::ok;
+        const std::string body = pattern(4 * 1024 * 1024, 9);
+        auto op = r.store->begin_put("bkt", "half", {}, body.size(), true, why);
+        REQUIRE(op);
+        size_t off = 0;
+        for (int i = 0; i < 6 && off < body.size(); ++i)
+            off += op->append(body.data() + off, 300000);
+        // Digest jobs are queued or running for what was appended.
+        op->abort();
+        op.reset();
+        r.settle(200);
+        CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+        std::string got;
+        CHECK(r.get("bkt", "half", got) == st::no_such_key);
+        // A put after the abandoned one still goes through the pool.
+        const std::string ok = pattern(1024 * 1024, 3);
+        CHECK(r.put("bkt", "after", ok).status == st::ok);
+    }
 }

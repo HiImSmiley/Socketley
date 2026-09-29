@@ -47,13 +47,21 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_cap = std::clamp(want, m_header_len + object_header_align, mib + m_header_len);
     m_cap = (m_cap + object_header_align - 1) / object_header_align * object_header_align;
 
-    m_stage[0].data = std::make_unique_for_overwrite<char[]>(m_cap);
+    m_hs = std::make_shared<hash_state>();
+    // A small body is hashed where it lands: the hop to a helper thread costs
+    // more than the digest of a few kilobytes.
+    constexpr uint64_t async_min = 256 * 1024;
+    m_async = store->m_hash && store->m_hash->enabled() && (!size_known || expected >= async_min);
+    if (m_async)
+        m_lane = store->m_hash->next_lane();
+
+    m_stage[0].data = std::make_shared_for_overwrite<char[]>(m_cap);
     std::memset(m_stage[0].data.get(), 0, m_header_len);
     m_stage[0].fill     = m_header_len;
     m_stage[0].file_off = 0;
     m_stage[0].state    = stage_state::filling;
     if (!size_known || m_header_len + expected > m_cap)
-        m_stage[1].data = std::make_unique_for_overwrite<char[]>(m_cap);
+        m_stage[1].data = std::make_shared_for_overwrite<char[]>(m_cap);
 
     if (size_known)
     {
@@ -165,9 +173,28 @@ void put_op::staged(size_t n)
     if (n == 0 || m_status != st::ok)
         return;
     stage& s = m_stage[m_active];
-    m_md5.update(s.data.get() + s.fill, n);
-    if (m_ck)
-        m_ck->update(s.data.get() + s.fill, n);
+    if (m_async)
+    {
+        // Behind the earlier pieces of this body on one thread, reading the
+        // bytes where they landed; the buffer is held until it reports.
+        ++s.hash_out;
+        ++m_hash_out;
+        const int index = m_active;
+        m_store->m_hash->submit(m_lane,
+            [hs = m_hs, buf = s.data, p = s.data.get() + s.fill, n]
+            {
+                hs->md5.update(p, n);
+                if (hs->ck)
+                    hs->ck->update(p, n);
+            },
+            [self = shared_from_this(), index] { self->on_hashed(index); });
+    }
+    else
+    {
+        m_hs->md5.update(s.data.get() + s.fill, n);
+        if (m_hs->ck)
+            m_hs->ck->update(s.data.get() + s.fill, n);
+    }
     s.fill += n;
     m_received += n;
 
@@ -293,6 +320,14 @@ void put_op::flush(stage& s)
 
 void put_op::on_write_done(stage& s, int64_t res)
 {
+    if (s.hash_out > 0)
+    {
+        // The pool is still reading it; on_hashed frees it.
+        s.state = stage_state::hashing;
+        if (m_status == st::ok && res < 0)
+            fail(write_status(res));
+        return;
+    }
     s.state = stage_state::free;
     s.fill  = 0;
     if (m_status != st::ok)
@@ -306,6 +341,30 @@ void put_op::on_write_done(stage& s, int64_t res)
     maybe_finish();
 }
 
+void put_op::on_hashed(int index)
+{
+    if (!*m_alive)
+        return;
+    stage& s = m_stage[index];
+    --s.hash_out;
+    --m_hash_out;
+    if (s.state == stage_state::hashing && s.hash_out == 0)
+    {
+        s.state = stage_state::free;
+        s.fill  = 0;
+        if (m_status == st::ok)
+        {
+            pump();
+            maybe_finish();
+        }
+    }
+    if (m_hash_out == 0 && m_finish_wait && m_status == st::ok)
+    {
+        m_finish_wait = false;
+        finish_now();
+    }
+}
+
 void put_op::finish(const md5_t* expected_md5, std::function<void(put_result)> cb)
 {
     if (m_status != st::ok)
@@ -314,25 +373,39 @@ void put_op::finish(const md5_t* expected_md5, std::function<void(put_result)> c
         return;
     }
     m_done = std::move(cb);
+    m_has_expect_md5 = expected_md5 != nullptr;
+    if (expected_md5)
+        m_expect_md5 = *expected_md5;
+    // The digests are complete only when every piece has been hashed.
+    if (m_hash_out > 0)
+    {
+        m_finish_wait = true;
+        return;
+    }
+    finish_now();
+}
+
+void put_op::finish_now()
+{
     m_eof  = true;
 
     m_meta.size     = m_received;
-    m_meta.md5      = m_md5.finish();
+    m_meta.md5      = m_hs->md5.finish();
     m_meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
-    if (expected_md5 && *expected_md5 != m_meta.md5)
+    if (m_has_expect_md5 && m_expect_md5 != m_meta.md5)
     {
         fail(st::bad_digest);
         return;
     }
-    if (m_ck)
+    if (m_hs->ck)
     {
-        const std::string got = m_ck->peek_b64();
+        const std::string got = m_hs->ck->peek_b64();
         if (!m_ck_expect.empty() && got != m_ck_expect)
         {
             fail(st::bad_digest);
             return;
         }
-        const std::string_view name = checksum_header(m_ck->algo());
+        const std::string_view name = checksum_header(m_hs->ck->algo());
         bool stored = false;
         for (auto& [n, v] : m_meta.extra)
             if (n == name)
@@ -484,7 +557,7 @@ void put_op::fail(st why)
 
 void put_op::track_checksum(checksum_algo algo, std::string expected_b64)
 {
-    m_ck        = std::make_unique<checksum_stream>(algo);
+    m_hs->ck    = std::make_unique<checksum_stream>(algo);
     m_ck_expect = std::move(expected_b64);
 }
 
