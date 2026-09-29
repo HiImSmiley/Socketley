@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A storage runtime against MinIO, and what was made faster.**
+  Measured with `warp` and boto3 over plain HTTP with SigV4, on one 16-core VM
+  with an ext4 virtio disk, against MinIO single node single drive on the same
+  filesystem; median of three alternating passes, the box quiet before each run,
+  server CPU (worker plus helper threads, or MinIO) per operation. The table
+  gives the median of each cell, with the ratio to MinIO in brackets and the CPU
+  in ms per operation for MinIO / one shard / four shards (`--shards 4`).
+  MinIO's 64 MiB put at 32 connections wrote more than the disk had room for in
+  30 s, so that row is 20 s.
+
+  | cell | MinIO | socketley, 1 shard | socketley, 4 shards | CPU ms/op |
+  |---|---|---|---|---|
+  | 4KiB GET c1 (ops/s) | 1909 | 8173 (4.28x) | 6090 (3.19x) | 0.55 / 0.03 / 0.04 |
+  | 4KiB GET c32 (ops/s) | 18161 | 30576 (1.68x) | 65927 (3.63x) | 0.57 / 0.03 / 0.05 |
+  | 4KiB PUT c1 (ops/s) | 54 | 26 (0.49x) | 40 (0.73x) | 1.28 / 0.58 / 0.67 |
+  | 4KiB PUT c32 (ops/s) | 533 | 525 (0.98x) | 465 (0.87x) | 1.33 / 0.36 / 0.48 |
+  | 4KiB MIXED c1 (ops/s) | 210 | 120 (0.57x) | 114 (0.54x) | 0.81 / 0.17 / 0.20 |
+  | 4KiB MIXED c32 (ops/s) | 2916 | 2415 (0.83x) | 2238 (0.77x) | 0.73 / 0.09 / 0.15 |
+  | 1MiB GET c1 (MiB/s) | 808 | 1673 (2.07x) | 1638 (2.03x) | 1.53 / 0.16 / 0.17 |
+  | 1MiB GET c32 (MiB/s) | 3255 | 13446 (4.13x) | 14106 (4.33x) | 3.25 / 0.14 / 0.21 |
+  | 1MiB PUT c1 (MiB/s) | 44 | 26 (0.60x) | 59 (1.35x) | 5.08 / 3.57 / 3.68 |
+  | 1MiB PUT c32 (MiB/s) | 169 | 255 (1.51x) | 161 (0.95x) | 7.25 / 4.02 / 5.14 |
+  | 1MiB MIXED c1 (MiB/s) | 79 | 53 (0.68x) | 56 (0.71x) | 1.69 / 0.71 / 0.72 |
+  | 1MiB MIXED c32 (MiB/s) | 597 | 494 (0.83x) | 490 (0.82x) | 2.33 / 0.66 / 0.79 |
+  | 64MiB GET c1 (MiB/s) | 2136 | 2962 (1.39x) | 2972 (1.39x) | 35.67 / 4.35 / 4.36 |
+  | 64MiB GET c32 (MiB/s) | 4825 | 18176 (3.77x) | 16969 (3.52x) | 141.10 / 7.69 / 6.42 |
+  | 64MiB PUT c1 (MiB/s) | 333 | 419 (1.26x) | 387 (1.16x) | 167.44 / 168.70 / 173.52 |
+  | 64MiB PUT c32 (MiB/s) | 556 | 613 (1.10x) | 595 (1.07x) | 535.63 / 267.65 / 441.70 |
+  | 64MiB MIXED c1 (MiB/s) | 871 | 1087 (1.25x) | 902 (1.04x) | 43.65 / 28.95 / 27.45 |
+  | 64MiB MIXED c32 (MiB/s) | 1373 | 1359 (0.99x) | 1539 (1.12x) | 182.80 / 53.36 / 58.21 |
+
+  Reads are faster than MinIO everywhere (1.4 to 4.3x, at a twentieth of the CPU
+  for small objects) and large puts match it. Where MinIO is still faster: puts
+  and mixed loads of small objects at low concurrency (a 4 KiB put at one
+  connection is 0.5x with one shard, 0.7x with four, and 4 KiB mixed 0.55x),
+  because MinIO waits for one sync where a put here waits for two, the file and
+  the directory that holds it, so that a power cut cannot lose an answered put;
+  and 1 MiB puts and mixed loads at one connection (0.6 to 0.7x with one shard),
+  which are the same two syncs. The disk's sync latency drifts by two to three
+  times within an hour, so the small-put rows move with it: in the fast phases a
+  4 KiB put at 32 connections was 1.4x MinIO and in the slow ones 0.8x. boto3, one
+  connection, 4 KiB, p50 / p99: GET 0.9 / 1.1 ms against MinIO's 1.2 / 1.8, HEAD
+  0.9 / 1.0 against 1.2 / 1.8, PUT 41 / 62 ms with one shard and 12 / 23 with
+  four against 27 / 66.
+
+  What changed: the 65536 second-level directories are 256 made with the bucket,
+  so a put never makes and syncs one; a put is answered when its file, its rename
+  and its directory are durable and the journal record follows behind it (a stop
+  syncs it, and any other start reads the object headers, which it already did:
+  about 5 s per 100,000 objects with a warm cache, against 10 ms after a clean
+  stop); the MD5 and the SHA-256 that verifies a signed body are taken on helper
+  threads (`SOCKETLEY_STORAGE_HASH_THREADS`, default 3, 0 for the loop), which
+  took the loop from 0.86 to 0.37 of a core during 64 MiB puts at 32 connections
+  and put a 64 MiB put at 32 connections from 100 to about 400 MiB/s on this
+  disk; and the signing key of a day is derived once per thread. The splice
+  threshold of 64 KiB was measured and left (below it a read and a write are as
+  fast, at 256 KiB splicing is 3.8x).
+
 - **A storage runtime shares what the other runtimes have, and can be scripted.**
   `--tls --cert --key [--ca]` terminate TLS on the listener (sessions are made
   before the first byte is read, so a plaintext client is refused, certificates

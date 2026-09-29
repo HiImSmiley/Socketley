@@ -6476,6 +6476,30 @@ in
 smaller objects are read once, with their header, and sent from memory with the
 response headers in one write.
 .PP
+.SS Performance
+Measured with warp and boto3 over plain HTTP with SigV4 on one 16\-core VM with an
+ext4 virtio disk, against MinIO as a single node with a single drive on the same
+filesystem, three alternating passes with the box quiet before each. Reads are
+faster than MinIO's: a 4 KiB GET at one connection is about 4x (8200 against 1900
+per second) and at 32 connections 1.7x with one shard and 3.6x with four, a 1 MiB
+GET 2x and 4x, a 64 MiB GET 1.4x and 3.8x, each at a tenth or less of the
+CPU. A 64 MiB put is 1.3x at one connection and 1.1x at 32 (about 600 MiB/s, which
+is what this disk takes), and 64 MiB mixed loads are level with MinIO.
+.PP
+MinIO is faster where a put waits for the disk and nothing else: a 4 KiB put at one
+connection is 0.5x with one shard and 0.7x with four (26 and 40 against 54 per
+second, 12 to 41 ms against 27 in boto3), a 4 KiB mixed load 0.55x, and 1 MiB puts
+and mixed loads at one connection 0.6 to 0.7x with one shard. The reason is the
+promise: a put is answered after its file and then its directory are synced, which
+is two waits for the disk where MinIO waits for one, so that an answered put
+survives a power cut. The disk's sync latency drifts by two to three times within
+an hour, so these rows move with it; at 32 connections a 4 KiB put was 1.4x MinIO
+in a fast phase and 0.8x in a slow one. The journal is not waited for: a stop syncs
+it, and a start after any other stop reads every object header, which takes about 5
+seconds per 100,000 objects with a warm cache. Uploads of 256 KiB or more are
+hashed on helper threads (\fBSOCKETLEY_STORAGE_HASH_THREADS\fR), which is what lets
+a 64 MiB put at 32 connections use the disk rather than one core.
+.
 .SS Sharding
 .B \-\-shards
 .I N
