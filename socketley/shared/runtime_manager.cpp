@@ -1015,6 +1015,11 @@ void runtime_manager::publish_endpoints()
         }
     }
 
+    // The primary of each Raft cluster cache, which may be on another node and is one member of a group named for the
+    // cache, so a proxy that names it follows the primary through a promotion.
+    for (const auto& [name, at] : m_cluster_primaries)
+        tbl->add_to_group(name, runtime_endpoint{at.first, at.second, {}});
+
     // Hand the finished table out, immutable from here on, so every runtime
     // holds the same one.
     {
@@ -1047,6 +1052,12 @@ void runtime_manager::publish_endpoints()
     // lock, because the sink writes to sockets.
     if (m_endpoint_sink)
         m_endpoint_sink(*tbl);
+}
+
+void runtime_manager::set_cluster_primaries(cluster_primaries primaries)
+{
+    m_cluster_primaries = std::move(primaries);
+    publish_endpoints();
 }
 
 void runtime_manager::set_endpoint_sink(std::function<void(const endpoint_table&)> sink)

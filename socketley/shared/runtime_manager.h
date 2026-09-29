@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -191,6 +192,11 @@ public:
     void set_cluster_discovery(cluster_discovery* cd);
     cluster_discovery* get_cluster_discovery() const;
 
+    // Where the primary of each Raft cluster cache is reached, published as a group named for the cache so that a proxy
+    // with `--backend @<name>` follows it; republished when it changes.
+    using cluster_primaries = std::map<std::string, std::pair<std::string, uint16_t>>;
+    void set_cluster_primaries(cluster_primaries primaries);
+
     mutable std::shared_mutex mutex;
 
 private:
@@ -244,4 +250,5 @@ private:
     bool m_replica = false;
 
     cluster_discovery* m_cluster = nullptr;
+    cluster_primaries  m_cluster_primaries;
 };

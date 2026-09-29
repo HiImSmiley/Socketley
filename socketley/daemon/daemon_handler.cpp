@@ -6725,6 +6725,22 @@ int daemon_handler::run_internal(const std::vector<std::string>& words, std::str
     return rc;
 }
 
+std::string daemon_handler::worker_detail(const std::string& name) const
+{
+    auto it = m_proxy_workers.find(name);
+    if (it == m_proxy_workers.end() || it->second.empty() || !it->second.front() || !it->second.front()->last_stats().seen)
+        return {};
+    return it->second.front()->last_stats().detail;
+}
+
+bool daemon_handler::send_replica_order(const std::string& name, std::string_view payload)
+{
+    auto it = m_proxy_workers.find(name);
+    if (it == m_proxy_workers.end() || it->second.empty() || !it->second.front())
+        return false;
+    return it->second.front()->send_replica_order(payload);
+}
+
 size_t daemon_handler::withhold_cluster_names(std::vector<std::string>& names, const char* verb, ipc_connection* conn) const
 {
     if (m_cluster_internal)

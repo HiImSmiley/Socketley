@@ -83,6 +83,10 @@ public:
     // This is how the cluster's reconciliation reaches create, start, stop and remove, and it returns once a worker
     // is forked rather than once it is serving.
     int run_internal(const std::vector<std::string>& words, std::string& out, bool cluster_owned);
+    // The stats text the worker of runtime `name` last published, empty until it has published; a cluster replica's report is read from it.
+    std::string worker_detail(const std::string& name) const;
+    // Sends the worker of runtime `name` a cluster replica's order; false when there is no worker to take it.
+    bool send_replica_order(const std::string& name, std::string_view payload);
     // The file this daemon read its settings from, so `dashboard` can say
     // where to put the setting it is asking for.
     void set_config_path(std::string path);
