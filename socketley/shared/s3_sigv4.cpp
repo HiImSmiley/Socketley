@@ -379,6 +379,12 @@ bool append_canonical_headers(std::string& out, std::span<const header_field> he
             if (found)
                 out.push_back(',');
             found = true;
+            // A value with no whitespace in it is its own canonical form.
+            if (std::none_of(h.value.begin(), h.value.end(), is_space))
+            {
+                out.append(h.value);
+                continue;
+            }
             bool pending_space = false, started = false;
             for (char c : h.value)
             {
