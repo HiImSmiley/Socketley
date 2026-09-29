@@ -12,13 +12,21 @@
 #
 # ─── WHAT EACH ASSERTION WOULD CATCH ────────────────────────────────────────
 #
-#   * a mode other than own or all accepted, or --fast-lo taken by the cli
+#   * a mode other than own, all or trust accepted, or --fast-lo taken by the cli
 #     together with --name, where it would configure nothing
 #   * a daemon without the capabilities refusing to serve, rather than saying
 #     so once and serving on the ordinary path; `daemon stats` not saying it
 #     is unavailable and why, or not saying off when it was never asked for
 #   * all: a local client of another process not put on the shortcut (acked
 #     counts the whole exchange), or its pipelined replies out of order
+#   * all: the cache's replies to that client redirected into it -- the reader
+#     is foreign, so the reply direction stays on TCP (the cache's own socket
+#     acks the whole reply)
+#   * trust: that same foreign client not on the shortcut both ways (the client's
+#     and the cache's sockets both ack the 1 their SYN took), its replies
+#     corrupted, or `daemon stats` not saying trust; and a proxy's pair to a
+#     foreign backend not on it in both directions.  The splice-reading case
+#     is not run under trust: there it loses bytes, which is why trust is opt-in
 #   * all: a runtime of another daemon -- same binary, same cgroup, no
 #     --fast-lo -- taken for one of this daemon's
 #   * all: the two directions of a proxy's pair to a local backend of another
@@ -63,9 +71,9 @@ daemon_isolate fastlo
 # The probes and the capped copy outlive each daemon's TMPD, which daemon_stop deletes.
 WORK=$(mktemp -d /tmp/socketley-fastlo-work-XXXXXX)
 daemon_watch "$WORK"
-ECHOPID=""; ORIGINPID=""; HCPID=""; NSPID=""
+ECHOPID=""; SPLPID=""; ORIGINPID=""; HCPID=""; NSPID=""
 cleanup(){ [ -n "$NSPID" ] && sudo -n kill -9 "$NSPID" 2>/dev/null || true
-    for p in "$ECHOPID" "$ORIGINPID" "$HCPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done
+    for p in "$ECHOPID" "$SPLPID" "$ORIGINPID" "$HCPID"; do [ -n "$p" ] && { kill -9 "$p" 2>/dev/null || true; }; done
     daemon_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -80,10 +88,12 @@ ORIGIN6=$((SL_PORT_BASE + 1818))
 CALLER6=$((SL_PORT_BASE + 1819))
 NSA=$((SL_PORT_BASE + 1822))
 
-# A foreign client: pipelined SETs and GETs of 300 KB values, then the
-# sender's tcpi_bytes_acked (offset 120 of struct tcp_info).
+# A foreign client: pipelined SETs and GETs of 300 KB values, then its own
+# socket's tcpi_bytes_acked (offset 120 of struct tcp_info) and the cache's
+# accepted socket's, read off ss while the connection is still open (-1 when
+# ss cannot say; ss leaves a zero out, which is read as 0).
 cat >"$WORK/cache_probe.py" <<'PY'
-import socket, struct, sys
+import re, socket, struct, subprocess, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
 v = b"v" * 300000
 cmds = b"".join(b"*3\r\n$3\r\nSET\r\n$2\r\nk%d\r\n$%d\r\n%s\r\n" % (i, len(v), v) for i in range(10))
@@ -99,7 +109,17 @@ try:
 except socket.timeout:
     pass
 acked = struct.unpack_from("Q", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256), 120)[0]
-print("ok" if got == want else "bad got=%d want=%d" % (len(got), len(want)), acked)
+served = -1
+try:
+    out = subprocess.run(["ss", "-tinH", "( sport = :%s )" % sys.argv[1]],
+                         capture_output=True, text=True).stdout.splitlines()
+    for i, ln in enumerate(out):
+        if ln.startswith("ESTAB"):
+            m = re.search(r"bytes_acked:(\d+)", out[i + 1] if i + 1 < len(out) else "")
+            served = int(m.group(1)) if m else 0
+except OSError:
+    pass
+print("ok" if got == want else "bad got=%d want=%d" % (len(got), len(want)), acked, served)
 PY
 
 # 4 MB of distinct bytes through a port and back.
@@ -232,8 +252,8 @@ restart(){ daemon_stop; daemon_isolate fastlo; daemon_start "$@"; }
 
 # ─── (a) the flag's value and its place on the command line ─────────────────
 OUT=$("$BIN" daemon --fast-lo bogus 2>&1) && RC=0 || RC=$?
-if [ "$RC" = 1 ] && grep -q 'invalid --fast-lo value' <<<"$OUT"; then pass
-else fail "bad mode" "daemon --fast-lo bogus should exit 1 naming the value" "rc=$RC out: $OUT"; fi
+if [ "$RC" = 1 ] && grep -q 'invalid --fast-lo value' <<<"$OUT" && grep -q 'trust' <<<"$OUT"; then pass
+else fail "bad mode" "daemon --fast-lo bogus should exit 1 naming the value and the three modes" "rc=$RC out: $OUT"; fi
 
 OUT=$("$BIN" daemon --name x --fast-lo 2>&1) && RC=0 || RC=$?
 if [ "$RC" = 1 ] && grep -q 'cannot be combined' <<<"$OUT"; then pass
@@ -281,9 +301,16 @@ attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null
 wait_port "$CPORT" || true
 R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
-read -r VERDICT ACKED <<<"$R"
+read -r VERDICT ACKED SERVED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -le 1 ]; then pass
 else fail "all: foreign client" "pipelined replies intact and the client's bytes off TCP" "probe: $R (acked <= 1 is the shortcut)"; fi
+# The cache's replies go into a foreign reader, so that direction is TCP.
+if [ "${SERVED:--1}" = -1 ]; then not_asserted "all: reply direction" "ss not available"
+elif [ "$SERVED" -gt 1000 ]; then pass
+else fail "all: reply direction" "the cache's replies to a foreign client go by TCP under all, its socket acking them" "probe: $R (served acked > 1000 is TCP)"; fi
+OUT=$("$BIN" daemon stats 2>&1 || true)
+if grep -q '^fast_lo:all$' <<<"$OUT"; then pass
+else fail "all stats" "daemon stats names the mode it runs" "out: $OUT"; fi
 
 # Another daemon of the same binary in the same cgroup is not this daemon.
 OTHERSOCK="$WORK/other.sock"
@@ -294,7 +321,7 @@ SOCKETLEY_SOCKET="$OTHERSOCK" HOME="$WORK" "$BIN" create cache oc -p "$OTHERPORT
 wait_port "$OTHERPORT" || true
 R=$(python3 "$WORK/cache_probe.py" "$OTHERPORT" 2>&1 || true)
 { kill -9 "$OTHERPID"; wait "$OTHERPID"; } 2>/dev/null || true
-read -r VERDICT ACKED <<<"$R"
+read -r VERDICT ACKED SERVED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -gt 1000 ]; then pass
 else fail "all: another daemon" "a daemon without --fast-lo, same binary, same cgroup, stays on TCP" "probe: $R (acked > 1000 is TCP)"; fi
 
@@ -339,14 +366,46 @@ fi
 restart "$CAPBIN" --fast-lo
 attached
 SPLREADY="$WORK/splice_ready"
-python3 "$WORK/splice_backend.py" "$SPLPORT" "$SPLREADY" >/dev/null 2>&1 & ECHOPID=$!; disown
+python3 "$WORK/splice_backend.py" "$SPLPORT" "$SPLREADY" >/dev/null 2>&1 & SPLPID=$!; disown
 for _ in $(seq 1 50); do [ -f "$SPLREADY" ] && break; sleep 0.1; done
 "$BIN" create proxy psr -p "$PXSPLREAD" --backend "127.0.0.1:$SPLPORT" --protocol tcp -s >/dev/null
 wait_port "$PXSPLREAD" || true
 R=$(timeout 15 python3 "$WORK/splice_client.py" "$PXSPLREAD" 2>&1 || echo "hung")
-kill -9 "$ECHOPID" 2>/dev/null || true; ECHOPID=""
+kill -9 "$SPLPID" 2>/dev/null || true; SPLPID=""
 if [ "$R" = ok ]; then pass
 else fail "all: splice backend" "a foreign backend reading with splice behind a proxy must get every byte" "probe: $R"; fi
+
+# ─── (c2) trust: the foreign client both ways ───────────────────────────────
+# The operator has said every local reader uses recvmsg, so the cache's replies
+# are redirected into the foreign client as well: both sockets ack only the
+# 1 their SYN took.  The splice-reading backend of (e2) is deliberately not run
+# here, since a redirect into a reader that splices loses its bytes.
+restart "$CAPBIN" --fast-lo trust
+attached
+"$BIN" create cache c -p "$CPORT" -s >/dev/null
+wait_port "$CPORT" || true
+R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
+read -r VERDICT ACKED SERVED <<<"$R"
+if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -le 1 ]; then pass
+else fail "trust: foreign client" "pipelined replies intact and the client's bytes off TCP" "probe: $R (acked <= 1 is the shortcut)"; fi
+if [ "${SERVED:--1}" = -1 ]; then not_asserted "trust: reply direction" "ss not available"
+elif [ "$SERVED" -le 1 ]; then pass
+else fail "trust: reply direction" "under trust the cache's replies to a foreign client are on the shortcut too" "probe: $R (served acked <= 1 is the shortcut)"; fi
+OUT=$("$BIN" daemon stats 2>&1 || true)
+if grep -q '^fast_lo:trust$' <<<"$OUT"; then pass
+else fail "trust stats" "daemon stats says trust, so an operator can see the reader risk was accepted" "out: $OUT"; fi
+if command -v ss >/dev/null 2>&1; then
+    "$BIN" create proxy pt -p "$PXFOREIGN" --backend "127.0.0.1:$EPORT" --protocol tcp -s >/dev/null
+    wait_port "$PXFOREIGN" || true
+    R=$(timeout 20 python3 "$WORK/backend_probe.py" "$PXFOREIGN" "$EPORT" 2>&1 || echo "hung")
+    read -r VERDICT BACKEND PROXY <<<"$R"
+    if [ "$VERDICT" = ok ] && [ "${BACKEND:--1}" -ge 0 ] && [ "${BACKEND:--1}" -le 1 ] &&
+       [ "${PROXY:--1}" -ge 0 ] && [ "${PROXY:--1}" -le 1 ]; then pass
+    else fail "trust: foreign backend" "both directions of a proxy's pair to a foreign backend on the shortcut, echo intact" \
+        "probe: $R (verdict, backend acked <=1, proxy acked <=1)"; fi
+else
+    not_asserted "trust: foreign backend" "ss not available"
+fi
 
 # ─── (f) all: a runtime's Lua HTTP call to a local IPv6 service ─────────────
 # The call is the runtime's connect, so its pair enters like the proxy's above;
@@ -393,7 +452,7 @@ attached
 "$BIN" create cache c -p "$CPORT" -s >/dev/null
 wait_port "$CPORT" || true
 R=$(python3 "$WORK/cache_probe.py" "$CPORT" 2>&1 || true)
-read -r VERDICT ACKED <<<"$R"
+read -r VERDICT ACKED SERVED <<<"$R"
 if [ "$VERDICT" = ok ] && [ "${ACKED:-0}" -gt 1000 ]; then pass
 else fail "own: foreign client" "a client of another process stays on TCP under own" "probe: $R (acked > 1000 is TCP)"; fi
 

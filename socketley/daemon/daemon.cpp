@@ -564,7 +564,8 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
                 {
                     std::cout << "invalid --fast-lo value: " << argv[i] << "\n"
                               << "  own: between this daemon's runtimes; all: also local "
-                                 "clients of other processes\n";
+                                 "clients of other processes; trust: all, redirecting into "
+                                 "foreign readers too\n";
                     return false;
                 }
                 break;
@@ -625,7 +626,7 @@ static bool parse_daemon_flags(int argc, char** argv, event_loop& loop,
 
             default:
                 std::cout << "unknown daemon flag: " << arg << "\n"
-                          << "  socketley daemon takes --cpus <set>, --fast-lo [own|all] "
+                          << "  socketley daemon takes --cpus <set>, --fast-lo [own|all|trust] "
                              "and the --raft-* flags.\n"
                           << "  Runtime flags belong on `create`; this command "
                              "configures the process's ring.\n";
@@ -748,8 +749,7 @@ int daemon_start(runtime_manager& manager, event_loop& loop,
     if (lo_mode != socketley::fast_lo_mode::off)
     {
         if (lo_shortcut.start(lo_mode, lo_limits))
-            ::setenv(socketley::fast_lo_env,
-                     lo_mode == socketley::fast_lo_mode::all ? "all" : "own", 1);
+            ::setenv(socketley::fast_lo_env, socketley::fast_lo_mode_name(lo_mode), 1);
         else
             LOG_WARN((std::string("fast-lo: unavailable, serving without it: ") +
                       lo_shortcut.reason() +

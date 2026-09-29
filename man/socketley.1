@@ -232,7 +232,7 @@ lever. The daemon itself stayed under one per cent of a core at fifty
 runtimes, and creating one took the same fourteen milliseconds at five as at
 fifty, so neither of those is the thing to watch.
 .TP
-.BR "daemon \-\-fast\-lo " [ own | all ]
+.BR "daemon \-\-fast\-lo " [ own | all | trust ]
 Put TCP pairs whose both ends are 127.0.0.1 or ::1 on a kernel shortcut. A BPF
 .B sockops
 program enters both sockets in a sockhash when the connection is established,
@@ -252,8 +252,48 @@ service.
 .B own
 takes only pairs whose both ends are this daemon's runtimes, such as a client
 runtime connected to a server runtime.
+.B trust
+is
+.B all
+without the receiver rule below: a send is redirected into a foreign receiver
+too, so a foreign client of a cache and a proxy's foreign backend are
+accelerated in both directions. It is for an operator who knows that every
+local process reading a socket of such a pair does so with
+.BR recv ,
+.B read
+or
+.BR recvmsg .
+.RS
+.PP
+.B Warning:
+a byte redirected into a socket waits in an ingress queue that only
+.B recvmsg
+drains. A local process that reads with
+.BR splice (2),
+.BR sendfile (2),
+.B TCP_ZEROCOPY_RECEIVE
+or a relay built on them (Go's
+.B io.Copy
+between two TCP connections, HAProxy with splicing) never sees those bytes:
+under
+.B trust
+it loses them, with no error on either side (measured: a backend reading with
+.B splice
+behind a proxy echoed 0 of 500 bytes). Such readers cannot be told apart from
+the outside, which is why
+.B all
+does not redirect into a foreign socket at all. Use
+.B all
+unless every local client and backend is known.
+.B socketley daemon stats
+reports which mode is running.
+.RE
 .IP
-A send is redirected only when the socket that will
+Under
+.B own
+and
+.B all
+a send is redirected only when the socket that will
 .I receive
 it is one of this daemon's workers' \(em a runtime that connects (its socket is
 marked when it does) or one that accepts on a runtime's listener. A send whose
@@ -269,33 +309,59 @@ Go's
 between two TCP connections, or HAProxy's splicing would lose the redirected
 bytes, and those readers cannot be told apart from the outside. This bounds the
 shortcut to what it can accelerate safely: into a runtime always, out to a
-foreign peer never.
+foreign peer never (unless
+.B trust
+is given).
 .IP
-What that means for the common shapes, measured on one box with 3 alternating
+What that means for the common shapes, measured on one box with alternating
 passes:
 .RS
 .IP \(bu 2
 Runtime to runtime (a client runtime to a server runtime, both ends this
-daemon's) is accelerated in both directions: 64 B round trips 1.3\(en1.4x
-one connection and eight, 16 KB about 1.2\(en1.5x. This is where the shortcut
-earns most.
+daemon's) is accelerated in both directions under every mode: 64 B round trips
+1.3\(en1.4x one connection and eight, 16 KB about 1.2\(en1.5x; a client runtime
+against a cache, off against
+.BR all ,
+110\(en116K against 83\(en85K round trips a second with one in flight.
 .IP \(bu 2
 A foreign client of a cache is accelerated only on the request it sends in;
 the reply comes back by TCP. So a small request/large reply workload gains
-little \(em
+little under
+.BR all :
 .B redis\-benchmark
-GET is within noise of no shortcut (245\(en272K against 235\(en266K
-requests/s), and a bulk reader is a touch slower for the split path (bulk 64
-KiB GET 1490 MB/s against 1350). A request that carries the payload does gain:
+(50 connections, 4 threads, six alternating passes, requests per second off /
+.B all
+/
+.BR trust "):"
+.B GET
+.B \-P1
+240\(en279K / 222\(en250K / 387\(en667K,
+.B SET
+.B \-P1
+222\(en286K / 197\(en273K / 462\(en632K, GET
+.B \-P16
+2.3\(en4.0M / 2.7\(en3.4M / 5.3\(en6.9M, and a bulk reader of 64 KiB values
+1377\(en1488 / 1276\(en1322 / 2464\(en3040 MB/s. A request that carries the
+payload does gain under
+.BR all :
 64 KiB
 .B SET
-pipelined 8 deep, 49.9K against 59.1K, 1.18x.
+pipelined 8 deep, 49.9K against 59.1K, 1.18x. Only
+.B trust
+takes the full gain of a foreign client.
 .IP \(bu 2
-A proxy in front of a foreign local backend accelerates the two legs that end
-in the proxy and leaves the two that end in a foreign socket on TCP, so a
-foreign backend that reads with
+A proxy in front of a foreign local backend accelerates, under
+.BR all ,
+the two legs that end in the proxy and leaves the two that end in a foreign
+socket on TCP, so a foreign backend that reads with
 .B splice
-keeps every byte.
+keeps every byte. Under
+.B trust
+both are redirected: 64 B round trips through a proxy to a C echo backend, one
+connection, 44\(en48K off, 41\(en45K
+.BR all ,
+86\(en88K
+.BR trust .
 .RE
 .IP
 Needs
@@ -310,9 +376,13 @@ with the reason, and serves on the ordinary path.
 .B own
 attaches to the daemon's cgroup and
 .B all
+and
+.B trust
 to the root cgroup; the daemon's own processes are the workers its supervisor
 forked, whose pids it keeps in a map. Under
 .B all
+and
+.B trust
 the program fires for every process on the host, so it takes only sockets in
 the daemon's own network namespace \(em its netns cookie is baked in at load,
 and a container's identical 127.0.0.1 tuple is left alone. This needs
@@ -386,7 +456,11 @@ The proxy's
 path reads a queue a socket on the shortcut does not fill, so a proxied pair
 with a 127.0.0.1 leg stays on the copy path while it is on.
 .IP \(bu 2
-A process that is not this daemon's is never redirected into \(em only its
+Under
+.B own
+and
+.B all
+a process that is not this daemon's is never redirected into \(em only its
 sends into one of our workers are, and our workers read with
 .BR recvmsg .
 So a foreign relay copying between two TCP connections with Go's
@@ -394,13 +468,16 @@ So a foreign relay copying between two TCP connections with Go's
 or HAProxy with splicing on keeps every byte on the leg it receives, and needs
 no
 .B own
-to be safe. This is the receiver rule above.
+to be safe. This is the receiver rule above;
+.B trust
+gives it up.
 .RE
 .RS
 .PP
 .nf
 sudo socketley daemon --fast-lo &        # all
 sudo socketley daemon --fast-lo own &
+sudo socketley daemon --fast-lo trust &  # only if no local reader splices
 .fi
 .RE
 .TP
@@ -694,6 +771,7 @@ is
 .BR off ,
 .BR own ,
 .BR all ,
+.BR trust ,
 or
 .B unavailable
 with
@@ -9973,9 +10051,10 @@ hook \(em the kernel moves those bytes without the script ever seeing them.
 Set by a daemon started with
 .B \-\-fast\-lo
 once the shortcut is attached, to
-.B own
+.BR own ,
+.B all
 or
-.BR all ,
+.BR trust ,
 so its workers keep a proxied pair with a 127.0.0.1 leg off splice. Not a setting: the daemon clears any inherited value at startup.
 .TP
 .B SOCKETLEY_NAPI_BUSY_POLL_US

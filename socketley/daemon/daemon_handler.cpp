@@ -6610,7 +6610,7 @@ int daemon_handler::cmd_daemon_stats(ipc_connection* conn)
     out << "fast_lo:" << f.mode << '\n';
     if (!f.reason.empty())
         out << "fast_lo_reason:" << f.reason << '\n';
-    if (f.mode == "all" || f.mode == "own")
+    if (f.mode != "off" && f.mode != "unavailable")
     {
         out << "fast_lo_sockets_shortcut:" << f.sockets_shortcut << '\n'
             << "fast_lo_sockets_tcp:" << f.sockets_tcp << '\n'

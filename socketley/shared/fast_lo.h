@@ -12,8 +12,13 @@ namespace socketley {
 
 // own: only pairs whose both ends are this daemon's runtimes.
 // all: also a local client of any process connecting to a runtime's port, and a
-// runtime's own connect to any local listener.
-enum class fast_lo_mode { off, own, all };
+// runtime's own connect to any local listener, redirecting only into our workers.
+// trust: all, but redirecting into a foreign receiver too, which loses the bytes
+// of one that reads with splice(2) or zero-copy receive.
+enum class fast_lo_mode { off, own, all, trust };
+
+// off, own, all or trust; the spelling `daemon --fast-lo` takes and stats reports.
+const char* fast_lo_mode_name(fast_lo_mode m);
 
 // The two memory bounds, in bytes, that keep a redirected backlog from growing
 // without limit: a per-pair ceiling on the unread backlog and a global budget
@@ -24,7 +29,7 @@ struct fast_lo_limits
     uint64_t global_bytes{64ull << 20};
 };
 
-// Parses the value of `daemon --fast-lo`; false on anything but own or all.
+// Parses the value of `daemon --fast-lo`; false on anything but own, all or trust.
 bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out);
 
 // Parses `--fast-lo-limit <pair-MiB>,<global-MiB>` into bytes; false on a value
@@ -90,7 +95,7 @@ private:
 // are as of the reconciler's last measurement, the event counts since start.
 struct fast_lo_figures
 {
-    std::string mode{"off"};      // off, own, all, or unavailable
+    std::string mode{"off"};      // off, own, all, trust, or unavailable
     std::string reason;           // why it is unavailable
     uint64_t sockets_shortcut{0};
     uint64_t sockets_tcp{0};      // tainted, and sending by TCP for good

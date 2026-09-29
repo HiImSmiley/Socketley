@@ -30,6 +30,10 @@
 #     (the bound not enforced) -- shown red by raising the ceiling to 512 MiB
 #   * a byte delivered out of order once the backend resumes and the proxy
 #     drains
+#   * trust: a paused foreign backend's own socket, into which trust redirects,
+#     holding far more than the ceiling -- the receiver rule is gone there, so
+#     the limiter is all that bounds it (red with the ceiling raised) -- or the
+#     metrics not saying mode trust
 #   * the sum across many stalled pairs exceeding the global budget -- shown red
 #     by raising the budget
 #   * a fast pair whose backend keeps up tainted anyway, because its count was
@@ -279,6 +283,37 @@ R=$(python3 "$WORK/flood.py" "$PXPORT" 4 256 "$PXPORT")
 read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
 if awk "BEGIN{exit !($PKV > 8)}"; then pass
 else fail "per-pair red" "a 512 MiB ceiling must let the backlog exceed 8 MiB (else the bound is untested)" "probe: $R"; fi
+
+# ─── (c2) trust: the bound covers a foreign receiver too ─────────────────────
+# Under trust the proxy's sends into a paused foreign backend are redirected, so
+# its backlog grows in the backend's socket, which the limiter must still bound;
+# the backend's own socket (local port BEPORT) is the one sampled.  The same
+# flood with the ceiling raised shows the sample can see an unbounded backlog.
+SOCKETLEY_CONFIG="$WORK/metrics.lua" restart "$CAPBIN" --fast-lo trust --fast-lo-limit 4,256
+attached
+backend "$WORK/pecho.py" "$BEPORT" 3
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+python3 "$WORK/flood.py" "$PXPORT" 3 64 "$BEPORT" >"$WORK/flood.out" 2>&1 & FLPID=$!
+sleep 2
+SCRAPE=$(python3 -c "import sys,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:%s/metrics' % sys.argv[1], timeout=5).read().decode())" "$MPORT" 2>&1 || true)
+wait "$FLPID" || true
+R=$(cat "$WORK/flood.out")
+read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
+if awk "BEGIN{exit !($PKV <= 8)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
+else fail "trust: per-pair bound" "a foreign backend's socket stays near the 4 MiB ceiling under trust and the echo drains in order" "probe: $R (peak<=8, in_order, complete)"; fi
+if grep -q 'socketley_fast_lo_info{mode="trust"} 1' <<<"$SCRAPE" &&
+   grep -qE 'socketley_fast_lo_tainted_total\{reason="bound"\} [1-9]' <<<"$SCRAPE"; then pass
+else fail "trust: metrics" "the metrics endpoint carries mode trust and the bound taint of the foreign receiver" \
+    "$(grep fast_lo <<<"$SCRAPE" | grep -v '^#' | tr '\n' ' ')"; fi
+
+restart "$CAPBIN" --fast-lo trust --fast-lo-limit 512,1024
+attached
+backend "$WORK/pecho.py" "$BEPORT" 3
+"$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
+R=$(python3 "$WORK/flood.py" "$PXPORT" 3 256 "$BEPORT")
+read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
+if awk "BEGIN{exit !($PKV > 8)}"; then pass
+else fail "trust: per-pair red" "a 512 MiB ceiling must let the foreign backend's backlog exceed 8 MiB (else the bound is untested)" "probe: $R"; fi
 
 # ─── (d) global budget caps the sum across many stalled pairs ───────────────
 restart "$CAPBIN" --fast-lo all --fast-lo-limit 4,12

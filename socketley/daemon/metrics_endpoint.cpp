@@ -505,12 +505,12 @@ std::string metrics_endpoint::build_metrics() const
 
     // The loopback shortcut, whose bytes no counter on lo sees.
     const socketley::fast_lo_figures lo = socketley::fast_lo_now();
-    out += "# HELP socketley_fast_lo_info The loopback shortcut's mode: off, own, all, or unavailable.\n"
+    out += "# HELP socketley_fast_lo_info The loopback shortcut's mode: off, own, all, trust, or unavailable.\n"
            "# TYPE socketley_fast_lo_info gauge\n"
            "socketley_fast_lo_info{mode=\"";
     label_escape_into(out, lo.mode);
     out += "\"} 1\n\n";
-    if (lo.mode == "all" || lo.mode == "own")
+    if (lo.mode != "off" && lo.mode != "unavailable")
     {
         auto series = [&out](const char* name, const char* type, const char* help,
                              std::initializer_list<std::pair<const char*, uint64_t>> vals) {

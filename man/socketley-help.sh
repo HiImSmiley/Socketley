@@ -155,17 +155,23 @@ cli_commands() {
     echo -e "  ${CYAN}./bin/Release/socketley daemon &${NC}  # dev mode"
     echo -e "  ${CYAN}./bin/Release/socketley daemon --cpus 0-3 &${NC}"
     echo ""
-    echo -e "${BOLD}daemon --fast-lo [own|all] [--fast-lo-limit P,G]${NC}"
+    echo -e "${BOLD}daemon --fast-lo [own|all|trust] [--fast-lo-limit P,G]${NC}"
     echo "  Put TCP pairs with both ends on 127.0.0.1 or ::1 on a kernel shortcut: a"
     echo "  send lands straight in the peer's receive queue, skipping TCP/IP."
     echo "  all (default): local clients of a runtime's port, runtimes among"
     echo "  themselves, and a runtime's own connects to any local listener; own:"
-    echo "  only this daemon's runtimes among themselves. A send is redirected"
-    echo "  only into one of our workers (which read with recvmsg), so a foreign"
-    echo "  splice/io.Copy/HAProxy reader keeps every byte and each direction is"
-    echo "  decided by its receiver. Runtime<->runtime 64 B round trips 1.3-1.4x;"
-    echo "  a foreign cache client gains on the request it sends, not the reply."
-    echo "  under all it is fenced to the daemon's own network namespace."
+    echo "  only this daemon's runtimes among themselves. Under own and all a send"
+    echo "  is redirected only into one of our workers (which read with recvmsg),"
+    echo "  so a foreign splice/io.Copy/HAProxy reader keeps every byte and each"
+    echo "  direction is decided by its receiver. Runtime<->runtime 64 B round"
+    echo "  trips 1.3-1.4x; a foreign cache client gains on the request it sends,"
+    echo "  not the reply (GET -P1 240-279K off, 222-250K all)."
+    echo "  trust: all, also redirecting into foreign receivers (GET -P1 387-667K)."
+    echo "  WARNING: a local process that reads with splice(2), sendfile(2),"
+    echo "  TCP_ZEROCOPY_RECEIVE, Go io.Copy between TCP conns or HAProxy splicing"
+    echo "  never sees those bytes and loses them, silently. Only if every local"
+    echo "  client and backend reads with recv/read/recvmsg."
+    echo "  all and trust are fenced to the daemon's own network namespace."
     echo "  Needs CAP_BPF and CAP_NET_ADMIN; without them it logs and serves as"
     echo "  usual. The redirected backlog is bounded: a pair whose reader really"
     echo "  holds the per-pair bound (--fast-lo-limit P,G in MiB, default 4,64)"
@@ -191,7 +197,7 @@ cli_commands() {
     echo ""
     echo -e "${BOLD}daemon stats${NC}"
     echo "  The daemon's own figures as key:value lines: whether --fast-lo is"
-    echo "  off, own, all or unavailable (and why), sockets on the shortcut and"
+    echo "  off, own, all, trust or unavailable (and why), sockets on the shortcut and"
     echo "  pinned to TCP, sockets entered, taints by reason (bound, unanswered,"
     echo "  budget, peer_off), bytes held and the budget. tcpdump and nftables on"
     echo "  lo never see shortcut bytes; this and socketley_fast_lo_* on the"
@@ -2969,7 +2975,7 @@ socketley — a daemon for long-living network runtimes (server, client, proxy, 
 
 USAGE
   socketley <command> [options]
-  socketley daemon [--cpus <set>] [--fast-lo [own|all]] [--fast-lo-limit P,G] [--name <name>]
+  socketley daemon [--cpus <set>] [--fast-lo [own|all|trust]] [--fast-lo-limit P,G] [--name <name>]
   socketley daemon stop | stats
   socketley --lua <file>
 

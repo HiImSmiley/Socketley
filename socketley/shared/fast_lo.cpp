@@ -96,7 +96,20 @@ bool parse_fast_lo_mode(std::string_view v, fast_lo_mode& out)
 {
     if (v == "own") { out = fast_lo_mode::own; return true; }
     if (v == "all") { out = fast_lo_mode::all; return true; }
+    if (v == "trust") { out = fast_lo_mode::trust; return true; }
     return false;
+}
+
+const char* fast_lo_mode_name(fast_lo_mode m)
+{
+    switch (m)
+    {
+        case fast_lo_mode::own: return "own";
+        case fast_lo_mode::all: return "all";
+        case fast_lo_mode::trust: return "trust";
+        case fast_lo_mode::off: break;
+    }
+    return "off";
 }
 
 bool parse_fast_lo_limit(std::string_view v, fast_lo_limits& out)
@@ -525,7 +538,7 @@ static int load_ops(int socks, int ports, int mine, int state, int snap, int pid
 // to TCP for good -- real backpressure, and order kept because tcp_bpf_recvmsg
 // drains the redirect queue before the TCP receive queue.
 static int load_msg(int socks, int state, int snap, int ring, int budget, int counters,
-                    uint64_t pair_bytes)
+                    uint64_t pair_bytes, bool trust)
 {
     bpf_asm a;
     const int pass = a.label(), do_redir = a.label(), taint_pass = a.label();
@@ -577,9 +590,14 @@ static int load_msg(int socks, int state, int snap, int ring, int budget, int co
     // psock ingress queue breaks any reader that is not recvmsg (splice, Go
     // io.Copy, HAProxy splicing), which we cannot enumerate.  The peer's own
     // state entry says whether it is ours; a peer not on the shortcut, or not
-    // ours, keeps this direction on TCP without a taint.
-    a.lookup(state, peer); a.jeqi(BPF_REG_0, 0, pass);
-    a.lddw(BPF_REG_1, BPF_REG_0, offsetof(state_val, ours)); a.jeqi(BPF_REG_1, 0, pass);
+    // ours, keeps this direction on TCP without a taint.  Under trust the
+    // operator has said every local reader uses recvmsg, so a foreign peer is
+    // redirected into as well.
+    if (!trust)
+    {
+        a.lookup(state, peer); a.jeqi(BPF_REG_0, 0, pass);
+        a.lddw(BPF_REG_1, BPF_REG_0, offsetof(state_val, ours)); a.jeqi(BPF_REG_1, 0, pass);
+    }
 
     // A check in flight whose answer has arrived: the count becomes the peer's
     // true queue plus what was sent since the check was asked.
@@ -1136,9 +1154,10 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
             : "map creation failed", errno);
 
     m_ops = load_ops(m_socks, m_ports, m_mine, m_state, m_snap, m_pids, m_counters,
-                     mode == fast_lo_mode::all, m_limits.pair_bytes, m_netns_cookie);
+                     mode != fast_lo_mode::own, m_limits.pair_bytes, m_netns_cookie);
     if (m_ops >= 0)
-        m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_counters, m_limits.pair_bytes);
+        m_msg = load_msg(m_socks, m_state, m_snap, m_ring, m_budget, m_counters, m_limits.pair_bytes,
+                         mode == fast_lo_mode::trust);
     if (m_ops < 0 || m_msg < 0)
         return fail(denied(errno) ? "no CAP_BPF/CAP_NET_ADMIN to load the programs"
                                   : "programs could not be loaded", errno);
@@ -1152,7 +1171,7 @@ bool fast_lo::start(fast_lo_mode mode, fast_lo_limits limits)
 
     // own needs only the daemon's cgroup, where every socket of its runtimes
     // is born; all needs the root, where a foreign client's socket is.
-    const std::string where = mode == fast_lo_mode::all ? "/sys/fs/cgroup" : own_cg;
+    const std::string where = mode != fast_lo_mode::own ? "/sys/fs/cgroup" : own_cg;
     const int cg = ::open(where.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (cg < 0)
         return fail("could not open the cgroup to attach to", errno);
@@ -1227,7 +1246,7 @@ fast_lo_figures fast_lo_now()
         f.reason = lo->m_reason;
         return f;
     }
-    f.mode = lo->m_mode == fast_lo_mode::all ? "all" : "own";
+    f.mode = fast_lo_mode_name(lo->m_mode);
     f.sockets_shortcut = lo->m_gauges.on_shortcut.load(std::memory_order_relaxed);
     f.sockets_tcp = lo->m_gauges.on_tcp.load(std::memory_order_relaxed);
     f.held_bytes = lo->m_gauges.held.load(std::memory_order_relaxed);
@@ -1311,9 +1330,12 @@ int main()
         std::printf("load_ops(all=%d) = %d errno=%d\n", all, ops, errno);
         if (ops < 0) std::printf("%s\n", g_verifier_log);
     }
-    const int msg = load_msg(socks, state, snap, ring, budget, counters, 4ull << 20);
-    std::printf("load_msg = %d errno=%d\n", msg, errno);
-    if (msg < 0) std::printf("%s\n", g_verifier_log);
+    for (bool trust : { false, true })
+    {
+        const int msg = load_msg(socks, state, snap, ring, budget, counters, 4ull << 20, trust);
+        std::printf("load_msg(trust=%d) = %d errno=%d\n", trust, msg, errno);
+        if (msg < 0) std::printf("%s\n", g_verifier_log);
+    }
 
     // The reconciler's exact lookup, for each loopback kind: a sender's key
     // must find its receiver's unread 100000 bytes.

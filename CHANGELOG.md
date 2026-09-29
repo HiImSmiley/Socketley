@@ -69,50 +69,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **SDK:** `cache_store` holds streams (`stream_get`, `stream_find`,
   `stream_make`, `stream_admit`, `stream_change`) as `stream_log`, which is
   usable on its own from `socketley/runtime/cache/stream_log.h`.
-- **`socketley daemon --fast-lo [own|all]`** puts TCP pairs whose both ends
-  are 127.0.0.1 on a kernel shortcut: a BPF sockops program enters both
+- **`socketley daemon --fast-lo [own|all|trust]`** puts TCP pairs whose both
+  ends are on loopback (127.0.0.1, 127.0.0.1 IPv4-mapped on a dual-stack
+  socket, or ::1) on a kernel shortcut: a BPF sockops program enters both
   sockets in a sockhash when the connection is established, and an `sk_msg`
   program places every send straight into the peer's receive queue, skipping
-  TCP/IP, the loopback device and its softirq. `all`, the default, takes any
-  local client connecting to a port one of the daemon's runtimes listens on;
-  `own` only pairs whose both ends are the daemon's runtimes, such as a client
-  runtime to a server runtime (a proxy already reaches a local runtime's
-  published nodes over unix sockets). Off unless given. Needs `CAP_BPF` and
-  `CAP_NET_ADMIN` and cgroup v2; without them the daemon logs
-  `fast-lo: unavailable, serving without it` and serves on the ordinary path.
-  The programs are hand-assembled and loaded with a raw `bpf(2)`, and are
-  detached when the daemon exits. Measured with redis-benchmark (50
-  connections, 4 threads, 3 alternating passes) against a cache: GET 210-285K
-  -> 592-695K requests/s, SET 267-276K -> 500-667K, GET pipelined 16 3.4-3.6M
-  -> 6.4-7.1M, with 45% less system CPU per request unpipelined. The
-  redirected backlog is **bounded**, by `--fast-lo-limit <per-pair-MiB>,`
-  `<global-MiB>` (default 4,64): the `sk_msg` program counts each pair's sends
-  in a BPF map and, each time the count passes a mark, asks a reconciler
-  thread through a BPF ring buffer for the peer's true queue, which the thread
-  reads with one exact `sock_diag` lookup (`INET_DIAG_SKMEMINFO`, which counts
-  the psock ingress backlog on this kernel) and hands back in tens of
-  microseconds. A reader that keeps up is snapped back, so a pair moving 3 GB/s
-  stays on the shortcut; a pair whose peer really holds the per-pair bound, or
-  whose count reaches twice it unanswered, is tainted to TCP -- which then
-  gives the ordinary `EAGAIN` backpressure -- and a flag taints new sends once
-  the sum across pairs reaches the global budget. A sweep once a second
-  recomputes the sum and re-asks any check whose answer was lost; an idle pair
-  costs nothing. Without a bound a receiver that read nothing took 731 MiB
-  before the kernel's global TCP memory ran out; with the default it stays near
-  4 MiB per pair (measured 4.2-4.4 MiB). The taint is permanent for the pair,
-  which is what keeps bytes in order: `tcp_bpf_recvmsg` drains the redirect
-  queue before the TCP receive queue. Two edges stay coarse: a pair moving
-  gigabytes a second whose answer is held up for more than about a
-  millisecond (the reconciler starved of CPU) reaches the hard ceiling and is
-  tainted, which costs speed and not bytes, and many pairs stalling in the same
-  instant can each hold their per-pair bound before the global flag is raised.
-  It also skips netfilter, conntrack
-  and the loopback device, so nftables rules on `lo` and `tcpdump -i lo` do not
-  see those bytes. The proxy's splice path reads a queue a socket on the
-  shortcut does not fill, so a proxied pair with a 127.0.0.1 leg stays on the
-  copy path while `--fast-lo` is on. The per-socket state is a
-  non-preallocated hash pruned when a socket closes and the taint LRUs are
-  gone, so the maps cost 3.9 MiB at rest rather than 12.6.
+  TCP/IP, the loopback device and its softirq. Off unless given; the mode
+  defaults to `all`. Needs `CAP_BPF` and `CAP_NET_ADMIN` and cgroup v2; without
+  them the daemon logs `fast-lo: unavailable, serving without it` and serves
+  on the ordinary path. The programs are hand-assembled, loaded with a raw
+  `bpf(2)` (a verifier `EAGAIN` from the daemon's own pending io_uring task
+  work is retried, as libbpf does) and detached when the daemon exits.
+  - **Modes.** `own`: only pairs whose both ends are the daemon's runtimes,
+    such as a client runtime and a server runtime. `all`: also a local client
+    of any process connecting to a runtime's port, and every connection a
+    runtime makes to any local listener (a tcp proxy with `--backend
+    127.0.0.1:8080` in front of a local application, a client runtime, a Lua
+    HTTP call). `trust`: `all` without the receiver rule below.
+  - **The receiver rule (`own`, `all`).** A send is redirected only when the
+    socket that will receive it is one of the daemon's workers' (a runtime that
+    connected, or one that accepted on a runtime's listener); a send into a
+    foreign socket goes by ordinary TCP, each direction of a pair decided by
+    its own receiver. A redirected byte sits in the receiver's ingress queue,
+    which only `recvmsg` drains: a foreign process reading with `splice(2)`,
+    `sendfile(2)`, `TCP_ZEROCOPY_RECEIVE`, Go's `io.Copy` between two TCP
+    connections or HAProxy with splicing never sees it (measured: a Python
+    backend splicing behind a proxy echoed 0 of 500 bytes) and cannot be told
+    apart from outside. The rule keeps such readers whole; the price is that a
+    foreign client of a cache, or a proxy's foreign backend, gains nothing on
+    the reply. `trust` is for an operator who knows every local client reads
+    with `recv`/`read`/`recvmsg`: it redirects into foreign receivers too and
+    a reader that splices loses its bytes. `daemon stats` and
+    `socketley_fast_lo_info{mode}` say which is running. Our own proxy already
+    keeps splice off any pair with a loopback leg. Measured with
+    `redis-benchmark` (50 connections, 4 threads) against a cache, six
+    alternating passes, requests per second off / `all` / `trust`: GET -P1
+    240-279K / 222-250K / 387-667K, SET -P1 222-286K / 197-273K / 462-632K,
+    GET -P16 2.3-4.0M / 2.7-3.4M / 5.3-6.9M; a bulk reader of 64 KiB values
+    1377-1488 / 1276-1322 / 2464-3040 MB/s (one GET -P1 pass of the first run,
+    169K off, was taken beside another job and is left out). A client runtime
+    against a cache, both ends ours, round trips per second off / `all`: one
+    in flight 83-85K / 110-116K, eight 577-700K / 686-771K; a tcp proxy to a
+    local C echo backend, 64 B one connection, 44-48K off / 41-45K `all` /
+    86-88K `trust` (the last measured on the build before the receiver rule,
+    which redirected exactly as `trust` does).
+  - **Bounded.** The redirected backlog is capped by `--fast-lo-limit
+    <per-pair-MiB>,<global-MiB>` (default 4,64): the `sk_msg` program counts
+    each pair's sends in a BPF map and, each time the count passes a mark, asks
+    a reconciler thread through a BPF ring buffer for the peer's true queue,
+    which it reads with one exact `sock_diag` lookup (`INET_DIAG_SKMEMINFO`,
+    which counts the ingress backlog on this kernel) and hands back in tens of
+    microseconds. A reader that keeps up is snapped back, so a pair moving 3
+    GB/s stays on the shortcut; a pair whose peer really holds the per-pair
+    bound, or whose count reaches twice it unanswered, is tainted to TCP, which
+    then gives the ordinary `EAGAIN` backpressure, and a flag taints new sends
+    once the sum across pairs reaches the global budget. A sweep once a second
+    recomputes the sum and re-asks any check whose answer was lost. Without a
+    bound a receiver that read nothing took 731 MiB before the kernel's global
+    TCP memory ran out; with the default it stays near 4 MiB per pair. The
+    taint is permanent, which keeps bytes in order: `tcp_bpf_recvmsg` drains
+    the redirect queue before the TCP receive queue. Two edges stay coarse: a
+    pair moving gigabytes a second whose answer is held up for more than about a
+    millisecond reaches the hard ceiling and is tainted (costs speed, not
+    bytes), and many pairs stalling in the same instant can each hold their
+    per-pair bound before the global flag is raised.
+  - **Fenced.** Under `all` and `trust` the sockops program is attached at the
+    root cgroup, where it fires for containers too, so it bakes in the
+    daemon's netns cookie (`SO_NETNS_COOKIE`; without it the shortcut refuses
+    to attach) and takes only sockets of that namespace, and every insert at
+    entry is `BPF_NOEXIST`, so a container's identical 127.0.0.1 tuple can
+    neither overwrite a daemon socket's entry nor be redirected into. A
+    connect of ours that never establishes deletes its mark on close.
+  - **Seen.** Shortcut bytes skip netfilter, conntrack and the loopback
+    device, so nftables on `lo` and `tcpdump -i lo` do not see them.
+    `socketley daemon stats` prints `key:value` lines and the metrics endpoint
+    carries `socketley_fast_lo_*`: the mode (`off`, `own`, `all`, `trust` or
+    `unavailable` with the reason), sockets on the shortcut and pinned to TCP,
+    sockets entered, taints by reason (`bound`, `unanswered`, `budget`,
+    `peer_off`), and bytes held against the budget, counted in a per-CPU BPF
+    array with one atomic add per entered socket and per taint, never per send.
+
 - **`socketley daemon --raft-listen <ip:port>` runs a Raft node on the daemon.**
   Off unless asked for; nothing else about the daemon changes, and the cluster
   directory keeps working as before. This release forms the cluster and keeps
@@ -138,87 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   branches on what happened; and `socketley.pipe` across two runtimes and
   `self.route()` reach a runtime in another process. Despite the name neither
   hands a descriptor over — the origin keeps the socket and relays.
-- **`--fast-lo all` also takes a runtime's own connections to local
-  services:** a connect one of the daemon's workers makes to any listener on
-  127.0.0.1 -- a tcp proxy with `--backend 127.0.0.1:8080` in front of a local
-  application, a client runtime, a Lua HTTP call -- puts both ends on the
-  shortcut, the foreign listener's end found by the connect's mark. `own` is
-  unchanged. The per-pair and global bounds cover these pairs as any other: a
-  proxy's pair to a local backend that stopped reading held 4.3 MiB under the
-  default bound. A tcp proxy in front of a local C echo backend, 3 alternating
-  passes, round trips per second without the shortcut / with only the client
-  leg on it (before) / with both legs: 64 B one connection 37-42K / 44-55K /
-  63-80K, 32 connections 66-101K / 78-132K / 120-176K; 16 KB one connection
-  28-30K / 29-34K / 34-39K, 32 connections 37-68K / 44-77K / 69-97K. A connect
-  that never establishes now deletes its mark on close, where it used to stay
-  in the map for the daemon's life. A process that reads a socket on the
-  shortcut with `splice(2)` -- a Go relay using `io.Copy` between two TCP
-  connections, HAProxy with splicing -- never sees those bytes; under `all`
-  that now includes a local backend a runtime connects to, so such a setup
-  wants `own`.
-- **`--fast-lo` takes ::1 pairs**, keeping 127.0.0.1 and 127.0.0.1
-  IPv4-mapped on a dual-stack socket. The whole address is checked on entry,
-  after which its last 32 bits are all that tell 127.0.0.1 from ::1, so the
-  key stays 16 bytes and GET -P1 against a cache stays within noise of the
-  IPv4-only build (533-606K against 519-615K requests/s). Runtimes listen and
-  proxy and client runtimes connect over IPv4, so a ::1 pair here is a Lua
-  `socketley.http()` to a local service on ::1 (`redis-benchmark -h ::1`
-  against a cache is refused: its listener is IPv4). Both ends entered, 3
-  alternating passes, round trips per second off / on: 64 B one connection
-  93-96K / 123-125K, eight 363-406K / 469-529K; 16 KB one 71-73K / 84-86K,
-  eight 253-278K / 326-340K (127.0.0.1 alongside: 80-93K / 125-128K,
-  378-387K / 524-532K, 62-69K / 85-86K, 279-282K / 386-391K). A Lua call
-  that opens a connection per request gains nothing (14.9K / 14.4K calls/s at
-  64 B): entering and leaving the sockhash costs what the request saves.
-- **`socketley daemon stats`** prints the daemon's own figures as `key:value`
-  lines, and the metrics endpoint carries them as `socketley_fast_lo_*`:
-  whether `--fast-lo` is off, own, all or unavailable (with the reason),
-  sockets on the shortcut and pinned to TCP, sockets entered, taints by reason
-  (`bound`: the peer really held the per-pair bound; `unanswered`: no answer
-  before twice the bound; `budget`: the global budget; `peer_off`: the peer
-  was not on the shortcut), bytes held against the budget and whether it is
-  reached -- the bytes `tcpdump -i lo` and nftables never see. Events are
-  counted in a per-CPU BPF array, one atomic add per entered socket and per
-  taint and never per send; the gauges come from the reconciler's
-  once-a-second sweep that already read every pair. GET -P1 against a cache,
-  10M requests, 3 alternating passes: 512-635K requests/s against 588-625K
-  without it, the spread two arms of the same binary show (533-635K).
-- **`--fast-lo` redirects a send only when the receiving socket is one of this
-  daemon's workers'** (a runtime that connected, or one that accepted on a
-  runtime's listener); a send whose receiver is a foreign socket goes by
-  ordinary TCP, each direction of a pair decided by its own receiver. A socket
-  that receives through the kernel's ingress queue can only be read with
-  `recvmsg`, so a foreign reader using `splice(2)`/`sendfile(2)`, Go's
-  `io.Copy` between two TCP connections, or HAProxy splicing would lose the
-  redirected bytes and cannot be told apart from outside; this keeps them
-  whole. Runtime-to-runtime pairs (both ends ours) are unchanged and
-  accelerated both ways (64 B round trips 1.3-1.4x, 16 KB 1.2-1.5x). A foreign
-  cache client is now accelerated only on the request it sends in, not on the
-  reply: `redis-benchmark` GET falls to within noise of no shortcut (245-272K
-  vs 235-266K req/s, was ~666K when both directions were redirected), a bulk
-  reader is slightly slower for the split path (64 KiB GET 1490 vs 1350 MB/s),
-  while a request that carries the payload still gains (64 KiB `SET` -P8 49.9K
-  -> 59.1K, 1.18x). Ownership is a flag stored in the state map at entry and
-  read once on the send path; enabling kTLS (`TCP_ULP tls`) on a foreign socket
-  that is in the sockhash still succeeds.
-
 ### Fixed
-
-- **`--fast-lo all` is fenced to the daemon's own network namespace.** The
-  program is attached at the root cgroup, where it fires for containers too;
-  its keys carried no namespace and entries went in unconditionally, so a
-  container's `127.0.0.1:A<->127.0.0.1:B` pair on a port number a runtime
-  listens on shared the daemon's tuple space and could overwrite our socket's
-  map entries or receive a host sender's redirected bytes. The daemon now bakes
-  its netns cookie (`SO_NETNS_COOKIE`) into the program and takes only sockets
-  that match, and every map insert at entry is `BPF_NOEXIST` so a live entry is
-  never overwritten (the close callback deletes, so a reused tuple finds its
-  key free). Measured: a pair in another namespace with the same ports as a
-  host pair no longer enters (the entered counter stays at the host pair's
-  two, was four), and the host pair keeps working. Needs `SO_NETNS_COOKIE`;
-  without it the shortcut refuses to attach rather than serve unfenced. `own`
-  was never exposed to this (a foreign namespace's sockets are not in the
-  daemon's cgroup).
 
 ### Changed
 
