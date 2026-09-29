@@ -1183,7 +1183,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         if (!prefetch.empty() && first + len <= prefetch.size())
         {
             close_file();
-            r.body = prefetch.substr(static_cast<size_t>(first), static_cast<size_t>(len));
+            r.body_view = std::string_view(prefetch).substr(static_cast<size_t>(first), static_cast<size_t>(len));
             ++m_c.copied_gets;
             send_response(cc, std::move(r));
             return;

@@ -163,30 +163,113 @@ inline bool base64url_decode(std::string_view in, std::string& out)
     return true;
 }
 
+// A UTC time in its fields, by arithmetic rather than gmtime_r, which takes the time zone lock.
+struct utc_fields
+{
+    int64_t  year;
+    unsigned month, day, hour, minute, second, weekday, milli;
+};
+
+inline utc_fields utc_of(int64_t ms)
+{
+    int64_t s = ms / 1000, milli = ms % 1000;
+    if (milli < 0)
+    {
+        milli += 1000;
+        --s;
+    }
+    int64_t days = s / 86400, rem = s % 86400;
+    if (rem < 0)
+    {
+        rem += 86400;
+        --days;
+    }
+    utc_fields f{};
+    f.weekday = static_cast<unsigned>((days % 7 + 11) % 7);
+    // Howard Hinnant's civil_from_days.
+    const int64_t z   = days + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const auto doe    = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp  = (5 * doy + 2) / 153;
+    f.day    = doy - (153 * mp + 2) / 5 + 1;
+    f.month  = mp < 10 ? mp + 3 : mp - 9;
+    f.year   = static_cast<int64_t>(yoe) + era * 400 + (f.month <= 2);
+    f.hour   = static_cast<unsigned>(rem / 3600);
+    f.minute = static_cast<unsigned>(rem / 60 % 60);
+    f.second = static_cast<unsigned>(rem % 60);
+    f.milli  = static_cast<unsigned>(milli);
+    return f;
+}
+
+inline void append_digits(std::string& out, uint64_t v, int width)
+{
+    char buf[24];
+    int n = 0;
+    do
+    {
+        buf[n++] = static_cast<char>('0' + v % 10);
+        v /= 10;
+    } while (v || n < width);
+    while (n)
+        out.push_back(buf[--n]);
+}
+
+inline void append_year(std::string& out, int64_t y)
+{
+    if (y < 0)
+        out.push_back('-');
+    append_digits(out, static_cast<uint64_t>(y < 0 ? -y : y), 4);
+}
+
 // 2006-01-02T15:04:05.000Z, what S3 writes into every XML timestamp.
 inline std::string iso8601(int64_t ms)
 {
-    const time_t s = static_cast<time_t>(ms / 1000);
-    struct tm tm{};
-    gmtime_r(&s, &tm);
-    char buf[40];
-    const size_t n = std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%S", &tm);
-    std::string out(buf, n);
-    char frac[8];
-    std::snprintf(frac, sizeof frac, ".%03dZ", static_cast<int>(ms % 1000));
-    out += frac;
+    const utc_fields f = utc_of(ms);
+    std::string out;
+    out.reserve(24);
+    append_year(out, f.year);
+    out.push_back('-');
+    append_digits(out, f.month, 2);
+    out.push_back('-');
+    append_digits(out, f.day, 2);
+    out.push_back('T');
+    append_digits(out, f.hour, 2);
+    out.push_back(':');
+    append_digits(out, f.minute, 2);
+    out.push_back(':');
+    append_digits(out, f.second, 2);
+    out.push_back('.');
+    append_digits(out, f.milli, 3);
+    out.push_back('Z');
     return out;
 }
 
 // Mon, 02 Jan 2006 15:04:05 GMT, the HTTP date every header carries.
 inline std::string http_date(int64_t ms)
 {
-    const time_t s = static_cast<time_t>(ms / 1000);
-    struct tm tm{};
-    gmtime_r(&s, &tm);
-    char buf[40];
-    const size_t n = std::strftime(buf, sizeof buf, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    return std::string(buf, n);
+    static constexpr std::string_view days[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static constexpr std::string_view months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const utc_fields f = utc_of(ms);
+    std::string out;
+    out.reserve(32);
+    out += days[f.weekday];
+    out += ", ";
+    append_digits(out, f.day, 2);
+    out.push_back(' ');
+    out += months[f.month - 1];
+    out.push_back(' ');
+    append_year(out, f.year);
+    out.push_back(' ');
+    append_digits(out, f.hour, 2);
+    out.push_back(':');
+    append_digits(out, f.minute, 2);
+    out.push_back(':');
+    append_digits(out, f.second, 2);
+    out += " GMT";
+    return out;
 }
 
 // Seconds since the epoch of an HTTP date, or -1 when it is not one.

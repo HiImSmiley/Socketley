@@ -287,6 +287,8 @@ struct response
     std::string reason;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // A body the caller holds until send_response returns, sent instead of `body`.
+    std::string_view body_view;
     // A HEAD or a 304 carries the headers a body would have and no body.
     bool        head_only{false};
     // The Content-Length to send when it is not the body's own.
@@ -383,7 +385,8 @@ public:
     void count_error(std::string_view code);
     void finish_request(const std::shared_ptr<conn>& c);
     void reset_request(const std::shared_ptr<conn>& c);
-    std::string response_head(const conn& c, const response& r) const;
+    // The status line and headers, with room reserved for `room` more bytes behind them.
+    std::string response_head(const conn& c, const response& r, size_t room = 0) const;
 
     // A body of known small size, gathered whole and handed to `done`.
     void collect_body(const std::shared_ptr<conn>& c, uint64_t limit, std::function<void()> done);

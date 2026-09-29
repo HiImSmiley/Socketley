@@ -1265,3 +1265,41 @@ TEST_CASE("a hot copy answers only the version the index names, and keeps within
         REQUIRE(r.del("bkt", k) == st::ok);
     CHECK(r.store->hot_bytes() == 0);
 }
+
+TEST_CASE("the HTTP and XML dates agree with gmtime and strftime across leap days, centuries and millis")
+{
+    auto reference = [](int64_t ms, const char* fmt, bool frac)
+    {
+        const time_t s = static_cast<time_t>(ms / 1000);
+        struct tm tm{};
+        gmtime_r(&s, &tm);
+        char buf[64];
+        std::string out(buf, std::strftime(buf, sizeof buf, fmt, &tm));
+        if (frac)
+        {
+            std::snprintf(buf, sizeof buf, ".%03dZ", static_cast<int>(ms % 1000));
+            out += buf;
+        }
+        return out;
+    };
+    std::vector<int64_t> at = {0, 999, 1000, 86399999, 86400000, 951782400000, 951868799999, 951868800000,
+                               4107542400000, 4107628800000, 1790467200123, 253402300799999};
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    for (int i = 0; i < 200000; ++i)
+    {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        at.push_back(static_cast<int64_t>(x % 253402300800000ull));
+    }
+    size_t bad = 0;
+    for (const int64_t ms : at)
+    {
+        const std::string h = http_date(ms), w = reference(ms, "%a, %d %b %Y %H:%M:%S GMT", false);
+        const std::string i = iso8601(ms), v = reference(ms, "%Y-%m-%dT%H:%M:%S", true);
+        if (h != w || i != v)
+        {
+            if (++bad <= 3)
+                FAIL_CHECK(ms << ": " << h << " / " << w << ", " << i << " / " << v);
+        }
+    }
+    CHECK(bad == 0);
+}

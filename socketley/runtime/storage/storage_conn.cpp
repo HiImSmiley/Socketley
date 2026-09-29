@@ -1006,7 +1006,7 @@ void storage_run::write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe
 
 // ─── HTTP ───────────────────────────────────────────────────────────────────
 
-std::string storage_run::response_head(const conn& c, const response& r) const
+std::string storage_run::response_head(const conn& c, const response& r, size_t room) const
 {
     static thread_local int64_t cached_sec = -1;
     static thread_local std::string cached_date;
@@ -1018,22 +1018,43 @@ std::string storage_run::response_head(const conn& c, const response& r) const
         cached_date = http_date(now_s * 1000);
     }
 
-    std::string h;
-    h.reserve(256 + r.headers.size() * 48);
-    h += "HTTP/1.1 " + std::to_string(r.status) + " " + (r.reason.empty() ? reason_phrase(r.status) : r.reason) + "\r\n";
-    h += "Server: Socketley\r\n";
-    h += "Date: " + cached_date + "\r\n";
-    h += "x-amz-request-id: " + c.req.request_id + "\r\n";
-    h += "x-amz-id-2: " + c.req.request_id + "\r\n";
+    const std::string_view reason = r.reason.empty() ? std::string_view(reason_phrase(r.status)) : r.reason;
+    size_t need = 200 + reason.size() + cached_date.size() + 2 * c.req.request_id.size();
     for (const auto& [k, v] : r.headers)
-        h += k + ": " + v + "\r\n";
+        need += k.size() + v.size() + 4;
+    std::string h;
+    h.reserve(need + room);
+    auto number = [&h](uint64_t n)
+    {
+        char buf[24];
+        h.append(buf, static_cast<size_t>(std::to_chars(buf, buf + sizeof buf, n).ptr - buf));
+    };
+    h += "HTTP/1.1 ";
+    number(static_cast<uint64_t>(r.status));
+    h += ' ';
+    h += reason;
+    h += "\r\nServer: Socketley\r\nDate: ";
+    h += cached_date;
+    h += "\r\nx-amz-request-id: ";
+    h += c.req.request_id;
+    h += "\r\nx-amz-id-2: ";
+    h += c.req.request_id;
+    h += "\r\n";
+    for (const auto& [k, v] : r.headers)
+    {
+        h += k;
+        h += ": ";
+        h += v;
+        h += "\r\n";
+    }
     if (r.status != 204 && r.status != 304 && r.status != 100)
     {
-        const uint64_t len = r.has_length_override ? r.length_override : r.body.size();
-        h += "Content-Length: " + std::to_string(len) + "\r\n";
+        h += "Content-Length: ";
+        number(r.has_length_override ? r.length_override
+                                      : (r.body_view.data() ? r.body_view.size() : r.body.size()));
+        h += "\r\n";
     }
-    h += r.close ? "Connection: close\r\n" : "Connection: keep-alive\r\n";
-    h += "\r\n";
+    h += r.close ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
     return h;
 }
 
@@ -1048,9 +1069,10 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
     r.close = r.close || !c->req.keep_alive;
 
     c->ph = phase::respond;
-    std::string out = response_head(*c, r);
-    if (!r.head_only)
-        out += r.body;
+    const std::string_view body = r.head_only ? std::string_view{}
+                                : r.body_view.data() ? r.body_view : std::string_view(r.body);
+    std::string out = response_head(*c, r, body.size());
+    out += body;
     c->close_after_write = r.close;
     c->after_write = [this, c]() { finish_request(c); };
     queue_write(c, std::move(out));
