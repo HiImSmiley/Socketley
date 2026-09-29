@@ -512,6 +512,7 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
                     if (!*alive)
                         return;
                     wire::mpu_ref fin{bucket, key, id, 0, 0, res.error.code.empty()};
+                    ++m_c.mpu_out;
                     m_transport.call(owner, wire::encode_mpu_ref(wire::op::mpu_finish, fin),
                                      [this, alive](bool fok, std::string_view)
                                      {
@@ -596,8 +597,7 @@ void shard_node::mpu_list(std::string bucket, std::function<void(st, std::vector
     if (m_mpu)
         for (const mpu_upload* u : m_mpu->uploads_of(bucket))
             g->all.push_back({u->key, u->id, u->initiated_ms});
-    if (m_store.shards() > 1)
-        ++m_c.mpu_out;
+    m_c.mpu_out += m_store.shards() - 1;
     each_peer([bucket](uint32_t) { return wire::encode_bucket(wire::op::mpu_list, bucket); },
               [g](uint32_t, bool ok, std::string_view reply)
               {

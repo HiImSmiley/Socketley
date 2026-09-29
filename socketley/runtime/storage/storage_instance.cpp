@@ -380,6 +380,8 @@ std::string storage_instance::stats_lines() const
             << "shard_list_fanouts:" << n.list_fanouts << "\n"
             << "shard_list_pages_served:" << n.list_pages_served << "\n"
             << "shard_bucket_ops:" << n.bucket_ops << "\n"
+            << "shard_mpu_sent:" << n.mpu_out << "\n"
+            << "shard_mpu_served:" << n.mpu_in << "\n"
             << "shard_peer_failures:" << n.peer_failures << "\n";
     }
     return out.str();

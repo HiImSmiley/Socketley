@@ -386,6 +386,9 @@ void storage_run::sweep()
         ++m_c.timeouts;
         close_conn(c);
     }
+    // An upload sealed for an assembler on another shard that never said how it
+    // ended is opened again after six hours.
+    m_mpu.unseal_stale(static_cast<int64_t>(m_store.now_ms()) - 6ll * 3600 * 1000);
     // Expired uploads are looked for a few times within the expiry, at most
     // every half minute, and only when any expire.
     if (m_mpu_expire_secs != 0)
@@ -1554,16 +1557,21 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
             send_error_st(cc, r.status);
             return;
         }
+        // A part is not an object: the completed upload is the put the script is told of.
+        const bool is_part = cc->req.has_query("uploadId");
         response resp;
         resp.status = 200;
         resp.headers.emplace_back("ETag", "\"" + r.meta.etag() + "\"");
         for (const auto& [n, v] : r.meta.extra)
             if (is_checksum_header(n))
                 resp.headers.emplace_back(n, v);
+        const std::string bucket = cc->req.bucket;
+        const std::string key    = cc->req.key;
         send_response(cc, std::move(resp));
         // After the answer is on its way, so a script that is slow to notice does
         // not hold the client.
-        notify_put(cc->req.bucket, cc->req.key, r.meta);
+        if (!is_part)
+            notify_put(bucket, key, r.meta);
     });
 }
 
