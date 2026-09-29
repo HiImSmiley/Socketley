@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "s3_sigv4_auth.h"
+#include "shard_wire.h"
 #include "storage_run.h"
 #include "../../shared/runtime_manager.h"
 #include "../../shared/event_loop.h"
@@ -32,11 +33,6 @@ storage_instance::~storage_instance()
     // A runtime destroyed while running has its run freed by the graveyard's
     // destructor, which is only safe because the loop is gone first in every
     // process that builds one.
-}
-
-bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
-{
-    return m_run && m_run->serve_rpc(ticket, payload);
 }
 
 void storage_instance::set_authenticator(std::unique_ptr<socketley::storage::authenticator> a)
@@ -92,6 +88,12 @@ void storage_instance::serve_request(std::string_view, std::string& out)
 
 bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
 {
+    // A sibling shard's request opens with the magic of the shard protocol, and
+    // a script's with the version byte of storage_rpc, so one payload is never both.
+    socketley::storage::wire::op sibling{};
+    if (!socketley::storage::wire::request_op(payload, sibling))
+        return m_run && m_run->serve_rpc(ticket, payload);
+
     if (!m_run || get_shards() <= 1)
         return false;
     auto* mgr = get_runtime_manager();

@@ -78,6 +78,10 @@ struct mpu_upload
     uint64_t    held{0};
     // Part commits in flight, which an abort or a completion waits out.
     uint32_t    committing{0};
+    // A completion another shard is assembling: when it was sealed for that, so
+    // an assembler that died leaves the upload open again after a while.
+    bool        remote_sealed{false};
+    int64_t     sealed_ms{0};
     std::function<void()> on_idle;
     // Commits of one part number wait behind each other, so the disk and the
     // list of parts end in the same state.
@@ -91,6 +95,32 @@ struct complete_result
     object_meta meta;
     // The checksum of the whole object, when the upload had an algorithm.
     std::string checksum_b64;
+};
+
+// What the assembly of a completed upload needs, decided against what the upload
+// holds and so handed to whichever shard reads the parts and writes the object.
+struct assemble_plan
+{
+    std::string bucket;
+    std::string id;
+    std::string key;
+    // The object as it will be: size, ETag, parts and the composite checksum included.
+    object_meta meta;
+    std::string checksum_b64;
+    std::vector<mpu_part> parts;
+};
+
+// One page of an upload's parts, as ListParts answers it.
+struct parts_page
+{
+    // no_such_key when the upload is missing or on its way out.
+    st            status{st::ok};
+    std::string   key;
+    std::string   id;
+    checksum_algo algo{checksum_algo::none};
+    std::vector<part_row> rows;
+    bool          truncated{false};
+    uint32_t      next_marker{0};
 };
 
 struct mpu_totals
@@ -142,6 +172,25 @@ public:
     // runs as the bytes move, so the caller can tell a slow assembly from a stuck one.
     void complete(std::string bucket, std::string id, std::vector<complete_part> parts,
                   std::function<void()> progress, std::function<void(complete_result)> cb);
+
+    // The two halves of `complete`, for a completion whose assembly runs on
+    // another shard: this one validates the list against the upload and seals it,
+    // the assembler makes the object from the plan, and this one is then told to
+    // remove the upload or to open it again.
+    void prepare_complete(std::string bucket, std::string id, std::vector<complete_part> parts,
+                          std::function<void(s3_error, assemble_plan)> cb, bool remote = false);
+    // Reads the plan's parts and commits the object through the store, so the
+    // owner of the key is the one that renames it; the upload is not touched.
+    void assemble_plan_object(assemble_plan plan, std::function<void()> progress,
+                              std::function<void(complete_result)> cb);
+    void finish_complete(std::string bucket, std::string id, bool ok);
+
+    // The parts of an upload, `max_parts` of them after `marker`.
+    parts_page list_parts(std::string_view bucket, std::string_view id, std::string_view key,
+                          uint32_t marker, uint32_t max_parts) const;
+
+    // Opens the completions whose assembler has not answered for `older_than_ms`.
+    void unseal_stale(int64_t older_than_ms);
 
     // False when there was no such upload.  `cb` runs once its files are gone.
     bool abort(std::string_view bucket, std::string_view id, std::function<void()> cb);

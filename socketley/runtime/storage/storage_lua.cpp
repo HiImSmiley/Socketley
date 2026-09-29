@@ -60,7 +60,8 @@ std::string_view storage_run::operation_name(const s3_request& r)
     if (bucket_level)
     {
         if (m == "GET")
-            return r.has_query("location") ? "GetBucketLocation"
+            return r.has_query("uploads") ? "ListMultipartUploads"
+                 : r.has_query("location") ? "GetBucketLocation"
                  : r.get_query("list-type") == "2" ? "ListObjectsV2" : "ListObjects";
         if (m == "PUT")
             return "CreateBucket";
@@ -72,14 +73,26 @@ std::string_view storage_run::operation_name(const s3_request& r)
             return "DeleteObjects";
         return "Unknown";
     }
+    const bool upload = r.has_query("uploadId");
     if (m == "GET")
-        return "GetObject";
+        return upload ? "ListParts" : "GetObject";
     if (m == "HEAD")
         return "HeadObject";
     if (m == "PUT")
+    {
+        if (upload && r.has_query("partNumber"))
+            return r.has_header("x-amz-copy-source") ? "UploadPartCopy" : "UploadPart";
         return r.has_header("x-amz-copy-source") ? "CopyObject" : "PutObject";
+    }
     if (m == "DELETE")
-        return "DeleteObject";
+        return upload ? "AbortMultipartUpload" : "DeleteObject";
+    if (m == "POST")
+    {
+        if (r.has_query("uploads"))
+            return "CreateMultipartUpload";
+        if (upload)
+            return "CompleteMultipartUpload";
+    }
     return "Unknown";
 }
 

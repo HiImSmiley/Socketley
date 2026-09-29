@@ -34,23 +34,40 @@ bool parse_u64(std::string_view s, uint64_t& out) { return parse_number(s, out);
 
 }   // namespace
 
-// The upload a request names, when there is one for this bucket and key.
-// Answers NoSuchUpload itself and returns null when there is not.
-const mpu_upload* storage_run::upload_for(const std::shared_ptr<conn>& c)
+// Asks the shard that owns the upload whether it can take a part, and runs `go`
+// with the checksum algorithm the upload has; answers NoSuchUpload itself when it
+// cannot.  The body of a part is not read while the owner is being asked.
+void storage_run::with_open_upload(const std::shared_ptr<conn>& c, std::function<void(checksum_algo)> go)
 {
     const s3_request& r = c->req;
     if (!m_store.has_bucket(r.bucket))
     {
         send_error_st(c, st::no_such_bucket);
-        return nullptr;
+        return;
     }
-    const mpu_upload* up = m_mpu.find(r.bucket, r.get_query("uploadId"));
-    if (!up || up->key != r.key || up->state == mpu_state::removing)
-    {
-        send_error(c, make_error("NoSuchUpload"), false, "UploadId", r.get_query("uploadId"));
-        return nullptr;
-    }
-    return up;
+    const bool remote = !m_store.owns(r.bucket, r.key);
+    if (remote)
+        c->ph = phase::hook_wait;
+    std::weak_ptr<conn> weak = c;
+    m_node.mpu_begin(r.bucket, r.key, std::string(r.get_query("uploadId")),
+        [this, weak, go = std::move(go)](st s, checksum_algo algo)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            cc->last_progress = std::chrono::steady_clock::now();
+            if (s == st::io_error)
+            {
+                send_error_st(cc, s);
+                return;
+            }
+            if (s != st::ok)
+            {
+                send_error(cc, make_error("NoSuchUpload"), false, "UploadId", cc->req.get_query("uploadId"));
+                return;
+            }
+            go(algo);
+        });
 }
 
 bool storage_run::part_number_of(const std::shared_ptr<conn>& c, uint32_t& number)
@@ -101,7 +118,7 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     std::weak_ptr<conn> weak = c;
     const std::string bucket = r.bucket;
     const std::string key    = r.key;
-    m_mpu.create(bucket, key, std::move(meta), algo, [this, weak, bucket, key](st s, std::string id)
+    m_node.mpu_create(bucket, key, std::move(meta), algo, [this, weak, bucket, key](st s, std::string id)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -134,22 +151,21 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
     uint32_t number = 0;
     if (!part_number_of(c, number))
         return;
-    const mpu_upload* up = upload_for(c);
-    if (!up)
-        return;
 
-    checksum_algo algo = checksum_algo::none;
-    if (m_mpu.begin_part(r.bucket, up->id, algo) != st::ok)
+    std::weak_ptr<conn> weak = c;
+    with_open_upload(c, [this, weak, number, keep_alive](checksum_algo algo)
     {
-        send_error(c, make_error("NoSuchUpload"), true, "UploadId", r.get_query("uploadId"));
-        return;
-    }
-    r.keep_alive = keep_alive;
-
-    // The part's own header names it by upload and number, since it is not an object.
-    const std::string part_key = "mpu/" + up->id + "/" + std::to_string(number);
-    ++m_c.mpu_parts;
-    start_put(c, part_key, object_meta{}, m_mpu.part_committer(r.bucket, up->id, number), algo);
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        s3_request& q = cc->req;
+        q.keep_alive = keep_alive;
+        const std::string id = std::string(q.get_query("uploadId"));
+        // The part's own header names it by upload and number, since it is not an object.
+        const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
+        ++m_c.mpu_parts;
+        start_put(cc, part_key, object_meta{}, m_node.mpu_part_committer(q.bucket, q.key, id, number), algo);
+    });
 }
 
 // ─── UploadPartCopy ─────────────────────────────────────────────────────────
@@ -160,16 +176,6 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     uint32_t number = 0;
     if (!part_number_of(c, number))
         return;
-    const mpu_upload* up = upload_for(c);
-    if (!up)
-        return;
-    checksum_algo algo = checksum_algo::none;
-    if (m_mpu.begin_part(r.bucket, up->id, algo) != st::ok)
-    {
-        send_error(c, make_error("NoSuchUpload"), false, "UploadId", r.get_query("uploadId"));
-        return;
-    }
-
     std::string src_bucket, src_key;
     s3_error    err;
     if (!parse_copy_source(r.header("x-amz-copy-source"), src_bucket, src_key, err))
@@ -182,12 +188,37 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    const object_meta* src = m_store.find(src_bucket, src_key);
-    if (!src)
+
+    std::weak_ptr<conn> weak = c;
+    with_open_upload(c, [this, weak, number, src_bucket, src_key](checksum_algo algo)
     {
-        send_error_st(c, st::no_such_key);
-        return;
-    }
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        // The source may be another shard's, whose header is then read from its file.
+        m_store.stat_object(src_bucket, src_key,
+            [this, weak, number, src_bucket, src_key, algo](st s, const object_meta& sm)
+            {
+                auto c2 = weak.lock();
+                if (!c2 || c2->dead)
+                    return;
+                if (s != st::ok)
+                {
+                    send_error_st(c2, s);
+                    return;
+                }
+                op_upload_part_copy_from(c2, number, algo, src_bucket, src_key, sm);
+            });
+    });
+}
+
+void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
+                                           const std::string& src_bucket, const std::string& src_key,
+                                           const object_meta& src_meta)
+{
+    s3_request& r = c->req;
+    const object_meta* src = &src_meta;
+    const std::string id = std::string(r.get_query("uploadId"));
 
     // Which bytes of the source: all of them, or the range the header names.
     uint64_t first = 0, len = src->size;
@@ -213,7 +244,7 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     object_meta meta;
     if (algo != checksum_algo::none)
         meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
-    const std::string part_key = "mpu/" + up->id + "/" + std::to_string(number);
+    const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
     st why = st::ok;
     auto op = m_store.begin_put(r.bucket, part_key, std::move(meta), len, true, why);
     if (!op)
@@ -223,7 +254,7 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     }
     if (algo != checksum_algo::none)
         op->track_checksum(algo, {});
-    op->set_committer(m_mpu.part_committer(r.bucket, up->id, number));
+    op->set_committer(m_node.mpu_part_committer(r.bucket, r.key, id, number));
     ++m_c.mpu_parts;
     ++m_c.copies;
 
@@ -391,9 +422,11 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
 void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
 {
     const s3_request& r = c->req;
-    const mpu_upload* up = upload_for(c);
-    if (!up)
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
         return;
+    }
 
     std::vector<complete_part> parts;
     if (!parse_complete_request(c->body, parts))
@@ -402,34 +435,45 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
         return;
     }
 
-    const checksum_algo algo = up->algo;
     const std::string   bucket = r.bucket;
     const std::string   key    = r.key;
     const std::string   host   = r.host;
+    const std::string   id     = std::string(r.get_query("uploadId"));
     std::weak_ptr<conn> weak = c;
-    m_mpu.complete(bucket, up->id, std::move(parts),
+    m_node.mpu_complete(bucket, key, id, std::move(parts),
         [weak]()
         {
             if (auto cc = weak.lock(); cc && !cc->dead)
                 cc->last_progress = std::chrono::steady_clock::now();
         },
-        [this, weak, bucket, key, host, algo](complete_result res)
+        [this, weak, bucket, key, host, id](complete_result res)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
                 return;
             if (!res.error.code.empty())
             {
-                send_error(cc, res.error);
+                send_error(cc, res.error, false,
+                           res.error.code == "NoSuchUpload" ? "UploadId" : std::string_view{},
+                           res.error.code == "NoSuchUpload" ? std::string_view(id) : std::string_view{});
                 return;
             }
             ++m_c.mpu_completed;
             ++m_c.puts;
+            // A completed upload is a put like any other, whatever shard it was assembled on.
+            const checksum_algo algo = [&]
+            {
+                for (const auto& [n, v] : res.meta.extra)
+                    if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
+                        return a;
+                return checksum_algo::none;
+            }();
             response resp;
             resp.headers.emplace_back("Content-Type", "application/xml");
             resp.body = complete_multipart_xml("http://" + host + "/" + bucket + "/" + key, bucket, key,
                                                res.meta.etag(), algo, res.checksum_b64);
             send_response(cc, std::move(resp));
+            notify_put(bucket, key, res.meta);
         });
 }
 
@@ -437,21 +481,29 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
 
 void storage_run::op_abort_multipart(const std::shared_ptr<conn>& c)
 {
-    const mpu_upload* up = upload_for(c);
-    if (!up)
+    const s3_request& r = c->req;
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
         return;
+    }
     std::weak_ptr<conn> weak = c;
-    if (!m_mpu.abort(c->req.bucket, up->id, [this, weak]()
+    const std::string id = std::string(r.get_query("uploadId"));
+    m_node.mpu_abort(r.bucket, r.key, id, [this, weak, id](bool found)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (!found)
         {
-            auto cc = weak.lock();
-            if (!cc || cc->dead)
-                return;
-            ++m_c.mpu_aborted;
-            response resp;
-            resp.status = 204;
-            send_response(cc, std::move(resp));
-        }))
-        send_error(c, make_error("NoSuchUpload"), false, "UploadId", c->req.get_query("uploadId"));
+            send_error(cc, make_error("NoSuchUpload"), false, "UploadId", id);
+            return;
+        }
+        ++m_c.mpu_aborted;
+        response resp;
+        resp.status = 204;
+        send_response(cc, std::move(resp));
+    });
 }
 
 // ─── ListParts ──────────────────────────────────────────────────────────────
@@ -459,9 +511,11 @@ void storage_run::op_abort_multipart(const std::shared_ptr<conn>& c)
 void storage_run::op_list_parts(const std::shared_ptr<conn>& c)
 {
     const s3_request& r = c->req;
-    const mpu_upload* up = upload_for(c);
-    if (!up)
+    if (!m_store.has_bucket(r.bucket))
+    {
+        send_error_st(c, st::no_such_bucket);
         return;
+    }
 
     auto bad = [&](std::string_view name, std::string_view msg)
     {
@@ -486,33 +540,41 @@ void storage_run::op_list_parts(const std::shared_ptr<conn>& c)
         return;
     }
 
-    list_parts_render lr;
-    lr.bucket    = r.bucket;
-    lr.key       = up->key;
-    lr.upload_id = up->id;
-    const std::string owner = owner_id();
-    lr.owner_id  = owner;
-    lr.part_number_marker = marker;
-    lr.max_parts = max_parts;
-    lr.algo      = up->algo;
-
-    std::vector<part_row> rows;
-    for (auto it = up->parts.upper_bound(marker); it != up->parts.end(); ++it)
-    {
-        if (rows.size() == max_parts)
+    std::weak_ptr<conn> weak = c;
+    const std::string id = std::string(r.get_query("uploadId"));
+    m_node.mpu_parts(r.bucket, r.key, id, marker, max_parts,
+        [this, weak, id, marker, max_parts](parts_page pg)
         {
-            lr.truncated = true;
-            break;
-        }
-        const mpu_part& p = it->second;
-        rows.push_back({p.number, p.mtime_ms, p.etag(), p.size, up->algo, p.checksum_b64});
-        lr.next_part_number_marker = p.number;
-    }
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (pg.status == st::io_error)
+            {
+                send_error_st(cc, pg.status);
+                return;
+            }
+            if (pg.status != st::ok)
+            {
+                send_error(cc, make_error("NoSuchUpload"), false, "UploadId", id);
+                return;
+            }
+            list_parts_render lr;
+            lr.bucket    = cc->req.bucket;
+            lr.key       = pg.key;
+            lr.upload_id = pg.id;
+            const std::string owner = owner_id();
+            lr.owner_id  = owner;
+            lr.part_number_marker = marker;
+            lr.max_parts = max_parts;
+            lr.algo      = pg.algo;
+            lr.truncated = pg.truncated;
+            lr.next_part_number_marker = pg.next_marker;
 
-    response resp;
-    resp.headers.emplace_back("Content-Type", "application/xml");
-    resp.body = list_parts_xml(lr, rows);
-    send_response(c, std::move(resp));
+            response resp;
+            resp.headers.emplace_back("Content-Type", "application/xml");
+            resp.body = list_parts_xml(lr, pg.rows);
+            send_response(cc, std::move(resp));
+        });
 }
 
 // ─── ListMultipartUploads ───────────────────────────────────────────────────
@@ -557,10 +619,23 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
     const std::string key_marker = std::string(r.get_query("key-marker"));
     const std::string id_marker  = std::string(r.get_query("upload-id-marker"));
 
-    std::vector<const mpu_upload*> all = m_mpu.uploads_of(r.bucket);
-    std::sort(all.begin(), all.end(), [](const mpu_upload* a, const mpu_upload* b)
+    // Every shard holds the uploads of the keys it owns, so the listing is theirs together.
+    std::weak_ptr<conn> weak = c;
+    m_node.mpu_list(r.bucket, [this, weak, max_uploads, url_enc, prefix, delimiter, key_marker, id_marker]
+                              (st ls, std::vector<wire::upload_stub> all)
     {
-        return std::tie(a->key, a->initiated_ms, a->id) < std::tie(b->key, b->initiated_ms, b->id);
+    auto cc = weak.lock();
+    if (!cc || cc->dead)
+        return;
+    if (ls != st::ok)
+    {
+        send_error_st(cc, ls);
+        return;
+    }
+    const s3_request& r = cc->req;
+    std::sort(all.begin(), all.end(), [](const wire::upload_stub& a, const wire::upload_stub& b)
+    {
+        return std::tie(a.key, a.initiated_ms, a.id) < std::tie(b.key, b.initiated_ms, b.id);
     });
 
     // A marker that is a rolled-up prefix stands for the whole group.
@@ -578,8 +653,9 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
     bool passed_marker = key_marker.empty();
     size_t taken = 0;
     std::string last_key, last_id;
-    for (const mpu_upload* u : all)
+    for (const wire::upload_stub& us : all)
     {
+        const wire::upload_stub* u = &us;
         if (!u->key.starts_with(prefix))
             continue;
         if (!passed_marker)
@@ -655,7 +731,8 @@ void storage_run::op_list_uploads(const std::shared_ptr<conn>& c)
     response resp;
     resp.headers.emplace_back("Content-Type", "application/xml");
     resp.body = list_uploads_xml(lr, rows, prefixes);
-    send_response(c, std::move(resp));
+    send_response(cc, std::move(resp));
+    });
 }
 
 // ─── Expiry ─────────────────────────────────────────────────────────────────

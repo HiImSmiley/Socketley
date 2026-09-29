@@ -1,3 +1,4 @@
+#include "../../shared/byte_codec.h"
 #include "shard_node.h"
 
 #include <memory>
@@ -332,7 +333,424 @@ void shard_node::list(std::string_view bucket, const list_query& q, std::functio
               });
 }
 
+// ─── Multipart ──────────────────────────────────────────────────────────────
+
+const mpu_upload* shard_node::mpu_find(const std::string& bucket, const std::string& key,
+                                       const std::string& id) const
+{
+    if (!m_mpu)
+        return nullptr;
+    const mpu_upload* up = m_mpu->find(bucket, id);
+    return (!up || up->key != key || up->state == mpu_state::removing) ? nullptr : up;
+}
+
+void shard_node::mpu_create(std::string bucket, std::string key, object_meta meta, checksum_algo algo,
+                            std::function<void(st, std::string)> cb)
+{
+    if (!m_mpu)
+    {
+        cb(st::io_error, {});
+        return;
+    }
+    if (m_store.owns(bucket, key))
+    {
+        m_mpu->create(std::move(bucket), std::move(key), std::move(meta), algo, std::move(cb));
+        return;
+    }
+    ++m_c.mpu_out;
+    auto alive = m_alive;
+    const uint32_t owner = m_store.owner_of(bucket, key);
+    m_transport.call(owner, wire::encode_mpu_create(bucket, key, meta, algo),
+        [this, alive, cb](bool ok, std::string_view reply)
+        {
+            if (!*alive)
+                return;
+            st s = st::io_error;
+            std::string id;
+            if (!ok || !wire::decode_mpu_created(reply, s, id))
+            {
+                ++m_c.peer_failures;
+                cb(st::io_error, {});
+                return;
+            }
+            cb(s, std::move(id));
+        });
+}
+
+void shard_node::mpu_begin(std::string bucket, std::string key, std::string id,
+                           std::function<void(st, checksum_algo)> cb)
+{
+    if (!m_mpu)
+    {
+        cb(st::io_error, checksum_algo::none);
+        return;
+    }
+    if (m_store.owns(bucket, key))
+    {
+        checksum_algo algo = checksum_algo::none;
+        const st s = mpu_find(bucket, key, id) ? m_mpu->begin_part(bucket, id, algo) : st::no_such_key;
+        cb(s, algo);
+        return;
+    }
+    ++m_c.mpu_out;
+    auto alive = m_alive;
+    wire::mpu_ref ref{bucket, key, id, 0, 0, false};
+    m_transport.call(m_store.owner_of(bucket, key), wire::encode_mpu_ref(wire::op::mpu_begin, ref),
+        [this, alive, cb](bool ok, std::string_view reply)
+        {
+            if (!*alive)
+                return;
+            st s = st::io_error;
+            checksum_algo algo = checksum_algo::none;
+            if (!ok || !wire::decode_mpu_begin(reply, s, algo))
+            {
+                ++m_c.peer_failures;
+                cb(st::io_error, checksum_algo::none);
+                return;
+            }
+            cb(s, algo);
+        });
+}
+
+put_op::committer shard_node::mpu_part_committer(std::string bucket, std::string key, std::string id,
+                                                 uint32_t number)
+{
+    if (!m_mpu)
+        return {};
+    if (m_store.owns(bucket, key))
+        return m_mpu->part_committer(std::move(bucket), std::move(id), number);
+
+    // The finished body is a file in the shared tmp directory, so the owner is sent
+    // its name and what it says about it and renames it into the upload.
+    const uint32_t owner = m_store.owner_of(bucket, key);
+    return [this, alive = m_alive, owner, id = std::move(id), number](commit_request req,
+                                                                     std::function<void(put_result)> done)
+    {
+        if (!*alive)
+            return;
+        ++m_c.mpu_out;
+        const std::string bucket_name = req.bucket;
+        const std::string tmp         = req.tmp_name;
+        const object_meta meta        = req.meta;
+        m_transport.call(owner, wire::encode_mpu_part(req, id, number),
+            [this, alive, bucket_name, tmp, meta, done](bool ok, std::string_view reply)
+            {
+                if (!*alive)
+                    return;
+                st s = st::io_error;
+                if (!ok || !wire::decode_status(reply, s))
+                {
+                    ++m_c.peer_failures;
+                    s = st::io_error;
+                }
+                // A body that did not become a part is nobody's, and a name the
+                // owner already renamed is not there to remove.
+                if (s != st::ok)
+                    m_store.remove_tmp(bucket_name, tmp);
+                done({s, meta});
+            });
+    };
+}
+
+void shard_node::mpu_complete(std::string bucket, std::string key, std::string id,
+                              std::vector<complete_part> parts, std::function<void()> progress,
+                              std::function<void(complete_result)> cb)
+{
+    if (!m_mpu)
+    {
+        complete_result r;
+        r.error = make_error("InternalError");
+        cb(std::move(r));
+        return;
+    }
+    if (m_store.owns(bucket, key))
+    {
+        if (!mpu_find(bucket, key, id))
+        {
+            complete_result r;
+            r.error = make_error("NoSuchUpload");
+            cb(std::move(r));
+            return;
+        }
+        m_mpu->complete(std::move(bucket), std::move(id), std::move(parts), std::move(progress), std::move(cb));
+        return;
+    }
+
+    // The owner validates the list and seals the upload; this shard reads the parts,
+    // writes the object and has it committed through the owner of the key, which is
+    // the owner of the upload too, and the owner is then told how it ended.  Nothing
+    // long is asked of the owner over the link.
+    ++m_c.mpu_out;
+    auto alive = m_alive;
+    const uint32_t owner = m_store.owner_of(bucket, key);
+    wire::mpu_ref ref{bucket, key, id, 0, 0, false};
+    m_transport.call(owner, wire::encode_mpu_prepare(ref, parts),
+        [this, alive, owner, bucket, key, id, progress = std::move(progress), cb](bool ok, std::string_view reply) mutable
+        {
+            if (!*alive)
+                return;
+            s3_error err;
+            assemble_plan plan;
+            if (!ok || !wire::decode_mpu_plan(reply, err, plan))
+            {
+                ++m_c.peer_failures;
+                complete_result r;
+                r.error = make_error("InternalError");
+                cb(std::move(r));
+                return;
+            }
+            if (!err.code.empty())
+            {
+                complete_result r;
+                r.error = std::move(err);
+                cb(std::move(r));
+                return;
+            }
+            m_mpu->assemble_plan_object(std::move(plan), std::move(progress),
+                [this, alive, owner, bucket, key, id, cb](complete_result res)
+                {
+                    if (!*alive)
+                        return;
+                    wire::mpu_ref fin{bucket, key, id, 0, 0, res.error.code.empty()};
+                    m_transport.call(owner, wire::encode_mpu_ref(wire::op::mpu_finish, fin),
+                                     [this, alive](bool fok, std::string_view)
+                                     {
+                                         if (*alive && !fok)
+                                             ++m_c.peer_failures;
+                                     });
+                    cb(std::move(res));
+                });
+        });
+}
+
+void shard_node::mpu_abort(std::string bucket, std::string key, std::string id, std::function<void(bool)> cb)
+{
+    if (!m_mpu)
+    {
+        cb(false);
+        return;
+    }
+    if (m_store.owns(bucket, key))
+    {
+        if (!mpu_find(bucket, key, id) || !m_mpu->abort(bucket, id, [cb]() { cb(true); }))
+            cb(false);
+        return;
+    }
+    ++m_c.mpu_out;
+    auto alive = m_alive;
+    wire::mpu_ref ref{bucket, key, id, 0, 0, false};
+    m_transport.call(m_store.owner_of(bucket, key), wire::encode_mpu_ref(wire::op::mpu_abort, ref),
+        [this, alive, cb](bool ok, std::string_view reply)
+        {
+            if (!*alive)
+                return;
+            st s = st::io_error;
+            if (!ok || !wire::decode_status(reply, s))
+                ++m_c.peer_failures;
+            cb(ok && s == st::ok);
+        });
+}
+
+void shard_node::mpu_parts(std::string bucket, std::string key, std::string id, uint32_t marker,
+                           uint32_t max_parts, std::function<void(parts_page)> cb)
+{
+    if (!m_mpu)
+    {
+        parts_page pg;
+        pg.status = st::io_error;
+        cb(std::move(pg));
+        return;
+    }
+    if (m_store.owns(bucket, key))
+    {
+        cb(m_mpu->list_parts(bucket, id, key, marker, max_parts));
+        return;
+    }
+    ++m_c.mpu_out;
+    auto alive = m_alive;
+    wire::mpu_ref ref{bucket, key, id, marker, max_parts, false};
+    m_transport.call(m_store.owner_of(bucket, key), wire::encode_mpu_ref(wire::op::mpu_parts, ref),
+        [this, alive, cb](bool ok, std::string_view reply)
+        {
+            if (!*alive)
+                return;
+            parts_page pg;
+            if (!ok || !wire::decode_parts_page(reply, pg))
+            {
+                ++m_c.peer_failures;
+                pg = parts_page{};
+                pg.status = st::io_error;
+            }
+            cb(std::move(pg));
+        });
+}
+
+void shard_node::mpu_list(std::string bucket, std::function<void(st, std::vector<wire::upload_stub>)> cb)
+{
+    struct gather
+    {
+        std::vector<wire::upload_stub> all;
+        st failed{st::ok};
+    };
+    auto g = std::make_shared<gather>();
+    if (m_mpu)
+        for (const mpu_upload* u : m_mpu->uploads_of(bucket))
+            g->all.push_back({u->key, u->id, u->initiated_ms});
+    if (m_store.shards() > 1)
+        ++m_c.mpu_out;
+    each_peer([bucket](uint32_t) { return wire::encode_bucket(wire::op::mpu_list, bucket); },
+              [g](uint32_t, bool ok, std::string_view reply)
+              {
+                  st ps = st::io_error;
+                  std::vector<wire::upload_stub> part;
+                  bytes::reader r(reply);
+                  uint8_t b = 0;
+                  if (ok && r.u8(b) && b == static_cast<uint8_t>(st::ok) &&
+                      wire::decode_upload_list(reply.substr(1), part))
+                      ps = st::ok;
+                  if (ps != st::ok)
+                  {
+                      if (g->failed == st::ok)
+                          g->failed = ps;
+                      return;
+                  }
+                  for (auto& u : part)
+                      g->all.push_back(std::move(u));
+              },
+              [g, cb]()
+              {
+                  // A shard that could not answer would make the listing quietly short.
+                  cb(g->failed, g->failed == st::ok ? std::move(g->all) : std::vector<wire::upload_stub>{});
+              });
+}
+
 // ─── Answering a sibling ────────────────────────────────────────────────────
+
+void shard_node::serve_mpu(wire::op o, std::string_view payload, std::function<void(bool, std::string)> reply)
+{
+    if (!m_mpu)
+    {
+        reply(false, {});
+        return;
+    }
+    ++m_c.mpu_in;
+    switch (o)
+    {
+        case wire::op::mpu_create:
+        {
+            std::string bucket, key;
+            object_meta meta;
+            checksum_algo algo = checksum_algo::none;
+            if (!wire::decode_mpu_create(payload, bucket, key, meta, algo) || !m_store.owns(bucket, key))
+            {
+                reply(false, {});
+                return;
+            }
+            m_mpu->create(std::move(bucket), std::move(key), std::move(meta), algo,
+                          [reply](st s, std::string id) { reply(true, wire::encode_mpu_created(s, id)); });
+            return;
+        }
+        case wire::op::mpu_begin:
+        {
+            wire::mpu_ref r;
+            if (!wire::decode_mpu_ref(payload, o, r))
+            {
+                reply(false, {});
+                return;
+            }
+            checksum_algo algo = checksum_algo::none;
+            const st s = mpu_find(r.bucket, r.key, r.id) ? m_mpu->begin_part(r.bucket, r.id, algo) : st::no_such_key;
+            reply(true, wire::encode_mpu_begin(s, algo));
+            return;
+        }
+        case wire::op::mpu_part:
+        {
+            commit_request req;
+            std::string id;
+            uint32_t number = 0;
+            if (!wire::decode_mpu_part(payload, req, id, number))
+            {
+                reply(false, {});
+                return;
+            }
+            auto commit = m_mpu->part_committer(req.bucket, id, number);
+            commit(std::move(req), [reply](put_result r) { reply(true, wire::encode_status(r.status)); });
+            return;
+        }
+        case wire::op::mpu_prepare:
+        {
+            wire::mpu_ref r;
+            std::vector<complete_part> parts;
+            if (!wire::decode_mpu_prepare(payload, r, parts))
+            {
+                reply(false, {});
+                return;
+            }
+            if (!mpu_find(r.bucket, r.key, r.id))
+            {
+                reply(true, wire::encode_mpu_plan(make_error("NoSuchUpload"), {}));
+                return;
+            }
+            m_mpu->prepare_complete(r.bucket, r.id, std::move(parts),
+                [reply](s3_error err, assemble_plan plan) { reply(true, wire::encode_mpu_plan(err, plan)); },
+                true);
+            return;
+        }
+        case wire::op::mpu_finish:
+        {
+            wire::mpu_ref r;
+            if (!wire::decode_mpu_ref(payload, o, r))
+            {
+                reply(false, {});
+                return;
+            }
+            m_mpu->finish_complete(r.bucket, r.id, r.flag);
+            reply(true, wire::encode_status(st::ok));
+            return;
+        }
+        case wire::op::mpu_abort:
+        {
+            wire::mpu_ref r;
+            if (!wire::decode_mpu_ref(payload, o, r))
+            {
+                reply(false, {});
+                return;
+            }
+            if (!mpu_find(r.bucket, r.key, r.id) || !m_mpu->abort(r.bucket, r.id, [reply]() { reply(true, wire::encode_status(st::ok)); }))
+                reply(true, wire::encode_status(st::no_such_key));
+            return;
+        }
+        case wire::op::mpu_parts:
+        {
+            wire::mpu_ref r;
+            if (!wire::decode_mpu_ref(payload, o, r))
+            {
+                reply(false, {});
+                return;
+            }
+            reply(true, wire::encode_parts_page(m_mpu->list_parts(r.bucket, r.id, r.key, r.a, r.b)));
+            return;
+        }
+        case wire::op::mpu_list:
+        {
+            std::string bucket;
+            int64_t ms = 0;
+            if (!wire::decode_bucket(payload, bucket, ms))
+            {
+                reply(false, {});
+                return;
+            }
+            std::vector<wire::upload_stub> all;
+            for (const mpu_upload* u : m_mpu->uploads_of(bucket))
+                all.push_back({u->key, u->id, u->initiated_ms});
+            reply(true, wire::encode_status(st::ok) + wire::encode_upload_list(all));
+            return;
+        }
+        default:
+            break;
+    }
+    reply(false, {});
+}
 
 void shard_node::serve(std::string_view payload, std::function<void(bool, std::string)> reply)
 {
@@ -390,6 +808,12 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
         }
         default:
             break;
+    }
+
+    if (o >= wire::op::mpu_create)
+    {
+        serve_mpu(o, payload, std::move(reply));
+        return;
     }
 
     std::string name;

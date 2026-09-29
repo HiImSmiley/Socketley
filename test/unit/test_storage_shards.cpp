@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "runtime/storage/object_format.h"
+#include "runtime/storage/multipart.h"
 #include "runtime/storage/object_store.h"
 #include "runtime/storage/shard_node.h"
 #include "runtime/storage/shard_owner.h"
@@ -69,6 +70,7 @@ struct member : io_handler
     event_loop                    loop{256};
     std::unique_ptr<file_io>      io;
     std::unique_ptr<object_store> store;
+    std::unique_ptr<multipart_store> mpu;
     std::unique_ptr<shard_node>   node;
     recovery_report               report;
 
@@ -123,7 +125,12 @@ struct cluster : shard_transport
             const bool ok = mb->store->open(err, &mb->report);
             INFO(err);
             REQUIRE(ok);
+            mb->mpu = std::make_unique<multipart_store>(mb->loop, *mb->io, *mb->store);
+            REQUIRE(mb->mpu->open(err));
             mb->node = std::make_unique<shard_node>(*mb->store, *this);
+            mb->node->set_multipart(mb->mpu.get());
+            multipart_store* mp = mb->mpu.get();
+            mb->store->set_drop_guard([mp](std::string_view bucket) { return mp->bucket_has_uploads(bucket); });
             m.push_back(std::move(mb));
         }
     }
@@ -308,6 +315,92 @@ struct cluster : shard_transport
         for (const auto& e : fs::directory_iterator(dir + "/" + bucket + "/tmp", ec))
             out.push_back(e.path().filename().string());
         return out;
+    }
+
+    // ── Multipart, each step on the shard a client happened to land on ─────
+    std::string mpu_create(uint32_t s, const std::string& bucket, const std::string& key,
+                           checksum_algo algo = checksum_algo::none)
+    {
+        std::string id;
+        st got = st::io_error;
+        bool fired = false;
+        m[s]->node->mpu_create(bucket, key, {}, algo, [&](st r, std::string i) { got = r; id = i; fired = true; });
+        REQUIRE(until([&] { return fired; }));
+        REQUIRE(got == st::ok);
+        return id;
+    }
+
+    st mpu_put_part(uint32_t s, const std::string& bucket, const std::string& key, const std::string& id,
+                    uint32_t number, const std::string& body)
+    {
+        st why = st::ok;
+        auto op = m[s]->store->begin_put(bucket, "mpu/" + id + "/" + std::to_string(number), {}, body.size(), true, why);
+        if (!op)
+            return why;
+        op->set_committer(m[s]->node->mpu_part_committer(bucket, key, id, number));
+        size_t off = 0;
+        while (off < body.size() && !op->failed())
+        {
+            const size_t took = op->append(body.data() + off, std::min<size_t>(body.size() - off, 1u << 20));
+            off += took;
+            if (took == 0)
+            {
+                bool ready = false;
+                op->on_ready([&] { ready = true; });
+                if (!until([&] { return ready || op->failed(); }))
+                    return st::io_error;
+            }
+        }
+        put_result out;
+        bool fired = false;
+        op->finish(nullptr, [&](put_result r) { out = std::move(r); fired = true; });
+        REQUIRE(until([&] { return fired; }, 30000));
+        return out.status;
+    }
+
+    complete_result mpu_complete(uint32_t s, const std::string& bucket, const std::string& key, const std::string& id,
+                                 const std::vector<std::pair<uint32_t, std::string>>& parts)
+    {
+        std::vector<complete_part> list;
+        for (const auto& [n, body] : parts)
+        {
+            complete_part cp;
+            cp.number = n;
+            cp.etag   = hex(md5_of(body));
+            list.push_back(cp);
+        }
+        complete_result out;
+        bool fired = false;
+        m[s]->node->mpu_complete(bucket, key, id, std::move(list), [] {}, [&](complete_result r) { out = std::move(r); fired = true; });
+        REQUIRE(until([&] { return fired; }, 60000));
+        return out;
+    }
+
+    std::vector<wire::upload_stub> mpu_list(uint32_t s, const std::string& bucket)
+    {
+        std::vector<wire::upload_stub> out;
+        bool fired = false;
+        m[s]->node->mpu_list(bucket, [&](st r, std::vector<wire::upload_stub> v) { REQUIRE(r == st::ok); out = std::move(v); fired = true; });
+        REQUIRE(until([&] { return fired; }));
+        return out;
+    }
+
+    bool mpu_abort(uint32_t s, const std::string& bucket, const std::string& key, const std::string& id)
+    {
+        bool found = false, fired = false;
+        m[s]->node->mpu_abort(bucket, key, id, [&](bool f) { found = f; fired = true; });
+        REQUIRE(until([&] { return fired; }));
+        return found;
+    }
+
+    parts_page mpu_parts(uint32_t s, const std::string& bucket, const std::string& key, const std::string& id,
+                         uint32_t marker = 0, uint32_t max = 1000)
+    {
+        parts_page pg;
+        bool fired = false;
+        m[s]->node->mpu_parts(bucket, key, id, marker, max, [&](parts_page p) { pg = std::move(p); fired = true; });
+        REQUIRE(until([&] { return fired; }));
+        return pg;
     }
 
     uint64_t objects_held() const
@@ -1022,4 +1115,265 @@ TEST_CASE("a quota is an equal share for each shard")
     CHECK(c.tmp_empties("bkt"));
     for (const auto& mb : c.m)
         CHECK(mb->store->totals().bytes <= (1u << 20));
+}
+
+// ─── Multipart on a sharded runtime ─────────────────────────────────────────
+
+namespace {
+
+// A key the shard `want` owns in `bucket`, for a test that needs the owner and the shards around it.
+std::string key_owned_by(const std::string& bucket, uint32_t want, uint32_t shards, const std::string& stem = "mp")
+{
+    for (int i = 0; i < 100000; ++i)
+    {
+        const std::string k = stem + std::to_string(i);
+        if (object_owner(bucket, k, shards) == want)
+            return k;
+    }
+    FAIL("no key");
+    return {};
+}
+
+}   // namespace
+
+TEST_CASE("an upload lives on the shard that owns its key and completes through any other")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 2, 4);
+
+    // Begun through shard 3, whose own store holds nothing of it.
+    const std::string id = c.mpu_create(3, "bkt", key);
+    CHECK(c.m[2]->mpu->find("bkt", id) != nullptr);
+    for (uint32_t s : {0u, 1u, 3u})
+        CHECK(c.m[s]->mpu->find("bkt", id) == nullptr);
+
+    // Parts written where each connection landed, whichever shard that is.
+    const std::string p1 = pattern(5u << 20, 1), p2 = pattern(5u << 20, 2), p3 = pattern(100000, 3);
+    REQUIRE(c.mpu_put_part(0, "bkt", key, id, 1, p1) == st::ok);
+    REQUIRE(c.mpu_put_part(1, "bkt", key, id, 2, p2) == st::ok);
+    REQUIRE(c.mpu_put_part(2, "bkt", key, id, 3, p3) == st::ok);
+    // A part of the same number again replaces it, from a fourth shard.
+    REQUIRE(c.mpu_put_part(3, "bkt", key, id, 3, p3) == st::ok);
+
+    const parts_page pg = c.mpu_parts(1, "bkt", key, id);
+    REQUIRE(pg.status == st::ok);
+    CHECK(pg.key == key);
+    REQUIRE(pg.rows.size() == 3);
+    CHECK(pg.rows[0].size == p1.size());
+    CHECK(pg.rows[2].etag == hex(md5_of(p3)));
+    // Pages of it.
+    const parts_page first = c.mpu_parts(0, "bkt", key, id, 0, 2);
+    CHECK(first.rows.size() == 2);
+    CHECK(first.truncated);
+    CHECK(first.next_marker == 2);
+    const parts_page rest = c.mpu_parts(3, "bkt", key, id, first.next_marker, 2);
+    REQUIRE(rest.rows.size() == 1);
+    CHECK(rest.rows[0].number == 3);
+    CHECK_FALSE(rest.truncated);
+    // The wrong key names no upload, whoever is asked.
+    CHECK(c.mpu_parts(1, "bkt", "elsewhere", id).status != st::ok);
+
+    // Completed through shard 1, which reads the parts and writes the object; the key's owner commits it.
+    const uint64_t out_before = c.m[1]->node->counters().commits_out;
+    const complete_result done = c.mpu_complete(1, "bkt", key, id, {{1, p1}, {2, p2}, {3, p3}});
+    REQUIRE(done.error.code.empty());
+    CHECK(done.meta.parts == 3);
+    CHECK(done.meta.size == p1.size() + p2.size() + p3.size());
+    std::string md5s = std::string(reinterpret_cast<const char*>(md5_of(p1).data()), 16) +
+                       std::string(reinterpret_cast<const char*>(md5_of(p2).data()), 16) +
+                       std::string(reinterpret_cast<const char*>(md5_of(p3).data()), 16);
+    CHECK(done.meta.etag() == hex(md5_of(md5s)) + "-3");
+    CHECK(c.m[1]->node->counters().commits_out == out_before + 1);
+    CHECK(c.m[2]->store->find("bkt", key) != nullptr);
+    for (uint32_t s : {0u, 1u, 3u})
+        CHECK(c.m[s]->store->find("bkt", key) == nullptr);
+
+    std::string all = p1 + p2 + p3;
+    for (uint32_t s = 0; s < 4; ++s)
+    {
+        std::string got;
+        REQUIRE(c.get(s, "bkt", key, got) == st::ok);
+        CHECK(got == all);
+    }
+
+    // The upload is gone from its owner, with its directory, and nothing is left in tmp/.
+    CHECK(c.until([&] { return c.m[2]->mpu->find("bkt", id) == nullptr; }));
+    CHECK(c.until([&] { return !fs::exists(d.path + "/bkt/mpu/" + id); }));
+    CHECK(c.tmp_empties("bkt"));
+    // Completing it again is NoSuchUpload, through any shard.
+    for (uint32_t s : {0u, 2u, 3u})
+        CHECK(c.mpu_complete(s, "bkt", key, id, {{1, p1}}).error.code == "NoSuchUpload");
+}
+
+TEST_CASE("a completion that fails on another shard opens the upload again, and a bad list is refused there")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 1, 3);
+    const std::string id = c.mpu_create(2, "bkt", key);
+    const std::string p1 = pattern(5u << 20, 4), p2 = pattern(1000, 5);
+    REQUIRE(c.mpu_put_part(0, "bkt", key, id, 1, p1) == st::ok);
+    REQUIRE(c.mpu_put_part(2, "bkt", key, id, 2, p2) == st::ok);
+
+    // A part the client never sent, a wrong ETag, a list out of order: each refused by the owner.
+    CHECK(c.mpu_complete(0, "bkt", key, id, {{1, p1}, {9, p2}}).error.code == "InvalidPart");
+    CHECK(c.mpu_complete(0, "bkt", key, id, {{1, p2}, {2, p2}}).error.code == "InvalidPart");
+    CHECK(c.mpu_complete(0, "bkt", key, id, {{2, p2}, {1, p1}}).error.code == "InvalidPartOrder");
+    // Each left the upload open, so the right list still completes it.
+    const complete_result ok = c.mpu_complete(2, "bkt", key, id, {{1, p1}, {2, p2}});
+    CHECK(ok.error.code.empty());
+    std::string got;
+    REQUIRE(c.get(0, "bkt", key, got) == st::ok);
+    CHECK(got == p1 + p2);
+}
+
+TEST_CASE("an assembler that dies leaves the upload sealed only until it is opened again")
+{
+    tmpdir d;
+    cluster c(d.path, 2);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 1, 2);
+    const std::string id = c.mpu_create(0, "bkt", key);
+    const std::string p1 = pattern(1000, 6);
+    REQUIRE(c.mpu_put_part(0, "bkt", key, id, 1, p1) == st::ok);
+
+    // The owner is asked to seal it for an assembler on shard 0, which then never answers.
+    bool prepared = false;
+    c.m[1]->mpu->prepare_complete("bkt", id, {complete_part{1, hex(md5_of(p1)), checksum_algo::none, {}}},
+                                  [&](s3_error e, assemble_plan) { CHECK(e.code.empty()); prepared = true; }, true);
+    REQUIRE(c.until([&] { return prepared; }));
+    checksum_algo a = checksum_algo::none;
+    CHECK(c.m[1]->mpu->begin_part("bkt", id, a) != st::ok);
+    // Not yet: the assembler may still be working.
+    c.m[1]->mpu->unseal_stale(0);
+    CHECK(c.m[1]->mpu->begin_part("bkt", id, a) != st::ok);
+    c.m[1]->mpu->unseal_stale(static_cast<int64_t>(c.m[1]->store->now_ms()) + 1000);
+    CHECK(c.m[1]->mpu->begin_part("bkt", id, a) == st::ok);
+}
+
+TEST_CASE("a listing of uploads is every shard's, and a bucket with one anywhere is not dropped")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(1, "bkt") == st::ok);
+
+    std::vector<std::pair<std::string, std::string>> made;
+    for (int i = 0; i < 12; ++i)
+    {
+        const std::string key = "up/" + std::to_string(i);
+        made.emplace_back(key, c.mpu_create(static_cast<uint32_t>(i) % 4, "bkt", key));
+    }
+    std::vector<std::string> want;
+    for (const auto& [k, id] : made)
+        want.push_back(k + "/" + id);
+    std::sort(want.begin(), want.end());
+    // Held by more than one shard, and listed whole by every one.
+    int holders = 0;
+    for (uint32_t s = 0; s < 4; ++s)
+        holders += c.m[s]->mpu->uploads_of("bkt").empty() ? 0 : 1;
+    CHECK(holders >= 2);
+    for (uint32_t s = 0; s < 4; ++s)
+    {
+        std::vector<std::string> got;
+        for (const auto& u : c.mpu_list(s, "bkt"))
+            got.push_back(u.key + "/" + u.id);
+        std::sort(got.begin(), got.end());
+        CHECK(got == want);
+    }
+
+    // No object in the bucket, and a drop through any shard is still refused while an upload is open.
+    for (uint32_t s = 0; s < 4; ++s)
+        CHECK(c.drop_bucket(s, "bkt") == st::bucket_not_empty);
+    for (uint32_t s = 0; s < 4; ++s)
+        CHECK(c.m[s]->store->has_bucket("bkt"));
+    // Aborting them all, each through another shard than the one that made it, lets it go.
+    for (size_t i = 0; i < made.size(); ++i)
+        CHECK(c.mpu_abort(static_cast<uint32_t>(i + 1) % 4, "bkt", made[i].first, made[i].second));
+    CHECK_FALSE(c.mpu_abort(0, "bkt", made[0].first, made[0].second));
+    CHECK(c.until([&] { return c.mpu_list(0, "bkt").empty(); }));
+    CHECK(c.drop_bucket(2, "bkt") == st::ok);
+}
+
+TEST_CASE("a part whose owner cannot be reached is refused and its temporary file removed")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 2, 3);
+    const std::string id = c.mpu_create(0, "bkt", key);
+    c.unreachable.insert(2);
+    CHECK(c.mpu_put_part(0, "bkt", key, id, 1, pattern(2000, 7)) == st::io_error);
+    CHECK(c.tmp_empties("bkt"));
+    c.unreachable.clear();
+    CHECK(c.mpu_put_part(0, "bkt", key, id, 1, pattern(2000, 7)) == st::ok);
+    CHECK(c.mpu_parts(1, "bkt", key, id).rows.size() == 1);
+}
+
+TEST_CASE("uploads are found again by the shard that owns their key after a restart, whatever the count")
+{
+    tmpdir d;
+    std::vector<std::pair<std::string, std::string>> made;
+    const std::string p1 = pattern(5u << 20, 8), p2 = pattern(2000, 9);
+    {
+        cluster c(d.path, 4);
+        REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+        for (int i = 0; i < 8; ++i)
+        {
+            const std::string key = "held/" + std::to_string(i);
+            const std::string id = c.mpu_create(static_cast<uint32_t>(i) % 4, "bkt", key);
+            REQUIRE(c.mpu_put_part(static_cast<uint32_t>(i + 1) % 4, "bkt", key, id, 1, p1) == st::ok);
+            REQUIRE(c.mpu_put_part(static_cast<uint32_t>(i + 2) % 4, "bkt", key, id, 2, p2) == st::ok);
+            made.emplace_back(key, id);
+        }
+        c.stop(true);
+    }
+    for (uint32_t n : {2u, 3u, 1u, 4u})
+    {
+        cluster c(d.path, n);
+        int total = 0;
+        for (const auto& [key, id] : made)
+        {
+            const uint32_t owner = object_owner("bkt", key, n);
+            for (uint32_t s = 0; s < n; ++s)
+                CHECK((c.m[s]->mpu->find("bkt", id) != nullptr) == (s == owner));
+            const parts_page pg = c.mpu_parts(static_cast<uint32_t>(total) % n, "bkt", key, id);
+            REQUIRE(pg.status == st::ok);
+            CHECK(pg.rows.size() == 2);
+            ++total;
+        }
+        c.stop(true);
+    }
+    // And one of them completes, in the split the last round left.
+    cluster c(d.path, 4);
+    const auto& [key, id] = made[3];
+    const complete_result done = c.mpu_complete(1, "bkt", key, id, {{1, p1}, {2, p2}});
+    CHECK(done.error.code.empty());
+    std::string got;
+    REQUIRE(c.get(2, "bkt", key, got) == st::ok);
+    CHECK(got == p1 + p2);
+}
+
+TEST_CASE("a restarted shard leaves a sibling's upload being made alone, and removes one that was never made")
+{
+    tmpdir d;
+    {
+        cluster c(d.path, 2);
+        REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+        c.stop(true);
+    }
+    // A directory with no meta file yet is another shard's upload being made this moment.
+    fs::create_directories(d.path + "/bkt/mpu/0123456789abcdef0123456789abcdef");
+    {
+        cluster c(d.path, 2);
+        CHECK(fs::exists(d.path + "/bkt/mpu/0123456789abcdef0123456789abcdef"));
+        c.stop(true);
+    }
+    // At one shard there is nobody it could be, and it is removed as it always was.
+    {
+        cluster c(d.path, 1);
+        CHECK_FALSE(fs::exists(d.path + "/bkt/mpu/0123456789abcdef0123456789abcdef"));
+    }
 }

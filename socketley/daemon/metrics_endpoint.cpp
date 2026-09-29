@@ -432,7 +432,21 @@ static storage_row parse_storage_row(std::string_view name, std::string_view det
         const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), v);
         if (ec != std::errc{} || end != num.data() + num.size())
             continue;
-        row.figures.emplace_back(std::string(line.substr(0, colon)), v);
+        // A sharded runtime's text is one section per shard, so a figure that
+        // comes again is the next shard's: added, except the ones every shard
+        // holds a whole copy of.
+        const std::string_view key = line.substr(0, colon);
+        bool merged = false;
+        for (auto& [k, held] : row.figures)
+            if (k == key)
+            {
+                if (key != "buckets" && key != "max_bytes" && key != "tls" && key != "shard_index")
+                    held += v;
+                merged = true;
+                break;
+            }
+        if (!merged)
+            row.figures.emplace_back(std::string(key), v);
     }
     return row;
 }

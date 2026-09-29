@@ -1639,8 +1639,16 @@ st object_store::drop_check(std::string_view name)
         return b->objects.empty() ? st::busy : st::bucket_not_empty;
     if (!b->objects.empty())
         return st::bucket_not_empty;
+    if (m_drop_guard && m_drop_guard(name))
+        return st::bucket_not_empty;
     b->closing = true;
     return st::ok;
+}
+
+void object_store::remove_tmp(std::string_view bucket_name, std::string tmp_name)
+{
+    if (bucket* b = find_bucket(bucket_name))
+        if (!m_io->unlinkat(b->tmp_fd, std::move(tmp_name), 0, [](int64_t) {})) {}
 }
 
 void object_store::drop_abort(std::string_view name)

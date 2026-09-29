@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 
@@ -221,6 +222,9 @@ struct assemble_state
     bool     buf_free[2]{true, true};
     std::function<void()> progress;
     std::function<void(complete_result)> cb;
+    // Whether the upload is this store's, to be removed or opened again when the
+    // object is done; an assembler on behalf of another shard leaves that to it.
+    bool     local{true};
 };
 
 multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& store)
@@ -341,16 +345,23 @@ bool multipart_store::recover_bucket(const std::string& bucket, std::string& err
             continue;
         }
 
-        // An upload whose meta file is not whole was never acknowledged.
+        // An upload whose meta file is not whole was never acknowledged, unless a
+        // sibling shard is making it this moment, which only its age tells apart.
         std::string head;
         decoded_header dh;
         if (read_prefix(dir.string() + "/meta", 64 * 1024, head))
             dh = decode_object_header(head);
         if (dh.status != header_status::ok)
         {
-            fs::remove_all(dir, dc);
+            const auto age = std::filesystem::file_time_type::clock::now() - fs::last_write_time(dir, dc);
+            if (m_store->shard() == 0 && !dc && (m_store->shards() == 1 || age > std::chrono::seconds(60)))
+                fs::remove_all(dir, dc);
             continue;
         }
+        // An upload belongs to the shard that owns its key, which is how every
+        // request that names it finds it.
+        if (!m_store->owns(bucket, dh.key))
+            continue;
 
         auto up = std::make_unique<mpu_upload>();
         up->bucket       = bucket;
@@ -745,13 +756,114 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
 void multipart_store::complete(std::string bucket, std::string id, std::vector<complete_part> parts,
                                std::function<void()> progress, std::function<void(complete_result)> cb)
 {
+    prepare_complete(bucket, id, std::move(parts),
+        [this, alive = m_alive, progress = std::move(progress), cb](s3_error err, assemble_plan plan) mutable
+        {
+            if (!*alive)
+                return;
+            if (!err.code.empty())
+            {
+                complete_result r;
+                r.error = std::move(err);
+                cb(std::move(r));
+                return;
+            }
+            auto a = std::make_shared<assemble_state>();
+            a->bucket       = std::move(plan.bucket);
+            a->id           = std::move(plan.id);
+            a->key          = std::move(plan.key);
+            a->meta         = std::move(plan.meta);
+            a->checksum_b64 = std::move(plan.checksum_b64);
+            a->parts        = std::move(plan.parts);
+            a->tmp_name     = m_store->tmp_name();
+            a->tmp_path     = base_of(a->bucket) + "/tmp/" + a->tmp_name;
+            a->dir_path     = upload_path(a->bucket, a->id);
+            a->cb           = std::move(cb);
+            a->progress     = std::move(progress);
+            assemble(std::move(a));
+        });
+}
+
+void multipart_store::assemble_plan_object(assemble_plan plan, std::function<void()> progress,
+                                           std::function<void(complete_result)> cb)
+{
+    auto a = std::make_shared<assemble_state>();
+    a->bucket       = std::move(plan.bucket);
+    a->id           = std::move(plan.id);
+    a->key          = std::move(plan.key);
+    a->meta         = std::move(plan.meta);
+    a->checksum_b64 = std::move(plan.checksum_b64);
+    a->parts        = std::move(plan.parts);
+    a->tmp_name     = m_store->tmp_name();
+    a->tmp_path     = base_of(a->bucket) + "/tmp/" + a->tmp_name;
+    a->dir_path     = upload_path(a->bucket, a->id);
+    a->cb           = std::move(cb);
+    a->progress     = std::move(progress);
+    a->local        = false;
+    assemble(std::move(a));
+}
+
+void multipart_store::finish_complete(std::string bucket, std::string id, bool ok)
+{
+    mpu_upload* u = find_mut(bucket, id);
+    if (!u)
+        return;
+    u->remote_sealed = false;
+    if (!ok)
+    {
+        u->state = mpu_state::open;
+        return;
+    }
+    u->state = mpu_state::removing;
+    remove_upload(std::move(bucket), std::move(id), {});
+}
+
+void multipart_store::unseal_stale(int64_t older_than_ms)
+{
+    for (auto& [k, up] : m_uploads)
+        if (up->state == mpu_state::sealed && up->remote_sealed && up->sealed_ms < older_than_ms)
+        {
+            up->state         = mpu_state::open;
+            up->remote_sealed = false;
+        }
+}
+
+parts_page multipart_store::list_parts(std::string_view bucket, std::string_view id, std::string_view key,
+                                       uint32_t marker, uint32_t max_parts) const
+{
+    parts_page pg;
+    const mpu_upload* up = find(bucket, id);
+    if (!up || up->key != key || up->state == mpu_state::removing)
+    {
+        pg.status = st::no_such_key;
+        return pg;
+    }
+    pg.key  = up->key;
+    pg.id   = up->id;
+    pg.algo = up->algo;
+    for (auto it = up->parts.upper_bound(marker); it != up->parts.end(); ++it)
+    {
+        if (pg.rows.size() == max_parts)
+        {
+            pg.truncated = true;
+            break;
+        }
+        const mpu_part& p = it->second;
+        pg.rows.push_back({p.number, p.mtime_ms, p.etag(), p.size, up->algo, p.checksum_b64});
+        pg.next_marker = p.number;
+    }
+    return pg;
+}
+
+void multipart_store::prepare_complete(std::string bucket, std::string id, std::vector<complete_part> parts,
+                                       std::function<void(s3_error, assemble_plan)> cb, bool remote)
+{
     auto fail = [&cb](std::string_view code, std::string_view message = {})
     {
-        complete_result r;
-        r.error = make_error(code);
+        s3_error e = make_error(code);
         if (!message.empty())
-            r.error.message = std::string(message);
-        cb(std::move(r));
+            e.message = std::string(message);
+        cb(std::move(e), {});
     };
 
     mpu_upload* up = find_mut(bucket, id);
@@ -761,9 +873,11 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
         return;
     }
     up->state = mpu_state::sealed;
+    up->remote_sealed = remote;
+    up->sealed_ms     = static_cast<int64_t>(m_store->now_ms());
     ++m_inflight;
 
-    auto go = [this, alive = m_alive, bucket, id, parts = std::move(parts), progress = std::move(progress), cb]() mutable
+    auto go = [this, alive = m_alive, bucket, id, parts = std::move(parts), cb]() mutable
     {
         if (!*alive)
             return;
@@ -771,19 +885,19 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
         auto reject = [&](std::string_view code, std::string_view message = {})
         {
             if (mpu_upload* u = find_mut(bucket, id))
-                u->state = mpu_state::open;
-            complete_result r;
-            r.error = make_error(code);
+            {
+                u->state         = mpu_state::open;
+                u->remote_sealed = false;
+            }
+            s3_error e = make_error(code);
             if (!message.empty())
-                r.error.message = std::string(message);
-            cb(std::move(r));
+                e.message = std::string(message);
+            cb(std::move(e), {});
         };
         mpu_upload* u = find_mut(bucket, id);
         if (!u)
         {
-            complete_result r;
-            r.error = make_error("NoSuchUpload");
-            cb(std::move(r));
+            cb(make_error("NoSuchUpload"), {});
             return;
         }
         if (parts.empty())
@@ -812,7 +926,7 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             }
         }
 
-        auto a = std::make_shared<assemble_state>();
+        assemble_plan plan;
         uint64_t total = 0;
         std::string md5s;
         std::string raw_checksums;
@@ -850,7 +964,7 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
                 }
                 raw_checksums += raw;
             }
-            a->parts.push_back(have);
+            plan.parts.push_back(have);
         }
         if (total > m_store->options().max_object_bytes)
         {
@@ -858,25 +972,20 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             return;
         }
 
-        a->bucket   = bucket;
-        a->id       = id;
-        a->key      = u->key;
-        a->meta     = u->meta;
-        a->meta.size  = total;
-        a->meta.md5   = md5_of(md5s);
-        a->meta.parts = static_cast<uint32_t>(parts.size());
-        a->meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
+        plan.bucket   = bucket;
+        plan.id       = id;
+        plan.key      = u->key;
+        plan.meta     = u->meta;
+        plan.meta.size  = total;
+        plan.meta.md5   = md5_of(md5s);
+        plan.meta.parts = static_cast<uint32_t>(parts.size());
+        plan.meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
         if (u->algo != checksum_algo::none)
         {
-            a->checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
-            a->meta.extra.emplace_back(std::string(checksum_header(u->algo)), a->checksum_b64);
+            plan.checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
+            plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
         }
-        a->tmp_name = m_store->tmp_name();
-        a->tmp_path = base_of(bucket) + "/tmp/" + a->tmp_name;
-        a->dir_path = upload_path(bucket, id);
-        a->cb       = std::move(cb);
-        a->progress = std::move(progress);
-        assemble(std::move(a));
+        cb({}, std::move(plan));
     };
 
     if (up->committing > 0)
@@ -1054,8 +1163,9 @@ void multipart_store::assemble_finish(const std::shared_ptr<assemble_state>& a)
         --m_inflight;
         a->dst.reset();
         if (!m_io->unlinkat(AT_FDCWD, a->tmp_path, 0, [](int64_t) {})) {}
-        if (mpu_upload* u = find_mut(a->bucket, a->id))
-            u->state = mpu_state::open;
+        if (a->local)
+            if (mpu_upload* u = find_mut(a->bucket, a->id))
+                u->state = mpu_state::open;
         complete_result r;
         r.error = error_for(why);
         a->cb(std::move(r));
@@ -1092,15 +1202,18 @@ void multipart_store::assemble_finish(const std::shared_ptr<assemble_state>& a)
                 return;
             }
             --m_inflight;
-            if (mpu_upload* u = find_mut(a->bucket, a->id))
-                u->state = mpu_state::removing;
+            if (a->local)
+                if (mpu_upload* u = find_mut(a->bucket, a->id))
+                    u->state = mpu_state::removing;
             complete_result out;
             out.meta         = pr.meta;
             out.checksum_b64 = a->checksum_b64;
             const std::string bucket = a->bucket;
             const std::string id     = a->id;
+            const bool local = a->local;
             a->cb(std::move(out));
-            remove_upload(bucket, id, {});
+            if (local)
+                remove_upload(bucket, id, {});
         });
     });
     if (!q)

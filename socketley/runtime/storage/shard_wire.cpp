@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::drop_forget))
+        o > static_cast<uint8_t>(op::mpu_list))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -361,6 +361,313 @@ list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys)
     out.truncated = true;
     out.resume_at = std::move(resume);
     return out;
+}
+
+// ─── Multipart ──────────────────────────────────────────────────────────────
+
+namespace
+{
+
+constexpr size_t id_cap = 128;
+
+void put_meta(bytes::writer& w, std::string_view key, const object_meta& m)
+{
+    std::string rec;
+    encode_put_record(rec, key, m);
+    w.bytes(rec);
+}
+
+bool get_meta(bytes::reader& r, std::string& key, object_meta& m)
+{
+    std::string rec;
+    return r.bytes(rec, record_cap) && decode_record(rec, key, m);
+}
+
+void put_part(bytes::writer& w, const mpu_part& p)
+{
+    w.u32(p.number);
+    w.u64(p.size);
+    for (const uint8_t b : p.md5)
+        w.u8(b);
+    w.u64(static_cast<uint64_t>(p.mtime_ms));
+    w.u64(p.data_off);
+    w.bytes(p.checksum_b64);
+}
+
+bool get_part(bytes::reader& r, mpu_part& p)
+{
+    uint64_t mt = 0, off = 0;
+    if (!r.u32(p.number) || !r.u64(p.size))
+        return false;
+    for (uint8_t& b : p.md5)
+        if (!r.u8(b))
+            return false;
+    if (!r.u64(mt) || !r.u64(off) || !r.bytes(p.checksum_b64, 256))
+        return false;
+    p.mtime_ms = static_cast<int64_t>(mt);
+    p.data_off = static_cast<size_t>(off);
+    return true;
+}
+
+bool algo_byte(bytes::reader& r, checksum_algo& a)
+{
+    uint8_t b = 0;
+    if (!r.u8(b) || b > static_cast<uint8_t>(checksum_algo::sha256))
+        return false;
+    a = static_cast<checksum_algo>(b);
+    return true;
+}
+
+}   // namespace
+
+std::string encode_mpu_create(std::string_view bucket, std::string_view key, const object_meta& meta,
+                              checksum_algo algo)
+{
+    bytes::writer w = begin(op::mpu_create);
+    w.bytes(bucket);
+    w.bytes(key);
+    w.u8(static_cast<uint8_t>(algo));
+    put_meta(w, key, meta);
+    return w.take();
+}
+
+bool decode_mpu_create(std::string_view payload, std::string& bucket, std::string& key, object_meta& meta,
+                       checksum_algo& algo)
+{
+    bytes::reader r(payload);
+    std::string k2;
+    return open_request(r, op::mpu_create) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap) &&
+           algo_byte(r, algo) && get_meta(r, k2, meta) && k2 == key;
+}
+
+std::string encode_mpu_ref(op o, const mpu_ref& ref)
+{
+    bytes::writer w = begin(o);
+    w.bytes(ref.bucket);
+    w.bytes(ref.key);
+    w.bytes(ref.id);
+    w.u32(ref.a);
+    w.u32(ref.b);
+    w.u8(ref.flag ? 1 : 0);
+    return w.take();
+}
+
+bool decode_mpu_ref(std::string_view payload, op want, mpu_ref& ref)
+{
+    bytes::reader r(payload);
+    return open_request(r, want) && r.bytes(ref.bucket, name_cap) && r.bytes(ref.key, name_cap) &&
+           r.bytes(ref.id, id_cap) && r.u32(ref.a) && r.u32(ref.b) && r.flag(ref.flag);
+}
+
+std::string encode_mpu_part(const commit_request& req, std::string_view id, uint32_t number)
+{
+    bytes::writer w = begin(op::mpu_part);
+    w.bytes(req.bucket);
+    w.bytes(req.key);
+    w.bytes(req.tmp_name);
+    w.bytes(id);
+    w.u32(number);
+    put_meta(w, req.key, req.meta);
+    return w.take();
+}
+
+bool decode_mpu_part(std::string_view payload, commit_request& req, std::string& id, uint32_t& number)
+{
+    bytes::reader r(payload);
+    std::string k2;
+    return open_request(r, op::mpu_part) && r.bytes(req.bucket, name_cap) && r.bytes(req.key, name_cap) &&
+           r.bytes(req.tmp_name, name_cap) && r.bytes(id, id_cap) && r.u32(number) &&
+           get_meta(r, k2, req.meta) && k2 == req.key;
+}
+
+std::string encode_mpu_prepare(const mpu_ref& ref, const std::vector<complete_part>& parts)
+{
+    bytes::writer w = begin(op::mpu_prepare);
+    w.bytes(ref.bucket);
+    w.bytes(ref.key);
+    w.bytes(ref.id);
+    w.u32(static_cast<uint32_t>(parts.size()));
+    for (const complete_part& p : parts)
+    {
+        w.u32(p.number);
+        w.bytes(p.etag);
+        w.u8(static_cast<uint8_t>(p.checksum_algo_));
+        w.bytes(p.checksum_b64);
+    }
+    return w.take();
+}
+
+bool decode_mpu_prepare(std::string_view payload, mpu_ref& ref, std::vector<complete_part>& parts)
+{
+    bytes::reader r(payload);
+    uint32_t n = 0;
+    if (!open_request(r, op::mpu_prepare) || !r.bytes(ref.bucket, name_cap) || !r.bytes(ref.key, name_cap) ||
+        !r.bytes(ref.id, id_cap) || !r.u32(n) || n > 20000 || n > r.left() / 4)
+        return false;
+    parts.clear();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        complete_part p;
+        if (!r.u32(p.number) || !r.bytes(p.etag, 256) || !algo_byte(r, p.checksum_algo_) ||
+            !r.bytes(p.checksum_b64, 256))
+            return false;
+        parts.push_back(std::move(p));
+    }
+    return true;
+}
+
+std::string encode_mpu_created(st s, std::string_view id)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(s));
+    w.bytes(id);
+    return w.take();
+}
+
+bool decode_mpu_created(std::string_view reply, st& s, std::string& id)
+{
+    bytes::reader r(reply);
+    return status_byte(r, s) && r.bytes(id, id_cap);
+}
+
+std::string encode_mpu_begin(st s, checksum_algo algo)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(s));
+    w.u8(static_cast<uint8_t>(algo));
+    return w.take();
+}
+
+bool decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo)
+{
+    bytes::reader r(reply);
+    return status_byte(r, s) && algo_byte(r, algo);
+}
+
+std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan)
+{
+    bytes::writer w;
+    w.bytes(err.code);
+    w.bytes(err.message);
+    if (!err.code.empty())
+        return w.take();
+    w.bytes(plan.bucket);
+    w.bytes(plan.id);
+    w.bytes(plan.key);
+    w.bytes(plan.checksum_b64);
+    put_meta(w, plan.key, plan.meta);
+    w.u32(static_cast<uint32_t>(plan.parts.size()));
+    for (const mpu_part& p : plan.parts)
+        put_part(w, p);
+    return w.take();
+}
+
+bool decode_mpu_plan(std::string_view reply, s3_error& err, assemble_plan& plan)
+{
+    bytes::reader r(reply);
+    std::string code, message;
+    if (!r.bytes(code, 256) || !r.bytes(message, 4096))
+        return false;
+    if (!code.empty())
+    {
+        err         = make_error(code);
+        err.message = std::move(message);
+        return true;
+    }
+    err = s3_error{};
+    uint32_t n = 0;
+    std::string key;
+    if (!r.bytes(plan.bucket, name_cap) || !r.bytes(plan.id, id_cap) || !r.bytes(plan.key, name_cap) ||
+        !r.bytes(plan.checksum_b64, 256) || !get_meta(r, key, plan.meta) || !r.u32(n) || n > 20000 ||
+        n > r.left() / 4)
+        return false;
+    plan.parts.clear();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        mpu_part p;
+        if (!get_part(r, p))
+            return false;
+        plan.parts.push_back(std::move(p));
+    }
+    return true;
+}
+
+std::string encode_parts_page(const parts_page& pg)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(pg.status));
+    w.bytes(pg.key);
+    w.bytes(pg.id);
+    w.u8(static_cast<uint8_t>(pg.algo));
+    w.u8(pg.truncated ? 1 : 0);
+    w.u32(pg.next_marker);
+    w.u32(static_cast<uint32_t>(pg.rows.size()));
+    for (const part_row& p : pg.rows)
+    {
+        w.u32(p.number);
+        w.u64(static_cast<uint64_t>(p.mtime_ms));
+        w.bytes(p.etag);
+        w.u64(p.size);
+        w.bytes(p.checksum_b64);
+    }
+    return w.take();
+}
+
+bool decode_parts_page(std::string_view reply, parts_page& pg)
+{
+    bytes::reader r(reply);
+    uint32_t n = 0;
+    bool trunc = false;
+    if (!status_byte(r, pg.status) || !r.bytes(pg.key, name_cap) || !r.bytes(pg.id, id_cap) ||
+        !algo_byte(r, pg.algo) || !r.flag(trunc) || !r.u32(pg.next_marker) || !r.u32(n) || n > 20000 ||
+        n > r.left() / 4)
+        return false;
+    pg.truncated = trunc;
+    pg.rows.clear();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        part_row p;
+        uint64_t mt = 0;
+        if (!r.u32(p.number) || !r.u64(mt) || !r.bytes(p.etag, 256) || !r.u64(p.size) ||
+            !r.bytes(p.checksum_b64, 256))
+            return false;
+        p.mtime_ms = static_cast<int64_t>(mt);
+        p.algo     = pg.algo;
+        pg.rows.push_back(std::move(p));
+    }
+    return true;
+}
+
+std::string encode_upload_list(const std::vector<upload_stub>& uploads)
+{
+    bytes::writer w;
+    w.u32(static_cast<uint32_t>(uploads.size()));
+    for (const upload_stub& u : uploads)
+    {
+        w.bytes(u.key);
+        w.bytes(u.id);
+        w.u64(static_cast<uint64_t>(u.initiated_ms));
+    }
+    return w.take();
+}
+
+bool decode_upload_list(std::string_view reply, std::vector<upload_stub>& uploads)
+{
+    bytes::reader r(reply);
+    uint32_t n = 0;
+    if (!r.u32(n) || n > r.left() / 4)
+        return false;
+    uploads.clear();
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        upload_stub u;
+        uint64_t ms = 0;
+        if (!r.bytes(u.key, name_cap) || !r.bytes(u.id, id_cap) || !r.u64(ms))
+            return false;
+        u.initiated_ms = static_cast<int64_t>(ms);
+        uploads.push_back(std::move(u));
+    }
+    return true;
 }
 
 }   // namespace socketley::storage::wire

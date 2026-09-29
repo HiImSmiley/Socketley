@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "multipart.h"
 #include "object_store.h"
 
 namespace socketley::storage::wire
@@ -32,6 +33,15 @@ enum class op : uint8_t
     drop_prepare  = 7,
     drop_abort    = 8,
     drop_forget   = 9,
+    // Multipart, to the shard that owns the upload's key.
+    mpu_create    = 10,
+    mpu_begin     = 11,
+    mpu_part      = 12,
+    mpu_prepare   = 13,
+    mpu_finish    = 14,
+    mpu_abort     = 15,
+    mpu_parts     = 16,
+    mpu_list      = 17,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -50,7 +60,53 @@ bool        decode_list(std::string_view payload, std::string& bucket, list_quer
 std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms = 0);
 bool        decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms);
 
+// ── Multipart ───────────────────────────────────────────────────────────────
+// An upload as a listing names it.
+struct upload_stub
+{
+    std::string key;
+    std::string id;
+    int64_t     initiated_ms{0};
+};
+
+std::string encode_mpu_create(std::string_view bucket, std::string_view key, const object_meta& meta,
+                              checksum_algo algo);
+bool        decode_mpu_create(std::string_view payload, std::string& bucket, std::string& key,
+                              object_meta& meta, checksum_algo& algo);
+
+// The requests that name an upload and carry at most two numbers and a flag:
+// begin, abort, a page of parts (marker, max) and finish (ok).
+struct mpu_ref
+{
+    std::string bucket;
+    std::string key;
+    std::string id;
+    uint32_t    a{0};
+    uint32_t    b{0};
+    bool        flag{false};
+};
+std::string encode_mpu_ref(op o, const mpu_ref& r);
+bool        decode_mpu_ref(std::string_view payload, op want, mpu_ref& r);
+
+std::string encode_mpu_part(const commit_request& req, std::string_view id, uint32_t number);
+bool        decode_mpu_part(std::string_view payload, commit_request& req, std::string& id, uint32_t& number);
+
+std::string encode_mpu_prepare(const mpu_ref& r, const std::vector<complete_part>& parts);
+bool        decode_mpu_prepare(std::string_view payload, mpu_ref& r, std::vector<complete_part>& parts);
+
 // ── Replies ─────────────────────────────────────────────────────────────────
+std::string encode_mpu_created(st s, std::string_view id);
+bool        decode_mpu_created(std::string_view reply, st& s, std::string& id);
+std::string encode_mpu_begin(st s, checksum_algo algo);
+bool        decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo);
+// An empty error code is a plan.
+std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan);
+bool        decode_mpu_plan(std::string_view reply, s3_error& err, assemble_plan& plan);
+std::string encode_parts_page(const parts_page& pg);
+bool        decode_parts_page(std::string_view reply, parts_page& pg);
+std::string encode_upload_list(const std::vector<upload_stub>& uploads);
+bool        decode_upload_list(std::string_view reply, std::vector<upload_stub>& uploads);
+
 std::string encode_status(st s);
 // The remove's answer says whether there was anything to remove, and a
 // bucket's creation when it was made.

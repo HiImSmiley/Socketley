@@ -439,7 +439,10 @@ public:
     void op_abort_multipart(const std::shared_ptr<conn>& c);
     void op_list_parts(const std::shared_ptr<conn>& c);
     void op_list_uploads(const std::shared_ptr<conn>& c);
-    const mpu_upload* upload_for(const std::shared_ptr<conn>& c);
+    void with_open_upload(const std::shared_ptr<conn>& c, std::function<void(checksum_algo)> go);
+    void op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
+                                  const std::string& src_bucket, const std::string& src_key,
+                                  const object_meta& src_meta);
     bool part_number_of(const std::shared_ptr<conn>& c, uint32_t& number);
     void reap_uploads();
     void op_get_object(const std::shared_ptr<conn>& c, bool head);

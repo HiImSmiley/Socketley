@@ -334,6 +334,11 @@ public:
     void drop_abort(std::string_view name);
     void drop_rename(std::string name, std::function<void(st)> cb);
     void drop_forget(std::string_view name);
+    // Whatever else a bucket holds that a drop must not throw away, such as an
+    // upload begun and never completed: true keeps the bucket.
+    void set_drop_guard(std::function<bool(std::string_view bucket)> guard) { m_drop_guard = std::move(guard); }
+    // Removes a body that will not become anything from the bucket's tmp directory.
+    void remove_tmp(std::string_view bucket, std::string tmp_name);
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -493,6 +498,7 @@ private:
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     std::unordered_set<std::string> m_creating;
     shard_peers* m_peers{nullptr};
+    std::function<bool(std::string_view)> m_drop_guard;
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.
     std::string m_kill_after_rename;

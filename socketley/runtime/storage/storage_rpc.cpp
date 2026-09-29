@@ -117,15 +117,18 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 answer(rq.kind, refusal_for(st::no_such_bucket));
                 return true;
             }
-            const object_meta* m = m_store.find(rq.bucket, rq.key);
-            if (!m)
+            // From memory when this shard owns the key and from the object's header otherwise.
+            m_store.stat_object(rq.bucket, rq.key, [answer](st s, const object_meta& m)
             {
-                answer(rq.kind, refusal_for(st::no_such_key));
-                return true;
-            }
-            storage_rpc::reply r;
-            r.info = rpc_info_of(*m);
-            answer(rq.kind, r);
+                if (s != st::ok)
+                {
+                    answer(op::head, refusal_for(s));
+                    return;
+                }
+                storage_rpc::reply r;
+                r.info = rpc_info_of(m);
+                answer(op::head, r);
+            });
             return true;
         }
 
@@ -137,29 +140,31 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             lq.delimiter   = rq.delimiter;
             lq.start_after = rq.start_after;
             lq.max_keys    = std::clamp<size_t>(rq.max_keys, 1, storage_rpc::max_list);
-            list_page page;
-            const st s = m_store.list(rq.bucket, lq, page);
-            if (s != st::ok)
+            // Every shard's keys, merged.
+            m_node.list(rq.bucket, lq, [answer](st s, list_page page)
             {
-                answer(rq.kind, refusal_for(s));
-                return true;
-            }
-            storage_rpc::reply r;
-            r.truncated = page.truncated;
-            for (const auto& o : page.objects)
-                r.objects.push_back(rpc_info_of(o.meta, o.key));
-            r.prefixes = page.prefixes;
-            // What the next page is asked to start after: the last thing this one said.
-            if (page.truncated)
-            {
-                std::string last;
-                if (!page.objects.empty())
-                    last = page.objects.back().key;
-                if (!page.prefixes.empty() && page.prefixes.back() > last)
-                    last = page.prefixes.back();
-                r.next = last;
-            }
-            answer(rq.kind, r);
+                if (s != st::ok)
+                {
+                    answer(op::list, refusal_for(s));
+                    return;
+                }
+                storage_rpc::reply r;
+                r.truncated = page.truncated;
+                for (const auto& o : page.objects)
+                    r.objects.push_back(rpc_info_of(o.meta, o.key));
+                r.prefixes = page.prefixes;
+                // What the next page is asked to start after: the last thing this one said.
+                if (page.truncated)
+                {
+                    std::string last;
+                    if (!page.objects.empty())
+                        last = page.objects.back().key;
+                    if (!page.prefixes.empty() && page.prefixes.back() > last)
+                        last = page.prefixes.back();
+                    r.next = last;
+                }
+                answer(op::list, r);
+            });
             return true;
         }
 
@@ -188,17 +193,24 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 answer(rq.kind, refusal_for(st::no_such_bucket));
                 return true;
             }
-            const object_meta* mem = m_store.find(rq.bucket, rq.key);
-            if (!mem)
+            // The size is known here for a key this shard owns; for another shard's the
+            // file is opened with a guess and the header says.
+            const bool mine = m_store.owns(rq.bucket, rq.key);
+            const object_meta* mem = mine ? m_store.find(rq.bucket, rq.key) : nullptr;
+            if (mine && !mem)
             {
                 answer(rq.kind, refusal_for(st::no_such_key));
                 return true;
             }
-            if (mem->size > storage_rpc::max_value)
+            const auto too_large = [](uint64_t size)
             {
-                answer(rq.kind, refusal("EntityTooLarge", "the object is " + std::to_string(mem->size) +
+                return refusal("EntityTooLarge", "the object is " + std::to_string(size) +
                        " bytes and a script may read at most " + std::to_string(storage_rpc::max_value) +
-                       " -- read it over the S3 port"));
+                       " -- read it over the S3 port");
+            };
+            if (mem && mem->size > storage_rpc::max_value)
+            {
+                answer(rq.kind, too_large(mem->size));
                 return true;
             }
             auto state = std::make_shared<rpc_state>();
@@ -206,9 +218,9 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             state->bucket = rq.bucket;
             state->key    = rq.key;
             m_rpc[ticket] = state;
-            const size_t want = static_cast<size_t>(mem->size);
+            const size_t want = mem ? static_cast<size_t>(mem->size) : 60000;
             m_store.open_object(rq.bucket, rq.key, want,
-                [this, state, answer](open_result o)
+                [this, state, answer, too_large](open_result o)
                 {
                     if (state->done)
                     {
@@ -220,6 +232,13 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                     {
                         state->done = true;
                         answer(op::get, refusal_for(o.status));
+                        return;
+                    }
+                    if (o.meta.size > storage_rpc::max_value)
+                    {
+                        state->done = true;
+                        m_loop.close_fd(o.fd);
+                        answer(op::get, too_large(o.meta.size));
                         return;
                     }
                     state->fd       = o.fd;

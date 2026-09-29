@@ -78,6 +78,10 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
                   std::string(owner.get_name())),
       m_node(m_store, m_transport), m_auth(auth)
 {
+    // Uploads are each on the shard that owns their key, and a bucket is dropped
+    // only when no shard holds one.
+    m_node.set_multipart(&m_mpu);
+    m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_has_uploads(bucket); });
     m_rid_seq = random_u64();
     m_max_conns = m_owner.get_max_connections();
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_SPLICE_MIN"))

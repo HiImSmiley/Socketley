@@ -12,7 +12,9 @@
 #include <string>
 #include <string_view>
 
+#include "multipart.h"
 #include "object_store.h"
+#include "shard_wire.h"
 
 namespace socketley::storage
 {
@@ -40,6 +42,9 @@ struct shard_counters
     uint64_t list_fanouts{0};
     uint64_t list_pages_served{0};
     uint64_t bucket_ops{0};
+    // Multipart steps this shard sent to the shard that owns an upload, and ones it served.
+    uint64_t mpu_out{0};
+    uint64_t mpu_in{0};
     // Requests that got no answer.
     uint64_t peer_failures{0};
 };
@@ -65,6 +70,26 @@ public:
     // ── A listing is every shard's, merged ──────────────────────────────────
     void list(std::string_view bucket, const list_query& q, std::function<void(st, list_page)> cb);
 
+    // ── An upload lives on the shard that owns its key ─────────────────────
+    // Every step that names an upload goes to that shard, so its parts and its
+    // state are one process's; a part's body is written where the connection
+    // landed and only its name crosses, and a completed upload is assembled
+    // where the request landed and committed by the owner of the key.
+    void set_multipart(multipart_store* mpu) { m_mpu = mpu; }
+    void mpu_create(std::string bucket, std::string key, object_meta meta, checksum_algo algo,
+                    std::function<void(st, std::string)> cb);
+    // no_such_key when the upload is missing, on its way out, or sealed.
+    void mpu_begin(std::string bucket, std::string key, std::string id,
+                   std::function<void(st, checksum_algo)> cb);
+    put_op::committer mpu_part_committer(std::string bucket, std::string key, std::string id, uint32_t number);
+    void mpu_complete(std::string bucket, std::string key, std::string id, std::vector<complete_part> parts,
+                      std::function<void()> progress, std::function<void(complete_result)> cb);
+    // `cb` gets false when there was no such upload.
+    void mpu_abort(std::string bucket, std::string key, std::string id, std::function<void(bool)> cb);
+    void mpu_parts(std::string bucket, std::string key, std::string id, uint32_t marker, uint32_t max_parts,
+                   std::function<void(parts_page)> cb);
+    void mpu_list(std::string bucket, std::function<void(st, std::vector<wire::upload_stub>)> cb);
+
     // Answers a request a sibling sent, once, with `ok` false for a payload that
     // is not one of ours.
     void serve(std::string_view payload, std::function<void(bool ok, std::string reply)> reply);
@@ -83,7 +108,11 @@ private:
                    std::function<void(uint32_t peer, bool ok, std::string_view reply)> one,
                    std::function<void()> done);
 
+    void serve_mpu(wire::op o, std::string_view payload, std::function<void(bool ok, std::string reply)> reply);
+    const mpu_upload* mpu_find(const std::string& bucket, const std::string& key, const std::string& id) const;
+
     object_store&    m_store;
+    multipart_store* m_mpu{nullptr};
     shard_transport& m_transport;
     shard_counters   m_c;
     std::shared_ptr<bool> m_alive;
