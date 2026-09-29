@@ -817,6 +817,11 @@ public:
     // Let go of the connection an await was holding open, and finish the close
     // it was deferring if that was the last answer owed.
     void release_await_hold(uint64_t ctx);
+
+    // The same hold for an await that is not the linked cache's, such as a
+    // socketley.storage call, charged the way a cache answer is so the two
+    // share one cap and one release.
+    void hold_answering_connection(uint64_t& ctx) override;
 #endif
 
 private:

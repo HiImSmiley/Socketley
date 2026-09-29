@@ -366,6 +366,9 @@ void storage_run::sweep()
             case phase::respond:
                 kill = quiet > write_stall_secs;
                 break;
+            case phase::hook_wait:
+                kill = quiet > body_stall_secs;
+                break;
         }
         if (kill)
             victims.push_back(c);
@@ -400,6 +403,7 @@ void storage_run::stop()
     if (m_stopped)
         return;
     m_stopped = true;
+    stop_rpc();
 
     if (m_listen_fd >= 0)
     {
@@ -480,7 +484,8 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
 
     // What the record layer already holds is delivered before another recv is
     // asked for, because nothing would ever complete for bytes that are here.
-    if (c->ssl && !c->pulling && c->tls_state == tls_conn_ready && c->ph != phase::respond)
+    if (c->ssl && !c->pulling && c->tls_state == tls_conn_ready && c->ph != phase::respond &&
+        c->ph != phase::hook_wait)
     {
         tls_pull(c);
         if (c->dead || c->rd_pending)
@@ -494,6 +499,7 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     switch (c->ph)
     {
         case phase::respond:
+        case phase::hook_wait:
             return;
         case phase::body_put:
             if (c->ssl)
@@ -626,6 +632,7 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
             arm_read(c);
             return;
         case phase::respond:
+        case phase::hook_wait:
             return;
     }
 }
@@ -698,7 +705,8 @@ void storage_run::tls_pull(const std::shared_ptr<conn>& c)
         return;
     c->pulling = true;
     char plain[tls_plain_bytes];
-    while (!c->dead && c->ph != phase::respond && c->park_off >= c->park.size())
+    while (!c->dead && c->ph != phase::respond && c->ph != phase::hook_wait &&
+           c->park_off >= c->park.size())
     {
         const int k = tls_context::ssl_read(c->ssl, plain, static_cast<int>(sizeof(plain)));
         if (k > 0)
@@ -980,6 +988,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->ck_trailer.clear();
     c->sent_body = 0;
     c->rd_direct = false;
+    c->principal.clear();
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)
@@ -1540,6 +1549,9 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
             if (is_checksum_header(n))
                 resp.headers.emplace_back(n, v);
         send_response(cc, std::move(resp));
+        // After the answer is on its way, so a script that is slow to notice does
+        // not hold the client.
+        notify_put(cc->req.bucket, cc->req.key, r.meta);
     });
 }
 

@@ -5251,6 +5251,16 @@ const char* server_instance::begin_cache_await(lua_State* th, std::string_view c
     return nullptr;
 }
 
+void server_instance::hold_answering_connection(uint64_t& ctx)
+{
+    ctx = 0;
+    server_connection* held = m_callback_conn;
+    if (!held || held->cache_pending >= MAX_CACHE_PENDING)
+        return;
+    ++held->cache_pending;
+    ctx = cache_cookie(held, false);
+}
+
 void server_instance::release_await_hold(uint64_t ctx)
 {
     if (ctx == 0 || ctx == CACHE_COOKIE_NO_CONN)

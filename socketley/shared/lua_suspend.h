@@ -101,12 +101,28 @@ public:
                   uint32_t exec_ms, id_t& out_id, A&&... args)
     {
         out_id = 0;
+
+        // Taken before anything can return, so a handler set for this call is
+        // never left over for the next one.
+        result_fn mine = std::move(m_next_result);
+        m_next_result  = nullptr;
+
         if (!m_lua || !fn.valid())
+        {
+            if (mine)
+                mine(nullptr, 0, "the callback is not defined");
             return outcome::failed;
+        }
 
         const auto [th, ref] = acquire();
         if (SOCKETLEY_UNLIKELY(!th))
+        {
+            if (mine)
+                mine(nullptr, 0, "no coroutine could be made for the callback");
             return outcome::failed;
+        }
+        if (SOCKETLEY_UNLIKELY(static_cast<bool>(mine)))
+            m_results[th] = std::move(mine);
 
         m_frames.push_back(frame{th, ref, what, exec_ms, 0});
 
@@ -193,6 +209,30 @@ public:
         resume(id, 1);
     }
 
+    // The same with any number of values, pushed by `push` onto the thread the
+    // handler stopped on and counted by what it returns -- for an answer that is
+    // a table, or several results, rather than the one string settle_value takes.
+    template <class Push>
+    void settle_with(id_t id, Push&& push)
+    {
+        record* r = find(id);
+        if (!r)
+            return;
+        const int n = push(r->th);
+        resume(id, n);
+    }
+
+    // ─── Getting what a callback returned ───────────────────────────────────
+    // A callback run for its answer rather than for its effects -- one that
+    // decides whether a request goes on -- asks to be told what it returned
+    // when it finishes, which for a callback that waits is after a later
+    // resume.  `results` are on the thread's stack for the call and no longer,
+    // and `error` is null unless the callback raised or was given up on; it is
+    // called exactly once per start() it was set for, except when the runtime
+    // lets every waiting callback go, which is the runtime coming down.
+    using result_fn = std::function<void(lua_State* results, int count, const char* error)>;
+    void set_next_result(result_fn fn) { m_next_result = std::move(fn); }
+
     // Every await ends in exactly one settle, including the ones whose answer
     // never came.  A script therefore never has to bound its own wait, which is
     // the whole point: `local v, err = self.cache(...)` always returns.
@@ -246,6 +286,8 @@ public:
     // sees a failure rather than silence.
     void forget_all()
     {
+        m_results.clear();
+        m_next_result = nullptr;
         if (!m_lua)
         {
             m_live.clear();
@@ -415,6 +457,8 @@ private:
                           << (done.what ? done.what : "callback")
                           << " yielded without waiting for anything; it will not resume"
                           << std::endl;
+                give_result(done.th, 1,
+                            "yielded without waiting for anything");
                 release(done.th, done.ref, false);
                 return outcome::failed;
             }
@@ -432,6 +476,9 @@ private:
             err.assign(msg ? msg : "(no message)");
         }
 
+        if (SOCKETLEY_UNLIKELY(!m_results.empty()))
+            give_result(done.th, rc, rc == 0 ? nullptr : err.c_str());
+
         if (done.id != 0)
             m_live.erase(done.id);
         release(done.th, done.ref, rc == 0);
@@ -444,6 +491,18 @@ private:
             return outcome::failed;
         }
         return outcome::finished;
+    }
+
+    // The handler registered for this thread, if there is one, told how the
+    // callback ended; `rc` 0 means it returned and its values are on the stack.
+    void give_result(lua_State* th, int rc, const char* error)
+    {
+        const auto it = m_results.find(th);
+        if (it == m_results.end())
+            return;
+        result_fn fn = std::move(it->second);
+        m_results.erase(it);
+        fn(th, rc == 0 ? lua_gettop(th) : 0, error);
     }
 
     void report_overflow(const char* what)
@@ -465,6 +524,9 @@ private:
     std::function<void(uint64_t)>    m_await_ended;
 
     id_t  m_seq{0};
+
+    result_fn                              m_next_result;
+    std::unordered_map<lua_State*, result_fn> m_results;
 
     uint64_t m_stat_started{0};
     uint64_t m_stat_suspended{0};

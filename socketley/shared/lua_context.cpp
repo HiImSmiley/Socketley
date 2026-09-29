@@ -5,6 +5,7 @@
 #include "lua_json.h"
 #include "coarse_clock.h"
 #include "lua_suspend.h"
+#include "lua_storage_api.h"
 
 // Outside the SOCKETLEY_NO_LUA guard: the no-Lua SDK compiles this file too,
 // and the callers that read a load failure back are not conditional on Lua.
@@ -649,6 +650,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     m_on_upstream_connect   = m_lua["on_upstream_connect"];
     m_on_upstream_disconnect = m_lua["on_upstream_disconnect"];
     m_on_http_request       = m_lua["on_http_request"];
+    m_on_request            = m_lua["on_request"];
+    m_on_put                = m_lua["on_put"];
 
     // Build callback bitmask for O(1) has_on_*() checks
     m_callback_mask = 0;
@@ -680,6 +683,8 @@ bool lua_context::load_script(std::string_view path, runtime_instance* owner)
     if (m_on_upstream_connect.valid())   m_callback_mask |= CB_ON_UPSTREAM_CONNECT;
     if (m_on_upstream_disconnect.valid()) m_callback_mask |= CB_ON_UPSTREAM_DISCONNECT;
     if (m_on_http_request.valid())       m_callback_mask |= CB_ON_HTTP_REQUEST;
+    if (m_on_request.valid())            m_callback_mask |= CB_ON_REQUEST;
+    if (m_on_put.valid())                m_callback_mask |= CB_ON_PUT;
 
     // The filter chain, where a malformed entry refuses the script rather than
     // being skipped, because a quietly dropped filter is a runtime that admits
@@ -958,6 +963,10 @@ void lua_context::cancel_timers()
     // already coming down.  Everywhere else an await ends in an answer.
     if (m_suspend)
         m_suspend->forget_all();
+
+    // And the storage calls it was owed answers to, for the same reason.
+    if (m_storage_client)
+        m_storage_client->cancel();
 }
 
 void lua_context::update_self_state(const char* state_str)
@@ -2938,6 +2947,12 @@ void lua_context::register_bindings(runtime_instance* owner)
 
         return result;
     };
+
+    // socketley.storage in every runtime that has a script, because what it
+    // needs is the request channel and every runtime has one.
+    if (!m_storage_client)
+        m_storage_client = std::make_unique<lua_storage_client>(*this, *owner);
+    m_storage_client->install(m_lua, sk);
 
     // Last and over the top of the bindings above, so the two builds differ in
     // one place and the list of what is refused is readable in one place.

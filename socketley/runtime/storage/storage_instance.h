@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "s3_auth.h"
+#include "../../shared/request_channel.h"
 #include "../../shared/runtime_instance.h"
 #include "../../shared/tls_context.h"
 #include "../../shared/unix_companion.h"
@@ -23,7 +24,7 @@ class storage_run;
 // because setup() and listen_addresses() have to answer with the same number.
 inline constexpr uint16_t storage_default_port = 9000;
 
-class storage_instance : public runtime_instance
+class storage_instance : public runtime_instance, public request_sink
 {
 public:
     explicit storage_instance(std::string_view name);
@@ -75,6 +76,19 @@ public:
     std::string stats_lines() const override;
     std::string config_refusal() const override;
     void refresh_cached_limits() override;
+
+    // What answers another runtime's script calling socketley.storage.* by this
+    // runtime's name: the object store itself, on a later turn, so a slow disk is
+    // latency for the caller and never a stopped loop.
+    request_sink* as_request_sink() override
+    {
+        if (auto* o = runtime_instance::as_request_sink())
+            return o;
+        return this;
+    }
+    void serve_request(std::string_view, std::string& out) override { out.clear(); }
+    bool serves_inline() const override { return false; }
+    bool serve_deferred(uint64_t ticket, std::string_view target, std::string_view payload) override;
 
     void listen_addresses(std::vector<std::string>& out) const override;
     uint16_t effective_port() const override;

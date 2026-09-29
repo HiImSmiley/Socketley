@@ -31,6 +31,11 @@ storage_instance::~storage_instance()
     // process that builds one.
 }
 
+bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
+{
+    return m_run && m_run->serve_rpc(ticket, payload);
+}
+
 void storage_instance::set_authenticator(std::unique_ptr<socketley::storage::authenticator> a)
 {
     m_auth = std::move(a);

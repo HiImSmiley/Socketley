@@ -709,6 +709,12 @@ public:
     // nothing to do -- false for nine of them, "" for the two pops -- so a
     // script could not tell the two apart, while a client on the wire got
     // "denied: readonly mode".  Empty for a runtime that is not a cache.
+    // A script's callback is about to wait for an answer from another runtime:
+    // a runtime that answers a peer through a connection keeps it open until the
+    // answer has been used, and says with `ctx` what to let go of afterwards
+    // (see lua_suspender::set_await_ended).  Zero, the default, holds nothing.
+    virtual void hold_answering_connection(uint64_t& ctx) { ctx = 0; }
+
     virtual std::string_view lua_cache_mode() const { return {}; }
 
     // The second question of exactly that kind, for the second reason a call

@@ -62,6 +62,7 @@ class runtime_instance;
 // lua_diag from this file, so including it here would be a cycle.  A call site
 // that starts a callback includes shared/lua_suspend.h itself.
 class lua_suspender;
+class lua_storage_client;
 
 // How long one Lua callback may hold the event-loop thread, enforced by a
 // count hook that fires every N VM instructions and tests wall-clock time --
@@ -214,6 +215,10 @@ public:
         CB_ON_WRITABLE           = 1u << 27,
         CB_ON_HTTP_BODY          = 1u << 28,
         CB_ON_UPSTREAM_WRITABLE  = 1u << 29,
+        // A storage runtime's: a request that has passed authentication and
+        // has not begun, and an object that has just been committed.
+        CB_ON_REQUEST            = 1u << 30,
+        CB_ON_PUT                = 1u << 31,
     };
 
     // Check if context has valid callbacks (bitmask lookup)
@@ -252,6 +257,8 @@ public:
     bool has_on_upstream_connect()   const { return m_callback_mask & CB_ON_UPSTREAM_CONNECT; }
     bool has_on_upstream_disconnect() const { return m_callback_mask & CB_ON_UPSTREAM_DISCONNECT; }
     bool has_on_http_request()       const { return m_callback_mask & CB_ON_HTTP_REQUEST; }
+    bool has_on_request()            const { return m_callback_mask & CB_ON_REQUEST; }
+    bool has_on_put()                const { return m_callback_mask & CB_ON_PUT; }
     // Whether the script declared a non-empty `filters` chain, a mask bit
     // because it is asked once per request on the proxy's route path.
     bool has_filters()               const { return m_callback_mask & CB_FILTERS; }
@@ -306,6 +313,12 @@ public:
     guarded_protected on_upstream_disconnect() { return {m_on_upstream_disconnect, "on_upstream_disconnect", m_deadline_ms, m_owner_name.c_str()}; }
     // A handler that raises has not declined; see m_on_http_request below.
     guarded_protected on_http_request()        { return {m_on_http_request,        "on_http_request",        m_deadline_ms, m_owner_name.c_str()}; }
+    guarded_protected on_put()                 { return {m_on_put,                 "on_put",                 m_deadline_ms, m_owner_name.c_str()}; }
+    // Handed over raw like on_message, because a storage runtime runs these on
+    // a coroutine so that a hook which asks another runtime something can stop.
+    sol::protected_function& raw_on_request()  { return m_on_request; }
+    sol::protected_function& raw_on_put()      { return m_on_put; }
+    sol::protected_function& raw_on_delete()   { return m_on_delete; }
     // The chain in the order the script listed it, handed back raw because the
     // caller arms one scope around the whole walk so ten filters share one
     // request's budget.
@@ -422,6 +435,15 @@ private:
     // indistinguishable from one that declined; the call site now answers 500
     // and says why.
     sol::protected_function m_on_http_request;
+
+    // A storage runtime's hooks.  on_request decides whether a request goes on,
+    // so it too has to arrive as a value -- a raise is a refusal, and says so.
+    sol::protected_function m_on_request;
+    sol::protected_function m_on_put;
+
+    // What socketley.storage waits on, made when the bindings are and freed with
+    // this context, which is after cancel_timers() has let go of its requests.
+    std::unique_ptr<lua_storage_client> m_storage_client;
 
     // The `filters` chain as a vector because order is the whole point,
     // collected once at load time, and protected because a filter is where
@@ -566,6 +588,8 @@ public:
     bool has_on_upstream_connect()   const { return false; }
     bool has_on_upstream_disconnect() const { return false; }
     bool has_on_http_request()       const { return false; }
+    bool has_on_request()            const { return false; }
+    bool has_on_put()                const { return false; }
     bool has_filters()               const { return false; }
     bool has_routes()                const { return false; }
     // A reference to one empty table for every caller: without Lua there is no

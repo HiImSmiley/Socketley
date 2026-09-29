@@ -167,6 +167,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         return;
     }
     c->hook = std::move(v.hook);
+    c->principal = std::move(v.principal);
 
     // A client that signs its payload in chunks, talking to a runtime with no
     // decoder for them, would have the framing stored as the object.
@@ -186,6 +187,13 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         return;
     }
 
+    // A script's say comes after authentication and before anything is done.
+    hook_request(c);
+}
+
+void storage_run::route(const std::shared_ptr<conn>& c)
+{
+    s3_request& r = c->req;
     const bool service = r.bucket.empty();
     const bool bucket_level = !service && r.key.empty();
 
@@ -559,13 +567,15 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
             continue;
         }
         ++m_c.deletes;
-        m_store.remove(bucket, dr.keys[i], [b, i, done_one](st s, bool)
+        m_store.remove(bucket, dr.keys[i], [this, b, i, done_one, bucket, key = dr.keys[i]](st s, bool existed)
         {
             if (s != st::ok)
             {
                 b->results[i].ok    = false;
                 b->results[i].error = error_for(s);
             }
+            else if (existed)
+                notify_delete(bucket, key);
             done_one();
         });
     }
@@ -883,6 +893,7 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         resp.headers.emplace_back("Content-Type", "application/xml");
         resp.body = copy_result_xml(p.meta);
         send_response(cc, std::move(resp));
+        notify_put(cc->req.bucket, cc->req.key, p.meta);
     });
 }
 
@@ -892,8 +903,13 @@ void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
 {
     ++m_c.deletes;
     std::weak_ptr<conn> weak = c;
-    m_store.remove(c->req.bucket, c->req.key, [this, weak](st s, bool)
+    m_store.remove(c->req.bucket, c->req.key,
+                   [this, weak, bucket = c->req.bucket, key = c->req.key](st s, bool existed)
     {
+        // Told whether or not the client is still there to hear the answer: the
+        // object is gone either way.
+        if (s == st::ok && existed)
+            notify_delete(bucket, key);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;

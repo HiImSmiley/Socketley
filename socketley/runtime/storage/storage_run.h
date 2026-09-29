@@ -21,6 +21,7 @@
 #include "multipart.h"
 #include "object_store.h"
 #include "s3_auth.h"
+#include "../../shared/storage_rpc.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/http_framing.h"
@@ -149,6 +150,9 @@ enum class phase : uint8_t
     body_discard,
     // The answer is being sent, and nothing is read until it is.
     respond,
+    // A script's on_request has the request and has not answered yet; nothing is
+    // read until it does.
+    hook_wait,
 };
 
 class storage_run;
@@ -252,7 +256,16 @@ struct conn
     bool        spliced{false};
     // The response is for a range or a whole object, kept for the counters.
     uint64_t    sent_body{0};
+
+    // The address of the peer, read the first time a script asks for it.
+    std::string peer;
+    // Who the authenticator said made the request, for the script.
+    std::string principal;
 };
+
+// An object's metadata as a script sees it: the user metadata without its
+// header prefix, and the fields S3 reports.
+storage_rpc::object_info rpc_info_of(const object_meta& m, std::string key = {});
 
 // One request's result, which every operation ends by giving to respond().
 struct response
@@ -381,8 +394,25 @@ public:
     void pipe_release(conn& c);
     void stream_read_done(const std::shared_ptr<conn>& c, int64_t res);
 
+    // ── Scripts ─────────────────────────────────────────────────────────────
+    // Asks on_request whether the request goes on, then routes it or refuses.
+    void hook_request(const std::shared_ptr<conn>& c);
+    // The hook has answered: `deny` refuses the request with that error, and null lets it go on.
+    void hook_done(uint64_t id, const s3_error* deny);
+    // Told after the commit, and only if the script has the hook.
+    void notify_put(std::string_view bucket, std::string_view key, const object_meta& m);
+    void notify_delete(std::string_view bucket, std::string_view key);
+    // What another runtime's script asked of this one, answered on a later turn
+    // through the ticket; false means it was not taken.
+    bool serve_rpc(uint64_t ticket, std::string_view payload);
+    void stop_rpc();
+    // The operation an S3 request is, by the name S3 gives it.
+    static std::string_view operation_name(const s3_request& r);
+
     // ── S3 ──────────────────────────────────────────────────────────────────
     void dispatch(const std::shared_ptr<conn>& c);
+    // From the request's head as far as the operation, after auth and the hook.
+    void route(const std::shared_ptr<conn>& c);
     void op_list_buckets(const std::shared_ptr<conn>& c);
     void op_create_bucket(const std::shared_ptr<conn>& c);
     void op_delete_bucket(const std::shared_ptr<conn>& c);
@@ -454,6 +484,9 @@ private:
     uint64_t    m_rid_seq{0};
     bool        m_stopped{false};
 
+    // Calls from other runtimes' scripts still in flight, so a stop can answer them.
+    struct rpc_state;
+    std::unordered_map<uint64_t, std::shared_ptr<rpc_state>> m_rpc;
     // A cap on what streaming puts hold, so a thousand uploaders cannot ask for a thousand buffers.
     uint32_t    m_max_active_puts{512};
     size_t      m_zero_copy_min{64 * 1024};
