@@ -290,9 +290,7 @@ private:
     bool                             m_notified_failed{false};
 };
 
-// The steps of a store that belong to another shard, which its owner hands to
-// whatever carries a request to a sibling.  The body of an object never
-// crosses: only the names and the metadata do.
+// The steps of a store that belong to another shard, handed to whatever carries a request to a sibling.
 class shard_peers
 {
 public:
@@ -348,9 +346,7 @@ public:
     void set_peers(shard_peers* peers) { m_peers = peers; }
 
     // ── Objects, answered from memory ───────────────────────────────────────
-    // Only the keys this shard owns are held, so a key another shard owns is
-    // absent here whether it exists or not.  The pointer is valid until the
-    // next operation that changes the bucket.
+    // Holds only the keys this shard owns, and the pointer is valid until the next operation that changes the bucket.
     const object_meta* find(std::string_view bucket, std::string_view key) const;
 
     // The metadata of any object, from memory when this shard owns the key and
@@ -368,9 +364,7 @@ public:
                                       object_meta meta, uint64_t expected, bool size_known,
                                       st& why);
 
-    // The single step that makes a written body the object: rename, sync,
-    // journal.  Done here when this shard owns the key and by the owner
-    // otherwise, and a body that did not become the object is removed.
+    // The step that makes a written body the object, run here when this shard owns the key and by the owner otherwise.
     void commit(commit_request req, std::function<void(put_result)> cb);
 
     // The step itself, which only the owner of the key may run.

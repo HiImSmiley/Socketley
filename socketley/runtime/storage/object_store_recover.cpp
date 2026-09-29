@@ -96,10 +96,7 @@ bool tmp_owner(const std::string& name, uint32_t& shard)
     return r.ec == std::errc{} && r.ptr == name.data() + dot;
 }
 
-// What a crash left in tmp/, counted: this shard's own files, and for shard 0
-// also those that belong to no shard of the current split, which are left by an
-// earlier split or by another version.  A sibling's files are its uploads in
-// flight and are not touched.
+// Removes this shard's own tmp/ files, and for shard 0 those of no shard of the split, never a sibling's upload in flight.
 uint64_t clean_tmp(const std::string& path, uint32_t shard, uint32_t nshards)
 {
     uint64_t n = 0;

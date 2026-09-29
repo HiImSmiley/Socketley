@@ -70,10 +70,7 @@ void limit_page(list_page& page, size_t max_bytes = max_page_bytes);
 std::string encode_page(st s, const list_page& page);
 bool        decode_page(std::string_view reply, st& s, list_page& out);
 
-// One shard's page for the same query from each shard, as the page a single
-// shard holding every key would have given.  A shard whose page is cut short is
-// only known as far as its last name, and nothing beyond the nearest such name
-// is used, so a page can be shorter than max_keys and never wrong.
+// The page one shard holding every key would give, from each shard's page for the query, and shorter than max_keys when a shard's page was cut short.
 list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys);
 
 }   // namespace socketley::storage::wire
