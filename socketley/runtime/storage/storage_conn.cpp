@@ -64,7 +64,8 @@ const char* reason_phrase(int status)
 }   // namespace
 
 storage_run::storage_run(storage_instance& owner, event_loop& loop, store_options opts, authenticator* auth)
-    : m_owner(owner), m_loop(loop), m_io(loop, this), m_store(loop, m_io, std::move(opts)), m_auth(auth)
+    : m_owner(owner), m_loop(loop), m_io(loop, this), m_store(loop, m_io, std::move(opts)),
+      m_mpu(loop, m_io, m_store), m_auth(auth)
 {
     m_rid_seq = random_u64();
     m_max_conns = m_owner.get_max_connections();
@@ -91,6 +92,9 @@ bool storage_run::open(std::string& err)
     recovery_report rep;
     if (!m_store.open(err, &rep))
         return false;
+    if (!m_mpu.open(err))
+        return false;
+    reap_uploads();
     LOG_INFO(("storage: " + std::to_string(rep.buckets) + " bucket(s), " +
               std::to_string(rep.objects) + " object(s) in " + m_store.options().dir +
               (rep.clean_start ? " (clean stop)" : " (recovered: " +
@@ -326,7 +330,18 @@ void storage_run::sweep()
         ++m_c.timeouts;
         close_conn(c);
     }
-    if (!m_conns.empty())
+    // Expired uploads are looked for a few times within the expiry, at most
+    // every half minute, and only when any expire.
+    if (m_mpu_expire_secs != 0)
+    {
+        const auto every = std::chrono::seconds(std::clamp<uint32_t>(m_mpu_expire_secs / 4, 1, 30));
+        if (now - m_last_reap >= every)
+        {
+            m_last_reap = now;
+            reap_uploads();
+        }
+    }
+    if (!m_conns.empty() || m_mpu_expire_secs != 0)
         arm_sweep();
 }
 
@@ -716,6 +731,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->body_refused = false;
     c->body_error = {};
     c->decoded_total = 0;
+    c->ck_trailer.clear();
     c->sent_body = 0;
     c->rd_direct = false;
 }
@@ -1223,6 +1239,22 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
                 return;
         }
     }
+    // A checksum that followed the body in a trailer is known only now.
+    if (c->hook && !c->ck_trailer.empty())
+    {
+        const std::string v = c->hook->trailer_value(c->ck_trailer);
+        std::string raw;
+        const checksum_algo a = checksum_from_header(c->ck_trailer);
+        if (!v.empty() && (!base64_decode(v, raw) || raw.size() != checksum_raw_len(a)))
+        {
+            s3_error e = make_error("InvalidRequest");
+            e.message = "Value for " + c->ck_trailer + " header is invalid.";
+            put_refused(c, e);
+            return;
+        }
+        if (!v.empty())
+            c->put->expect_checksum(v);
+    }
     c->ph = phase::respond;
     const md5_t* expect = c->has_expected_md5 ? &c->expected_md5 : nullptr;
     uint64_t declared = 0;
@@ -1257,8 +1289,38 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
         response resp;
         resp.status = 200;
         resp.headers.emplace_back("ETag", "\"" + r.meta.etag() + "\"");
+        for (const auto& [n, v] : r.meta.extra)
+            if (is_checksum_header(n))
+                resp.headers.emplace_back(n, v);
         send_response(cc, std::move(resp));
     });
+}
+
+void storage_run::deny_request(const std::shared_ptr<conn>& c, const s3_error& e)
+{
+    s3_request& r = c->req;
+    // A client that waits for 100 Continue has sent nothing, and a chunked
+    // body has no length to read to.
+    if (r.has_content_length && !r.chunked && !r.expect_continue && r.content_length > 0 &&
+        r.content_length <= discard_limit)
+    {
+        c->body_error = e;
+        c->body_left  = r.content_length;
+        c->ph         = phase::body_discard;
+        // Some of it came with the head.
+        const size_t have = static_cast<size_t>(std::min<uint64_t>(c->in.size(), c->body_left));
+        c->body_left -= have;
+        c->in.erase(0, have);
+        if (c->body_left == 0)
+        {
+            send_error(c, e, false);
+            return;
+        }
+        arm_read(c);
+        return;
+    }
+    r.keep_alive = false;
+    send_error(c, e, true);
 }
 
 void storage_run::put_failed(const std::shared_ptr<conn>& c, st why)

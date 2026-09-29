@@ -153,6 +153,10 @@ struct runtime_config
     std::string storage_dir;
     bool storage_anonymous = false;
     uint64_t storage_max_bytes = 0;
+    std::string storage_access_key;
+    std::string storage_secret_key;
+    std::string storage_credentials;
+    uint32_t storage_mpu_expire_secs = 0;
 
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.

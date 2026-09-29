@@ -785,6 +785,10 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.storage_dir = std::string(stg->get_dir());
             cfg.storage_anonymous = stg->get_anonymous();
             cfg.storage_max_bytes = stg->get_max_bytes();
+            cfg.storage_access_key = std::string(stg->get_access_key());
+            cfg.storage_secret_key = std::string(stg->get_secret_key());
+            cfg.storage_credentials = std::string(stg->get_credentials_file());
+            cfg.storage_mpu_expire_secs = stg->get_mpu_expire_secs();
             break;
         }
     }
@@ -1044,6 +1048,14 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
                 append_bool_field("anonymous", true);
             if (cfg.storage_max_bytes > 0)
                 append_int_field("max_bytes", cfg.storage_max_bytes);
+            if (!cfg.storage_access_key.empty())
+                append_str_field("access_key", cfg.storage_access_key);
+            if (!cfg.storage_secret_key.empty())
+                append_str_field("secret_key", cfg.storage_secret_key);
+            if (!cfg.storage_credentials.empty())
+                append_str_field("credentials", cfg.storage_credentials);
+            if (cfg.storage_mpu_expire_secs > 0)
+                append_int_field("mpu_expire", cfg.storage_mpu_expire_secs);
             break;
     }
 
@@ -1203,6 +1215,10 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.storage_dir = json_get_string(json, "dir");
             cfg.storage_anonymous = json_get_bool(json, "anonymous");
             cfg.storage_max_bytes = json_get_size(json, "max_bytes");
+            cfg.storage_access_key = json_get_string(json, "access_key");
+            cfg.storage_secret_key = json_get_string(json, "secret_key");
+            cfg.storage_credentials = json_get_string(json, "credentials");
+            cfg.storage_mpu_expire_secs = static_cast<uint32_t>(json_get_size(json, "mpu_expire"));
             break;
     }
 

@@ -37,6 +37,24 @@ public:
     void set_anonymous(bool on) { m_anonymous = on; }
     bool get_anonymous() const { return m_anonymous; }
 
+    // The credentials requests are signed with, as a pair given here and as
+    // a file of `access:secret` lines that is re-read when it changes.
+    void set_access_key(std::string_view k) { m_access_key = std::string(k); }
+    void set_secret_key(std::string_view k) { m_secret_key = std::string(k); }
+    void set_credentials_file(std::string_view f) { m_credentials_file = std::string(f); }
+    std::string_view get_access_key() const { return m_access_key; }
+    std::string_view get_secret_key() const { return m_secret_key; }
+    std::string_view get_credentials_file() const { return m_credentials_file; }
+    bool has_credentials() const
+    {
+        return !m_access_key.empty() || !m_secret_key.empty() || !m_credentials_file.empty();
+    }
+
+    // Uploads left open this many seconds are aborted; 0 keeps them until they
+    // are completed or aborted.
+    void set_mpu_expire_secs(uint32_t s) { m_mpu_expire_secs = s; }
+    uint32_t get_mpu_expire_secs() const { return m_mpu_expire_secs; }
+
     // A quota on the bytes held, 0 for none.
     void set_max_bytes(uint64_t bytes) { m_max_bytes = bytes; }
     uint64_t get_max_bytes() const { return m_max_bytes; }
@@ -68,6 +86,10 @@ private:
     std::string m_dir;
     bool        m_anonymous{false};
     uint64_t    m_max_bytes{0};
+    std::string m_access_key;
+    std::string m_secret_key;
+    std::string m_credentials_file;
+    uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;
 

@@ -703,7 +703,7 @@ int cli_dispatch(int argc, char** argv)
 std::string cli_caller_path(std::string_view flag, std::string_view value)
 {
     static constexpr std::string_view path_flags[] = {
-        "--lua", "--log", "-w", "--persistent", "--http", "--dir",
+        "--lua", "--log", "-w", "--persistent", "--http", "--dir", "--credentials",
         "--cert", "--key", "--ca", "--client-ca", "--client-cert", "--client-key",
     };
     std::string_view prefix;

@@ -141,6 +141,7 @@ struct verify_result : error_info
 };
 
 // Secret for an access key, or an empty view for an unknown key; the view only has to outlive the call, and the callable is a lambda or function object, not a bare function.
+// It holds a pointer to the callable and not a copy, so a secret_lookup built from a temporary and kept past that statement dangles: name the callable and keep it alive.
 class secret_lookup
 {
 public:

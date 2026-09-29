@@ -166,6 +166,8 @@ void put_op::staged(size_t n)
         return;
     stage& s = m_stage[m_active];
     m_md5.update(s.data.get() + s.fill, n);
+    if (m_ck)
+        m_ck->update(s.data.get() + s.fill, n);
     s.fill += n;
     m_received += n;
 
@@ -322,10 +324,36 @@ void put_op::finish(const md5_t* expected_md5, std::function<void(put_result)> c
         fail(st::bad_digest);
         return;
     }
+    if (m_ck)
+    {
+        const std::string got = m_ck->peek_b64();
+        if (!m_ck_expect.empty() && got != m_ck_expect)
+        {
+            fail(st::bad_digest);
+            return;
+        }
+        const std::string_view name = checksum_header(m_ck->algo());
+        bool stored = false;
+        for (auto& [n, v] : m_meta.extra)
+            if (n == name)
+            {
+                v      = got;
+                stored = true;
+            }
+        if (!stored)
+            m_meta.extra.emplace_back(std::string(name), got);
+    }
 
     // The header goes into the first buffer when that is still in memory, and
     // is written on its own otherwise.
     m_header = encode_object_header(m_key, m_meta, m_header_len);
+    // The body starts where room was reserved for it, and a header that grew
+    // past that would be written over it.
+    if (m_header.size() != m_header_len)
+    {
+        fail(st::io_error);
+        return;
+    }
     stage& first = m_stage[0];
     if (!m_first_written && first.state != stage_state::writing)
     {
@@ -410,15 +438,18 @@ void put_op::maybe_finish()
             req.key      = self->m_key;
             req.tmp_name = self->m_tmp_name;
             req.meta     = self->m_meta;
-            self->m_store->commit(std::move(req),
-                [self](put_result r2)
-                {
-                    self->release();
-                    auto d = std::move(self->m_done);
-                    self->m_done = nullptr;
-                    if (d)
-                        d(std::move(r2));
-                });
+            auto done = [self](put_result r2)
+            {
+                self->release();
+                auto d = std::move(self->m_done);
+                self->m_done = nullptr;
+                if (d)
+                    d(std::move(r2));
+            };
+            if (self->m_committer)
+                self->m_committer(std::move(req), std::move(done));
+            else
+                self->m_store->commit(std::move(req), std::move(done));
         });
     if (!queued)
         fail(st::io_error);
@@ -448,6 +479,17 @@ void put_op::fail(st why)
         auto self = shared_from_this();
         cb(why);
     }
+}
+
+void put_op::track_checksum(checksum_algo algo, std::string expected_b64)
+{
+    m_ck        = std::make_unique<checksum_stream>(algo);
+    m_ck_expect = std::move(expected_b64);
+}
+
+void put_op::expect_checksum(std::string b64)
+{
+    m_ck_expect = std::move(b64);
 }
 
 void put_op::abort()

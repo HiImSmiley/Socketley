@@ -3464,7 +3464,9 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
 
             if (type == runtime_storage &&
                 (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") ||
-                 pa.hashes[i] == fnv1a("--max-bytes")))
+                 pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
+                 pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
+                 pa.hashes[i] == fnv1a("--mpu-expire")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
@@ -3923,6 +3925,17 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             if (cfg.has("anonymous") && cfg.storage_anonymous != stg->get_anonymous())
             {
                 conn->write_buf = "cannot change anonymous access while running\n";
+                return 1;
+            }
+            // The keys the running authenticator holds are those it read at start;
+            // the credentials file is re-read by itself, so changing its contents
+            // needs no import at all.
+            if ((cfg.has("access_key") && cfg.storage_access_key != std::string(stg->get_access_key())) ||
+                (cfg.has("secret_key") && cfg.storage_secret_key != std::string(stg->get_secret_key())) ||
+                (cfg.has("credentials") && cfg.storage_credentials != std::string(stg->get_credentials_file())))
+            {
+                conn->write_buf = "cannot change the access key, secret key or credentials file while running; "
+                                  "edit the credentials file, which is re-read when it changes, or stop and start\n";
                 return 1;
             }
         }

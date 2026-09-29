@@ -20,42 +20,12 @@ namespace
 constexpr uint64_t small_body_limit = 4ull << 20;
 constexpr size_t   user_meta_limit  = 2048;
 
-// Standard base64, for Content-MD5.
-bool base64_decode(std::string_view in, std::string& out)
-{
-    out.clear();
-    uint32_t acc = 0;
-    int bits = 0;
-    size_t pad = 0;
-    for (char c : in)
-    {
-        int v;
-        if (c >= 'A' && c <= 'Z') v = c - 'A';
-        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') v = c - '0' + 52;
-        else if (c == '+') v = 62;
-        else if (c == '/') v = 63;
-        else if (c == '=') { ++pad; continue; }
-        else return false;
-        if (pad)
-            return false;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
-        }
-    }
-    return true;
-}
-
 // The subresources of the S3 API this runtime does not implement, so a request
 // naming one is refused as such and never mistaken for the plain operation.
 bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
-        "acl", "tagging", "uploads", "uploadId", "partNumber", "versioning", "versions",
+        "acl", "tagging", "versioning", "versions",
         "versionId", "policy", "policyStatus", "cors", "lifecycle", "website", "notification",
         "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
@@ -63,6 +33,9 @@ bool unsupported_subresource(const s3_request& r, bool object)
         "acl", "location-constraint",
     };
     (void)object;
+    // A part number outside an upload asks for one part of a finished object.
+    if (r.has_query("partNumber") && !r.has_query("uploadId"))
+        return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
             if (q.first == n)
@@ -105,6 +78,71 @@ bool parse_uint(std::string_view s, uint64_t& out)
 
 }   // namespace
 
+// ─── The checksum a request asks for ────────────────────────────────────────
+
+bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error& err)
+{
+    out = {};
+    auto bad = [&](std::string_view message)
+    {
+        err = make_error("InvalidRequest");
+        err.message = std::string(message);
+        return false;
+    };
+    auto choose = [&](checksum_algo a) -> bool
+    {
+        if (out.algo != checksum_algo::none && out.algo != a)
+            return bad("Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.");
+        out.algo = a;
+        return true;
+    };
+
+    for (const auto& [name, value] : r.headers)
+    {
+        if (!is_checksum_header(name))
+            continue;
+        const checksum_algo a = checksum_from_header(name);
+        if (a == checksum_algo::none)
+            return bad("Value for " + name + " header is invalid.");
+        if (!choose(a))
+            return false;
+        std::string raw;
+        if (!base64_decode(http_trim_ows(value), raw) || raw.size() != checksum_raw_len(a))
+            return bad("Value for " + name + " header is invalid.");
+        out.expected_b64 = std::string(http_trim_ows(value));
+    }
+
+    if (const std::string_view alg = r.header("x-amz-sdk-checksum-algorithm"); !alg.empty())
+    {
+        const checksum_algo a = checksum_from_name(alg);
+        if (a == checksum_algo::none)
+            return bad("Checksum algorithm provided is unsupported. Please try again with any of the valid types: "
+                       "[CRC32, CRC32C, CRC64NVME, SHA1, SHA256]");
+        if (!choose(a))
+            return false;
+    }
+
+    // A checksum that follows the body in a trailer is named ahead of it.
+    std::string_view trailers = r.header("x-amz-trailer");
+    while (!trailers.empty())
+    {
+        const size_t comma = trailers.find(',');
+        std::string name(http_trim_ows(trailers.substr(0, comma)));
+        trailers = comma == std::string_view::npos ? std::string_view{} : trailers.substr(comma + 1);
+        for (char& ch : name)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (!is_checksum_header(name))
+            continue;
+        const checksum_algo a = checksum_from_header(name);
+        if (a == checksum_algo::none)
+            return bad("Value for " + name + " header is invalid.");
+        if (!choose(a))
+            return false;
+        out.trailer_name = std::move(name);
+    }
+    return true;
+}
+
 // ─── Routing ────────────────────────────────────────────────────────────────
 
 void storage_run::dispatch(const std::shared_ptr<conn>& c)
@@ -125,8 +163,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     auth_verdict v = m_auth->authorize(rv);
     if (!v.allowed)
     {
-        r.keep_alive = false;
-        send_error(c, v.error.code.empty() ? make_error("AccessDenied") : v.error, true);
+        deny_request(c, v.error.code.empty() ? make_error("AccessDenied") : v.error);
         return;
     }
     c->hook = std::move(v.hook);
@@ -151,6 +188,14 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
 
     const bool service = r.bucket.empty();
     const bool bucket_level = !service && r.key.empty();
+
+    // A part's body streams into the upload like an object's into a file.
+    const bool part_request = !service && !bucket_level && r.has_query("uploadId") && r.has_query("partNumber");
+    if (r.method == "PUT" && part_request && !r.has_header("x-amz-copy-source") && !unsupported_subresource(r, true))
+    {
+        op_upload_part(c);
+        return;
+    }
 
     if (r.method == "PUT" && !service && !bucket_level && !r.has_header("x-amz-copy-source") &&
         !unsupported_subresource(r, true))
@@ -185,7 +230,9 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         {
             if (m == "GET")
             {
-                if (q.has_query("location"))
+                if (q.has_query("uploads"))
+                    op_list_uploads(c);
+                else if (q.has_query("location"))
                     op_bucket_location(c);
                 else
                 {
@@ -212,14 +259,34 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
                 send_error(c, make_error("MethodNotAllowed"));
             return;
         }
+        const bool upload = q.has_query("uploadId");
         if (m == "GET")
-            op_get_object(c, false);
+        {
+            if (upload)
+                op_list_parts(c);
+            else
+                op_get_object(c, false);
+        }
         else if (m == "HEAD")
             op_get_object(c, true);
         else if (m == "PUT")
-            op_copy_object(c);
+        {
+            if (upload && q.has_query("partNumber"))
+                op_upload_part_copy(c);
+            else
+                op_copy_object(c);
+        }
         else if (m == "DELETE")
-            op_delete_object(c);
+        {
+            if (upload)
+                op_abort_multipart(c);
+            else
+                op_delete_object(c);
+        }
+        else if (m == "POST" && q.has_query("uploads"))
+            op_create_multipart(c);
+        else if (m == "POST" && upload)
+            op_complete_multipart(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
     });
@@ -258,6 +325,12 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
 
 void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
 {
+    // An upload that was never completed is something the bucket still holds.
+    if (m_mpu.bucket_has_uploads(c->req.bucket))
+    {
+        send_error_st(c, st::bucket_not_empty);
+        return;
+    }
     std::weak_ptr<conn> weak = c;
     m_store.delete_bucket(c->req.bucket, [this, weak](st s)
     {
@@ -519,7 +592,24 @@ bool storage_run::object_meta_from_headers(const std::shared_ptr<conn>& c, objec
             if (name == k)
                 take = true;
         if (name == "content-encoding" && http_list_has_token(value, "aws-chunked", 11))
+        {
+            // The framing is not part of the object, and any other coding is.
+            std::string rest;
+            std::string_view codings = value;
+            while (!codings.empty())
+            {
+                const size_t comma = codings.find(',');
+                const std::string_view one = http_trim_ows(codings.substr(0, comma));
+                codings = comma == std::string_view::npos ? std::string_view{} : codings.substr(comma + 1);
+                if (one.empty() || http_token_equals(one, "aws-chunked", 11))
+                    continue;
+                rest += rest.empty() ? "" : ", ";
+                rest += one;
+            }
             take = false;
+            if (!rest.empty())
+                m.extra.emplace_back(name, std::move(rest));
+        }
         if (name.starts_with("x-amz-meta-"))
         {
             take = true;
@@ -549,6 +639,35 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
 
+    object_meta meta;
+    s3_error err;
+    if (!object_meta_from_headers(c, meta, err))
+    {
+        r.keep_alive = false;
+        send_error(c, err, true);
+        return;
+    }
+
+    // S3's conditional write: refuse to replace what is there.
+    if (r.header("if-none-match") == "*" && m_store.find(r.bucket, r.key))
+    {
+        r.keep_alive = false;
+        send_error(c, make_error("PreconditionFailed"), true);
+        return;
+    }
+
+    start_put(c, r.key, std::move(meta), {});
+}
+
+// Begins streaming the request's body into a temporary file for `key`, after
+// the checks every body that becomes a file has passed; `committer` says where
+// the finished file goes when it is not the object namespace, and a checksum
+// algorithm is taken whether or not the client named one when `forced_algo` says so.
+void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
+                            put_op::committer committer, checksum_algo forced_algo)
+{
+    s3_request& r = c->req;
+
     // The digest the client promises, checked when the body is in.
     if (const std::string_view md5h = r.header("content-md5"); !md5h.empty())
     {
@@ -570,22 +689,31 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    object_meta meta;
-    s3_error err;
-    if (!object_meta_from_headers(c, meta, err))
+    checksum_request ck;
+    s3_error         err;
+    if (!parse_checksum_request(r, ck, err))
     {
         r.keep_alive = false;
         send_error(c, err, true);
         return;
     }
-
-    // S3's conditional write: refuse to replace what is there.
-    if (r.header("if-none-match") == "*" && m_store.find(r.bucket, r.key))
+    if (forced_algo != checksum_algo::none)
     {
-        r.keep_alive = false;
-        send_error(c, make_error("PreconditionFailed"), true);
-        return;
+        if (ck.algo != checksum_algo::none && ck.algo != forced_algo)
+        {
+            r.keep_alive = false;
+            err = make_error("InvalidRequest");
+            err.message = "Checksum Type mismatch occurred, expected checksum Type: " +
+                          std::string(checksum_name(forced_algo)) + ", actual checksum Type: " +
+                          std::string(checksum_name(ck.algo));
+            send_error(c, err, true);
+            return;
+        }
+        ck.algo = forced_algo;
     }
+    // A placeholder of the value's length, so the header reserves room for it.
+    if (ck.algo != checksum_algo::none)
+        meta.extra.emplace_back(std::string(checksum_header(ck.algo)), std::string(checksum_b64_len(ck.algo), 'A'));
 
     uint64_t expected = r.content_length;
     bool     known    = r.has_content_length && !r.chunked;
@@ -603,7 +731,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     }
 
     st why = st::ok;
-    auto op = m_store.begin_put(r.bucket, r.key, std::move(meta), expected, known, why);
+    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why);
     if (!op)
     {
         // The body is not read, so the connection cannot be reused.
@@ -617,10 +745,44 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         send_error_st(c, op->status());
         return;
     }
+    if (ck.algo != checksum_algo::none)
+    {
+        op->track_checksum(ck.algo, std::move(ck.expected_b64));
+        c->ck_trailer = std::move(ck.trailer_name);
+    }
+    if (committer)
+        op->set_committer(std::move(committer));
     begin_put_body(c, std::move(op));
 }
 
 // ─── CopyObject ─────────────────────────────────────────────────────────────
+
+bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err)
+{
+    std::string src;
+    std::string_view raw = header;
+    // A version id after the key is not supported and not ignored either.
+    if (const size_t q = raw.find("?versionId="); q != std::string_view::npos)
+        raw = raw.substr(0, q);
+    if (!percent_decode(raw, src, false))
+    {
+        err = make_error("InvalidArgument");
+        return false;
+    }
+    std::string_view sv = src;
+    if (!sv.empty() && sv.front() == '/')
+        sv.remove_prefix(1);
+    const size_t slash = sv.find('/');
+    if (slash == std::string_view::npos || slash == 0 || slash + 1 >= sv.size())
+    {
+        err = make_error("InvalidArgument");
+        err.message = "Copy Source must mention the source bucket and key: sourcebucket/sourcekey";
+        return false;
+    }
+    bucket = std::string(sv.substr(0, slash));
+    key    = std::string(sv.substr(slash + 1));
+    return true;
+}
 
 void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
 {
@@ -634,29 +796,13 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    std::string src;
-    std::string_view raw = src_hdr;
-    // A version id after the key is not supported and not ignored either.
-    if (const size_t q = raw.find("?versionId="); q != std::string_view::npos)
-        raw = raw.substr(0, q);
-    if (!percent_decode(raw, src, false))
+    std::string src_bucket, src_key;
+    s3_error    copy_err;
+    if (!parse_copy_source(src_hdr, src_bucket, src_key, copy_err))
     {
-        send_error(c, make_error("InvalidArgument"));
+        send_error(c, copy_err, false, "ArgumentName", "x-amz-copy-source");
         return;
     }
-    std::string_view sv = src;
-    if (!sv.empty() && sv.front() == '/')
-        sv.remove_prefix(1);
-    const size_t slash = sv.find('/');
-    if (slash == std::string_view::npos || slash == 0 || slash + 1 >= sv.size())
-    {
-        s3_error e = make_error("InvalidArgument");
-        e.message = "Copy Source must mention the source bucket and key: sourcebucket/sourcekey";
-        send_error(c, e, false, "ArgumentName", "x-amz-copy-source");
-        return;
-    }
-    const std::string src_bucket(sv.substr(0, slash));
-    const std::string src_key(sv.substr(slash + 1));
 
     const std::string_view directive = r.header("x-amz-metadata-directive");
     if (!directive.empty() && directive != "COPY" && directive != "REPLACE")
@@ -769,7 +915,7 @@ namespace
 
 // The headers an object's stored metadata puts on a response, with the
 // response-* query overrides a presigned URL may add.
-void object_headers(const s3_request& q, const object_meta& m, response& r)
+void object_headers(const s3_request& q, const object_meta& m, response& r, bool ranged)
 {
     r.headers.emplace_back("Accept-Ranges", "bytes");
     r.headers.emplace_back("ETag", "\"" + m.etag() + "\"");
@@ -801,11 +947,20 @@ void object_headers(const s3_request& q, const object_meta& m, response& r)
     else
         r.headers.emplace_back("Content-Type", m.content_type);
 
+    // The checksum a client asked to see, which describes the whole object and
+    // so is left off an answer that holds only part of it.
+    const bool with_checksum = !ranged && http_token_equals(q.header("x-amz-checksum-mode"), "enabled", 7);
     for (const auto& [n, v] : m.extra)
     {
         if (n.starts_with("x-amz-meta-"))
         {
             r.headers.emplace_back(n, v);
+            continue;
+        }
+        if (is_checksum_header(n))
+        {
+            if (with_checksum)
+                r.headers.emplace_back(n, v);
             continue;
         }
         std::string display;
@@ -959,7 +1114,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             }
         }
 
-        object_headers(rq, m, r);
+        object_headers(rq, m, r, ranged);
         if (ranged)
         {
             r.status = 206;

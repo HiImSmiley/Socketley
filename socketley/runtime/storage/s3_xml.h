@@ -69,6 +69,8 @@ inline s3_error make_error(std::string_view code)
         {"BadDigest", 400, "The Content-MD5 or checksum value that you specified did not match what we received."},
         {"EntityTooLarge", 400, "Your proposed upload exceeds the maximum allowed size"},
         {"EntityTooSmall", 400, "Your proposed upload is smaller than the minimum allowed object size."},
+        {"InvalidPart", 400, "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag."},
+        {"InvalidPartOrder", 400, "The list of parts was not in ascending order. The parts list must be specified in order by part number."},
         {"KeyTooLongError", 400, "Your key is too long"},
         {"MetadataTooLarge", 400, "Your metadata headers exceed the maximum allowed metadata size."},
         {"MalformedXML", 400, "The XML you provided was not well-formed or did not validate against our published schema."},
@@ -108,9 +110,11 @@ inline s3_error error_for(st s)
         case st::bad_digest:          return make_error("BadDigest");
         case st::storage_full:        return make_error("StorageFull");
         case st::busy:                return make_error("OperationAborted");
+        // A part whose upload was aborted while its body was arriving, which is
+        // the only way a cancelled body still has someone to answer.
+        case st::cancelled:           return make_error("NoSuchUpload");
         case st::ok:
         case st::io_error:
-        case st::cancelled:
             break;
     }
     return make_error("InternalError");

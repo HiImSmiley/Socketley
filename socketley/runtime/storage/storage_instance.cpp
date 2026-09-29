@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "s3_sigv4_auth.h"
 #include "storage_run.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
@@ -64,9 +65,14 @@ std::string storage_instance::config_refusal() const
         return "storage: --dir <path> is required, because that is where the buckets live\n";
     // Refused rather than defaulted: an endpoint that answers anybody must have
     // been asked to.
-    if (!m_anonymous && !m_auth)
-        return "storage: a runtime with no credentials serves nobody; pass --anonymous "
-               "to accept every request without authentication\n";
+    if (!m_anonymous && !m_auth && !has_credentials())
+        return "storage: a runtime with no credentials serves nobody; pass --access-key and "
+               "--secret-key or --credentials to require signed requests, or --anonymous to "
+               "accept every request without authentication\n";
+    if (has_credentials())
+        if (const std::string why = socketley::storage::sigv4_config_error(
+                {m_access_key, m_secret_key, m_credentials_file, m_anonymous}); !why.empty())
+            return "storage: " + why + "\n";
     return {};
 }
 
@@ -74,7 +80,10 @@ void storage_instance::refresh_cached_limits()
 {
     m_max_conns_cached = get_max_connections();
     if (m_run)
+    {
         m_run->store().set_max_bytes(m_max_bytes);
+        m_run->set_mpu_expire_secs(m_mpu_expire_secs);
+    }
 }
 
 void storage_instance::on_cqe(struct io_uring_cqe*)
@@ -128,7 +137,22 @@ bool storage_instance::setup(event_loop& loop)
     refresh_cached_limits();
 
     socketley::storage::authenticator* auth = m_auth.get();
-    if (!auth)
+    std::unique_ptr<socketley::storage::authenticator> signed_auth;
+    if (!auth && has_credentials())
+    {
+        // Made at every start, so a reload picks up a changed file and key.
+        auto a = std::make_unique<socketley::storage::sigv4_authenticator>(
+            socketley::storage::sigv4_config{m_access_key, m_secret_key, m_credentials_file, m_anonymous});
+        std::string why;
+        if (!a->load(why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            return false;
+        }
+        auth        = a.get();
+        signed_auth = std::move(a);
+    }
+    else if (!auth)
     {
         m_anon = std::make_unique<socketley::storage::anonymous_authenticator>();
         auth   = m_anon.get();
@@ -141,6 +165,9 @@ bool storage_instance::setup(event_loop& loop)
     opts.max_bytes = m_max_bytes;
 
     auto run = std::make_unique<storage_run>(*this, loop, opts, auth);
+    if (signed_auth)
+        run->adopt_authenticator(std::move(signed_auth));
+    run->set_mpu_expire_secs(m_mpu_expire_secs);
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -224,6 +251,7 @@ std::string storage_instance::stats_lines() const
         return {};
     const auto& c = m_run->counters();
     const auto  t = m_run->store().totals();
+    const auto  mp = m_run->multipart().totals();
     out << "buckets:" << t.buckets << "\n"
         << "objects:" << t.objects << "\n"
         << "bytes:" << t.bytes << "\n"
@@ -243,6 +271,12 @@ std::string storage_instance::stats_lines() const
         << "journal_records:" << t.journal_records << "\n"
         << "journal_compactions:" << t.compactions << "\n"
         << "fsyncs:" << t.fsyncs << "\n"
-        << "timeouts:" << c.timeouts << "\n";
+        << "timeouts:" << c.timeouts << "\n"
+        << "multipart_uploads:" << mp.uploads << "\n"
+        << "multipart_parts:" << mp.parts << "\n"
+        << "multipart_bytes:" << mp.bytes << "\n"
+        << "multipart_created:" << c.mpu_created << "\n"
+        << "multipart_completed:" << c.mpu_completed << "\n"
+        << "multipart_aborted:" << c.mpu_aborted << "\n";
     return out.str();
 }

@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include "checksum.h"
+#include "multipart.h"
 #include "object_store.h"
 #include "s3_auth.h"
 #include "../../shared/event_loop.h"
@@ -49,6 +51,11 @@ struct storage_counters
     // Body bytes taken in from clients.
     uint64_t bytes_in{0};
     uint64_t timeouts{0};
+    // Multipart: uploads begun, parts taken, uploads completed and aborted.
+    uint64_t mpu_created{0};
+    uint64_t mpu_parts{0};
+    uint64_t mpu_completed{0};
+    uint64_t mpu_aborted{0};
 };
 
 // The request as parsed.  Owns its strings, so what an asynchronous step
@@ -103,6 +110,25 @@ struct s3_request
         return {};
     }
 };
+
+// The checksum a request asks to be taken of its body: named by a header that
+// carries the value, by a trailer that will, or by the SDK's algorithm header.
+struct checksum_request
+{
+    checksum_algo algo{checksum_algo::none};
+    // The base64 the request gave ahead of the body, empty when it did not.
+    std::string   expected_b64;
+    // The trailer that will carry the value after the body, empty when none.
+    std::string   trailer_name;
+};
+
+// False with `err` when the request names a checksum the runtime cannot take
+// or names two that disagree.
+bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error& err);
+
+// The bucket and key an x-amz-copy-source header names, decoded; false with
+// `err` when it names neither or is not one.
+bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err);
 
 enum class phase : uint8_t
 {
@@ -183,6 +209,8 @@ struct conn
     s3_error    body_error;
     bool        body_refused{false};
     uint64_t    decoded_total{0};
+    // The trailer a checksum will arrive in after the body, when it does.
+    std::string ck_trailer;
 
     // ── A file being sent ───────────────────────────────────────────────────
     int         file_fd{-1};
@@ -238,6 +266,21 @@ public:
     object_store& store() { return m_store; }
     file_io& io() { return m_io; }
     void set_authenticator(authenticator* a) { m_auth = a; }
+    // An authenticator the run keeps for as long as it lives, because a
+    // request in flight when a stop came is still asking it.
+    void adopt_authenticator(std::unique_ptr<authenticator> a)
+    {
+        m_auth_owned = std::move(a);
+        m_auth       = m_auth_owned.get();
+    }
+    multipart_store& multipart() { return m_mpu; }
+    // Uploads left open this many seconds are aborted; zero keeps them until they are.
+    void set_mpu_expire_secs(uint32_t s)
+    {
+        m_mpu_expire_secs = s;
+        if (s != 0)
+            arm_sweep();
+    }
     void on_turn();
 
     // Called by the object store's callbacks through a captured id.
@@ -282,6 +325,10 @@ public:
     void put_failed(const std::shared_ptr<conn>& c, st why);
     void put_refused(const std::shared_ptr<conn>& c, const s3_error& e);
     void enter_discard(const std::shared_ptr<conn>& c);
+    // Answers a request that is refused before its body was read, after reading
+    // and dropping the body when it is small enough, so the client hears the
+    // answer and not a reset.
+    void deny_request(const std::shared_ptr<conn>& c, const s3_error& e);
 
     // ── Sending a file out ──────────────────────────────────────────────────
     void send_file(const std::shared_ptr<conn>& c, response head, int fd, uint64_t off, uint64_t len);
@@ -301,7 +348,21 @@ public:
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_delete_objects(const std::shared_ptr<conn>& c);
     void op_put_object(const std::shared_ptr<conn>& c);
+    void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
+                   put_op::committer committer, checksum_algo forced_algo = checksum_algo::none);
     void op_copy_object(const std::shared_ptr<conn>& c);
+
+    // Multipart, in storage_multipart.cpp.
+    void op_create_multipart(const std::shared_ptr<conn>& c);
+    void op_upload_part(const std::shared_ptr<conn>& c);
+    void op_upload_part_copy(const std::shared_ptr<conn>& c);
+    void op_complete_multipart(const std::shared_ptr<conn>& c);
+    void op_abort_multipart(const std::shared_ptr<conn>& c);
+    void op_list_parts(const std::shared_ptr<conn>& c);
+    void op_list_uploads(const std::shared_ptr<conn>& c);
+    const mpu_upload* upload_for(const std::shared_ptr<conn>& c);
+    bool part_number_of(const std::shared_ptr<conn>& c, uint32_t& number);
+    void reap_uploads();
     void op_get_object(const std::shared_ptr<conn>& c, bool head);
     void op_delete_object(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
@@ -316,8 +377,12 @@ private:
     event_loop&       m_loop;
     file_io           m_io;
     object_store      m_store;
+    multipart_store   m_mpu;
     authenticator*    m_auth;
+    std::unique_ptr<authenticator> m_auth_owned;
     anonymous_authenticator m_anon;
+    uint32_t          m_mpu_expire_secs{0};
+    std::chrono::steady_clock::time_point m_last_reap{};
 
     int         m_listen_fd{-1};
     io_request  m_accept_req{};

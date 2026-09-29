@@ -1,0 +1,1247 @@
+#include "multipart.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <charconv>
+#include <cstring>
+#include <filesystem>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "s3_xml.h"
+#include "../../shared/logging.h"
+#include "../../shared/random_id.h"
+
+namespace fs = std::filesystem;
+
+namespace socketley::storage
+{
+
+namespace
+{
+
+constexpr size_t chunk_bytes = 1u << 20;
+// Files removed at once when an upload goes, so ten thousand parts do not
+// queue ten thousand operations.
+constexpr size_t unlink_window = 16;
+constexpr std::string_view algorithm_extra = "x-amz-checksum-algorithm";
+
+st errno_st(int64_t res)
+{
+    return (res == -ENOSPC || res == -EDQUOT) ? st::storage_full : st::io_error;
+}
+
+std::string new_upload_id()
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string id;
+    id.reserve(32);
+    for (int w = 0; w < 2; ++w)
+    {
+        uint64_t v = random_u64();
+        for (int i = 0; i < 16; ++i, v >>= 4)
+            id.push_back(digits[v & 15]);
+    }
+    return id;
+}
+
+bool valid_upload_id(std::string_view id)
+{
+    if (id.size() != 32)
+        return false;
+    for (char c : id)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+// A descriptor that is closed when the last holder lets go, on the loop while
+// there is one and directly when the run has been freed.
+std::shared_ptr<int> hold_fd(event_loop* loop, const std::shared_ptr<bool>& alive, int fd)
+{
+    return std::shared_ptr<int>(new int(fd), [loop, alive](int* p)
+    {
+        if (*p >= 0)
+        {
+            if (*alive)
+                loop->close_fd(*p);
+            else
+                ::close(*p);
+        }
+        delete p;
+    });
+}
+
+// Disk operations one after another, each started when the one before it has
+// reported, ending at the first that failed.
+class disk_chain : public std::enable_shared_from_this<disk_chain>
+{
+public:
+    using launch = std::function<bool(file_io::done)>;
+
+    explicit disk_chain(std::shared_ptr<bool> alive) : m_alive(std::move(alive)) {}
+
+    // A result of `tolerate` is counted as success, for a directory that may already be there.
+    disk_chain& then(launch fn, int64_t tolerate = 0)
+    {
+        m_steps.push_back({std::move(fn), tolerate});
+        return *this;
+    }
+
+    // `finished` gets 0, or the first negative errno; it does not run at all
+    // when the store has gone.
+    void run(std::function<void(int64_t)> finished)
+    {
+        m_finished = std::move(finished);
+        next();
+    }
+
+private:
+    struct step
+    {
+        launch  fn;
+        int64_t tolerate;
+    };
+
+    void next()
+    {
+        auto self = shared_from_this();
+        if (m_i == m_steps.size())
+        {
+            finish(0);
+            return;
+        }
+        step& s = m_steps[m_i++];
+        const int64_t tolerate = s.tolerate;
+        const bool queued = s.fn([self, tolerate](int64_t r)
+        {
+            if (!*self->m_alive)
+                return;
+            if (r < 0 && r != tolerate)
+            {
+                self->finish(r);
+                return;
+            }
+            self->next();
+        });
+        if (!queued)
+            finish(-EIO);
+    }
+
+    void finish(int64_t r)
+    {
+        auto f = std::move(m_finished);
+        m_finished = nullptr;
+        if (f)
+            f(r);
+    }
+
+    std::shared_ptr<bool> m_alive;
+    std::vector<step>     m_steps;
+    size_t                m_i{0};
+    std::function<void(int64_t)> m_finished;
+};
+
+// Reads the start of a file, blocking, for the scan at startup.
+bool read_prefix(const std::string& path, size_t max, std::string& out, uint64_t* file_size = nullptr)
+{
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    struct stat sb{};
+    if (::fstat(fd, &sb) != 0)
+    {
+        ::close(fd);
+        return false;
+    }
+    if (file_size)
+        *file_size = static_cast<uint64_t>(sb.st_size);
+    out.resize(std::min<size_t>(max, static_cast<size_t>(sb.st_size)));
+    size_t got = 0;
+    while (got < out.size())
+    {
+        const ssize_t n = ::pread(fd, out.data() + got, out.size() - got, static_cast<off_t>(got));
+        if (n <= 0)
+            break;
+        got += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    out.resize(got);
+    return true;
+}
+
+const std::string* extra_value(const object_meta& m, std::string_view name)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == name)
+            return &v;
+    return nullptr;
+}
+
+}   // namespace
+
+struct part_commit
+{
+    std::string bucket;
+    std::string id;
+    uint32_t    number{0};
+    std::string tmp_path;
+    std::string part_path;
+    commit_request req;
+    std::function<void(put_result)> done;
+};
+
+struct assemble_state
+{
+    std::string bucket;
+    std::string id;
+    std::string key;
+    object_meta meta;
+    std::string checksum_b64;
+    std::vector<mpu_part> parts;
+    std::string tmp_name;
+    std::string tmp_path;
+    std::string dir_path;
+    std::shared_ptr<int> dst;
+    size_t   hdr_len{0};
+    size_t   part_idx{0};
+    uint64_t part_off{0};
+    uint64_t dst_off{0};
+    // The descriptor of the part being read, shared with the chunks still using it.
+    std::shared_ptr<int> cur;
+    bool     opening{false};
+    bool     header_done{false};
+    bool     finishing{false};
+    int      inflight{0};
+    bool     failed{false};
+    int64_t  err{0};
+    std::unique_ptr<char[]> buf[2];
+    bool     buf_free[2]{true, true};
+    std::function<void()> progress;
+    std::function<void(complete_result)> cb;
+};
+
+multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& store)
+    : m_loop(&loop), m_io(&io), m_store(&store), m_alive(std::make_shared<bool>(true))
+{
+}
+
+multipart_store::~multipart_store()
+{
+    *m_alive = false;
+    for (auto& [k, up] : m_uploads)
+        if (up->dir_fd >= 0)
+            ::close(up->dir_fd);
+}
+
+multipart_store::key_t multipart_store::key_of(std::string_view bucket, std::string_view id)
+{
+    std::string k(bucket);
+    k.push_back('/');
+    k.append(id);
+    return k;
+}
+
+std::string multipart_store::base_of(std::string_view bucket) const
+{
+    return m_store->options().dir + "/" + std::string(bucket);
+}
+
+std::string multipart_store::upload_path(std::string_view bucket, std::string_view id) const
+{
+    return base_of(bucket) + "/mpu/" + std::string(id);
+}
+
+mpu_upload* multipart_store::find_mut(std::string_view bucket, std::string_view id)
+{
+    const auto it = m_uploads.find(key_of(bucket, id));
+    return it == m_uploads.end() ? nullptr : it->second.get();
+}
+
+const mpu_upload* multipart_store::find(std::string_view bucket, std::string_view id) const
+{
+    const auto it = m_uploads.find(key_of(bucket, id));
+    return it == m_uploads.end() ? nullptr : it->second.get();
+}
+
+std::vector<const mpu_upload*> multipart_store::uploads_of(std::string_view bucket) const
+{
+    std::vector<const mpu_upload*> out;
+    const std::string prefix = std::string(bucket) + "/";
+    for (auto it = m_uploads.lower_bound(prefix); it != m_uploads.end() && it->first.starts_with(prefix); ++it)
+        if (it->second->state != mpu_state::removing)
+            out.push_back(it->second.get());
+    return out;
+}
+
+bool multipart_store::bucket_has_uploads(std::string_view bucket) const
+{
+    const std::string prefix = std::string(bucket) + "/";
+    const auto it = m_uploads.lower_bound(prefix);
+    return it != m_uploads.end() && it->first.starts_with(prefix);
+}
+
+mpu_totals multipart_store::totals() const
+{
+    mpu_totals t;
+    for (const auto& [k, up] : m_uploads)
+    {
+        ++t.uploads;
+        t.parts += up->parts.size();
+        t.bytes += up->held;
+    }
+    return t;
+}
+
+// ─── Startup ────────────────────────────────────────────────────────────────
+
+bool multipart_store::open(std::string& err)
+{
+    for (const bucket_info& b : m_store->buckets())
+        if (!recover_bucket(b.name, err))
+            return false;
+    return true;
+}
+
+bool multipart_store::recover_bucket(const std::string& bucket, std::string& err)
+{
+    const std::string mpu = base_of(bucket) + "/mpu";
+    if (::mkdir(mpu.c_str(), 0755) < 0)
+    {
+        if (errno != EEXIST)
+        {
+            err = "cannot create " + mpu + ": " + std::strerror(errno);
+            return false;
+        }
+    }
+    else
+    {
+        const int fd = ::open(base_of(bucket).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            if (::fsync(fd) < 0) {}
+            ::close(fd);
+        }
+    }
+
+    std::error_code ec;
+    std::vector<fs::path> entries;
+    for (const auto& e : fs::directory_iterator(mpu, ec))
+        entries.push_back(e.path());
+
+    for (const fs::path& dir : entries)
+    {
+        const std::string id = dir.filename().string();
+        std::error_code dc;
+        if (!valid_upload_id(id) || !fs::is_directory(dir, dc))
+        {
+            LOG_WARN(("storage: ignoring " + dir.string() + ", which is not a multipart upload").c_str());
+            continue;
+        }
+
+        // An upload whose meta file is not whole was never acknowledged.
+        std::string head;
+        decoded_header dh;
+        if (read_prefix(dir.string() + "/meta", 64 * 1024, head))
+            dh = decode_object_header(head);
+        if (dh.status != header_status::ok)
+        {
+            fs::remove_all(dir, dc);
+            continue;
+        }
+
+        auto up = std::make_unique<mpu_upload>();
+        up->bucket       = bucket;
+        up->id           = id;
+        up->key          = dh.key;
+        up->meta         = dh.meta;
+        up->initiated_ms = dh.meta.mtime_ms;
+        up->meta.mtime_ms = 0;
+        for (auto it = up->meta.extra.begin(); it != up->meta.extra.end();)
+        {
+            if (it->first == algorithm_extra)
+            {
+                up->algo = checksum_from_name(it->second);
+                it       = up->meta.extra.erase(it);
+            }
+            else
+                ++it;
+        }
+        up->dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (up->dir_fd < 0)
+        {
+            err = "cannot open " + dir.string() + ": " + std::strerror(errno);
+            return false;
+        }
+
+        for (const auto& pe : fs::directory_iterator(dir, dc))
+        {
+            const std::string name = pe.path().filename().string();
+            if (name == "meta")
+                continue;
+            uint32_t n = 0;
+            const auto r = std::from_chars(name.data(), name.data() + name.size(), n);
+            bool keep = r.ec == std::errc{} && r.ptr == name.data() + name.size() && n >= 1 && n <= mpu_max_parts;
+            mpu_part part;
+            if (keep)
+            {
+                std::string ph;
+                uint64_t    fsize = 0;
+                keep = read_prefix(pe.path().string(), 64 * 1024, ph, &fsize);
+                if (keep)
+                {
+                    const decoded_header pd = decode_object_header(ph);
+                    keep = pd.status == header_status::ok && fsize == pd.header_len + pd.meta.size;
+                    if (keep)
+                    {
+                        part.number   = n;
+                        part.size     = pd.meta.size;
+                        part.md5      = pd.meta.md5;
+                        part.mtime_ms = pd.meta.mtime_ms;
+                        part.data_off = pd.header_len;
+                        if (const std::string* v = extra_value(pd.meta, checksum_header(up->algo)))
+                            part.checksum_b64 = *v;
+                    }
+                }
+            }
+            if (!keep)
+            {
+                // A stray file, or a part that is not what its header says.
+                fs::remove(pe.path(), dc);
+                continue;
+            }
+            up->held += part.size;
+            up->parts.emplace(n, std::move(part));
+        }
+        m_store->hold_bytes(up->held);
+        m_uploads.emplace(key_of(bucket, id), std::move(up));
+    }
+    return true;
+}
+
+// ─── Creating ───────────────────────────────────────────────────────────────
+
+void multipart_store::create(std::string bucket, std::string key, object_meta meta, checksum_algo algo,
+                             std::function<void(st, std::string)> cb)
+{
+    if (!m_store->has_bucket(bucket))
+    {
+        cb(st::no_such_bucket, {});
+        return;
+    }
+    if (key.empty() || key.size() > max_key_bytes)
+    {
+        cb(st::key_too_long, {});
+        return;
+    }
+
+    struct state
+    {
+        std::string bucket;
+        std::string key;
+        std::string id;
+        std::string dir;
+        std::string mpu;
+        std::string header;
+        object_meta meta;
+        checksum_algo algo{checksum_algo::none};
+        int64_t     initiated{0};
+        bool        mpu_made{false};
+        std::shared_ptr<int> dir_fd;
+        std::shared_ptr<int> file_fd;
+        std::shared_ptr<int> sync_fd;
+        std::function<void(st, std::string)> cb;
+    };
+    auto s = std::make_shared<state>();
+    s->bucket    = std::move(bucket);
+    s->key       = std::move(key);
+    s->id        = new_upload_id();
+    s->mpu       = base_of(s->bucket) + "/mpu";
+    s->dir       = s->mpu + "/" + s->id;
+    s->meta      = std::move(meta);
+    s->algo      = algo;
+    s->initiated = static_cast<int64_t>(m_store->now_ms());
+    s->cb        = std::move(cb);
+    s->dir_fd    = hold_fd(m_loop, m_alive, -1);
+    s->file_fd   = hold_fd(m_loop, m_alive, -1);
+    s->sync_fd   = hold_fd(m_loop, m_alive, -1);
+
+    // The header says what the object will be, and carries when the upload
+    // began in the field an object keeps its modification time in.
+    object_meta stored = s->meta;
+    stored.mtime_ms    = s->initiated;
+    if (algo != checksum_algo::none)
+        stored.extra.emplace_back(std::string(algorithm_extra), std::string(checksum_name(algo)));
+    s->header = encode_object_header(s->key, stored);
+
+    ++m_inflight;
+    auto ch = std::make_shared<disk_chain>(m_alive);
+    file_io* io = m_io;
+
+    // The directory holding every upload of the bucket, synced into the
+    // bucket when this is what made it.
+    ch->then([io, s](file_io::done d)
+    {
+        return io->mkdirat(AT_FDCWD, s->mpu, 0755, [s, d](int64_t r) { s->mpu_made = r == 0; d(r); });
+    }, -EEXIST);
+    ch->then([io, s](file_io::done d)
+    {
+        if (!s->mpu_made)
+        {
+            d(0);
+            return true;
+        }
+        return io->openat(AT_FDCWD, s->mpu.substr(0, s->mpu.size() - 4), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                          [s, d](int64_t r) { if (r >= 0) *s->sync_fd = static_cast<int>(r); d(r < 0 ? r : 0); });
+    });
+    ch->then([io, s](file_io::done d)
+    {
+        if (*s->sync_fd < 0)
+        {
+            d(0);
+            return true;
+        }
+        return io->fsync(*s->sync_fd, false, std::move(d));
+    });
+    ch->then([io, s](file_io::done d)
+    {
+        return io->mkdirat(AT_FDCWD, s->dir, 0755, std::move(d));
+    });
+    ch->then([io, s](file_io::done d)
+    {
+        return io->openat(AT_FDCWD, s->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                          [s, d](int64_t r) { if (r >= 0) *s->dir_fd = static_cast<int>(r); d(r < 0 ? r : 0); });
+    });
+    ch->then([io, s](file_io::done d)
+    {
+        return io->openat(*s->dir_fd, "meta", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
+                          [s, d](int64_t r) { if (r >= 0) *s->file_fd = static_cast<int>(r); d(r < 0 ? r : 0); });
+    });
+    ch->then([io, s](file_io::done d)
+    {
+        return io->pwrite(*s->file_fd, s->header.data(), static_cast<uint32_t>(s->header.size()), 0, std::move(d));
+    });
+    ch->then([io, s](file_io::done d) { return io->fsync(*s->file_fd, true, std::move(d)); });
+    ch->then([io, s](file_io::done d) { return io->fsync(*s->dir_fd, false, std::move(d)); });
+    // The upload's own directory is an entry of the bucket's, which the id must survive.
+    ch->then([io, s](file_io::done d)
+    {
+        return io->openat(AT_FDCWD, s->mpu, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                          [s, d](int64_t r)
+                          {
+                              if (r >= 0)
+                              {
+                                  if (*s->sync_fd >= 0)
+                                      ::close(*s->sync_fd);
+                                  *s->sync_fd = static_cast<int>(r);
+                              }
+                              d(r < 0 ? r : 0);
+                          });
+    });
+    ch->then([io, s](file_io::done d) { return io->fsync(*s->sync_fd, false, std::move(d)); });
+
+    ch->run([this, alive = m_alive, s](int64_t r)
+    {
+        if (!*alive)
+            return;
+        --m_inflight;
+        if (r < 0)
+        {
+            // Nothing was promised, so what was made is taken back where it can be.
+            if (*s->file_fd >= 0)
+                if (!m_io->unlinkat(AT_FDCWD, s->dir + "/meta", 0, [](int64_t) {})) {}
+            if (*s->dir_fd >= 0)
+                if (!m_io->unlinkat(AT_FDCWD, s->dir, AT_REMOVEDIR, [](int64_t) {})) {}
+            s->cb(errno_st(r), {});
+            return;
+        }
+        if (!m_store->has_bucket(s->bucket))
+        {
+            s->cb(st::no_such_bucket, {});
+            return;
+        }
+        auto up = std::make_unique<mpu_upload>();
+        up->bucket       = s->bucket;
+        up->id           = s->id;
+        up->key          = s->key;
+        up->meta         = s->meta;
+        up->initiated_ms = s->initiated;
+        up->algo         = s->algo;
+        // The directory descriptor is the upload's from here.
+        up->dir_fd = ::dup(*s->dir_fd);
+        m_uploads.emplace(key_of(s->bucket, s->id), std::move(up));
+        s->cb(st::ok, s->id);
+    });
+}
+
+// ─── Parts ──────────────────────────────────────────────────────────────────
+
+st multipart_store::begin_part(std::string_view bucket, std::string_view id, checksum_algo& algo) const
+{
+    const mpu_upload* up = find(bucket, id);
+    if (!up || up->state != mpu_state::open)
+        return st::no_such_key;
+    algo = up->algo;
+    return st::ok;
+}
+
+void multipart_store::lane_enter(std::string_view bucket, std::string_view id, uint32_t number,
+                                 std::function<void()> run)
+{
+    mpu_upload* up = find_mut(bucket, id);
+    if (!up)
+    {
+        run();
+        return;
+    }
+    auto it = up->lanes.find(number);
+    if (it == up->lanes.end())
+    {
+        up->lanes.emplace(number, std::vector<std::function<void()>>{});
+        run();
+        return;
+    }
+    it->second.push_back(std::move(run));
+}
+
+void multipart_store::lane_leave(std::string_view bucket, std::string_view id, uint32_t number)
+{
+    mpu_upload* up = find_mut(bucket, id);
+    if (!up)
+        return;
+    auto it = up->lanes.find(number);
+    if (it == up->lanes.end())
+        return;
+    if (it->second.empty())
+    {
+        up->lanes.erase(it);
+        return;
+    }
+    auto next = std::move(it->second.front());
+    it->second.erase(it->second.begin());
+    next();
+}
+
+put_op::committer multipart_store::part_committer(std::string bucket, std::string id, uint32_t number)
+{
+    return [this, alive = m_alive, bucket = std::move(bucket), id = std::move(id), number](
+               commit_request req, std::function<void(put_result)> done)
+    {
+        if (!*alive)
+            return;
+        auto pc = std::make_shared<part_commit>();
+        pc->bucket    = bucket;
+        pc->id        = id;
+        pc->number    = number;
+        pc->tmp_path  = base_of(bucket) + "/tmp/" + req.tmp_name;
+        pc->part_path = upload_path(bucket, id) + "/" + std::to_string(number);
+        pc->req       = std::move(req);
+        pc->done      = std::move(done);
+
+        mpu_upload* up = find_mut(bucket, id);
+        if (!up || up->state != mpu_state::open)
+        {
+            // The upload went away while the body was coming in.
+            if (!m_io->unlinkat(AT_FDCWD, pc->tmp_path, 0, [](int64_t) {})) {}
+            pc->done({st::cancelled, pc->req.meta});
+            return;
+        }
+        ++up->committing;
+        lane_enter(bucket, id, number, [this, alive, pc]()
+        {
+            if (!*alive)
+                return;
+            run_part_commit(pc);
+        });
+    };
+}
+
+void multipart_store::run_part_commit(std::shared_ptr<part_commit> pc)
+{
+    mpu_upload* up = find_mut(pc->bucket, pc->id);
+    if (!up)
+    {
+        finish_part(pc, -ENOENT, false);
+        return;
+    }
+    auto renamed = std::make_shared<bool>(false);
+    auto ch = std::make_shared<disk_chain>(m_alive);
+    ch->then([this, pc, renamed](file_io::done d)
+    {
+        return m_io->renameat(AT_FDCWD, pc->tmp_path, AT_FDCWD, pc->part_path,
+                              [renamed, d](int64_t r) { *renamed = r >= 0; d(r); });
+    });
+    // The upload's directory, so the part is still there after a crash.
+    ch->then([this, pc](file_io::done d)
+    {
+        mpu_upload* u = find_mut(pc->bucket, pc->id);
+        if (!u || u->dir_fd < 0)
+        {
+            d(-ENOENT);
+            return true;
+        }
+        return m_io->fsync(u->dir_fd, false, std::move(d));
+    });
+    ch->run([this, alive = m_alive, pc, renamed](int64_t r)
+    {
+        if (!*alive)
+            return;
+        finish_part(pc, r, *renamed);
+    });
+}
+
+void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_t res, bool renamed)
+{
+    lane_leave(pc->bucket, pc->id, pc->number);
+    mpu_upload* up = find_mut(pc->bucket, pc->id);
+
+    put_result out{st::ok, pc->req.meta};
+    if (res < 0)
+    {
+        if (!renamed)
+        {
+            if (!m_io->unlinkat(AT_FDCWD, pc->tmp_path, 0, [](int64_t) {})) {}
+        }
+        else if (!m_io->unlinkat(AT_FDCWD, pc->part_path, 0, [](int64_t) {})) {}
+        out.status = up ? errno_st(res) : st::cancelled;
+    }
+    else if (up)
+    {
+        mpu_part part;
+        part.number   = pc->number;
+        part.size     = pc->req.meta.size;
+        part.md5      = pc->req.meta.md5;
+        part.mtime_ms = pc->req.meta.mtime_ms;
+        part.data_off = object_header_len(pc->req.key, pc->req.meta);
+        if (const std::string* v = extra_value(pc->req.meta, checksum_header(up->algo)))
+            part.checksum_b64 = *v;
+
+        const auto old = up->parts.find(pc->number);
+        if (old != up->parts.end())
+        {
+            up->held -= std::min(up->held, old->second.size);
+            m_store->release_bytes(old->second.size);
+        }
+        up->held += part.size;
+        m_store->hold_bytes(part.size);
+        up->parts[pc->number] = std::move(part);
+    }
+    else
+        out.status = st::cancelled;
+
+    if (up && up->committing > 0 && --up->committing == 0 && up->on_idle)
+    {
+        auto f = std::move(up->on_idle);
+        up->on_idle = nullptr;
+        f();
+    }
+    pc->done(std::move(out));
+}
+
+// ─── Completing ─────────────────────────────────────────────────────────────
+
+void multipart_store::complete(std::string bucket, std::string id, std::vector<complete_part> parts,
+                               std::function<void()> progress, std::function<void(complete_result)> cb)
+{
+    auto fail = [&cb](std::string_view code, std::string_view message = {})
+    {
+        complete_result r;
+        r.error = make_error(code);
+        if (!message.empty())
+            r.error.message = std::string(message);
+        cb(std::move(r));
+    };
+
+    mpu_upload* up = find_mut(bucket, id);
+    if (!up || up->state != mpu_state::open)
+    {
+        fail("NoSuchUpload");
+        return;
+    }
+    up->state = mpu_state::sealed;
+    ++m_inflight;
+
+    auto go = [this, alive = m_alive, bucket, id, parts = std::move(parts), progress = std::move(progress), cb]() mutable
+    {
+        if (!*alive)
+            return;
+        --m_inflight;
+        auto reject = [&](std::string_view code, std::string_view message = {})
+        {
+            if (mpu_upload* u = find_mut(bucket, id))
+                u->state = mpu_state::open;
+            complete_result r;
+            r.error = make_error(code);
+            if (!message.empty())
+                r.error.message = std::string(message);
+            cb(std::move(r));
+        };
+        mpu_upload* u = find_mut(bucket, id);
+        if (!u)
+        {
+            complete_result r;
+            r.error = make_error("NoSuchUpload");
+            cb(std::move(r));
+            return;
+        }
+        if (parts.empty())
+        {
+            reject("MalformedXML", "You must specify at least one part");
+            return;
+        }
+
+        // The order of the list first, and then what each entry names, and only
+        // then how big the parts are.
+        {
+            uint32_t prev = 0;
+            for (const complete_part& want : parts)
+            {
+                if (want.number < 1 || want.number > mpu_max_parts)
+                {
+                    reject("InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive");
+                    return;
+                }
+                if (want.number <= prev)
+                {
+                    reject("InvalidPartOrder");
+                    return;
+                }
+                prev = want.number;
+            }
+        }
+
+        auto a = std::make_shared<assemble_state>();
+        uint64_t total = 0;
+        std::string md5s;
+        std::string raw_checksums;
+        for (size_t i = 0; i < parts.size(); ++i)
+        {
+            const complete_part& want = parts[i];
+            const auto it = u->parts.find(want.number);
+            if (it == u->parts.end() || it->second.etag() != want.etag)
+            {
+                reject("InvalidPart");
+                return;
+            }
+            const mpu_part& have = it->second;
+            if (want.checksum_algo_ != checksum_algo::none &&
+                (want.checksum_algo_ != u->algo || want.checksum_b64 != have.checksum_b64))
+            {
+                reject("InvalidPart", "One or more of the specified parts has a checksum that does not match what was uploaded.");
+                return;
+            }
+            if (i + 1 < parts.size() && have.size < mpu_min_part_bytes)
+            {
+                reject("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size. "
+                                         "Each part must be at least 5 MB in size, except the last part.");
+                return;
+            }
+            total += have.size;
+            md5s.append(reinterpret_cast<const char*>(have.md5.data()), have.md5.size());
+            if (u->algo != checksum_algo::none)
+            {
+                std::string raw;
+                if (!base64_decode(have.checksum_b64, raw))
+                {
+                    reject("InvalidPart");
+                    return;
+                }
+                raw_checksums += raw;
+            }
+            a->parts.push_back(have);
+        }
+        if (total > m_store->options().max_object_bytes)
+        {
+            reject("EntityTooLarge");
+            return;
+        }
+
+        a->bucket   = bucket;
+        a->id       = id;
+        a->key      = u->key;
+        a->meta     = u->meta;
+        a->meta.size  = total;
+        a->meta.md5   = md5_of(md5s);
+        a->meta.parts = static_cast<uint32_t>(parts.size());
+        a->meta.mtime_ms = static_cast<int64_t>(m_store->now_ms());
+        if (u->algo != checksum_algo::none)
+        {
+            a->checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
+            a->meta.extra.emplace_back(std::string(checksum_header(u->algo)), a->checksum_b64);
+        }
+        a->tmp_name = object_store::tmp_name();
+        a->tmp_path = base_of(bucket) + "/tmp/" + a->tmp_name;
+        a->dir_path = upload_path(bucket, id);
+        a->cb       = std::move(cb);
+        a->progress = std::move(progress);
+        assemble(std::move(a));
+    };
+
+    if (up->committing > 0)
+        up->on_idle = std::move(go);
+    else
+        go();
+}
+
+void multipart_store::assemble(std::shared_ptr<assemble_state> a)
+{
+    ++m_inflight;
+    a->buf[0] = std::make_unique_for_overwrite<char[]>(chunk_bytes);
+    a->buf[1] = std::make_unique_for_overwrite<char[]>(chunk_bytes);
+
+    const bool q = m_io->openat(AT_FDCWD, a->tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600,
+        [this, alive = m_alive, a](int64_t r)
+        {
+            if (!*alive)
+                return;
+            if (r < 0)
+            {
+                a->failed = true;
+                a->err    = r;
+                a->header_done = true;
+                assemble_pump(a);
+                return;
+            }
+            a->dst = hold_fd(m_loop, m_alive, static_cast<int>(r));
+            const auto header = std::make_shared<std::string>(encode_object_header(a->key, a->meta));
+            a->hdr_len = header->size();
+            a->dst_off = 0;
+            const bool qh = m_io->pwrite(*a->dst, header->data(), static_cast<uint32_t>(header->size()), 0,
+                [this, alive, a, header](int64_t rh)
+                {
+                    if (!*alive)
+                        return;
+                    if (rh < 0)
+                    {
+                        a->failed = true;
+                        a->err    = rh;
+                    }
+                    a->dst_off     = a->hdr_len;
+                    a->header_done = true;
+                    assemble_pump(a);
+                });
+            if (!qh)
+            {
+                a->failed = true;
+                a->err    = -EIO;
+                a->header_done = true;
+                assemble_pump(a);
+            }
+        });
+    if (!q)
+    {
+        a->failed = true;
+        a->err    = -EIO;
+        a->header_done = true;
+        assemble_pump(a);
+    }
+}
+
+// Reads the next megabyte of the parts and writes it into the object, with a
+// second buffer read while the first is written; the bytes pass through this
+// process because io_uring has no copy between two files.
+void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
+{
+    while (!a->failed && a->header_done && a->part_idx < a->parts.size())
+    {
+        const mpu_part& p = a->parts[a->part_idx];
+        if (p.size == 0 || a->part_off >= p.size)
+        {
+            ++a->part_idx;
+            a->part_off = 0;
+            a->cur.reset();
+            continue;
+        }
+        const int slot = a->buf_free[0] ? 0 : (a->buf_free[1] ? 1 : -1);
+        if (slot < 0)
+            break;
+        if (!a->cur)
+        {
+            if (a->opening)
+                break;
+            a->opening = true;
+            const std::string path = a->dir_path + "/" + std::to_string(p.number);
+            const bool q = m_io->openat(AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0,
+                [this, alive = m_alive, a](int64_t r)
+                {
+                    if (!*alive)
+                        return;
+                    a->opening = false;
+                    if (r < 0)
+                    {
+                        a->failed = true;
+                        a->err    = r;
+                    }
+                    else
+                        a->cur = hold_fd(m_loop, m_alive, static_cast<int>(r));
+                    assemble_pump(a);
+                });
+            if (!q)
+            {
+                a->opening = false;
+                a->failed  = true;
+                a->err     = -EIO;
+            }
+            break;
+        }
+
+        const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(chunk_bytes, p.size - a->part_off));
+        const uint64_t src_off = p.data_off + a->part_off;
+        const uint64_t dst_off = a->dst_off;
+        std::shared_ptr<int> src = a->cur;
+        a->buf_free[slot] = false;
+        ++a->inflight;
+        a->part_off += n;
+        a->dst_off  += n;
+        if (a->part_off >= p.size)
+        {
+            ++a->part_idx;
+            a->part_off = 0;
+            a->cur.reset();
+        }
+
+        auto chunk_done = [this, alive = m_alive, a, slot](int64_t res)
+        {
+            if (!*alive)
+                return;
+            a->buf_free[slot] = true;
+            --a->inflight;
+            if (a->progress)
+                a->progress();
+            if (res < 0 && !a->failed)
+            {
+                a->failed = true;
+                a->err    = res;
+            }
+            assemble_pump(a);
+        };
+        char* buf = a->buf[slot].get();
+        const bool qr = m_io->pread(*src, buf, n, src_off,
+            [this, a, src, buf, n, dst_off, chunk_done](int64_t rn)
+            {
+                if (rn != static_cast<int64_t>(n))
+                {
+                    chunk_done(rn < 0 ? rn : -EIO);
+                    return;
+                }
+                if (!m_io->pwrite(*a->dst, buf, n, dst_off, chunk_done))
+                    chunk_done(-EIO);
+            });
+        if (!qr)
+        {
+            a->buf_free[slot] = true;
+            --a->inflight;
+            a->failed = true;
+            a->err    = -EIO;
+        }
+    }
+
+    if (a->inflight == 0 && !a->opening && a->header_done && !a->finishing &&
+        (a->failed || a->part_idx >= a->parts.size()))
+    {
+        a->finishing = true;
+        assemble_finish(a);
+    }
+}
+
+void multipart_store::assemble_finish(const std::shared_ptr<assemble_state>& a)
+{
+    // What every way out does: the upload is open again, and the client is told why.
+    auto give_up = [this, a](st why)
+    {
+        --m_inflight;
+        a->dst.reset();
+        if (!m_io->unlinkat(AT_FDCWD, a->tmp_path, 0, [](int64_t) {})) {}
+        if (mpu_upload* u = find_mut(a->bucket, a->id))
+            u->state = mpu_state::open;
+        complete_result r;
+        r.error = error_for(why);
+        a->cb(std::move(r));
+    };
+    if (a->failed)
+    {
+        give_up(errno_st(a->err));
+        return;
+    }
+
+    const bool q = m_io->fsync(*a->dst, true, [this, alive = m_alive, a, give_up](int64_t r)
+    {
+        if (!*alive)
+            return;
+        if (r < 0)
+        {
+            give_up(errno_st(r));
+            return;
+        }
+        a->dst.reset();
+        commit_request req;
+        req.bucket   = a->bucket;
+        req.key      = a->key;
+        req.tmp_name = a->tmp_name;
+        req.meta     = a->meta;
+        m_store->commit(std::move(req), [this, alive, a, give_up](put_result pr)
+        {
+            if (!*alive)
+                return;
+            if (pr.status != st::ok)
+            {
+                // The commit removed the temporary file itself when it could.
+                give_up(pr.status);
+                return;
+            }
+            --m_inflight;
+            if (mpu_upload* u = find_mut(a->bucket, a->id))
+                u->state = mpu_state::removing;
+            complete_result out;
+            out.meta         = pr.meta;
+            out.checksum_b64 = a->checksum_b64;
+            const std::string bucket = a->bucket;
+            const std::string id     = a->id;
+            a->cb(std::move(out));
+            remove_upload(bucket, id, {});
+        });
+    });
+    if (!q)
+        give_up(st::io_error);
+}
+
+// ─── Removing ───────────────────────────────────────────────────────────────
+
+bool multipart_store::abort(std::string_view bucket, std::string_view id, std::function<void()> cb)
+{
+    mpu_upload* up = find_mut(bucket, id);
+    if (!up || up->state != mpu_state::open)
+        return false;
+    up->state = mpu_state::removing;
+    remove_upload(std::string(bucket), std::string(id), std::move(cb));
+    return true;
+}
+
+size_t multipart_store::expire(int64_t cutoff_ms)
+{
+    std::vector<std::pair<std::string, std::string>> old;
+    for (const auto& [k, up] : m_uploads)
+        if (up->state == mpu_state::open && up->initiated_ms < cutoff_ms)
+            old.emplace_back(up->bucket, up->id);
+    for (const auto& [b, i] : old)
+        if (abort(b, i, {})) {}
+    return old.size();
+}
+
+void multipart_store::remove_upload(std::string bucket, std::string id, std::function<void()> cb)
+{
+    mpu_upload* up = find_mut(bucket, id);
+    if (!up)
+    {
+        if (cb)
+            cb();
+        return;
+    }
+    ++m_inflight;
+    auto go = [this, alive = m_alive, bucket, id, cb = std::move(cb)]() mutable
+    {
+        if (!*alive)
+            return;
+        mpu_upload* u = find_mut(bucket, id);
+        std::vector<uint32_t> numbers;
+        if (u)
+            for (const auto& [n, p] : u->parts)
+                numbers.push_back(n);
+        remove_files(bucket, id, std::move(numbers), std::move(cb));
+    };
+    if (up->committing > 0)
+        up->on_idle = std::move(go);
+    else
+        go();
+}
+
+void multipart_store::remove_files(std::string bucket, std::string id, std::vector<uint32_t> parts,
+                                   std::function<void()> cb)
+{
+    struct batch
+    {
+        std::vector<std::string> paths;
+        size_t next{0};
+        size_t inflight{0};
+        std::function<void()> done;
+    };
+    auto b = std::make_shared<batch>();
+    const std::string dir = upload_path(bucket, id);
+    for (uint32_t n : parts)
+        b->paths.push_back(dir + "/" + std::to_string(n));
+
+    auto ch = std::make_shared<disk_chain>(m_alive);
+    // The meta file goes first, so an upload cut short here is not found again.
+    ch->then([this, dir](file_io::done d) { return m_io->unlinkat(AT_FDCWD, dir + "/meta", 0, std::move(d)); }, -ENOENT);
+    ch->then([this, b](file_io::done d)
+    {
+        b->done = [d]() { d(0); };
+        auto pump = std::make_shared<std::function<void()>>();
+        std::weak_ptr<std::function<void()>> weak = pump;
+        *pump = [this, b, weak, alive = m_alive]()
+        {
+            if (!*alive)
+                return;
+            // Held by each completion, so the function lives while any is owed.
+            auto self = weak.lock();
+            while (b->inflight < unlink_window && b->next < b->paths.size())
+            {
+                const std::string& path = b->paths[b->next++];
+                ++b->inflight;
+                const bool q = m_io->unlinkat(AT_FDCWD, path, 0, [b, self, alive](int64_t)
+                {
+                    if (!*alive)
+                        return;
+                    --b->inflight;
+                    (*self)();
+                });
+                if (!q)
+                    --b->inflight;
+            }
+            if (b->inflight == 0 && b->next >= b->paths.size())
+            {
+                auto f = std::move(b->done);
+                b->done = nullptr;
+                if (f)
+                    f();
+            }
+        };
+        (*pump)();
+        return true;
+    });
+    ch->then([this, dir](file_io::done d) { return m_io->unlinkat(AT_FDCWD, dir, AT_REMOVEDIR, std::move(d)); });
+
+    ch->run([this, alive = m_alive, bucket, id, cb = std::move(cb)](int64_t r)
+    {
+        if (!*alive)
+            return;
+        if (r < 0)
+            LOG_WARN(("storage: multipart upload " + id + " of bucket " + bucket +
+                      " left files behind: " + std::strerror(static_cast<int>(-r))).c_str());
+        forget(bucket, id);
+        --m_inflight;
+        if (cb)
+            cb();
+    });
+}
+
+void multipart_store::forget(const std::string& bucket, const std::string& id)
+{
+    const auto it = m_uploads.find(key_of(bucket, id));
+    if (it == m_uploads.end())
+        return;
+    std::unique_ptr<mpu_upload> up = std::move(it->second);
+    m_uploads.erase(it);
+    m_store->release_bytes(up->held);
+    if (up->dir_fd >= 0)
+        m_loop->close_fd(up->dir_fd);
+    up->dir_fd = -1;
+    // Commits waiting behind another find the upload gone and drop their file.
+    for (auto& [n, waiting] : up->lanes)
+        for (auto& fn : waiting)
+            fn();
+}
+
+}   // namespace socketley::storage

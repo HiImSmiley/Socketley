@@ -108,6 +108,10 @@ constexpr config_key config_keys[] = {
     { "dir",                "--dir",                key_kind::text    },
     { "anonymous",          "--anonymous",          key_kind::boolean },
     { "max_bytes",          "--max-bytes",          key_kind::scalar  },
+    { "access_key",         "--access-key",         key_kind::text    },
+    { "secret_key",         "--secret-key",         key_kind::text    },
+    { "credentials",        "--credentials",        key_kind::text    },
+    { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
 };
 
 // Keys with no flag of their own, listed so an unknown key can still be

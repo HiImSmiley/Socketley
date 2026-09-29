@@ -83,6 +83,10 @@ public:
     // The length of the decoded payload when the framing announces it, as
     // aws-chunked does with x-amz-decoded-content-length.
     virtual std::optional<uint64_t> decoded_length() const { return std::nullopt; }
+
+    // A header the body carried after its last chunk, such as
+    // x-amz-checksum-crc32c, valid once finish() has returned true.
+    virtual std::string trailer_value(std::string_view /*lowercase_name*/) const { return {}; }
 };
 
 struct auth_verdict
@@ -102,11 +106,13 @@ public:
     virtual auth_verdict authorize(const request_view& req) = 0;
 };
 
-// `--anonymous`: every request is allowed and nobody is named.
+// `--anonymous`: every request is allowed and nobody is named.  A body that is
+// aws-chunked without signatures is decoded, and one whose chunks are signed is
+// left for the runtime to refuse, since nobody is there to verify them.
 class anonymous_authenticator final : public authenticator
 {
 public:
-    auth_verdict authorize(const request_view&) override { return {}; }
+    auth_verdict authorize(const request_view& req) override;
 };
 
 }   // namespace socketley::storage

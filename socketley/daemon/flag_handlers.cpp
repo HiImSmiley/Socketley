@@ -1266,6 +1266,48 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
         case fnv1a("--anonymous"):
             stg->set_anonymous(true);
             return 0;
+        // The one pair every request is signed with.
+        case fnv1a("--access-key"):
+        case fnv1a("--secret-key"):
+        {
+            const bool access = pa.hashes[i] == fnv1a("--access-key");
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << (access ? "--access-key" : "--secret-key") << " requires a value\n";
+                return 1;
+            }
+            const std::string_view v = pa.args[++i];
+            if (access)
+                stg->set_access_key(v);
+            else
+                stg->set_secret_key(v);
+            return 0;
+        }
+        // Several pairs, one access:secret per line, re-read when the file changes.
+        case fnv1a("--credentials"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--credentials requires a file path\n";
+                return 1;
+            }
+            stg->set_credentials_file(pa.args[++i]);
+            return 0;
+        }
+        // Open multipart uploads are aborted after this long, and never when it is absent.
+        case fnv1a("--mpu-expire"):
+        {
+            uint64_t secs = 0;
+            const std::string_view v = i + 1 < pa.count ? pa.args[i + 1] : std::string_view{};
+            if (parse_duration_seconds(v, uint64_t{10} * 365 * 86400, secs) != duration_parse::ok || secs == 0)
+            {
+                std::cout << "--mpu-expire requires a duration such as 24h or 7d\n";
+                return 1;
+            }
+            ++i;
+            stg->set_mpu_expire_secs(static_cast<uint32_t>(std::min<uint64_t>(secs, UINT32_MAX)));
+            return 0;
+        }
         case fnv1a("--max-bytes"):
         {
             if (i + 1 >= pa.count)

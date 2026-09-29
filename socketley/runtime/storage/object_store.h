@@ -15,6 +15,7 @@
 // The object file is the truth and the journal is what makes a listing cheap:
 // a start after a clean stop trusts the journal, and any other start reads
 // every header and reconciles the journal against them.
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -25,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "checksum.h"
 #include "object_format.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
@@ -148,6 +150,16 @@ struct store_options
 
 class object_store;
 
+// What the owner of a key needs to make a body a visible object.
+struct commit_request
+{
+    std::string bucket;
+    std::string key;
+    // In the bucket's tmp directory, written and synced.
+    std::string tmp_name;
+    object_meta meta;
+};
+
 // A body being written, from the first byte to the commit.
 //
 // The staged bytes are written in large pieces while the next ones arrive, the
@@ -184,6 +196,20 @@ public:
 
     // The body will not complete: the temporary file is removed.
     void abort();
+
+    // Takes the checksum of the body as it is staged and checks it against
+    // `expected_b64` (empty for none) when the body is complete.  The caller
+    // has put an entry named checksum_header(algo) in the meta given to
+    // begin_put, holding a value of the length the checksum has, so that the
+    // header reserved room for it.
+    void track_checksum(checksum_algo algo, std::string expected_b64);
+    // The value a trailer carried after the body, which is checked at finish().
+    void expect_checksum(std::string b64);
+
+    // Where a finished body goes instead of into the object namespace: a
+    // multipart part, which the caller renames and keeps track of itself.
+    using committer = std::function<void(commit_request, std::function<void(put_result)>)>;
+    void set_committer(committer c) { m_committer = std::move(c); }
 
     // The object's key and bucket, for the caller's log line.
     const std::string& key() const { return m_key; }
@@ -233,6 +259,9 @@ private:
     // Where the next buffer to be filled begins in the file.
     uint64_t   m_next_off{0};
     md5_stream m_md5;
+    std::unique_ptr<checksum_stream> m_ck;
+    std::string m_ck_expect;
+    committer   m_committer;
     st         m_status{st::ok};
 
     bool                             m_eof{false};
@@ -246,16 +275,6 @@ private:
     std::function<void()>            m_ready_cb;
     std::function<void(st)>          m_failed_cb;
     bool                             m_notified_failed{false};
-};
-
-// What the owner of a key needs to make a body a visible object.
-struct commit_request
-{
-    std::string bucket;
-    std::string key;
-    // In the bucket's tmp directory, written and synced.
-    std::string tmp_name;
-    object_meta meta;
 };
 
 class object_store
@@ -327,6 +346,14 @@ public:
 
     uint64_t now_ms() const;
 
+    // The name of a fresh file in a bucket's tmp directory.
+    static std::string tmp_name();
+
+    // Bytes something outside the object namespace holds on the disk, counted
+    // against the quota until they are given back.
+    void hold_bytes(uint64_t n) { m_reserved += n; }
+    void release_bytes(uint64_t n) { m_reserved -= std::min(m_reserved, n); }
+
 private:
     friend class put_op;
     struct bucket;
@@ -396,8 +423,6 @@ private:
                      std::function<void(int leaf_fd, st)> cb);
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
-
-    static std::string tmp_name();
 
     event_loop*   m_loop;
     file_io*      m_io;
