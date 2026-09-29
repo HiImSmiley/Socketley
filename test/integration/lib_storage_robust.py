@@ -532,6 +532,9 @@ if boto3:
         print("  SKIP: needs %d MiB free under %s and has %d" % (BIG_MIB * 2 + 512, DATA, free_mib))
     else:
         s3.create_bucket(Bucket="gig")
+        # The high-water mark is reset, so the phases before this one cannot have set it.
+        with open("/proc/%d/clear_refs" % PID, "w") as f:
+            f.write("5")
         rss_before = status_kib("VmRSS")
         th = threading.Thread(target=sampler)
         th.start()
