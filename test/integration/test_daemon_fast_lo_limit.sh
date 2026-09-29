@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# suite: quiet -- stalled readers against a per-pair and a global budget, whose reconciler a loaded box starves
 # Integration test: `daemon --fast-lo-limit` bounds the redirected backlog
 #
 # ─── WHY THIS FILE EXISTS ───────────────────────────────────────────────────
