@@ -63,5 +63,39 @@ case "$stats" in
     *"type:storage"*"puts:"*) echo "  PASS: stats reports the storage counters" ;;
     *) echo "  FAIL [stats]: $stats"; echo "  FAILED"; exit 1 ;;
 esac
+
+# A put refused on its headers -- here a create-only put over a key that is
+# there -- is answered before its body is read, and the body is read off after:
+# a client that sends the body once it has the headers out must hear 412 and
+# keep its connection, not meet a reset (seen in the full suite through a shard).
+refusal=$(python3 - "$PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+def one(req):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5); s.sendall(req); s.recv(65536); s.close()
+one(b"PUT /refusal HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+one(b"PUT /refusal/k HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi")
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+import time
+s.sendall(b"PUT /refusal/k HTTP/1.1\r\nHost: x\r\nIf-None-Match: *\r\nContent-Length: 65536\r\n\r\n")
+time.sleep(0.3)   # long enough for a runtime that answers at the headers to have closed
+try:
+    s.sendall(b"z" * 65536)
+    s.sendall(b"GET /refusal/k HTTP/1.1\r\nHost: x\r\n\r\n")
+    got = b""
+    while b"\r\n\r\nhi" not in got:
+        d = s.recv(65536)
+        if not d: break
+        got += d
+    first = got.split(b"\r\n", 1)[0].decode()
+    print(first, "| then:", "200 on the same connection" if b"HTTP/1.1 200" in got else "no answer")
+except OSError as e:
+    print("sending the body:", type(e).__name__)
+PY
+)
+case "$refusal" in
+    *"412"*"200 on the same connection"*) echo "  PASS: a put refused on its headers hears 412 and keeps its connection" ;;
+    *) echo "  FAIL [refusal before the body]: $refusal"; echo "  FAILED"; exit 1 ;;
+esac
 echo "  PASSED"
 exit 0

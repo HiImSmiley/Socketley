@@ -659,10 +659,11 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
 
     object_meta meta;
     s3_error err;
+    // Refused before the body is read, and the body is read off after the
+    // answer, so a client still sending it hears the refusal and not a reset.
     if (!object_meta_from_headers(c, meta, err))
     {
-        r.keep_alive = false;
-        send_error(c, err, true);
+        deny_request(c, err);
         return;
     }
 
@@ -672,8 +673,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     const bool create_only = r.header("if-none-match") == "*";
     if (create_only && m_store.owns(r.bucket, r.key) && m_store.find(r.bucket, r.key))
     {
-        r.keep_alive = false;
-        send_error(c, make_error("PreconditionFailed"), true);
+        deny_request(c, make_error("PreconditionFailed"));
         return;
     }
 
