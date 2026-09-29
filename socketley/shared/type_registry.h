@@ -1,5 +1,5 @@
 #pragma once
-// Runtime types beyond the built-in four, keyed by name, because the numeric
+// Runtime types beyond the built-in five, keyed by name, because the numeric
 // id is assigned in registration order and is meaningless outside this
 // process -- the name is what crosses a process boundary.
 #include <cstdint>
@@ -16,7 +16,7 @@ namespace type_registry
 using factory = std::function<std::unique_ptr<runtime_instance>(std::string_view name)>;
 
 // Everything below this id is a built-in whose value is fixed for ever.
-inline constexpr uint8_t first_registered = 4;
+inline constexpr uint8_t first_registered = 5;
 
 // Claims a local id for `name`, refusing a built-in name, a name already
 // holding a factory, and a name the id space cannot fit.

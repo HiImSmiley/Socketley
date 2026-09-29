@@ -7,6 +7,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../runtime/storage/storage_instance.h"
 #include "../cli/command_hashing.h"
 #include "type_registry.h"
 
@@ -778,6 +779,14 @@ runtime_config state_persistence::read_from_instance(const runtime_instance* ins
             cfg.cache_public = cache->get_public();
             break;
         }
+        case runtime_storage:
+        {
+            auto* stg = static_cast<const storage_instance*>(instance);
+            cfg.storage_dir = std::string(stg->get_dir());
+            cfg.storage_anonymous = stg->get_anonymous();
+            cfg.storage_max_bytes = stg->get_max_bytes();
+            break;
+        }
     }
 
     cfg.type_name = type_str(cfg.type);
@@ -1029,6 +1038,13 @@ std::string state_persistence::format_json_pretty(const runtime_config& cfg) con
             if (cfg.cache_public)
                 append_bool_field("public", true);
             break;
+        case runtime_storage:
+            append_str_field("dir", cfg.storage_dir);
+            if (cfg.storage_anonymous)
+                append_bool_field("anonymous", true);
+            if (cfg.storage_max_bytes > 0)
+                append_int_field("max_bytes", cfg.storage_max_bytes);
+            break;
     }
 
     // A registered type's fields as one nested object, absent when there are
@@ -1182,6 +1198,11 @@ bool state_persistence::parse_json_string(const std::string& json, runtime_confi
             cfg.max_memory = json_get_size(json, "max_memory");
             cfg.eviction = str_to_eviction(json_get_string(json, "eviction"));
             cfg.cache_public = json_get_bool(json, "public");
+            break;
+        case runtime_storage:
+            cfg.storage_dir = json_get_string(json, "dir");
+            cfg.storage_anonymous = json_get_bool(json, "anonymous");
+            cfg.storage_max_bytes = json_get_size(json, "max_bytes");
             break;
     }
 

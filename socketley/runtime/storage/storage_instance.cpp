@@ -1,0 +1,246 @@
+#include "storage_instance.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <sstream>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "storage_run.h"
+#include "../../shared/event_loop.h"
+#include "../../shared/logging.h"
+#include "../../shared/socket_tuning.h"
+#include "../../shared/unix_listener.h"
+
+using socketley::storage::storage_run;
+
+storage_instance::storage_instance(std::string_view name)
+    : runtime_instance(runtime_storage, name)
+{
+}
+
+storage_instance::~storage_instance()
+{
+    // A runtime destroyed while running has its run freed by the graveyard's
+    // destructor, which is only safe because the loop is gone first in every
+    // process that builds one.
+}
+
+void storage_instance::set_authenticator(std::unique_ptr<socketley::storage::authenticator> a)
+{
+    m_auth = std::move(a);
+}
+
+size_t storage_instance::get_connection_count() const
+{
+    return m_run ? m_run->connection_count() : 0;
+}
+
+uint16_t storage_instance::effective_port() const
+{
+    if (!get_listen_path().empty())
+        return 0;
+    return get_port() ? get_port() : storage_default_port;
+}
+
+void storage_instance::listen_addresses(std::vector<std::string>& out) const
+{
+    const std::string listen_path(get_listen_path());
+    if (!listen_path.empty())
+    {
+        out.push_back("unix:" + listen_path);
+        return;
+    }
+    out.push_back("tcp:" + std::to_string(effective_port()));
+}
+
+std::string storage_instance::config_refusal() const
+{
+    if (m_dir.empty())
+        return "storage: --dir <path> is required, because that is where the buckets live\n";
+    // Refused rather than defaulted: an endpoint that answers anybody must have
+    // been asked to.
+    if (!m_anonymous && !m_auth)
+        return "storage: a runtime with no credentials serves nobody; pass --anonymous "
+               "to accept every request without authentication\n";
+    return {};
+}
+
+void storage_instance::refresh_cached_limits()
+{
+    m_max_conns_cached = get_max_connections();
+}
+
+void storage_instance::on_cqe(struct io_uring_cqe*)
+{
+    // Every completion of a storage runtime belongs to a run, which registers
+    // itself; anything landing here is the instance's own registration and
+    // owes nothing.
+}
+
+bool storage_instance::open_listener(uint16_t port, bool reuseport, int& out_fd)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (reuseport)
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    // The buffers are left to the kernel: a body of gigabytes is what autotuning
+    // is for, and the sizes a small-message runtime pins would cap it.
+    socket_tuning::tcp_listener_defaults(fd, 0, 0);
+
+    struct sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+        LOG_ERROR(("storage: port " + std::to_string(port) + " could not be bound: " +
+                   std::string(std::strerror(errno))).c_str());
+        ::close(fd);
+        return false;
+    }
+    if (::listen(fd, 4096) < 0)
+    {
+        ::close(fd);
+        return false;
+    }
+    out_fd = fd;
+    return true;
+}
+
+bool storage_instance::setup(event_loop& loop)
+{
+    // A run the ring has finished with is freed here, and the ones it still
+    // owes completions stay where they are.
+    std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+
+    m_loop = &loop;
+    refresh_cached_limits();
+
+    socketley::storage::authenticator* auth = m_auth.get();
+    if (!auth)
+    {
+        m_anon = std::make_unique<socketley::storage::anonymous_authenticator>();
+        auth   = m_anon.get();
+    }
+
+    socketley::storage::store_options opts;
+    opts.dir       = m_dir;
+    opts.shard     = get_shard_index();
+    opts.nshards   = std::max<uint32_t>(get_shards(), 1);
+    opts.max_bytes = m_max_bytes;
+
+    auto run = std::make_unique<storage_run>(*this, loop, opts, auth);
+
+    // The one blocking step: reading the directory and reconciling the journals
+    // happens here, before the listener exists, so no connection waits behind it.
+    std::string err;
+    if (!run->open(err))
+    {
+        LOG_ERROR(("storage: " + err).c_str());
+        run->stop();
+        m_graveyard.push_back(std::move(run));
+        return false;
+    }
+
+    const std::string listen_path(get_listen_path());
+    int fd = -1;
+    if (!listen_path.empty())
+    {
+        if (const std::string msg = socketley::unix_sock::listen_config_refusal(
+                listen_path, get_port(), get_tls()); !msg.empty())
+        {
+            LOG_ERROR(("storage: " + msg).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        auto r = socketley::unix_sock::bind_listener(listen_path);
+        if (r.fd < 0)
+        {
+            LOG_ERROR(("storage: " + r.error).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        fd = r.fd;
+        m_bound_listen_path = listen_path;
+    }
+    else if (!open_listener(effective_port(), /*reuseport=*/get_shards() > 1, fd))
+    {
+        run->stop();
+        m_graveyard.push_back(std::move(run));
+        return false;
+    }
+
+    if (!run->listen_on(fd))
+    {
+        loop.close_fd(fd);
+        run->stop();
+        m_graveyard.push_back(std::move(run));
+        return false;
+    }
+    m_run = std::move(run);
+    return true;
+}
+
+void storage_instance::teardown(event_loop&)
+{
+    if (m_run)
+    {
+        m_run->stop();
+        m_graveyard.push_back(std::move(m_run));
+    }
+    if (!m_bound_listen_path.empty())
+    {
+        if (::unlink(m_bound_listen_path.c_str()) < 0) {}
+        m_bound_listen_path.clear();
+    }
+    m_loop = nullptr;
+}
+
+void storage_instance::on_loop_turn()
+{
+    if (!m_graveyard.empty())
+        std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
+    if (m_run)
+        m_run->on_turn();
+}
+
+std::string storage_instance::stats_lines() const
+{
+    std::ostringstream out;
+    if (!m_run)
+        return {};
+    const auto& c = m_run->counters();
+    const auto  t = m_run->store().totals();
+    out << "buckets:" << t.buckets << "\n"
+        << "objects:" << t.objects << "\n"
+        << "bytes:" << t.bytes << "\n"
+        << "max_bytes:" << m_max_bytes << "\n"
+        << "requests:" << c.requests << "\n"
+        << "gets:" << c.gets << "\n"
+        << "heads:" << c.heads << "\n"
+        << "puts:" << c.puts << "\n"
+        << "deletes:" << c.deletes << "\n"
+        << "copies:" << c.copies << "\n"
+        << "lists:" << c.lists << "\n"
+        << "client_errors:" << c.client_errors << "\n"
+        << "server_errors:" << c.server_errors << "\n"
+        << "zero_copy_gets:" << c.zero_copy_gets << "\n"
+        << "copied_gets:" << c.copied_gets << "\n"
+        << "zero_copy_bytes:" << c.zero_copy_bytes << "\n"
+        << "journal_records:" << t.journal_records << "\n"
+        << "journal_compactions:" << t.compactions << "\n"
+        << "fsyncs:" << t.fsyncs << "\n"
+        << "timeouts:" << c.timeouts << "\n";
+    return out.str();
+}

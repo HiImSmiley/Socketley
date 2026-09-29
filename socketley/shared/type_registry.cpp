@@ -48,6 +48,7 @@ bool builtin_lookup(std::string_view name, runtime_type& out)
     if (name == "client") { out = runtime_client; return true; }
     if (name == "proxy")  { out = runtime_proxy;  return true; }
     if (name == "cache")  { out = runtime_cache;  return true; }
+    if (name == "storage") { out = runtime_storage; return true; }
     return false;
 }
 
@@ -172,6 +173,7 @@ const char* type_to_string(runtime_type t)
         case runtime_client: return "client";
         case runtime_proxy:  return "proxy";
         case runtime_cache:  return "cache";
+        case runtime_storage: return "storage";
         default: break;
     }
 

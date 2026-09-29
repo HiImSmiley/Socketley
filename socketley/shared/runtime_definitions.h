@@ -16,10 +16,11 @@ enum runtime_type : uint8_t
     runtime_server = 0,
     runtime_client = 1,
     runtime_proxy  = 2,
-    runtime_cache  = 3
+    runtime_cache  = 3,
+    runtime_storage = 4
 };
 
-// The four names, once.  Five places had this switch -- lua_context,
+// The five names, once.  Five places had this switch -- lua_context,
 // cluster_discovery, metrics_endpoint, daemon_handler's ps --json, and the
 // --log file that was about to be the fifth -- all returning the same four
 // strings, which is exactly the shape a state renamed in one of them would

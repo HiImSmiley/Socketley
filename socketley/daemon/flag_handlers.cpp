@@ -14,6 +14,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../runtime/storage/storage_instance.h"
 
 // Five flags that describe inbound traffic are refused on a client, which
 // accepts none, because they were stored and reported by `show` while no code
@@ -1231,6 +1232,54 @@ int parse_cache_flags(cache_instance* cache, const parsed_args& pa, size_t& i,
             }
             ++i;
             cache->set_cluster_replica(incarnation);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
+                        std::string_view /*name*/)
+{
+    switch (pa.hashes[i])
+    {
+        // Where the buckets live.  Made absolute by the CLI against the
+        // caller's directory, because the worker resolves it against its own.
+        case fnv1a("--dir"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--dir requires a directory path\n";
+                return 1;
+            }
+            const std::string_view dir = pa.args[++i];
+            if (dir.empty() || dir.find('\0') != std::string_view::npos)
+            {
+                std::cout << "--dir requires a directory path\n";
+                return 1;
+            }
+            stg->set_dir(dir);
+            return 0;
+        }
+        // Off by default: an endpoint that answers anybody has to be asked to.
+        case fnv1a("--anonymous"):
+            stg->set_anonymous(true);
+            return 0;
+        case fnv1a("--max-bytes"):
+        {
+            if (i + 1 >= pa.count)
+            {
+                std::cout << "--max-bytes requires a size value\n";
+                return 1;
+            }
+            size_t bytes;
+            if (!parse_size_suffix(pa.args[++i], bytes))
+            {
+                std::cout << "invalid max-bytes value (use K/M/G suffix)\n";
+                return 1;
+            }
+            stg->set_max_bytes(bytes);
             return 0;
         }
         default:

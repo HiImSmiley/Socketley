@@ -7,6 +7,7 @@
 
 class cache_instance;
 class proxy_instance;
+class storage_instance;
 class runtime_instance;
 struct runtime_config;
 
@@ -29,6 +30,11 @@ void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
 // --public reached neither.
 void apply_cache_config(cache_instance& cache, const runtime_config& cfg,
                         bool by_presence = false);
+
+// A storage runtime's own fields, with `by_presence` meaning what it means for the
+// cache.
+void apply_storage_config(storage_instance& stg, const runtime_config& cfg,
+                          bool by_presence = false);
 
 // The fields every type has; not the ring settings, and not --lua, whose
 // failure to load means different things to a daemon and to a worker.

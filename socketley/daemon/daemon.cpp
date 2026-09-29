@@ -17,6 +17,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../runtime/storage/storage_instance.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/worker/worker_main.h"
 
@@ -480,6 +481,11 @@ static void restore_runtimes(state_persistence& persistence,
             case runtime_cache:
             {
                 apply_cache_config(*static_cast<cache_instance*>(instance), cfg);
+                break;
+            }
+            case runtime_storage:
+            {
+                apply_storage_config(*static_cast<storage_instance*>(instance), cfg);
                 break;
             }
         }

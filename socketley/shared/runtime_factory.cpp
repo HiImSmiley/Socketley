@@ -5,6 +5,7 @@
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
+#include "../runtime/storage/storage_instance.h"
 
 std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_view name)
 {
@@ -18,6 +19,8 @@ std::unique_ptr<runtime_instance> create_runtime(runtime_type type, std::string_
             return std::make_unique<client_instance>(name);
         case runtime_proxy:
             return std::make_unique<proxy_instance>(name);
+        case runtime_storage:
+            return std::make_unique<storage_instance>(name);
         default:
             return type_registry::make(type, name);
     }

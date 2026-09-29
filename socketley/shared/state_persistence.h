@@ -149,6 +149,11 @@ struct runtime_config
     // is the protected default those caches start under.
     bool cache_public = false;
 
+    // Storage
+    std::string storage_dir;
+    bool storage_anonymous = false;
+    uint64_t storage_max_bytes = 0;
+
     // A registered type's own fields in declaration order, opaque here, held
     // as strings because the schema that gives them kinds lives in a manifest.
     std::vector<std::pair<std::string, std::string>> extra;

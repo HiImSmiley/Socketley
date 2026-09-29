@@ -7,6 +7,7 @@
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../runtime/storage/storage_instance.h"
 
 void apply_proxy_config(proxy_instance& prx, const runtime_config& cfg,
                         bool by_presence)
@@ -88,6 +89,19 @@ void apply_cache_config(cache_instance& cache, const runtime_config& cfg, bool b
         cache.set_eviction(static_cast<eviction_policy>(cfg.eviction));
     if (asked("public", cfg.cache_public))
         cache.set_public(cfg.cache_public);
+}
+
+void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool by_presence)
+{
+    auto asked = [&](std::string_view key, bool nondefault) {
+        return by_presence ? cfg.has(key) : nondefault;
+    };
+    if (asked("dir", !cfg.storage_dir.empty()))
+        stg.set_dir(cfg.storage_dir);
+    if (asked("anonymous", cfg.storage_anonymous))
+        stg.set_anonymous(cfg.storage_anonymous);
+    if (asked("max_bytes", cfg.storage_max_bytes > 0))
+        stg.set_max_bytes(cfg.storage_max_bytes);
 }
 
 void apply_common_config(runtime_instance& rt, const runtime_config& cfg)
@@ -228,6 +242,10 @@ void apply_typed_config(runtime_instance& rt, const runtime_config& cfg)
 
         case runtime_cache:
             apply_cache_config(static_cast<cache_instance&>(rt), cfg);
+            break;
+
+        case runtime_storage:
+            apply_storage_config(static_cast<storage_instance&>(rt), cfg);
             break;
     }
 

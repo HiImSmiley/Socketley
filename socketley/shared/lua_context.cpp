@@ -2970,6 +2970,9 @@ void lua_context::register_bindings(runtime_instance* owner)
         case runtime_proxy:
             register_proxy_table(owner, self);
             break;
+        case runtime_storage:
+            // No verbs of its own yet.
+            break;
     }
 
     m_lua["self"] = self;

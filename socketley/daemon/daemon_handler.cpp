@@ -14,6 +14,7 @@
 #include "../cli/runtime_type_parser.h"
 #include "../cli/command_hashing.h"
 #include "../runtime/cache/cache_instance.h"
+#include "../runtime/storage/storage_instance.h"
 #include "../runtime/server/server_instance.h"
 #include "../runtime/client/client_instance.h"
 #include "../runtime/proxy/proxy_instance.h"
@@ -1340,6 +1341,10 @@ int daemon_handler::cmd_create([[maybe_unused]] ipc_connection* conn,
                 case runtime_cache:
                     result = parse_cache_flags(
                         static_cast<cache_instance*>(instance), pa, i, name);
+                    break;
+                case runtime_storage:
+                    result = parse_storage_flags(
+                        static_cast<storage_instance*>(instance), pa, i, name);
                     break;
                 default:
                     // A registered type's flags come from its manifest schema.
@@ -3426,6 +3431,11 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                     // `import` rather than reading as a typo.
                     result = -1;
                     break;
+                case runtime_storage:
+                    // A storage runtime's own settings are applied by `import`,
+                    // as a cache's are.
+                    result = -1;
+                    break;
                 default:
                     // A registered type's fields reach its worker at the next
                     // start, which is when the config frame is built.
@@ -4071,6 +4081,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
         {
             apply_cache_config(*static_cast<cache_instance*>(instance), cfg,
                                /*by_presence=*/true);
+            break;
+        }
+        case runtime_storage:
+        {
+            apply_storage_config(*static_cast<storage_instance*>(instance), cfg,
+                                 /*by_presence=*/true);
             break;
         }
         default:
