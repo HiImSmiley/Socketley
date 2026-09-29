@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -170,27 +171,35 @@ void hmac_sha256(std::string_view key, std::initializer_list<std::string_view> p
     OPENSSL_cleanse(pad, sizeof(pad));
 }
 
+// By table, since a branch per digit of a random hash is mispredicted half the time.
+constexpr auto hex_table = []
+{
+    std::array<int8_t, 256> t{};
+    for (int i = 0; i < 256; i++)
+        t[static_cast<size_t>(i)] = i >= '0' && i <= '9' ? static_cast<int8_t>(i - '0')
+                                  : i >= 'a' && i <= 'f' ? static_cast<int8_t>(i - 'a' + 10)
+                                  : i >= 'A' && i <= 'F' ? static_cast<int8_t>(i - 'A' + 10) : int8_t{-1};
+    return t;
+}();
+
 int hex_val(char c)
 {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+    return hex_table[static_cast<unsigned char>(c)];
 }
 
 bool hex_decode32(std::string_view hex, uint8_t out[32])
 {
     if (hex.size() != 64)
         return false;
+    int bad = 0;
     for (size_t i = 0; i < 32; i++)
     {
-        int hi = hex_val(hex[2 * i]);
-        int lo = hex_val(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0)
-            return false;
+        const int hi = hex_val(hex[2 * i]);
+        const int lo = hex_val(hex[2 * i + 1]);
+        bad |= hi | lo;
         out[i] = static_cast<uint8_t>(hi << 4 | lo);
     }
-    return true;
+    return bad >= 0;
 }
 
 void hex_encode32(const uint8_t in[32], char out[64])
@@ -230,25 +239,47 @@ std::string_view trim(std::string_view s)
     return s;
 }
 
-bool is_unreserved(unsigned char c)
+constexpr auto unreserved_table = []
 {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    std::array<bool, 256> t{};
+    for (int c = 0; c < 256; c++)
+        t[static_cast<size_t>(c)] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                                    c == '-' || c == '_' || c == '.' || c == '~';
+    return t;
+}();
+
+bool kept_as_is(unsigned char c, bool keep_slash)
+{
+    return unreserved_table[c] || (keep_slash && c == '/');
 }
 
 void uri_encode_append(std::string& out, std::string_view s, bool keep_slash)
 {
     static constexpr char digits[] = "0123456789ABCDEF";
-    for (unsigned char c : s)
+    out.reserve(out.size() + s.size());
+    size_t i = 0;
+    while (i < s.size())
     {
-        if (is_unreserved(c) || (keep_slash && c == '/'))
-            out.push_back(static_cast<char>(c));
-        else
-        {
-            out.push_back('%');
-            out.push_back(digits[c >> 4]);
-            out.push_back(digits[c & 15]);
-        }
+        size_t run = i;
+        while (run < s.size() && kept_as_is(static_cast<unsigned char>(s[run]), keep_slash))
+            ++run;
+        out.append(s.data() + i, run - i);
+        if (run == s.size())
+            break;
+        const auto c = static_cast<unsigned char>(s[run]);
+        const char esc[3] = {'%', digits[c >> 4], digits[c & 15]};
+        out.append(esc, 3);
+        i = run + 1;
     }
+}
+
+// A path that decoding leaves alone and encoding gives back unchanged.
+bool canonical_already(std::string_view path)
+{
+    for (unsigned char c : path)
+        if (!kept_as_is(c, true))
+            return false;
+    return true;
 }
 
 // A malformed escape stays a literal '%', which the encoder then turns into %25.
@@ -504,13 +535,13 @@ verify_result malformed(auth_form form, const char* msg)
 struct parsed_auth
 {
     auth_form form = auth_form::none;
-    std::string access_key;
-    std::string date;
-    std::string region;
-    std::string service;
-    std::string signed_headers;
-    std::string signature_hex;
-    std::string expires;
+    // Views into the Authorization header, or into verify's copies of the decoded query.
+    std::string_view access_key;
+    std::string_view date;
+    std::string_view region;
+    std::string_view service;
+    std::string_view signed_headers;
+    std::string_view signature_hex;
     std::string payload_from_query;
     bool has_payload_query = false;
     stamp when;
@@ -532,10 +563,10 @@ bool split_credential(std::string_view cred, parsed_auth& a)
     }
     if (rest.empty() || parts[3] != "aws4_request")
         return false;
-    a.access_key = std::string(rest);
-    a.date       = std::string(parts[0]);
-    a.region     = std::string(parts[1]);
-    a.service    = std::string(parts[2]);
+    a.access_key = rest;
+    a.date       = parts[0];
+    a.region     = parts[1];
+    a.service    = parts[2];
     return true;
 }
 
@@ -613,6 +644,8 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         return fail(sigv4_status::malformed, 400, "InvalidRequest", "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature query string parameter or the Authorization header should be specified");
 
     parsed_auth a;
+    // The presigned parameters decoded, which `a` points into.
+    std::string cred_q, date_q, signed_q, sig_q, exp_q;
 
     if (auth_hdr)
     {
@@ -645,8 +678,8 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
             return malformed(a.form, "The authorization header is malformed; the Credential, SignedHeaders and Signature components are all required.");
         if (!split_credential(cred, a))
             return malformed(a.form, "The authorization header is malformed; the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".");
-        a.signed_headers = std::string(signed_h);
-        a.signature_hex  = std::string(sig);
+        a.signed_headers = signed_h;
+        a.signature_hex  = sig;
 
         const header_field* xd = find_header(req.headers, "x-amz-date");
         if (xd)
@@ -667,29 +700,28 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
         a.form = auth_form::query;
         if (algo_q != algorithm)
             return malformed(a.form, "X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\".");
-        std::string cred, date, signed_h, sig, exp;
-        if (!query_param(req.raw_query, "X-Amz-Credential", cred) || !query_param(req.raw_query, "X-Amz-Date", date) ||
-            !query_param(req.raw_query, "X-Amz-SignedHeaders", signed_h) || !query_param(req.raw_query, "X-Amz-Signature", sig) ||
-            !query_param(req.raw_query, "X-Amz-Expires", exp))
+        if (!query_param(req.raw_query, "X-Amz-Credential", cred_q) || !query_param(req.raw_query, "X-Amz-Date", date_q) ||
+            !query_param(req.raw_query, "X-Amz-SignedHeaders", signed_q) || !query_param(req.raw_query, "X-Amz-Signature", sig_q) ||
+            !query_param(req.raw_query, "X-Amz-Expires", exp_q))
             return malformed(a.form, "Query-string authentication requires the X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.");
-        if (!split_credential(cred, a))
+        if (!split_credential(cred_q, a))
             return malformed(a.form, "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed.");
-        if (!parse_amz_date(date, a.when))
+        if (!parse_amz_date(date_q, a.when))
             return malformed(a.form, "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\".");
         uint64_t e;
-        if (!parse_u64(exp, e))
+        if (!parse_u64(exp_q, e))
             return malformed(a.form, "X-Amz-Expires should be a number.");
         if (e < 1)
             return malformed(a.form, "X-Amz-Expires must be non-negative.");
         if (e > static_cast<uint64_t>(opts.max_expires_seconds))
             return malformed(a.form, "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds.");
         a.expires_s      = static_cast<int64_t>(e);
-        a.signed_headers = std::move(signed_h);
-        a.signature_hex  = std::move(sig);
+        a.signed_headers = signed_q;
+        a.signature_hex  = sig_q;
         a.has_payload_query = query_param(req.raw_query, "X-Amz-Content-Sha256", a.payload_from_query);
     }
 
-    if (a.date.size() != 8 || std::string_view(a.date) != std::string_view(a.when.amz, 8))
+    if (a.date.size() != 8 || a.date != std::string_view(a.when.amz, 8))
         return malformed(a.form, "The credential scope date does not match the request date.");
     if (a.service != opts.service)
         return malformed(a.form, "The credential scope names a different service than this one.");
@@ -759,24 +791,23 @@ verify_result verify(const request_view& req, const verify_options& opts, const 
     uint8_t key[32];
     derive_signing_key(secret, a.date, a.region, a.service, key);
 
-    std::string scope;
+    thread_local std::string scope;
+    scope.clear();
     append(scope, {a.date, "/", a.region, "/", a.service, "/aws4_request"});
 
     thread_local std::string creq;
     thread_local std::string sts;
-    std::string path_a;
-    {
-        std::string decoded = decode_component(req.raw_path.empty() ? std::string_view("/") : req.raw_path, false);
-        uri_encode_append(path_a, decoded, true);
-    }
     std::string_view path_b = req.raw_path.empty() ? std::string_view("/") : req.raw_path;
+    std::string path_a;
+    if (!canonical_already(path_b))
+        uri_encode_append(path_a, decode_component(path_b, false), true);
+    std::string_view paths[2] = {path_a.empty() ? path_b : std::string_view(path_a), path_b};
 
     std::string query;
     canonical_query(query, req.raw_query, a.form == auth_form::query ? std::string_view("X-Amz-Signature") : std::string_view{});
 
     bool matched  = false;
     char sig_hex[64] = {};
-    std::string_view paths[2] = {path_a, path_b};
     for (int attempt = 0; attempt < 2 && !matched; attempt++)
     {
         if (attempt == 1 && paths[1] == paths[0])
