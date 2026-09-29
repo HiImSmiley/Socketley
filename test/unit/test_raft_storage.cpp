@@ -85,6 +85,35 @@ TEST_CASE("crc32c is the Castagnoli polynomial")
     CHECK(st::crc32c("", 0) == 0u);
 }
 
+TEST_CASE("crc32c agrees with a bitwise reference at every length, offset and seed")
+{
+    // The instruction path steps eight bytes at a time, so its tails and odd
+    // starts are what a single vector does not reach.
+    auto reference = [](const unsigned char* p, size_t n, uint32_t crc) {
+        crc = ~crc;
+        while (n--)
+        {
+            crc ^= *p++;
+            for (int k = 0; k < 8; ++k)
+                crc = (crc & 1) ? (crc >> 1) ^ 0x82F63B78u : crc >> 1;
+        }
+        return ~crc;
+    };
+    std::vector<unsigned char> buf(4096 + 16);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (auto& b : buf)
+    {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        b = static_cast<unsigned char>(x);
+    }
+    for (size_t off = 0; off < 16; ++off)
+        for (size_t n : { 0u, 1u, 7u, 8u, 9u, 15u, 16u, 17u, 63u, 64u, 65u, 1000u, 4096u })
+        {
+            const uint32_t seed = static_cast<uint32_t>(off * 2654435761u + n);
+            CHECK(st::crc32c(buf.data() + off, n, seed) == reference(buf.data() + off, n, seed));
+        }
+}
+
 TEST_CASE("replay applies hard state, entries and truncations, and a re-stated entry cuts nothing")
 {
     std::string wal;

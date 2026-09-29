@@ -7,7 +7,6 @@
 #include <openssl/evp.h>
 
 #if defined(__x86_64__)
-#include <nmmintrin.h>
 #endif
 
 #include "../../shared/raft_storage.h"
@@ -70,38 +69,8 @@ uint64_t crc64_update(uint64_t crc, const unsigned char* p, size_t n)
     return ~crc;
 }
 
-#if defined(__x86_64__)
-__attribute__((target("sse4.2")))
-uint32_t crc32c_hw(uint32_t crc, const unsigned char* p, size_t n)
-{
-    uint64_t c = static_cast<uint32_t>(~crc);
-    while (n >= 8)
-    {
-        uint64_t v;
-        std::memcpy(&v, p, 8);
-        c = _mm_crc32_u64(c, v);
-        p += 8;
-        n -= 8;
-    }
-    uint32_t c32 = static_cast<uint32_t>(c);
-    while (n--)
-        c32 = _mm_crc32_u8(c32, *p++);
-    return ~c32;
-}
-
-bool have_crc32c_hw()
-{
-    static const bool yes = __builtin_cpu_supports("sse4.2");
-    return yes;
-}
-#endif
-
 uint32_t crc32c_update(uint32_t crc, const unsigned char* p, size_t n)
 {
-#if defined(__x86_64__)
-    if (have_crc32c_hw())
-        return crc32c_hw(crc, p, n);
-#endif
     return raft::storage::crc32c(p, n, crc);
 }
 
