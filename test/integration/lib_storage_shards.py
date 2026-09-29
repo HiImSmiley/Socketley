@@ -18,6 +18,7 @@ and exit with the number of failures.
                                    then one more key put
   equiv    -- NODES4... -- NODES1... a listing through each of the first nodes is
                                    the listing of the last, page for page
+  copy     NODE...                 CopyObject and create-only puts through every shard
   owner    BUCKET KEY N            the shard that owns the key, printed
   slow_put NODE BUCKET KEY BYTES READY RELEASE
                                    a put whose body is sent in two halves
@@ -314,6 +315,13 @@ def mode_verify(prior, nodes):
             s, _, b = req(node, "GET", "/%s/%s" % (bucket, k))
             wrong += s != 200 or b != b"later"
         check("node %d serves every key whole" % ni, wrong == 0, "%d wrong" % wrong)
+        wrong = 0
+        for i, k in enumerate(keys):
+            s, h, b = req(node, "HEAD", "/%s/%s" % (bucket, q(k)))
+            if s != 200 or int(h.get("content-length", "-1")) != len(body_for(i)) \
+                    or h.get("etag", "").strip('"') != hashlib.md5(body_for(i)).hexdigest():
+                wrong += 1
+        check("node %d answers a HEAD for every key" % ni, wrong == 0, "%d wrong" % wrong)
         pages = list_pages(node, bucket)
         listed = sorted(k for p in pages for k in p[0]) if pages else None
         check("node %d lists exactly the keys" % ni, listed == sorted(everything),
@@ -325,6 +333,50 @@ def mode_verify(prior, nodes):
     k = "later%d" % prior
     s, _, _ = req(nodes[prior % len(nodes)], "PUT", "/%s/%s" % (bucket, k), body=b"later")
     check("a put after the change lands through node %d" % (prior % len(nodes)), s == 200, s)
+
+
+def mode_copy(nodes):
+    """CopyObject asked of every shard, between keys whose owners differ."""
+    n = len(nodes)
+    bucket = "cpy"
+    st, _, _ = req(nodes[0], "PUT", "/" + bucket)
+    check("the bucket is made", st in (200, 409), st)
+    bad = 0
+    made = 0
+    for i in range(40):
+        src, dst = "src%d" % i, "dst%d" % i
+        if n > 1 and owner(bucket, src, n) == owner(bucket, dst, n):
+            continue
+        body = body_for(i)
+        s, _, _ = req(nodes[i % n], "PUT", "/%s/%s" % (bucket, src), body=body)
+        if s != 200:
+            bad += 1
+            continue
+        # Asked of a shard that owns neither, where there is one.
+        landing = next((x for x in range(n) if x != owner(bucket, src, n) and x != owner(bucket, dst, n)), 0)
+        s, _, cb = req(nodes[landing], "PUT", "/%s/%s" % (bucket, dst), headers={"x-amz-copy-source": "/%s/%s" % (bucket, src)})
+        if s != 200 or hashlib.md5(body).hexdigest() not in cb.decode():
+            bad += 1
+            continue
+        made += 1
+        for node in nodes:
+            s, _, got = req(node, "GET", "/%s/%s" % (bucket, dst))
+            bad += s != 200 or got != body
+    check("copies made through a shard that owns neither key are whole on every shard", bad == 0 and made >= 10,
+          "%d wrong, %d made" % (bad, made))
+    # A copy onto itself is refused, and so is a missing source, wherever they are asked.
+    for node in nodes:
+        s, _, _ = req(node, "PUT", "/%s/src1" % bucket, headers={"x-amz-copy-source": "/%s/nothing" % bucket})
+        check("a missing copy source is NoSuchKey through every shard", s == 404, s)
+    # If-None-Match: * is decided by the owner, wherever the put lands.
+    for i, node in enumerate(nodes):
+        s, _, _ = req(node, "PUT", "/%s/src1" % bucket, body=b"other", headers={"If-None-Match": "*"})
+        check("a create-only put over an existing key is refused through shard %d" % i, s == 412, s)
+    s, _, got = req(nodes[0], "GET", "/%s/src1" % bucket)
+    check("and the object is as it was", s == 200 and got == body_for(1), s)
+    codes = [req(node, "PUT", "/%s/fresh%d" % (bucket, i), body=b"x", headers={"If-None-Match": "*"})[0]
+             for i, node in enumerate(nodes)]
+    check("a create-only put of a new key succeeds through every shard", codes == [200] * n, codes)
 
 
 def mode_equiv(args):
@@ -380,6 +432,8 @@ def main():
         mode_verify(sys.argv[2], sys.argv[3:])
     elif mode == "equiv":
         mode_equiv(sys.argv[1:])
+    elif mode == "copy":
+        mode_copy(sys.argv[2:])
     elif mode == "owner":
         print(owner(sys.argv[2], sys.argv[3], int(sys.argv[4])))
         return

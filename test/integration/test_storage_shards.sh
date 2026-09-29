@@ -114,11 +114,16 @@ for i in 0 1 2 3; do
     expect "shard $i has the bucket" "$(code --unix-socket "${N4[$i]}" -I http://x/shared)" 200
 done
 expect "making it again through shard 3 is refused as it is" "$(code --unix-socket "${N4[3]}" -X PUT http://x/shared)" 409
-curl -s --unix-socket "${N4[1]}" -X PUT --data-binary held http://x/shared/held -o /dev/null
+# A key some other shard than 0 owns, so that shard 0's own emptiness is not what refuses.
+held=held
+for i in $(seq 1 50); do
+    [ "$(python3 "$HERE/lib_storage_shards.py" owner shared "held$i" 4)" != 0 ] && { held="held$i"; break; }
+done
+curl -s --unix-socket "${N4[1]}" -X PUT --data-binary held "http://x/shared/$held" -o /dev/null
 expect "a bucket holding an object is not dropped, whichever shard is asked" \
     "$(code --unix-socket "${N4[0]}" -X DELETE http://x/shared)" 409
-expect "and is still whole afterwards" "$(curl -s --unix-socket "${N4[3]}" http://x/shared/held)" held
-expect "the object is deleted through another shard" "$(code --unix-socket "${N4[2]}" -X DELETE http://x/shared/held)" 204
+expect "and is still whole afterwards" "$(curl -s --unix-socket "${N4[3]}" "http://x/shared/$held")" held
+expect "the object is deleted through another shard" "$(code --unix-socket "${N4[2]}" -X DELETE "http://x/shared/$held")" 204
 expect "the empty bucket is dropped through shard 1" "$(code --unix-socket "${N4[1]}" -X DELETE http://x/shared)" 204
 for i in 0 1 2 3; do
     expect "shard $i no longer has it" "$(code --unix-socket "${N4[$i]}" -I http://x/shared)" 404
@@ -126,6 +131,9 @@ done
 expect "and it can be made again through shard 0" "$(code --unix-socket "${N4[0]}" -X PUT http://x/shared)" 200
 expect "with an object put through shard 3" "$(code --unix-socket "${N4[3]}" -X PUT --data-binary again http://x/shared/again)" 200
 expect "read through shard 1" "$(curl -s --unix-socket "${N4[1]}" http://x/shared/again)" again
+
+echo "== copies and create-only puts =="
+run_py copy "${N4[@]}"
 
 echo "== one key put through every shard at once =="
 run_py storm "$BIN" "${N4[@]}"

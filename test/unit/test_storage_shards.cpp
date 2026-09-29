@@ -846,13 +846,17 @@ TEST_CASE("a bucket made through one shard is on all of them and dropped from al
 
     // A shard holding an object refuses the drop for everyone, wherever it was asked,
     // and the bucket is still whole and usable afterwards.
-    REQUIRE(c.put(1, "shared", "k", "v").status == st::ok);
+    // A key that a shard other than 0 owns, so that shard 0's own emptiness is not what refuses.
+    std::string k = "k";
+    for (int i = 0; object_owner("shared", k, 3) == 0; ++i)
+        k = "k" + std::to_string(i);
+    REQUIRE(c.put(1, "shared", k, "v").status == st::ok);
     for (uint32_t s = 0; s < 3; ++s)
         CHECK(c.drop_bucket(s, "shared") == st::bucket_not_empty);
     for (uint32_t s = 0; s < 3; ++s)
         CHECK(c.m[s]->store->has_bucket("shared"));
     REQUIRE(c.put(0, "shared", "k2", "v2").status == st::ok);
-    REQUIRE(c.del(2, "shared", "k") == st::ok);
+    REQUIRE(c.del(2, "shared", k) == st::ok);
     REQUIRE(c.del(1, "shared", "k2") == st::ok);
 
     REQUIRE(c.drop_bucket(1, "shared") == st::ok);
