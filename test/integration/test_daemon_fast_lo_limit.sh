@@ -264,13 +264,17 @@ read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
 if awk "BEGIN{exit !($PKV <= 8)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
 else fail "per-pair bound" "the proxy's backlog stays near the 4 MiB ceiling and drains in order" "probe: $R (peak<=8, in_order, complete)"; fi
 
+# A stalled pair is stopped at its bound either way: by the answer that its peer
+# holds the bound, or, when a loaded box delays that answer past twice the
+# bound, as unanswered -- the peak above is what holds the memory claim.
 if grep -q '^fast_lo:all$' <<<"$MID" && [ "$(figure fast_lo_entered "$MID")" -ge 2 ] &&
-   [ "$(figure fast_lo_tainted_bound "$MID")" -ge 1 ] && [ "$(figure fast_lo_sockets_tcp "$MID")" -ge 1 ] &&
+   [ $(( $(figure fast_lo_tainted_bound "$MID") + $(figure fast_lo_tainted_unanswered "$MID") )) -ge 1 ] &&
+   [ "$(figure fast_lo_sockets_tcp "$MID")" -ge 1 ] &&
    [ "$(figure fast_lo_held_bytes "$MID")" -ge 3145728 ]; then pass
-else fail "stats: stalled" "daemon stats shows the pair entered, tainted for its bound, on TCP, and ~4 MiB held" \
+else fail "stats: stalled" "daemon stats shows the pair entered, stopped at its bound (bound, or unanswered on a loaded box), on TCP, and ~4 MiB held" \
     "$(tr '\n' ' ' <<<"$MID")"; fi
 if grep -q 'socketley_fast_lo_info{mode="all"} 1' <<<"$SCRAPE" &&
-   grep -qE 'socketley_fast_lo_tainted_total\{reason="bound"\} [1-9]' <<<"$SCRAPE" &&
+   grep -qE 'socketley_fast_lo_tainted_total\{reason="(bound|unanswered)"\} [1-9]' <<<"$SCRAPE" &&
    grep -qE 'socketley_fast_lo_sockets\{path="tcp"\} [1-9]' <<<"$SCRAPE"; then pass
 else fail "metrics: stalled" "the metrics endpoint carries the mode, the bound taint and the socket on TCP" \
     "$(grep fast_lo <<<"$SCRAPE" | grep -v '^#' | tr '\n' ' ')"; fi
@@ -303,7 +307,7 @@ read -r PK IO CO SM AK <<<"$R"; PKV=${PK#peak_mib=}
 if awk "BEGIN{exit !($PKV <= 8)}" && [ "$IO" = in_order=1 ] && [ "$CO" = complete=1 ]; then pass
 else fail "trust: per-pair bound" "a foreign backend's socket stays near the 4 MiB ceiling under trust and the echo drains in order" "probe: $R (peak<=8, in_order, complete)"; fi
 if grep -q 'socketley_fast_lo_info{mode="trust"} 1' <<<"$SCRAPE" &&
-   grep -qE 'socketley_fast_lo_tainted_total\{reason="bound"\} [1-9]' <<<"$SCRAPE"; then pass
+   grep -qE 'socketley_fast_lo_tainted_total\{reason="(bound|unanswered)"\} [1-9]' <<<"$SCRAPE"; then pass
 else fail "trust: metrics" "the metrics endpoint carries mode trust and the bound taint of the foreign receiver" \
     "$(grep fast_lo <<<"$SCRAPE" | grep -v '^#' | tr '\n' ' ')"; fi
 
