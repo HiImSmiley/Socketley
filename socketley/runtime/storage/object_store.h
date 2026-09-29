@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -379,6 +380,17 @@ public:
     // Holds only the keys this shard owns, and the pointer is valid until the next operation that changes the bucket.
     const object_meta* find(std::string_view bucket, std::string_view key) const;
 
+    // ── Hot small objects, kept in memory ───────────────────────────────────
+    // The bytes of small objects this shard owns, so a hot one is answered
+    // without opening its file; an entry is dropped wherever its index entry
+    // changes, and taken only while it still matches the index.
+    static constexpr uint64_t hot_max_object = 60000;
+    // The bytes of `key` when they are held for exactly the version `current` names.
+    const std::string* hot_get(std::string_view bucket, std::string_view key, const object_meta& current);
+    // Keeps what a read brought in, when `read` is still the indexed version.
+    void hot_put(std::string_view bucket, std::string_view key, const object_meta& read, std::string_view body);
+    uint64_t hot_bytes() const { return m_hot_bytes; }
+
     // The metadata of any object, from memory when this shard owns the key and
     // from the object's own header otherwise.
     void stat_object(std::string_view bucket, std::string_view key,
@@ -542,6 +554,21 @@ private:
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.
     std::string m_kill_after_rename;
+
+    struct hot_entry
+    {
+        std::string id;        // bucket, a NUL, key
+        std::string body;
+        object_meta meta;
+    };
+    void hot_drop(std::string_view bucket, std::string_view key);
+    void hot_drop_bucket(std::string_view bucket);
+    const std::string& hot_id(std::string_view bucket, std::string_view key);
+    std::list<hot_entry>                                         m_hot_lru;   // most recent first
+    std::unordered_map<std::string_view, std::list<hot_entry>::iterator> m_hot_index;
+    uint64_t    m_hot_bytes{0};
+    uint64_t    m_hot_budget{32ull << 20};
+    std::string m_hot_scratch;
     uint64_t m_reserved{0};
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.

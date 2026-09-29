@@ -54,6 +54,8 @@ struct storage_counters
     uint64_t zero_copy_bytes{0};
     uint64_t zero_copy_gets{0};
     uint64_t copied_gets{0};
+    // GETs answered from the hot small-object copy, with no file opened.
+    uint64_t hot_gets{0};
     // Body bytes taken in from clients.
     uint64_t bytes_in{0};
     uint64_t timeouts{0};
@@ -324,6 +326,7 @@ public:
     size_t connection_count() const { return m_conns.size(); }
     const storage_counters& counters() const { return m_c; }
     object_store& store() { return m_store; }
+    uint64_t hot_bytes() const { return m_store.hot_bytes(); }
     shard_node& node() { return m_node; }
     file_io& io() { return m_io; }
     void set_authenticator(authenticator* a) { m_auth = a; }

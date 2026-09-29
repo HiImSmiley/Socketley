@@ -63,7 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   threads (`SOCKETLEY_STORAGE_HASH_THREADS`, default 3, 0 for the loop), which
   took the loop from 0.86 to 0.37 of a core during 64 MiB puts at 32 connections
   and put a 64 MiB put at 32 connections from 100 to about 400 MiB/s on this
-  disk; and the signing key of a day is derived once per thread. The splice
+  disk; the signing key of a day is derived once per thread; and an object of up
+  to 60000 bytes is kept in memory by the shard that owns it once read (32 MiB
+  per shard, `SOCKETLEY_STORAGE_HOT_BYTES`, 0 for none; `stats` counts
+  `hot_gets` and `hot_bytes`), answered only while its version is the one the
+  index names, which took a 4 KiB GET at 32 connections on one shard from 28500
+  to 45400 per second and from 33 to 20 us of worker CPU, and at one connection
+  from 6900 to 7900 (the table above is from before it). The splice
   threshold of 64 KiB was measured and left (below it a read and a write are as
   fast, at 256 KiB splicing is 3.8x).
 

@@ -1212,3 +1212,56 @@ TEST_CASE("a body given up while the pool is still reading it leaves no temporar
         CHECK(r.put("bkt", "after", ok).status == st::ok);
     }
 }
+
+TEST_CASE("a hot copy answers only the version the index names, and keeps within its budget")
+{
+    tmpdir d;
+    ::setenv("SOCKETLEY_STORAGE_HOT_BYTES", "10000", 1);
+    rig r(d.path);
+    ::unsetenv("SOCKETLEY_STORAGE_HOT_BYTES");
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+
+    const std::string v1 = pattern(3000, 1), v2 = pattern(3000, 2);
+    REQUIRE(r.put("bkt", "k", v1).status == st::ok);
+    const object_meta m1 = *r.store->find("bkt", "k");
+    r.store->hot_put("bkt", "k", m1, v1);
+    const std::string* hot = r.store->hot_get("bkt", "k", m1);
+    REQUIRE(hot != nullptr);
+    CHECK(*hot == v1);
+
+    // A read of the old file that finishes after the overwrite committed.
+    REQUIRE(r.put("bkt", "k", v2).status == st::ok);
+    const object_meta m2 = *r.store->find("bkt", "k");
+    r.store->hot_put("bkt", "k", m1, v1);
+    CHECK(r.store->hot_bytes() == 0);
+    CHECK(r.store->hot_get("bkt", "k", m2) == nullptr);
+
+    // A copy whose version is not the one asked for is dropped, not answered.
+    r.store->hot_put("bkt", "k", m2, v2);
+    REQUIRE(r.store->hot_get("bkt", "k", m2) != nullptr);
+    CHECK(r.store->hot_get("bkt", "k", m1) == nullptr);
+    CHECK(r.store->hot_bytes() == 0);
+
+    // The least recently answered go first, as many as the budget needs.
+    auto warm = [&](const char* k, size_t n)
+    {
+        const std::string body = pattern(n, static_cast<unsigned>(k[0]));
+        REQUIRE(r.put("bkt", k, body).status == st::ok);
+        r.store->hot_put("bkt", k, *r.store->find("bkt", k), body);
+    };
+    auto held = [&](const char* k) { return r.store->hot_get("bkt", k, *r.store->find("bkt", k)) != nullptr; };
+    warm("a", 3000);
+    warm("b", 3000);
+    warm("c", 3000);
+    REQUIRE(held("a"));
+    warm("d", 6000);
+    CHECK(r.store->hot_bytes() <= 10000);
+    CHECK(held("a"));
+    CHECK_FALSE(held("b"));
+    CHECK_FALSE(held("c"));
+    CHECK(held("d"));
+
+    for (const char* k : {"a", "b", "c", "d", "k"})
+        REQUIRE(r.del("bkt", k) == st::ok);
+    CHECK(r.store->hot_bytes() == 0);
+}

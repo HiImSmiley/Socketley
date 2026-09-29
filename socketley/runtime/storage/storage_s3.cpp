@@ -1179,8 +1179,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             return;
         }
 
-        // A body the header read already brought in is sent from memory in one write.
-        if (fd >= 0 && first + len <= prefetch.size())
+        // A body the header read already brought in, or the hot copy, is sent from memory in one write.
+        if (!prefetch.empty() && first + len <= prefetch.size())
         {
             close_file();
             r.body = prefetch.substr(static_cast<size_t>(first), static_cast<size_t>(len));
@@ -1220,11 +1220,21 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         return;
     }
 
+    // A hot small object this shard owns is answered from memory, with no file opened.
+    if (mem && mem->size > 0 && mem->size <= object_store::hot_max_object)
+        if (const std::string* hot = m_store.hot_get(q.bucket, q.key, *mem))
+        {
+            ++m_c.hot_gets;
+            answer(*mem, -1, 0, *hot);
+            return;
+        }
+
     // Small objects are read whole with their header, in one read; a key whose
     // size is not known here is read that way too, since the read is short for
     // a small object and only a little long for a large one.
-    const size_t prefetch = mem ? (mem->size <= 60000 ? static_cast<size_t>(mem->size) : 0) : 60000;
-    m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer](open_result o)
+    const size_t prefetch = mem ? (mem->size <= object_store::hot_max_object ? static_cast<size_t>(mem->size) : 0)
+                                : object_store::hot_max_object;
+    m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer, mine, b = q.bucket, k = q.key](open_result o)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -1238,6 +1248,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_error_st(cc, o.status);
             return;
         }
+        if (mine && o.meta.size > 0 && o.prefetch.size() >= o.meta.size)
+            m_store.hot_put(b, k, o.meta, std::string_view(o.prefetch).substr(0, static_cast<size_t>(o.meta.size)));
         answer(o.meta, o.fd, o.data_off, o.prefetch);
     });
 }

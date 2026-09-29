@@ -6476,6 +6476,16 @@ in
 smaller objects are read once, with their header, and sent from memory with the
 response headers in one write.
 .PP
+An object of up to 60000 bytes is kept in memory after it is first read by the
+shard that owns its key, up to 32 MiB per shard
+(\fBSOCKETLEY_STORAGE_HOT_BYTES\fR) with the least recently read going first, and
+later GETs on that shard are answered from the copy without opening the file. A
+copy is answered only while it is the version the shard's index names, and an
+overwrite, copy or delete of the key drops it, so a GET never answers bytes that
+were replaced. With
+.B \-\-shards
+a GET that lands on another shard reads the file as before.
+.PP
 .SS Performance
 Measured with warp and boto3 over plain HTTP with SigV4 on one 16\-core VM with an
 ext4 virtio disk, against MinIO as a single node with a single drive on the same
@@ -6593,6 +6603,10 @@ reports
 .BR server_errors ,
 .BR zero_copy_gets ,
 .BR copied_gets ,
+.B hot_gets
+(the copied GETs answered from the hot copy),
+.B hot_bytes
+(what the hot copies hold),
 .BR zero_copy_bytes ,
 .BR journal_records ,
 .BR journal_compactions ,
@@ -10870,6 +10884,18 @@ splices every body. Below the default a read and a write cost less than the
 pipe a splice needs, so this changes what
 .B zero_copy_bytes
 counts and how much CPU a GET takes, never what it returns.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_HOT_BYTES
+How many bytes of small objects (up to 60000 bytes each) a storage shard keeps in
+memory to answer repeated GETs of the keys it owns without opening their files.
+Default
+.B 33554432
+(32 MiB);
+.B 0
+keeps nothing. This changes CPU use and GET throughput and the memory a worker
+holds, never what a GET returns.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP

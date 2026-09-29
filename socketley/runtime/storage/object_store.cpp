@@ -78,6 +78,94 @@ object_store::object_store(event_loop& loop, file_io& io, store_options opts)
         m_opts.nshards = 1;
     if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_RENAME"))
         m_kill_after_rename = e;
+    // The hot-object budget per shard, 0 to keep nothing.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_HOT_BYTES"))
+        m_hot_budget = std::strtoull(e, nullptr, 10);
+}
+
+const std::string& object_store::hot_id(std::string_view bucket_name, std::string_view key)
+{
+    m_hot_scratch.assign(bucket_name);
+    m_hot_scratch.push_back('\0');
+    m_hot_scratch.append(key);
+    return m_hot_scratch;
+}
+
+// Same size, bytes and time: the version the index names, whatever wrote it.
+static bool same_version(const object_meta& a, const object_meta& b)
+{
+    return a.size == b.size && a.mtime_ms == b.mtime_ms && a.md5 == b.md5 && a.parts == b.parts;
+}
+
+const std::string* object_store::hot_get(std::string_view bucket_name, std::string_view key,
+                                         const object_meta& current)
+{
+    if (m_hot_index.empty())
+        return nullptr;
+    auto it = m_hot_index.find(hot_id(bucket_name, key));
+    if (it == m_hot_index.end())
+        return nullptr;
+    if (!same_version(it->second->meta, current))
+    {
+        m_hot_bytes -= it->second->body.size() + it->second->id.size();
+        m_hot_lru.erase(it->second);
+        m_hot_index.erase(it);
+        return nullptr;
+    }
+    m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
+    return &it->second->body;
+}
+
+void object_store::hot_put(std::string_view bucket_name, std::string_view key, const object_meta& read,
+                           std::string_view body)
+{
+    if (m_hot_budget == 0 || body.size() != read.size || read.size > hot_max_object)
+        return;
+    // A read that raced a commit brought in the old version, which must not outlive it.
+    const object_meta* cur = find(bucket_name, key);
+    if (!cur || !same_version(*cur, read))
+        return;
+    const std::string& id = hot_id(bucket_name, key);
+    if (m_hot_index.count(id))
+        return;
+    m_hot_lru.push_front(hot_entry{id, std::string(body), read});
+    m_hot_index.emplace(m_hot_lru.front().id, m_hot_lru.begin());
+    m_hot_bytes += body.size() + m_hot_lru.front().id.size();
+    while (m_hot_bytes > m_hot_budget && !m_hot_lru.empty())
+    {
+        hot_entry& old = m_hot_lru.back();
+        m_hot_bytes -= old.body.size() + old.id.size();
+        m_hot_index.erase(old.id);
+        m_hot_lru.pop_back();
+    }
+}
+
+void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
+{
+    if (m_hot_index.empty())
+        return;
+    auto it = m_hot_index.find(hot_id(bucket_name, key));
+    if (it == m_hot_index.end())
+        return;
+    m_hot_bytes -= it->second->body.size() + it->second->id.size();
+    auto lit = it->second;
+    m_hot_index.erase(it);
+    m_hot_lru.erase(lit);
+}
+
+void object_store::hot_drop_bucket(std::string_view bucket_name)
+{
+    for (auto it = m_hot_lru.begin(); it != m_hot_lru.end();)
+    {
+        if (std::string_view(it->id).substr(0, it->id.find('\0')) == bucket_name)
+        {
+            m_hot_bytes -= it->body.size() + it->id.size();
+            m_hot_index.erase(it->id);
+            it = m_hot_lru.erase(it);
+        }
+        else
+            ++it;
+    }
 }
 
 uint32_t object_store::owner_of(std::string_view bucket_name, std::string_view key) const
@@ -568,6 +656,7 @@ void object_store::lane_leave(const std::string& bucket_name, const std::string&
 
 void object_store::apply_put(bucket& b, const std::string& key, const object_meta& meta)
 {
+    hot_drop(b.name, key);
     auto it = b.objects.find(key);
     if (it != b.objects.end())
     {
@@ -587,6 +676,7 @@ void object_store::apply_put(bucket& b, const std::string& key, const object_met
 
 void object_store::apply_delete(bucket& b, const std::string& key)
 {
+    hot_drop(b.name, key);
     auto it = b.objects.find(key);
     if (it == b.objects.end())
         return;
@@ -1648,6 +1738,7 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
+    hot_drop_bucket(name);
     m_buckets.erase(it);
 }
 

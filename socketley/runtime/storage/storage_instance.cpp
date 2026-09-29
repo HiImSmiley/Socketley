@@ -350,6 +350,8 @@ std::string storage_instance::stats_lines() const
         << "server_errors:" << c.server_errors << "\n"
         << "zero_copy_gets:" << c.zero_copy_gets << "\n"
         << "copied_gets:" << c.copied_gets << "\n"
+        << "hot_gets:" << c.hot_gets << "\n"
+        << "hot_bytes:" << m_run->hot_bytes() << "\n"
         << "zero_copy_bytes:" << c.zero_copy_bytes << "\n"
         << "journal_records:" << t.journal_records << "\n"
         << "journal_compactions:" << t.compactions << "\n"
