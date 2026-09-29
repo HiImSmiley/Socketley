@@ -46,6 +46,7 @@ Usage:  python3 test/fuzz/make_corpus.py [output-root]
 """
 
 import hashlib
+import hmac
 import os
 import struct
 import sys
@@ -2411,7 +2412,144 @@ KEPT_BUDGET = {
     "proxy": 8,        # 0 kept
     "proxytunnel": 8,  # 0 kept
     "raftmsg": 8,      # 0 kept
+    "s3sigv4": 8,      # 0 kept
 }
+
+
+# ─────────────────────────────── S3 SigV4 ────────────────────────────────────
+#
+# Seeds for fuzz_s3_sigv4, with signatures that verify under the target's fixed key and clock, so that mutations
+# start from requests and streams that reach the verifying branches rather than the first parse error.  The signer
+# here restates test/unit/gen_s3_sigv4_cases.py's reference for canonical inputs (no path or query needing re-encoding).
+
+_S3_AK = "AKIDFUZZ"
+_S3_SK = "fuzz-secret-key"
+_S3_DATE = "20260929T120000Z"
+_S3_EMPTY = hashlib.sha256(b"").hexdigest()
+
+
+def _s3_hm(k, m):
+    return hmac.new(k, m if isinstance(m, bytes) else m.encode(), hashlib.sha256).digest()
+
+
+def _s3_key(secret, region="us-east-1"):
+    k = _s3_hm(("AWS4" + secret).encode(), _S3_DATE[:8])
+    return _s3_hm(_s3_hm(_s3_hm(k, region), "s3"), "aws4_request")
+
+
+def _s3_sign(method, path, query, headers, signed, payload, region="us-east-1", secret=_S3_SK, drop=None):
+    items = sorted(p.partition("=")[0::2] for p in query.split("&") if p and p.partition("=")[0] != drop)
+    cq = "&".join("%s=%s" % (n, v) for n, v in items)
+    ch = ""
+    for n in signed:
+        ch += "%s:%s\n" % (n, ",".join(" ".join(v.split()) for k, v in headers if k.lower() == n))
+    creq = "\n".join([method, path, cq, ch, ";".join(signed), payload])
+    sts = "\n".join(["AWS4-HMAC-SHA256", _S3_DATE, "%s/%s/s3/aws4_request" % (_S3_DATE[:8], region),
+                     hashlib.sha256(creq.encode()).hexdigest()])
+    return _s3_hm(_s3_key(secret, region), sts).hex()
+
+
+def _s3_request(flags, method, path, query, payload_fallback, headers):
+    lines = [method, path, query, payload_fallback] + ["%s:%s" % h for h in headers]
+    return bytes([flags]) + "\n".join(lines).encode()
+
+
+def _s3_header_request(method, path, query, extra=(), payload=_S3_EMPTY, region="us-east-1", ak=_S3_AK,
+                       secret=_S3_SK, date=_S3_DATE, flags=0, sig=None):
+    hdrs = [("Host", "storage.local:9000"), ("x-amz-date", date), ("x-amz-content-sha256", payload)] + list(extra)
+    signed = sorted(set(h[0].lower() for h in hdrs))
+    sig = sig or _s3_sign(method, path, query, hdrs, signed, payload, region, secret)
+    auth = "AWS4-HMAC-SHA256 Credential=%s/%s/%s/s3/aws4_request, SignedHeaders=%s, Signature=%s" % (
+        ak, date[:8], region, ";".join(signed), sig)
+    return _s3_request(flags, method, path, query, "", hdrs + [("Authorization", auth)])
+
+
+def _s3_presigned(method, path, extra_query="", expires=3600, region="us-east-1", date=_S3_DATE):
+    base = ("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=%s%%2F%s%%2F%s%%2Fs3%%2Faws4_request&X-Amz-Date=%s"
+            "&X-Amz-Expires=%d&X-Amz-SignedHeaders=host" % (_S3_AK, date[:8], region, date, expires))
+    q = base + ("&" + extra_query if extra_query else "")
+    hdrs = [("Host", "storage.local:9000")]
+    sig = _s3_sign(method, path, q, hdrs, ["host"], "UNSIGNED-PAYLOAD", region, drop="X-Amz-Signature")
+    return _s3_request(0, method, path, q + "&X-Amz-Signature=" + sig, "", hdrs)
+
+
+def _s3_chunk(prev, data, key):
+    sts = "\n".join(["AWS4-HMAC-SHA256-PAYLOAD", _S3_DATE, "%s/us-east-1/s3/aws4_request" % _S3_DATE[:8], prev,
+                     _S3_EMPTY, hashlib.sha256(data).hexdigest()])
+    return _s3_hm(key, sts).hex()
+
+
+def _s3_stream(kind, pieces, trailers=(), step=3, tamper=None):
+    key = bytes(0x11 + i for i in range(32))
+    prev = "0" * 64
+    wire = b""
+    for p in list(pieces) + [b""]:
+        if kind == 2:
+            wire += b"%x\r\n" % len(p) + p + (b"\r\n" if p else b"")
+            continue
+        prev = _s3_chunk(prev, p, key)
+        wire += b"%x;chunk-signature=%s\r\n" % (len(p), prev.encode()) + p + (b"\r\n" if p else b"")
+    text = "".join("%s:%s\n" % t for t in trailers)
+    lines = "".join("%s:%s\r\n" % t for t in trailers).encode()
+    if kind == 1:
+        ts = _s3_hm(key, "\n".join(["AWS4-HMAC-SHA256-TRAILER", _S3_DATE, "%s/us-east-1/s3/aws4_request" % _S3_DATE[:8],
+                                    prev, hashlib.sha256(text.encode()).hexdigest()])).hex()
+        wire += lines + b"x-amz-trailer-signature:%s\r\n\r\n" % ts.encode()
+    elif kind == 2:
+        wire += lines + b"\r\n"
+    else:
+        wire += b"\r\n"
+    if tamper:
+        wire = tamper(wire)
+    return bytes([1, kind, step]) + wire
+
+
+def s3sigv4_seeds():
+    crc = ("x-amz-checksum-crc32", "AAAAAA==")
+    sha = ("x-amz-checksum-sha256", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=")
+    body = bytes(range(32, 127)) * 2
+    return {
+        "get": _s3_header_request("GET", "/bucket/key", ""),
+        "get_query": _s3_header_request("GET", "/bucket", "list-type=2&prefix=a%20b&max-keys=10"),
+        "put_hex_payload": _s3_header_request("PUT", "/bucket/key", "", payload=hashlib.sha256(b"hello").hexdigest(),
+                                              extra=[("Content-MD5", "XUFAKrxLKna5cZ2REBfFkg==")]),
+        "put_unsigned_payload": _s3_header_request("PUT", "/bucket/key", "", payload="UNSIGNED-PAYLOAD"),
+        "put_streaming_signed": _s3_header_request(
+            "PUT", "/bucket/key", "", payload="STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            extra=[("Content-Encoding", "aws-chunked"), ("x-amz-decoded-content-length", "190")]),
+        "put_streaming_trailer": _s3_header_request(
+            "PUT", "/bucket/key", "", payload="STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            extra=[("Content-Encoding", "aws-chunked"), ("x-amz-trailer", "x-amz-checksum-crc32"),
+                   ("x-amz-decoded-content-length", "190")]),
+        "pinned_region": _s3_header_request("GET", "/bucket/key", "", flags=2),
+        "repeated_and_folded_header": _s3_header_request("GET", "/b/k", "", extra=[("x-amz-meta-a", "one   two"),
+                                                                                    ("x-amz-meta-a", " three ")]),
+        "presigned_get": _s3_presigned("GET", "/bucket/key"),
+        "presigned_with_query": _s3_presigned("GET", "/bucket/key", "response-content-type=text%2Fplain"),
+        "presigned_expiry_max": _s3_presigned("GET", "/bucket/key", expires=604800),
+        "eu_region": _s3_header_request("GET", "/bucket/key", "", region="eu-west-1"),
+        "bad_signature": _s3_header_request("GET", "/bucket/key", "", sig="0" * 64),
+        "unknown_key": _s3_header_request("GET", "/bucket/key", "", ak="AKIDOTHER"),
+        "skewed": _s3_header_request("GET", "/bucket/key", "", date="20260929T100000Z"),
+        "expired": _s3_presigned("GET", "/bucket/key", expires=1, date="20260929T110000Z"),
+        "no_auth": _s3_request(0, "GET", "/bucket/key", "", "", [("Host", "storage.local:9000")]),
+        "foreign_scheme": _s3_request(0, "GET", "/", "", "", [("Host", "h"),
+                                                              ("Authorization", "AWS AKIDFUZZ:frJIUN8DYpKDtOLCwo//yllqDzg=")]),
+        "both_auth": _s3_request(0, "GET", "/", "X-Amz-Algorithm=AWS4-HMAC-SHA256", "",
+                                 [("Host", "h"), ("Authorization", "AWS4-HMAC-SHA256 Credential=a/b/c/d/aws4_request")]),
+        "empty": bytes([0]),
+        "stream_signed_three": _s3_stream(0, [body[:70], body[70:140], body[140:]]),
+        "stream_signed_empty": _s3_stream(0, []),
+        "stream_signed_trailer": _s3_stream(1, [body], [crc]),
+        "stream_signed_trailer_two": _s3_stream(1, [body[:50], body[50:]], [crc, sha]),
+        "stream_unsigned_trailer": _s3_stream(2, [body[:100], body[100:]], [crc], step=1),
+        "stream_unsigned_empty": _s3_stream(2, [], [crc]),
+        "stream_bad_chunk_signature": _s3_stream(0, [body], tamper=lambda w: w.replace(b"chunk-signature=", b"chunk-signature=0", 1)),
+        "stream_truncated": _s3_stream(0, [body[:70], body[70:]], tamper=lambda w: w[:len(w) // 2]),
+        "stream_bad_crlf": _s3_stream(0, [body], tamper=lambda w: w.replace(b"\r\n", b"\n\r", 1)),
+        "stream_wide_size": bytes([1, 0, 4]) + b"00000000000000000001;chunk-signature=" + b"0" * 64 + b"\r\n",
+        "stream_extra_after_final": _s3_stream(2, [body], [crc], tamper=lambda w: w + b"GET / HTTP/1.1\r\n\r\n"),
+    }
 
 
 def write_set(root, name, seeds):
@@ -2445,7 +2583,8 @@ def main(argv):
                         ("client", client_seeds()), ("proxy", proxy_seeds()),
                         ("proxytunnel", proxytunnel_seeds()),
                         ("eventloop", eventloop_seeds()),
-                        ("raftmsg", raftmsg_seeds())):
+                        ("raftmsg", raftmsg_seeds()),
+                        ("s3sigv4", s3sigv4_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

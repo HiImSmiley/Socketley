@@ -1273,6 +1273,28 @@ project "fuzz_raft_msg"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: SigV4 request verification and the aws-chunked decoder ───
+--
+-- Reachable by anything that can send an HTTP request to a storage runtime, before the request is otherwise looked at.
+-- One translation unit of the tree and libcrypto.
+
+project "fuzz_s3_sigv4"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+    links { "crypto" }
+
+    files {
+        "test/fuzz/fuzz_s3_sigv4.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/shared/s3_sigv4.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: cache_store as an operation sequence ───
 --
 -- Not a parser target.  It decodes the fuzzer's bytes into a program —
@@ -1716,6 +1738,46 @@ project "test_cluster_state"
         "test/unit/test_cluster_state.cpp",
         "socketley/shared/cluster_state.cpp",
         "socketley/shared/replica_role.cpp"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
+
+-- ─── Test: AWS Signature V4 verification, against the published vectors and boto3's own requests ───
+--
+-- Pure code over libcrypto, so one translation unit of the tree.
+
+project "test_s3_sigv4"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    links { "crypto" }
+
+    files {
+        "test/unit/test_s3_sigv4.cpp",
+        "socketley/shared/s3_sigv4.cpp"
     }
 
     filter "configurations:Debug"

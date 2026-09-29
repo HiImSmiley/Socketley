@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Generates test/unit/s3_sigv4_cases.inc for test_s3_sigv4.cpp.
+
+The generated file is what is committed; running this needs python3 and boto3 1.34, and is only for regenerating it.
+
+    python3 test/unit/gen_s3_sigv4_cases.py [--suite DIR] > test/unit/s3_sigv4_cases.inc
+
+Sources of the cases:
+  suite    the AWS SigV4 test suite as shipped in botocore (tests/unit/auth/aws4_testsuite); DIR is a checkout of that
+           directory, and without --suite it is downloaded from the botocore 1.34.46 tag on GitHub.
+  docs     the "Examples: Signature calculations" of the S3 API reference and the aws-chunked example of the S3
+           streaming page; their signatures are the published constants below, and this script refuses to run if its own
+           independent implementation does not reproduce them.
+  boto3    requests signed by the installed botocore with a frozen clock, captured on their way to the socket.
+  ref      requests and streams signed by the reference implementation in this file, for the aws-chunked variants that
+           no installed client sends (signed chunks with a trailer, signed chunks of odd sizes).
+"""
+import argparse, base64, datetime, hashlib, hmac, io, json, os, sys, types, urllib.parse, urllib.request, zlib
+
+# ---------------------------------------------------------------- reference implementation
+
+def H(b): return hashlib.sha256(b).hexdigest()
+def hm(k, m): return hmac.new(k, m.encode() if isinstance(m, str) else m, hashlib.sha256).digest()
+
+def skey(secret, date, region, service):
+    return hm(hm(hm(hm(('AWS4' + secret).encode(), date), region), service), 'aws4_request')
+
+def enc(s): return urllib.parse.quote(s, safe='-_.~')
+
+def canon_query(q, drop=None):
+    items = []
+    for part in q.split('&') if q else []:
+        if not part: continue
+        n, _, v = part.partition('=')
+        n = urllib.parse.unquote_plus(n); v = urllib.parse.unquote_plus(v)
+        if n == drop: continue
+        items.append((enc(n), enc(v)))
+    items.sort()
+    return '&'.join(f'{n}={v}' for n, v in items)
+
+def canon_path(p): return urllib.parse.quote(urllib.parse.unquote(p), safe='/-_.~') or '/'
+
+def sign(method, path, query, headers, signed, payload_hash, amzdate, region, secret, service='s3', drop=None, verbatim_path=False):
+    ch = ''
+    for n in signed:
+        vals = [' '.join(v.split()) for k, v in headers if k.lower() == n]
+        ch += f"{n}:{','.join(vals)}\n"
+    creq = '\n'.join([method, path if verbatim_path else canon_path(path), canon_query(query, drop), ch, ';'.join(signed), payload_hash])
+    date = amzdate[:8]
+    sts = '\n'.join(['AWS4-HMAC-SHA256', amzdate, f'{date}/{region}/{service}/aws4_request', H(creq.encode())])
+    return hm(skey(secret, date, region, service), sts).hex()
+
+EMPTY = H(b'')
+
+def chunk_sig(key, amzdate, scope, prev, data):
+    return hm(key, '\n'.join(['AWS4-HMAC-SHA256-PAYLOAD', amzdate, scope, prev, EMPTY, H(data)])).hex()
+
+def trailer_sig(key, amzdate, scope, prev, trailer_text):
+    return hm(key, '\n'.join(['AWS4-HMAC-SHA256-TRAILER', amzdate, scope, prev, H(trailer_text.encode())])).hex()
+
+def signed_stream(secret, region, amzdate, seed, pieces, trailers=None):
+    """aws-chunked body: signed chunks, and with `trailers` (list of (name, value)) a signed trailer."""
+    key = skey(secret, amzdate[:8], region, 's3'); scope = f'{amzdate[:8]}/{region}/s3/aws4_request'
+    out = b''; prev = seed
+    for p in pieces + [b'']:
+        prev = chunk_sig(key, amzdate, scope, prev, p)
+        out += f'{len(p):x};chunk-signature={prev}\r\n'.encode() + p + (b'\r\n' if p else b'')
+    if trailers is None:
+        return out + b'\r\n'
+    text = ''.join(f'{n}:{v}\n' for n, v in trailers)
+    ts = trailer_sig(key, amzdate, scope, prev, text)
+    return out + ''.join(f'{n}:{v}\r\n' for n, v in trailers).encode() + f'x-amz-trailer-signature:{ts}\r\n\r\n'.encode()
+
+# ---------------------------------------------------------------- output
+
+cases = []
+
+def cs(b):
+    """C++ string_view literal for bytes, with an explicit length."""
+    if isinstance(b, str): b = b.encode()
+    out = ''
+    for c in b:
+        ch = chr(c)
+        if ch == '\\': out += '\\\\'
+        elif ch == '"': out += '\\"'
+        elif ch == '\n': out += '\\n'
+        elif ch == '\r': out += '\\r'
+        elif 0x20 <= c < 0x7f and ch != '?': out += ch
+        else: out += '\\%03o' % c
+    return f'sv("{out}", {len(b)})'
+
+def add(name, source, access_key, secret, region, service, now, method, path, query, headers, fallback='', body=b'',
+        decoded=None, trailer=None, expect_kind=''):
+    cases.append(dict(name=name, source=source, access_key=access_key, secret=secret, region=region, service=service, now=now,
+                      method=method, path=path, query=query, headers=headers, fallback=fallback, body=body,
+                      decoded=decoded, trailer=trailer, expect_kind=expect_kind))
+
+def emit():
+    print('// Generated by test/unit/gen_s3_sigv4_cases.py; do not edit.')
+    print('// name, source, access key, secret, region, service, now, method, path, query, headers, payload hash fallback,')
+    print('// body (as it arrives after the headers), decoded body (streaming only), trailer name and value, expected payload kind.')
+    for c in cases:
+        hs = ', '.join('{%s, %s}' % (cs(k), cs(v)) for k, v in c['headers'])
+        tr = c['trailer'] or ('', '')
+        print('{%s, %s, %s, %s, %s, %s, %dLL, %s, %s, %s, {%s}, %s, %s, %s, %s, %s},' % (
+            cs(c['name']), cs(c['source']), cs(c['access_key']), cs(c['secret']), cs(c['region']), cs(c['service']), c['now'],
+            cs(c['method']), cs(c['path']), cs(c['query']), hs, cs(c['fallback']), cs(c['body']),
+            cs(c['decoded'] if c['decoded'] is not None else b''), cs(tr[0]) + ', ' + cs(tr[1]), cs(c['expect_kind'])))
+
+# ---------------------------------------------------------------- the AWS test suite
+
+def unix(amz): return int(datetime.datetime.strptime(amz, '%Y%m%dT%H%M%SZ').replace(tzinfo=datetime.timezone.utc).timestamp())
+
+def load_suite(d):
+    if d is None:
+        base = 'https://api.github.com/repos/boto/botocore/contents/tests/unit/auth/aws4_testsuite'
+        ref = '?ref=1.34.46'
+        get = lambda u: urllib.request.urlopen(u, timeout=30).read()
+        files = {}
+        for top in json.loads(get(base + ref)):
+            if top['type'] != 'dir': continue
+            for f in json.loads(get(top['url'])):
+                if f.get('download_url') and f['name'].endswith(('.sreq', '.authz')):
+                    files.setdefault(top['name'], {})[f['name'].rsplit('.', 1)[1]] = get(f['download_url'])
+    else:
+        files = {n: {e: open(f'{d}/{n}/{n}.{e}', 'rb').read() for e in ('sreq', 'authz')} for n in sorted(os.listdir(d)) if os.path.exists(f'{d}/{n}/{n}.sreq')}
+    return files
+
+def suite_cases(files):
+    n_skipped = []
+    for name in sorted(files):
+        raw = files[name]['sreq']
+        authz_text = files[name]['authz'].decode().strip()
+        head, _, body = raw.partition(b'\n\n')
+        lines = head.decode().split('\n')
+        method, target, _ = lines[0].split(' ') if lines[0].count(' ') == 2 else (lines[0].split(' ')[0], lines[0].split(' ', 1)[1].rsplit(' ', 1)[0], '')
+        path, _, query = target.partition('?')
+        hdrs = []
+        for ln in lines[1:]:
+            if ln[:1] in (' ', '\t'):
+                hdrs[-1][1] += '\n' + ln
+                continue
+            k, _, v = ln.partition(':')
+            hdrs.append([k, v])
+        amz = next(v for k, v in hdrs if k.lower() == 'x-amz-date').strip()
+        # get-vanilla-with-session-token carries get-vanilla's signature in its .sreq, so the .authz is the authority
+        for h in hdrs:
+            if h[0].lower() == 'authorization':
+                h[1] = ' ' + authz_text
+        add('suite/' + name, 'aws4_testsuite', 'AKIDEXAMPLE', 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY', 'us-east-1', 'service', unix(amz),
+            method, path, query, [(k, v) for k, v in hdrs], fallback=H(body), body=body)
+    return n_skipped
+
+# ---------------------------------------------------------------- the S3 docs
+
+DOC_AK = 'AKIAIOSFODNN7EXAMPLE'
+DOC_SK = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+DOC_DATE = '20130524T000000Z'
+DOC_T = unix(DOC_DATE)
+
+def authz(ak, date, region, signed, sig, sep=', '):
+    return f'AWS4-HMAC-SHA256 Credential={ak}/{date[:8]}/{region}/s3/aws4_request{sep}SignedHeaders={";".join(signed)}{sep}Signature={sig}'
+
+def docs_cases():
+    e = EMPTY
+    host = 'examplebucket.s3.amazonaws.com'
+    def doc(name, method, path, query, hdrs, signed, published, payload, body=b''):
+        got = sign(method, path, query, hdrs, signed, payload, DOC_DATE, 'us-east-1', DOC_SK)
+        assert got == published, (name, got, published)
+        h = list(hdrs) + [('Authorization', authz(DOC_AK, DOC_DATE, 'us-east-1', signed, published, ','))]
+        add('docs/' + name, 's3 api reference, Examples: Signature Calculations', DOC_AK, DOC_SK, 'us-east-1', 's3', DOC_T, method, path, query, h,
+            body=body)
+    doc('get-object', 'GET', '/test.txt', '', [('Host', host), ('Range', 'bytes=0-9'), ('x-amz-content-sha256', e), ('x-amz-date', DOC_DATE)],
+        ['host', 'range', 'x-amz-content-sha256', 'x-amz-date'], 'f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41', e)
+    body = b'Welcome to Amazon S3.'
+    doc('put-object', 'PUT', '/test$file.text', '', [('Date', 'Fri, 24 May 2013 00:00:00 GMT'), ('Host', host), ('x-amz-date', DOC_DATE),
+        ('x-amz-storage-class', 'REDUCED_REDUNDANCY'), ('x-amz-content-sha256', H(body))],
+        ['date', 'host', 'x-amz-content-sha256', 'x-amz-date', 'x-amz-storage-class'], '98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd', H(body), body)
+    doc('get-bucket-lifecycle', 'GET', '/', 'lifecycle', [('Host', host), ('x-amz-content-sha256', e), ('x-amz-date', DOC_DATE)],
+        ['host', 'x-amz-content-sha256', 'x-amz-date'], 'fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543', e)
+    doc('list-objects', 'GET', '/', 'max-keys=2&prefix=J', [('Host', host), ('x-amz-content-sha256', e), ('x-amz-date', DOC_DATE)],
+        ['host', 'x-amz-content-sha256', 'x-amz-date'], '34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7', e)
+    # presigned GET from the query-string page; the signature is in the query and the request has no other auth
+    q = ('X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request'
+         '&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host')
+    sig = sign('GET', '/test.txt', q, [('Host', host)], ['host'], 'UNSIGNED-PAYLOAD', DOC_DATE, 'us-east-1', DOC_SK, drop='X-Amz-Signature')
+    assert sig == 'aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404'
+    add('docs/presigned-get', 's3 api reference, Authenticating Requests: Using Query Parameters', DOC_AK, DOC_SK, 'us-east-1', 's3', DOC_T + 3600,
+        'GET', '/test.txt', q + '&X-Amz-Signature=' + sig, [('Host', host)], expect_kind='unsigned_payload')
+    # the aws-chunked PUT: 65 KiB of 'a' in chunks of 64 KiB; the body is built by the test from its published chunk signatures
+    sh = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
+    hdrs = [('Host', 's3.amazonaws.com'), ('x-amz-date', DOC_DATE), ('x-amz-storage-class', 'REDUCED_REDUNDANCY'), ('Content-Encoding', 'aws-chunked'),
+            ('x-amz-content-sha256', sh), ('x-amz-decoded-content-length', '66560'), ('Content-Length', '66824')]
+    signed = ['content-encoding', 'content-length', 'host', 'x-amz-content-sha256', 'x-amz-date', 'x-amz-decoded-content-length', 'x-amz-storage-class']
+    seed = sign('PUT', '/examplebucket/chunkObject.txt', '', hdrs, signed, sh, DOC_DATE, 'us-east-1', DOC_SK)
+    assert seed == '4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9'
+    key = skey(DOC_SK, DOC_DATE[:8], 'us-east-1', 's3'); scope = '20130524/us-east-1/s3/aws4_request'
+    s1 = chunk_sig(key, DOC_DATE, scope, seed, b'a' * 65536); s2 = chunk_sig(key, DOC_DATE, scope, s1, b'a' * 1024); s3 = chunk_sig(key, DOC_DATE, scope, s2, b'')
+    assert (s1, s2, s3) == ('ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648', '0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497',
+                            'b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9')
+    add('docs/chunked-put', 's3 api reference, Signature Calculations for the Authorization Header: Transferring Payload in Multiple Chunks',
+        DOC_AK, DOC_SK, 'us-east-1', 's3', DOC_T, 'PUT', '/examplebucket/chunkObject.txt', '',
+        hdrs + [('Authorization', authz(DOC_AK, DOC_DATE, 'us-east-1', signed, seed, ','))], expect_kind='streaming_signed')
+
+# ---------------------------------------------------------------- generated by the reference implementation
+
+REF_AK, REF_SK = 'AKIDSTREAMING', 'ref/secret+key0123456789ABCDEFGHIJKLMNOPQR'
+REF_DATE = '20260929T120000Z'
+
+def ref_streams():
+    def one(name, region, kind, pieces, trailers=None, unsigned_trailer_body=None, extra=()):
+        decoded = b''.join(pieces)
+        hdrs = [('Host', 'storage.local:9000'), ('x-amz-date', REF_DATE), ('Content-Encoding', 'aws-chunked'),
+                ('x-amz-decoded-content-length', str(len(decoded))), ('x-amz-content-sha256', kind)]
+        if trailers:
+            hdrs.append(('x-amz-trailer', ','.join(n for n, _ in trailers)))
+        hdrs += list(extra)
+        signed = sorted(k.lower() for k, _ in hdrs if k.lower() not in ('content-encoding',) or True)
+        seed = sign('PUT', '/bucket/obj', '', hdrs, signed, kind, REF_DATE, region, REF_SK)
+        if kind == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD':
+            body = signed_stream(REF_SK, region, REF_DATE, seed, pieces)
+        elif kind == 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER':
+            body = signed_stream(REF_SK, region, REF_DATE, seed, pieces, trailers)
+        else:
+            body = b''.join(f'{len(p):x}\r\n'.encode() + p + b'\r\n' for p in pieces) + b'0\r\n' + ''.join(f'{n}:{v}\r\n' for n, v in trailers or []).encode() + b'\r\n'
+        kmap = {'STREAMING-AWS4-HMAC-SHA256-PAYLOAD': 'streaming_signed', 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER': 'streaming_signed_trailer',
+                'STREAMING-UNSIGNED-PAYLOAD-TRAILER': 'streaming_unsigned_trailer'}
+        h = hdrs + [('Authorization', authz(REF_AK, REF_DATE, region, signed, seed))]
+        add('ref/' + name, 'gen_s3_sigv4_cases.py reference implementation', REF_AK, REF_SK, region, 's3', unix(REF_DATE), 'PUT', '/bucket/obj', '', h,
+            body=body, decoded=decoded, trailer=(trailers[0] if trailers else None), expect_kind=kmap[kind])
+    S, ST, UT = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD', 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER', 'STREAMING-UNSIGNED-PAYLOAD-TRAILER'
+    text = bytes(range(32, 127)) * 3
+    crc = ('x-amz-checksum-crc32', base64.b64encode(zlib.crc32(text).to_bytes(4, 'big')).decode())
+    sha = ('x-amz-checksum-sha256', base64.b64encode(hashlib.sha256(text).digest()).decode())
+    one('signed-empty', 'us-east-1', S, [])
+    one('signed-one-chunk', 'us-east-1', S, [b'hello world'])
+    one('signed-three-chunks', 'eu-west-1', S, [text[:100], text[100:200], text[200:]])
+    one('signed-one-byte-chunks', 'us-east-1', S, [b'a', b'b', b'c'])
+    one('signed-binary', 'us-east-1', S, [bytes(range(256)), b'\r\n\r\n0\r\n'])
+    one('signed-trailer-crc32', 'us-east-1', ST, [text[:150], text[150:]], [crc])
+    one('signed-trailer-two-lines', 'us-west-2', ST, [text], [crc, sha])
+    one('signed-trailer-empty-body', 'us-east-1', ST, [], [crc])
+    one('unsigned-trailer-crc32', 'us-east-1', UT, [text[:150], text[150:]], [crc])
+    one('unsigned-trailer-sha256', 'us-east-1', UT, [text], [sha])
+    one('unsigned-trailer-empty', 'us-east-1', UT, [], [('x-amz-checksum-crc32', 'AAAAAA==')])
+
+def ref_paths():
+    def one(name, path, query, verbatim=False):
+        hdrs = [('Host', 'storage.local:9000'), ('x-amz-date', REF_DATE), ('x-amz-content-sha256', EMPTY)]
+        signed = ['host', 'x-amz-content-sha256', 'x-amz-date']
+        sig = sign('GET', path, query, hdrs, signed, EMPTY, REF_DATE, 'us-east-1', REF_SK, verbatim_path=verbatim)
+        add('ref/' + name, 'gen_s3_sigv4_cases.py reference implementation', REF_AK, REF_SK, 'us-east-1', 's3', unix(REF_DATE), 'GET', path, query,
+            hdrs + [('Authorization', authz(REF_AK, REF_DATE, 'us-east-1', signed, sig))])
+    one('path-signed-as-sent-lowercase-hex', '/bkt/caf%c3%a9', '', True)
+    one('path-signed-as-sent-encoded-slash', '/bkt/a%2Fb', '', True)
+    one('path-canonical-lowercase-hex', '/bkt/caf%c3%a9', '')
+    one('path-literal-plus-and-sub-delims', '/bkt/a+b!c(d)*e', '')
+    one('path-empty-segments-kept', '/bkt//a///b/', '')
+    one('path-dot-segments-kept', '/bkt/a/./b/../c', '')
+    one('path-tidied-would-not-verify', '/bkt//a$b/./../c', '')
+    one('query-plus-is-space', '/bkt', 'prefix=a+b&x=%7e&my+key=1')
+    one('query-no-equals-and-duplicates', '/bkt', 'uploads&b=2&a=1&a=0&&c=')
+    one('query-equal-names-sort-by-value', '/bkt', 'k=b&k=a&k=B&K=a')
+    # a signed header that is present and empty is signed as "name:", and one that is absent is not the same request
+    hdrs = [('Host', 'storage.local:9000'), ('x-amz-date', REF_DATE), ('x-amz-content-sha256', EMPTY), ('x-amz-meta-empty', '')]
+    signed = ['host', 'x-amz-content-sha256', 'x-amz-date', 'x-amz-meta-empty']
+    sig = sign('GET', '/bkt/k', '', hdrs, signed, EMPTY, REF_DATE, 'us-east-1', REF_SK)
+    add('ref/header-signed-empty-value', 'gen_s3_sigv4_cases.py reference implementation', REF_AK, REF_SK, 'us-east-1', 's3', unix(REF_DATE), 'GET', '/bkt/k', '',
+        hdrs + [('Authorization', authz(REF_AK, REF_DATE, 'us-east-1', signed, sig))])
+
+# ---------------------------------------------------------------- boto3 / botocore
+
+def boto3_cases():
+    import boto3, botocore.auth, botocore, botocore.exceptions
+    from botocore.config import Config
+    from botocore.awsrequest import AWSResponse
+
+    NOW = datetime.datetime(2026, 9, 29, 12, 0, 0)
+
+    class FakeDT(datetime.datetime):
+        @classmethod
+        def utcnow(cls): return NOW
+
+    botocore.auth.datetime = types.SimpleNamespace(datetime=FakeDT, timedelta=datetime.timedelta, timezone=datetime.timezone,
+                                                   date=datetime.date, time=datetime.time)
+    T = int((NOW - datetime.datetime(1970, 1, 1)).total_seconds())
+    AK, SK = 'AKIABOTO3EXAMPLE', 'boto3/secret+key0123456789ABCDEFGHIJKLMNOPQR'
+
+    def client(scheme, host, region='us-east-1', token=None, addressing='path', **s3):
+        c = boto3.client('s3', endpoint_url=f'{scheme}://{host}', aws_access_key_id=AK, aws_secret_access_key=SK, aws_session_token=token,
+                         region_name=region, config=Config(signature_version='s3v4', s3={'addressing_style': addressing, **s3}, retries={'max_attempts': 0}))
+        return c
+
+    def capture(label, c, fn, region):
+        got = []
+        def hook(request, **kw):
+            u = urllib.parse.urlsplit(request.url)
+            hdrs = [(k, v.decode() if isinstance(v, bytes) else v) for k, v in request.headers.items()]
+            # the unsigned headers that differ per run and per machine are pinned, so the output is reproducible
+            fixed = {'amz-sdk-invocation-id': '00000000-0000-4000-8000-000000000000', 'user-agent': 'Boto3/1.34.46 Botocore/1.34.46'}
+            hdrs = [(k, fixed.get(k.lower(), v)) for k, v in hdrs]
+            hdrs.append(('Host', u.netloc))
+            body = request.body
+            if hasattr(body, 'read'): body = body.read()
+            got.append((request.method, u.path, u.query, hdrs, body or b''))
+            r = AWSResponse(request.url, 200, {}, None); r._content = b''
+            return r
+        c.meta.events.register('before-send.s3', hook)
+        try:
+            fn(c)
+        except botocore.exceptions.ClientError:
+            pass
+        c.meta.events.unregister('before-send.s3', hook)
+        method, path, query, hdrs, body = got[-1]
+        kind = ''
+        for k, v in hdrs:
+            if k.lower() == 'x-amz-content-sha256':
+                kind = {'UNSIGNED-PAYLOAD': 'unsigned_payload', 'STREAMING-UNSIGNED-PAYLOAD-TRAILER': 'streaming_unsigned_trailer'}.get(v, 'hex')
+        decoded = None; trailer = None
+        if kind == 'streaming_unsigned_trailer':
+            dl = int(next(v for k, v in hdrs if k.lower() == 'x-amz-decoded-content-length'))
+            # the decoded payload and the trailer are read back out of the captured aws-chunked body, so the case states them
+            rest = body; decoded = b''
+            while True:
+                size, _, rest = rest.partition(b'\r\n')
+                n = int(size, 16)
+                if n == 0: break
+                decoded += rest[:n]; rest = rest[n + 2:]
+            assert len(decoded) == dl
+            tline = rest.split(b'\r\n')[0].decode()
+            trailer = tuple(tline.split(':', 1))
+        add('boto3/' + label, 'botocore ' + botocore.__version__ + ' S3SigV4Auth', AK, SK, region, 's3', T, method, path, query, hdrs,
+            body=body, decoded=decoded, trailer=trailer, expect_kind=kind)
+
+    def presign(label, c, op, region, headers=(), **params):
+        url = c.generate_presigned_url(op, Params=params, ExpiresIn=3600)
+        u = urllib.parse.urlsplit(url)
+        method = 'PUT' if op == 'put_object' else 'GET'
+        add('boto3/presigned-' + label, 'botocore ' + botocore.__version__ + ' S3SigV4QueryAuth', AK, SK, region, 's3', T + 60, method, u.path, u.query,
+            [('Host', u.netloc)] + list(headers), expect_kind='unsigned_payload')
+
+    body = b'hello world'
+    http = client('http', 'localhost:9000')
+    https = client('https', 'storage.example.com')
+    capture('put-http-hex-payload', http, lambda c: c.put_object(Bucket='bkt', Key='dir/obj.txt', Body=body), 'us-east-1')
+    capture('put-https-unsigned', https, lambda c: c.put_object(Bucket='bkt', Key='dir/obj.txt', Body=body), 'us-east-1')
+    capture('put-https-payload-signing', client('https', 'storage.example.com', payload_signing_enabled=True),
+            lambda c: c.put_object(Bucket='bkt', Key='dir/obj.txt', Body=body), 'us-east-1')
+    capture('put-https-crc32-trailer', https, lambda c: c.put_object(Bucket='bkt', Key='dir/obj.txt', Body=body * 40, ChecksumAlgorithm='CRC32'), 'us-east-1')
+    capture('put-https-sha256-trailer', https, lambda c: c.put_object(Bucket='bkt', Key='k', Body=body, ChecksumAlgorithm='SHA256'), 'us-east-1')
+    capture('put-https-empty-crc32-trailer', https, lambda c: c.put_object(Bucket='bkt', Key='empty', Body=b'', ChecksumAlgorithm='CRC32'), 'us-east-1')
+    capture('put-http-crc32', http, lambda c: c.put_object(Bucket='bkt', Key='k', Body=body, ChecksumAlgorithm='CRC32'), 'us-east-1')
+    capture('put-metadata', http, lambda c: c.put_object(Bucket='bkt', Key='meta', Body=body, ContentType='text/plain; charset=utf-8',
+            Metadata={'author': 'me  and  you', 'k2': 'v 2'}, CacheControl='max-age=3600', StorageClass='STANDARD_IA'), 'us-east-1')
+    capture('get-special-key', http, lambda c: c.get_object(Bucket='bkt', Key="a b/c+d/üñi/!*'()$&,:;=@~.txt"), 'us-east-1')
+    capture('get-slashes-and-dots', http, lambda c: c.get_object(Bucket='bkt', Key='a//b/../c/./d/'), 'us-east-1')
+    capture('get-range-version', http, lambda c: c.get_object(Bucket='bkt', Key='k', Range='bytes=0-99', VersionId='v+/=1'), 'us-east-1')
+    capture('get-response-overrides', http, lambda c: c.get_object(Bucket='bkt', Key='k', ResponseContentDisposition='attachment; filename="a b.txt"',
+            ResponseContentType='text/plain'), 'us-east-1')
+    capture('head-object', http, lambda c: c.head_object(Bucket='bkt', Key='k'), 'us-east-1')
+    capture('list-v2-all-params', http, lambda c: c.list_objects_v2(Bucket='bkt', Prefix='dir/sub dir/', Delimiter='/', MaxKeys=50,
+            ContinuationToken='1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=', StartAfter='dir/a+b', EncodingType='url', FetchOwner=True), 'us-east-1')
+    capture('list-v2-plain', http, lambda c: c.list_objects_v2(Bucket='bkt'), 'us-east-1')
+    capture('list-v1-marker', http, lambda c: c.list_objects(Bucket='bkt', Marker='m k', Prefix='p'), 'us-east-1')
+    capture('list-buckets', http, lambda c: c.list_buckets(), 'us-east-1')
+    capture('head-bucket', http, lambda c: c.head_bucket(Bucket='bkt'), 'us-east-1')
+    capture('create-bucket-eu', client('http', 'localhost:9000', region='eu-west-1'),
+            lambda c: c.create_bucket(Bucket='bkt', CreateBucketConfiguration={'LocationConstraint': 'eu-west-1'}), 'eu-west-1')
+    capture('delete-object', http, lambda c: c.delete_object(Bucket='bkt', Key='k'), 'us-east-1')
+    capture('delete-objects', http, lambda c: c.delete_objects(Bucket='bkt', Delete={'Objects': [{'Key': 'a'}, {'Key': 'b c'}], 'Quiet': True}), 'us-east-1')
+    capture('create-multipart', http, lambda c: c.create_multipart_upload(Bucket='bkt', Key='big'), 'us-east-1')
+    capture('upload-part', http, lambda c: c.upload_part(Bucket='bkt', Key='big', PartNumber=3, UploadId='abc+def/==', Body=body), 'us-east-1')
+    capture('complete-multipart', http, lambda c: c.complete_multipart_upload(Bucket='bkt', Key='big', UploadId='u1',
+            MultipartUpload={'Parts': [{'ETag': '"e1"', 'PartNumber': 1}, {'ETag': '"e2"', 'PartNumber': 2}]}), 'us-east-1')
+    capture('abort-multipart', http, lambda c: c.abort_multipart_upload(Bucket='bkt', Key='big', UploadId='u1'), 'us-east-1')
+    capture('list-multipart-uploads', http, lambda c: c.list_multipart_uploads(Bucket='bkt', Prefix='p'), 'us-east-1')
+    capture('copy-object', http, lambda c: c.copy_object(Bucket='dst', Key='new key', CopySource={'Bucket': 'src', 'Key': 'old key/ü+x'},
+            MetadataDirective='REPLACE', Metadata={'a': 'b'}), 'us-east-1')
+    capture('get-bucket-location', http, lambda c: c.get_bucket_location(Bucket='bkt'), 'us-east-1')
+    capture('session-token-eu-central', client('http', 'localhost:9000', region='eu-central-1', token='FQoGZXIvYXdzE+token/with+chars=='),
+            lambda c: c.get_object(Bucket='bkt', Key='k'), 'eu-central-1')
+    capture('virtual-host-style', client('http', 'storage.example.com:9000', addressing='virtual'), lambda c: c.get_object(Bucket='bkt', Key='a b'), 'us-east-1')
+    capture('default-port-host', client('http', 'storage.example.com'), lambda c: c.get_object(Bucket='bkt', Key='k'), 'us-east-1')
+    capture('ipv4-host', client('http', '127.0.0.1:9000'), lambda c: c.head_object(Bucket='bkt', Key='k'), 'us-east-1')
+    presign('get', client('https', 'storage.example.com'), 'get_object', 'us-east-1', Bucket='bkt', Key='a b/c+d.txt')
+    presign('get-response-overrides', client('http', 'localhost:9000'), 'get_object', 'us-east-1', Bucket='bkt', Key='k',
+            ResponseContentDisposition='attachment; filename="x y.txt"', VersionId='v1')
+    presign('put-content-type', client('http', 'localhost:9000'), 'put_object', 'us-east-1', headers=[('Content-Type', 'image/png')], Bucket='bkt', Key='up/load', ContentType='image/png')
+    presign('get-session-token', client('http', 'localhost:9000', region='eu-west-1', token='tok/en+1=='), 'get_object', 'eu-west-1', Bucket='bkt', Key='k')
+
+# ---------------------------------------------------------------- main
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--suite')
+    a = ap.parse_args()
+    suite_cases({k: v for k, v in load_suite(a.suite).items()})
+    docs_cases()
+    ref_streams()
+    ref_paths()
+    boto3_cases()
+    emit()
