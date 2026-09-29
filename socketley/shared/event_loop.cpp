@@ -1254,8 +1254,13 @@ void event_loop::run()
 
         if (io_uring_peek_cqe(&m_ring, &cqe) != 0)
         {
-            // Ring is empty: block until at least one CQE arrives
-            if (io_uring_wait_cqe(&m_ring, &cqe) < 0)
+            // Ring is empty: block until at least one CQE arrives.  Any signal
+            // ends the wait with -EINTR, and one that is not a stop request of
+            // ours -- a ptrace attach, a SIGSTOP -- must not end the daemon.
+            const int rc = io_uring_wait_cqe(&m_ring, &cqe);
+            if (rc == -EINTR)
+                continue;
+            if (rc < 0)
                 break;
         }
 
