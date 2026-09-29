@@ -110,6 +110,16 @@ check '[ "$(HOME=$T/a/home SOCKETLEY_SOCKET=$(sock a) "$BIN" cluster raft-status
       "raft-status did not exit 0 on a healthy cluster"
 check 'status a | grep -q "cleartext (--raft-insecure)"' "status does not say the transport is cleartext"
 
+# ─── two nodes cannot share a name, because {node} would name both alike ────
+# The label is what is compared and test_cluster_state covers that; this is a name that is simply taken.
+node_start dup --raft-listen 127.0.0.1:$((PB+7)) --raft-join 127.0.0.1:$PB --raft-insecure --raft-name b
+refused() { [ "$(role dup)" = stopped ] && status dup | grep -q "^error: .*already node .* at 127.0.0.1:$((PB+1))"; }
+check 'wait_for 15 refused' "a node joining under the name of an existing member was not refused with a message naming it"
+check 'grep -q "already node .* at 127.0.0.1:$((PB+1))" "$T/dup.log"' "the refusal is not in the joiner's log"
+check 'grep -q "refused .* (b): --raft-name b is already node" "$T/a.log"' "the leader did not log the refusal"
+check '[ "$(voters a)" = 3 ]' "the refused node changed the membership"
+kill -9 "$(cat "$T/dup.pid")" 2>/dev/null || true; daemon_sweep "$(sock dup)"
+
 # ─── kill -9 the leader: a new one within the bound ────────────────────────
 old_id=$(myid "$L")
 old_term=$(field "$L" term)

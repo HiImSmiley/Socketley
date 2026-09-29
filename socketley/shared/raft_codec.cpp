@@ -98,6 +98,13 @@ std::string encode(kind k, const lease& l)
     return w.take();
 }
 
+std::string encode(const refusal& r)
+{
+    writer w(kind::refuse);
+    w.bytes(r.why.substr(0, max_label));
+    return w.take();
+}
+
 bool decode(std::string_view payload, frame& out, std::string* why)
 {
     reader r(payload);
@@ -140,6 +147,12 @@ bool decode(std::string_view payload, frame& out, std::string* why)
         out.kind = static_cast<kind>(k);
         if (!r.u64(out.lease.nonce) || !r.u64(out.lease.index))
             return fail(why, "malformed lease");
+        break;
+
+    case static_cast<uint8_t>(kind::refuse):
+        out.kind = kind::refuse;
+        if (!r.bytes(out.no.why, max_label) || out.no.why.empty())
+            return fail(why, "malformed refusal");
         break;
 
     case static_cast<uint8_t>(kind::message):

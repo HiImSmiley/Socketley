@@ -26,15 +26,6 @@ bool control_free(std::string_view s)
     return true;
 }
 
-// The characters a command line carries unquoted, so a node name with a space in it cannot split one argument in two.
-std::string label(std::string_view name)
-{
-    std::string out;
-    for (unsigned char c : name)
-        out += (std::isalnum(c) || c == '-' || c == '_' || c == '.') ? static_cast<char>(c) : '_';
-    return out;
-}
-
 void put_args(bytes::writer& w, const std::vector<std::string>& args)
 {
     w.u32(static_cast<uint32_t>(args.size()));
@@ -56,6 +47,24 @@ bool get_args(bytes::reader& r, std::vector<std::string>& args)
 }
 
 }   // namespace
+
+// The characters a command line carries unquoted, so a node name with a space in it cannot split one argument in two.
+std::string node_label(std::string_view name)
+{
+    std::string out;
+    for (unsigned char c : name)
+        out += (std::isalnum(c) || c == '-' || c == '_' || c == '.') ? static_cast<char>(c) : '_';
+    return out;
+}
+
+node_id label_holder(const std::map<node_id, std::string>& names, node_id id, std::string_view name)
+{
+    const std::string label = node_label(name);
+    for (const auto& [other, theirs] : names)
+        if (other != id && node_label(theirs) == label)
+            return other;
+    return 0;
+}
 
 // ─── commands ───
 
@@ -230,7 +239,7 @@ bool unquote_arg(std::string_view word, std::string& out)
 std::string expand_args(std::string_view args, std::string_view node_name)
 {
     static constexpr std::string_view token = "{node}";
-    const std::string who = label(node_name);
+    const std::string who = node_label(node_name);
     std::string out;
     size_t pos = 0;
     for (;;)

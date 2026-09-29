@@ -131,6 +131,8 @@ private:
     void try_join();
     void promote_learners();
     void ensure_own_record();
+    // Why `name` cannot be given to node `id`, empty when no other member's {node} label is the same.
+    std::string name_conflict(socketley::raft::node_id id, const std::string& name) const;
 
     void retire(link* l);
     void reap();

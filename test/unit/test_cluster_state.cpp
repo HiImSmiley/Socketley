@@ -229,6 +229,19 @@ TEST_CASE("{node} becomes the executing node's name, made safe for a command lin
     CHECK(cl::expand_args("x{node}", "a;b\n") == "xa_b_");
 }
 
+TEST_CASE("two nodes whose names make one {node} label are one name")
+{
+    const std::map<cl::node_id, std::string> names = {{1, "a"}, {2, "b c"}, {3, "d"}};
+    // The same name held by another node, and one that only becomes it once made safe for a command line.
+    CHECK(cl::label_holder(names, 9, "a") == 1);
+    CHECK(cl::label_holder(names, 9, "b_c") == 2);
+    CHECK(cl::label_holder(names, 9, "b?c") == 2);
+    // A node is not its own duplicate, so a restart under the same name is fine, and a name nobody holds is free.
+    CHECK(cl::label_holder(names, 2, "b c") == 0);
+    CHECK(cl::label_holder(names, 9, "b-c") == 0);
+    CHECK(cl::label_holder({}, 9, "a") == 0);
+}
+
 // ─── the state machine ───
 
 TEST_CASE("apply: create, scale, assign and remove")

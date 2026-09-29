@@ -2264,6 +2264,10 @@ def raft_command(data):
     return struct.pack("<BB", 1, 4) + rw_bytes(data)
 
 
+def raft_refuse(why):
+    return struct.pack("<BB", 1, 7) + rw_bytes(why)
+
+
 # socketley/shared/cluster_state.cpp: 'C', op, then the fields of that op.
 def rw_args(args):
     return struct.pack("<I", len(args)) + b"".join(rw_bytes(a) for a in args)
@@ -2341,6 +2345,8 @@ def raftmsg_seeds():
     s["lease_req"] = b"\x00" + raft_lease(False, 7)
     s["lease_grant"] = b"\x00" + raft_lease(True, 7, 4242)
     s["lease_torn"] = b"\x00" + raft_lease(True, 7, 4242)[:-3]
+    s["refuse"] = b"\x00" + raft_refuse(b"--raft-name b is already node 1122334455667788 at 127.0.0.1:19001")
+    s["refuse_empty"] = b"\x00" + raft_refuse(b"")
     s["cluster_cache_type"] = b"\x80" + cl_create(b"db", b"cache", [], 1)
     s["cluster_test_flag"] = b"\x80" + cl_create(b"api", b"server", [b"--test"], 1)
     s["cluster_zero_replicas"] = b"\x80" + cl_create(b"api", b"server", [], 0)

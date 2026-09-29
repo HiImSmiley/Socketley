@@ -1046,6 +1046,13 @@ bool raft_host::on_frame(link& l, std::string_view payload)
         return true;
     }
 
+    case wire::kind::refuse:
+        // Only a node still waiting to be admitted takes it to heart, and a member never stops on another's word.
+        if (m_cfg.join.empty() || m_node->is_member(m_id) || l.peer == m_id)
+            return false;
+        fail_stop(f.no.why);
+        return false;
+
     case wire::kind::hello:
         return false;
     }
@@ -1109,6 +1116,14 @@ void raft_host::handle_join(const std::string& payload, raft::node_id id, const 
         if (leader != raft::no_node && leader != m_id)
             if (link* l = outbound(leader))
                 enqueue(l, payload);
+        return;
+    }
+
+    if (const std::string why = name_conflict(id, name); !why.empty())
+    {
+        warn("refused " + hex_id(id) + " (" + name + "): " + why);
+        if (link* l = outbound(id))
+            enqueue(l, wire::encode(wire::refusal{why}));
         return;
     }
 
@@ -1191,11 +1206,27 @@ void raft_host::promote_learners()
     }
 }
 
+std::string raft_host::name_conflict(raft::node_id id, const std::string& name) const
+{
+    std::map<raft::node_id, std::string> names;
+    for (const auto& [other, mb] : m_book)
+        names[other] = mb.name;
+    const raft::node_id other = socketley::cluster::label_holder(names, id, name);
+    if (other == 0)
+        return {};
+    const member& mb = m_book.at(other);
+    return "--raft-name " + name + (mb.name == name ? "" : " (as {node}, like " + mb.name + ")") + " is already node "
+         + hex_id(other) + " at " + mb.addr + ", and {node} in a cluster runtime's flags would name both alike: give this node "
+           "another --raft-name";
+}
+
 void raft_host::ensure_own_record()
 {
     auto it = m_book.find(m_id);
     if (it != m_book.end() && it->second.name == m_cfg.name && it->second.addr == m_cfg.advertise)
         return;
+    if (const std::string why = name_conflict(m_id, m_cfg.name); !why.empty())
+        return fail_stop(why);
     const member me{m_cfg.name, m_cfg.advertise, true};
     if (m_node->propose(encode_record(m_id, me)).status == raft::propose_status::ok)
     {

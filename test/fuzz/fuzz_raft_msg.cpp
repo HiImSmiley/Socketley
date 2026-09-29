@@ -94,6 +94,14 @@ void one_payload(std::string_view p)
                    "a lease frame did not survive a round trip");
         break;
     }
+    case wire::kind::refuse:
+    {
+        again = wire::encode(f.no);
+        wire::frame g;
+        FUZZ_CHECK(wire::decode(again, g) && g.kind == wire::kind::refuse && g.no == f.no,
+                   "a refusal did not survive a round trip");
+        break;
+    }
     case wire::kind::command:
     {
         again = wire::encode(f.cmd);

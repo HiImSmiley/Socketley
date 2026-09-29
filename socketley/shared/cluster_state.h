@@ -56,7 +56,11 @@ std::string refusal(const command& c);
 // The types that may run as a cluster runtime, and the reason for one that may not.
 std::string type_refusal(std::string_view type);
 
-// The argument with "{node}" replaced by a label made of letters, digits, '-', '_' and '.'.
+// What "{node}" stands for: the node's name with everything but letters, digits, '-', '_' and '.' turned into '_', so two names can share one label.
+std::string node_label(std::string_view name);
+// The member other than `id` whose label is the same as `name`'s, or zero: two of them would expand {node} to one string.
+node_id label_holder(const std::map<node_id, std::string>& names, node_id id, std::string_view name);
+// The argument with "{node}" replaced by the node's label.
 std::string expand_args(std::string_view arg, std::string_view node_name);
 std::vector<std::string> expand_args(const std::vector<std::string>& args, std::string_view node_name);
 
