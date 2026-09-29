@@ -97,7 +97,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   header when the supervisor restarts it, and a restarted shard removes only its
   own temporary files. A directory started with another `--shards` is rebuilt
   from the object headers rather than refused. `--max-bytes` becomes an equal
-  share per shard.
+  share per shard. A multipart upload lives on the shard that owns its key:
+  parts are written where the connection landed and only their names cross,
+  CompleteMultipartUpload is validated and sealed by the owner, assembled by the
+  shard the request landed on and committed through the owner of the key, and
+  ListMultipartUploads merges every shard's; TLS, credentials (and the credentials
+  file), scripts and `socketley.storage` calls work on every shard, and the
+  metrics series add the shards up. A completed upload now fires `on_put` once
+  (its parts do not), and `on_request` names the multipart operations.
 
 - **Cluster runtimes: on a daemon in Raft mode the cluster heals itself.**
   `socketley cluster create server api -p 8080 --replicas 2` declares a

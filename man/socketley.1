@@ -6129,7 +6129,9 @@ and the common flags apply as documented under
 .BI \-\-dir " path"
 Where the buckets live. Required, created if it does not exist, and made
 absolute against the caller's directory. A runtime is one process on one
-directory: two runtimes on one path would append to each other's journals.
+directory, or with
+.B \-\-shards
+several that share it: two runtimes on one path would append to each other's journals.
 .TP
 .BI \-\-access\-key " key"
 .TQ
@@ -6441,7 +6443,7 @@ An object is one file at
 whose first bytes are a checksummed header carrying the key, size, ETag, content
 type, user metadata and time, so the file says what it is and any byte sequence is
 a valid key. Each bucket also keeps an append\-only journal of puts and deletes
-(\fBindex.0\fR, CRC32C\-framed, rewritten when garbage passes the live objects),
+(\fBindex.0\fR, or \fBindex.\fIshard\fR for a sharded runtime; CRC32C\-framed, rewritten when garbage passes the live objects),
 from which listings are answered out of memory.
 .PP
 A put writes a temporary file, syncs it, renames it into place, syncs the
@@ -6517,10 +6519,32 @@ section per shard with
 .BR shard_deletes_served ,
 .BR shard_list_fanouts ,
 .BR shard_list_pages_served ,
-.B shard_bucket_ops
-and
+.BR shard_bucket_ops ,
+.BR shard_mpu_sent ,
+.B shard_mpu_served
+(multipart steps) and
 .BR shard_peer_failures ;
 at one shard nothing is sent and they read zero.
+.PP
+A multipart upload lives on the shard that owns its key, so every step that names
+it (create, part, complete, abort, ListParts) is that shard's, and ListMultipartUploads
+asks every shard. A part's body is written where the connection landed and only its
+name crosses to the shard that keeps the upload; CompleteMultipartUpload has that shard
+check the list and seal the upload, the shard the request landed on assemble the object
+from the parts on the shared disk and commit it through the owner of the key, and the
+owner remove the upload, so nothing long is asked of a sibling over the link. An
+upload whose assembler never reports is opened again after six hours, uploads are
+found again by the shard that owns their key after a restart with another
+.BR \-\-shards ,
+and a bucket with an open upload on any shard is not dropped. TLS, credentials, the
+credentials file, scripts and the metrics are each shard's own or their sum: every shard
+terminates TLS and re\-reads the credentials file, a script's hooks run on the shard
+that took the request, a script's
+.B socketley.storage
+call is answered by whichever shard the daemon relays it to and reaches the rest as any
+request does, and the
+.B socketley_storage_
+series add the shards together (a bucket every shard holds is counted once).
 .PP
 .B stats
 reports
@@ -6600,7 +6624,9 @@ answered before its body is read and its connection closed.
 has
 .BR method ,
 .B operation
-(the name S3 gives it: GetObject, PutObject, DeleteObjects, ListObjectsV2, .\|.\|.),
+(the name S3 gives it: GetObject, PutObject, DeleteObjects, ListObjectsV2, CreateMultipartUpload,
+UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts,
+ListMultipartUploads, .\|.\|.),
 .BR bucket ,
 .BR key ,
 .B path
@@ -6629,7 +6655,8 @@ names all three. A raise, and a value of any other type, are refusals answered
 is not a hook.
 .TP
 .B on_put(bucket, key, meta)
-Called after an object is committed, for a put, for the destination of a copy
+Called after an object is committed, for a put, for the destination of a copy,
+for a completed multipart upload (once, when it is completed, and never for its parts)
 and for an object a script put with
 .BR socketley.storage.put ,
 and never for one that was refused.
