@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   leader's after 5.1-6.0 s (an election first). Also `cluster scale <name> <n>`,
   `cluster remove <name>` and `cluster placement`, which shows the runtimes,
   where each is placed and what is unplaced, the leader's view of every node,
-  and this node's replicas. A server, a proxy or a client; a cache is refused
-  because nothing promotes a follower yet. `{node}` in the flags is the name of
+  and this node's replicas. A server, a proxy, a client or a cache (below).
+  `{node}` in the flags is the name of
   the node running the replica, which is how several nodes share one host
   (`--listen unix:/run/api-{node}.sock`). Replicas are marked `[cluster]` in
   `ls` and `ps` (`"cluster":true` in `--json`, `cluster:replica` in `stats`),
@@ -40,12 +40,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that had lapsed is taken up again only after the node has applied the leader's
   log as it stood at the grant. Losing the quorum stops every cluster replica
   on every node until there is one again. A hung daemon (not a dead one) cannot
-  stop its workers, and a leader change longer than the lease restarts the
+  stop the workers of a server, a proxy or a client (a cache's fences itself),
+  and a leader change longer than the lease restarts the
   survivors' replicas; both are in the manual, with what is not built yet.
   Tested in a simulation of the real Raft core and the real placement logic
   (300 seeds of loss, delay, one-way cuts, splits, kills and reboots in the
   suite, 6000 run once) that checks after every tick that no runtime runs on
   more nodes than it has replicas, and with three real daemons and `kill -9`.
+- **A cluster cache survives the loss of its primary's node.**
+  `socketley cluster create cache db -p 6379 --replicas 3` gives one primary
+  and followers on distinct nodes, replicating with the cache's own
+  `--replicate` (a full dump, then every write). When the primary's node dies
+  the leader promotes the follower whose copy is the most up to date and writes
+  it to the log with the next epoch: measured with `kill -9` and real daemons, a
+  survivor took its first write 3.9-4.1 s after a node that was not the Raft
+  leader died (11 kills) and 5.2-5.7 s after the leader's (4 kills). A proxy
+  with `--backend @db` follows the primary (the cache's name is published as a
+  group of one), and `cluster placement` names it, with the epoch and offset of
+  every copy. What a replica may do is decided twice: the log must name the very
+  process it runs (an incarnation, so a restarted primary comes back empty and
+  does not lead) AND its node must hold a lease, and the worker enforces the
+  lease itself: it takes the daemon's order every 100 ms, standing for the lease
+  the daemon had left, so a daemon that hangs or dies leaves a primary that
+  refuses every command within its lease (measured 2.7-3.1 s with a daemon
+  stopped by SIGSTOP, 2.8-3.2 s for a primary that lost its quorum, both in nine
+  runs). A fence keeps the data, so a primary that lost its quorum for a minute
+  is the primary again with everything it held. The old primary that comes back
+  follows the new one and takes a full dump. Replication stays asynchronous, and
+  the manual says what that loses, measured: with a client writing and `kill -9`
+  of the node, none of about 4,800 writes a few seconds apart, none of about
+  700,000 pipelined at 230,000 a second, and 871,000-911,000 of about 1.6
+  million when both followers had stopped receiving four seconds before; what
+  survives is always a prefix of the primary's history. Promotion compares copies
+  by epoch and then a count of the records the primary produced, which rides on
+  every lease request. A cache with `--tls`, `--listen`, `--shards` or
+  `--replicate` is refused as a cluster runtime. Tested in the cluster
+  simulation (real Raft core, real brain, the real replica state machine, a
+  hung daemon, cuts and reboots; no cache is ever led by two replicas at any
+  tick) and with three real daemons.
+- **Two nodes cannot share a `--raft-name`.** `{node}` would name both alike, so
+  the leader refuses a join whose name (or whose name once made safe for a
+  command line) is a member's, and the joiner stops with the reason in its log
+  and in `cluster raft-status`.
 - **Streams in the cache**, wire-compatible with Redis 7.0: XADD (NOMKSTREAM,
   MAXLEN/MINID with `=` and `~`, LIMIT, `*`, `ms-*` and explicit ids), XLEN,
   XRANGE, XREVRANGE, XREAD with BLOCK, XDEL, XTRIM, XSETID, XGROUP (CREATE with

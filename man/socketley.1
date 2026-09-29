@@ -9555,9 +9555,12 @@ cluster runtime, behave exactly as without it. The cluster elects a leader,
 replicates a log to disk and keeps membership, and the state machine behind the
 log holds the cluster's runtimes (see
 .B Cluster runtimes
-below): a stateless runtime is declared once, placed on distinct nodes by the
-leader, and started on a survivor when its node dies. Cache placement and
-promoting a follower to primary do not go through it yet.
+below): a runtime is declared once, placed on distinct nodes by the leader, and
+started on a survivor when its node dies; a cache is replicated, and when the
+node that holds its primary dies the leader promotes the follower that holds
+the most (see
+.B Cluster caches
+below).
 .PP
 .B Flags
 (on the command line that starts the daemon, like
@@ -9580,6 +9583,16 @@ is a wildcard.
 .BI \-\-raft\-name " name"
 This node's name in the membership, and the name its certificate must carry
 (as a DNS subjectAltName or common name). Defaults to the advertised address.
+A name is one node's: a node that joins under the name of a member, or under one
+that reads the same once
+.B {node}
+has made it safe for a command line (see
+.BR "Cluster runtimes" ),
+is refused by the leader with the reason, and stops with that reason in its log
+and in
+.BR "cluster raft\-status" ,
+because two nodes named alike would give every cluster runtime the same socket
+path or file.
 .TP
 .B \-\-raft\-init
 Found a new single-voter cluster, on first start only.
@@ -9671,8 +9684,9 @@ and the flags
 .B create
 takes, plus
 .B \-\-replicas
-(default 1). It is a server, a proxy or a client: a cache is refused, because
-nothing promotes a follower when its node dies yet. The flags are stored as a list of arguments, so a value with a space in it
+(default 1). It is a server, a proxy, a client or a cache (see
+.BR "Cluster caches" ).
+The flags are stored as a list of arguments, so a value with a space in it
 stays one argument, and run as they are on every node that holds a replica, so a file they
 name must exist on each node (a relative path is made absolute against the
 caller's directory, as for
@@ -9724,7 +9738,10 @@ is never moved for tidiness. Asking for more replicas than there are live nodes
 runs what fits;
 .B cluster placement
 says how many replicas are unplaced. It prints the runtimes with their
-replicas, where each is placed and how many are unplaced, the nodes with the
+replicas, where each is placed and how many are unplaced, each cache's primary
+and the copies it has (see
+.BR "Cluster caches" ),
+the nodes with the
 number of replicas each holds and, on the leader, whether the leader counts each
 up and when it last heard from it, and this node's replicas with what each is
 doing (running, waiting for a lease, failed with the reason, or blocked by a
@@ -9798,7 +9815,10 @@ none over two. A leader change that takes longer than the lease
 survivor's replicas until the new leader has granted a lease, a few hundred
 milliseconds after it is elected. The lease is enforced by the daemon's loop,
 so a daemon that is hung and not dead (SIGSTOP, a blocked disk) cannot stop
-its workers, which are separate processes; and whatever a replica does on
+the workers of a server, a proxy or a client, which are separate processes (a
+cache's worker fences itself: see
+.BR "Cluster caches" );
+and whatever a replica does on
 its way down (a
 .B \-\-drain
 that flushes its connections) spends part of the margin.
@@ -9810,14 +9830,165 @@ about 3.9\(en4.3 s when the node was a follower (the failure timeout and a
 commit), about 5.1\(en6.0 s when it was the leader (an election first), and up
 to 8.7 s in the simulation when a split vote stretched the election.
 .PP
+.B Cluster caches.
+A cache is a cluster runtime that holds data, so keeping it running is not
+enough:
+.PP
+.nf
+socketley cluster create cache db \-p 6379 \-\-replicas 3
+socketley cluster create proxy gw \-p 7000 \-\-backend @db \-\-replicas 3
+.fi
+.PP
+The leader places the replicas as for any runtime, and the log names one of
+them the
+.B primary
+of an
+.BR epoch :
+a number that only grows, so two leaders that race to promote agree on which was
+first. The others are its followers, and follow it with the cache's own
+replication (\c
+.BR \-\-replicate :
+a full dump, then every write), dialling the primary's
+.B \-p
+on the host its node advertises to Raft. That is why a cluster cache needs
+.BR \-p ;
+it is refused with
+.BR \-\-listen ,
+.BR \-\-shards ,
+.BR \-\-tls ,
+.B \-\-replicate
+(the cluster sets it) and without a port. On one host each replica needs its own
+port, which is what
+.B {node}
+is for: named 1, 2 and 3, the nodes run
+.B \-p 630{node}
+as ports 6301, 6302 and 6303. A cache with one replica has a primary and
+nothing to promote. The first primary is the replica on the lowest node id,
+chosen once every replica has said it exists (or after an election timeout). A
+replica is a process the log can name (its
+.BR incarnation ),
+and a restarted one is another, holding nothing the old one did.
+.PP
+.B Who may write.
+A replica takes a client's command only under its worker's last order from its
+daemon, sent every 100 ms and standing for the lease the daemon held when it
+sent it. A replica that is
+.B fenced
+answers every command, reads included, with an error, and refuses
+.BR replicate ;
+a
+.B follower
+answers reads and refuses writes; the
+.B primary
+takes writes. A replica starts fenced, and leads only if this node holds a lease
+AND the log names the very process it runs as the primary; anything else follows
+whoever the log names, or waits when nobody is named. A fence
+.B keeps the data:
+the process stays up, so a node that lost its quorum for a minute and got it back
+is the primary again with everything it had, and a follower keeps its link and
+its copy through a spell without a lease. When the orders stop, for any reason
+(the node lost its quorum, or the daemon hung or died), the worker fences itself
+when the last one runs out, without the daemon's help. Measured in nine runs
+with real daemons: a worker whose daemon was stopped with SIGSTOP refused writes
+after 2.7\(en3.1 s, and a primary that lost its quorum stopped taking writes after
+2.8\(en3.2 s (the lease is three quarters of the failure timeout, 3 s at the
+defaults).
+.PP
+.B Promotion.
+The leader replaces a primary when nobody leads, when its node has been declared
+down (in the same round that takes its replica away), or when its node is alive
+but has not, for the failure timeout, named the process the log calls the
+primary in a lease request: a primary whose daemon restarted comes back empty
+and does not lead, and a replica that has the data is promoted after that
+timeout. Every lease request carries, for each cache replica the node runs, its
+incarnation, the epoch of the primary whose stream the copy came from, its
+offset in that stream, and whether it leads. The offset is a count of records:
+the primary counts every record it produces, whether or not a follower is
+connected, the end-of-dump marker carries the count at which the dump was taken,
+and a follower is at that number plus the records it has applied since; a copy is
+empty from the first line of a dump to its last. The leader promotes the replica
+whose copy is the most up to date, comparing epochs first (offsets of two
+primaries are not on one scale), then offsets, then the lowest node id, and
+writes it with the next epoch to the log. The offsets the leader has are up to
+about half a second old (a stats push and a request interval), but the primary
+has been gone for the failure timeout by the time it looks, so the followers' last
+reports are their final positions. A primary that comes back, or a node that is
+given a replica again, is a new process: it follows the primary of the epoch it
+finds and takes a full dump that replaces whatever it held, so nothing it wrote
+that the cluster did not have survives, and it does not lead a cache whose log
+names another. A cache scaled down never loses its primary.
+.PP
+.B How long,
+kill \-9 of the node that holds the primary to a survivor taking a write, on one
+host with real daemons (the default timing): 3.9\(en4.1 s when the node was not
+the Raft leader (the failure timeout and a commit; eleven kills) and 5.2\(en5.7 s when
+it was (an election first; four kills). In a simulation of the same logic over
+60 kills it was 4.1\(en4.2 s and 5.6\(en7.2 s, the longer ones being a split vote. A
+follower dials the new primary within about a fifth of a second of being told,
+and a proxy follows through the endpoint group the primary is published as: the
+first write through a proxy on a survivor succeeded 20\(en95 ms after the first
+write made directly to the new primary (five runs).
+.PP
+.B What a failover can lose.
+Replication is asynchronous: the primary answers a write and streams it
+afterwards, so when its node dies the promoted follower lacks the acknowledged
+writes it had not received. What survives is always a prefix of the primary's
+history (replication is ordered, and the tests read every acknowledged key back
+to check that no write is lost that a later one outlived). How long the tail is
+depends on how far behind the best follower was. Measured with a client writing
+continuously and kill \-9 of the primary's node, three kills each: one
+connection writing one key at a time, about a thousand a second (4,800
+acknowledged), none missing; 200 writes pipelined at a time as fast as one
+connection goes (700,000 acknowledged, some 230,000 a second), none missing; and
+the same with both followers' workers stopped (SIGSTOP) for the four seconds before
+the kill, so that neither was receiving, about 1.6 million acknowledged and
+871,000 to 911,000 of them missing, which is every write the primary took while
+no follower had it.
+A process that dies on a machine that stays up loses only what had not left the
+primary's user space, because the kernel still delivers what it accepted from the
+primary's sockets, which is why the first two conditions lose nothing. A machine
+that loses power, or a network that is cut, loses the socket buffers as well, and
+a primary drops a follower that is 8 MiB behind; neither is bounded by anything
+short of a follower having the write, and neither could be tried without root.
+There is no synchronous mode: a write that must survive its primary is written to
+two caches.
+.PP
+.B Finding the primary.
+.B "cluster placement"
+prints, under
+.BR "CACHE PRIMARIES" ,
+each cache's primary and epoch and, for each replica, the epoch and offset of its
+copy and how old that news is: the leader hears every node's, the others their
+own. A proxy with
+.BI \-\-backend " @name"
+follows the primary: the cache's name is published as a group of one, the
+primary's host and port, on every node that holds a lease, and republished when
+it moves. The
+.B stats
+of a replica carry
+.BR cluster_role ,
+.BR cluster_epoch ,
+.B cluster_offset
+and
+.BR cluster_incarnation .
+.PP
+.B Limits.
+A cache whose replicas all die at once starts again empty: the data lived in
+memory, and a
+.B \-\-persistent
+file is loaded by a restarted process but does not take part in choosing the
+primary, and is replaced when the replica syncs from the primary that was
+chosen. A cache with one replica loses its data with its node. A worker that
+answers its daemon and takes no orders is not replaced.
+.PP
 .B Not yet:
 removing a member, snapshots sent in chunks (a snapshot goes in one frame of
-at most 16 MiB), a cluster id that keeps two clusters from mixing, cache
-placement and promoting a follower to primary, editing a cluster runtime in
-place, moving a replica off a node before it is stopped for maintenance (a
-node stopped with SIGTERM keeps its assignments until the failure timeout), a
-worker that fences itself when its daemon is hung, and a replica that fails
-to start on one node being tried on another.
+at most 16 MiB), a cluster id that keeps two clusters from mixing, editing a
+cluster runtime in place, moving a replica off a node before it is stopped for
+maintenance (a node stopped with SIGTERM keeps its assignments until the failure
+timeout), a worker that fences itself when its daemon is hung for a server, a
+proxy or a client (a cache does), synchronous replication of a cache, and a
+replica that fails to start on one node being tried on another.
 .SH INSTALLATION
 .SS Quick Install
 .nf
