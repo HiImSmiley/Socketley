@@ -365,7 +365,11 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
         char c;
         REQUIRE(::read(ready[0], &c, 1) == 1);
         ::close(ready[0]);
-        const auto delay_us = static_cast<useconds_t>(rng() % 60000);
+        // Every fourth round waits up to half a second, because on a loaded box
+        // a 60 ms window ended before any rename in every round and the file
+        // then checked nothing (files seen 0 beside three agents' builds).
+        const uint64_t window_us = round % 4 == 3 ? 500000 : 60000;
+        const auto delay_us = static_cast<useconds_t>(rng() % window_us);
         ::usleep(delay_us);
         ::kill(child, SIGKILL);
         int status = 0;
