@@ -187,10 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`socketley daemon --raft-listen <ip:port>` runs a Raft node on the daemon.**
   Off unless asked for; nothing else about the daemon changes, and the cluster
-  directory keeps working as before. This release forms the cluster and keeps
-  it: leader election with pre-vote and check-quorum, a replicated log on disk,
-  membership, and graceful handover. No runtime, placement or cache failover
-  goes through it yet.
+  directory keeps working as before. It forms the cluster and keeps it: leader
+  election with pre-vote and check-quorum, a replicated log on disk,
+  membership, and graceful handover. Cluster runtimes and cluster caches
+  (below) are what goes through its log.
 - `--raft-init` founds a cluster; `--raft-join <ip:port>` joins one, first as a
   learner and then promoted to voter once caught up. Both apply to the first
   start only; afterwards the node comes back from its own state.
