@@ -329,7 +329,8 @@ private:
     // memory the ring writes into outlives the close.
     std::vector<std::shared_ptr<conn>> m_closing;
 
-    std::vector<std::pair<int, int>> m_pipes;
+    struct pooled_pipe { int rd; int wr; uint32_t size; };
+    std::vector<pooled_pipe> m_pipes;
 
     struct timer
     {

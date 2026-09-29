@@ -193,6 +193,10 @@ void apply_live_config(runtime_instance& rt, const runtime_config& cfg)
         prx.set_retry_all(cfg.retry_all);
     }
 
+    // A storage quota is read at each put, so it moves under a serving runtime.
+    if (rt.get_type() == runtime_storage)
+        static_cast<storage_instance&>(rt).set_max_bytes(cfg.storage_max_bytes);
+
     // The setters above write fields the hot paths do not read; this is what
     // makes them true for a runtime that is already serving.
     rt.refresh_cached_limits();

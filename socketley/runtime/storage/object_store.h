@@ -316,6 +316,9 @@ public:
     store_totals totals() const;
     const store_options& options() const { return m_opts; }
 
+    // The quota may move under a serving store; what is held stays held.
+    void set_max_bytes(uint64_t bytes) { m_opts.max_bytes = bytes; }
+
     // Whether anything is still being written, which a clean stop must wait out.
     bool busy() const;
 

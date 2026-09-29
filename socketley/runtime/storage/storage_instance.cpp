@@ -73,6 +73,8 @@ std::string storage_instance::config_refusal() const
 void storage_instance::refresh_cached_limits()
 {
     m_max_conns_cached = get_max_connections();
+    if (m_run)
+        m_run->store().set_max_bytes(m_max_bytes);
 }
 
 void storage_instance::on_cqe(struct io_uring_cqe*)

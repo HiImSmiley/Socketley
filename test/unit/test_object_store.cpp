@@ -515,6 +515,28 @@ TEST_CASE("a delimiter that matches within the prefix's own length is not a roll
     CHECK(p.prefixes == std::vector<std::string>{"dir/b/"});
 }
 
+TEST_CASE("a marker that is a rolled-up prefix skips the keys behind it")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    for (const char* k : {"a", "b/1", "b/2", "c", "d/1"})
+        REQUIRE(r.put("bkt", k, "1").status == st::ok);
+
+    list_query q;
+    q.delimiter   = "/";
+    q.start_after = "b/";
+    list_page p;
+    REQUIRE(r.store->list("bkt", q, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"c"});
+    CHECK(p.prefixes == std::vector<std::string>{"d/"});
+
+    // Without a delimiter the same marker is only a key to start after.
+    q.delimiter.clear();
+    REQUIRE(r.store->list("bkt", q, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"b/1", "b/2", "c", "d/1"});
+}
+
 TEST_CASE("a clean restart keeps every object and trusts the journal")
 {
     tmpdir d;

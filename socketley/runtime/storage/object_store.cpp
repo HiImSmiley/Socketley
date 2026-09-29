@@ -181,8 +181,14 @@ st object_store::list(std::string_view bucket_name, const list_query& q, list_pa
                 // Every key under the prefix is one entry, so the walk jumps
                 // past all of them instead of stepping over each.
                 const std::string next = prefix_successor(cp);
-                out.prefixes.push_back(std::move(cp));
-                ++count;
+                // A marker that is itself a rolled-up prefix means the caller
+                // has that prefix already, and not the keys behind it.
+                const bool seen = !q.has_resume && !q.start_after.empty() && cp <= q.start_after;
+                if (!seen)
+                {
+                    out.prefixes.push_back(std::move(cp));
+                    ++count;
+                }
                 it = next.empty() ? b->objects.end() : b->objects.lower_bound(next);
                 continue;
             }

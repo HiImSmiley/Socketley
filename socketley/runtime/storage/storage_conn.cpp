@@ -79,10 +79,10 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
 
 storage_run::~storage_run()
 {
-    for (auto& [a, b] : m_pipes)
+    for (const pooled_pipe& p : m_pipes)
     {
-        ::close(a);
-        ::close(b);
+        ::close(p.rd);
+        ::close(p.wr);
     }
 }
 
@@ -753,7 +753,7 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
         return;
 
     const size_t end = c->in.find("\r\n\r\n");
-    if (end == std::string::npos)
+    if (end == std::string::npos || end + 4 > max_head_bytes)
     {
         if (c->in.size() > max_head_bytes)
         {
@@ -1321,8 +1321,9 @@ bool storage_run::pipe_acquire(conn& c)
         return true;
     if (!m_pipes.empty())
     {
-        c.pipe_rd = m_pipes.back().first;
-        c.pipe_wr = m_pipes.back().second;
+        c.pipe_rd   = m_pipes.back().rd;
+        c.pipe_wr   = m_pipes.back().wr;
+        c.pipe_size = m_pipes.back().size;
         m_pipes.pop_back();
         return true;
     }
@@ -1343,8 +1344,8 @@ void storage_run::pipe_release(conn& c)
         return;
     // Back in the pool only when empty and unused; anything else is closed,
     // because a pipe with bytes in it would put them in the next stream.
-    if (!c.dead && c.pipe_held == 0 && !c.sp_in_pending && !c.sp_out_pending && m_pipes.size() < 64)
-        m_pipes.emplace_back(c.pipe_rd, c.pipe_wr);
+    if (c.pipe_held == 0 && !c.sp_in_pending && !c.sp_out_pending && m_pipes.size() < 64)
+        m_pipes.push_back({c.pipe_rd, c.pipe_wr, c.pipe_size});
     else
     {
         m_loop.close_fd(c.pipe_rd);

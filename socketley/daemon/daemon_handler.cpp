@@ -3462,6 +3462,19 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
             for (uint32_t h : cache_only)
                 if (pa.hashes[i] == h) { is_cache_flag = true; break; }
 
+            if (type == runtime_storage &&
+                (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") ||
+                 pa.hashes[i] == fnv1a("--max-bytes")))
+            {
+                restore_edit();
+                std::cout << pa.args[i] << " cannot be changed with `edit`\n"
+                             "  A storage runtime's own settings are applied by `import`:\n"
+                             "    socketley show " << name
+                          << " > cfg.json   # edit the field, then\n"
+                             "    socketley import " << name << " < cfg.json\n";
+                return 1;
+            }
+
             if (is_cache_flag && type == runtime_cache)
             {
                 restore_edit();
@@ -3897,6 +3910,28 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
                 return 1;
             }
         }
+        if (type == runtime_storage)
+        {
+            // The directory is what the worker opened at start, and moving it
+            // under a serving runtime would strand every open object.
+            auto* stg = static_cast<storage_instance*>(instance);
+            if (cfg.has("dir") && cfg.storage_dir != std::string(stg->get_dir()))
+            {
+                conn->write_buf = "cannot change the storage directory while running\n";
+                return 1;
+            }
+            if (cfg.has("anonymous") && cfg.storage_anonymous != stg->get_anonymous())
+            {
+                conn->write_buf = "cannot change anonymous access while running\n";
+                return 1;
+            }
+        }
+    }
+
+    if (type == runtime_storage && cfg.has("dir") && cfg.storage_dir.empty())
+    {
+        conn->write_buf = "dir needs a directory: it is where the buckets live\n";
+        return 1;
     }
 
     // ─── ONLY WHAT THE DOCUMENT NAMES ───────────────────────────────────────
