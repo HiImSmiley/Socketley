@@ -113,6 +113,7 @@ inline s3_error error_for(st s)
         // A part whose upload was aborted while its body was arriving, which is
         // the only way a cancelled body still has someone to answer.
         case st::cancelled:           return make_error("NoSuchUpload");
+        case st::precondition_failed: return make_error("PreconditionFailed");
         case st::ok:
         case st::io_error:
             break;

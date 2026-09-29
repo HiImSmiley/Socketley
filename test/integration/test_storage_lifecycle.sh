@@ -5,10 +5,9 @@
 # ─── WHAT THIS HOLDS DOWN ───────────────────────────────────────────────────
 #
 #   refusals    a runtime with no --dir, or with neither --anonymous nor a way
-#               to authenticate, is not made; --shards, which the runtime does
-#               not do yet, is refused rather than stored, and --tls with a
-#               certificate that cannot be read does not start (the TLS runtime
-#               itself is test_storage_tls.sh)
+#               to authenticate, is not made; a shard count above the limit is
+#               refused, and --tls with a certificate that cannot be read does
+#               not start (the TLS runtime itself is test_storage_tls.sh)
 #   durability  an object put is served after `stop` and `start`, after its
 #               worker is killed with SIGKILL, and after the daemon itself is
 #               restarted and brings the runtime back on its own; an upload cut
@@ -81,8 +80,8 @@ contains "and names --anonymous" "$out" "--anonymous"
 out=$("$BIN" create storage x3 -p "$P3" --dir "$DATA" --anonymous --tls --cert /nonexistent.pem --key /nonexistent-key.pem -s 2>&1); rc=$?
 expect "--tls with a certificate that cannot be read does not start" "$rc" 1
 "$BIN" remove x3 >/dev/null 2>&1 || true
-out=$("$BIN" create storage x4 -p "$P3" --dir "$DATA" --anonymous --shards 2 2>&1); rc=$?
-expect "create with --shards 2 is refused" "$rc" 1
+out=$("$BIN" create storage x4 -p "$P3" --dir "$DATA" --anonymous --shards 65 2>&1); rc=$?
+expect "create with more shards than the limit is refused" "$rc" 1
 contains "and says why" "$out" "shards"
 out=$("$BIN" create storage x5 -p "$P3" --dir "$DATA" --anonymous --max-bytes 12x 2>&1); rc=$?
 expect "create with a bad --max-bytes is refused" "$rc" 1

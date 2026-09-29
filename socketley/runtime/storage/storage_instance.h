@@ -93,6 +93,22 @@ public:
     void listen_addresses(std::vector<std::string>& out) const override;
     uint16_t effective_port() const override;
 
+    // ── request_sink ────────────────────────────────────────────────────────
+    // What a sibling shard asks of this one: a commit, a delete, a page of a
+    // listing, a bucket made or dropped.  Answered on a later turn, because
+    // each of them waits on the disk.
+    void serve_request(std::string_view payload, std::string& out) override;
+    bool serves_inline() const override { return false; }
+    bool serve_deferred(uint64_t ticket, std::string_view target, std::string_view payload) override;
+    // Itself in the worker, and the daemon's override where the runtime is a
+    // placeholder for a worker, whose run is empty.
+    request_sink* as_request_sink() override
+    {
+        if (auto* o = runtime_instance::as_request_sink())
+            return o;
+        return this;
+    }
+
     // What was counted, for the tests that read it through `stats`.
     socketley::storage::storage_run* run() const { return m_run.get(); }
 

@@ -187,22 +187,29 @@ decoded_header decode_object_header(std::string_view bytes)
     return d;
 }
 
-std::string encode_journal_header(uint32_t shard)
+std::string encode_journal_header(uint32_t shard, uint32_t nshards)
 {
     std::string h(journal_magic);
-    put_u32(h, 1);
+    put_u32(h, 2);
     put_u32(h, shard);
+    put_u32(h, nshards);
+    put_u32(h, 0);
     return h;
 }
 
-bool journal_header_ok(std::string_view bytes, uint32_t shard)
+journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards)
 {
     if (bytes.size() < journal_header_len || bytes.substr(0, 8) != journal_magic)
-        return false;
-    uint32_t version, sh;
+        return journal_header_status::bad;
+    uint32_t version, sh, n;
     std::memcpy(&version, bytes.data() + 8, 4);
     std::memcpy(&sh, bytes.data() + 12, 4);
-    return version == 1 && sh == shard;
+    std::memcpy(&n, bytes.data() + 16, 4);
+    if (version != 2 || n == 0)
+        return journal_header_status::bad;
+    if (sh != shard || n != nshards)
+        return journal_header_status::other_layout;
+    return journal_header_status::ok;
 }
 
 namespace

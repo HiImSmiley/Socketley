@@ -16,6 +16,7 @@
 #include "storage_instance.h"
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
+#include "../../shared/runtime_manager.h"
 #include "../../shared/unix_listener.h"
 
 namespace socketley::storage
@@ -72,7 +73,10 @@ const char* reason_phrase(int status)
 
 storage_run::storage_run(storage_instance& owner, event_loop& loop, store_options opts, authenticator* auth)
     : m_owner(owner), m_loop(loop), m_io(loop, this), m_store(loop, m_io, std::move(opts)),
-      m_mpu(loop, m_io, m_store), m_auth(auth)
+      m_mpu(loop, m_io, m_store),
+      m_transport(owner.get_runtime_manager() ? &owner.get_runtime_manager()->requests() : nullptr,
+                  std::string(owner.get_name())),
+      m_node(m_store, m_transport), m_auth(auth)
 {
     m_rid_seq = random_u64();
     m_max_conns = m_owner.get_max_connections();
@@ -421,6 +425,10 @@ void storage_run::stop()
         all.push_back(c);
     for (auto& c : all)
         close_conn(c);
+
+    // No crossing is answered from here on, and none that is out will be.
+    m_node.stop();
+    m_transport.stop();
 
     // Marked clean only when nothing is half done, which is decided inside.
     m_store.close(true);

@@ -871,7 +871,7 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             a->checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
             a->meta.extra.emplace_back(std::string(checksum_header(u->algo)), a->checksum_b64);
         }
-        a->tmp_name = object_store::tmp_name();
+        a->tmp_name = m_store->tmp_name();
         a->tmp_path = base_of(bucket) + "/tmp/" + a->tmp_name;
         a->dir_path = upload_path(bucket, id);
         a->cb       = std::move(cb);

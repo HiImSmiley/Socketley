@@ -4,21 +4,19 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <csignal>
 
 #include <fcntl.h>
 
 #include "s3_names.h"
+#include "shard_owner.h"
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
 
 namespace socketley::storage
 {
 
-namespace
-{
-
-// The smallest string greater than every string that begins with `s`, empty
-// when there is none because `s` is all 0xFF bytes.
 std::string prefix_successor(std::string s)
 {
     while (!s.empty() && static_cast<unsigned char>(s.back()) == 0xFF)
@@ -28,6 +26,9 @@ std::string prefix_successor(std::string s)
     s.back() = static_cast<char>(static_cast<unsigned char>(s.back()) + 1);
     return s;
 }
+
+namespace
+{
 
 st errno_status(int64_t res)
 {
@@ -54,6 +55,7 @@ const char* status_name(st s)
         case st::bad_digest:          return "bad digest";
         case st::storage_full:        return "storage full";
         case st::busy:                return "busy";
+        case st::precondition_failed: return "precondition failed";
         case st::io_error:            return "i/o error";
         case st::cancelled:           return "cancelled";
     }
@@ -63,6 +65,22 @@ const char* status_name(st s)
 object_store::object_store(event_loop& loop, file_io& io, store_options opts)
     : m_loop(&loop), m_io(&io), m_opts(std::move(opts)), m_alive(std::make_shared<bool>(true))
 {
+    if (m_opts.nshards == 0)
+        m_opts.nshards = 1;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_KILL_AFTER_RENAME"))
+        m_kill_after_rename = e;
+}
+
+uint32_t object_store::owner_of(std::string_view bucket_name, std::string_view key) const
+{
+    return object_owner(bucket_name, key, m_opts.nshards);
+}
+
+uint64_t object_store::quota() const
+{
+    if (m_opts.nshards <= 1)
+        return m_opts.max_bytes;
+    return (m_opts.max_bytes + m_opts.nshards - 1) / m_opts.nshards;
 }
 
 object_store::~object_store()
@@ -77,9 +95,10 @@ uint64_t object_store::now_ms() const
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-std::string object_store::tmp_name()
+std::string object_store::tmp_name() const
 {
-    return hex(reinterpret_cast<const uint8_t*>(std::array<uint64_t, 2>{random_u64(), random_u64()}.data()), 16);
+    return std::to_string(m_opts.shard) + "." +
+           hex(reinterpret_cast<const uint8_t*>(std::array<uint64_t, 2>{random_u64(), random_u64()}.data()), 16);
 }
 
 object_store::bucket* object_store::find_bucket(std::string_view name)
@@ -134,6 +153,30 @@ const object_meta* object_store::find(std::string_view bucket_name, std::string_
         return nullptr;
     auto it = b->objects.find(key);
     return it == b->objects.end() ? nullptr : &it->second;
+}
+
+void object_store::stat_object(std::string_view bucket_name, std::string_view key,
+                               std::function<void(st, const object_meta&)> cb)
+{
+    const bucket* b = find_bucket(bucket_name);
+    if (!b || b->closing)
+    {
+        cb(st::no_such_bucket, object_meta{});
+        return;
+    }
+    if (owns(bucket_name, key))
+    {
+        const object_meta* m = find(bucket_name, key);
+        cb(m ? st::ok : st::no_such_key, m ? *m : object_meta{});
+        return;
+    }
+    // Another shard's key: its file is the truth and any shard may read it.
+    open_object(bucket_name, key, 0, [this, cb](open_result o)
+    {
+        if (o.fd >= 0)
+            m_loop->close_fd(o.fd);
+        cb(o.status, o.meta);
+    });
 }
 
 st object_store::list(std::string_view bucket_name, const list_query& q, list_page& out) const
@@ -330,7 +373,7 @@ void object_store::compact_step(std::shared_ptr<bool> alive, const std::string& 
 
     auto buf = std::make_shared<std::string>();
     if (b->dump_off == 0)
-        *buf = encode_journal_header(m_opts.shard);
+        *buf = encode_journal_header(m_opts.shard, m_opts.nshards);
     bool wrote_records = false;
     while (b->dump_it != b->objects.cend() && buf->size() < compact_chunk)
     {
@@ -663,10 +706,64 @@ void object_store::ensure_dirs(const std::string& bucket_name, const std::string
 
 void object_store::commit(commit_request req, std::function<void(put_result)> cb)
 {
+    const uint32_t owner = owner_of(req.bucket, req.key);
+    if (owner == m_opts.shard)
+    {
+        commit_local(std::move(req), std::move(cb));
+        return;
+    }
+
+    // The body is on the shared disk already, so the owner is sent the name
+    // and the metadata and nothing else.
+    bucket* b = find_bucket(req.bucket);
+    if (!m_peers || !b || b->closing)
+    {
+        if (b && !b->closing)
+            if (!m_io->unlinkat(b->tmp_fd, req.tmp_name, 0, [](int64_t) {})) {}
+        cb({b && !b->closing ? st::io_error : st::no_such_bucket, req.meta});
+        return;
+    }
+    ++b->active_ops;
+    ++m_inflight;
+
+    auto alive = m_alive;
+    const std::string bname = req.bucket;
+    const std::string tmp   = req.tmp_name;
+    const object_meta meta  = req.meta;
+    m_peers->commit(owner, std::move(req), [this, alive, bname, tmp, meta, cb](put_result r)
+    {
+        if (!*alive)
+            return;
+        --m_inflight;
+        if (bucket* bp = find_bucket(bname))
+        {
+            --bp->active_ops;
+            // A body that did not become the object is nobody's, and a name
+            // the owner already renamed is not there to remove.
+            if (r.status != st::ok)
+                if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
+        }
+        r.meta = meta;
+        cb(std::move(r));
+    });
+}
+
+void object_store::commit_local(commit_request req, std::function<void(put_result)> cb)
+{
     bucket* b = find_bucket(req.bucket);
     if (!b || b->closing)
     {
         cb({st::no_such_bucket, req.meta});
+        return;
+    }
+    if (!owns(req.bucket, req.key))
+    {
+        // A request the caller routed wrongly, which must not write a journal
+        // that another shard's key would then be missing from.
+        LOG_WARN(("storage: a commit for a key that shard " + std::to_string(owner_of(req.bucket, req.key)) +
+                  " owns reached shard " + std::to_string(m_opts.shard)).c_str());
+        if (!m_io->unlinkat(b->tmp_fd, req.tmp_name, 0, [](int64_t) {})) {}
+        cb({st::io_error, req.meta});
         return;
     }
     ++b->active_ops;
@@ -677,6 +774,7 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
     const std::string key   = req.key;
     const object_meta meta  = req.meta;
     const std::string tmp   = req.tmp_name;
+    const bool create_only  = req.create_only;
 
     // What every way out of the commit does: the lane is handed on and the
     // bucket is released before the caller hears, because the caller is free
@@ -692,13 +790,32 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
         cb(std::move(r));
     };
 
-    lane_enter(*b, key, [this, alive, bname, key, meta, tmp, done]()
+    lane_enter(*b, key, [this, alive, bname, key, meta, tmp, create_only, done]()
     {
         bucket* bp = find_bucket(bname);
         if (!bp)
         {
             done({st::no_such_bucket, meta});
             return;
+        }
+        if (create_only && bp->objects.contains(key))
+        {
+            if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
+            done({st::precondition_failed, meta});
+            return;
+        }
+        // The landing shard judged the quota from its own bytes, which is only a
+        // sample of the owner's, so the owner judges it again for the key it holds.
+        if (m_opts.nshards > 1 && m_opts.max_bytes)
+        {
+            const auto old = bp->objects.find(key);
+            const uint64_t held = old == bp->objects.end() ? 0 : old->second.size;
+            if (m_totals.bytes - held + meta.size > quota())
+            {
+                if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
+                done({st::storage_full, meta});
+                return;
+            }
         }
         const std::string rel = object_rel_path(key);
         ensure_dirs(bname, rel, [this, alive, bname, key, meta, tmp, rel, done](int leaf, st why)
@@ -731,6 +848,8 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
                         done({errno_status(r), meta});
                         return;
                     }
+                    if (!m_kill_after_rename.empty() && key.starts_with(m_kill_after_rename))
+                        ::raise(SIGKILL);
                     // The rename is in the directory now and durable once the
                     // directory is synced; only then may the journal say so.
                     const bool q2 = m_io->fsync(leaf, false,
@@ -784,10 +903,48 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
 void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
                           std::function<void(st, bool)> cb)
 {
+    const uint32_t owner = owner_of(bucket_name, key_sv);
+    if (owner == m_opts.shard)
+    {
+        remove_local(bucket_name, key_sv, std::move(cb));
+        return;
+    }
+
+    bucket* b = find_bucket(bucket_name);
+    if (!m_peers || !b || b->closing)
+    {
+        cb(b && !b->closing ? st::io_error : st::no_such_bucket, false);
+        return;
+    }
+    ++b->active_ops;
+    ++m_inflight;
+    auto alive = m_alive;
+    const std::string bname(bucket_name);
+    m_peers->remove(owner, bname, std::string(key_sv), [this, alive, bname, cb](st s, bool existed)
+    {
+        if (!*alive)
+            return;
+        --m_inflight;
+        if (bucket* bp = find_bucket(bname))
+            --bp->active_ops;
+        cb(s, existed);
+    });
+}
+
+void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
+                                std::function<void(st, bool)> cb)
+{
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
     {
         cb(st::no_such_bucket, false);
+        return;
+    }
+    if (!owns(bucket_name, key_sv))
+    {
+        LOG_WARN(("storage: a delete for a key that shard " + std::to_string(owner_of(bucket_name, key_sv)) +
+                  " owns reached shard " + std::to_string(m_opts.shard)).c_str());
+        cb(st::io_error, false);
         return;
     }
     ++b->active_ops;
@@ -1036,7 +1193,7 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         return nullptr;
     }
     if (m_opts.max_bytes && size_known &&
-        m_totals.bytes + m_reserved + expected > m_opts.max_bytes)
+        m_totals.bytes + m_reserved + expected > quota())
     {
         why = st::storage_full;
         return nullptr;
@@ -1082,21 +1239,9 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
         cb({st::no_such_bucket, meta});
         return;
     }
-    auto sit = sb->objects.find(src_key);
-    if (sit == sb->objects.end())
-    {
-        cb({st::no_such_key, meta});
-        return;
-    }
     if (dst_key.empty() || dst_key.size() > max_key_bytes)
     {
         cb({st::key_too_long, meta});
-        return;
-    }
-    const uint64_t size = sit->second.size;
-    if (m_opts.max_bytes && m_totals.bytes + m_reserved + size > m_opts.max_bytes)
-    {
-        cb({st::storage_full, meta});
         return;
     }
 
@@ -1104,10 +1249,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
     cs->dst_bucket = std::string(dst_bucket);
     cs->dst_key    = std::string(dst_key);
     cs->meta       = std::move(meta);
-    cs->meta.size  = size;
-    cs->reserved   = size;
     cs->cb         = std::move(cb);
-    m_reserved += size;
     ++db->active_ops;
     ++m_inflight;
 
@@ -1144,8 +1286,18 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
                 (*finish)({o.status, cs->meta});
                 return;
             }
+            // The source's own header is the size, because a key another shard
+            // owns is not in this shard's memory.
             cs->src_fd  = o.fd;
             cs->src_off = o.data_off;
+            if (m_opts.max_bytes && m_totals.bytes + m_reserved + o.meta.size > quota())
+            {
+                (*finish)({st::storage_full, cs->meta});
+                return;
+            }
+            cs->meta.size = o.meta.size;
+            cs->reserved  = o.meta.size;
+            m_reserved += o.meta.size;
             cs->meta.md5   = o.meta.md5;
             cs->meta.parts = o.meta.parts;
             cs->meta.mtime_ms = static_cast<int64_t>(now_ms());
@@ -1295,14 +1447,32 @@ struct create_state
 
 void object_store::create_bucket(std::string name, std::function<void(st)> cb)
 {
-    if (!valid_bucket_name(name))
+    create_bucket_impl(std::move(name), false, 0, std::move(cb));
+}
+
+void object_store::adopt_bucket(std::string name, int64_t created_ms, std::function<void(st)> cb)
+{
+    create_bucket_impl(std::move(name), true, created_ms, std::move(cb));
+}
+
+int64_t object_store::bucket_created_ms(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b ? b->created_ms : 0;
+}
+
+void object_store::create_bucket_impl(std::string name, bool adopt, int64_t created_ms,
+                                      std::function<void(st)> cb)
+{
+    if (!adopt && !valid_bucket_name(name))
     {
         cb(st::invalid_bucket_name);
         return;
     }
     if (m_buckets.contains(name))
     {
-        cb(st::bucket_exists);
+        // A shard told of a bucket it already holds has nothing to do.
+        cb(adopt ? st::ok : st::bucket_exists);
         return;
     }
     if (m_creating.contains(name))
@@ -1316,8 +1486,11 @@ void object_store::create_bucket(std::string name, std::function<void(st)> cb)
     auto cs  = std::make_shared<create_state>();
     cs->name = std::move(name);
     cs->cb   = std::move(cb);
-    cs->created_ms = static_cast<int64_t>(now_ms());
+    cs->created_ms = adopt ? created_ms : static_cast<int64_t>(now_ms());
     cs->text = std::to_string(cs->created_ms);
+    // The directories and the creation stamp are shard 0's, so an adopting
+    // shard begins at its own journal.
+    cs->stage = adopt ? 6 : 0;
 
     auto alive = m_alive;
     auto step  = std::make_shared<std::function<void(int64_t)>>();
@@ -1374,7 +1547,8 @@ void object_store::create_bucket(std::string name, std::function<void(st)> cb)
                 break;
             case 6:
                 if (res < 0) { fail(errno_status(res)); return; }
-                m_loop->close_fd(cs->fd);
+                if (cs->fd >= 0)
+                    m_loop->close_fd(cs->fd);
                 cs->fd = -1;
                 queued = m_io->openat(m_root_fd, base + "/index." + std::to_string(m_opts.shard),
                                       O_RDWR | O_CREAT | O_TRUNC, 0644, next);
@@ -1382,7 +1556,7 @@ void object_store::create_bucket(std::string name, std::function<void(st)> cb)
             case 7:
                 if (res < 0) { fail(errno_status(res)); return; }
                 cs->fd = static_cast<int>(res);
-                cs->text = encode_journal_header(m_opts.shard);
+                cs->text = encode_journal_header(m_opts.shard, m_opts.nshards);
                 queued = m_io->pwrite(cs->fd, cs->text.data(), static_cast<uint32_t>(cs->text.size()),
                                       0, next);
                 break;
@@ -1447,24 +1621,63 @@ void object_store::create_bucket(std::string name, std::function<void(st)> cb)
 
 void object_store::delete_bucket(std::string name, std::function<void(st)> cb)
 {
+    if (const st s = drop_check(name); s != st::ok)
+    {
+        cb(s);
+        return;
+    }
+    drop_rename(std::move(name), std::move(cb));
+}
+
+st object_store::drop_check(std::string_view name)
+{
     bucket* b = find_bucket(name);
     if (!b || b->closing)
+        return st::no_such_bucket;
+    if (b->active_puts || b->active_ops || b->j.writing || b->j.frozen || !b->j.pending.empty() ||
+        !b->lanes.empty())
+        return b->objects.empty() ? st::busy : st::bucket_not_empty;
+    if (!b->objects.empty())
+        return st::bucket_not_empty;
+    b->closing = true;
+    return st::ok;
+}
+
+void object_store::drop_abort(std::string_view name)
+{
+    if (bucket* b = find_bucket(name))
+        b->closing = false;
+}
+
+void object_store::forget_bucket(const std::string& name)
+{
+    auto it = m_buckets.find(name);
+    if (it == m_buckets.end())
+        return;
+    bucket& bb = *it->second;
+    for (int* fd : {&bb.dir_fd, &bb.data_fd, &bb.tmp_fd, &bb.j.fd, &bb.dump_fd})
+        if (*fd >= 0)
+        {
+            m_loop->close_fd(*fd);
+            *fd = -1;
+        }
+    m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
+    m_buckets.erase(it);
+}
+
+void object_store::drop_forget(std::string_view name)
+{
+    forget_bucket(std::string(name));
+}
+
+void object_store::drop_rename(std::string name, std::function<void(st)> cb)
+{
+    bucket* b = find_bucket(name);
+    if (!b)
     {
         cb(st::no_such_bucket);
         return;
     }
-    if (b->active_puts || b->active_ops || b->j.writing || b->j.frozen || !b->j.pending.empty() ||
-        !b->lanes.empty())
-    {
-        cb(b->objects.empty() ? st::busy : st::bucket_not_empty);
-        return;
-    }
-    if (!b->objects.empty())
-    {
-        cb(st::bucket_not_empty);
-        return;
-    }
-
     b->closing = true;
     ++m_inflight;
     auto alive = m_alive;
@@ -1492,18 +1705,7 @@ void object_store::delete_bucket(std::string name, std::function<void(st)> cb)
                     if (!*alive)
                         return;
                     ++m_totals.fsyncs;
-                    if (auto it = m_buckets.find(name); it != m_buckets.end())
-                    {
-                        bucket& bb = *it->second;
-                        for (int* fd : {&bb.dir_fd, &bb.data_fd, &bb.tmp_fd, &bb.j.fd})
-                            if (*fd >= 0)
-                            {
-                                m_loop->close_fd(*fd);
-                                *fd = -1;
-                            }
-                        m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
-                        m_buckets.erase(it);
-                    }
+                    forget_bucket(name);
                     --m_inflight;
                     cb(r2 < 0 ? st::io_error : st::ok);
                 });

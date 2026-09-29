@@ -66,14 +66,6 @@ inline std::string shards_config_refusal(runtime_type type,
                "connections to the peer -- a different feature wearing this "
                "flag's name\n";
 
-    // Every shard would open the same directory and append to the same
-    // journal, so until the shards split the journal between them and send a
-    // key's writes to its owner, one process is the only correct number.
-    if (type == runtime_storage)
-        return "--shards is not available on a storage runtime yet: its shards "
-               "would share one directory and one journal without an owner for "
-               "each key\n";
-
     // --listen used to be refused here, on the grounds that N processes
     // binding one path unlink each other's node.  That is true of one path and
     // not of N: each shard binds its own, name#0.sock .. name#N-1.sock, the

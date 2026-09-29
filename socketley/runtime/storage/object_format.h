@@ -80,10 +80,22 @@ decoded_header decode_object_header(std::string_view bytes);
 
 // ─── The index journal ──────────────────────────────────────────────────────
 inline constexpr std::string_view journal_magic = std::string_view("SKLIDX\x01\x00", 8);
-inline constexpr size_t           journal_header_len = 16;
+inline constexpr size_t           journal_header_len = 24;
 
-std::string encode_journal_header(uint32_t shard);
-bool        journal_header_ok(std::string_view bytes, uint32_t shard);
+// A journal says which shard wrote it and under how many, because the owner of
+// a key moves with the shard count and a journal from another split holds the
+// wrong keys.
+std::string encode_journal_header(uint32_t shard, uint32_t nshards);
+
+enum class journal_header_status : uint8_t
+{
+    ok,
+    // A journal of ours from another shard count: sound, and not what this split owns.
+    other_layout,
+    bad,
+};
+
+journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards);
 
 enum class record_type : uint8_t { put = 1, del = 2 };
 

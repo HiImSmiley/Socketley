@@ -22,6 +22,8 @@
 #include "object_store.h"
 #include "s3_auth.h"
 #include "../../shared/storage_rpc.h"
+#include "shard_node.h"
+#include "storage_transport.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/http_framing.h"
@@ -312,6 +314,7 @@ public:
     size_t connection_count() const { return m_conns.size(); }
     const storage_counters& counters() const { return m_c; }
     object_store& store() { return m_store; }
+    shard_node& node() { return m_node; }
     file_io& io() { return m_io; }
     void set_authenticator(authenticator* a) { m_auth = a; }
     // An authenticator the run keeps for as long as it lives, because a
@@ -419,10 +422,13 @@ public:
     void op_head_bucket(const std::shared_ptr<conn>& c);
     void op_bucket_location(const std::shared_ptr<conn>& c);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
+    void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
+                      bool replace, const object_meta& src_meta);
     void op_delete_objects(const std::shared_ptr<conn>& c);
     void op_put_object(const std::shared_ptr<conn>& c);
     void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
-                   put_op::committer committer, checksum_algo forced_algo = checksum_algo::none);
+                   put_op::committer committer, checksum_algo forced_algo = checksum_algo::none,
+                   bool create_only = false);
     void op_copy_object(const std::shared_ptr<conn>& c);
 
     // Multipart, in storage_multipart.cpp.
@@ -451,6 +457,10 @@ private:
     file_io           m_io;
     object_store      m_store;
     multipart_store   m_mpu;
+    // What carries a request to a sibling shard, and the logic that makes one
+    // and answers one; a runtime of one shard never calls the transport.
+    channel_transport m_transport;
+    shard_node        m_node;
     authenticator*    m_auth;
     std::unique_ptr<authenticator> m_auth_owned;
     anonymous_authenticator m_anon;

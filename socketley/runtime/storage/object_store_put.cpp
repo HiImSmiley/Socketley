@@ -65,7 +65,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     ++store->m_inflight;
     ++store->m_puts_active;
 
-    m_tmp_name = object_store::tmp_name();
+    m_tmp_name = store->tmp_name();
     auto self = shared_from_this();
     object_store::bucket* b = store->find_bucket(m_bucket);
     const bool queued = store->m_io->openat(b->tmp_fd, m_tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0600,
@@ -180,7 +180,7 @@ void put_op::staged(size_t n)
     if (m_store->m_opts.max_bytes && m_reserved < m_received)
     {
         const uint64_t more = m_received - m_reserved;
-        if (m_store->m_totals.bytes + m_store->m_reserved + more > m_store->m_opts.max_bytes)
+        if (m_store->m_totals.bytes + m_store->m_reserved + more > m_store->quota())
         {
             fail(st::storage_full);
             return;
@@ -438,6 +438,7 @@ void put_op::maybe_finish()
             req.key      = self->m_key;
             req.tmp_name = self->m_tmp_name;
             req.meta     = self->m_meta;
+            req.create_only = self->m_create_only;
             auto done = [self](put_result r2)
             {
                 self->release();

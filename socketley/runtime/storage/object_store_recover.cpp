@@ -85,18 +85,48 @@ int64_t wall_ms()
     return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
-// Every entry of a directory removed, counting them, for tmp/.
-uint64_t empty_dir(const std::string& path)
+// The shard a tmp/ entry belongs to, from the "<shard>." its name begins with,
+// and false for a name that has none.
+bool tmp_owner(const std::string& name, uint32_t& shard)
+{
+    const size_t dot = name.find('.');
+    if (dot == 0 || dot == std::string::npos || dot > 3)
+        return false;
+    const auto r = std::from_chars(name.data(), name.data() + dot, shard);
+    return r.ec == std::errc{} && r.ptr == name.data() + dot;
+}
+
+// What a crash left in tmp/, counted: this shard's own files, and for shard 0
+// also those that belong to no shard of the current split, which are left by an
+// earlier split or by another version.  A sibling's files are its uploads in
+// flight and are not touched.
+uint64_t clean_tmp(const std::string& path, uint32_t shard, uint32_t nshards)
 {
     uint64_t n = 0;
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(path, ec))
     {
+        uint32_t who = 0;
+        const bool named  = tmp_owner(e.path().filename().string(), who);
+        const bool mine   = named && who == shard;
+        const bool orphan = !named || who >= nshards;
+        if (!mine && !(shard == 0 && orphan))
+            continue;
         std::error_code rc;
         fs::remove_all(e.path(), rc);
         ++n;
     }
     return n;
+}
+
+// The number in the "<prefix><k>" a marker or a journal is named by, false
+// when the name is not of that form.
+bool suffix_number(const std::string& name, std::string_view prefix, uint32_t& k)
+{
+    if (!name.starts_with(prefix) || name.size() == prefix.size())
+        return false;
+    const auto r = std::from_chars(name.data() + prefix.size(), name.data() + name.size(), k);
+    return r.ec == std::errc{} && r.ptr == name.data() + name.size();
 }
 
 }   // namespace
@@ -120,9 +150,11 @@ bool object_store::open(std::string& err, recovery_report* report)
     }
 
     // A bucket deleted by a rename into .trash is removed here, where walking
-    // its tree blocks nobody.
+    // its tree blocks nobody.  Shard 0 alone does it, because it is also the
+    // shard that renames buckets into it while the others may be restarting.
     const std::string trash = m_opts.dir + "/.trash";
-    fs::remove_all(trash, ec);
+    if (m_opts.shard == 0)
+        fs::remove_all(trash, ec);
     if (::mkdir(trash.c_str(), 0700) < 0 && errno != EEXIST)
     {
         err = "cannot create " + trash + ": " + errstr(errno);
@@ -140,6 +172,16 @@ bool object_store::open(std::string& err, recovery_report* report)
     }
     rep.clean_start = clean;
     m_clean_start   = clean;
+
+    // The marker of a shard the split no longer has, which a later split that
+    // brings the number back would otherwise trust for a journal it never wrote.
+    if (m_opts.shard == 0)
+        for (const auto& e : fs::directory_iterator(m_opts.dir, ec))
+        {
+            uint32_t k = 0;
+            if (suffix_number(e.path().filename().string(), ".clean.", k) && k >= m_opts.nshards)
+                if (::unlink(e.path().c_str()) < 0) {}
+        }
 
     std::vector<std::string> names;
     for (const auto& e : fs::directory_iterator(m_opts.dir, ec))
@@ -194,8 +236,10 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             ms = ::stat(base.c_str(), &sb) == 0
                      ? static_cast<int64_t>(sb.st_mtim.tv_sec) * 1000
                      : wall_ms();
-            const int fd = ::open((base + "/created").c_str(),
-                                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            // Shard 0 writes it, since two shards truncating one file at once could
+            // leave each reading the other's half.
+            const int fd = m_opts.shard != 0 ? -1
+                : ::open((base + "/created").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
             if (fd >= 0)
             {
                 const std::string t = std::to_string(ms);
@@ -215,11 +259,28 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         return false;
     }
 
-    rep.tmp_removed += empty_dir(base + "/tmp");
+    rep.tmp_removed += clean_tmp(base + "/tmp", m_opts.shard, m_opts.nshards);
+
+    // The journals of shards the split no longer has hold keys some other shard
+    // owns now; they are read by nobody and would be trusted by a later split.
+    if (m_opts.shard == 0)
+    {
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(base, ec))
+        {
+            const std::string fn = e.path().filename().string();
+            uint32_t k = 0;
+            const bool stale_new = fn.ends_with(".new") &&
+                                   suffix_number(fn.substr(0, fn.size() - 4), "index.", k);
+            if ((stale_new && k >= m_opts.nshards) ||
+                (suffix_number(fn, "index.", k) && k >= m_opts.nshards))
+                if (::unlink(e.path().c_str()) < 0) {}
+        }
+    }
 
     std::string why;
-    bool torn = false, corrupt = false;
-    const bool loaded = load_journal(*b, why, torn, corrupt, rep);
+    bool torn = false, corrupt = false, other_layout = false;
+    const bool loaded = load_journal(*b, why, torn, corrupt, other_layout, rep);
     if (!loaded)
     {
         err = why;
@@ -227,9 +288,16 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     // The files are consulted when the last stop was not clean, when the
-    // journal could not be trusted, and when it is missing.
+    // journal could not be trusted, when it was written for another split,
+    // and when it is missing.
     bool changed = false;
-    if (!m_clean_start || corrupt || torn)
+    if (other_layout)
+    {
+        changed = true;
+        LOG_INFO(("storage: the journal of bucket " + name + " was written for another shard count; "
+                  "this shard's keys are rebuilt from the object files").c_str());
+    }
+    if (!m_clean_start || corrupt || torn || other_layout)
     {
         const uint64_t before = rep.adopted + rep.dropped;
         reconcile_with_files(*b, rep);
@@ -265,7 +333,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
 }
 
 bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt,
-                                recovery_report& rep)
+                                bool& other_layout, recovery_report& rep)
 {
     const std::string path = m_opts.dir + "/" + b.name + "/index." + std::to_string(m_opts.shard);
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
@@ -286,7 +354,7 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
     uint64_t valid_end = 0;
     if (sb.st_size == 0)
     {
-        const std::string h = encode_journal_header(m_opts.shard);
+        const std::string h = encode_journal_header(m_opts.shard, m_opts.nshards);
         if (!write_all_fd(fd, h.data(), h.size()) || ::fsync(fd) < 0)
         {
             bad_why = "cannot write " + path + ": " + errstr(errno);
@@ -298,8 +366,17 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
     else
     {
         std::string head(journal_header_len, '\0');
-        if (::pread(fd, head.data(), head.size(), 0) != static_cast<ssize_t>(head.size()) ||
-            !journal_header_ok(head, m_opts.shard))
+        const bool read_ok = ::pread(fd, head.data(), head.size(), 0) == static_cast<ssize_t>(head.size());
+        const journal_header_status hs = read_ok ? journal_header_check(head, m_opts.shard, m_opts.nshards)
+                                                 : journal_header_status::bad;
+        if (hs == journal_header_status::other_layout)
+        {
+            // Sound, and written for another split: what it holds is not this
+            // shard's to trust, and the object files are the record to go by.
+            other_layout = true;
+            valid_end    = 0;
+        }
+        else if (hs != journal_header_status::ok)
         {
             // Not a journal of ours, so everything it says is unusable and the
             // files are the only record left.
@@ -388,7 +465,7 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
         }
     }
 
-    if (corrupt)
+    if (corrupt || other_layout)
     {
         b.objects.clear();
         b.j.records = 0;
@@ -449,11 +526,18 @@ void object_store::reconcile_with_files(bucket& b, recovery_report& rep)
                            static_cast<uint64_t>(sb.st_size) == d.header_len + d.meta.size;
         if (!sound)
         {
-            ++rep.corrupt_files;
-            LOG_WARN(("storage: " + it->path().string() +
-                      " is not a whole object file and is left unserved").c_str());
+            // Every shard walks every file, so one of them says so.
+            if (m_opts.shard == 0)
+            {
+                ++rep.corrupt_files;
+                LOG_WARN(("storage: " + it->path().string() +
+                          " is not a whole object file and is left unserved").c_str());
+            }
             continue;
         }
+        // A sibling's object, which its own journal and its own start deal with.
+        if (!owns(b.name, d.key))
+            continue;
 
         auto found = b.objects.find(d.key);
         if (found == b.objects.end())
@@ -494,7 +578,7 @@ bool object_store::rewrite_journal_sync(bucket& b, std::string& err)
         return false;
     }
 
-    std::string buf = encode_journal_header(m_opts.shard);
+    std::string buf = encode_journal_header(m_opts.shard, m_opts.nshards);
     uint64_t    off = 0;
     bool        ok  = true;
     for (const auto& [k, m] : b.objects)

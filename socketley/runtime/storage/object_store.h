@@ -50,11 +50,17 @@ enum class st : uint8_t
     storage_full,
     // Another operation on the same bucket has to finish first.
     busy,
+    // A create-only write found the key already there.
+    precondition_failed,
     io_error,
     cancelled,
 };
 
 const char* status_name(st s);
+
+// The smallest string greater than every string that begins with `s`, empty
+// when there is none because `s` is all 0xFF bytes.
+std::string prefix_successor(std::string s);
 
 struct bucket_info
 {
@@ -158,6 +164,9 @@ struct commit_request
     // In the bucket's tmp directory, written and synced.
     std::string tmp_name;
     object_meta meta;
+    // Refused with precondition_failed when the key already exists, decided by
+    // the owner under the key's lane so two racing creators cannot both win.
+    bool        create_only{false};
 };
 
 // A body being written, from the first byte to the commit.
@@ -182,6 +191,9 @@ public:
     size_t append(const char* p, size_t n);
 
     void on_ready(std::function<void()> cb) { m_ready_cb = std::move(cb); }
+
+    // The commit refuses to replace an object that is already there.
+    void set_create_only(bool on) { m_create_only = on; }
 
     // Called once, with the reason, if the write fails before finish().
     void on_failed(std::function<void(st)> cb) { m_failed_cb = std::move(cb); }
@@ -270,11 +282,24 @@ private:
     bool                             m_header_writing{false};
     bool                             m_sync_started{false};
     bool                             m_tmp_committed{false};
+    bool                             m_create_only{false};
     mutable bool                     m_want_ready{false};
     std::function<void(put_result)>  m_done;
     std::function<void()>            m_ready_cb;
     std::function<void(st)>          m_failed_cb;
     bool                             m_notified_failed{false};
+};
+
+// The steps of a store that belong to another shard, which its owner hands to
+// whatever carries a request to a sibling.  The body of an object never
+// crosses: only the names and the metadata do.
+class shard_peers
+{
+public:
+    virtual ~shard_peers() = default;
+    virtual void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) = 0;
+    virtual void remove(uint32_t owner, std::string bucket, std::string key,
+                        std::function<void(st, bool existed)> cb) = 0;
 };
 
 class object_store
@@ -300,9 +325,38 @@ public:
     void create_bucket(std::string name, std::function<void(st)> cb);
     void delete_bucket(std::string name, std::function<void(st)> cb);
 
+    // The halves of a bucket's life that a sharded runtime runs on more than
+    // one shard: the others take up a bucket shard 0 made, and drop one in
+    // three steps so that no shard is left holding a directory that moved.
+    void adopt_bucket(std::string name, int64_t created_ms, std::function<void(st)> cb);
+    int64_t bucket_created_ms(std::string_view name) const;
+    // Refuses a bucket that holds objects or work, and otherwise stops it
+    // taking any until it is dropped or the drop is aborted.
+    st   drop_check(std::string_view name);
+    void drop_abort(std::string_view name);
+    void drop_rename(std::string name, std::function<void(st)> cb);
+    void drop_forget(std::string_view name);
+
+    // ── Sharding ────────────────────────────────────────────────────────────
+    uint32_t shard() const { return m_opts.shard; }
+    uint32_t shards() const { return m_opts.nshards; }
+    uint32_t owner_of(std::string_view bucket, std::string_view key) const;
+    bool     owns(std::string_view bucket, std::string_view key) const
+    {
+        return owner_of(bucket, key) == m_opts.shard;
+    }
+    void set_peers(shard_peers* peers) { m_peers = peers; }
+
     // ── Objects, answered from memory ───────────────────────────────────────
-    // The pointer is valid until the next operation that changes the bucket.
+    // Only the keys this shard owns are held, so a key another shard owns is
+    // absent here whether it exists or not.  The pointer is valid until the
+    // next operation that changes the bucket.
     const object_meta* find(std::string_view bucket, std::string_view key) const;
+
+    // The metadata of any object, from memory when this shard owns the key and
+    // from the object's own header otherwise.
+    void stat_object(std::string_view bucket, std::string_view key,
+                     std::function<void(st, const object_meta&)> cb);
     st list(std::string_view bucket, const list_query& q, list_page& out) const;
 
     // ── Writes ──────────────────────────────────────────────────────────────
@@ -314,12 +368,17 @@ public:
                                       object_meta meta, uint64_t expected, bool size_known,
                                       st& why);
 
-    // The single step that makes a written body the object: rename, sync, journal.
-    // A function call now, and the one a shard would send to the key's owner.
+    // The single step that makes a written body the object: rename, sync,
+    // journal.  Done here when this shard owns the key and by the owner
+    // otherwise, and a body that did not become the object is removed.
     void commit(commit_request req, std::function<void(put_result)> cb);
+
+    // The step itself, which only the owner of the key may run.
+    void commit_local(commit_request req, std::function<void(put_result)> cb);
 
     // `existed` says whether there was an object to remove.
     void remove(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
+    void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
 
     // A new body made of an existing object's, with the metadata `meta` names.
     void copy(std::string_view src_bucket, std::string_view src_key,
@@ -346,8 +405,9 @@ public:
 
     uint64_t now_ms() const;
 
-    // The name of a fresh file in a bucket's tmp directory.
-    static std::string tmp_name();
+    // The name of a fresh file in a bucket's tmp directory, named for this shard
+    // so a restart removes only the files its own uploads left.
+    std::string tmp_name() const;
 
     // Bytes something outside the object namespace holds on the disk, counted
     // against the quota until they are given back.
@@ -404,7 +464,8 @@ private:
 
     // Startup, blocking.
     bool recover_bucket(const std::string& name, recovery_report& rep, std::string& err);
-    bool load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt, recovery_report& rep);
+    bool load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt, bool& other_layout,
+                      recovery_report& rep);
     void reconcile_with_files(bucket& b, recovery_report& rep);
     bool rewrite_journal_sync(bucket& b, std::string& err);
 
@@ -424,12 +485,23 @@ private:
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
 
+    // What a quota lets this shard hold: an equal share, since the shards
+    // cannot see each other's bytes.
+    uint64_t quota() const;
+    void create_bucket_impl(std::string name, bool adopt, int64_t created_ms,
+                            std::function<void(st)> cb);
+    void forget_bucket(const std::string& name);
+
     event_loop*   m_loop;
     file_io*      m_io;
     store_options m_opts;
     int           m_root_fd{-1};
     std::map<std::string, std::unique_ptr<bucket>, std::less<>> m_buckets;
     std::unordered_set<std::string> m_creating;
+    shard_peers* m_peers{nullptr};
+    // A test hook: a commit of a key with this prefix kills the process after
+    // its rename and before its journal record.
+    std::string m_kill_after_rename;
     uint64_t m_reserved{0};
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.

@@ -12,6 +12,7 @@
 
 #include "s3_sigv4_auth.h"
 #include "storage_run.h"
+#include "../../shared/runtime_manager.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/logging.h"
 #include "../../shared/socket_tuning.h"
@@ -26,6 +27,8 @@ storage_instance::storage_instance(std::string_view name)
 
 storage_instance::~storage_instance()
 {
+    if (auto* mgr = get_runtime_manager())
+        mgr->requests().drop_sink(this);
     // A runtime destroyed while running has its run freed by the graveyard's
     // destructor, which is only safe because the loop is gone first in every
     // process that builds one.
@@ -79,6 +82,29 @@ std::string storage_instance::config_refusal() const
                 {m_access_key, m_secret_key, m_credentials_file, m_anonymous}); !why.empty())
             return "storage: " + why + "\n";
     return {};
+}
+
+void storage_instance::serve_request(std::string_view, std::string& out)
+{
+    // Unreachable because serves_inline() is false.
+    out.clear();
+}
+
+bool storage_instance::serve_deferred(uint64_t ticket, std::string_view, std::string_view payload)
+{
+    if (!m_run || get_shards() <= 1)
+        return false;
+    auto* mgr = get_runtime_manager();
+    if (!mgr)
+        return false;
+    request_channel* ch = &mgr->requests();
+    // The channel outlives the run, so an answer that comes after the run is
+    // gone still lands on a ticket the channel knows or ignores.
+    m_run->node().serve(payload, [ch, ticket](bool ok, std::string reply)
+    {
+        ch->complete_deferred(ticket, ok ? request_status::ok : request_status::no_target, reply);
+    });
+    return true;
 }
 
 void storage_instance::refresh_cached_limits()
@@ -211,7 +237,19 @@ bool storage_instance::setup(event_loop& loop)
             m_graveyard.push_back(std::move(run));
             return false;
         }
-        auto r = socketley::unix_sock::bind_listener(listen_path);
+        // One node per shard, because a path is one listener and the second
+        // process to bind it would unlink the first.
+        if (const std::string msg = socketley::unix_sock::shard_listen_path_refusal(
+                listen_path, get_shards()); !msg.empty())
+        {
+            LOG_ERROR(("storage: " + msg).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        const std::string mine = socketley::unix_sock::shard_listen_path(
+            listen_path, get_shard_index(), get_shards());
+        auto r = socketley::unix_sock::bind_listener(mine);
         if (r.fd < 0)
         {
             LOG_ERROR(("storage: " + r.error).c_str());
@@ -220,7 +258,7 @@ bool storage_instance::setup(event_loop& loop)
             return false;
         }
         fd = r.fd;
-        m_bound_listen_path = listen_path;
+        m_bound_listen_path = mine;
     }
     else if (!open_listener(effective_port(), /*reuseport=*/get_shards() > 1, fd))
     {
@@ -328,5 +366,20 @@ std::string storage_instance::stats_lines() const
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)
         out << "error_" << code << ":" << n << "\n";
+    if (get_shards() > 1)
+    {
+        // What the shards say to one another, per shard because how the work
+        // is spread is a question a sum cannot answer.
+        const auto& n = m_run->node().counters();
+        out << "shard_index:" << get_shard_index() << "\n"
+            << "shard_commits_sent:" << n.commits_out << "\n"
+            << "shard_commits_served:" << n.commits_in << "\n"
+            << "shard_deletes_sent:" << n.removes_out << "\n"
+            << "shard_deletes_served:" << n.removes_in << "\n"
+            << "shard_list_fanouts:" << n.list_fanouts << "\n"
+            << "shard_list_pages_served:" << n.list_pages_served << "\n"
+            << "shard_bucket_ops:" << n.bucket_ops << "\n"
+            << "shard_peer_failures:" << n.peer_failures << "\n";
+    }
     return out.str();
 }

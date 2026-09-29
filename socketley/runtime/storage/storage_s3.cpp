@@ -315,7 +315,7 @@ void storage_run::op_create_bucket(const std::shared_ptr<conn>& c)
 {
     std::weak_ptr<conn> weak = c;
     const std::string name = c->req.bucket;
-    m_store.create_bucket(name, [this, weak, name](st s)
+    m_node.create_bucket(name, [this, weak, name](st s)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -340,7 +340,7 @@ void storage_run::op_delete_bucket(const std::shared_ptr<conn>& c)
         return;
     }
     std::weak_ptr<conn> weak = c;
-    m_store.delete_bucket(c->req.bucket, [this, weak](st s)
+    m_node.delete_bucket(c->req.bucket, [this, weak](st s)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -437,7 +437,7 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
     lr.v2        = v2;
     lr.owner_id  = "socketley";
 
-    std::string token_text, next_token, next_marker;
+    std::string token_text;
     if (v2)
     {
         lq.start_after = std::string(q.get_query("start-after"));
@@ -462,36 +462,44 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
         lr.marker      = q.get_query("marker");
     }
 
-    list_page page;
-    const st s = m_store.list(q.bucket, lq, page);
-    if (s != st::ok)
+    // Every shard's part of the answer, merged, and the request's own strings
+    // are still the views `lr` holds for as long as the connection is.
+    std::weak_ptr<conn> weak = c;
+    m_node.list(q.bucket, lq, [this, weak, lr, v2](st s, list_page page) mutable
     {
-        send_error_st(c, s);
-        return;
-    }
-    if (v2 && page.truncated)
-    {
-        next_token = base64url_encode(page.resume_at);
-        lr.next_token = next_token;
-    }
-    if (!v2 && page.truncated)
-    {
-        // The last thing this page returned, which the next request's marker
-        // picks up after.
-        const std::string* last = nullptr;
-        if (!page.objects.empty())
-            last = &page.objects.back().key;
-        if (!page.prefixes.empty() && (!last || page.prefixes.back() > *last))
-            last = &page.prefixes.back();
-        if (last)
-            next_marker = *last;
-        lr.next_marker = next_marker;
-    }
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        if (s != st::ok)
+        {
+            send_error_st(cc, s);
+            return;
+        }
+        std::string next_token, next_marker;
+        if (v2 && page.truncated)
+        {
+            next_token = base64url_encode(page.resume_at);
+            lr.next_token = next_token;
+        }
+        if (!v2 && page.truncated)
+        {
+            // The last thing this page returned, which the next request's marker
+            // picks up after.
+            const std::string* last = nullptr;
+            if (!page.objects.empty())
+                last = &page.objects.back().key;
+            if (!page.prefixes.empty() && (!last || page.prefixes.back() > *last))
+                last = &page.prefixes.back();
+            if (last)
+                next_marker = *last;
+            lr.next_marker = next_marker;
+        }
 
-    response r;
-    r.headers.emplace_back("Content-Type", "application/xml");
-    r.body = list_xml(lr, page);
-    send_response(c, std::move(r));
+        response r;
+        r.headers.emplace_back("Content-Type", "application/xml");
+        r.body = list_xml(lr, page);
+        send_response(cc, std::move(r));
+    });
 }
 
 // ─── DeleteObjects ──────────────────────────────────────────────────────────
@@ -658,15 +666,18 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    // S3's conditional write: refuse to replace what is there.
-    if (r.header("if-none-match") == "*" && m_store.find(r.bucket, r.key))
+    // S3's conditional write: refuse to replace what is there.  A key another
+    // shard owns is not known here, so its owner decides at commit, which is
+    // also where two racing creators are told apart.
+    const bool create_only = r.header("if-none-match") == "*";
+    if (create_only && m_store.owns(r.bucket, r.key) && m_store.find(r.bucket, r.key))
     {
         r.keep_alive = false;
         send_error(c, make_error("PreconditionFailed"), true);
         return;
     }
 
-    start_put(c, r.key, std::move(meta), {});
+    start_put(c, r.key, std::move(meta), {}, checksum_algo::none, create_only);
 }
 
 // Begins streaming the request's body into a temporary file for `key`, after
@@ -674,7 +685,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
 // the finished file goes when it is not the object namespace, and a checksum
 // algorithm is taken whether or not the client named one when `forced_algo` says so.
 void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
-                            put_op::committer committer, checksum_algo forced_algo)
+                            put_op::committer committer, checksum_algo forced_algo, bool create_only)
 {
     s3_request& r = c->req;
 
@@ -762,6 +773,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     }
     if (committer)
         op->set_committer(std::move(committer));
+    op->set_create_only(create_only);
     begin_put_body(c, std::move(op));
 }
 
@@ -830,12 +842,28 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    const object_meta* src_meta = m_store.find(src_bucket, src_key);
-    if (!src_meta)
-    {
-        send_error_st(c, st::no_such_key);
-        return;
-    }
+    // The source may be another shard's, whose header is then read from its file.
+    std::weak_ptr<conn> weak = c;
+    m_store.stat_object(src_bucket, src_key,
+        [this, weak, src_bucket, src_key, replace](st s, const object_meta& sm)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (s != st::ok)
+            {
+                send_error_st(cc, s);
+                return;
+            }
+            op_copy_from(cc, src_bucket, src_key, replace, sm);
+        });
+}
+
+void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket,
+                               std::string src_key, bool replace, const object_meta& src)
+{
+    s3_request& r = c->req;
+    const object_meta* src_meta = &src;
     if (src_bucket == r.bucket && src_key == r.key && !replace)
     {
         s3_error e = make_error("InvalidRequest");
@@ -1051,8 +1079,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    const object_meta* mem = m_store.find(q.bucket, q.key);
-    if (!mem)
+    // Memory holds this shard's keys only, so another shard's key is asked of
+    // its file, which is the truth and which any shard can read.
+    const bool mine = m_store.owns(q.bucket, q.key);
+    const object_meta* mem = mine ? m_store.find(q.bucket, q.key) : nullptr;
+    if (mine && !mem)
     {
         send_error_st(c, st::no_such_key);
         return;
@@ -1166,15 +1197,33 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_file(cc, std::move(r), fd, data_off + first, len);
     };
 
+    std::weak_ptr<conn> weak = c;
     if (head)
     {
-        answer(*mem, -1, 0, std::string{});
+        if (mem)
+        {
+            answer(*mem, -1, 0, std::string{});
+            return;
+        }
+        m_store.stat_object(q.bucket, q.key, [this, weak, answer](st s, const object_meta& m)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+                return;
+            if (s != st::ok)
+            {
+                send_error_st(cc, s);
+                return;
+            }
+            answer(m, -1, 0, std::string{});
+        });
         return;
     }
 
-    std::weak_ptr<conn> weak = c;
-    // Small objects are read whole with their header, in one read.
-    const size_t prefetch = mem->size <= 60000 ? static_cast<size_t>(mem->size) : 0;
+    // Small objects are read whole with their header, in one read; a key whose
+    // size is not known here is read that way too, since the read is short for
+    // a small object and only a little long for a large one.
+    const size_t prefetch = mem ? (mem->size <= 60000 ? static_cast<size_t>(mem->size) : 0) : 60000;
     m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer](open_result o)
     {
         auto cc = weak.lock();
