@@ -63,6 +63,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     if (auto* b = store->find_bucket(m_bucket))
         ++b->active_puts;
     ++store->m_inflight;
+    ++store->m_puts_active;
 
     m_tmp_name = object_store::tmp_name();
     auto self = shared_from_this();
@@ -120,6 +121,7 @@ void put_op::release()
         if (b->active_puts > 0)
             --b->active_puts;
     --m_store->m_inflight;
+    --m_store->m_puts_active;
 }
 
 void put_op::cleanup_tmp()

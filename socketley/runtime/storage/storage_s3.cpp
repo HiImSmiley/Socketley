@@ -595,7 +595,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
             expected = *d;
             known    = true;
         }
-    if (m_active_puts >= m_max_active_puts)
+    if (m_store.active_puts() >= m_max_active_puts)
     {
         r.keep_alive = false;
         send_error(c, make_error("SlowDown"), true);

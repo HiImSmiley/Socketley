@@ -322,6 +322,9 @@ public:
     // Whether anything is still being written, which a clean stop must wait out.
     bool busy() const;
 
+    // Bodies on their way in across every bucket, for a cap on what streaming puts hold.
+    uint32_t active_puts() const { return m_puts_active; }
+
     uint64_t now_ms() const;
 
 private:
@@ -407,6 +410,7 @@ private:
     // Set false when the store goes away, so a callback still in the ring finds out.
     std::shared_ptr<bool> m_alive;
     uint32_t m_inflight{0};
+    uint32_t m_puts_active{0};
     bool     m_clean_start{false};
 };
 

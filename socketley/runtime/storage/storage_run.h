@@ -346,7 +346,6 @@ private:
     bool        m_stopped{false};
 
     // A cap on what streaming puts hold, so a thousand uploaders cannot ask for a thousand buffers.
-    uint32_t    m_active_puts{0};
     uint32_t    m_max_active_puts{512};
     size_t      m_zero_copy_min{64 * 1024};
     size_t      m_max_conns{0};
