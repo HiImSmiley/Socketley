@@ -116,7 +116,9 @@ private:
         }
         step& s = m_steps[m_i++];
         const int64_t tolerate = s.tolerate;
-        const bool queued = s.fn([self, tolerate](int64_t r)
+        // A launched step's captures go with it, or one that holds what holds this chain is a cycle.
+        const launch fn = std::move(s.fn);
+        const bool queued = fn([self, tolerate](int64_t r)
         {
             if (!*self->m_alive)
                 return;
