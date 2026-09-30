@@ -585,10 +585,14 @@ private:
     const bucket* find_bucket(std::string_view name) const;
 
     // Startup, blocking.
-    bool recover_bucket(const std::string& name, recovery_report& rep, std::string& err);
+    struct recovering;
+    bool recover_bucket(const std::string& name, recovery_report& rep, std::vector<recovering>& out,
+                        std::string& err);
+    bool finish_bucket(recovering& r, recovery_report& rep, std::string& err);
     bool load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt, bool& other_layout,
                       recovery_report& rep);
-    void reconcile_with_files(bucket& b, recovery_report& rep);
+    // Reads every object file of the buckets that need it, on threads; false when a directory could not be read whole.
+    bool reconcile_with_files(std::vector<recovering>& rs, recovery_report& rep, std::string& err);
     bool rewrite_journal_sync(bucket& b, std::string& err);
 
     // The journal.

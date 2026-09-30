@@ -6473,6 +6473,28 @@ That reading happens before the listener opens and takes as long as the object
 count makes it, and is the only place the loop blocks on the disk: every request
 is served on the runtime's io_uring.
 .PP
+The start after a crash reads every header even of a file the journal names with
+the same size, since an overwrite whose record was lost can leave exactly that: the
+header is the only thing that tells the two versions apart. What makes it fast is
+that the reads are many at once. The 256 directories of every bucket are shared out
+among threads, one per CPU the runtime may run on (at most 16,
+\fBSOCKETLEY_STORAGE_RECOVERY_THREADS\fR), which have joined before the listener
+opens; each reads its directories with 128 KiB
+.BR getdents64 (2)
+calls and keeps 32 opens and header reads in flight on an io_uring of its own
+(\fBSOCKETLEY_STORAGE_RECOVERY_DEPTH\fR, 0 for one file at a time without a ring),
+all within half of what
+.B RLIMIT_NOFILE
+leaves. Only a file at the one path its key gives, \fIab\fB/\fIsha256(key)\fR, is
+read, which is what lets a bucket whose files match its journal one for one skip
+the search for records whose file is gone. A directory that cannot be read whole,
+or a descriptor table that runs out on the way, fails the start with the reason
+rather than dropping the objects it did not see. With 1 KiB objects on an ext4
+virtio disk and four CPUs, 100,000 objects take 0.24 s with a warm cache (0.8 s
+before this was parallel) and about 1 s from a cold one (11 to 33 s before), and
+1,000,000 take 2.3 s warm (9.8 s) and 19 s cold (344 s); a start after a clean
+stop reads only the journals, 0.07 s for 100,000 and 0.66 s for 1,000,000.
+.PP
 A body is never held whole: it streams from the socket into a megabyte staging
 buffer, is hashed as it passes (on helper threads from 256 KiB up, so that the
 loop is not the one core that hashes every upload) and written while the next
@@ -6542,8 +6564,9 @@ drifts by two to three times within an hour, which is why these rows name their
 phase.
 .PP
 The journal is not waited for: a stop syncs
-it, and a start after any other stop reads every object header, which takes about 5
-seconds per 100,000 objects with a warm cache. Uploads of 256 KiB or more are
+it, and a start after any other stop reads every object header, which takes about a
+quarter of a second per 100,000 objects with a warm cache and about a second from a
+cold one on four CPUs (see How objects are stored). Uploads of 256 KiB or more are
 hashed on helper threads (\fBSOCKETLEY_STORAGE_HASH_THREADS\fR), which is what lets
 a 64 MiB put at 32 connections use the disk rather than one core.
 .
@@ -10955,6 +10978,26 @@ the throughput of large puts, never what is stored.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_RECOVERY_THREADS
+How many threads a storage worker reads its object headers on at a start after a
+stop that was not clean, 1 to 64. Default: the CPUs the worker may run on, at most
+16. The threads end before the listener opens. This changes how long such a start
+takes, never what it finds.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
+.B SOCKETLEY_STORAGE_RECOVERY_DEPTH
+How many opens and header reads each of those threads keeps in flight on an io_uring
+of its own, 0 to 256; both this and the thread count are lowered to fit half of what
+.B RLIMIT_NOFILE
+leaves. Default
+.BR 32 ;
+.B 0
+reads one file at a time without a ring. This changes how long a start from a cold
+cache takes, never what it finds.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_RECV_BUFS
 How many 16 KiB buffers the receive ring of a storage worker holds, a power of two.
 Default
@@ -12139,7 +12182,7 @@ worker's, so what it holds up is every runtime at once.
 On start, before its listener exists, it reads the directory, removes temporary
 files and, after any stop that was not clean, reads every object's header to
 reconcile the journals \(em a start that takes as long as the object count
-makes it. On stop it syncs a marker file saying the stop was clean. Between the
+makes it, on threads and many reads at once, which have all ended before it serves. On stop it syncs a marker file saying the stop was clean. Between the
 two every read and write of a file is an io_uring operation, so a slow disk is
 latency on the requests waiting for it and not a runtime that stopped answering
 its other connections.

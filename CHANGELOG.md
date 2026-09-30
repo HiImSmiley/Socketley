@@ -59,9 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   What changed: the 65536 second-level directories are 256 made with the bucket,
   so a put never makes and syncs one; a put is answered when its file, its rename
   and its directory are durable and the journal record follows behind it (a stop
-  syncs it, and any other start reads the object headers, which it already did:
-  about 5 s per 100,000 objects with a warm cache, against 10 ms after a clean
-  stop), and that record is synced once a megabyte has gathered, before a
+  syncs it, and any other start reads every object header, which it already did,
+  now on one thread per CPU with 32 opens and reads in flight each on an io_uring
+  of its own (`SOCKETLEY_STORAGE_RECOVERY_THREADS`, `SOCKETLEY_STORAGE_RECOVERY_DEPTH`),
+  all joined before the listener opens: on four CPUs 100,000 objects of 1 KiB
+  take 0.24 s with a warm cache (0.8 s one at a time) and about 1 s cold (11 to
+  33 s), 1,000,000 take 2.3 s warm (9.8 s) and 19 s cold (344 s), and four
+  shards, each reading every header, 0.52 s for 100,000 warm (0.75 s) and 0.94 s
+  cold (10 s), 5.4 s for 1,000,000 warm (8.8 s) and 19 s cold (192 s); a start
+  after a clean stop reads the journals only, 0.07 s for 100,000 and 0.66 s for
+  1,000,000), and that record is synced once a megabyte has gathered, before a
   compaction or at a stop, no longer each time the queue drains, where the next
   put's own sync queued behind it (4 KiB puts at one connection 77 to 104 per
   second); a put of up to 1 MiB with a known length and no condition is written

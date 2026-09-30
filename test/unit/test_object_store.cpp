@@ -20,7 +20,9 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 // The object store on a real ring and a real directory: what a PUT leaves on
@@ -1177,6 +1179,216 @@ TEST_CASE("an object directory that has gone is made again by the next put and b
     CHECK(again.get("bkt", "lost", got) == st::ok);
 }
 
+TEST_CASE("a copy of an object file away from its key's path does not stand in for a file that is gone")
+{
+    tmpdir d;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        REQUIRE(r.put("bkt", "a", "alpha").status == st::ok);
+        REQUIRE(r.put("bkt", "b", "beta").status == st::ok);
+        r.settle();
+    }
+    // A delete of b whose record never landed, and a copy of a's file in a
+    // directory its key does not lead to: as many whole files as records.
+    fs::remove(data_path(d.path, "bkt", "b"));
+    const std::string h     = key_hash("a");
+    const std::string other = h.substr(0, 2) == "00" ? "01" : "00";
+    fs::copy_file(data_path(d.path, "bkt", "a"), d.path + "/bkt/data/" + other + "/" + h);
+
+    rig again(d.path);
+    CHECK_FALSE(again.report.clean_start);
+    CHECK(again.report.dropped == 1);
+    CHECK(again.store->find("bkt", "b") == nullptr);
+    CHECK(again.store->find("bkt", "a") != nullptr);
+    list_page p;
+    REQUIRE(again.store->list("bkt", {}, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"a"});
+}
+
+TEST_CASE("an overwrite of the same size whose journal record never landed serves the new object")
+{
+    tmpdir d;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        REQUIRE(r.put("bkt", "k", "old-body").status == st::ok);
+        r.settle();
+    }
+    const std::string jbefore = slurp(journal_path(d.path, "bkt"));
+    {
+        rig r(d.path);
+        REQUIRE(r.put("bkt", "k", "new-body").status == st::ok);
+        r.settle();
+    }
+    spill(journal_path(d.path, "bkt"), jbefore);
+
+    // Same name and same size as the record says, so only the header tells them apart.
+    rig again(d.path);
+    CHECK(again.report.adopted == 1);
+    const object_meta* m = again.store->find("bkt", "k");
+    REQUIRE(m != nullptr);
+    CHECK(m->md5 == md5_of("new-body"));
+    std::string got;
+    REQUIRE(again.get("bkt", "k", got) == st::ok);
+    CHECK(got == "new-body");
+}
+
+namespace {
+
+// Sets an environment variable for as long as it lives.
+struct env_var
+{
+    std::string name;
+    env_var(const char* n, const char* v) : name(n) { ::setenv(n, v, 1); }
+    ~env_var() { ::unsetenv(name.c_str()); }
+};
+
+void crash_start_everywhere()
+{
+    tmpdir d;
+    const char* buckets[] = {"bkt-a", "bkt-b", "bkt-c"};
+    std::map<std::string, uint64_t> half;
+    {
+        rig r(d.path);
+        for (const char* b : buckets)
+        {
+            REQUIRE(r.make_bucket(b) == st::ok);
+            for (int i = 0; i < 300; ++i)
+                REQUIRE(r.put(b, "key-" + std::to_string(i), std::string(b) + std::to_string(i)).status == st::ok);
+        }
+        r.settle();
+        for (const char* b : buckets)
+            half[b] = fs::file_size(journal_path(d.path, b));
+        for (const char* b : buckets)
+        {
+            for (int i = 300; i < 600; ++i)
+                REQUIRE(r.put(b, "key-" + std::to_string(i), std::string(b) + std::to_string(i)).status == st::ok);
+            for (int i = 0; i < 100; ++i)
+                REQUIRE(r.del(b, "key-" + std::to_string(i)) == st::ok);
+            // An overwrite of the same size, which only the header tells from the record.
+            for (int i = 100; i < 150; ++i)
+                REQUIRE(r.put(b, "key-" + std::to_string(i), std::string(b) + "Z" + std::to_string(i).substr(1)).status == st::ok);
+        }
+        r.settle();
+    }
+    // The journals as they were half way, which is what a crash that lost the last group commits leaves.
+    for (const char* b : buckets)
+        fs::resize_file(journal_path(d.path, b), half[b]);
+
+    rig again(d.path);
+    CHECK_FALSE(again.report.clean_start);
+    CHECK(again.report.objects == 3u * 500u);
+    CHECK(again.report.dropped == 3u * 100u);
+    CHECK(again.report.adopted == 3u * (300u + 50u));
+    for (const char* b : buckets)
+        for (int i = 0; i < 600; ++i)
+        {
+            const std::string key = "key-" + std::to_string(i);
+            const object_meta* m  = again.store->find(b, key);
+            INFO(b << " " << key);
+            if (i < 100)
+            {
+                CHECK(m == nullptr);
+                continue;
+            }
+            REQUIRE(m != nullptr);
+            const std::string body = i < 150 ? std::string(b) + "Z" + std::to_string(i).substr(1)
+                                             : std::string(b) + std::to_string(i);
+            CHECK(m->md5 == md5_of(body));
+        }
+}
+
+size_t open_fds()
+{
+    size_t n = 0;
+    for ([[maybe_unused]] const auto& e : fs::directory_iterator("/proc/self/fd"))
+        ++n;
+    return n;
+}
+
+}   // namespace
+
+TEST_CASE("a start after a crash finds every adoption and every loss in every object directory of every bucket")
+{
+    // As many threads as CPUs with many headers in flight, then one thread
+    // reading one file at a time, then several threads one file each through a ring.
+    SUBCASE("the default walk") { crash_start_everywhere(); }
+    SUBCASE("one thread, no ring")
+    {
+        env_var t("SOCKETLEY_STORAGE_RECOVERY_THREADS", "1");
+        env_var w("SOCKETLEY_STORAGE_RECOVERY_DEPTH", "0");
+        crash_start_everywhere();
+    }
+    SUBCASE("three threads, one file in flight each")
+    {
+        env_var t("SOCKETLEY_STORAGE_RECOVERY_THREADS", "3");
+        env_var w("SOCKETLEY_STORAGE_RECOVERY_DEPTH", "1");
+        crash_start_everywhere();
+    }
+}
+
+TEST_CASE("the walk of the object files keeps within the descriptors RLIMIT_NOFILE leaves and finds every object")
+{
+    tmpdir d;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        r.store->close(true);
+    }
+    // Written straight into place, some twenty to a directory, and no journal
+    // knows them, as a crash that took every record leaves them.
+    constexpr int count = 5000;
+    for (int i = 0; i < count; ++i)
+    {
+        const std::string key = "k" + std::to_string(i);
+        object_meta m;
+        m.size = 1;
+        m.md5  = md5_of("v");
+        spill(data_path(d.path, "bkt", key), encode_object_header(key, m) + "v");
+    }
+    fs::remove(d.path + "/.clean.0");
+
+    // In a child, since a hard limit once lowered stays lowered, and after the
+    // ring, whose table of registered files the limit would refuse.
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0)
+    {
+        struct quiet : io_handler
+        {
+            void on_cqe(struct io_uring_cqe*) override {}
+        } h;
+        event_loop loop{256};
+        if (!loop.init())
+            ::_exit(10);
+        file_io io(loop, &h);
+        // Room for the store and a few files more, far fewer than the threads would hold at full depth.
+        struct rlimit low{};
+        low.rlim_cur = low.rlim_max = open_fds() + 12;
+        if (::setrlimit(RLIMIT_NOFILE, &low) < 0)
+            ::_exit(11);
+        store_options o;
+        o.dir = d.path;
+        object_store s(loop, io, o);
+        recovery_report rep;
+        std::string err;
+        if (!s.open(err, &rep))
+        {
+            std::fprintf(stderr, "open: %s\n", err.c_str());
+            ::_exit(12);
+        }
+        const bool good = !rep.clean_start && rep.objects == count && rep.adopted == count &&
+                          s.find("bkt", "k4999") != nullptr;
+        s.close(false);
+        ::_exit(good ? 0 : 13);
+    }
+    int status = 0;
+    REQUIRE(::waitpid(pid, &status, 0) == pid);
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+}
+
 TEST_CASE("a body hashed on the pool's threads stores the same bytes and the same ETag as one hashed in line")
 {
     tmpdir d;
@@ -1828,6 +2040,80 @@ TEST_CASE("a whole pooled file of a key another shard owns is left to that shard
     CHECK(s1.report.rolled_forward == 1);
     CHECK(s1.store->find("bkt", key) != nullptr);
     CHECK_FALSE(fs::exists(d.path + "/bkt/pool/" + pool_name));
+}
+
+TEST_CASE("a pooled file rolled forward on a start that trusts its journal is still indexed")
+{
+    tmpdir d;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        REQUIRE(r.put("bkt", "old", "o").status == st::ok);
+        r.store->close(true);
+    }
+    // A whole pooled file its journal never heard of, beside the marker of a clean stop.
+    object_meta m;
+    m.size = 4;
+    m.md5  = md5_of("body");
+    fs::create_directories(d.path + "/bkt/pool");
+    spill(d.path + "/bkt/pool/0.00000000000000000000000000000004", encode_object_header("new", m) + "body");
+    REQUIRE(fs::exists(d.path + "/.clean.0"));
+
+    rig again(d.path);
+    CHECK(again.report.clean_start);
+    CHECK(again.report.rolled_forward == 1);
+    CHECK(again.store->find("bkt", "new") != nullptr);
+    CHECK(again.store->find("bkt", "old") != nullptr);
+    std::string got;
+    REQUIRE(again.get("bkt", "new", got) == st::ok);
+    CHECK(got == "body");
+}
+
+TEST_CASE("a new pooled put whose rename and journal record a crash both took is in the index after the next start")
+{
+    tmpdir d;
+    const std::string v = pattern(2000, 7);
+    std::string journal;
+    {
+        rig r(d.path);
+        r.plain = true;
+        for (const char* b : {"bkt", "other"})
+        {
+            REQUIRE(r.make_bucket(b) == st::ok);
+            REQUIRE(r.put(b, "old", "o").status == st::ok);
+        }
+        REQUIRE(r.put("bkt", "gone", "g").status == st::ok);
+        REQUIRE(r.until([&] { return !r.store->busy(); }));
+        r.store->close(true);
+        journal = slurp(journal_path(d.path, "bkt"));
+    }
+    {
+        rig r(d.path);
+        r.plain = true;
+        REQUIRE(r.put("bkt", "new", v).status == st::ok);
+        REQUIRE(r.del("bkt", "gone") == st::ok);
+        REQUIRE(r.until([&] { return !r.store->busy(); }));
+    }
+    // The record of each comes after its syncs, so a crash may leave neither
+    // record, and the new object's file still in pool/ under the name it was taken by.
+    spill(journal_path(d.path, "bkt"), journal);
+    fs::create_directories(d.path + "/bkt/pool");
+    fs::rename(data_path(d.path, "bkt", "new"), d.path + "/bkt/pool/0.00000000000000000000000000000003");
+    REQUIRE_FALSE(fs::exists(d.path + "/.clean.0"));
+
+    rig again(d.path);
+    CHECK_FALSE(again.report.clean_start);
+    CHECK(again.report.rolled_forward == 1);
+    CHECK(again.report.dropped == 1);
+    const object_meta* m = again.store->find("bkt", "new");
+    REQUIRE(m != nullptr);
+    CHECK(m->md5 == md5_of(v));
+    CHECK(again.store->find("bkt", "gone") == nullptr);
+    CHECK(again.store->find("bkt", "old") != nullptr);
+    CHECK(again.store->find("other", "old") != nullptr);
+    list_page p;
+    REQUIRE(again.store->list("bkt", {}, p) == st::ok);
+    CHECK(keys_of(p) == std::vector<std::string>{"new", "old"});
 }
 
 TEST_CASE("the next operation on a key waits until the pooled put before it is synced")

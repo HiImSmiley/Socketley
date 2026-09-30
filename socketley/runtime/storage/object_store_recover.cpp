@@ -2,22 +2,32 @@
 //
 // All of this is blocking on purpose: it runs in setup(), before the listener
 // is bound, so no connection can wait behind it and the ring is not asked for
-// anything.  Nothing here runs once the runtime serves.
+// anything.  Nothing here runs once the runtime serves, which is also why the
+// walk of the object files may take threads: they have joined before it does.
 #include "object_store.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <system_error>
+#include <thread>
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <liburing.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "s3_names.h"
+#include "shard_owner.h"
 #include "../../shared/logging.h"
 
 namespace fs = std::filesystem;
@@ -129,7 +139,346 @@ bool suffix_number(const std::string& name, std::string_view prefix, uint32_t& k
     return r.ec == std::errc{} && r.ptr == name.data() + name.size();
 }
 
+// The size of the buffer a directory is read into, some fifteen hundred names at a time.
+constexpr size_t dents_bytes = 128 * 1024;
+
+// Headers each thread of the walk has in flight, so that a cold disk has many reads to work on at once.
+constexpr unsigned walk_depth = 32;
+
+// What one object directory holds, as its files' headers say.
+struct dir_scan
+{
+    // Keys of the journal whose file says exactly what the journal does.
+    std::vector<const std::string*> matched;
+    // Files the journal lacks, or describes otherwise.
+    std::vector<std::pair<std::string, object_meta>> differ;
+    // Below the data directory, the files that are not whole object files.
+    std::vector<std::string> unsound;
+    // Why the directory could not be read whole, which fails the start rather than drop what went unseen.
+    int failed{0};
+};
+
+// An error that says nothing about the file and everything about the moment, such as a descriptor table that is full.
+bool transient(int e)
+{
+    return e == EMFILE || e == ENFILE || e == ENOMEM || e == EAGAIN || e == EINTR;
+}
+
+size_t open_fds()
+{
+    size_t n = 0;
+    std::error_code ec;
+    for (fs::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end; it.increment(ec))
+        ++n;
+    return n;
+}
+
+// How many threads walk the object files and how many headers each has in flight.
+struct walk_shape
+{
+    unsigned threads{1};
+    // Zero reads one file at a time, without a ring.
+    unsigned depth{0};
+};
+
+unsigned env_count(const char* name, unsigned fallback, unsigned lo, unsigned hi)
+{
+    if (const char* e = std::getenv(name))
+    {
+        char* end;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && *end == '\0' && v >= static_cast<long>(lo) && v <= static_cast<long>(hi))
+            return static_cast<unsigned>(v);
+    }
+    return fallback;
+}
+
+walk_shape recovery_shape()
+{
+    walk_shape w;
+    // One thread per CPU this process may use, so a pinned runtime stays on its pin.
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    const unsigned cpus = ::sched_getaffinity(0, sizeof set, &set) == 0
+                              ? static_cast<unsigned>(std::clamp(CPU_COUNT(&set), 1, 16))
+                              : 1u;
+    w.threads = env_count("SOCKETLEY_STORAGE_RECOVERY_THREADS", cpus, 1, 64);
+    w.depth   = env_count("SOCKETLEY_STORAGE_RECOVERY_DEPTH", walk_depth, 0, 256);
+
+    // Half of what RLIMIT_NOFILE leaves, since every thread holds a directory, a ring and its files.
+    struct rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+    {
+        const size_t used   = open_fds();
+        const size_t budget = rl.rlim_cur > used ? (rl.rlim_cur - used) / 2 : 0;
+        while (w.threads > 1 && budget < 3u * w.threads)
+            --w.threads;
+        const size_t per = budget / w.threads;
+        w.depth = static_cast<unsigned>(std::min<size_t>(w.depth, per > 2 ? per - 2 : 0));
+    }
+    return w;
+}
+
+enum class file_verdict : uint8_t { skip, unsound, ok, failed };
+
+// What a thread of the walk keeps from file to file: the digest files are named by, and whose keys it looks at.
+struct walker
+{
+    // Fetched once, since EVP_sha256() looks the digest up behind a lock on every call.
+    EVP_MD*          md{EVP_MD_fetch(nullptr, "SHA256", nullptr)};
+    EVP_MD_CTX*      ctx{EVP_MD_CTX_new()};
+    std::string_view bucket;
+    uint32_t         shard{0};
+    uint32_t         nshards{1};
+
+    walker() = default;
+    walker(const walker&)            = delete;
+    walker& operator=(const walker&) = delete;
+    ~walker()
+    {
+        EVP_MD_CTX_free(ctx);
+        EVP_MD_free(md);
+    }
+
+    // Whether `name` is the hash of `key`, the one name a file of that key may have.
+    bool named_for(std::string_view key, std::string_view name)
+    {
+        uint8_t  out[EVP_MAX_MD_SIZE];
+        unsigned len = 0;
+        if (!md || !ctx || EVP_DigestInit_ex(ctx, md, nullptr) != 1 ||
+            EVP_DigestUpdate(ctx, key.data(), key.size()) != 1 || EVP_DigestFinal_ex(ctx, out, &len) != 1)
+            return key_hash(key) == name;
+        return hex(out, len) == name;
+    }
+
+    // A key another shard owns is none of this one's business, except shard 0's, which says which files are not whole.
+    bool ignores(std::string_view key) const
+    {
+        return nshards > 1 && shard != 0 && object_owner(bucket, key, nshards) != shard;
+    }
+};
+
+// The verdict on an open object file whose first `n` bytes are in `head`, which closes it.
+file_verdict judge_object_file(walker& w, int fd, const struct stat& sb, const char* name, std::string& head,
+                               ssize_t n, decoded_header& d)
+{
+    if (n >= 0)
+    {
+        head.resize(static_cast<size_t>(n));
+        d = decode_object_header(head);
+        if (d.status == header_status::need_more && d.need <= 64 * 1024)
+        {
+            head.resize(d.need);
+            n = ::pread(fd, head.data(), head.size(), 0);
+            if (n >= 0)
+            {
+                head.resize(static_cast<size_t>(n));
+                d = decode_object_header(head);
+            }
+        }
+    }
+    ::close(fd);
+
+    if (n >= 0 && d.status == header_status::ok && w.ignores(d.key))
+        return file_verdict::skip;
+    const bool sound = n >= 0 && d.status == header_status::ok &&
+                       static_cast<uint64_t>(sb.st_size) == d.header_len + d.meta.size &&
+                       w.named_for(d.key, name);
+    return sound ? file_verdict::ok : file_verdict::unsound;
+}
+
+// A name the walk found, and whether it is to be followed to a regular file first.
+struct dir_entry
+{
+    uint32_t      at;
+    unsigned char type;
+};
+
+// A file that is no regular file, followed, as a link to an object file was always read as one.
+bool regular(int dir_fd, const char* name, unsigned char type)
+{
+    if (type == DT_REG)
+        return true;
+    struct stat lb{};
+    return (type == DT_UNKNOWN || type == DT_LNK) && ::fstatat(dir_fd, name, &lb, 0) == 0 && S_ISREG(lb.st_mode);
+}
+
+// What a failed open of an object file means: nothing when the file cannot be opened, a failed walk when the moment is to blame.
+file_verdict open_failed(int e, int& why)
+{
+    if (!transient(e))
+        return file_verdict::skip;
+    why = e;
+    return file_verdict::failed;
+}
+
+// One file at a time, for a walk that has no ring.
+template <typename V>
+void read_files_one_by_one(walker& w, int dfd, const std::vector<dir_entry>& es, const std::string& names,
+                           std::string& head, int& why, V&& verdict)
+{
+    for (const dir_entry& e : es)
+    {
+        const char* name = names.data() + e.at;
+        if (!regular(dfd, name, e.type))
+            continue;
+        decoded_header d;
+        const int fd = ::openat(dfd, name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            verdict(name, open_failed(errno, why), d);
+            continue;
+        }
+        struct stat sb{};
+        head.resize(object_header_align);
+        const ssize_t n = ::fstat(fd, &sb) == 0 ? ::pread(fd, head.data(), head.size(), 0) : -1;
+        verdict(name, judge_object_file(w, fd, sb, name, head, n, d), d);
+    }
+}
+
+// A slot of the ring's window: one file between its open and its verdict.
+struct ring_slot
+{
+    std::string head;
+    struct stat sb{};
+    int         fd{-1};
+    uint32_t    e{0};
+};
+
+// Every file of `es` opened and its header read through `ring`, as many at once as there are slots.
+template <typename V>
+void read_files_ring(walker& w, io_uring* ring, int dfd, const std::vector<dir_entry>& es, const std::string& names,
+                     std::vector<ring_slot>& slots, int& why, V&& verdict)
+{
+    size_t   next     = 0;
+    unsigned inflight = 0;
+    auto start_open = [&](unsigned s)
+    {
+        for (; next < es.size(); ++next)
+        {
+            const char* name = names.data() + es[next].at;
+            if (!regular(dfd, name, es[next].type))
+                continue;
+            io_uring_sqe* sqe = io_uring_get_sqe(ring);
+            io_uring_prep_openat(sqe, dfd, name, O_RDONLY | O_CLOEXEC, 0);
+            io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(s) << 1);
+            slots[s].e = static_cast<uint32_t>(next++);
+            ++inflight;
+            return;
+        }
+    };
+    for (unsigned s = 0; s < slots.size(); ++s)
+        start_open(s);
+    while (inflight)
+    {
+        // A ring that refuses to go on fails the walk, since what it still holds will not be heard of.
+        const int rc = io_uring_submit_and_wait(ring, 1);
+        if (rc < 0 && rc != -EINTR)
+        {
+            why = -rc;
+            return;
+        }
+        io_uring_cqe* cqe;
+        unsigned      at;
+        unsigned      seen = 0;
+        io_uring_for_each_cqe(ring, at, cqe)
+        {
+            ++seen;
+            --inflight;
+            const unsigned s    = static_cast<unsigned>(cqe->user_data >> 1);
+            ring_slot&     sl   = slots[s];
+            const char*    name = names.data() + es[sl.e].at;
+            decoded_header d;
+            if (cqe->user_data & 1)
+                verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, cqe->res, d), d);
+            else if (cqe->res < 0)
+                verdict(name, open_failed(-cqe->res, why), d);
+            else
+            {
+                sl.fd = cqe->res;
+                if (::fstat(sl.fd, &sl.sb) < 0)
+                    verdict(name, judge_object_file(w, sl.fd, sl.sb, name, sl.head, -1, d), d);
+                else
+                {
+                    // The header is read through the ring too, so a cold one waits on the disk beside the others.
+                    sl.head.resize(object_header_align);
+                    io_uring_sqe* sqe = io_uring_get_sqe(ring);
+                    io_uring_prep_read(sqe, sl.fd, sl.head.data(), static_cast<unsigned>(sl.head.size()), 0);
+                    io_uring_sqe_set_data64(sqe, (static_cast<uint64_t>(s) << 1) | 1);
+                    ++inflight;
+                    continue;
+                }
+            }
+            start_open(s);
+        }
+        io_uring_cq_advance(ring, seen);
+    }
+}
+
+// Reads every object file of data/<sub in two hex digits> and hands each whole one to `found`.
+template <typename F>
+void scan_object_dir(walker& w, int data_fd, uint32_t sub, char* dents, std::string& head, dir_scan& out, F&& found,
+                     io_uring* ring, std::vector<ring_slot>& slots)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    const char dir[3] = {digits[sub >> 4], digits[sub & 15], 0};
+    const int dfd = ::openat(data_fd, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+    {
+        // A directory that is not there holds nothing; one that cannot be read may hold anything.
+        if (errno != ENOENT)
+            out.failed = errno;
+        return;
+    }
+    std::vector<dir_entry> es;
+    std::string            names;
+    for (;;)
+    {
+        const ssize_t got = ::getdents64(dfd, dents, dents_bytes);
+        if (got < 0)
+            out.failed = errno;
+        if (got <= 0)
+            break;
+        for (ssize_t off = 0; off < got;)
+        {
+            const auto* e = reinterpret_cast<const struct dirent64*>(dents + off);
+            off += e->d_reclen;
+            const std::string_view name(e->d_name);
+            // Only the one path its key gives a file, which is what makes one file per key.
+            if (name.size() != 64 || name[0] != dir[0] || name[1] != dir[1])
+                continue;
+            es.push_back({static_cast<uint32_t>(names.size()), e->d_type});
+            names.append(name).push_back('\0');
+        }
+    }
+    auto verdict = [&](const char* name, file_verdict v, decoded_header& d)
+    {
+        if (v == file_verdict::ok)
+            found(d);
+        else if (v == file_verdict::unsound)
+            out.unsound.push_back(std::string(dir) + "/" + name);
+    };
+    if (ring)
+        read_files_ring(w, ring, dfd, es, names, slots, out.failed, verdict);
+    else
+        read_files_one_by_one(w, dfd, es, names, head, out.failed, verdict);
+    ::close(dfd);
+}
+
 }   // namespace
+
+// A bucket between its journal and its verdict.
+struct object_store::recovering
+{
+    bucket* b{nullptr};
+    bool    torn{false};
+    bool    corrupt{false};
+    bool    other_layout{false};
+    // The object files are to be read.
+    bool    scan{false};
+    // The files said something the journal did not.
+    bool    changed{false};
+};
 
 bool object_store::open(std::string& err, recovery_report* report)
 {
@@ -201,8 +550,16 @@ bool object_store::open(std::string& err, recovery_report* report)
     }
     std::sort(names.begin(), names.end());
 
+    // Every journal first, then the object files of every bucket that needs them in one parallel walk, then the verdicts.
+    std::vector<recovering> rs;
+    rs.reserve(names.size());
     for (const std::string& n : names)
-        if (!recover_bucket(n, rep, err))
+        if (!recover_bucket(n, rep, rs, err))
+            return false;
+    if (!reconcile_with_files(rs, rep, err))
+        return false;
+    for (recovering& r : rs)
+        if (!finish_bucket(r, rep, err))
             return false;
 
     m_totals.buckets = m_buckets.size();
@@ -211,7 +568,8 @@ bool object_store::open(std::string& err, recovery_report* report)
     return true;
 }
 
-bool object_store::recover_bucket(const std::string& name, recovery_report& rep, std::string& err)
+bool object_store::recover_bucket(const std::string& name, recovery_report& rep, std::vector<recovering>& out,
+                                  std::string& err)
 {
     const std::string base = m_opts.dir + "/" + name;
     auto b = std::make_unique<bucket>();
@@ -306,10 +664,9 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         }
     }
 
+    recovering r;
     std::string why;
-    bool torn = false, corrupt = false, other_layout = false;
-    const bool loaded = load_journal(*b, why, torn, corrupt, other_layout, rep);
-    if (!loaded)
+    if (!load_journal(*b, why, r.torn, r.corrupt, r.other_layout, rep))
     {
         err = why;
         return false;
@@ -317,46 +674,48 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
 
     // The files are consulted when the last stop was not clean, when the
     // journal could not be trusted, when it was written for another split,
-    // and when it is missing.
-    bool changed = false;
-    if (other_layout)
+    // when it is missing, and when a pooled put was rolled forward.
+    r.scan = !m_clean_start || r.corrupt || r.torn || r.other_layout || rolled > 0;
+    r.b    = b.get();
+    m_buckets.emplace(name, std::move(b));
+    out.push_back(std::move(r));
+    return true;
+}
+
+bool object_store::finish_bucket(recovering& r, recovery_report& rep, std::string& err)
+{
+    bucket& b = *r.b;
+    bool changed = r.changed;
+    if (r.other_layout)
     {
-        changed = true;
-        LOG_INFO(("storage: the journal of bucket " + name + " was written for another shard count; "
+        LOG_INFO(("storage: the journal of bucket " + b.name + " was written for another shard count; "
                   "this shard's keys are rebuilt from the object files").c_str());
     }
-    if (!m_clean_start || corrupt || torn || other_layout || rolled > 0)
+    if (r.corrupt)
     {
-        const uint64_t before = rep.adopted + rep.dropped;
-        reconcile_with_files(*b, rep);
-        changed = rep.adopted + rep.dropped != before;
-        if (corrupt)
-        {
-            ++rep.rebuilt_journals;
-            changed = true;
-            LOG_WARN(("storage: the journal of bucket " + name +
-                      " is damaged and was rebuilt from the object files").c_str());
-        }
+        ++rep.rebuilt_journals;
+        changed = true;
+        LOG_WARN(("storage: the journal of bucket " + b.name +
+                  " is damaged and was rebuilt from the object files").c_str());
     }
 
     uint64_t bytes = 0;
-    for (const auto& [k, m] : b->objects)
+    for (const auto& [k, m] : b.objects)
         bytes += m.size;
-    b->bytes = bytes;
+    b.bytes = bytes;
 
-    const bool garbage = b->j.records > m_opts.compact_floor &&
-                         b->j.records > 2 * (b->objects.size() + 1);
-    if (changed || garbage || torn)
-        if (!rewrite_journal_sync(*b, err))
+    const bool garbage = b.j.records > m_opts.compact_floor &&
+                         b.j.records > 2 * (b.objects.size() + 1);
+    if (changed || garbage || r.torn)
+        if (!rewrite_journal_sync(b, err))
             return false;
 
-    b->j.compact_after = 0;
-    m_totals.objects += b->objects.size();
-    m_totals.bytes += b->bytes;
-    m_totals.journal_records += b->j.records;
-    rep.objects += b->objects.size();
+    b.j.compact_after = 0;
+    m_totals.objects += b.objects.size();
+    m_totals.bytes += b.bytes;
+    m_totals.journal_records += b.j.records;
+    rep.objects += b.objects.size();
     ++rep.buckets;
-    m_buckets.emplace(name, std::move(b));
     return true;
 }
 
@@ -568,90 +927,135 @@ bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, boo
     return true;
 }
 
-void object_store::reconcile_with_files(bucket& b, recovery_report& rep)
+bool object_store::reconcile_with_files(std::vector<recovering>& rs, recovery_report& rep, std::string& err)
 {
-    const std::string data = m_opts.dir + "/" + b.name + "/data";
-    std::unordered_set<std::string_view> seen;
-    std::error_code ec;
-
-    for (fs::recursive_directory_iterator it(data, ec), end; !ec && it != end; it.increment(ec))
+    // One piece of work is one object directory of one bucket, so a single
+    // large bucket spreads over the threads as well as many small ones do.
+    struct item
     {
-        std::error_code fc;
-        if (!it->is_regular_file(fc))
-            continue;
-        const std::string fname = it->path().filename().string();
-        if (fname.size() != 64)
-            continue;
+        recovering* r;
+        uint32_t    sub;
+    };
+    std::vector<item> items;
+    for (recovering& r : rs)
+        if (r.scan)
+            for (uint32_t sub = 0; sub < 256; ++sub)
+                items.push_back({&r, sub});
+    if (items.empty())
+        return true;
 
-        const int fd = ::open(it->path().c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-            continue;
+    std::vector<dir_scan> out(items.size());
+    std::atomic<size_t>   next{0};
+    const walk_shape      shape = recovery_shape();
 
-        struct stat sb{};
-        std::string head(object_header_align, '\0');
-        ssize_t n = ::fstat(fd, &sb) == 0
-                        ? ::pread(fd, head.data(), head.size(), 0)
-                        : -1;
-        decoded_header d;
-        if (n >= 0)
+    // The journals' entries are only read while the threads run, and changed once they have joined.
+    auto work = [&]()
+    {
+        std::unique_ptr<char[]> dents(new char[dents_bytes]);
+        std::string            head;
+        io_uring               ring{};
+        const bool             ringed = shape.depth > 0 && io_uring_queue_init(shape.depth, &ring, 0) == 0;
+        std::vector<ring_slot> slots(ringed ? shape.depth : 0);
+        walker                 w;
+        w.shard   = m_opts.shard;
+        w.nshards = m_opts.nshards;
+        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < items.size();)
         {
-            head.resize(static_cast<size_t>(n));
-            d = decode_object_header(head);
-            if (d.status == header_status::need_more && d.need <= 64 * 1024)
-            {
-                head.resize(d.need);
-                n = ::pread(fd, head.data(), head.size(), 0);
-                if (n >= 0)
+            const bucket& b = *items[i].r->b;
+            dir_scan&     o = out[i];
+            w.bucket = b.name;
+            scan_object_dir(w, b.data_fd, items[i].sub, dents.get(), head, o,
+                [&](decoded_header& d)
                 {
-                    head.resize(static_cast<size_t>(n));
-                    d = decode_object_header(head);
+                    // A sibling's object, which its own journal and its own start deal with.
+                    if (!owns(b.name, d.key))
+                        return;
+                    const auto found = b.objects.find(d.key);
+                    if (found != b.objects.end() && found->second == d.meta)
+                        o.matched.push_back(&found->first);
+                    else
+                        o.differ.emplace_back(std::move(d.key), std::move(d.meta));
+                }, ringed ? &ring : nullptr, slots);
+        }
+        if (ringed)
+            io_uring_queue_exit(&ring);
+    };
+
+    std::vector<std::thread> pool;
+    const size_t want = std::min<size_t>(shape.threads, items.size());
+    for (size_t t = 1; t < want; ++t)
+    {
+        try { pool.emplace_back(work); }
+        catch (const std::system_error&) { break; }
+    }
+    work();
+    for (std::thread& t : pool)
+        t.join();
+
+    for (size_t k = 0; k < items.size(); ++k)
+        if (out[k].failed)
+        {
+            char dir[3];
+            std::snprintf(dir, sizeof dir, "%02x", items[k].sub);
+            err = "cannot read the object files in " + m_opts.dir + "/" + items[k].r->b->name + "/data/" + dir +
+                  ": " + errstr(out[k].failed);
+            return false;
+        }
+
+    size_t k = 0;
+    for (recovering& r : rs)
+    {
+        if (!r.scan)
+            continue;
+        bucket&        b      = *r.b;
+        const uint64_t before = rep.adopted + rep.dropped;
+        const size_t   first  = k;
+        size_t         seen   = 0;
+        for (; k < items.size() && items[k].r == &r; ++k)
+        {
+            dir_scan& s = out[k];
+            for (auto& [key, meta] : s.differ)
+            {
+                auto found = b.objects.find(key);
+                if (found == b.objects.end())
+                    found = b.objects.emplace(std::move(key), std::move(meta)).first;
+                else
+                    found->second = std::move(meta);
+                ++rep.adopted;
+                s.matched.push_back(&found->first);
+            }
+            seen += s.matched.size();
+            // Every shard walks every file, so one of them says so.
+            if (m_opts.shard == 0)
+                for (const std::string& rel : s.unsound)
+                {
+                    ++rep.corrupt_files;
+                    LOG_WARN(("storage: " + m_opts.dir + "/" + b.name + "/data/" + rel +
+                              " is not a whole object file and is left unserved").c_str());
+                }
+        }
+
+        // A key has one path, so as many whole files as entries leaves no entry without its file.
+        if (seen != b.objects.size())
+        {
+            std::unordered_set<const std::string*> have;
+            have.reserve(seen);
+            for (size_t j = first; j < k; ++j)
+                have.insert(out[j].matched.begin(), out[j].matched.end());
+            for (auto it = b.objects.begin(); it != b.objects.end();)
+            {
+                if (have.contains(&it->first))
+                    ++it;
+                else
+                {
+                    ++rep.dropped;
+                    it = b.objects.erase(it);
                 }
             }
         }
-        ::close(fd);
-
-        const bool sound = n >= 0 && d.status == header_status::ok &&
-                           key_hash(d.key) == fname &&
-                           static_cast<uint64_t>(sb.st_size) == d.header_len + d.meta.size;
-        if (!sound)
-        {
-            // Every shard walks every file, so one of them says so.
-            if (m_opts.shard == 0)
-            {
-                ++rep.corrupt_files;
-                LOG_WARN(("storage: " + it->path().string() +
-                          " is not a whole object file and is left unserved").c_str());
-            }
-            continue;
-        }
-        // A sibling's object, which its own journal and its own start deal with.
-        if (!owns(b.name, d.key))
-            continue;
-
-        auto found = b.objects.find(d.key);
-        if (found == b.objects.end())
-        {
-            found = b.objects.emplace(d.key, d.meta).first;
-            ++rep.adopted;
-        }
-        else if (!(found->second == d.meta))
-        {
-            found->second = d.meta;
-            ++rep.adopted;
-        }
-        seen.insert(found->first);
+        r.changed = rep.adopted + rep.dropped != before;
     }
-
-    for (auto it = b.objects.begin(); it != b.objects.end();)
-    {
-        if (seen.contains(std::string_view(it->first)))
-            ++it;
-        else
-        {
-            ++rep.dropped;
-            it = b.objects.erase(it);
-        }
-    }
+    return true;
 }
 
 bool object_store::rewrite_journal_sync(bucket& b, std::string& err)
