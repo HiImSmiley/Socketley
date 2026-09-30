@@ -107,7 +107,7 @@ const std::string* object_store::hot_get(std::string_view bucket_name, std::stri
         return nullptr;
     if (!same_version(it->second->meta, current))
     {
-        m_hot_bytes -= it->second->body.size() + it->second->id.size();
+        m_hot_bytes -= held_bytes(*it->second);
         m_hot_lru.erase(it->second);
         m_hot_index.erase(it);
         return nullptr;
@@ -129,7 +129,7 @@ bool object_store::hot_find(std::string_view bucket_name, std::string_view key, 
         return false;
     if (!same_version(e.meta, *e.live))
     {
-        m_hot_bytes -= e.body.size() + e.id.size();
+        m_hot_bytes -= held_bytes(e);
         const auto lit = it->second;
         m_hot_index.erase(it);
         m_hot_lru.erase(lit);
@@ -165,7 +165,7 @@ void object_store::hot_insert(const std::string& id, const object_meta& read, st
     while (m_hot_bytes > m_hot_budget && !m_hot_lru.empty())
     {
         hot_entry& old = m_hot_lru.back();
-        m_hot_bytes -= old.body.size() + old.id.size();
+        m_hot_bytes -= held_bytes(old);
         m_hot_index.erase(old.id);
         m_hot_lru.pop_back();
     }
@@ -235,7 +235,7 @@ void object_store::hot_forget_owner(uint32_t shard)
         const size_t z = id.find('\0');
         if (owner_of(id.substr(0, z), id.substr(z + 1)) == shard)
         {
-            m_hot_bytes -= it->body.size() + it->id.size();
+            m_hot_bytes -= held_bytes(*it);
             m_hot_index.erase(it->id);
             it = m_hot_lru.erase(it);
         }
@@ -251,7 +251,7 @@ void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
     auto it = m_hot_index.find(hot_id(bucket_name, key));
     if (it == m_hot_index.end())
         return;
-    m_hot_bytes -= it->second->body.size() + it->second->id.size();
+    m_hot_bytes -= held_bytes(*it->second);
     auto lit = it->second;
     m_hot_index.erase(it);
     m_hot_lru.erase(lit);
@@ -264,7 +264,7 @@ void object_store::hot_drop_bucket(std::string_view bucket_name)
     {
         if (std::string_view(it->id).substr(0, it->id.find('\0')) == bucket_name)
         {
-            m_hot_bytes -= it->body.size() + it->id.size();
+            m_hot_bytes -= held_bytes(*it);
             m_hot_index.erase(it->id);
             it = m_hot_lru.erase(it);
         }

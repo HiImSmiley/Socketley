@@ -404,6 +404,8 @@ public:
     // Keeps what a read brought in, when `read` is still the indexed version.
     void hot_put(std::string_view bucket, std::string_view key, const object_meta& read, std::string_view body);
     uint64_t hot_bytes() const { return m_hot_bytes; }
+    // Counts the headers just rendered into a held copy's `head` against the budget.
+    void hot_charge(size_t n) { m_hot_bytes += n; }
     // Read before a read of another shard's key starts, and handed back to hot_put_foreign when it ends.
     uint64_t hot_epoch() const { return m_drop_epoch; }
     // What is held of a key another shard owns.
@@ -592,6 +594,8 @@ private:
         // The index's record of the key, null for another shard's: valid until hot_drop, which every change to that record makes first.
         const object_meta* live;
     };
+    // What an entry counts against the budget: its bytes, its name and the headers rendered for it.
+    static uint64_t held_bytes(const hot_entry& e) { return e.body.size() + e.id.size() + e.head.size(); }
     void hot_insert(const std::string& id, const object_meta& read, std::string_view body, const object_meta* live);
     void hot_drop(std::string_view bucket, std::string_view key);
     void hot_drop_bucket(std::string_view bucket);

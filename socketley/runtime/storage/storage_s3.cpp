@@ -1241,7 +1241,10 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             evaluate(q, *mem) == cond::proceed)
         {
             if (hot.head->empty())
+            {
                 render_object_headers(q, *mem, *hot.head);
+                m_store.hot_charge(hot.head->size());
+            }
             response r;
             r.headers_raw = *hot.head;
             r.body_view   = *hot.body;
