@@ -327,7 +327,8 @@ def flood(n, label):
     socks = []
     for i in range(n):
         s = dial()
-        s.sendall(put_head("upl", "flood%03d" % i, 1 << 20) + b"x" * 100)
+        # Past the 1 MiB a pooled file takes, so each upload's file is one in tmp/.
+        s.sendall(put_head("upl", "flood%03d" % i, (1 << 20) + 4096) + b"x" * 100)
         socks.append(s)
     # Answers arrive only from the refused ones; the admitted are waiting for their body.
     heard = {}

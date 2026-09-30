@@ -206,7 +206,8 @@ struct writer
         run->op   = op;
         run->body = make_body(key, op, length_for(key, op));
         st why;
-        run->put = e.store->begin_put(bucket, key_name(key), {}, run->body.size(), true, why);
+        // Half the keys go as PutObject sends them, answered at the rename from a pooled file.
+        run->put = e.store->begin_put(bucket, key_name(key), {}, run->body.size(), true, why, key % 2 == 0);
         if (!run->put)
         {
             kick(key);
@@ -344,7 +345,7 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
 
     std::mt19937_64 rng(0xC0FFEEull ^ static_cast<uint64_t>(::getpid()));
     uint64_t total_files = 0, kills_with_tmp = 0, torn_journals = 0, adopted = 0, dropped = 0;
-    uint64_t killed_busy = 0;
+    uint64_t killed_busy = 0, rolled = 0;
 
     for (int round = 0; round < rounds; ++round)
     {
@@ -409,9 +410,19 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
         adopted += e.report.adopted;
         dropped += e.report.dropped;
 
-        // The store and the files agree.
-        CHECK(e.store->totals().objects == before.found.size());
+        // A whole pooled file of the put in flight is rolled forward, so the
+        // disk is judged again as the recovery left it, and must still be whole.
+        const survey after = survey_disk(dir);
+        INFO(after.problem);
+        REQUIRE(after.problem.empty());
         for (const auto& [name, kv] : before.found)
+            if (!after.found.contains(name))
+                FAIL_CHECK("the start removed the object file of " << name);
+        rolled += e.report.rolled_forward;
+
+        // The store and the files agree.
+        CHECK(e.store->totals().objects == after.found.size());
+        for (const auto& [name, kv] : after.found)
         {
             const object_meta* m = e.store->find(bucket, name);
             REQUIRE(m != nullptr);
@@ -421,8 +432,8 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
         // And with what the writer was told.
         for (uint32_t k = 0; k < key_count; ++k)
         {
-            const auto it = before.found.find(key_name(k));
-            if (it == before.found.end())
+            const auto it = after.found.find(key_name(k));
+            if (it == after.found.end())
             {
                 // Absent is allowed when nothing was acknowledged, or when a
                 // delete at or after the last acknowledgement was begun.
@@ -449,7 +460,7 @@ TEST_CASE("a writer killed at random moments leaves only whole objects and never
     MESSAGE("rounds " << rounds << ", files seen " << total_files << ", rounds with a tmp file left "
             << kills_with_tmp << ", keys killed mid-operation " << killed_busy
             << ", torn journal tails " << torn_journals << ", adopted " << adopted
-            << ", dropped " << dropped);
+            << ", dropped " << dropped << ", rolled forward " << rolled);
     CHECK(killed_busy > static_cast<uint64_t>(rounds));
     CHECK(total_files > 0);
 }

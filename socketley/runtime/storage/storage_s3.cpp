@@ -788,7 +788,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     }
 
     st why = st::ok;
-    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why);
+    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why, !committer && !create_only);
     if (!op)
     {
         // The body is not read, so the connection cannot be reused.

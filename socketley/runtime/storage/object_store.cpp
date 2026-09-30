@@ -290,6 +290,260 @@ std::string object_store::tmp_name() const
            hex(reinterpret_cast<const uint8_t*>(std::array<uint64_t, 2>{random_u64(), random_u64()}.data()), 16);
 }
 
+// ─── The pool of files for small puts ───────────────────────────────────────
+
+namespace
+{
+
+// Files made at a time, the count below which more are made, and a bound on
+// the descriptors every bucket's pool holds together.
+constexpr uint32_t pool_batch  = 16;
+constexpr uint32_t pool_low    = 8;
+constexpr uint32_t pool_fd_cap = 256;
+
+}   // namespace
+
+bool object_store::take_pooled(bucket& b, std::string& name, int& fd)
+{
+    if (b.pool.empty())
+    {
+        pool_refill(b);
+        return false;
+    }
+    name = std::move(b.pool.back().first);
+    fd   = b.pool.back().second;
+    b.pool.pop_back();
+    --m_pool_fds;
+    pool_refill(b);
+    return true;
+}
+
+void object_store::pool_refill(bucket& b)
+{
+    if (b.closing || b.pool_making > 0 || b.pool.size() >= pool_low ||
+        m_pool_fds + pool_batch > pool_fd_cap)
+        return;
+    if (b.pool_fd < 0)
+    {
+        pool_open_dir(b);
+        return;
+    }
+    b.pool_making = pool_batch;
+    auto alive = m_alive;
+    const std::string bname = b.name;
+    const uint64_t    gen   = b.gen;
+    auto made = std::make_shared<std::vector<std::pair<std::string, int>>>();
+    // The bucket these files were made for, and not one made again under its name since.
+    auto same = [this, bname, gen]() -> bucket*
+    {
+        bucket* bp = find_bucket(bname);
+        return bp && bp->gen == gen ? bp : nullptr;
+    };
+    auto discard = [this, same](std::vector<std::pair<std::string, int>>& files)
+    {
+        bucket* bp = same();
+        for (auto& [n, fd] : files)
+        {
+            m_loop->close_fd(fd);
+            if (bp)
+                if (!m_io->unlinkat(bp->pool_fd, n, 0, [](int64_t) {})) {}
+        }
+        files.clear();
+    };
+    // A file joins the pool only once a sync of pool/ that began after it was made has ended.
+    auto one_done = [this, alive, made, same, discard]()
+    {
+        bucket* bp = same();
+        if (!bp)
+        {
+            discard(*made);
+            return;
+        }
+        if (--bp->pool_making > 0)
+            return;
+        sync_pool(*bp, [this, alive, made, same, discard](bool ok)
+        {
+            if (!*alive)
+                return;
+            bucket* bq = same();
+            if (!bq || !ok || bq->closing)
+            {
+                discard(*made);
+                return;
+            }
+            for (auto& f : *made)
+                bq->pool.push_back(std::move(f));
+            m_pool_fds += static_cast<uint32_t>(made->size());
+            made->clear();
+        });
+    };
+    for (uint32_t i = 0; i < pool_batch; ++i)
+    {
+        std::string name = tmp_name();
+        const bool q = m_io->openat(b.pool_fd, name, O_WRONLY | O_CREAT | O_EXCL, 0600,
+            [this, alive, name, made, one_done](int64_t fd)
+            {
+                if (!*alive)
+                    return;
+                if (fd >= 0)
+                    made->emplace_back(name, static_cast<int>(fd));
+                one_done();
+            });
+        if (!q)
+            one_done();
+    }
+}
+
+void object_store::pool_open_dir(bucket& b)
+{
+    // pool/ is itself a name in the bucket directory, durable before a file in it can be.
+    b.pool_making = 1;
+    auto alive = m_alive;
+    const std::string bname = b.name;
+    const uint64_t    gen   = b.gen;
+    auto same = [this, bname, gen]() -> bucket*
+    {
+        bucket* bp = find_bucket(bname);
+        return bp && bp->gen == gen ? bp : nullptr;
+    };
+    auto give_up = [same]()
+    {
+        if (bucket* bp = same())
+            bp->pool_making = 0;
+    };
+    const bool q = m_io->mkdirat(b.dir_fd, "pool", 0755, [this, alive, same, give_up](int64_t r)
+    {
+        if (!*alive)
+            return;
+        bucket* bp = same();
+        if (!bp || (r < 0 && r != -EEXIST))
+        {
+            give_up();
+            return;
+        }
+        const bool q2 = m_io->openat(bp->dir_fd, "pool", O_RDONLY | O_DIRECTORY, 0,
+            [this, alive, same, give_up](int64_t fd)
+            {
+                if (!*alive)
+                    return;
+                bucket* bq = same();
+                if (!bq || fd < 0)
+                {
+                    if (fd >= 0)
+                        m_loop->close_fd(static_cast<int>(fd));
+                    give_up();
+                    return;
+                }
+                const bool q3 = m_io->fsync(bq->dir_fd, false, [this, alive, same, give_up, fd](int64_t r3)
+                {
+                    if (!*alive)
+                        return;
+                    ++m_totals.fsyncs;
+                    bucket* bs = same();
+                    if (!bs || r3 < 0)
+                    {
+                        m_loop->close_fd(static_cast<int>(fd));
+                        give_up();
+                        return;
+                    }
+                    bs->pool_fd      = static_cast<int>(fd);
+                    bs->pool_making  = 0;
+                    pool_refill(*bs);
+                });
+                if (!q3)
+                {
+                    m_loop->close_fd(static_cast<int>(fd));
+                    give_up();
+                }
+            });
+        if (!q2)
+            give_up();
+    });
+    if (!q)
+        give_up();
+}
+
+void object_store::pool_close(bucket& b)
+{
+    for (auto& [n, fd] : b.pool)
+        m_loop->close_fd(fd);
+    m_pool_fds -= std::min<uint32_t>(m_pool_fds, static_cast<uint32_t>(b.pool.size()));
+    b.pool.clear();
+    if (b.pool_fd >= 0)
+        m_loop->close_fd(b.pool_fd);
+    b.pool_fd = -1;
+}
+
+void object_store::sync_pool(bucket& b, std::function<void(bool)> cb)
+{
+    b.pool_sync_next.push_back(std::move(cb));
+    if (!b.pool_syncing)
+        sync_pool_round(b.name);
+}
+
+void object_store::sync_pool_round(const std::string& bucket_name)
+{
+    bucket* b = find_bucket(bucket_name);
+    if (!b || b->pool_sync_next.empty())
+        return;
+    b->pool_syncing = true;
+    auto round = std::make_shared<std::vector<std::function<void(bool)>>>(std::move(b->pool_sync_next));
+    b->pool_sync_next.clear();
+    auto alive = m_alive;
+    auto end = [this, alive, bucket_name, round](int64_t r)
+    {
+        if (!*alive)
+            return;
+        if (bucket* bp = find_bucket(bucket_name))
+            bp->pool_syncing = false;
+        for (auto& c : *round)
+            c(r >= 0);
+        sync_pool_round(bucket_name);
+    };
+    if (!m_io->fsync(b->pool_fd, false, [this, alive, end](int64_t r)
+        {
+            if (*alive)
+                ++m_totals.fsyncs;
+            end(r);
+        }))
+        end(-EIO);
+}
+
+void object_store::drop_tmp(bucket& b, const std::string& tmp, bool pooled, std::function<void()> then)
+{
+    if (!pooled)
+    {
+        if (!m_io->unlinkat(b.tmp_fd, tmp, 0, [](int64_t) {})) {}
+        then();
+        return;
+    }
+    // A whole pooled file left under its name would be rolled forward by the next start.
+    auto alive = m_alive;
+    const std::string bname = b.name;
+    const bool q = m_io->unlinkat(b.pool_fd, tmp, 0, [this, alive, bname, then](int64_t)
+    {
+        if (!*alive)
+            return;
+        bucket* bp = find_bucket(bname);
+        if (!bp)
+        {
+            then();
+            return;
+        }
+        sync_pool(*bp, [this, then](bool ok)
+        {
+            if (!ok)
+                m_sync_lost = true;
+            then();
+        });
+    });
+    if (!q)
+    {
+        m_sync_lost = true;
+        then();
+    }
+}
+
 object_store::bucket* object_store::find_bucket(std::string_view name)
 {
     auto it = m_buckets.find(name);
@@ -975,22 +1229,39 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
     const object_meta meta  = req.meta;
     const std::string tmp   = req.tmp_name;
     const bool create_only  = req.create_only;
+    const bool pooled       = req.pooled;
 
-    // What every way out of the commit does: the lane is handed on and the
-    // bucket is released before the caller hears, because the caller is free
-    // to start the next operation from its callback.
-    auto done = [this, alive, bname, key, cb](put_result r)
+    // The lane is handed on and the bucket released once nothing of the
+    // commit is left to do, which for a pooled file is after the answer.
+    auto release = [this, bname, key]()
     {
-        if (!*alive)
-            return;
         if (bucket* bp = find_bucket(bname))
             --bp->active_ops;
         --m_inflight;
         lane_leave(bname, key);
+    };
+    // Every other way out releases before the caller hears, because the
+    // caller is free to start the next operation from its callback.
+    auto done = [alive, release, cb](put_result r)
+    {
+        if (!*alive)
+            return;
+        release();
         cb(std::move(r));
     };
+    // A refusal after the body was synced, which for a pooled file first makes its removal durable.
+    auto refuse = [this, alive, bname, tmp, pooled, done](put_result r)
+    {
+        bucket* bp = find_bucket(bname);
+        if (!bp)
+        {
+            done(std::move(r));
+            return;
+        }
+        drop_tmp(*bp, tmp, pooled, [done, r]() { done(r); });
+    };
 
-    lane_enter(*b, key, [this, alive, bname, key, meta, tmp, create_only, done]()
+    lane_enter(*b, key, [this, alive, bname, key, meta, tmp, create_only, pooled, release, cb, done, refuse]()
     {
         bucket* bp = find_bucket(bname);
         if (!bp)
@@ -1012,26 +1283,23 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
             const uint64_t held = old == bp->objects.end() ? 0 : old->second.size;
             if (m_totals.bytes - held + meta.size > quota())
             {
-                if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
-                done({st::storage_full, meta});
+                refuse({st::storage_full, meta});
                 return;
             }
         }
         const std::string rel = object_rel_path(key);
-        ensure_dirs(bname, rel, [this, alive, bname, key, meta, tmp, rel, done](int leaf, st why)
+        ensure_dirs(bname, rel, [this, alive, bname, key, meta, tmp, rel, pooled, release, cb, done, refuse](int leaf, st why)
         {
             if (!*alive)
                 return;
             bucket* bq = find_bucket(bname);
             if (!bq || why != st::ok)
             {
-                if (bq)
-                    if (!m_io->unlinkat(bq->tmp_fd, tmp, 0, [](int64_t) {})) {}
-                done({why == st::ok ? st::no_such_bucket : why, meta});
+                refuse({why == st::ok ? st::no_such_bucket : why, meta});
                 return;
             }
-            const bool q = m_io->renameat(bq->tmp_fd, tmp, bq->data_fd, rel,
-                [this, alive, bname, key, meta, tmp, leaf, done](int64_t r)
+            const bool q = m_io->renameat(pooled ? bq->pool_fd : bq->tmp_fd, tmp, bq->data_fd, rel,
+                [this, alive, bname, key, meta, leaf, pooled, release, cb, done, refuse](int64_t r)
                 {
                     if (!*alive)
                         return;
@@ -1044,12 +1312,16 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                     if (r < 0)
                     {
                         m_loop->close_fd(leaf);
-                        if (!m_io->unlinkat(br->tmp_fd, tmp, 0, [](int64_t) {})) {}
-                        done({errno_status(r), meta});
+                        refuse({errno_status(r), meta});
                         return;
                     }
                     if (!m_kill_after_rename.empty() && key.starts_with(m_kill_after_rename))
                         ::raise(SIGKILL);
+                    if (pooled)
+                    {
+                        commit_pooled(*br, key, meta, leaf, release, cb);
+                        return;
+                    }
                     // The rename is in the directory now and durable once the
                     // directory is synced; only then may the journal say so.
                     const bool q2 = m_io->fsync(leaf, false,
@@ -1092,6 +1364,57 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
             }
         });
     });
+}
+
+void object_store::commit_pooled(bucket& b, const std::string& key, const object_meta& meta, int leaf,
+                                 std::function<void()> release, std::function<void(put_result)> cb)
+{
+    // Answered at the rename: the body and the pool name it was written under
+    // were durable before it, so a crash that takes the rename leaves a whole
+    // file the next start rolls forward.
+    apply_put(b, key, meta);
+    auto alive = m_alive;
+    const std::string bname = b.name;
+
+    // The key's next operation waits for both syncs, since a pool file whose
+    // removal is not durable would be rolled forward over it.
+    auto left = std::make_shared<int>(2);
+    auto ok   = std::make_shared<bool>(true);
+    auto part = [this, alive, bname, key, meta, left, ok, release](bool good)
+    {
+        if (!*alive)
+            return;
+        *ok = *ok && good;
+        if (--*left > 0)
+            return;
+        if (!*ok)
+        {
+            m_sync_lost = true;
+            LOG_WARN(("storage: syncing the directories of an answered put to " + bname + "/" + key +
+                      " failed; the next start reads the files again").c_str());
+        }
+        if (bucket* bs = find_bucket(bname))
+        {
+            std::string rec;
+            encode_put_record(rec, key, meta);
+            journal_append(*bs, rec, nullptr);
+        }
+        release();
+    };
+    if (!m_io->fsync(leaf, false, [this, alive, leaf, part](int64_t r)
+        {
+            if (!*alive)
+                return;
+            ++m_totals.fsyncs;
+            m_loop->close_fd(leaf);
+            part(r >= 0);
+        }))
+    {
+        m_loop->close_fd(leaf);
+        part(false);
+    }
+    sync_pool(b, part);
+    invalidate_siblings(bname, key, [cb, meta]() { cb({st::ok, meta}); });
 }
 
 void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
@@ -1367,7 +1690,7 @@ void object_store::open_object(std::string_view bucket_name, std::string_view ke
 
 std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, std::string_view key,
                                                 object_meta meta, uint64_t expected,
-                                                bool size_known, st& why)
+                                                bool size_known, st& why, bool plain)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1401,7 +1724,7 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
     }
 
     std::shared_ptr<put_op> op(new put_op);
-    op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known);
+    op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain);
     why = st::ok;
     return op;
 }
@@ -1880,6 +2203,7 @@ void object_store::forget_bucket(const std::string& name)
     if (it == m_buckets.end())
         return;
     bucket& bb = *it->second;
+    pool_close(bb);
     for (int* fd : {&bb.dir_fd, &bb.data_fd, &bb.tmp_fd, &bb.j.fd, &bb.dump_fd})
         if (*fd >= 0)
         {

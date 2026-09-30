@@ -154,6 +154,8 @@ struct recovery_report
     uint64_t torn_tails{0};
     uint64_t rebuilt_journals{0};
     uint64_t corrupt_files{0};
+    // Answered puts whose rename a crash took, moved into place from their pool file.
+    uint64_t rolled_forward{0};
     bool     clean_start{false};
 };
 
@@ -184,6 +186,9 @@ struct commit_request
     // Refused with precondition_failed when the key already exists, decided by
     // the owner under the key's lane so two racing creators cannot both win.
     bool        create_only{false};
+    // A file from the bucket's pool, whose name was durable before the body
+    // was written, so the answer waits for the rename and not for its sync.
+    bool        pooled{false};
 };
 
 // A body being written, from the first byte to the commit.
@@ -210,7 +215,13 @@ public:
     void on_ready(std::function<void()> cb) { m_ready_cb = std::move(cb); }
 
     // The commit refuses to replace an object that is already there.
-    void set_create_only(bool on) { m_create_only = on; }
+    void set_create_only(bool on)
+    {
+        m_create_only = on;
+        // A pooled file is rolled forward after a crash, which a condition would have refused.
+        if (on && m_pooled)
+            fail(st::io_error);
+    }
 
     // Called once, with the reason, if the write fails before finish().
     void on_failed(std::function<void(st)> cb) { m_failed_cb = std::move(cb); }
@@ -238,7 +249,13 @@ public:
     // Where a finished body goes instead of into the object namespace: a
     // multipart part, which the caller renames and keeps track of itself.
     using committer = std::function<void(commit_request, std::function<void(put_result)>)>;
-    void set_committer(committer c) { m_committer = std::move(c); }
+    void set_committer(committer c)
+    {
+        m_committer = std::move(c);
+        // A pooled file is rolled forward into the object namespace, which is not where this one goes.
+        if (m_pooled)
+            fail(st::io_error);
+    }
 
     // The object's key and bucket, for the caller's log line.
     const std::string& key() const { return m_key; }
@@ -273,7 +290,7 @@ private:
     void on_hashed(int stage_index);
     void finish_now();
     void begin(object_store* store, std::string bucket, std::string key, object_meta meta,
-               uint64_t expected, bool size_known);
+               uint64_t expected, bool size_known, bool plain);
     void pump();
     void flush(stage& s);
     void on_write_done(stage& s, int64_t res);
@@ -295,11 +312,14 @@ private:
     int                   m_active{0};
     int                   m_tmp_fd{-1};
     bool                  m_opening{true};
+    bool                  m_pooled{false};
     bool                  m_released{false};
     // Bytes reserved against the quota until this operation ends.
     uint64_t              m_reserved{0};
 
     uint64_t   m_received{0};
+    // The body's length when it was promised, and never reached otherwise.
+    uint64_t   m_whole{UINT64_MAX};
     // Where the next buffer to be filled begins in the file.
     uint64_t   m_next_off{0};
     std::shared_ptr<hash_state> m_hs;
@@ -442,10 +462,14 @@ public:
     // Null with `why` set when the request cannot start at all; the body is
     // then fed to the returned operation.  `expected` is the size a
     // Content-Length promised, and 0 with size_known false when it is not
-    // known.
+    // known.  `plain` is a put of an object with no condition and no
+    // committer, which may take a file from the pool.
     std::shared_ptr<put_op> begin_put(std::string_view bucket, std::string_view key,
                                       object_meta meta, uint64_t expected, bool size_known,
-                                      st& why);
+                                      st& why, bool plain = false);
+
+    // The largest body a pooled file takes, since a start reads it whole to roll it forward.
+    static constexpr uint64_t pooled_max = 1u << 20;
 
     // The step that makes a written body the object, run here when this shard owns the key and by the owner otherwise.
     void commit(commit_request req, std::function<void(put_result)> cb);
@@ -500,6 +524,7 @@ private:
     friend class put_op;
     struct bucket;
     struct lane;
+    static inline uint64_t s_bucket_gen = 0;
 
     // The journal of one bucket.
     struct journal
@@ -528,6 +553,8 @@ private:
     struct bucket
     {
         std::string name;
+        // Tells this bucket from one made again under its name.
+        uint64_t    gen{++s_bucket_gen};
         int64_t     created_ms{0};
         int         dir_fd{-1};
         int         data_fd{-1};
@@ -544,6 +571,14 @@ private:
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
         uint64_t    dump_off{0};
+        // pool/, made by the first refill, and its empty files, open, whose
+        // names a sync of pool/ has made durable.
+        int         pool_fd{-1};
+        std::vector<std::pair<std::string, int>> pool;
+        uint32_t    pool_making{0};
+        // Syncs of pool/: whoever asks while one runs is covered by the next.
+        bool        pool_syncing{false};
+        std::vector<std::function<void(bool)>> pool_sync_next;
     };
 
     bucket* find_bucket(std::string_view name);
@@ -565,6 +600,20 @@ private:
     void journal_kick(bucket& b);
     bool compact_due(const bucket& b) const;
     void maybe_compact(bucket& b);
+
+    // The pool of pre-made files for small puts, and the syncs of pool/ they need.
+    bool take_pooled(bucket& b, std::string& name, int& fd);
+    void pool_refill(bucket& b);
+    void pool_open_dir(bucket& b);
+    void pool_close(bucket& b);
+    void sync_pool(bucket& b, std::function<void(bool)> cb);
+    void sync_pool_round(const std::string& bucket_name);
+    // Removes a temporary file, and for a pooled one waits until the removal is durable.
+    void drop_tmp(bucket& b, const std::string& tmp, bool pooled, std::function<void()> then);
+    // The rest of a pooled commit once its rename is done: the answer, then the syncs.
+    void commit_pooled(bucket& b, const std::string& key, const object_meta& meta, int leaf,
+                       std::function<void()> release, std::function<void(put_result)> cb);
+    uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
     void compact_finish(const std::string& name, bool ok);
 
@@ -633,6 +682,10 @@ private:
     bool     m_clean_start{false};
     // A journal write or sync failed, so a stop is not a clean one.
     bool     m_journal_lost{false};
+    // A sync of pool/ or of an object directory failed, so a stop is not a clean one.
+    bool     m_sync_lost{false};
+    // Descriptors held by every bucket's pool.
+    uint32_t m_pool_fds{0};
 };
 
 }   // namespace socketley::storage

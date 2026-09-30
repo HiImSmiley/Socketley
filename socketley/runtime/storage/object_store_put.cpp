@@ -24,7 +24,7 @@ st write_status(int64_t res)
 }   // namespace
 
 void put_op::begin(object_store* store, std::string bucket, std::string key, object_meta meta,
-                   uint64_t expected, bool size_known)
+                   uint64_t expected, bool size_known, bool plain)
 {
     m_store  = store;
     m_alive  = store->m_alive;
@@ -63,6 +63,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     if (!size_known || m_header_len + expected > m_cap)
         m_stage[1].data = std::make_shared_for_overwrite<char[]>(m_cap);
 
+    m_whole = size_known ? expected : UINT64_MAX;
     if (size_known)
     {
         m_reserved = expected;
@@ -73,9 +74,16 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     ++store->m_inflight;
     ++store->m_puts_active;
 
+    object_store::bucket* b = store->find_bucket(m_bucket);
+    if (plain && size_known && expected <= object_store::pooled_max && store->owns(m_bucket, m_key) &&
+        store->take_pooled(*b, m_tmp_name, m_tmp_fd))
+    {
+        m_pooled  = true;
+        m_opening = false;
+        return;
+    }
     m_tmp_name = store->tmp_name();
     auto self = shared_from_this();
-    object_store::bucket* b = store->find_bucket(m_bucket);
     const bool queued = store->m_io->openat(b->tmp_fd, m_tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0600,
         [self](int64_t r)
         {
@@ -144,7 +152,7 @@ void put_op::cleanup_tmp()
     if (!m_tmp_name.empty() && !m_tmp_committed)
     {
         if (auto* b = m_store->find_bucket(m_bucket))
-            if (!m_store->m_io->unlinkat(b->tmp_fd, m_tmp_name, 0, [](int64_t) {})) {}
+            if (!m_store->m_io->unlinkat(m_pooled ? b->pool_fd : b->tmp_fd, m_tmp_name, 0, [](int64_t) {})) {}
         m_tmp_name.clear();
     }
 }
@@ -215,7 +223,9 @@ void put_op::staged(size_t n)
         m_store->m_reserved += more;
         m_reserved += more;
     }
-    if (s.fill == m_cap)
+    // The last piece of a body of known length waits for finish(), which puts
+    // the header in front of it so the two go in one write.
+    if (s.fill == m_cap && m_received != m_whole)
     {
         s.state = stage_state::full;
         m_next_off = s.file_off + s.fill;
@@ -512,6 +522,7 @@ void put_op::maybe_finish()
             req.tmp_name = self->m_tmp_name;
             req.meta     = self->m_meta;
             req.create_only = self->m_create_only;
+            req.pooled      = self->m_pooled;
             auto done = [self](put_result r2)
             {
                 self->release();

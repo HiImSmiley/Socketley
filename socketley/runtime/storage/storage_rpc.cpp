@@ -314,7 +314,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 return true;
             }
             st why = st::ok;
-            auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why);
+            auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why, true);
             if (!op_ptr)
             {
                 answer(rq.kind, refusal_for(why));

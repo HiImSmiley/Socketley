@@ -58,9 +58,11 @@ struct rig : io_handler
     std::unique_ptr<hash_pool>    pool;
     std::unique_ptr<object_store> store;
     recovery_report               report;
+    // Puts go as S3's PutObject sends them, free to take a pooled file.
+    bool                          plain{false};
 
     explicit rig(const std::string& dir, uint64_t compact_floor = 4096, uint64_t max_bytes = 0,
-                 unsigned hash_threads = 0)
+                 unsigned hash_threads = 0, uint32_t shard = 0, uint32_t nshards = 1)
     {
         REQUIRE(loop.init());
         io = std::make_unique<file_io>(loop, this);
@@ -73,6 +75,8 @@ struct rig : io_handler
         o.dir           = dir;
         o.compact_floor = compact_floor;
         o.max_bytes     = max_bytes;
+        o.shard         = shard;
+        o.nshards       = nshards;
         store = std::make_unique<object_store>(loop, *io, o);
         if (pool)
             store->set_hash_pool(pool.get());
@@ -119,7 +123,7 @@ struct rig : io_handler
                    object_meta meta = {}, size_t piece = 100000, const md5_t* expect = nullptr)
     {
         st why = st::ok;
-        auto op = store->begin_put(bucket, key, std::move(meta), body.size(), true, why);
+        auto op = store->begin_put(bucket, key, std::move(meta), body.size(), true, why, plain);
         if (!op)
             return {why, {}};
         size_t off = 0;
@@ -219,6 +223,15 @@ std::string journal_path(const std::string& dir, const std::string& bucket)
 std::string data_path(const std::string& dir, const std::string& bucket, const std::string& key)
 {
     return dir + "/" + bucket + "/data/" + object_rel_path(key);
+}
+
+size_t count_pool_files(const std::string& dir, const std::string& bucket)
+{
+    std::error_code ec;
+    size_t n = 0;
+    for (const auto& e : fs::directory_iterator(dir + "/" + bucket + "/pool", ec))
+        n += e.is_regular_file() ? 1 : 0;
+    return n;
 }
 
 }   // namespace
@@ -1642,3 +1655,221 @@ TEST_CASE("a listing rendered while the index is walked is the listing rendered 
     CHECK(compared == 5 * 2 * 4 * 5 * 2 * 2);
 }
 
+// ─── Pooled files: answered at the rename, rolled forward after a crash ────
+
+TEST_CASE("a plain put takes a pooled file and is answered before its directories are synced")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.plain = true;
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    // The first finds the pool empty and has it made; its files join once pool/ is synced.
+    REQUIRE(r.put("bkt", "first", "v").status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") > 0; }));
+    r.settle(20);
+    const size_t pooled = count_pool_files(d.path, "bkt");
+    CHECK(pooled >= 8);
+
+    st why = st::ok;
+    auto op = r.store->begin_put("bkt", "k", {}, 5, true, why, true);
+    REQUIRE(op);
+    REQUIRE(op->append("hello", 5) == 5);
+    bool fired = false, busy_at_answer = false;
+    op->finish(nullptr, [&](put_result res)
+    {
+        CHECK(res.status == st::ok);
+        busy_at_answer = r.store->working();
+        fired = true;
+    });
+    REQUIRE(r.until([&] { return fired; }));
+    // The syncs of data/<leaf> and pool/ are still owed when the answer goes.
+    CHECK(busy_at_answer);
+    CHECK(count_pool_files(d.path, "bkt") == pooled - 1);
+    REQUIRE(r.until([&] { return !r.store->working(); }));
+    std::string got;
+    REQUIRE(r.get("bkt", "k", got) == st::ok);
+    CHECK(got == "hello");
+    r.store->close(true);
+}
+
+TEST_CASE("a put with a condition or a committer never takes a pooled file")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.plain = true;
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "first", "v").status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") > 0; }));
+    r.settle(20);
+    // A caller that marks a pooled put conditional afterwards is refused rather than rolled forward.
+    st why = st::ok;
+    auto op = r.store->begin_put("bkt", "k", {}, 1, true, why, true);
+    REQUIRE(op);
+    op->set_create_only(true);
+    CHECK(op->failed());
+    // And one that says so at the start writes to a file of its own.
+    r.settle(20);
+    const size_t pooled = count_pool_files(d.path, "bkt");
+    auto op2 = r.store->begin_put("bkt", "k2", {}, 1, true, why, false);
+    REQUIRE(op2);
+    op2->set_create_only(true);
+    CHECK_FALSE(op2->failed());
+    CHECK(count_pool_files(d.path, "bkt") == pooled);
+    op2->abort();
+    r.settle(20);
+}
+
+namespace {
+
+// What a crash can leave of an answered pooled put: the new object still under
+// its pool name, and the object it replaced still at the key's path.
+struct lost_rename
+{
+    std::string v1, v2, pool_name;
+};
+
+lost_rename stage_lost_rename(const std::string& dir, bool clean_stop)
+{
+    lost_rename s;
+    s.v1 = pattern(3000, 1);
+    s.v2 = pattern(5000, 2);
+    rig r(dir);
+    r.plain = true;
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "key", s.v1).status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy(); }));
+    const std::string file_v1 = slurp(data_path(dir, "bkt", "key"));
+    REQUIRE(r.put("bkt", "key", s.v2).status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy(); }));
+    r.store->close(clean_stop);
+    s.pool_name = "0.00000000000000000000000000000001";
+    fs::rename(data_path(dir, "bkt", "key"), dir + "/bkt/pool/" + s.pool_name);
+    spill(data_path(dir, "bkt", "key"), file_v1);
+    return s;
+}
+
+}   // namespace
+
+TEST_CASE("an answered pooled put whose rename a crash took is rolled forward by the next start")
+{
+    for (const bool clean : {false, true})
+    {
+        INFO("clean stop " << clean);
+        tmpdir d;
+        const lost_rename s = stage_lost_rename(d.path, clean);
+        rig again(d.path);
+        CHECK(again.report.rolled_forward == 1);
+        std::string got;
+        REQUIRE(again.get("bkt", "key", got) == st::ok);
+        CHECK(got == s.v2);
+        // And the index names the version that was rolled forward.
+        const object_meta* idx = again.store->find("bkt", "key");
+        REQUIRE(idx != nullptr);
+        CHECK(idx->md5 == md5_of(s.v2));
+        CHECK(idx->size == s.v2.size());
+        CHECK(count_pool_files(d.path, "bkt") == 0);
+    }
+}
+
+TEST_CASE("a pooled file that is not whole is removed and never replaces the object")
+{
+    for (int variant = 0; variant < 3; ++variant)
+    {
+        INFO("variant " << variant);
+        tmpdir d;
+        const lost_rename s = stage_lost_rename(d.path, false);
+        const std::string p = d.path + "/bkt/pool/" + s.pool_name;
+        std::string f = slurp(p);
+        if (variant == 0)
+            f[f.size() - 100] ^= 1;          // a page of the body that never reached the disk
+        else if (variant == 1)
+            f.resize(f.size() - 1);          // cut short
+        else
+            f = std::string(f.size(), '\0'); // nothing but the length
+        spill(p, f);
+        rig again(d.path);
+        CHECK(again.report.rolled_forward == 0);
+        std::string got;
+        REQUIRE(again.get("bkt", "key", got) == st::ok);
+        CHECK(got == s.v1);
+        CHECK(count_pool_files(d.path, "bkt") == 0);
+    }
+}
+
+TEST_CASE("a whole pooled file of a key another shard owns is left to that shard")
+{
+    tmpdir d;
+    std::string key;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        r.store->close(true);
+    }
+    // A key shard 1 of two owns, written by a single-shard run whose rename a crash took.
+    {
+        rig probe(d.path, 4096, 0, 0, 0, 2);
+        for (int i = 0; key.empty(); ++i)
+            if (probe.store->owner_of("bkt", "k" + std::to_string(i)) == 1)
+                key = "k" + std::to_string(i);
+        probe.store->close(true);
+    }
+    object_meta m;
+    m.size = 4;
+    m.md5  = md5_of("body");
+    const std::string pool_name = "0.00000000000000000000000000000002";
+    fs::create_directories(d.path + "/bkt/pool");
+    spill(d.path + "/bkt/pool/" + pool_name, encode_object_header(key, m) + "body");
+    {
+        rig s0(d.path, 4096, 0, 0, 0, 2);
+        CHECK(s0.report.rolled_forward == 0);
+        CHECK(fs::exists(d.path + "/bkt/pool/" + pool_name));
+    }
+    rig s1(d.path, 4096, 0, 0, 1, 2);
+    CHECK(s1.report.rolled_forward == 1);
+    CHECK(s1.store->find("bkt", key) != nullptr);
+    CHECK_FALSE(fs::exists(d.path + "/bkt/pool/" + pool_name));
+}
+
+TEST_CASE("the next operation on a key waits until the pooled put before it is synced")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.plain = true;
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "first", "v").status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy() && count_pool_files(d.path, "bkt") >= 16; }));
+    r.settle(20);
+    // Eight takes leave the pool above the mark that makes more, so no other sync is counted.
+    for (int i = 0; i < 8; ++i)
+    {
+        INFO("round " << i);
+        const std::string key = "k" + std::to_string(i);
+        st why = st::ok;
+        auto op = r.store->begin_put("bkt", key, {}, 1, true, why, true);
+        REQUIRE(op);
+        REQUIRE(op->append("x", 1) == 1);
+        uint64_t at_answer = 0;
+        bool answered = false, deleted = false, early = false;
+        op->finish(nullptr, [&](put_result res)
+        {
+            REQUIRE(res.status == st::ok);
+            at_answer = r.store->totals().fsyncs;
+            answered  = true;
+            r.store->remove("bkt", key, [&](st s, bool)
+            {
+                CHECK(s == st::ok);
+                deleted = true;
+            });
+        });
+        // Watched a completion at a time: the object's file must outlive the put's
+        // data/<leaf> and pool/ syncs, since a delete let in at the answer races them
+        // and a crash could then roll the put forward over it.
+        REQUIRE(r.until([&]
+        {
+            if (answered && r.store->totals().fsyncs < at_answer + 2 && !fs::exists(data_path(d.path, "bkt", key)))
+                early = true;
+            return deleted && !r.store->working();
+        }));
+        CHECK_FALSE(early);
+    }
+}

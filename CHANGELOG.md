@@ -41,25 +41,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   | 64MiB MIXED c32 (MiB/s) | 1373 | 1359 (0.99x) | 1539 (1.12x) | 182.80 / 53.36 / 58.21 |
 
   Reads are faster than MinIO everywhere (1.4 to 4.3x, at a twentieth of the CPU
-  for small objects) and large puts match it. Where MinIO is still faster: puts
-  and mixed loads of small objects at low concurrency (a 4 KiB put at one
-  connection is 0.5x with one shard, 0.7x with four, and 4 KiB mixed 0.55x),
-  because MinIO waits for one sync where a put here waits for two, the file and
-  the directory that holds it, so that a power cut cannot lose an answered put;
-  and 1 MiB puts and mixed loads at one connection (0.6 to 0.7x with one shard),
-  which are the same two syncs. The disk's sync latency drifts by two to three
-  times within an hour, so the small-put rows move with it: in the fast phases a
-  4 KiB put at 32 connections was 1.4x MinIO and in the slow ones 0.8x. boto3, one
-  connection, 4 KiB, p50 / p99: GET 0.9 / 1.1 ms against MinIO's 1.2 / 1.8, HEAD
-  0.9 / 1.0 against 1.2 / 1.8, PUT 41 / 62 ms with one shard and 12 / 23 with
-  four against 27 / 66.
+  for small objects) and large puts match it. The small-put rows of the table
+  are from before a put stopped waiting behind the journal's sync and before a
+  put of up to 1 MiB was answered after one sync instead of two (below); with
+  both, measured later with warp 1.3.1 and interleaved with MinIO on the same
+  disk, a 4 KiB put at one connection is level with MinIO in the disk's fast
+  phases (about 120 per second each) and 0.6x in its slow ones (33 against 54),
+  and at 32 connections 1.2x or more (540 to 610 against 460); boto3, one
+  connection, 4 KiB PUT p50 7.6 to 8.6 ms against MinIO's 8.5 to 17 on the same
+  disk minutes apart. MinIO syncs its file once and never its directory, so a
+  power cut can take a put it answered; an answered put here survives one. The
+  disk's sync latency drifts by two to three times within an hour, so the
+  small-put rows move with it. boto3, one connection, 4 KiB, p50 / p99 (table
+  era): GET 0.9 / 1.1 ms against MinIO's 1.2 / 1.8, HEAD 0.9 / 1.0 against 1.2 /
+  1.8, PUT 41 / 62 ms with one shard and 12 / 23 with four against 27 / 66.
 
   What changed: the 65536 second-level directories are 256 made with the bucket,
   so a put never makes and syncs one; a put is answered when its file, its rename
   and its directory are durable and the journal record follows behind it (a stop
   syncs it, and any other start reads the object headers, which it already did:
   about 5 s per 100,000 objects with a warm cache, against 10 ms after a clean
-  stop); the MD5 and the SHA-256 that verifies a signed body are taken on helper
+  stop), and that record is synced once a megabyte has gathered, before a
+  compaction or at a stop, no longer each time the queue drains, where the next
+  put's own sync queued behind it (4 KiB puts at one connection 77 to 104 per
+  second); a put of up to 1 MiB with a known length and no condition is written
+  into one of 16 empty files each bucket keeps in `pool/`, made and synced ahead
+  of time, so that once its file is synced and renamed into place it is on disk
+  under one name or the other and is answered then, the syncs of `pool/` and of
+  its directory following the answer with the key's next operation waiting for
+  them; a start moves any whole file left in `pool/` (length and MD5 as its
+  header says) into place (4 KiB puts at 32 connections about 430 to 600 per
+  second, boto3 p50 11.3 to 7.6 ms); the MD5 and the SHA-256 that verifies a signed body are taken on helper
   threads (`SOCKETLEY_STORAGE_HASH_THREADS`, default 3, 0 for the loop), which
   took the loop from 0.86 to 0.37 of a core during 64 MiB puts at 32 connections
   and put a 64 MiB put at 32 connections from 100 to about 400 MiB/s on this

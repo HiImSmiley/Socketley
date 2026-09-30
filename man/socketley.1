@@ -6449,15 +6449,26 @@ from which listings are answered out of memory.
 .PP
 A put writes a temporary file, syncs it, renames it into place and syncs the
 directory, and only then answers 200; a delete removes the file and syncs the
-directory. The journal record of either is appended behind the answer and synced
-in a group, because the object files are the truth and the journal is only the
-index of them: an answer never waits for it. A crash at any point leaves the old
-object or the new one and never a torn one, and nothing that was answered is
-undone. A start after a clean stop (which writes and syncs the journals last)
-trusts them; any other start removes temporary files and reads every object
-header to reconcile the journals with the files, so a journal that is lost,
-damaged or short of its last records is rebuilt from the objects, and a delete
-whose record was lost does not bring the object back, because its file is gone.
+directory. A put of up to 1 MiB whose length is known and that carries no
+condition (no \fBIf\-None\-Match\fR, not a part) is written instead into one of a
+few empty files the bucket keeps ready in \fBpool/\fR, whose names were synced
+before any put took one; once that file is synced and renamed into place the put
+is answered, and the syncs of \fBpool/\fR and of the object's directory follow the
+answer, with the key's next put or delete waiting for them. The answered object is
+on disk either way: a crash that takes the rename leaves it whole in \fBpool/\fR,
+and the next start moves it into place (a file there counts as whole only when its
+length and MD5 are those its header names). The journal record of either is
+appended behind the answer and synced once a megabyte of records has gathered,
+before a compaction and at a stop, and never merely because the queue drained,
+since that sync would sit in front of the next put's own: the object files are the
+truth and the journal is only the index of them, so an answer never waits for it.
+A crash at any point leaves the old object or the new one and never a torn one,
+and nothing that was answered is undone. A start after a clean stop (which writes
+and syncs the journals last) trusts them; any other start removes temporary files
+and reads every object header to reconcile the journals with the files, so a
+journal that is lost, damaged or short of its last records is rebuilt from the
+objects, and a delete whose record was lost does not bring the object back,
+because its file is gone.
 That reading happens before the listener opens and takes as long as the object
 count makes it, and is the only place the loop blocks on the disk: every request
 is served on the runtime's io_uring.
@@ -6512,15 +6523,25 @@ GET 2x and 4x, a 64 MiB GET 1.4x and 3.8x, each at a tenth or less of the
 CPU. A 64 MiB put is 1.3x at one connection and 1.1x at 32 (about 600 MiB/s, which
 is what this disk takes), and 64 MiB mixed loads are level with MinIO.
 .PP
-MinIO is faster where a put waits for the disk and nothing else: a 4 KiB put at one
-connection is 0.5x with one shard and 0.7x with four (26 and 40 against 54 per
-second, 12 to 41 ms against 27 in boto3), a 4 KiB mixed load 0.55x, and 1 MiB puts
-and mixed loads at one connection 0.6 to 0.7x with one shard. The reason is the
-promise: a put is answered after its file and then its directory are synced, which
-is two waits for the disk where MinIO waits for one, so that an answered put
-survives a power cut. The disk's sync latency drifts by two to three times within
-an hour, so these rows move with it; at 32 connections a 4 KiB put was 1.4x MinIO
-in a fast phase and 0.8x in a slow one. The journal is not waited for: a stop syncs
+Small puts wait for the disk and for little else, so they move with it. A put of
+up to 1 MiB waits for one sync, of its pooled file, where it waited for two, the
+file and then its directory, and no put waits behind a sync of the journal, whose
+record used to be synced behind each answer, where the next put's own sync then
+queued behind it. With warp 1.3.1 (three alternating passes each), dropping that
+journal sync took 4 KiB puts at one connection from 77 to 104 per second; the
+pooled file took them from 107 to 118 in a fast phase of the disk and left them
+level (35 and 34) in a slow one, took 4 KiB puts at 32 connections from about 430
+to 600 per second and 1 MiB puts at one connection from 22 to 28 in the slow
+phase. boto3's p50 for a 4 KiB put went from 13.0 ms to 11.3 and then 7.6 ms,
+against MinIO's 8.5 to 17 ms on the same disk minutes apart. Against MinIO, a 4 KiB
+put at one connection is level in the disk's fast phases (about 120 per second
+each) and 0.6x in its slow ones (33 against 54), and at 32 connections 1.2x or
+more. MinIO syncs its file once and never its directory, so a power cut can take a
+put it has answered; here an answered put survives one. The disk's sync latency
+drifts by two to three times within an hour, which is why these rows name their
+phase.
+.PP
+The journal is not waited for: a stop syncs
 it, and a start after any other stop reads every object header, which takes about 5
 seconds per 100,000 objects with a warm cache. Uploads of 256 KiB or more are
 hashed on helper threads (\fBSOCKETLEY_STORAGE_HASH_THREADS\fR), which is what lets

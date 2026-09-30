@@ -97,12 +97,15 @@ bool tmp_owner(const std::string& name, uint32_t& shard)
 }
 
 // Removes this shard's own tmp/ files, and for shard 0 those of no shard of the split, never a sibling's upload in flight.
-uint64_t clean_tmp(const std::string& path, uint32_t shard, uint32_t nshards)
+uint64_t clean_tmp(const std::string& path, uint32_t shard, uint32_t nshards,
+                   const std::unordered_set<std::string>& keep)
 {
     uint64_t n = 0;
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(path, ec))
     {
+        if (keep.contains(e.path().filename().string()))
+            continue;
         uint32_t who = 0;
         const bool named  = tmp_owner(e.path().filename().string(), who);
         const bool mine   = named && who == shard;
@@ -279,7 +282,12 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         return false;
     }
 
-    rep.tmp_removed += clean_tmp(base + "/tmp", m_opts.shard, m_opts.nshards);
+    std::unordered_set<std::string> keep;
+    const uint64_t rolled = roll_forward_pooled(*b, keep);
+    rep.rolled_forward += rolled;
+    rep.tmp_removed += clean_tmp(base + "/tmp", m_opts.shard, m_opts.nshards, {});
+    // What is left in pool/ is empty, cut short or another shard's, and the last two are no refill's.
+    clean_tmp(base + "/pool", m_opts.shard, m_opts.nshards, keep);
 
     // The journals of shards the split no longer has hold keys some other shard
     // owns now; they are read by nobody and would be trusted by a later split.
@@ -317,7 +325,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         LOG_INFO(("storage: the journal of bucket " + name + " was written for another shard count; "
                   "this shard's keys are rebuilt from the object files").c_str());
     }
-    if (!m_clean_start || corrupt || torn || other_layout)
+    if (!m_clean_start || corrupt || torn || other_layout || rolled > 0)
     {
         const uint64_t before = rep.adopted + rep.dropped;
         reconcile_with_files(*b, rep);
@@ -350,6 +358,67 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     ++rep.buckets;
     m_buckets.emplace(name, std::move(b));
     return true;
+}
+
+// A put answered at its rename leaves, until its directories are synced, the
+// whole object in pool/, which the shard owning its key moves into place; any
+// shard's file is looked at, since the split may have changed.
+uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep)
+{
+    const std::string base = m_opts.dir + "/" + b.name;
+    uint64_t rolled = 0;
+    std::unordered_set<std::string> leaves;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(base + "/pool", ec))
+    {
+        const std::string name = e.path().filename().string();
+        const int fd = ::open(e.path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        struct stat sb{};
+        std::string all;
+        if (::fstat(fd, &sb) == 0 && sb.st_size > 0 &&
+            static_cast<uint64_t>(sb.st_size) <= 64 * 1024 + pooled_max)
+        {
+            all.resize(static_cast<size_t>(sb.st_size));
+            size_t got = 0;
+            while (got < all.size())
+            {
+                const ssize_t n = ::pread(fd, all.data() + got, all.size() - got, static_cast<off_t>(got));
+                if (n <= 0)
+                    break;
+                got += static_cast<size_t>(n);
+            }
+            all.resize(got);
+        }
+        ::close(fd);
+
+        // Whole means the length the header gives and the digest it names, so
+        // neither a body cut short nor one whose pages never reached the disk passes.
+        const decoded_header d = decode_object_header(all);
+        const bool whole = d.status == header_status::ok && all.size() == d.header_len + d.meta.size &&
+                           md5_of(std::string_view(all).substr(d.header_len)) == d.meta.md5;
+        if (!whole)
+            continue;
+        if (!owns(b.name, d.key))
+        {
+            keep.insert(name);
+            continue;
+        }
+        const std::string rel = object_rel_path(d.key);
+        if (::rename(e.path().c_str(), (base + "/data/" + rel).c_str()) < 0)
+        {
+            LOG_WARN(("storage: rolling " + e.path().string() + " forward failed: " + errstr(errno)).c_str());
+            keep.insert(name);
+            continue;
+        }
+        leaves.insert(rel.substr(0, 2));
+        ++rolled;
+    }
+    for (const std::string& leaf : leaves)
+        if (!fsync_dir_path(base + "/data/" + leaf)) {}
+    if (rolled && !fsync_dir_path(base + "/pool")) {}
+    return rolled;
 }
 
 bool object_store::load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt,
@@ -680,7 +749,7 @@ void object_store::close(bool clean)
     // The marker only when nothing is half done, because a stop that left a
     // rename without its journal record is exactly what the next start must
     // go and look for.
-    if (clean && !working() && !m_journal_lost && settle_journals() && m_root_fd >= 0)
+    if (clean && !working() && !m_journal_lost && !m_sync_lost && settle_journals() && m_root_fd >= 0)
     {
         const std::string marker = m_opts.dir + "/.clean." + std::to_string(m_opts.shard);
         const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -694,6 +763,7 @@ void object_store::close(bool clean)
 
     for (auto& [name, b] : m_buckets)
     {
+        pool_close(*b);
         for (int* fd : {&b->dir_fd, &b->data_fd, &b->tmp_fd, &b->j.fd, &b->dump_fd})
             if (*fd >= 0)
             {
