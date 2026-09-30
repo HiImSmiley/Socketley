@@ -1,7 +1,11 @@
 #pragma once
 // The XML S3 speaks: errors, listings and the batch-delete exchange, with
 // element names and the namespace exactly as S3 writes them.
+#include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,14 +21,32 @@ namespace socketley::storage
 inline constexpr std::string_view s3_xmlns = "http://s3.amazonaws.com/doc/2006-03-01/";
 inline constexpr std::string_view xml_decl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
 
-// The characters that would end an element, and the control characters an XML
-// 1.0 document may not carry at all.
-inline std::string xml_escape(std::string_view in)
+// Whether xml_escape keeps a byte: the ones that would end an element and the
+// control characters an XML 1.0 document may not carry at all are changed.
+inline bool xml_plain(unsigned char c)
 {
-    std::string out;
-    out.reserve(in.size());
-    for (unsigned char c : in)
+    static constexpr auto table = []
     {
+        std::array<bool, 256> t{};
+        for (int i = 0; i < 256; ++i)
+            t[static_cast<size_t>(i)] = !(i == '&' || i == '<' || i == '>' || i == '"' || i == '\'' ||
+                                          (i < 0x20 && i != '\t' && i != '\n' && i != '\r'));
+        return t;
+    }();
+    return table[c];
+}
+
+// Appended to `out` without a temporary, the bytes it keeps copied in runs.
+inline void xml_escape_to(std::string& out, std::string_view in)
+{
+    size_t run = 0;
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (xml_plain(c))
+            continue;
+        out.append(in, run, i - run);
+        run = i + 1;
         switch (c)
         {
             case '&':  out += "&amp;"; break;
@@ -33,18 +55,23 @@ inline std::string xml_escape(std::string_view in)
             case '"':  out += "&quot;"; break;
             case '\'': out += "&apos;"; break;
             default:
-                if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
-                {
-                    // Not representable in the document; a numeric reference is
-                    // what S3 sends for these, and clients that decode it get the byte.
-                    char buf[12];
-                    std::snprintf(buf, sizeof buf, "&#x%X;", c);
-                    out += buf;
-                }
-                else
-                    out.push_back(static_cast<char>(c));
+            {
+                // Not representable in the document; a numeric reference is
+                // what S3 sends for these, and clients that decode it get the byte.
+                char buf[12];
+                std::snprintf(buf, sizeof buf, "&#x%X;", c);
+                out += buf;
+            }
         }
     }
+    out.append(in, run, in.size() - run);
+}
+
+inline std::string xml_escape(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size());
+    xml_escape_to(out, in);
     return out;
 }
 
@@ -180,48 +207,151 @@ struct list_render
     std::string_view owner_id;
 };
 
-inline std::string list_xml(const list_render& r, const list_page& p)
+// The digits of a number appended without a temporary string.
+inline void append_number(std::string& out, uint64_t v)
 {
-    const auto enc = [&](std::string_view s)
-    {
-        return xml_escape(r.url_encode_keys ? url_encode(s) : std::string(s));
-    };
-    std::string x(xml_decl);
-    x += "<ListBucketResult xmlns=\"" + std::string(s3_xmlns) + "\">";
-    x += "<Name>" + xml_escape(r.bucket) + "</Name>";
-    x += "<Prefix>" + enc(r.prefix) + "</Prefix>";
+    char buf[24];
+    const auto r = std::to_chars(buf, buf + sizeof buf, v);
+    out.append(buf, static_cast<size_t>(r.ptr - buf));
+}
+
+// A key, prefix or marker as the listing spells it.
+inline void list_xml_text(std::string& x, const list_render& r, std::string_view s)
+{
+    // What url_encode leaves is already free of anything the XML escape would change.
+    if (r.url_encode_keys)
+        url_encode_to(x, s);
+    else
+        xml_escape_to(x, s);
+}
+
+// Everything before the first entry.
+inline void list_xml_head(std::string& x, const list_render& r, size_t key_count, bool truncated)
+{
+    x += xml_decl;
+    x += "<ListBucketResult xmlns=\"";
+    x += s3_xmlns;
+    x += "\"><Name>";
+    xml_escape_to(x, r.bucket);
+    x += "</Name><Prefix>";
+    list_xml_text(x, r, r.prefix);
+    x += "</Prefix>";
     if (r.v2)
     {
         if (!r.continuation_token.empty())
-            x += "<ContinuationToken>" + xml_escape(r.continuation_token) + "</ContinuationToken>";
-        if (p.truncated && !r.next_token.empty())
-            x += "<NextContinuationToken>" + xml_escape(r.next_token) + "</NextContinuationToken>";
-        x += "<KeyCount>" + std::to_string(p.objects.size() + p.prefixes.size()) + "</KeyCount>";
+        {
+            x += "<ContinuationToken>";
+            xml_escape_to(x, r.continuation_token);
+            x += "</ContinuationToken>";
+        }
+        if (truncated && !r.next_token.empty())
+        {
+            x += "<NextContinuationToken>";
+            xml_escape_to(x, r.next_token);
+            x += "</NextContinuationToken>";
+        }
+        x += "<KeyCount>";
+        append_number(x, key_count);
+        x += "</KeyCount>";
     }
     else
-        x += "<Marker>" + enc(r.marker) + "</Marker>";
-    x += "<MaxKeys>" + std::to_string(r.max_keys) + "</MaxKeys>";
+    {
+        x += "<Marker>";
+        list_xml_text(x, r, r.marker);
+        x += "</Marker>";
+    }
+    x += "<MaxKeys>";
+    append_number(x, r.max_keys);
+    x += "</MaxKeys>";
     if (!r.delimiter.empty())
-        x += "<Delimiter>" + enc(r.delimiter) + "</Delimiter>";
+    {
+        x += "<Delimiter>";
+        list_xml_text(x, r, r.delimiter);
+        x += "</Delimiter>";
+    }
     if (r.url_encode_keys)
         x += "<EncodingType>url</EncodingType>";
-    x += std::string("<IsTruncated>") + (p.truncated ? "true" : "false") + "</IsTruncated>";
-    if (!r.v2 && p.truncated && !r.delimiter.empty() && !r.next_marker.empty())
-        x += "<NextMarker>" + enc(r.next_marker) + "</NextMarker>";
-    if (r.v2 && !r.start_after.empty())
-        x += "<StartAfter>" + enc(r.start_after) + "</StartAfter>";
-    for (const list_entry& e : p.objects)
+    x += truncated ? "<IsTruncated>true</IsTruncated>" : "<IsTruncated>false</IsTruncated>";
+    if (!r.v2 && truncated && !r.delimiter.empty() && !r.next_marker.empty())
     {
-        x += "<Contents><Key>" + enc(e.key) + "</Key><LastModified>" + iso8601(e.meta.mtime_ms) +
-             "</LastModified><ETag>" + quoted_etag(e.meta) + "</ETag><Size>" +
-             std::to_string(e.meta.size) + "</Size>";
-        if (!r.v2 || r.fetch_owner)
-            x += "<Owner><ID>" + xml_escape(r.owner_id) + "</ID><DisplayName>" +
-                 xml_escape(r.owner_id) + "</DisplayName></Owner>";
-        x += "<StorageClass>STANDARD</StorageClass></Contents>";
+        x += "<NextMarker>";
+        list_xml_text(x, r, r.next_marker);
+        x += "</NextMarker>";
     }
+    if (r.v2 && !r.start_after.empty())
+    {
+        x += "<StartAfter>";
+        list_xml_text(x, r, r.start_after);
+        x += "</StartAfter>";
+    }
+}
+
+// One <Contents> element, written after the key in one place and appended once.
+inline void list_xml_object(std::string& x, const list_render& r, const std::string& key,
+                            const object_meta& m)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    const auto lit = [](char* q, std::string_view t)
+    {
+        std::memcpy(q, t.data(), t.size());
+        return q + t.size();
+    };
+    x += "<Contents><Key>";
+    list_xml_text(x, r, key);
+    char  buf[320];
+    char* q = lit(buf, "</Key><LastModified>");
+    q = write_iso8601(q, m.mtime_ms);
+    q = lit(q, "</LastModified><ETag>&quot;");
+    for (const uint8_t b : m.md5)
+    {
+        *q++ = digits[b >> 4];
+        *q++ = digits[b & 15];
+    }
+    if (m.parts)
+    {
+        *q++ = '-';
+        q = std::to_chars(q, buf + sizeof buf - 64, static_cast<uint64_t>(m.parts)).ptr;
+    }
+    q = lit(q, "&quot;</ETag><Size>");
+    q = std::to_chars(q, buf + sizeof buf - 64, m.size).ptr;
+    q = lit(q, "</Size>");
+    if (!r.v2 || r.fetch_owner)
+    {
+        x.append(buf, static_cast<size_t>(q - buf));
+        x += "<Owner><ID>";
+        xml_escape_to(x, r.owner_id);
+        x += "</ID><DisplayName>";
+        xml_escape_to(x, r.owner_id);
+        x += "</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Contents>";
+        return;
+    }
+    q = lit(q, "<StorageClass>STANDARD</StorageClass></Contents>");
+    x.append(buf, static_cast<size_t>(q - buf));
+}
+
+inline void list_xml_prefix(std::string& x, const list_render& r, std::string_view common)
+{
+    x += "<CommonPrefixes><Prefix>";
+    list_xml_text(x, r, common);
+    x += "</Prefix></CommonPrefixes>";
+}
+
+inline std::string list_xml(const list_render& r, const list_page& p)
+{
+    // Room for the whole page, so it is written without the string moving.
+    size_t room = 1024 + r.prefix.size() + r.marker.size() + r.next_marker.size() + r.start_after.size() +
+                  r.continuation_token.size() + r.next_token.size() + r.delimiter.size();
+    for (const list_entry& e : p.objects)
+        room += e.key.size() + 240 + (r.v2 && !r.fetch_owner ? 0 : 110 + 2 * r.owner_id.size());
     for (const std::string& c : p.prefixes)
-        x += "<CommonPrefixes><Prefix>" + enc(c) + "</Prefix></CommonPrefixes>";
+        room += c.size() + 48;
+    std::string x;
+    x.reserve(room);
+    list_xml_head(x, r, p.objects.size() + p.prefixes.size(), p.truncated);
+    for (const list_entry& e : p.objects)
+        list_xml_object(x, r, e.key, e.meta);
+    for (const std::string& c : p.prefixes)
+        list_xml_prefix(x, r, c);
     x += "</ListBucketResult>";
     return x;
 }

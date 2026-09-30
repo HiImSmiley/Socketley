@@ -4,6 +4,7 @@
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/object_store.h"
 #include "runtime/storage/s3_names.h"
+#include "runtime/storage/s3_xml.h"
 #include "shared/event_loop.h"
 #include "shared/file_io.h"
 #include "shared/hash_pool.h"
@@ -1389,3 +1390,178 @@ TEST_CASE("the HTTP and XML dates agree with gmtime and strftime across leap day
     }
     CHECK(bad == 0);
 }
+
+namespace {
+
+// The listing as it was written before it was built in place: a string per piece, joined.
+std::string reference_escape(std::string_view in)
+{
+    std::string out;
+    for (unsigned char c : in)
+    {
+        switch (c)
+        {
+            case '&':  out += "&amp;"; break;
+            case '<':  out += "&lt;"; break;
+            case '>':  out += "&gt;"; break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default:
+                if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
+                {
+                    char buf[12];
+                    std::snprintf(buf, sizeof buf, "&#x%X;", c);
+                    out += buf;
+                }
+                else
+                    out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+std::string reference_url_encode(std::string_view in)
+{
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : in)
+    {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/')
+            out.push_back(static_cast<char>(c));
+        else
+        {
+            out.push_back('%');
+            out.push_back(digits[c >> 4]);
+            out.push_back(digits[c & 15]);
+        }
+    }
+    return out;
+}
+
+std::string reference_list_xml(const list_render& r, const list_page& p)
+{
+    const auto enc = [&](std::string_view s)
+    {
+        return reference_escape(r.url_encode_keys ? reference_url_encode(s) : std::string(s));
+    };
+    std::string x(xml_decl);
+    x += "<ListBucketResult xmlns=\"" + std::string(s3_xmlns) + "\">";
+    x += "<Name>" + reference_escape(r.bucket) + "</Name>";
+    x += "<Prefix>" + enc(r.prefix) + "</Prefix>";
+    if (r.v2)
+    {
+        if (!r.continuation_token.empty())
+            x += "<ContinuationToken>" + reference_escape(r.continuation_token) + "</ContinuationToken>";
+        if (p.truncated && !r.next_token.empty())
+            x += "<NextContinuationToken>" + reference_escape(r.next_token) + "</NextContinuationToken>";
+        x += "<KeyCount>" + std::to_string(p.objects.size() + p.prefixes.size()) + "</KeyCount>";
+    }
+    else
+        x += "<Marker>" + enc(r.marker) + "</Marker>";
+    x += "<MaxKeys>" + std::to_string(r.max_keys) + "</MaxKeys>";
+    if (!r.delimiter.empty())
+        x += "<Delimiter>" + enc(r.delimiter) + "</Delimiter>";
+    if (r.url_encode_keys)
+        x += "<EncodingType>url</EncodingType>";
+    x += std::string("<IsTruncated>") + (p.truncated ? "true" : "false") + "</IsTruncated>";
+    if (!r.v2 && p.truncated && !r.delimiter.empty() && !r.next_marker.empty())
+        x += "<NextMarker>" + enc(r.next_marker) + "</NextMarker>";
+    if (r.v2 && !r.start_after.empty())
+        x += "<StartAfter>" + enc(r.start_after) + "</StartAfter>";
+    for (const list_entry& e : p.objects)
+    {
+        x += "<Contents><Key>" + enc(e.key) + "</Key><LastModified>" + iso8601(e.meta.mtime_ms) +
+             "</LastModified><ETag>" + quoted_etag(e.meta) + "</ETag><Size>" +
+             std::to_string(e.meta.size) + "</Size>";
+        if (!r.v2 || r.fetch_owner)
+            x += "<Owner><ID>" + reference_escape(r.owner_id) + "</ID><DisplayName>" +
+                 reference_escape(r.owner_id) + "</DisplayName></Owner>";
+        x += "<StorageClass>STANDARD</StorageClass></Contents>";
+    }
+    for (const std::string& c : p.prefixes)
+        x += "<CommonPrefixes><Prefix>" + enc(c) + "</Prefix></CommonPrefixes>";
+    x += "</ListBucketResult>";
+    return x;
+}
+
+}   // namespace
+
+TEST_CASE("a listing built in place is the listing built by joining pieces, for every byte a key can hold")
+{
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    const auto next = [&]
+    {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        return x;
+    };
+    // Every byte value is in the alphabet, so the escapes, the percent forms and the
+    // control characters all meet a run of plain bytes on both sides.
+    const auto text = [&](size_t max)
+    {
+        std::string s;
+        const size_t n = next() % (max + 1);
+        for (size_t i = 0; i < n; ++i)
+            s.push_back(next() % 3 ? static_cast<char>('a' + next() % 26) : static_cast<char>(next() % 256));
+        return s;
+    };
+
+    size_t bad = 0;
+    for (int round = 0; round < 3000; ++round)
+    {
+        list_page page;
+        const size_t objects = next() % 6, prefixes = next() % 4;
+        for (size_t i = 0; i < objects; ++i)
+        {
+            list_entry e;
+            e.key = text(40);
+            e.meta.size     = next() % 4 ? next() % 100000 : next();
+            e.meta.mtime_ms = static_cast<int64_t>(next() % 253402300800000ull);
+            for (auto& b : e.meta.md5)
+                b = static_cast<uint8_t>(next());
+            e.meta.parts = next() % 3 ? 0 : static_cast<uint32_t>(next() % 10000);
+            page.objects.push_back(std::move(e));
+        }
+        for (size_t i = 0; i < prefixes; ++i)
+            page.prefixes.push_back(text(20));
+        page.truncated = next() % 2;
+
+        const std::string bucket = text(12), prefix = text(10), delim = text(3), start = text(10),
+                          token = text(10), next_token = text(10), marker = text(10), next_marker = text(10);
+        list_render r;
+        r.bucket             = bucket;
+        r.prefix             = prefix;
+        r.delimiter          = delim;
+        r.start_after        = start;
+        r.continuation_token = token;
+        r.next_token         = next_token;
+        r.marker             = marker;
+        r.next_marker        = next_marker;
+        r.max_keys           = next() % 1001;
+        r.url_encode_keys    = next() % 2;
+        r.fetch_owner        = next() % 2;
+        r.v2                 = next() % 2;
+        r.owner_id           = next() % 2 ? "socketley" : "o<w&ner";
+
+        const std::string want = reference_list_xml(r, page), got = list_xml(r, page);
+        if (want != got && ++bad <= 2)
+            FAIL_CHECK("round " << round << "\nwant " << want << "\ngot  " << got);
+    }
+    CHECK(bad == 0);
+
+    // The escape and the url encoder on their own, appended to text already there.
+    size_t off = 0;
+    for (int i = 0; i < 20000; ++i)
+    {
+        const std::string s = text(64);
+        std::string a = "<", b = "<";
+        xml_escape_to(a, s);
+        b += reference_escape(s);
+        std::string u = "%", v = "%";
+        url_encode_to(u, s);
+        v += reference_url_encode(s);
+        if (a != b || u != v)
+            ++off;
+    }
+    CHECK(off == 0);
+}
+

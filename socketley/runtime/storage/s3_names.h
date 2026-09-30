@@ -1,9 +1,11 @@
 #pragma once
 // The small rules S3 states about names and their spellings on the wire: what a
 // bucket may be called, how a key is percent-encoded, and the two time formats.
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <string_view>
@@ -82,25 +84,46 @@ inline bool percent_decode(std::string_view in, std::string& out, bool plus_is_s
     return true;
 }
 
+// The bytes url_encode keeps as they are: the unreserved set and '/'.
+inline bool url_keeps(unsigned char c, bool keep_slash)
+{
+    static constexpr auto table = []
+    {
+        std::array<bool, 256> t{};
+        for (int i = 0; i < 256; ++i)
+            t[static_cast<size_t>(i)] = (i >= '0' && i <= '9') || (i >= 'a' && i <= 'z') ||
+                                        (i >= 'A' && i <= 'Z') || i == '-' || i == '_' ||
+                                        i == '.' || i == '~';
+        return t;
+    }();
+    return table[c] || (keep_slash && c == '/');
+}
+
 // The encoding `encoding-type=url` asks for in a listing: everything but the
-// unreserved set and '/' is escaped.
-inline std::string url_encode(std::string_view in, bool keep_slash = true)
+// unreserved set and '/' is escaped; appended to `out` without a temporary.
+inline void url_encode_to(std::string& out, std::string_view in, bool keep_slash = true)
 {
     static constexpr char digits[] = "0123456789ABCDEF";
+    size_t run = 0;
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (url_keeps(c, keep_slash))
+            continue;
+        out.append(in, run, i - run);
+        out.push_back('%');
+        out.push_back(digits[c >> 4]);
+        out.push_back(digits[c & 15]);
+        run = i + 1;
+    }
+    out.append(in, run, in.size() - run);
+}
+
+inline std::string url_encode(std::string_view in, bool keep_slash = true)
+{
     std::string out;
     out.reserve(in.size());
-    for (unsigned char c : in)
-    {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' ||
-            (keep_slash && c == '/'))
-            out.push_back(static_cast<char>(c));
-        else
-        {
-            out.push_back('%');
-            out.push_back(digits[c >> 4]);
-            out.push_back(digits[c & 15]);
-        }
-    }
+    url_encode_to(out, in, keep_slash);
     return out;
 }
 
@@ -223,26 +246,70 @@ inline void append_year(std::string& out, int64_t y)
     append_digits(out, static_cast<uint64_t>(y < 0 ? -y : y), 4);
 }
 
-// 2006-01-02T15:04:05.000Z, what S3 writes into every XML timestamp.
-inline std::string iso8601(int64_t ms)
+// The two digits of `v` (below 100) written at `p`.
+inline char* put_two(char* p, unsigned v)
+{
+    p[0] = static_cast<char>('0' + v / 10);
+    p[1] = static_cast<char>('0' + v % 10);
+    return p + 2;
+}
+
+// 2006-01-02T15:04:05.000Z, what S3 writes into every XML timestamp, at `p`;
+// room for 40 bytes, and the end of what was written comes back.
+inline char* write_iso8601(char* p, int64_t ms)
 {
     const utc_fields f = utc_of(ms);
+    if (f.year < 0 || f.year > 9999)
+    {
+        std::string wide;
+        append_year(wide, f.year);
+        wide.push_back('-');
+        append_digits(wide, f.month, 2);
+        wide.push_back('-');
+        append_digits(wide, f.day, 2);
+        wide.push_back('T');
+        append_digits(wide, f.hour, 2);
+        wide.push_back(':');
+        append_digits(wide, f.minute, 2);
+        wide.push_back(':');
+        append_digits(wide, f.second, 2);
+        wide.push_back('.');
+        append_digits(wide, f.milli, 3);
+        wide.push_back('Z');
+        std::memcpy(p, wide.data(), wide.size());
+        return p + wide.size();
+    }
+    const auto year = static_cast<unsigned>(f.year);
+    p = put_two(p, year / 100);
+    p = put_two(p, year % 100);
+    *p++ = '-';
+    p = put_two(p, f.month);
+    *p++ = '-';
+    p = put_two(p, f.day);
+    *p++ = 'T';
+    p = put_two(p, f.hour);
+    *p++ = ':';
+    p = put_two(p, f.minute);
+    *p++ = ':';
+    p = put_two(p, f.second);
+    *p++ = '.';
+    *p++ = static_cast<char>('0' + f.milli / 100);
+    p = put_two(p, f.milli % 100);
+    *p++ = 'Z';
+    return p;
+}
+
+inline void append_iso8601(std::string& out, int64_t ms)
+{
+    char buf[48];
+    out.append(buf, static_cast<size_t>(write_iso8601(buf, ms) - buf));
+}
+
+inline std::string iso8601(int64_t ms)
+{
     std::string out;
     out.reserve(24);
-    append_year(out, f.year);
-    out.push_back('-');
-    append_digits(out, f.month, 2);
-    out.push_back('-');
-    append_digits(out, f.day, 2);
-    out.push_back('T');
-    append_digits(out, f.hour, 2);
-    out.push_back(':');
-    append_digits(out, f.minute, 2);
-    out.push_back(':');
-    append_digits(out, f.second, 2);
-    out.push_back('.');
-    append_digits(out, f.milli, 3);
-    out.push_back('Z');
+    append_iso8601(out, ms);
     return out;
 }
 
