@@ -30,6 +30,8 @@ from botocore.config import Config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lib_s3_signing as sig  # noqa: E402
 
+from lib_asan import rss_check
+
 PORT = int(sys.argv[1])
 DATA = sys.argv[2]
 PID = int(sys.argv[3])
@@ -674,7 +676,7 @@ def large_half():
 
     after = worker_hwm_kib()
     limit_kib = int(os.environ.get("SOCKETLEY_STORAGE_AUTH_RSS_MIB", "64")) * 1024
-    check("the worker's peak resident set stays bounded through both (%d -> %d KiB, limit %d)" % (before, after, limit_kib),
+    rss_check(check, PID, "the worker's peak resident set stays bounded through both (%d -> %d KiB, limit %d)" % (before, after, limit_kib),
           0 < after <= limit_kib, (before, after))
 
 

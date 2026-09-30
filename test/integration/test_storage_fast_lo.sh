@@ -36,7 +36,7 @@ expect() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2', want '$3'"
 
 CAPBIN="$WORK/socketley-fastlo"
 cleanup() {
-    for r in sf_stg sf_px; do "$CAPBIN" stop "$r" >/dev/null 2>&1 || true; done
+    for r in sf_stg sf_px; do "$BIN" stop "$r" >/dev/null 2>&1 || true; done
     sleep 0.3
     daemon_stop
     rm -rf "$WORK"
@@ -60,8 +60,10 @@ run_mode() {   # mode
     if grep -q 'fast-lo: unavailable' "$SOCKETLEY_DLOG"; then
         skip "the shortcut did not attach here: $(grep 'fast-lo' "$SOCKETLEY_DLOG" | head -1)"
     fi
-    "$CAPBIN" create storage sf_stg -p "$P" --dir "$WORK/objects-$mode" --anonymous -s >/dev/null 2>&1 || bad "$mode: create" "sf_stg"
-    "$CAPBIN" create proxy sf_px -p $((P+1)) --protocol tcp --backend sf_stg -s >/dev/null 2>&1 || bad "$mode: create" "sf_px"
+    # Only the daemon needs the capabilities; the CLI is the plain binary, whose
+    # LeakSanitizer cannot run in a process that file capabilities make undumpable.
+    "$BIN" create storage sf_stg -p "$P" --dir "$WORK/objects-$mode" --anonymous -s >/dev/null 2>&1 || bad "$mode: create" "sf_stg"
+    "$BIN" create proxy sf_px -p $((P+1)) --protocol tcp --backend sf_stg -s >/dev/null 2>&1 || bad "$mode: create" "sf_px"
     for _ in $(seq 1 100); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P/")" = 200 ] && \
         [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((P+1))/")" = 200 ] && break
@@ -79,17 +81,17 @@ run_mode() {   # mode
             "$(curl -s -m 60 -H 'Range: bytes=1000000-30999999' "$url/flobkt/$how" | md5sum | cut -d' ' -f1)" "$want_r"
     done
     local entered zc
-    entered=$("$CAPBIN" daemon stats 2>&1 | sed -n 's/^fast_lo_entered://p')
+    entered=$("$BIN" daemon stats 2>&1 | sed -n 's/^fast_lo_entered://p')
     if [ "${entered:-0}" -gt 0 ]; then ok "$mode: the shortcut took sockets ($entered)"; else bad "$mode: the shortcut was engaged" "fast_lo_entered=$entered"; fi
     for _ in $(seq 1 50); do
-        zc=$("$CAPBIN" stats sf_stg 2>/dev/null | sed -n 's/^zero_copy_bytes://p')
+        zc=$("$BIN" stats sf_stg 2>/dev/null | sed -n 's/^zero_copy_bytes://p')
         [ "${zc:-0}" -ge 143886080 ] && break
         sleep 0.1
     done
     if [ "${zc:-0}" -ge 143886080 ]; then ok "$mode: every download went by splice ($zc bytes)"; else bad "$mode: downloads by splice" "zero_copy_bytes=$zc"; fi
-    "$CAPBIN" stop sf_stg >/dev/null 2>&1; "$CAPBIN" stop sf_px >/dev/null 2>&1
+    "$BIN" stop sf_stg >/dev/null 2>&1; "$BIN" stop sf_px >/dev/null 2>&1
     sleep 0.3
-    "$CAPBIN" remove sf_stg >/dev/null 2>&1; "$CAPBIN" remove sf_px >/dev/null 2>&1
+    "$BIN" remove sf_stg >/dev/null 2>&1; "$BIN" remove sf_px >/dev/null 2>&1
     kill "$SOCKETLEY_DPID" 2>/dev/null
     for _ in $(seq 1 50); do kill -0 "$SOCKETLEY_DPID" 2>/dev/null || break; sleep 0.1; done
     daemon_sweep "${SOCKETLEY_SOCKET:-}"

@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 
+from lib_asan import rss_check
+
 PORT = int(sys.argv[1])
 DATA = sys.argv[2]
 PID = int(sys.argv[3])
@@ -285,7 +287,7 @@ rss_many = status_kib("VmRSS")
 note("%d uploads in flight, each with 64 KiB sent of 8 MiB: %d temporary files, RSS %d KiB (was %d), fds %d (was %d)" %
      (N_UP, n_tmp, rss_many, base_rss, fds(), base_fds))
 check("%d concurrent uploads each hold a temporary file" % N_UP, n_tmp == N_UP, n_tmp)
-check("their resident set stays under 150 MiB in total (worker RSS %d KiB)" % rss_many, rss_many < 150 * 1024, rss_many)
+rss_check(check, PID, "their resident set stays under 150 MiB in total (worker RSS %d KiB)" % rss_many, rss_many < 150 * 1024, rss_many)
 st, hd, b = request("GET", "/upl/keep")
 check("with %d uploads in flight a GET is served" % N_UP, st == 200 and b == old)
 for s in socks[:100]:

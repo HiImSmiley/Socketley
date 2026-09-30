@@ -16,6 +16,8 @@ import socket
 import sys
 import time
 
+from lib_asan import rss_check
+
 PORT = int(sys.argv[1])
 PID = int(sys.argv[2])
 SIZE_MIB = int(sys.argv[3])
@@ -98,7 +100,7 @@ conn.close()
 print("  PUT %d MiB in %.2f s (%.0f MiB/s)" % (SIZE_MIB, put_secs, SIZE_MIB / put_secs))
 put_hwm = status_kib("VmHWM")
 print("  worker peak RSS after the PUT: %d KiB" % put_hwm)
-check("the worker's peak RSS stays under %d MiB through the PUT" % MAX_RSS_MIB, put_hwm < MAX_RSS_MIB * 1024,
+rss_check(check, PID, "the worker's peak RSS stays under %d MiB through the PUT" % MAX_RSS_MIB, put_hwm < MAX_RSS_MIB * 1024,
       "%d KiB" % put_hwm)
 
 # ── GET, whole ──────────────────────────────────────────────────────────────
@@ -122,7 +124,7 @@ check("and they are the bytes that were put", got.hexdigest() == md5.hexdigest()
 print("  GET %d MiB in %.2f s (%.0f MiB/s)" % (SIZE_MIB, get_secs, SIZE_MIB / get_secs))
 get_hwm = status_kib("VmHWM")
 print("  worker peak RSS after the GET: %d KiB" % get_hwm)
-check("the worker's peak RSS stays under %d MiB through the GET" % MAX_RSS_MIB, get_hwm < MAX_RSS_MIB * 1024,
+rss_check(check, PID, "the worker's peak RSS stays under %d MiB through the GET" % MAX_RSS_MIB, get_hwm < MAX_RSS_MIB * 1024,
       "%d KiB" % get_hwm)
 
 after = wait_counter("zero_copy_bytes", int(before.get("zero_copy_bytes", "0")) + SIZE)
@@ -167,7 +169,7 @@ s, body = request("PUT", "/large-bucket/copy-dst", headers={"x-amz-copy-source":
 check("a CopyObject of %d MiB is 200" % (SIZE_MIB // 4), s == 200, (s, body[:200]))
 final_hwm = status_kib("VmHWM")
 print("  worker peak RSS at the end: %d KiB" % final_hwm)
-check("and the peak RSS is still under %d MiB after the copy" % MAX_RSS_MIB, final_hwm < MAX_RSS_MIB * 1024,
+rss_check(check, PID, "and the peak RSS is still under %d MiB after the copy" % MAX_RSS_MIB, final_hwm < MAX_RSS_MIB * 1024,
       "%d KiB" % final_hwm)
 
 print("  Results: %d/%d passed (%d failed)" % (passed, passed + failed, failed))

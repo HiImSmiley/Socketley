@@ -34,6 +34,8 @@ from botocore.config import Config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lib_s3_signing as sig  # noqa: E402
 
+from lib_asan import rss_check
+
 PORT = int(sys.argv[1])
 DATA = sys.argv[2]
 MODE = sys.argv[3]
@@ -551,7 +553,7 @@ def large_mode():
     check("and it reads back as the parts, joined", g.hexdigest() == want.hexdigest())
     after = hwm()
     limit = int(os.environ.get("SOCKETLEY_STORAGE_MPU_RSS_MIB", "64")) * 1024
-    check("the worker's peak resident set stays bounded through the parts and the assembly (%d -> %d KiB, limit %d)" %
+    rss_check(check, pid, "the worker's peak resident set stays bounded through the parts and the assembly (%d -> %d KiB, limit %d)" %
           (before, after, limit), 0 < after <= limit, (before, after))
     check("nothing is left of the upload", wait_for(lambda: upload_dirs() == [], 10.0), upload_dirs())
 
