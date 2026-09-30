@@ -835,6 +835,13 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
         // The answer was decided while this was in flight, so what it brought is counted and dropped.
         if (c->ph == phase::body_discard)
         {
+            // Such a recv asks for no more than the body's rest, so none of what it brought can be the next request.
+            if (n > c->body_left)
+            {
+                give_hook_buffer(std::move(c->hbuf));
+                close_conn(c);
+                return;
+            }
             static const char sink[1] = {0};
             plain_in(c, sink, n);
         }

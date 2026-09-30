@@ -77,7 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the key, from 45 to 30 us of worker CPU summed over the shards at 32 connections
   (about 50 thousand to 56 thousand per second) and from 30 to 20 us at one connection (7100 to
   8100 per second), at about 14 us more for a PUT into memory-backed storage (the
-  table above is from before it). The splice
+  table above is from before it). A connection receives into a buffer a shared
+  ring lends it for one completion, with one multishot recv armed across
+  requests on a cleartext connection (`SOCKETLEY_STORAGE_RECV_BUFS`, default 64
+  of 16 KiB, 0 for a buffer per connection; `SOCKETLEY_RECV_MULTISHOT=0` as for
+  the other runtimes), so an idle keep-alive connection holds about 2 KiB instead
+  of 10 (10000 of them 20 MiB instead of 100) and a TLS one about 19 KiB instead
+  of 92, and a GET costs one submission instead of two; CPU per request and PUT
+  throughput are level. The splice
   threshold of 64 KiB was measured and left (below it a read and a write are as
   fast, at 256 KiB splicing is 3.8x).
 
