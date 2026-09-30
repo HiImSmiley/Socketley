@@ -67,6 +67,12 @@ struct storage_counters
     // TLS handshakes that completed and that did not.
     uint64_t tls_handshakes{0};
     uint64_t tls_failures{0};
+    // Receives that found the buffer ring empty and were taken by the connection's own buffer instead.
+    uint64_t recv_fallbacks{0};
+    // Recvs withdrawn, because the phase wanted a buffer of its own or what they brought had piled up.
+    uint64_t recv_cancels{0};
+    // Body bytes received straight into a put's staging buffer, without passing through one the ring lent.
+    uint64_t recv_direct_bytes{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -190,13 +196,12 @@ struct conn
     bool         dead{false};
 
     // ── TLS ─────────────────────────────────────────────────────────────────
-    // Null on a cleartext connection.  With a session, `rbuf`'s job is done by
-    // `cbuf` (ciphertext), `wq` holds plaintext waiting for the record layer
-    // and `wbuf` the ciphertext the kernel is reading.
+    // Null on a cleartext connection.  With a session, what a recv brings is
+    // ciphertext, `wq` holds plaintext waiting for the record layer and `wbuf`
+    // the ciphertext the kernel is reading.
     SSL*            ssl{nullptr};
     tls_conn_state  tls_state{tls_conn_none};
     bool            pulling{false};
-    std::unique_ptr<char[]> cbuf;
     std::chrono::steady_clock::time_point accepted{};
 
     io_request rd_req{};
@@ -209,12 +214,20 @@ struct conn
     bool       sp_out_pending{false};
     bool       closing{false};
 
-    // A recv lands here, and for a body with nothing to decode straight in the
-    // put's staging buffer instead.
-    static constexpr size_t rbuf_size = 8192;
-    char        rbuf[rbuf_size];
+    // A recv lands in a buffer the ring lends for the length of the completion, and for a body
+    // with nothing to decode straight in the put's staging buffer instead.
     bool        rd_direct{false};
-    size_t      rd_direct_room{0};
+    // The armed recv is one that keeps delivering until it is cancelled or the peer goes.
+    bool        rd_multi{false};
+    // A cancel for that recv has been submitted, and its last completion is awaited.
+    bool        rd_cancel{false};
+    // The last recv took what the socket had and left it empty, so the next one waits for data instead of trying first.
+    bool        rd_drained{true};
+    // The peer will send no more, which a connection still answering does not act on until it is done.
+    bool        peer_eof{false};
+    // Read into by a recv the ring could not serve, and only then allocated.
+    std::unique_ptr<char[]> fbuf;
+    bool        rd_fallback{false};
 
     phase       ph{phase::head};
     // Bytes read and not yet consumed: a head being assembled, or the start of
@@ -370,13 +383,26 @@ public:
     void arm_accept();
     void adopt(int fd);
     void arm_read(const std::shared_ptr<conn>& c);
+    // What the next recv on a connection should be, or that none should be.
+    struct read_plan
+    {
+        enum class kind : uint8_t { none, ring, own };
+        kind     k{kind::none};
+        char*    buf{nullptr};
+        uint32_t len{0};
+        bool     direct{false};
+        bool     hook{false};
+    };
+    read_plan plan_read(const conn& c) const;
+    // Withdraws the recv that is armed, whose last completion says -ECANCELED.
+    void cancel_read(const std::shared_ptr<conn>& c);
     void read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void splice_out_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     // Plaintext, wherever it came from: the socket's bytes or a session's.
     void plain_in(const std::shared_ptr<conn>& c, const char* p, size_t n);
-    void tls_in(const std::shared_ptr<conn>& c, size_t n);
+    void tls_in(const std::shared_ptr<conn>& c, const char* data, size_t n);
     void tls_pull(const std::shared_ptr<conn>& c);
     // Moves what the record layer has to say and what waits in `wq` into `wbuf`.
     bool tls_encrypt(const std::shared_ptr<conn>& c);
@@ -389,7 +415,7 @@ public:
 
     // ── HTTP ────────────────────────────────────────────────────────────────
     void process_in(const std::shared_ptr<conn>& c);
-    bool parse_head(const std::shared_ptr<conn>& c, size_t head_len);
+    bool parse_head(const std::shared_ptr<conn>& c, std::string_view head);
     void send_response(const std::shared_ptr<conn>& c, response r);
     void send_error(const std::shared_ptr<conn>& c, const s3_error& e, bool close = false,
                     std::string_view extra_name = {}, std::string_view extra_value = {});
@@ -554,6 +580,9 @@ private:
     uint32_t    m_max_active_puts{512};
     size_t      m_zero_copy_min{64 * 1024};
     size_t      m_max_conns{0};
+    // Whether a recv can be lent a buffer by the ring, and be armed once to keep delivering.
+    bool        m_ring{false};
+    bool        m_multishot{false};
 
     friend class ::storage_instance;
 };

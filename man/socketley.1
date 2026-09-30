@@ -10930,6 +10930,22 @@ the throughput of large puts, never what is stored.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_RECV_BUFS
+How many 16 KiB buffers the receive ring of a storage worker holds, a power of two.
+Default
+.BR 64 ;
+.B 0
+takes the ring away, and every connection reads into a buffer of its own. A connection
+is lent a buffer only for the length of one completion, so an idle keep\-alive
+connection holds none, and a receive that finds the ring empty is taken by a buffer
+of its own for that one read, counted as
+.B recv_fallbacks
+in
+.BR stats .
+This changes the memory a worker holds and never what it returns.
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_CACHE_TTL_SWEEP_MS
 Interval between periodic sweeps for expired cache keys, in milliseconds.
 Default

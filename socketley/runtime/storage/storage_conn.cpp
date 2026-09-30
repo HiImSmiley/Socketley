@@ -35,9 +35,17 @@ constexpr size_t   hook_buffers_kept   = 32;
 // sent it hears the answer instead of a reset; beyond it the connection closes.
 constexpr uint64_t discard_limit       = 64ull << 20;
 constexpr int      body_stall_secs     = 60;
-// A TLS read is a whole record's worth at a time, so a body is not fed to the
-// record layer eight kilobytes at once.
-constexpr size_t   tls_read_bytes      = 64 * 1024;
+// The group of the buffer ring a recv is lent its bytes from, and its geometry: a head is a few hundred
+// bytes, so what one buffer holds is what a small body can arrive in.
+constexpr uint16_t ring_group          = 5;
+constexpr uint32_t ring_buf_bytes      = 16 * 1024;
+constexpr uint32_t ring_buf_count      = 64;
+// What a recv brings when the ring has none to lend.
+constexpr uint32_t fallback_bytes      = 16 * 1024;
+// A body this small is taken out of the ring's buffers, and a larger one is read where it will be written.
+constexpr uint64_t direct_min          = 32 * 1024;
+// What may pile up unread by the phase before the recv that delivers it is stopped.
+constexpr size_t   backlog_cap         = 256 * 1024;
 constexpr size_t   tls_plain_bytes     = 16 * 1024;
 // What one turn of the encryptor puts in front of the kernel.
 constexpr size_t   tls_write_slice     = 64 * 1024;
@@ -119,6 +127,17 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
         if (end != e && v >= 0)
             m_zero_copy_min = static_cast<size_t>(v);
     }
+    // A count the tests shrink to make the ring run dry; zero takes it away.
+    uint32_t ring_bufs = ring_buf_count;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_RECV_BUFS"))
+    {
+        char* end;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && v >= 0 && v <= 4096 && (v & (v - 1)) == 0)
+            ring_bufs = static_cast<uint32_t>(v);
+    }
+    m_ring      = ring_bufs != 0 && m_loop.setup_buf_ring(ring_group, ring_bufs, ring_buf_bytes);
+    m_multishot = m_ring && m_loop.recv_multishot_enabled();
 }
 
 storage_run::~storage_run()
@@ -260,11 +279,19 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             if (cl.get() == raw)
                 c = cl;
     if (!c)
+    {
+        // A buffer the ring lent to a completion nobody can take is still the ring's.
+        m_loop.return_cqe_buf(cqe, req);
         return;
+    }
 
     switch (req->type)
     {
-        case op_read:       read_done(c, cqe); break;
+        case op_read:
+        case op_read_provided:
+        case op_recv_multishot:
+            read_done(c, cqe);
+            break;
         case op_write:      write_done(c, cqe); break;
         case op_splice_file: splice_in_done(c, cqe); break;
         case op_splice:     splice_out_done(c, cqe); break;
@@ -375,7 +402,6 @@ void storage_run::adopt(int fd)
             return;
         }
         c->tls_state = tls_conn_handshake;
-        c->cbuf      = std::make_unique<char[]>(tls_read_bytes);
     }
     m_conns.emplace(c->id, c);
     runtime_instance::stat_add(m_owner.m_stat_total_connections, 1);
@@ -558,10 +584,90 @@ void storage_run::maybe_release(const std::shared_ptr<conn>& c)
     }
 }
 
+// What the next recv of a connection should be, decided in one place because arm_read() asks it both to
+// arm one and to learn whether the one already armed is the wrong kind.
+storage_run::read_plan storage_run::plan_read(const conn& c) const
+{
+    read_plan p;
+    p.k = read_plan::kind::ring;
+    switch (c.ph)
+    {
+        case phase::respond:
+        case phase::hook_wait:
+            p.k = read_plan::kind::none;
+            return p;
+        case phase::body_put:
+            if (c.ssl)
+            {
+                // Ciphertext cannot land in the staging buffer: what the put
+                // takes is what the session decrypted.
+                if (c.park_off < c.park.size())
+                    p.k = read_plan::kind::none;   // waiting for the put to take what is parked
+            }
+            else if (!c.hook && !c.req.chunked && c.put && !c.put->failed() && c.put_failed == st::ok &&
+                     c.body_left >= direct_min)
+            {
+                // Straight into the staging buffer: the bytes are hashed where
+                // they land and written from there.
+                const size_t room = c.put->stage_room();
+                char* buf = room ? c.put->stage_ptr() : nullptr;
+                const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>({room, c.body_left, 1u << 20}));
+                if (!buf || len == 0)
+                    p.k = read_plan::kind::none;   // the put's ready callback arms this again
+                else
+                {
+                    p.k      = read_plan::kind::own;
+                    p.buf    = buf;
+                    p.len    = len;
+                    p.direct = true;
+                }
+            }
+            else if (c.hook && c.hook->heavy() && !c.req.chunked && m_hash.enabled() && c.put &&
+                     !c.put->failed() && c.put_failed == st::ok && c.body_left >= direct_min)
+            {
+                // A signed body is verified on a helper thread, a quarter megabyte at a time.
+                if (c.park_off < c.park.size() || c.hook_busy)
+                    p.k = read_plan::kind::none;   // resumed when the hook has reported and the put has taken its bytes
+                else
+                {
+                    p.k    = read_plan::kind::own;
+                    p.len  = static_cast<uint32_t>(std::min<uint64_t>(hook_read_bytes, c.body_left));
+                    p.hook = true;
+                }
+            }
+            else if (c.park_off < c.park.size())
+                p.k = read_plan::kind::none;   // waiting for the put to take what is parked
+            break;
+        default:
+            break;
+    }
+    return p;
+}
+
+void storage_run::cancel_read(const std::shared_ptr<conn>& c)
+{
+    if (c->rd_cancel)
+        return;
+    if (!m_loop.submit_cancel_request(&c->rd_req))
+    {
+        close_conn(c);
+        return;
+    }
+    c->rd_cancel = true;
+    ++m_c.recv_cancels;
+}
+
 void storage_run::arm_read(const std::shared_ptr<conn>& c)
 {
-    if (c->dead || c->rd_pending || c->fd < 0)
+    if (c->dead || c->fd < 0)
         return;
+    if (c->rd_pending)
+    {
+        // A recv that keeps delivering is left standing, unless the phase now wants a buffer of its own.
+        if (c->rd_multi && !c->rd_cancel && plan_read(*c).k == read_plan::kind::own)
+            cancel_read(c);
+        return;
+    }
 
     // What the record layer already holds is delivered before another recv is
     // asked for, because nothing would ever complete for bytes that are here.
@@ -573,67 +679,54 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
             return;
     }
 
-    char*    buf = c->ssl ? c->cbuf.get() : c->rbuf;
-    uint32_t len = static_cast<uint32_t>(c->ssl ? tls_read_bytes : conn::rbuf_size);
-    c->rd_direct = false;
-    c->rd_hook   = false;
-
-    switch (c->ph)
+    read_plan plan = plan_read(*c);
+    if (plan.k == read_plan::kind::none)
+        return;
+    // A peer that has said all it will say is answered, and gone when there is nothing left to read.
+    if (c->peer_eof)
     {
-        case phase::respond:
-        case phase::hook_wait:
-            return;
-        case phase::body_put:
-            if (c->ssl)
-            {
-                // Ciphertext cannot land in the staging buffer: what the put
-                // takes is what the session decrypted.
-                if (c->park_off < c->park.size())
-                    return;   // waiting for the put to take what is parked
-            }
-            else if (!c->hook && !c->req.chunked && c->put && !c->put->failed() && c->put_failed == st::ok)
-            {
-                // Straight into the staging buffer: the bytes are hashed where
-                // they land and written from there.
-                const size_t room = c->put->stage_room();
-                if (room == 0)
-                    return;   // the put's ready callback arms this again
-                char* p = c->put->stage_ptr();
-                if (!p)
-                    return;
-                buf = p;
-                len = static_cast<uint32_t>(std::min<uint64_t>({room, c->body_left, 1u << 20}));
-                c->rd_direct = true;
-                if (len == 0)
-                    return;
-            }
-            else if (c->hook && c->hook->heavy() && !c->req.chunked && m_hash.enabled() && c->put &&
-                     !c->put->failed() && c->put_failed == st::ok)
-            {
-                // A signed body is verified on a helper thread, a quarter megabyte at a time.
-                if (c->park_off < c->park.size() || c->hook_busy)
-                    return;   // resumed when the hook has reported and the put has taken its bytes
-                if (!c->hbuf)
-                    c->hbuf = take_hook_buffer();
-                buf = c->hbuf.get();
-                len = static_cast<uint32_t>(std::min<uint64_t>(hook_read_bytes, c->body_left));
-                if (len == 0)
-                    return;
-                c->rd_hook = true;
-            }
-            else if (c->park_off < c->park.size())
-                return;   // waiting for the put to take what is parked
-            break;
-        default:
-            break;
+        close_conn(c);
+        return;
+    }
+    c->rd_direct = plan.direct;
+    c->rd_hook   = plan.hook;
+    c->rd_multi  = false;
+    c->rd_cancel = false;
+    if (plan.hook)
+    {
+        if (!c->hbuf)
+            c->hbuf = take_hook_buffer();
+        plan.buf = c->hbuf.get();
     }
 
     c->rd_req = io_request{};
     c->rd_req.owner  = this;
-    c->rd_req.type   = op_read;
     c->rd_req.buffer = reinterpret_cast<char*>(c.get());
-    if (!m_loop.submit_read(c->fd, buf, len, &c->rd_req))
+    bool queued = false;
+    if (plan.k == read_plan::kind::ring && m_ring && !c->rd_fallback)
     {
+        // Nothing is held for an idle connection: the kernel picks a buffer when bytes arrive.
+        if (m_multishot && !c->ssl)
+            queued = c->rd_multi = m_loop.submit_recv_multishot(c->fd, ring_group, &c->rd_req);
+        if (!queued)
+            queued = m_loop.submit_read_provided(c->fd, ring_group, &c->rd_req, c->rd_drained);
+    }
+    else
+    {
+        if (plan.k == read_plan::kind::ring)
+        {
+            // The ring could not lend one, so this receive brings its own.
+            c->fbuf = std::make_unique_for_overwrite<char[]>(fallback_bytes);
+            plan.buf = c->fbuf.get();
+            plan.len = fallback_bytes;
+        }
+        c->rd_req.type = op_read;
+        queued = m_loop.submit_read(c->fd, plan.buf, plan.len, &c->rd_req);
+    }
+    c->rd_fallback = false;
+    if (!queued)
+    {
+        c->rd_multi = false;
         close_conn(c);
         return;
     }
@@ -642,13 +735,53 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
 
 void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe)
 {
-    c->rd_pending = false;
+    const bool multi = is_multishot_recv_op(c->rd_req.type);
+    const bool more  = multi && (cqe->flags & IORING_CQE_F_MORE) != 0;
+    // Whatever the ring lent goes back on every way out, and a fallback buffer is freed with it.
+    struct lent
+    {
+        event_loop&              loop;
+        bool                     held;
+        uint16_t                 id;
+        std::unique_ptr<char[]>  own;
+        ~lent()
+        {
+            if (held)
+                loop.return_buf(ring_group, id);
+        }
+    } lend{m_loop, (cqe->flags & IORING_CQE_F_BUFFER) != 0,
+           static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT), std::move(c->fbuf)};
+    if (!more)
+    {
+        c->rd_pending = false;
+        c->rd_multi   = false;
+        c->rd_cancel  = false;
+    }
     if (c->dead)
     {
         maybe_release(c);
         return;
     }
     const int res = cqe->res;
+    if (res == -ENOBUFS)
+    {
+        // The ring had nothing to lend: this receive is taken by a buffer of the connection's own.
+        ++m_c.recv_fallbacks;
+        c->rd_fallback = true;
+        arm_read(c);
+        return;
+    }
+    if (res == -ECANCELED && !more)
+    {
+        // Asked for, because the phase wanted a buffer of its own or the backlog was full.
+        arm_read(c);
+        return;
+    }
+    if (res == 0 && (c->ph == phase::respond || c->ph == phase::hook_wait))
+    {
+        c->peer_eof = true;
+        return;
+    }
     if (res <= 0)
     {
         // The peer went, or the socket failed: whatever it was owed is moot.
@@ -656,43 +789,75 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
         return;
     }
     const size_t n = static_cast<size_t>(res);
-    c->last_progress = std::chrono::steady_clock::now();
+    c->rd_drained = event_loop::recv_drained(cqe);
+    // A request being answered is not progress by the client, or a stalled write would never be reaped.
+    if (c->ph != phase::respond && c->ph != phase::hook_wait)
+        c->last_progress = std::chrono::steady_clock::now();
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, n);
     m_c.bytes_in += n;
 
-    if (c->ssl)
-    {
-        tls_in(c, n);
-        return;
-    }
+    const char* data = nullptr;
+    if (lend.held)
+        data = m_loop.get_buf_ptr(ring_group, lend.id);
+    else if (lend.own)
+        data = lend.own.get();
 
-    if (c->ph == phase::body_put && c->rd_direct)
+    if (c->rd_direct || c->rd_hook)
     {
+        const bool direct = c->rd_direct;
         c->rd_direct = false;
-        c->body_left -= n;
-        if (c->put && !c->put->failed())
-            c->put->staged(n);
-        if (c->dead)
-            return;
-        if (c->put_failed != st::ok || c->ph != phase::body_put)
+        c->rd_hook   = false;
+        if (c->ph == phase::body_put && direct)
         {
-            arm_read(c);
+            m_c.recv_direct_bytes += n;
+            c->body_left -= n;
+            if (c->put && !c->put->failed())
+                c->put->staged(n);
+            if (c->dead)
+                return;
+            if (c->put_failed != st::ok || c->ph != phase::body_put)
+            {
+                arm_read(c);
+                return;
+            }
+            if (c->body_left == 0)
+                put_body_complete(c);
+            else
+                arm_read(c);
             return;
         }
-        if (c->body_left == 0)
-            put_body_complete(c);
-        else
-            arm_read(c);
+        if (c->ph == phase::body_put)
+        {
+            c->body_left -= n;
+            hook_async(c, n);
+            return;
+        }
+        // The answer was decided while this was in flight, so what it brought is counted and dropped.
+        if (c->ph == phase::body_discard)
+        {
+            static const char sink[1] = {0};
+            plain_in(c, sink, n);
+        }
+        give_hook_buffer(std::move(c->hbuf));
         return;
     }
-    if (c->ph == phase::body_put && c->rd_hook)
+    if (!data)
     {
-        c->rd_hook = false;
-        c->body_left -= n;
-        hook_async(c, n);
+        close_conn(c);
         return;
     }
-    plain_in(c, c->rbuf, n);
+    if (c->ssl)
+        tls_in(c, data, n);
+    else
+        plain_in(c, data, n);
+    if (c->dead)
+        return;
+    // A recv that keeps delivering is stopped when what it brought has piled up faster than it is taken.
+    if (more && !c->rd_cancel &&
+        (c->in.size() > backlog_cap || c->park.size() - c->park_off > backlog_cap))
+        cancel_read(c);
+    else if (!more && multi)
+        arm_read(c);
 }
 
 // What a heavy hook did with one recv: run on a helper thread, reported on the loop.
@@ -772,7 +937,21 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
     {
         case phase::head:
             if (c->in.empty())
+            {
                 c->request_began = c->last_progress;
+                // A head that lies whole in what arrived is parsed there, and only what follows it is kept.
+                const size_t end = std::string_view(p, n).find("\r\n\r\n");
+                if (end != std::string_view::npos && end + 4 <= max_head_bytes)
+                {
+                    if (!parse_head(c, std::string_view(p, end + 4)))
+                        return;
+                    c->in.assign(p + end + 4, n - end - 4);
+                    ++m_c.requests;
+                    runtime_instance::stat_add(m_owner.m_stat_total_messages, 1);
+                    dispatch(c);
+                    return;
+                }
+            }
             c->in.append(p, n);
             process_in(c);
             return;
@@ -805,6 +984,8 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
             return;
         case phase::respond:
         case phase::hook_wait:
+            // The next request, sent ahead of the answer to this one.
+            c->in.append(p, n);
             return;
     }
 }
@@ -813,9 +994,8 @@ void storage_run::plain_in(const std::shared_ptr<conn>& c, const char* p, size_t
 
 // Ciphertext in: into the session, the handshake advanced, and whatever the
 // records carry delivered.  Its own records go out before it returns.
-void storage_run::tls_in(const std::shared_ptr<conn>& c, size_t n)
+void storage_run::tls_in(const std::shared_ptr<conn>& c, const char* data, size_t n)
 {
-    const char* data = c->cbuf.get();
     size_t off = 0;
     while (off < n)
     {
@@ -1232,7 +1412,7 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
         arm_read(c);
         return;
     }
-    if (!parse_head(c, end + 4))
+    if (!parse_head(c, std::string_view(c->in).substr(0, end + 4)))
         return;
     c->in.erase(0, end + 4);
     ++m_c.requests;
@@ -1240,12 +1420,12 @@ void storage_run::process_in(const std::shared_ptr<conn>& c)
     dispatch(c);
 }
 
-bool storage_run::parse_head(const std::shared_ptr<conn>& c, size_t head_len)
+bool storage_run::parse_head(const std::shared_ptr<conn>& c, std::string_view head)
 {
     s3_request& r = c->req;
     r.reset();
     new_request_id(r.request_id);
-    r.head.assign(c->in, 0, head_len);
+    r.head.assign(head);
 
     const std::string_view all(r.head);
     auto bad = [&](std::string_view code, bool close = true)

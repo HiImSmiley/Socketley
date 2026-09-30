@@ -365,7 +365,10 @@ std::string storage_instance::stats_lines() const
         << "multipart_aborted:" << c.mpu_aborted << "\n"
         << "tls:" << (m_run->tls_enabled() ? 1 : 0) << "\n"
         << "tls_handshakes:" << c.tls_handshakes << "\n"
-        << "tls_failures:" << c.tls_failures << "\n";
+        << "tls_failures:" << c.tls_failures << "\n"
+        << "recv_fallbacks:" << c.recv_fallbacks << "\n"
+        << "recv_cancels:" << c.recv_cancels << "\n"
+        << "recv_direct_bytes:" << c.recv_direct_bytes << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)
