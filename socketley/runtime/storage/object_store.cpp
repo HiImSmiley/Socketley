@@ -199,6 +199,24 @@ void object_store::hot_invalidate(std::string_view bucket_name, std::string_view
     hot_drop(bucket_name, key);
 }
 
+void object_store::hot_forget_owner(uint32_t shard)
+{
+    hot_note_drop(0);
+    for (auto it = m_hot_lru.begin(); it != m_hot_lru.end();)
+    {
+        const std::string_view id(it->id);
+        const size_t z = id.find('\0');
+        if (owner_of(id.substr(0, z), id.substr(z + 1)) == shard)
+        {
+            m_hot_bytes -= it->body.size() + it->id.size();
+            m_hot_index.erase(it->id);
+            it = m_hot_lru.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
 void object_store::hot_drop(std::string_view bucket_name, std::string_view key)
 {
     if (m_hot_index.empty())

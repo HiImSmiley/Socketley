@@ -152,7 +152,23 @@ bool storage_run::listen_on(int fd)
 {
     m_listen_fd = fd;
     arm_accept();
+    tell_started();
+    arm_sweep();
     return m_accept_pending;
+}
+
+void storage_run::tell_started()
+{
+    if (m_start_note != start_note::untold || m_store.shards() <= 1)
+        return;
+    // A sibling silent for this long is gone, and one that comes back holds no copies.
+    if (++m_start_tries > 30)
+    {
+        m_start_note = start_note::told;
+        return;
+    }
+    m_start_note = start_note::telling;
+    m_node.announce_start([this](bool all) { m_start_note = all ? start_note::told : start_note::untold; });
 }
 
 bool storage_run::drained() const
@@ -443,7 +459,8 @@ void storage_run::sweep()
             reap_uploads();
         }
     }
-    if (!m_conns.empty() || m_mpu_expire_secs != 0)
+    tell_started();
+    if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told)
         arm_sweep();
 }
 

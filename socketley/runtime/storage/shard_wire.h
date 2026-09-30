@@ -44,6 +44,8 @@ enum class op : uint8_t
     mpu_list      = 17,
     // From the owner of a key to its siblings: drop the small copy you hold of it.
     hot_drop      = 18,
+    // From a shard that has just started: drop every copy you hold of my keys.
+    hot_owner_started = 19,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -57,6 +59,8 @@ bool        decode_remove(std::string_view payload, std::string& bucket, std::st
 
 std::string encode_hot_drop(std::string_view bucket, std::string_view key);
 bool        decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key);
+std::string encode_hot_owner_started(uint32_t shard);
+bool        decode_hot_owner_started(std::string_view payload, uint32_t& shard);
 
 std::string encode_list(std::string_view bucket, const list_query& q);
 bool        decode_list(std::string_view payload, std::string& bucket, list_query& q);

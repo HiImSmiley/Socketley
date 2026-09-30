@@ -405,6 +405,8 @@ public:
                          std::string_view body);
     // The owner's word that the key changed: drops it and refuses the reads that were in flight.
     void hot_invalidate(std::string_view bucket, std::string_view key);
+    // A sibling started, so every copy of its keys may be older than its files, and so may every read in flight.
+    void hot_forget_owner(uint32_t shard);
 
     // The metadata of any object, from memory when this shard owns the key and
     // from the object's own header otherwise.

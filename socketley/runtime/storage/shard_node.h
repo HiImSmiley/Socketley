@@ -67,6 +67,9 @@ public:
                 std::function<void(st, bool)> cb) override;
     // Sent by the owner before it answers a commit or a delete, so no sibling answers the old bytes after it.
     void invalidate(std::string bucket, std::string key, std::function<void()> done) override;
+    // Tells the siblings this shard has started, so they drop the copies they hold of its keys, which a
+    // commit this shard died in may have replaced without their being told; `done` hears whether all answered.
+    void announce_start(std::function<void(bool)> done);
 
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
     void create_bucket(std::string name, std::function<void(st)> cb);

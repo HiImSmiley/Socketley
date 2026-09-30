@@ -124,6 +124,14 @@ void shard_node::invalidate(std::string bucket, std::string key, std::function<v
               std::move(done));
 }
 
+void shard_node::announce_start(std::function<void(bool)> done)
+{
+    auto all = std::make_shared<bool>(true);
+    each_peer([this](uint32_t) { return wire::encode_hot_owner_started(m_store.shard()); },
+              [all](uint32_t, bool ok, std::string_view) { *all = *all && ok; },
+              [all, done = std::move(done)]() { done(*all); });
+}
+
 // ─── Buckets ────────────────────────────────────────────────────────────────
 
 void shard_node::create_bucket(std::string name, std::function<void(st)> cb)
@@ -813,6 +821,18 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             }
             ++m_c.hot_drops_in;
             m_store.hot_invalidate(bucket, key);
+            reply(true, wire::encode_status(st::ok));
+            return;
+        }
+        case wire::op::hot_owner_started:
+        {
+            uint32_t shard = 0;
+            if (!wire::decode_hot_owner_started(payload, shard))
+            {
+                reply(false, {});
+                return;
+            }
+            m_store.hot_forget_owner(shard);
             reply(true, wire::encode_status(st::ok));
             return;
         }

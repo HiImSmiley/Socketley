@@ -23,6 +23,9 @@
 #     ETag, or a final GET on any connection that is not the last PUT)
 #   * a sibling's drop not being served (shard_hot_drops_sent is not
 #     shard_hot_drops_served)
+#   * an owner killed between renaming a new version into place and telling
+#     its siblings, whose restart adopts the new file while the siblings keep
+#     answering their copies of the old one (the restarted shard tells them)
 set -euo pipefail
 BIN="${BIN:-$(dirname "$0")/../../bin/Release/socketley}"
 BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
@@ -198,7 +201,66 @@ H=$(stat_sum hot_gets)
 if [ "${H:-x}" = 0 ] && grep -Eq "(^| )overwrite 0( |$)" <<<"$R"; then pass
 else fail "off" "SOCKETLEY_STORAGE_HOT_BYTES=0 keeps nothing on any shard" "hot_gets=${H:-?} probe: $R"; fi
 
-
 "$BIN" stop st >/dev/null; "$BIN" remove st >/dev/null
+daemon_stop
+
+# The owner of a key dies after renaming its new version into place, before any
+# sibling heard of it; the new version is written by a daemon whose workers are
+# killed by the hook, and the old one by a daemon without it, on the same data.
+KDATA="$WORK/killdata"
+SOCK_NAME=stk
+node(){ echo "$SOCKETLEY_TMPD/$SOCK_NAME#$1.sock"; }
+node_pid(){ ss -lxpn 2>/dev/null | grep -F "$(node "$1") " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+node_up(){   # shard [pid it must not be]
+    local p
+    for _ in $(seq 1 150); do
+        p=$(node_pid "$1")
+        if [ -n "$p" ] && [ "$p" != "${2:-}" ] &&
+           [ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$(node "$1")" http://x/)" = 200 ]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+body_md5(){ curl -s --max-time 5 --unix-socket "$(node "$1")" "http://x/hotk/$KEY" | md5sum | cut -d' ' -f1; }
+make_stk(){
+    "$BIN" create storage stk --listen "unix:$SOCKETLEY_TMPD/$SOCK_NAME.sock" --dir "$KDATA" --anonymous --shards 4 -s >/dev/null
+    for i in 0 1 2 3; do node_up "$i" || fail "restart" "shard $i of the runtime comes up"; done
+}
+
+KEY=""
+for i in $(seq 1 64); do
+    if [ "$(python3 "$HERE/lib_storage_shards.py" owner hotk "killme/k$i" 4)" = 2 ]; then KEY="killme/k$i"; break; fi
+done
+daemon_isolate stghotk
+daemon_start "$BIN"
+make_stk
+curl -s -o /dev/null --unix-socket "$(node 0)" -X PUT http://x/hotk
+head -c 3000 /dev/urandom >"$WORK/v1"; head -c 3000 /dev/urandom >"$WORK/v2"
+curl -s -o /dev/null --unix-socket "$(node 1)" -X PUT --data-binary @"$WORK/v1" "http://x/hotk/$KEY"
+"$BIN" stop stk >/dev/null; "$BIN" remove stk >/dev/null
+daemon_stop
+
+daemon_isolate stghotk
+SOCKETLEY_STORAGE_KILL_AFTER_RENAME=killme/ daemon_start "$BIN"
+make_stk
+V1=$(md5sum <"$WORK/v1" | cut -d' ' -f1); V2=$(md5sum <"$WORK/v2" | cut -d' ' -f1)
+for _ in 1 2 3; do for i in 0 1 3; do body_md5 "$i" >/dev/null; done; done
+WARM=$(for i in 0 1 3; do body_md5 "$i"; done | sort -u | tr '\n' ' ')
+OWNER_PID=$(node_pid 2)
+# Through shard 3, which writes the body and asks shard 2 to commit it.
+curl -s -o /dev/null --max-time 20 --unix-socket "$(node 3)" -X PUT --data-binary @"$WORK/v2" "http://x/hotk/$KEY" || true
+node_up 2 "$OWNER_PID" || fail "restart" "the owner came back after the hook killed it" "pid was $OWNER_PID"
+SEEN=""
+for _ in $(seq 1 30); do
+    SEEN=$(for i in 0 1 2 3; do body_md5 "$i"; done | sort -u | tr '\n' ' ')
+    [ "$SEEN" = "$V2 " ] && break
+    sleep 0.1
+done
+if [ -n "$KEY" ] && [ "$WARM" = "$V1 " ] && [ "$SEEN" = "$V2 " ]; then pass
+else fail "restart" "after the owner restarts on the version it renamed, every shard answers that version" \
+    "key=$KEY warm=$WARM (v1 $V1) seen=$SEEN (v2 $V2)"; fi
+"$BIN" stop stk >/dev/null; "$BIN" remove stk >/dev/null
 echo "  Results: $PASS/$TOTAL passed ($FAIL failed)"
 [ "$FAIL" = 0 ]

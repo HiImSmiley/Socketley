@@ -6489,7 +6489,9 @@ and before it answers the client (one round trip to the siblings, in parallel, a
 the milliseconds of the syncs), and a read that a drop of its key arrived during is not
 kept. A PUT, copy, multipart completion or DELETE that was answered is therefore never
 followed by a GET on any shard that returns the bytes it replaced. A sibling that is down
-is not waited for and holds nothing when it starts again. A GET of a 4 KiB object at 32
+is not waited for and holds nothing when it starts again, and a shard that starts tells
+the others to drop every copy of its keys, since it may have died between renaming a new
+version into place and telling them. A GET of a 4 KiB object at 32
 connections on four shards took 45 us of worker CPU (summed over the shards) before the
 copy was kept on every shard and takes 30 us, and about 50 thousand requests per second
 becomes about 56 thousand; at one connection 30 to 20 us and 7100 to 8100 requests per

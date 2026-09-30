@@ -530,6 +530,12 @@ private:
     timer       m_sweep_timer;
     timer       m_accept_backoff;
 
+    // Asked again at each sweep until every sibling has heard this shard started, or it gave up.
+    void tell_started();
+    enum class start_note : uint8_t { untold, telling, told };
+    start_note  m_start_note{start_note::untold};
+    uint32_t    m_start_tries{0};
+
     storage_counters m_c;
     uint64_t    m_rid_seq{0};
     // The decoded path of the request being parsed, kept for its capacity.
