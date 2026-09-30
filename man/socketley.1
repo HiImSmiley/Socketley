@@ -6496,7 +6496,11 @@ connections on four shards took 45 us of worker CPU (summed over the shards) bef
 copy was kept on every shard and takes 30 us, and about 50 thousand requests per second
 becomes about 56 thousand; at one connection 30 to 20 us and 7100 to 8100 requests per
 second; a PUT of 4 KiB into memory-backed storage takes about 14 us longer for the round
-trip.
+trip. Every copy keeps the response headers of a plain GET once it has answered one, so
+a shard spends the same on a GET whether or not it owns the key; measured later on four
+CPUs with another client, four shards take about 26 us per 4 KiB GET at 32 connections
+against about 17 us for one shard, the difference being four half-idle loops that each
+sleep and wake for every few requests rather than work that only a shard does.
 .PP
 .SS Performance
 Measured with warp and boto3 over plain HTTP with SigV4 on one 16\-core VM with an

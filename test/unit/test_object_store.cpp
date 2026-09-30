@@ -1289,11 +1289,12 @@ TEST_CASE("a copy of another shard's key is kept unless a drop of it arrived whi
     auto meta_of = [](const std::string& body) { object_meta m; m.size = body.size(); m.md5 = md5_of(body); return m; };
     auto held = [&](const char* k, std::string* body = nullptr)
     {
-        const object_meta* m = nullptr;
-        const std::string* b = nullptr;
-        const bool h = r.store->hot_get_foreign("bkt", k, m, b);
+        object_store::hot_hit hit;
+        const bool h = r.store->hot_find("bkt", k, hit);
+        if (h)
+            CHECK(hit.foreign);
         if (h && body)
-            *body = *b;
+            *body = *hit.body;
         return h;
     };
     const std::string v1 = pattern(2000, 1), v2 = pattern(2000, 2);

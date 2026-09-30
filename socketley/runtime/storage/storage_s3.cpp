@@ -1129,13 +1129,13 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_error_st(c, st::no_such_bucket);
         return;
     }
+    // A GET of a key held in memory finds the copy, and whose key it is, in one lookup.
+    object_store::hot_hit hot;
+    const bool held = !head && m_store.hot_find(q.bucket, q.key, hot);
     // Memory holds this shard's keys only, so another shard's key is asked of
     // its file, which is the truth and which any shard can read.
-    const bool mine = m_store.owns(q.bucket, q.key);
-    // A GET of a key held in memory finds the index's record through the copy, in one lookup.
-    object_store::hot_hit hot;
-    const bool held = mine && !head && m_store.hot_find(q.bucket, q.key, hot);
-    const object_meta* mem = held ? hot.meta : mine ? m_store.find(q.bucket, q.key) : nullptr;
+    const bool mine = held ? !hot.foreign : m_store.owns(q.bucket, q.key);
+    const object_meta* mem = held ? (hot.foreign ? nullptr : hot.meta) : mine ? m_store.find(q.bucket, q.key) : nullptr;
     if (mine && !mem)
     {
         send_error_st(c, st::no_such_key);
@@ -1266,17 +1266,18 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         return;
     }
 
-    // A hot small object this shard owns is answered from memory, with no file opened.
+    // A hot small object is answered from memory, with no file opened; another
+    // shard's for as long as its owner has not said it changed.
     if (held)
     {
         ++m_c.hot_gets;
         // A GET that asks for nothing but the object gets the headers kept with the copy.
         if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
-            evaluate(q, *mem) == cond::proceed)
+            evaluate(q, *hot.meta) == cond::proceed)
         {
             if (hot.head->empty())
             {
-                render_object_headers(q, *mem, *hot.head);
+                render_object_headers(q, *hot.meta, *hot.head);
                 m_store.hot_charge(hot.head->size());
             }
             response r;
@@ -1286,21 +1287,8 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_response(c, std::move(r));
             return;
         }
-        answer(c, *mem, -1, 0, *hot.body);
+        answer(c, *hot.meta, -1, 0, *hot.body);
         return;
-    }
-
-    // Another shard's small object is answered from memory too, for as long as its owner has not said it changed.
-    if (!mem)
-    {
-        const object_meta* held_meta = nullptr;
-        const std::string* held_body = nullptr;
-        if (m_store.hot_get_foreign(q.bucket, q.key, held_meta, held_body))
-        {
-            ++m_c.hot_gets;
-            answer(c, *held_meta, -1, 0, *held_body);
-            return;
-        }
     }
     const uint64_t drop_epoch = m_store.hot_epoch();
 

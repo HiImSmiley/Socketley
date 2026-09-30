@@ -18,6 +18,8 @@
 #   * the owner not telling its siblings (an overwrite, a copy onto the key, a
 #     multipart completion or a delete leaves some connection answering the
 #     previous version, or 200 after the delete)
+#   * the headers kept with a sibling's copy outliving it (an overwrite of the
+#     same bytes under a new Content-Type and metadata answers the old ones)
 #   * the drop not waited for, or a read of the old file kept after the drop
 #     (a storm of PUTs and GETs on one key: a body that does not match its
 #     ETag, or a final GET on any connection that is not the last PUT)
@@ -125,6 +127,24 @@ if mode == "basic":
         assert s == 204, s
         total += stale(None)
     out.append("delete %d" % total)
+elif mode == "meta":
+    # The same bytes each time under another Content-Type and metadata, so only the headers tell the versions apart.
+    v = b"m" * 2500
+    def stale_head(ct, mv):
+        n = 0
+        for c in cs:
+            c.request("GET", "/hotb/m")
+            r = c.getresponse(); d = r.read()
+            n += not (r.status == 200 and d == v and r.getheader("Content-Type") == ct and
+                      r.getheader("x-amz-meta-v") == mv)
+        return n
+    total = 0
+    for i in range(6):
+        ct, mv = "application/x-v%d" % i, str(i)
+        s, e, d = req(cs[(i * 13 + 5) % N], "PUT", "/hotb/m", v, {"Content-Type": ct, "x-amz-meta-v": mv})
+        assert s == 200, s
+        total += stale_head(ct, mv) + stale_head(ct, mv) + stale_head(ct, mv)
+    out.append("meta %d" % total)
 elif mode == "storm":
     # Each body starts with its version, and a reader that began after version v was answered must not be given an older one.
     stop = False; bad = [0]; last = [None]; lock = threading.Lock(); reads = [0]; older = [0]
@@ -175,6 +195,10 @@ for name in warm overwrite copy mpu delete; do
     if grep -Eq "(^| )$name 0( |$)" <<<"$R"; then pass
     else fail "$name" "once a change is answered, every connection on every shard sees it" "probe: $R"; fi
 done
+
+R=$(python3 "$WORK/hot.py" "$PORT" meta 2>&1) || true
+if grep -Eq "(^| )meta 0( |$)" <<<"$R"; then pass
+else fail "meta" "an overwrite of the same bytes under new headers is answered with the new headers on every shard" "probe: $R"; fi
 
 R=$(python3 "$WORK/hot.py" "$PORT" storm 2>&1) || true
 [ -z "${VERBOSE:-}" ] || echo "  storm: $R"

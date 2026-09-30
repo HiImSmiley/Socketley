@@ -404,13 +404,15 @@ public:
     static constexpr uint64_t hot_max_object = 60000;
     // The bytes of `key` when they are held for exactly the version `current` names.
     const std::string* hot_get(std::string_view bucket, std::string_view key, const object_meta& current);
-    // A held copy with the index's own record of the version it is a copy of, found by one lookup.
+    // A held copy, found by one lookup, with the index's own record of its version when this shard owns the key.
     struct hot_hit
     {
         const object_meta* meta{nullptr};
         const std::string* body{nullptr};
         // The response headers of this version as text, empty until a reader renders them.
         std::string*       head{nullptr};
+        // The copy is of another shard's key, so `meta` is what its read found and not an index record.
+        bool               foreign{false};
     };
     bool hot_find(std::string_view bucket, std::string_view key, hot_hit& out);
     // Keeps what a read brought in, when `read` is still the indexed version.
@@ -420,9 +422,6 @@ public:
     void hot_charge(size_t n) { m_hot_bytes += n; }
     // Read before a read of another shard's key starts, and handed back to hot_put_foreign when it ends.
     uint64_t hot_epoch() const { return m_drop_epoch; }
-    // What is held of a key another shard owns.
-    bool hot_get_foreign(std::string_view bucket, std::string_view key, const object_meta*& meta,
-                         const std::string*& body);
     // Keeps what a read of another shard's key brought in, unless a drop of that key or of its bucket arrived since `epoch`.
     void hot_put_foreign(std::string_view bucket, std::string_view key, uint64_t epoch, const object_meta& read,
                          std::string_view body);

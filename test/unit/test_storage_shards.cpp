@@ -298,11 +298,10 @@ struct cluster : shard_transport
 
     bool held(uint32_t s, const std::string& bucket, const std::string& key, std::string* body = nullptr)
     {
-        const object_meta* mm = nullptr;
-        const std::string* bb = nullptr;
-        const bool h = m[s]->store->hot_get_foreign(bucket, key, mm, bb);
+        object_store::hot_hit hit;
+        const bool h = m[s]->store->hot_find(bucket, key, hit) && hit.foreign;
         if (h && body)
-            *body = *bb;
+            *body = *hit.body;
         return h;
     }
 

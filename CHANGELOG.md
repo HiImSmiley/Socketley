@@ -77,7 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the key, from 45 to 30 us of worker CPU summed over the shards at 32 connections
   (about 50 thousand to 56 thousand per second) and from 30 to 20 us at one connection (7100 to
   8100 per second), at about 14 us more for a PUT into memory-backed storage (the
-  table above is from before it). A connection receives into a buffer a shared
+  table above is from before it). A copy of another shard's key keeps its rendered
+  response headers too and is found by the same single lookup, so a GET costs a
+  shard the same whether or not it owns the key (it was 1.8 us more); four shards
+  went from 27.5 to 25.9 us per GET at 32 connections and 32.6 to 30.9 at one,
+  against 16.9 at one shard. A connection receives into a buffer a shared
   ring lends it for one completion, with one multishot recv armed across
   requests on a cleartext connection (`SOCKETLEY_STORAGE_RECV_BUFS`, default 64
   of 16 KiB, 0 for a buffer per connection; `SOCKETLEY_RECV_MULTISHOT=0` as for

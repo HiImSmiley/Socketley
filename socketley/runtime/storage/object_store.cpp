@@ -124,10 +124,8 @@ bool object_store::hot_find(std::string_view bucket_name, std::string_view key, 
     if (it == m_hot_index.end())
         return false;
     hot_entry& e = *it->second;
-    // A copy of another shard's key has no record here to be found through.
-    if (!e.live)
-        return false;
-    if (!same_version(e.meta, *e.live))
+    // A copy of another shard's key has no record here, and is current until its owner's drop.
+    if (e.live && !same_version(e.meta, *e.live))
     {
         m_hot_bytes -= held_bytes(e);
         const auto lit = it->second;
@@ -136,9 +134,10 @@ bool object_store::hot_find(std::string_view bucket_name, std::string_view key, 
         return false;
     }
     m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
-    out.meta = e.live;
-    out.body = &e.body;
-    out.head = &e.head;
+    out.meta    = e.live ? e.live : &e.meta;
+    out.body    = &e.body;
+    out.head    = &e.head;
+    out.foreign = !e.live;
     return true;
 }
 
@@ -169,20 +168,6 @@ void object_store::hot_insert(const std::string& id, const object_meta& read, st
         m_hot_index.erase(old.id);
         m_hot_lru.pop_back();
     }
-}
-
-bool object_store::hot_get_foreign(std::string_view bucket_name, std::string_view key, const object_meta*& meta,
-                                   const std::string*& body)
-{
-    if (m_hot_index.empty())
-        return false;
-    auto it = m_hot_index.find(hot_id(bucket_name, key));
-    if (it == m_hot_index.end())
-        return false;
-    m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
-    meta = &it->second->meta;
-    body = &it->second->body;
-    return true;
 }
 
 // Zero stands for every key, which a dropped bucket is, so no key's hash is zero.
