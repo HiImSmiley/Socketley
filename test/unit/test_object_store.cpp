@@ -916,8 +916,8 @@ TEST_CASE("a quota refuses a body that would not fit and counts what it holds")
     REQUIRE(r.make_bucket("bkt") == st::ok);
     CHECK(r.put("bkt", "a", pattern(60000)).status == st::ok);
     CHECK(r.put("bkt", "big", pattern(60000)).status == st::storage_full);
-    r.settle();
-    CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+    // The unlink is on the ring, and a loaded disk takes longer than a fixed number of turns.
+    CHECK(r.until([&] { return fs::is_empty(d.path + "/bkt/tmp"); }));
     CHECK(r.put("bkt", "small", pattern(30000)).status == st::ok);
     // Overwriting frees what the old body held.
     CHECK(r.del("bkt", "a") == st::ok);
@@ -987,8 +987,8 @@ TEST_CASE("an aborted put leaves nothing behind")
     }
     r.settle(20);
     op->abort();
-    r.settle(50);
-    CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+    // The unlink is on the ring, and a loaded disk takes longer than a fixed number of turns.
+    CHECK(r.until([&] { return fs::is_empty(d.path + "/bkt/tmp"); }));
     CHECK(r.store->find("bkt", "k") == nullptr);
     // The bucket can be removed again: nothing holds it.
     CHECK(r.drop_bucket("bkt") == st::ok);
@@ -1200,8 +1200,8 @@ TEST_CASE("a digest that disagrees with the body refuses it after the pool has f
     CHECK(r.put("bkt", "bad", body, {}, 100000, &wrong).status == st::bad_digest);
     std::string got;
     CHECK(r.get("bkt", "bad", got) == st::no_such_key);
-    r.settle();
-    CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+    // The unlink is on the ring, and a loaded disk takes longer than a fixed number of turns.
+    CHECK(r.until([&] { return fs::is_empty(d.path + "/bkt/tmp"); }));
     const md5_t right = md5_of(body);
     CHECK(r.put("bkt", "good", body, {}, 100000, &right).status == st::ok);
 }
@@ -1222,8 +1222,8 @@ TEST_CASE("a body given up while the pool is still reading it leaves no temporar
         // Digest jobs are queued or running for what was appended.
         op->abort();
         op.reset();
-        r.settle(200);
-        CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+        // The unlink is on the ring, and a loaded disk takes longer than a fixed number of turns.
+        CHECK(r.until([&] { return fs::is_empty(d.path + "/bkt/tmp"); }));
         std::string got;
         CHECK(r.get("bkt", "half", got) == st::no_such_key);
         // A put after the abandoned one still goes through the pool.
