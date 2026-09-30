@@ -809,8 +809,8 @@ TEST_CASE("puts that arrive while the journal is being compacted are not lost")
             ops.push_back(op);
         }
         REQUIRE(r.until([&] { return done == 300; }));
-        r.settle(100);
-        CHECK(r.store->totals().compactions >= 1);
+        // A compaction may still be starting behind the last record; a fixed number of turns lost that race on a slow disk.
+        CHECK(r.until([&] { return r.store->totals().compactions >= 1 && !r.store->busy(); }));
         r.store->close(true);
     }
     rig again(d.path, 20);
@@ -1059,6 +1059,24 @@ TEST_CASE("a bucket has its 256 object directories from the start and a put make
     CHECK(fs::exists(d.path + "/bkt/data/" + h.substr(0, 2) + "/" + h));
     // No put synced a directory it had to make: file, directory and journal, at most.
     CHECK(r.store->totals().fsyncs - synced <= 3u * 200u);
+}
+
+TEST_CASE("puts one after another sync their file and directory and no journal between them")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    REQUIRE(r.put("bkt", "first", "v").status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy(); }));
+    const uint64_t synced  = r.store->totals().fsyncs;
+    const uint64_t written = fs::file_size(journal_path(d.path, "bkt"));
+    for (int i = 0; i < 20; ++i)
+        REQUIRE(r.put("bkt", "key-" + std::to_string(i), "v").status == st::ok);
+    REQUIRE(r.until([&] { return !r.store->busy(); }));
+    // A journal sync issued behind each answer would be waited for by the next put's own.
+    CHECK(r.store->totals().fsyncs - synced == 2u * 20u);
+    // The records are written all the same, and only their sync is left for later.
+    CHECK(fs::file_size(journal_path(d.path, "bkt")) > written);
 }
 
 TEST_CASE("an answered put and an answered delete survive the loss of the journal behind them")

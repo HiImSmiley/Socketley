@@ -563,6 +563,7 @@ private:
     // Writes and syncs what is queued, blocking, for a stop; false if a journal is busy.
     bool settle_journals();
     void journal_kick(bucket& b);
+    bool compact_due(const bucket& b) const;
     void maybe_compact(bucket& b);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
     void compact_finish(const std::string& name, bool ok);

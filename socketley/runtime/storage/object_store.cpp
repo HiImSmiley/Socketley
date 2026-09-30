@@ -488,10 +488,11 @@ void object_store::journal_kick(bucket& b)
     if (b.j.writing || b.j.frozen)
         return;
 
-    // Records written and not synced are made durable when the queue has
-    // drained, or when they have grown past a bound under a load that never lets
-    // it drain: no put waits for this, since the object files are the truth.
-    if (b.j.dirty && (b.j.pending.empty() || b.j.dirty_bytes >= journal_sync_bytes))
+    // Records written and not synced are made durable past a bound, before a
+    // compaction and for whoever waits on the journal, and not whenever the
+    // queue drains: that sync would sit in front of the next put's own.
+    if (b.j.dirty && (b.j.dirty_bytes >= journal_sync_bytes ||
+                      (b.j.pending.empty() && (!b.j.idle_cbs.empty() || compact_due(b)))))
     {
         b.j.writing = true;
         const std::string name = b.name;
@@ -585,12 +586,15 @@ void object_store::journal_kick(bucket& b)
         finish(false);
 }
 
+bool object_store::compact_due(const bucket& b) const
+{
+    return b.j.records >= m_opts.compact_floor && b.j.records >= 2 * (b.objects.size() + 1) &&
+           b.j.records >= b.j.compact_after;
+}
+
 void object_store::maybe_compact(bucket& b)
 {
-    if (b.closing || b.j.frozen || b.j.writing)
-        return;
-    if (b.j.records < m_opts.compact_floor || b.j.records < 2 * (b.objects.size() + 1) ||
-        b.j.records < b.j.compact_after)
+    if (b.closing || b.j.frozen || b.j.writing || b.j.dirty || !compact_due(b))
         return;
 
     b.j.frozen = true;
