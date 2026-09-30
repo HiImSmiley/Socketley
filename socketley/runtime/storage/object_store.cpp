@@ -1155,112 +1155,123 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
     ++b->active_ops;
     ++m_inflight;
 
-    auto alive = m_alive;
-    const std::string bname = std::string(bucket_name);
-    const std::string key   = std::string(key_sv);
-
-    auto done = [this, alive, bname, key, cb](st s, bool existed)
+    // What every step of the removal shares, so a step's callback holds one pointer and not copies of the rest.
+    struct removal
     {
-        if (!*alive)
+        std::shared_ptr<bool>         alive;
+        std::string                   bname, key, dir;
+        bool                          existed{false};
+        std::function<void(st, bool)> cb;
+    };
+    using removal_ptr = std::shared_ptr<removal>;
+    auto rm   = std::make_shared<removal>();
+    rm->alive = m_alive;
+    rm->bname = std::string(bucket_name);
+    rm->key   = std::string(key_sv);
+    rm->cb    = std::move(cb);
+
+    const auto done = [this](const removal_ptr& r, st s, bool existed)
+    {
+        if (!*r->alive)
             return;
-        if (bucket* bp = find_bucket(bname))
+        if (bucket* bp = find_bucket(r->bname))
             --bp->active_ops;
         --m_inflight;
-        lane_leave(bname, key);
-        cb(s, existed);
+        lane_leave(r->bname, r->key);
+        r->cb(s, existed);
     };
 
-    lane_enter(*b, key, [this, alive, bname, key, done]()
+    // The unlink is durable, so the object cannot come back whatever happens to the record that says it is gone.
+    const auto journal_it = [this, done](const removal_ptr& r)
     {
-        bucket* bp = find_bucket(bname);
-        if (!bp)
+        bucket* br = find_bucket(r->bname);
+        if (!br)
         {
-            done(st::no_such_bucket, false);
+            done(r, st::no_such_bucket, false);
             return;
         }
-        const bool existed = bp->objects.contains(key);
-        const std::string rel = object_rel_path(key);
-        const bool q = m_io->unlinkat(bp->data_fd, rel, 0,
-            [this, alive, bname, key, rel, existed, done](int64_t r)
+        std::string rec;
+        encode_delete_record(rec, r->key, static_cast<int64_t>(now_ms()));
+        journal_append(*br, rec, nullptr);
+        apply_delete(*br, r->key);
+        invalidate_siblings(r->bname, r->key, [done, r]() { done(r, st::ok, r->existed); });
+    };
+
+    lane_enter(*b, rm->key, [this, rm, done, journal_it]()
+    {
+        bucket* bp = find_bucket(rm->bname);
+        if (!bp)
+        {
+            done(rm, st::no_such_bucket, false);
+            return;
+        }
+        rm->existed = bp->objects.contains(rm->key);
+        std::string rel = object_rel_path(rm->key);
+        rm->dir = rel.substr(0, 2);
+        const bool q = m_io->unlinkat(bp->data_fd, std::move(rel), 0,
+            [this, rm, done, journal_it](int64_t r)
             {
-                if (!*alive)
+                if (!*rm->alive)
                     return;
-                bucket* bq = find_bucket(bname);
+                bucket* bq = find_bucket(rm->bname);
                 if (!bq)
                 {
-                    done(st::no_such_bucket, false);
+                    done(rm, st::no_such_bucket, false);
                     return;
                 }
                 if (r < 0 && r != -ENOENT)
                 {
-                    done(errno_status(r), existed);
+                    done(rm, errno_status(r), rm->existed);
                     return;
                 }
-                if (r == -ENOENT && !existed)
+                if (r == -ENOENT && !rm->existed)
                 {
-                    done(st::ok, false);
+                    done(rm, st::ok, false);
+                    return;
+                }
+                if (r == -ENOENT)
+                {
+                    journal_it(rm);
                     return;
                 }
                 // The unlink made durable before the journal says it happened,
                 // or a crash brings the file back and a rebuild adopts it.
-                const std::string dir = rel.substr(0, 2);
-                auto journal_it = [this, alive, bname, key, existed, done]()
-                {
-                    bucket* br = find_bucket(bname);
-                    if (!br)
+                const bool q2 = m_io->openat(bq->data_fd, rm->dir, O_RDONLY | O_DIRECTORY, 0,
+                    [this, rm, done, journal_it](int64_t dfd)
                     {
-                        done(st::no_such_bucket, false);
-                        return;
-                    }
-                    // The unlink is durable, so the object cannot come back
-                    // whatever happens to the record that says it is gone.
-                    std::string rec;
-                    encode_delete_record(rec, key, static_cast<int64_t>(now_ms()));
-                    journal_append(*br, rec, nullptr);
-                    apply_delete(*br, key);
-                    invalidate_siblings(bname, key, [done, existed]() { done(st::ok, existed); });
-                };
-                if (r == -ENOENT)
-                {
-                    journal_it();
-                    return;
-                }
-                const bool q2 = m_io->openat(bq->data_fd, dir, O_RDONLY | O_DIRECTORY, 0,
-                    [this, alive, journal_it, done, existed](int64_t dfd)
-                    {
-                        if (!*alive)
+                        if (!*rm->alive)
                             return;
                         if (dfd < 0)
                         {
-                            done(st::io_error, existed);
+                            done(rm, st::io_error, rm->existed);
                             return;
                         }
                         const int fd = static_cast<int>(dfd);
                         const bool q3 = m_io->fsync(fd, false,
-                            [this, alive, journal_it, done, existed, fd](int64_t r3)
+                            [this, rm, done, journal_it, fd](int64_t r3)
                             {
-                                if (!*alive)
+                                if (!*rm->alive)
                                     return;
                                 ++m_totals.fsyncs;
                                 m_loop->close_fd(fd);
                                 if (r3 < 0)
                                 {
-                                    done(st::io_error, existed);
+                                    done(rm, st::io_error, rm->existed);
                                     return;
                                 }
-                                journal_it();
+                                journal_it(rm);
                             });
                         if (!q3)
                         {
                             m_loop->close_fd(fd);
-                            done(st::io_error, existed);
+                            done(rm, st::io_error, rm->existed);
                         }
                     });
                 if (!q2)
-                    done(st::io_error, existed);
+                    done(rm, st::io_error, rm->existed);
             });
         if (!q)
-            done(st::io_error, existed);
+            done(rm, st::io_error, rm->existed);
     });
 }
 

@@ -574,49 +574,53 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
         std::vector<delete_result> results;
         size_t                     pending{0};
         bool                       quiet{false};
+        std::string                bucket;
+        std::weak_ptr<conn>        weak;
     };
     auto b = std::make_shared<batch>();
     b->quiet   = dr.quiet;
     b->pending = dr.keys.size();
     b->results.resize(dr.keys.size());
+    b->bucket  = q.bucket;
+    b->weak    = c;
 
-    std::weak_ptr<conn> weak = c;
-    const std::string bucket = q.bucket;
-    auto done_one = [this, b, weak]()
+    const auto done_one = [this](const std::shared_ptr<batch>& bt)
     {
-        if (--b->pending != 0)
+        if (--bt->pending != 0)
             return;
-        auto cc = weak.lock();
+        auto cc = bt->weak.lock();
         if (!cc || cc->dead)
             return;
         response r;
         r.headers.emplace_back("Content-Type", "application/xml");
-        r.body = delete_result_xml(b->results, b->quiet);
+        r.body = delete_result_xml(bt->results, bt->quiet);
         send_response(cc, std::move(r));
     };
 
     // Every removal is started at once, so their journal records share fsyncs.
     for (size_t i = 0; i < dr.keys.size(); ++i)
     {
-        b->results[i].key = dr.keys[i];
-        if (dr.keys[i].empty() || dr.keys[i].size() > max_key_bytes)
+        delete_result& res = b->results[i];
+        res.key = std::move(dr.keys[i]);
+        if (res.key.empty() || res.key.size() > max_key_bytes)
         {
-            b->results[i].ok    = false;
-            b->results[i].error = make_error("KeyTooLongError");
-            done_one();
+            res.ok    = false;
+            res.error = make_error("KeyTooLongError");
+            done_one(b);
             continue;
         }
         ++m_c.deletes;
-        m_store.remove(bucket, dr.keys[i], [this, b, i, done_one, bucket, key = dr.keys[i]](st s, bool existed)
+        m_store.remove(b->bucket, res.key, [this, b, i, done_one](st s, bool existed)
         {
+            delete_result& one = b->results[i];
             if (s != st::ok)
             {
-                b->results[i].ok    = false;
-                b->results[i].error = error_for(s);
+                one.ok    = false;
+                one.error = error_for(s);
             }
             else if (existed)
-                notify_delete(bucket, key);
-            done_one();
+                notify_delete(b->bucket, one.key);
+            done_one(b);
         });
     }
 }
