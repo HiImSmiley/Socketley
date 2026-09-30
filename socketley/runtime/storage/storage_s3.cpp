@@ -464,6 +464,36 @@ void storage_run::op_list_objects(const std::shared_ptr<conn>& c, bool v2)
         lr.marker      = q.get_query("marker");
     }
 
+    // A lone shard holds every key, so the walk of its index is rendered as it goes.
+    if (m_store.shards() <= 1)
+    {
+        list_xml_writer walk(lr);
+        if (const st s = m_store.list_walk(q.bucket, lq, walk); s != st::ok)
+        {
+            send_error_st(c, s);
+            return;
+        }
+        std::string next_token, next_marker;
+        if (v2 && walk.is_truncated())
+        {
+            next_token = base64url_encode(walk.resume_at());
+            lr.next_token = next_token;
+        }
+        if (!v2 && walk.is_truncated())
+        {
+            if (const std::string* last = walk.last_named())
+            {
+                next_marker    = *last;
+                lr.next_marker = next_marker;
+            }
+        }
+        response r;
+        r.headers.emplace_back("Content-Type", "application/xml");
+        r.body = walk.finish();
+        send_response(c, std::move(r));
+        return;
+    }
+
     // Every shard's part of the answer, merged, and the request's own strings
     // are still the views `lr` holds for as long as the connection is.
     std::weak_ptr<conn> weak = c;

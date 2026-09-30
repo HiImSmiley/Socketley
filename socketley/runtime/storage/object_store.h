@@ -100,6 +100,18 @@ struct list_page
     std::string              resume_at;
 };
 
+// What a walk of a listing reports, in key order, so a caller that renders each
+// entry need not have it copied into a page first.
+class list_visitor
+{
+public:
+    virtual ~list_visitor() = default;
+    virtual void object(const std::string& key, const object_meta& meta) = 0;
+    virtual void prefix(std::string common) = 0;
+    // The walk stopped with more behind it, which starts at `resume_at`.
+    virtual void truncated(const std::string& resume_at) = 0;
+};
+
 struct put_result
 {
     st          status{st::ok};
@@ -424,6 +436,8 @@ public:
     void stat_object(std::string_view bucket, std::string_view key,
                      std::function<void(st, const object_meta&)> cb);
     st list(std::string_view bucket, const list_query& q, list_page& out) const;
+    // The same walk, reported to `v` as it goes.
+    st list_walk(std::string_view bucket, const list_query& q, list_visitor& v) const;
 
     // ── Writes ──────────────────────────────────────────────────────────────
     // Null with `why` set when the request cannot start at all; the body is

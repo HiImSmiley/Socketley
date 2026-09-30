@@ -1565,3 +1565,61 @@ TEST_CASE("a listing built in place is the listing built by joining pieces, for 
     CHECK(off == 0);
 }
 
+TEST_CASE("a listing rendered while the index is walked is the listing rendered from the page")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    for (const char* k : {"a", "b/1", "b/2", "b/sub/x", "c", "d/1", "e", "photos/2020/a.jpg",
+                          "photos/2020/b.jpg", "photos/2021/c.jpg", "photos/index.html", "z&<>'\"", "z\x01y"})
+        REQUIRE(r.put("bkt", k, k).status == st::ok);
+
+    size_t compared = 0;
+    for (const char* prefix : {"", "b/", "photos/", "photos/2020/", "nothing"})
+        for (const char* delimiter : {"", "/"})
+            for (const char* after : {"", "b/2", "c", "photos/"})
+                for (const size_t max_keys : {size_t{0}, size_t{1}, size_t{2}, size_t{5}, size_t{1000}})
+                    for (const bool v2 : {false, true})
+                        for (const bool encode : {false, true})
+                        {
+                            list_query q;
+                            q.prefix      = prefix;
+                            q.delimiter   = delimiter;
+                            q.start_after = after;
+                            q.max_keys    = max_keys;
+
+                            list_page page;
+                            REQUIRE(r.store->list("bkt", q, page) == st::ok);
+
+                            list_render lr;
+                            lr.bucket          = "bkt";
+                            lr.prefix          = prefix;
+                            lr.delimiter       = delimiter;
+                            lr.max_keys        = max_keys;
+                            lr.url_encode_keys = encode;
+                            lr.v2              = v2;
+                            lr.owner_id        = "socketley";
+
+                            list_xml_writer walk(lr);
+                            REQUIRE(r.store->list_walk("bkt", q, walk) == st::ok);
+
+                            // What the S3 handler says about where the page ends, from the page and from the walk.
+                            const std::string* last = nullptr;
+                            if (!page.objects.empty())
+                                last = &page.objects.back().key;
+                            if (!page.prefixes.empty() && (!last || page.prefixes.back() > *last))
+                                last = &page.prefixes.back();
+                            if (last)
+                                CHECK((walk.last_named() && *walk.last_named() == *last));
+                            else
+                                CHECK(walk.last_named() == nullptr);
+                            CHECK(walk.is_truncated() == page.truncated);
+                            if (page.truncated)
+                                CHECK(walk.resume_at() == page.resume_at);
+
+                            CHECK(walk.finish() == list_xml(lr, page));
+                            ++compared;
+                        }
+    CHECK(compared == 5 * 2 * 4 * 5 * 2 * 2);
+}
+

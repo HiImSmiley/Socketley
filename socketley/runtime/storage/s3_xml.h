@@ -356,6 +356,73 @@ inline std::string list_xml(const list_render& r, const list_page& p)
     return x;
 }
 
+// A listing rendered as the walk of the store reports it, without a page in between.
+class list_xml_writer final : public list_visitor
+{
+public:
+    explicit list_xml_writer(const list_render& r) : m_r(r) {}
+
+    void object(const std::string& key, const object_meta& meta) override
+    {
+        list_xml_object(m_objects, m_r, key, meta);
+        // The first entry says how big a page of them will be, so the rest are appended without the buffer moving.
+        if (m_count == 0)
+            m_objects.reserve(std::min<size_t>(m_objects.size() * std::min<size_t>(m_r.max_keys, 1000) + 256, 262144));
+        ++m_count;
+        m_last_object = &key;
+    }
+    void prefix(std::string common) override
+    {
+        list_xml_prefix(m_prefixes, m_r, common);
+        ++m_count;
+        m_last_prefix = std::move(common);
+        m_has_prefix  = true;
+    }
+    void truncated(const std::string& resume_at) override
+    {
+        m_truncated = true;
+        m_resume_at = resume_at;
+    }
+
+    bool               is_truncated() const { return m_truncated; }
+    // Where a V2 continuation token points, when the page is cut.
+    const std::string& resume_at() const { return m_resume_at; }
+    // What a V1 page's marker is: the last of what it named, object or prefix.
+    const std::string* last_named() const
+    {
+        const std::string* last = m_last_object;
+        if (m_has_prefix && (!last || m_last_prefix > *last))
+            last = &m_last_prefix;
+        return last;
+    }
+
+    // The document, with the tokens the render has been given by now.
+    std::string finish() const
+    {
+        const list_render& r = m_r;
+        std::string x;
+        x.reserve(1024 + m_objects.size() + m_prefixes.size() + r.prefix.size() + r.marker.size() +
+                  r.next_marker.size() + r.start_after.size() + r.continuation_token.size() +
+                  r.next_token.size() + r.delimiter.size());
+        list_xml_head(x, r, m_count, m_truncated);
+        x += m_objects;
+        x += m_prefixes;
+        x += "</ListBucketResult>";
+        return x;
+    }
+
+private:
+    const list_render& m_r;
+    std::string        m_objects, m_prefixes;
+    size_t             m_count{0};
+    // The keys live in the store's index and are not touched while the walk runs.
+    const std::string* m_last_object{nullptr};
+    std::string        m_last_prefix;
+    bool               m_has_prefix{false};
+    bool               m_truncated{false};
+    std::string        m_resume_at;
+};
+
 inline std::string copy_result_xml(const object_meta& m)
 {
     std::string x(xml_decl);

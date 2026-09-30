@@ -393,13 +393,45 @@ void object_store::stat_object(std::string_view bucket_name, std::string_view ke
     });
 }
 
+namespace
+{
+
+// A page built from a walk, which is what a sibling shard is answered with.
+class page_builder final : public list_visitor
+{
+public:
+    explicit page_builder(list_page& out) : m_out(out) {}
+
+    void object(const std::string& key, const object_meta& meta) override
+    {
+        m_out.objects.push_back({key, meta});
+    }
+    void prefix(std::string common) override { m_out.prefixes.push_back(std::move(common)); }
+    void truncated(const std::string& resume_at) override
+    {
+        m_out.truncated = true;
+        m_out.resume_at = resume_at;
+    }
+
+private:
+    list_page& m_out;
+};
+
+}   // namespace
+
 st object_store::list(std::string_view bucket_name, const list_query& q, list_page& out) const
+{
+    out = list_page{};
+    page_builder builder(out);
+    return list_walk(bucket_name, q, builder);
+}
+
+st object_store::list_walk(std::string_view bucket_name, const list_query& q, list_visitor& v) const
 {
     const bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
         return st::no_such_bucket;
 
-    out = list_page{};
     if (q.max_keys == 0)
         return st::ok;
 
@@ -424,8 +456,7 @@ st object_store::list(std::string_view bucket_name, const list_query& q, list_pa
     {
         if (count >= q.max_keys)
         {
-            out.truncated = true;
-            out.resume_at = it->first;
+            v.truncated(it->first);
             break;
         }
         const std::string& key = it->first;
@@ -443,14 +474,14 @@ st object_store::list(std::string_view bucket_name, const list_query& q, list_pa
                 const bool seen = !q.has_resume && !q.start_after.empty() && cp <= q.start_after;
                 if (!seen)
                 {
-                    out.prefixes.push_back(std::move(cp));
+                    v.prefix(std::move(cp));
                     ++count;
                 }
                 it = next.empty() ? b->objects.end() : b->objects.lower_bound(next);
                 continue;
             }
         }
-        out.objects.push_back({key, it->second});
+        v.object(key, it->second);
         ++count;
         ++it;
     }
