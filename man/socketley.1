@@ -11341,6 +11341,14 @@ the throughput of large puts, never what is stored.
 .IP
 Inherited by worker processes, which have no command line of their own.
 .TP
+.B SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS
+A test aid: the number of seconds a bucket lifecycle rule counts as one day, 1 to
+86400, read by the lifecycle sweep alone, which then also runs as often as every
+second. Unset, a day is a day. It changes when objects expire, so it is never for a
+runtime holding data anyone wants (see Bucket lifecycle).
+.IP
+Inherited by worker processes, which have no command line of their own.
+.TP
 .B SOCKETLEY_STORAGE_RECOVERY_THREADS
 How many threads a storage worker reads its object headers on at a start after a
 stop that was not clean, 1 to 64. Default: the CPUs the worker may run on, at most
