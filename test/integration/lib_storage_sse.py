@@ -135,7 +135,8 @@ def on_disk(data, key, bucket=B):
 
 
 def sealed_len(n):
-    return n + (n + 65535) // 65536 * 28
+    """Version 2: whole chunks, then the short one that ends the stream."""
+    return n + (n // 65536 + 1) * 28
 
 
 def boto(port, https=False):

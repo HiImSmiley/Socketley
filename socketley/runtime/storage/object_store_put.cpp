@@ -60,6 +60,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     {
         // Every buffer holds whole chunks behind the header's room, so each is sealed and written on its own.
         m_seal = std::make_shared<const sse_seal_spec>(*seal);
+        m_tail_sealed = seal->version == sse_format_v1;
         const size_t body = size_known ? static_cast<size_t>(std::min<uint64_t>(expected, mib)) : mib;
         m_cap = m_header_len + std::max(sse_chunk, (body + sse_chunk - 1) / sse_chunk * sse_chunk);
     }
@@ -430,26 +431,30 @@ void put_op::flush_sealed(stage& s)
     const size_t   lead  = s.file_off == 0 ? m_header_len : 0;
     const size_t   n     = s.fill - lead;
     const uint64_t index = (s.file_off == 0 ? 0 : s.file_off - m_header_len) / sse_chunk;
+    // The buffer that holds the end of the body closes its stream.
+    const bool     last  = m_eof && s.file_off + s.fill == m_header_len + m_received;
+    if (last)
+        m_tail_sealed = true;
     if (!s.out)
-        s.out = std::make_shared_for_overwrite<char[]>(m_header_len + sse_stored_len(m_cap - m_header_len));
+        s.out = std::make_shared_for_overwrite<char[]>(m_header_len + sse_stored_len(m_cap - m_header_len, sse_format));
     auto bad  = std::make_shared<bool>(false);
     // The header's room goes along as it is, which finish() may already have filled.
-    auto work = [seal = m_seal, data = s.data, out = s.out, lead, n, index, bad]
+    auto work = [seal = m_seal, data = s.data, out = s.out, lead, n, index, last, bad]
     {
         std::memcpy(out.get(), data.get(), lead);
-        *bad = !sse_seal(seal->key, index, data.get() + lead, n, out.get() + lead);
+        *bad = !sse_seal(seal->key, seal->version, seal->stream, index, data.get() + lead, n, last, out.get() + lead);
     };
     stage* sp = &s;
     if (m_async)
     {
-        m_store->m_hash->submit(m_seal_lane, std::move(work), [self = shared_from_this(), sp, lead, n, bad]
+        m_store->m_hash->submit(m_seal_lane, std::move(work), [self = shared_from_this(), sp, lead, n, last, bad]
         {
             if (!*self->m_alive || self->m_status != st::ok)
                 return;
             if (*bad)
                 self->fail(st::io_error);
             else
-                self->write_sealed(*sp, lead, n);
+                self->write_sealed(*sp, lead, n, last);
         });
         return;
     }
@@ -457,15 +462,47 @@ void put_op::flush_sealed(stage& s)
     if (*bad)
         fail(st::io_error);
     else
-        write_sealed(s, lead, n);
+        write_sealed(s, lead, n, last);
 }
 
-void put_op::write_sealed(stage& s, size_t lead, size_t n)
+void put_op::write_sealed_tail()
+{
+    // Only a body of whole chunks can end outside its buffers, so the empty chunk follows them.
+    const uint64_t index = m_received / sse_chunk;
+    if (!sse_seal(m_seal->key, m_seal->version, m_seal->stream, index, nullptr, 0, true, m_tail.data()))
+    {
+        fail(st::io_error);
+        return;
+    }
+    const uint64_t at  = index * (sse_chunk + sse_overhead);
+    const int      fd  = m_placed ? m_place_fd : m_tmp_fd;
+    const uint64_t off = m_placed ? m_place_off + at : m_header_len + at;
+    m_tail_writing = true;
+    auto self = shared_from_this();
+    const bool queued = m_store->m_io->pwrite(fd, m_tail.data(), static_cast<uint32_t>(m_tail.size()), off,
+        [self](int64_t r)
+        {
+            if (!*self->m_alive || self->m_status != st::ok)
+                return;
+            self->m_tail_writing = false;
+            if (r < 0)
+            {
+                self->fail(write_status(r));
+                return;
+            }
+            self->m_tail_sealed = true;
+            self->maybe_finish();
+        });
+    if (!queued)
+        fail(st::io_error);
+}
+
+void put_op::write_sealed(stage& s, size_t lead, size_t n, bool last)
 {
     const uint64_t at = (s.file_off == 0 ? 0 : s.file_off - m_header_len) / sse_chunk * (sse_chunk + sse_overhead);
     int         fd  = m_tmp_fd;
     const char* p   = s.out.get();
-    size_t      len = lead + static_cast<size_t>(sse_stored_len(n));
+    size_t      len = lead + static_cast<size_t>(sse_sealed_len(n, m_seal->version, last));
     uint64_t    off = lead ? 0 : m_header_len + at;
     if (m_placed)
     {
@@ -646,6 +683,12 @@ void put_op::maybe_finish()
             return;
 
     auto self = shared_from_this();
+    if (!m_tail_sealed && m_seal)
+    {
+        if (!m_tail_writing)
+            write_sealed_tail();
+        return;
+    }
     if (!m_header_done)
     {
         if (m_header_writing)

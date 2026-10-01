@@ -791,7 +791,7 @@ put_op::committer shard_node::mpu_part_committer(std::string bucket, std::string
 
 void shard_node::mpu_complete(std::string bucket, std::string key, std::string id,
                               std::vector<complete_part> parts, std::function<void()> progress,
-                              std::function<void(complete_result)> cb)
+                              std::function<void(complete_result)> cb, complete_binder bind)
 {
     if (!m_mpu)
     {
@@ -809,7 +809,8 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
             cb(std::move(r));
             return;
         }
-        m_mpu->complete(std::move(bucket), std::move(id), std::move(parts), std::move(progress), std::move(cb));
+        m_mpu->complete(std::move(bucket), std::move(id), std::move(parts), std::move(progress), std::move(cb),
+                        std::move(bind));
         return;
     }
 
@@ -822,7 +823,8 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
     const uint32_t owner = m_store.owner_of(bucket, key);
     wire::mpu_ref ref{bucket, key, id, 0, 0, false};
     m_transport.call(owner, wire::encode_mpu_prepare(ref, parts),
-        [this, alive, owner, bucket, key, id, progress = std::move(progress), cb](bool ok, std::string_view reply) mutable
+        [this, alive, owner, bucket, key, id, progress = std::move(progress), cb,
+         bind = std::move(bind)](bool ok, std::string_view reply) mutable
         {
             if (!*alive)
                 return;
@@ -857,7 +859,7 @@ void shard_node::mpu_complete(std::string bucket, std::string key, std::string i
                                              ++m_c.peer_failures;
                                      });
                     cb(std::move(res));
-                });
+                }, std::move(bind));
         });
 }
 

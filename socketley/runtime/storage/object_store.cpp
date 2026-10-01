@@ -2312,7 +2312,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
             cs->meta.md5    = o.meta.md5;
             cs->meta.parts  = 0;
             cs->rehash      = o.meta.parts != 0;
-            std::erase_if(cs->meta.extra, [](const auto& e) { return e.first == part_sizes_extra; });
+            clear_part_layout(cs->meta);
             cs->meta.mtime_ms = static_cast<int64_t>(now_ms());
 
             bucket* bp = find_bucket(cs->dst_bucket);

@@ -114,7 +114,8 @@ public:
                    bool known, std::function<void(st, checksum_algo, part_place)> cb);
     put_op::committer mpu_part_committer(std::string bucket, std::string key, std::string id, uint32_t number);
     void mpu_complete(std::string bucket, std::string key, std::string id, std::vector<complete_part> parts,
-                      std::function<void()> progress, std::function<void(complete_result)> cb);
+                      std::function<void()> progress, std::function<void(complete_result)> cb,
+                      complete_binder bind = {});
     // `cb` gets false when there was no such upload.
     void mpu_abort(std::string bucket, std::string key, std::string id, std::function<void(bool)> cb);
     void mpu_parts(std::string bucket, std::string key, std::string id, uint32_t marker, uint32_t max_parts,

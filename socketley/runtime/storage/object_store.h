@@ -400,7 +400,9 @@ private:
     size_t limit(const stage& s) const { return m_seal && s.file_off != 0 ? m_cap - m_header_len : m_cap; }
     // Seals an encrypted buffer's chunks, then writes them where the body's layout puts them.
     void flush_sealed(stage& s);
-    void write_sealed(stage& s, size_t lead, size_t n);
+    void write_sealed(stage& s, size_t lead, size_t n, bool last);
+    // Writes the empty chunk that ends a sealed body whose length is whole chunks and whose buffers are written.
+    void write_sealed_tail();
     void on_write_done(stage& s, int64_t res);
     void fail(st why);
     void maybe_finish();
@@ -443,6 +445,10 @@ private:
     // The key the body is encrypted with, shared with the jobs that seal it, and their lane.
     std::shared_ptr<const sse_seal_spec> m_seal;
     uint32_t    m_seal_lane{0};
+    // The chunk that ends the sealed stream has been written, and the one written on its own when no buffer held it.
+    bool        m_tail_sealed{false};
+    bool        m_tail_writing{false};
+    std::array<char, sse_overhead> m_tail{};
     committer   m_committer;
     st         m_status{st::ok};
     // A body placed into another file by place_body(), and the syncs still owed before the commit.

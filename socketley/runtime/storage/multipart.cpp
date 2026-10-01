@@ -128,7 +128,7 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
 // How far apart the parts of an upload lie in its data file: their size, or what that size takes sealed.
 uint64_t place_stride(const mpu_upload& u)
 {
-    return is_encrypted(u.meta) ? sse_stored_len(u.place_size) : u.place_size;
+    return is_encrypted(u.meta) ? sse_stored_len(u.place_size, sse_version_of(u.meta)) : u.place_size;
 }
 
 // Whether the listed parts are 1..N, each where the object needs it in the data file, and the only parts there.
@@ -216,8 +216,9 @@ struct assemble_state
     bool     local{true};
     // The parts are in place in the data file, which becomes the object itself.
     bool     in_place{false};
-    // The parts are sealed, and so are their bytes on disk, which is more than their sizes say.
-    bool     sealed{false};
+    // The format the parts are sealed in, 0 for none, since their bytes on disk are more than their sizes say.
+    uint8_t  sealed{0};
+    complete_binder bind;
 };
 
 multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& store)
@@ -816,10 +817,12 @@ void multipart_store::finish_part(const std::shared_ptr<part_commit>& pc, int64_
 // ─── Completing ─────────────────────────────────────────────────────────────
 
 void multipart_store::complete(std::string bucket, std::string id, std::vector<complete_part> parts,
-                               std::function<void()> progress, std::function<void(complete_result)> cb)
+                               std::function<void()> progress, std::function<void(complete_result)> cb,
+                               complete_binder bind)
 {
     prepare_complete(bucket, id, std::move(parts),
-        [this, alive = m_alive, progress = std::move(progress), cb](s3_error err, assemble_plan plan) mutable
+        [this, alive = m_alive, progress = std::move(progress), cb, bind = std::move(bind)](s3_error err,
+                                                                                           assemble_plan plan) mutable
         {
             if (!*alive)
                 return;
@@ -843,12 +846,13 @@ void multipart_store::complete(std::string bucket, std::string id, std::vector<c
             a->dir_path     = upload_path(a->bucket, a->id);
             a->cb           = std::move(cb);
             a->progress     = std::move(progress);
+            a->bind         = std::move(bind);
             assemble(std::move(a));
         });
 }
 
 void multipart_store::assemble_plan_object(assemble_plan plan, std::function<void()> progress,
-                                           std::function<void(complete_result)> cb)
+                                           std::function<void(complete_result)> cb, complete_binder bind)
 {
     auto a = std::make_shared<assemble_state>();
     a->bucket       = std::move(plan.bucket);
@@ -864,6 +868,7 @@ void multipart_store::assemble_plan_object(assemble_plan plan, std::function<voi
     a->cb           = std::move(cb);
     a->progress     = std::move(progress);
     a->local        = false;
+    a->bind         = std::move(bind);
     assemble(std::move(a));
 }
 
@@ -1057,10 +1062,29 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
         sizes.reserve(plan.parts.size());
         for (const mpu_part& p : plan.parts)
             sizes.push_back(p.size);
+        bool recorded = parts.size() == 1;
         if (std::string v = encode_part_sizes(sizes); !v.empty())
+        {
             plan.meta.extra.emplace_back(std::string(part_sizes_extra), std::move(v));
-        // An encrypted object's chunks are found by its part sizes, so one whose sizes cannot be kept is not made.
-        else if (is_encrypted(plan.meta) && parts.size() > 1)
+            recorded = true;
+        }
+        // A version 2 stream is sealed as the part number it was uploaded as, which a list of 1..N goes without.
+        if (sse_version_of(plan.meta) >= sse_format)
+        {
+            std::vector<uint32_t> numbers;
+            bool one_to_n = true;
+            for (const mpu_part& p : plan.parts)
+            {
+                numbers.push_back(p.number);
+                one_to_n = one_to_n && p.number == numbers.size();
+            }
+            std::string v = encode_part_numbers(numbers);
+            recorded = recorded && (one_to_n || !v.empty());
+            if (!v.empty())
+                plan.meta.extra.emplace_back(std::string(part_numbers_extra), std::move(v));
+        }
+        // An encrypted object's chunks are found by its parts, so one whose parts cannot be kept is not made.
+        if (is_encrypted(plan.meta) && !recorded)
         {
             reject("InvalidRequest", "The parts of an encrypted upload must leave its part sizes short enough to "
                                      "record: make every part but the last one size");
@@ -1079,7 +1103,14 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
 
 void multipart_store::assemble(std::shared_ptr<assemble_state> a)
 {
-    a->sealed = is_encrypted(a->meta);
+    a->sealed = sse_version_of(a->meta);
+    if (a->bind)
+        if (s3_error e = a->bind(a->meta); !e.code.empty())
+        {
+            ++m_inflight;
+            assemble_fail(a, std::move(e));
+            return;
+        }
     const uint64_t base = a->in_place && !a->parts.empty() ? a->parts.front().data_off : 0;
     auto header = std::make_shared<std::string>(encode_object_header(a->key, a->meta, base));
     // A header that outgrew the room its upload reserved would be written over part 1.
@@ -1205,7 +1236,7 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
     while (!a->failed && a->header_done && a->part_idx < a->parts.size())
     {
         const mpu_part& p = a->parts[a->part_idx];
-        const uint64_t  len = a->sealed ? sse_stored_len(p.size) : p.size;
+        const uint64_t  len = a->sealed ? sse_stored_len(p.size, a->sealed) : p.size;
         if (len == 0 || a->part_off >= len)
         {
             ++a->part_idx;
@@ -1307,6 +1338,11 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
 
 void multipart_store::assemble_fail(const std::shared_ptr<assemble_state>& a, st why)
 {
+    assemble_fail(a, error_for(why));
+}
+
+void multipart_store::assemble_fail(const std::shared_ptr<assemble_state>& a, s3_error why)
+{
     // What every way out does: the upload is open again, and the client is told why.
     --m_inflight;
     a->dst.reset();
@@ -1315,7 +1351,7 @@ void multipart_store::assemble_fail(const std::shared_ptr<assemble_state>& a, st
         if (mpu_upload* u = find_mut(a->bucket, a->id))
             reopen(*u);
     complete_result r;
-    r.error = error_for(why);
+    r.error = std::move(why);
     a->cb(std::move(r));
 }
 

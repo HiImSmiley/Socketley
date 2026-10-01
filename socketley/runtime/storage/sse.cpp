@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <charconv>
 #include <cstring>
 
 #include <fcntl.h>
@@ -20,15 +19,45 @@ namespace socketley::storage
 namespace
 {
 
-constexpr std::string_view sse_version = "1";
 constexpr std::string_view chunk_text  = "65536";
 // What a wrapped key is sealed together with, so a data key is never taken for anything else.
-constexpr std::string_view wrap_aad = "socketley-sse-key-v1";
+constexpr std::string_view wrap_aad_v1 = "socketley-sse-key-v1";
+constexpr std::string_view wrap_aad_v2 = "socketley-sse-key-v2";
+// What a version 2 chunk's additional data begins with, so it is never read as a version 1 one.
+constexpr std::string_view chunk_aad_v2 = "SKS2";
+constexpr size_t chunk_aad_max = 17;
 
-void put_index(uint8_t* aad, uint64_t index)
+void put_be(uint8_t* at, uint64_t v, int bytes)
 {
-    for (int i = 7; i >= 0; --i, index >>= 8)
-        aad[i] = static_cast<uint8_t>(index & 0xff);
+    for (int i = bytes - 1; i >= 0; --i, v >>= 8)
+        at[i] = static_cast<uint8_t>(v & 0xff);
+}
+
+// The additional data a chunk is sealed with, written into `aad`; its length.
+size_t chunk_aad(uint8_t* aad, uint8_t version, uint32_t stream, uint64_t index, bool last)
+{
+    if (version == sse_format_v1)
+    {
+        put_be(aad, index, 8);
+        return 8;
+    }
+    std::memcpy(aad, chunk_aad_v2.data(), chunk_aad_v2.size());
+    put_be(aad + 4, stream, 4);
+    put_be(aad + 8, index, 8);
+    aad[16] = last ? 1 : 0;
+    return chunk_aad_max;
+}
+
+// The additional data a data key is wrapped with.
+std::string wrap_aad(uint8_t version, const sse_digest* parts)
+{
+    std::string aad(version == sse_format_v1 ? wrap_aad_v1 : wrap_aad_v2);
+    if (parts && version != sse_format_v1)
+    {
+        aad += "/parts/";
+        aad.append(reinterpret_cast<const char*>(parts->data()), parts->size());
+    }
+    return aad;
 }
 
 bool hex_nibble(char ch, uint8_t& out)
@@ -42,12 +71,6 @@ bool hex_nibble(char ch, uint8_t& out)
     else
         return false;
     return true;
-}
-
-bool number(std::string_view s, uint64_t& out)
-{
-    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
 }
 
 // One AES-256-GCM context with its key schedule set, reused for every chunk of a call.
@@ -104,7 +127,7 @@ private:
 
 std::string encode_sse(const sse_record& r)
 {
-    std::string v(sse_version);
+    std::string v = std::to_string(r.version);
     v += r.mode == sse_mode::c ? ";c;" : ";s3;";
     v += chunk_text;
     v += r.per_part ? ";p;" : ";o;";
@@ -125,9 +148,10 @@ bool decode_sse(std::string_view v, sse_record& out)
         f[i] = v.substr(0, semi);
         v    = i == 5 ? std::string_view{} : v.substr(semi + 1);
     }
-    if (f[0] != sse_version || (f[1] != "s3" && f[1] != "c") || f[2] != chunk_text || (f[3] != "o" && f[3] != "p") ||
-        f[4].size() != 8)
+    if ((f[0] != "1" && f[0] != "2") || (f[1] != "s3" && f[1] != "c") || f[2] != chunk_text ||
+        (f[3] != "o" && f[3] != "p") || f[4].size() != 8)
         return false;
+    out.version  = f[0] == "1" ? sse_format_v1 : sse_format;
     out.mode     = f[1] == "c" ? sse_mode::c : sse_mode::s3;
     out.per_part = f[3] == "p";
     for (size_t i = 0; i < 4; ++i)
@@ -157,6 +181,13 @@ sse_mode sse_mode_of(const object_meta& m)
     return r.mode;
 }
 
+uint8_t sse_version_of(const object_meta& m)
+{
+    const std::string* v = sse_value(m);
+    sse_record r;
+    return v && decode_sse(*v, r) ? r.version : 0;
+}
+
 uint64_t stored_size(const object_meta& m)
 {
     const std::string* v = sse_value(m);
@@ -174,56 +205,38 @@ bool sse_layout::init(const object_meta& m)
     sse_record r;
     if (!v || !decode_sse(*v, r))
         return false;
-    m_size = m.size;
+    m_version = r.version;
+    m_size    = m.size;
+    m_stream.clear();
+    m_len.clear();
     m_plain_at.clear();
     m_cipher_at.clear();
     // A part's own file, and a copy or a put, are one stream whatever their record says.
-    if (!r.per_part || m.parts <= 1)
+    const bool parts = r.per_part && (r.version == sse_format_v1 ? m.parts > 1 : m.parts >= 1);
+    if (!parts)
     {
-        m_stored = sse_stored_len(m.size);
-        return true;
-    }
-    std::string_view list;
-    for (const auto& [n, val] : m.extra)
-        if (n == part_sizes_extra)
-            list = val;
-    if (list.empty())
-        return false;
-    std::vector<uint64_t> sizes;
-    sizes.reserve(list.find(',') == std::string_view::npos ? m.parts : 16);
-    if (list.find(',') == std::string_view::npos)
-    {
-        uint64_t each = 0;
-        if (!number(list, each) || each == 0 || each > m.size / (m.parts - 1))
-            return false;
-        sizes.assign(m.parts - 1, each);
-        sizes.push_back(m.size - each * (m.parts - 1));
+        m_stream.push_back(0);
+        m_len.push_back(m.size);
     }
     else
     {
-        while (!list.empty())
-        {
-            const size_t comma = list.find(',');
-            uint64_t s = 0;
-            if (!number(list.substr(0, comma), s))
-                return false;
-            sizes.push_back(s);
-            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-        }
+        part_list l;
+        if (!part_list_of(m, l))
+            return false;
+        m_stream = std::move(l.numbers);
+        m_len    = std::move(l.sizes);
     }
-    if (sizes.size() != m.parts)
-        return false;
     uint64_t plain = 0, cipher = 0;
-    m_plain_at.reserve(sizes.size());
-    m_cipher_at.reserve(sizes.size());
-    for (uint64_t s : sizes)
+    m_plain_at.reserve(m_len.size());
+    m_cipher_at.reserve(m_len.size());
+    for (uint64_t s : m_len)
     {
         if (s > m.size - plain)
             return false;
         m_plain_at.push_back(plain);
         m_cipher_at.push_back(cipher);
         plain  += s;
-        cipher += sse_stored_len(s);
+        cipher += sse_stored_len(s, m_version);
     }
     if (plain != m.size)
         return false;
@@ -231,25 +244,63 @@ bool sse_layout::init(const object_meta& m)
     return true;
 }
 
+sse_layout::chunk sse_layout::make(uint32_t part, uint64_t index) const
+{
+    chunk c;
+    c.part       = part;
+    c.stream     = m_stream[part];
+    c.index      = index;
+    c.last       = m_version != sse_format_v1 && index + 1 == sse_chunks(m_len[part], m_version);
+    c.plain_off  = m_plain_at[part] + index * sse_chunk;
+    c.plain_len  = std::min<uint64_t>(sse_chunk, m_len[part] - index * sse_chunk);
+    c.cipher_off = m_cipher_at[part] + index * (sse_chunk + sse_overhead);
+    return c;
+}
+
 sse_layout::chunk sse_layout::at(uint64_t x) const
 {
-    uint64_t part_plain = 0, part_cipher = 0, part_size = m_size;
-    if (!m_plain_at.empty())
+    // The last part that begins at or before x, which skips any empty part in front of it.
+    const size_t p = static_cast<size_t>(std::upper_bound(m_plain_at.begin(), m_plain_at.end(), x) -
+                                         m_plain_at.begin()) - 1;
+    return make(static_cast<uint32_t>(p), (x - m_plain_at[p]) / sse_chunk);
+}
+
+bool sse_layout::first(chunk& c) const
+{
+    for (size_t p = 0; p < m_len.size(); ++p)
+        if (sse_chunks(m_len[p], m_version) > 0)
+        {
+            c = make(static_cast<uint32_t>(p), 0);
+            return true;
+        }
+    return false;
+}
+
+bool sse_layout::next(chunk& c) const
+{
+    if (c.index + 1 < sse_chunks(m_len[c.part], m_version))
     {
-        // The last part that begins at or before x, which skips any empty part in front of it.
-        const size_t p = static_cast<size_t>(std::upper_bound(m_plain_at.begin(), m_plain_at.end(), x) -
-                                             m_plain_at.begin()) - 1;
-        part_plain  = m_plain_at[p];
-        part_cipher = m_cipher_at[p];
-        part_size   = (p + 1 < m_plain_at.size() ? m_plain_at[p + 1] : m_size) - part_plain;
+        c = make(c.part, c.index + 1);
+        return true;
     }
-    chunk c;
-    const uint64_t local = x - part_plain;
-    c.index      = local / sse_chunk;
-    c.plain_off  = part_plain + c.index * sse_chunk;
-    c.plain_len  = std::min<uint64_t>(sse_chunk, part_size - c.index * sse_chunk);
-    c.cipher_off = part_cipher + c.index * (sse_chunk + sse_overhead);
-    return c;
+    for (size_t p = c.part + 1; p < m_len.size(); ++p)
+        if (sse_chunks(m_len[p], m_version) > 0)
+        {
+            c = make(static_cast<uint32_t>(p), 0);
+            return true;
+        }
+    return false;
+}
+
+sse_digest sse_layout::parts_digest() const
+{
+    part_list l;
+    l.numbers = m_stream;
+    l.sizes   = m_len;
+    const std::string bytes = encode_part_list(l, m_size);
+    digest_stream d(EVP_sha256());
+    d.update(bytes.data(), bytes.size());
+    return d.finish<32>();
 }
 
 // ─── Keys ───────────────────────────────────────────────────────────────────
@@ -272,66 +323,69 @@ std::array<uint8_t, 4> sse_key_id(const sse_key& master)
     return {h[0], h[1], h[2], h[3]};
 }
 
-bool sse_wrap(const sse_key& kek, const sse_key& data, std::string& wrapped)
+bool sse_wrap(const sse_key& kek, const sse_key& data, std::string& wrapped, uint8_t version,
+              const sse_digest* parts)
 {
     wrapped.assign(sse_wrapped_bytes, '\0');
     auto* w = reinterpret_cast<uint8_t*>(wrapped.data());
     if (RAND_bytes(w, static_cast<int>(sse_nonce)) != 1)
         return false;
+    const std::string aad = wrap_aad(version, parts);
     gcm g(kek.data(), true);
-    return g.seal(w, reinterpret_cast<const uint8_t*>(wrap_aad.data()), wrap_aad.size(), data.data(), data.size(),
+    return g.seal(w, reinterpret_cast<const uint8_t*>(aad.data()), aad.size(), data.data(), data.size(),
                   w + sse_nonce, w + sse_nonce + sse_key_bytes);
 }
 
-bool sse_unwrap(const sse_key& kek, std::string_view wrapped, sse_key& data)
+bool sse_unwrap(const sse_key& kek, std::string_view wrapped, sse_key& data, uint8_t version,
+                const sse_digest* parts)
 {
     if (wrapped.size() != sse_wrapped_bytes)
         return false;
     const auto* w = reinterpret_cast<const uint8_t*>(wrapped.data());
+    const std::string aad = wrap_aad(version, parts);
     gcm g(kek.data(), false);
-    return g.open(w, reinterpret_cast<const uint8_t*>(wrap_aad.data()), wrap_aad.size(), w + sse_nonce,
-                  sse_key_bytes, w + sse_nonce + sse_key_bytes, data.data());
+    return g.open(w, reinterpret_cast<const uint8_t*>(aad.data()), aad.size(), w + sse_nonce, sse_key_bytes,
+                  w + sse_nonce + sse_key_bytes, data.data());
 }
 
 // ─── Chunks ─────────────────────────────────────────────────────────────────
 
-bool sse_seal(const sse_key& key, uint64_t first, const char* in, size_t n, char* out)
+bool sse_seal(const sse_key& key, uint8_t version, uint32_t stream, uint64_t first, const char* in, size_t n,
+              bool last, char* out)
 {
     gcm g(key.data(), true);
-    uint8_t aad[8];
+    uint8_t aad[chunk_aad_max];
+    const uint64_t chunks = last ? sse_chunks(n, version) : (n + sse_chunk - 1) / sse_chunk;
     // Random per chunk, so a part written again under its upload's key never repeats a nonce.
-    const size_t chunks = (n + sse_chunk - 1) / sse_chunk;
-    for (size_t i = 0; i < chunks; ++i)
+    for (uint64_t i = 0; i < chunks; ++i)
     {
-        const size_t len = std::min(sse_chunk, n - i * sse_chunk);
+        const size_t len = std::min(sse_chunk, n - static_cast<size_t>(i) * sse_chunk);
         auto* o = reinterpret_cast<uint8_t*>(out + i * (sse_chunk + sse_overhead));
         if (RAND_bytes(o, static_cast<int>(sse_nonce)) != 1)
             return false;
-        put_index(aad, first + i);
-        if (!g.seal(o, aad, sizeof aad, reinterpret_cast<const uint8_t*>(in + i * sse_chunk), len, o + sse_nonce,
+        const size_t alen = chunk_aad(aad, version, stream, first + i, last && i + 1 == chunks);
+        if (!g.seal(o, aad, alen, reinterpret_cast<const uint8_t*>(in + i * sse_chunk), len, o + sse_nonce,
                     o + sse_nonce + len))
             return false;
     }
     return true;
 }
 
-bool sse_open(const sse_key& key, uint64_t first, const char* in, size_t n, char* out)
+bool sse_open(const sse_key& key, uint8_t version, const sse_layout::chunk* chunks, size_t count, const char* in,
+              char* out)
 {
     gcm g(key.data(), false);
-    uint8_t aad[8];
-    size_t at = 0;
-    for (uint64_t index = first; at < n; ++index)
+    uint8_t aad[chunk_aad_max];
+    for (size_t i = 0; i < count; ++i)
     {
-        const size_t whole = std::min(sse_chunk + sse_overhead, n - at);
-        if (whole <= sse_overhead)
+        const sse_layout::chunk& c = chunks[i];
+        const auto* p = reinterpret_cast<const uint8_t*>(in);
+        const size_t len  = static_cast<size_t>(c.plain_len);
+        const size_t alen = chunk_aad(aad, version, c.stream, c.index, c.last);
+        if (!g.open(p, aad, alen, p + sse_nonce, len, p + sse_nonce + len, reinterpret_cast<uint8_t*>(out)))
             return false;
-        const size_t len = whole - sse_overhead;
-        const auto* c = reinterpret_cast<const uint8_t*>(in + at);
-        put_index(aad, index);
-        if (!g.open(c, aad, sizeof aad, c + sse_nonce, len, c + sse_nonce + len,
-                    reinterpret_cast<uint8_t*>(out + (index - first) * sse_chunk)))
-            return false;
-        at += whole;
+        in  += c.stored();
+        out += len;
     }
     return true;
 }

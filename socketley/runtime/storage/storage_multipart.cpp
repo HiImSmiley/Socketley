@@ -181,7 +181,7 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
         const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
         object_meta   meta;
         sse_seal_spec seal;
-        if (s3_error err; !sse_part_key(cc, place.sse, meta, seal, err))
+        if (s3_error err; !sse_part_key(cc, place.sse, number, meta, seal, err))
         {
             deny_request(cc, err);
             return;
@@ -278,7 +278,8 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     sse_seal_spec seal;
     sse_key probe{};
     if (s3_error err; !sse_customer(c, sse_c_copy_prefix, src_customer, err) ||
-                      !sse_read_key(c, *src, sse_c_copy_prefix, probe, err) || !sse_part_key(c, record, meta, seal, err))
+                      !sse_read_key(c, *src, sse_c_copy_prefix, probe, err) ||
+                      !sse_part_key(c, record, number, meta, seal, err))
     {
         send_error(c, err);
         return;
@@ -337,11 +338,20 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
         return;
     }
 
+    // The client's key, which S3 lets a completion leave out, binds an SSE-C object's part list when it is given.
+    std::optional<sse_key> customer;
+    if (s3_error err; !sse_customer(c, sse_c_prefix, customer, err))
+    {
+        send_error(c, err);
+        return;
+    }
+
     const std::string   bucket = r.bucket;
     const std::string   key    = r.key;
     const std::string   host(r.host);
     const std::string   id     = std::string(r.get_query("uploadId"));
     std::weak_ptr<conn> weak = c;
+    auto bind = [this, customer](object_meta& m) { return sse_bind_parts(m, customer); };
     m_node.mpu_complete(bucket, key, id, std::move(parts),
         [weak]()
         {
@@ -379,7 +389,7 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
                                                res.meta.etag(), algo, res.checksum_b64);
             send_response(cc, std::move(resp));
             notify_put(bucket, key, res.meta);
-        });
+        }, std::move(bind));
 }
 
 // ─── AbortMultipartUpload ───────────────────────────────────────────────────

@@ -21,6 +21,7 @@ constexpr size_t           prelude_len = 24;
 constexpr size_t           max_record_bytes = 64 * 1024;
 
 constexpr std::string_view slot_magic = std::string_view("SKLTAG\x01\x00", 8);
+constexpr std::string_view part_list_magic = std::string_view("SKLPRT\x01\x00", 8);
 // magic, sequence, payload length, crc.
 constexpr size_t           slot_head  = 24;
 constexpr size_t           sector     = 512;
@@ -267,60 +268,161 @@ std::string version_rel_path(std::string_view key, std::string_view id)
     return p;
 }
 
+namespace
+{
+
+bool decimal(std::string_view s, uint64_t& out)
+{
+    const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
+}
+
+const std::string* extra_of(const object_meta& m, std::string_view name)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == name)
+            return &v;
+    return nullptr;
+}
+
+// Hands each item of a comma-separated list to `take`, false when one is refused.
+template <typename F>
+bool each_item(std::string_view v, F take)
+{
+    for (;;)
+    {
+        const size_t comma = v.find(',');
+        if (!take(v.substr(0, comma)))
+            return false;
+        if (comma == std::string_view::npos)
+            return true;
+        v.remove_prefix(comma + 1);
+    }
+}
+
+}   // namespace
+
+std::string encode_part_numbers(const std::vector<uint32_t>& numbers)
+{
+    bool plain = true;
+    for (size_t i = 0; i < numbers.size(); ++i)
+        plain = plain && numbers[i] == i + 1;
+    if (plain)
+        return {};
+    std::string out;
+    for (size_t i = 0; i < numbers.size();)
+    {
+        size_t j = i;
+        while (j + 1 < numbers.size() && numbers[j + 1] == numbers[j] + 1)
+            ++j;
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(numbers[i]);
+        if (j > i)
+            out += '-' + std::to_string(numbers[j]);
+        if (out.size() > max_part_sizes_bytes)
+            return {};
+        i = j + 1;
+    }
+    return out;
+}
+
+bool part_list_of(const object_meta& m, part_list& out)
+{
+    out.numbers.clear();
+    out.sizes.clear();
+    const uint32_t count = m.parts ? m.parts : 1;
+    if (count == 1)
+        out.sizes.push_back(m.size);
+    else
+    {
+        const std::string* v = extra_of(m, part_sizes_extra);
+        if (!v || v->empty())
+            return false;
+        if (v->find(',') == std::string::npos)
+        {
+            uint64_t each = 0;
+            if (!decimal(*v, each) || each == 0 || each > m.size / (count - 1))
+                return false;
+            out.sizes.assign(count - 1, each);
+            out.sizes.push_back(m.size - each * (count - 1));
+        }
+        else
+        {
+            // A list that does not add up to the object is trusted for no part of it.
+            uint64_t total = 0;
+            const bool ok = each_item(*v, [&](std::string_view item)
+            {
+                uint64_t s = 0;
+                if (!decimal(item, s) || s > m.size - total || out.sizes.size() == count)
+                    return false;
+                total += s;
+                out.sizes.push_back(s);
+                return true;
+            });
+            if (!ok || out.sizes.size() != count || total != m.size)
+                return false;
+        }
+    }
+    const std::string* nv = extra_of(m, part_numbers_extra);
+    if (!nv)
+    {
+        for (uint32_t i = 1; i <= count; ++i)
+            out.numbers.push_back(i);
+        return true;
+    }
+    // Ascending and within S3's bounds, which is all a completion can have recorded.
+    const bool ok = each_item(*nv, [&](std::string_view item)
+    {
+        const size_t dash = item.find('-');
+        uint64_t lo = 0, hi = 0;
+        if (!decimal(item.substr(0, dash), lo))
+            return false;
+        if (dash == std::string_view::npos)
+            hi = lo;
+        else if (!decimal(item.substr(dash + 1), hi))
+            return false;
+        if (lo < 1 || hi < lo || hi > 10000 || (!out.numbers.empty() && lo <= out.numbers.back()) ||
+            out.numbers.size() + (hi - lo + 1) > count)
+            return false;
+        for (uint64_t n = lo; n <= hi; ++n)
+            out.numbers.push_back(static_cast<uint32_t>(n));
+        return true;
+    });
+    return ok && out.numbers.size() == count;
+}
+
+void clear_part_layout(object_meta& m)
+{
+    std::erase_if(m.extra, [](const auto& e) { return e.first == part_sizes_extra || e.first == part_numbers_extra; });
+}
+
+std::string encode_part_list(const part_list& l, uint64_t total)
+{
+    std::string out(part_list_magic);
+    put_u64(out, total);
+    put_u32(out, static_cast<uint32_t>(l.sizes.size()));
+    for (size_t i = 0; i < l.sizes.size(); ++i)
+    {
+        put_u32(out, i < l.numbers.size() ? l.numbers[i] : 0);
+        put_u64(out, l.sizes[i]);
+    }
+    return out;
+}
+
 part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len)
 {
     const uint32_t count = m.parts ? m.parts : 1;
     if (n < 1 || n > count)
         return part_status::out_of_range;
-    if (count == 1)
-    {
-        first = 0;
-        len   = m.size;
-        return part_status::ok;
-    }
-    std::string_view v;
-    for (const auto& [name, value] : m.extra)
-        if (name == part_sizes_extra)
-            v = value;
-    if (v.empty())
+    part_list l;
+    if (!part_list_of(m, l))
         return part_status::unknown;
-
-    auto number = [](std::string_view s, uint64_t& out)
-    {
-        const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
-        return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
-    };
-    if (v.find(',') == std::string_view::npos)
-    {
-        uint64_t each = 0;
-        if (!number(v, each) || each == 0 || each > m.size / (count - 1))
-            return part_status::unknown;
-        first = (n - 1) * each;
-        len   = n < count ? each : m.size - first;
-        return part_status::ok;
-    }
-    // A list that does not add up to the object is trusted for no part of it.
-    uint64_t total = 0;
-    uint32_t i     = 0;
-    bool     found = false;
-    for (;;)
-    {
-        const size_t comma = v.find(',');
-        uint64_t s = 0;
-        if (!number(v.substr(0, comma), s) || s > m.size - total)
-            return part_status::unknown;
-        if (++i == n)
-        {
-            first = total;
-            len   = s;
-            found = true;
-        }
-        total += s;
-        if (comma == std::string_view::npos)
-            break;
-        v.remove_prefix(comma + 1);
-    }
-    return found && i == count && total == m.size ? part_status::ok : part_status::unknown;
+    first = 0;
+    for (uint32_t i = 0; i + 1 < n; ++i)
+        first += l.sizes[i];
+    len = l.sizes[n - 1];
+    return part_status::ok;
 }
 
 size_t object_header_len(std::string_view key, const object_meta& m)

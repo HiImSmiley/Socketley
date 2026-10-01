@@ -14,20 +14,13 @@ constexpr uint64_t window_bytes = 1u << 20;
 // A window this small is opened where it lands, since the hop to a thread costs more.
 constexpr size_t open_inline_max = 64 * 1024;
 
-// Opens each chunk of `chunks`, which lie one after another from the start of `cipher`, into `plain`.
-bool open_chunks(const sse_key& key, const std::vector<sse_layout::chunk>& chunks, const std::string& cipher,
-                 std::string& plain)
+// Whether a window that has reached plaintext `end` takes chunk `c` too: one holding bytes before it, or an
+// empty last chunk right at it, which is what proves a stream read to its end was not cut short.
+bool takes(const sse_layout::chunk& c, uint64_t end, uint64_t plain, uint64_t budget)
 {
-    size_t in = 0, out = 0;
-    for (const sse_layout::chunk& c : chunks)
-    {
-        const size_t stored = static_cast<size_t>(c.plain_len) + sse_overhead;
-        if (!sse_open(key, c.index, cipher.data() + in, stored, plain.data() + out))
-            return false;
-        in  += stored;
-        out += static_cast<size_t>(c.plain_len);
-    }
-    return true;
+    if (c.plain_len == 0)
+        return c.plain_off <= end;
+    return c.plain_off < end && plain < budget;
 }
 
 }   // namespace
@@ -128,14 +121,14 @@ void body_reader::fetch()
             const sse_layout::chunk head = m_layout.at(m_pos);
             uint64_t at = head.plain_off;
             uint64_t stored = 0, plain = 0;
-            while (at < m_end && plain < window_bytes)
+            sse_layout::chunk c = head;
+            do
             {
-                const sse_layout::chunk c = m_layout.at(at);
                 chunks->push_back(c);
-                stored += c.plain_len + sse_overhead;
+                stored += c.stored();
                 plain  += c.plain_len;
                 at      = c.plain_off + c.plain_len;
-            }
+            } while (m_layout.next(c) && takes(c, m_end, plain, window_bytes));
             off    = m_data_off + head.cipher_off;
             want   = stored;
             s.skip = static_cast<size_t>(m_pos - head.plain_off);
@@ -181,9 +174,9 @@ void body_reader::read_done(int index, int64_t res, uint64_t want, std::shared_p
         return;
     }
     auto ok = std::make_shared<bool>(false);
-    auto work = [key = *m_key, chunks, cipher = s.cipher, plain = s.plain, ok]
+    auto work = [key = *m_key, version = m_layout.version(), chunks, cipher = s.cipher, plain = s.plain, ok]
     {
-        *ok = open_chunks(key, *chunks, *cipher, *plain);
+        *ok = sse_open(key, version, chunks->data(), chunks->size(), cipher->data(), plain->data());
     };
     if (m_pool && want > open_inline_max)
     {
@@ -207,16 +200,12 @@ bool sse_open_body(const object_meta& m, const sse_key& key, std::string_view st
     if (!l.init(m) || stored.size() < l.stored())
         return false;
     plain.resize(static_cast<size_t>(m.size));
-    uint64_t at = 0;
-    while (at < m.size)
-    {
-        const sse_layout::chunk c = l.at(at);
-        if (!sse_open(key, c.index, stored.data() + c.cipher_off, static_cast<size_t>(c.plain_len) + sse_overhead,
-                      plain.data() + c.plain_off))
-            return false;
-        at = c.plain_off + c.plain_len;
-    }
-    return true;
+    // Every chunk on disk, the empty ones that end a stream too, which are the proof it was not cut short.
+    std::vector<sse_layout::chunk> all;
+    sse_layout::chunk c;
+    for (bool more = l.first(c); more; more = l.next(c))
+        all.push_back(c);
+    return sse_open(key, l.version(), all.data(), all.size(), stored.data(), plain.data());
 }
 
 }   // namespace socketley::storage

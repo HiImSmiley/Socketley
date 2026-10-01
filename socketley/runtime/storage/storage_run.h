@@ -626,8 +626,10 @@ public:
     bool sse_new_key(const sse_ask& ask, bool per_part, object_meta& meta, sse_seal_spec& seal, s3_error& err);
     // The key a part of an upload is sealed with, from the upload's `record`, which the part's `meta` is given too;
     // an empty record seals nothing.
-    bool sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, object_meta& meta,
+    bool sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, uint32_t number, object_meta& meta,
                       sse_seal_spec& seal, s3_error& err);
+    // Wraps a completed upload's data key again with its part list, when the key that wraps it is at hand.
+    s3_error sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const;
     // The key the SSE-C headers under `prefix` give, none when they are absent; false with `err` when they are refused.
     bool sse_customer(const std::shared_ptr<conn>& c, std::string_view prefix, std::optional<sse_key>& out,
                       s3_error& err);

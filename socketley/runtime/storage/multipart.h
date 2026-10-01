@@ -152,6 +152,9 @@ struct assemble_plan
     bool        in_place{false};
 };
 
+// What a completion's assembler makes of the object's meta before its header is written; an error refuses it.
+using complete_binder = std::function<s3_error(object_meta&)>;
+
 // One page of an upload's parts, as ListParts answers it.
 struct parts_page
 {
@@ -219,7 +222,8 @@ public:
     // uploaded, and removes the upload once the object is committed.  `progress`
     // runs as the bytes move, so the caller can tell a slow assembly from a stuck one.
     void complete(std::string bucket, std::string id, std::vector<complete_part> parts,
-                  std::function<void()> progress, std::function<void(complete_result)> cb);
+                  std::function<void()> progress, std::function<void(complete_result)> cb,
+                  complete_binder bind = {});
 
     // The two halves of `complete`, for a completion whose assembly runs on
     // another shard: this one validates the list against the upload and seals it,
@@ -230,7 +234,7 @@ public:
     // Reads the plan's parts and commits the object through the store, so the
     // owner of the key is the one that renames it; the upload is not touched.
     void assemble_plan_object(assemble_plan plan, std::function<void()> progress,
-                              std::function<void(complete_result)> cb);
+                              std::function<void(complete_result)> cb, complete_binder bind = {});
     void finish_complete(std::string bucket, std::string id, bool ok);
 
     // The parts of an upload, `max_parts` of them after `marker`.
@@ -272,6 +276,7 @@ private:
     void assemble_copy(std::shared_ptr<assemble_state> a);
     void assemble_commit(const std::shared_ptr<assemble_state>& a);
     void assemble_fail(const std::shared_ptr<assemble_state>& a, st why);
+    void assemble_fail(const std::shared_ptr<assemble_state>& a, s3_error why);
     // The upload is open again after a completion that did not finish.
     void reopen(mpu_upload& u);
     void assemble_pump(const std::shared_ptr<assemble_state>& a);

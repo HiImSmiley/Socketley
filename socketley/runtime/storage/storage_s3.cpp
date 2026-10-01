@@ -1321,8 +1321,6 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
                 r.headers.emplace_back(n, v);
             continue;
         }
-        if (n == part_sizes_extra)
-            continue;
         if (n == sse_extra)
         {
             sse_headers(q, m, r.headers);
@@ -1333,6 +1331,9 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
             r.headers.emplace_back("x-amz-version-id", version_of(m).id);
             continue;
         }
+        // What the store keeps for itself about the object's bytes is no header of the object.
+        if (n.starts_with("x-socketley-"))
+            continue;
         std::string display;
         bool next_upper = true;
         for (char ch : n)
@@ -1565,9 +1566,17 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         if (sealed && !clear)
         {
             std::string plain;
-            if (len > 0 && prefetch.size() >= stored_size(m) && sse_open_body(m, key, prefetch, plain))
+            // An empty object is opened too, since the chunk that ends its stream is what says it is empty.
+            if ((len > 0 || m.size == 0) && prefetch.size() >= stored_size(m))
             {
                 close_file();
+                if (!sse_open_body(m, key, prefetch, plain))
+                {
+                    LOG_WARN(("storage: the encrypted object \"" + rq.key + "\" does not open: a chunk is missing, "
+                              "cut short or moved").c_str());
+                    send_error(cc, make_error("InternalError"));
+                    return;
+                }
                 r.body = plain.substr(static_cast<size_t>(first), static_cast<size_t>(len));
                 ++m_c.copied_gets;
                 ++m_c.sse_gets;

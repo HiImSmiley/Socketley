@@ -58,6 +58,30 @@ inline constexpr size_t max_part_sizes_bytes = 4096;
 // The entry for parts of these sizes, empty when it would be longer than the bound.
 std::string encode_part_sizes(const std::vector<uint64_t>& sizes);
 
+// The extra entry naming the numbers a multipart object's parts were uploaded as, when they are not 1..N:
+// single numbers and ranges, comma-separated, such as 1-3,5,9.
+inline constexpr std::string_view part_numbers_extra = "x-socketley-part-numbers";
+
+// The entry for these ascending numbers, empty when they are 1..N or the entry would be longer than the bound.
+std::string encode_part_numbers(const std::vector<uint32_t>& numbers);
+
+// A multipart object's parts in order: the number each was uploaded as, and its size.
+struct part_list
+{
+    std::vector<uint32_t> numbers;
+    std::vector<uint64_t> sizes;
+};
+
+// The parts `m`'s header records, a single-part object being its own part 1; false when they are not
+// recorded or do not add up to the object.
+bool part_list_of(const object_meta& m, part_list& out);
+
+// Removes what `m` records of its parts, for a copy that is one part whatever its source was.
+void clear_part_layout(object_meta& m);
+
+// The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over.
+std::string encode_part_list(const part_list& l, uint64_t total);
+
 // The extra entry a version of a key in a versioned bucket is named by: its order among the
 // key's versions, whether it is a delete marker, and its id.
 inline constexpr std::string_view version_extra = "x-socketley-version";

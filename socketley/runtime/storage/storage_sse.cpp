@@ -209,6 +209,20 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
         err = sse_error("InternalError", "The object's encryption record cannot be read");
         return false;
     }
+    // A completed upload's key is wrapped with its part list, so a header that names other parts does not open it.
+    sse_digest digest{};
+    const sse_digest* parts = nullptr;
+    if (rec.version != sse_format_v1 && rec.per_part && m.parts >= 1)
+    {
+        sse_layout l;
+        if (!l.init(m))
+        {
+            err = sse_error("InternalError", "The object's part list cannot be read");
+            return false;
+        }
+        digest = l.parts_digest();
+        parts  = &digest;
+    }
     if (rec.mode == sse_mode::c)
     {
         if (!customer)
@@ -217,7 +231,9 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
                                               "correct parameters must be provided to retrieve the object.");
             return false;
         }
-        if (!sse_unwrap(*customer, rec.wrapped, out))
+        // A completion that was not given the client's key left it wrapped as its upload had it.
+        if (!sse_unwrap(*customer, rec.wrapped, out, rec.version, parts) &&
+            !(parts && sse_unwrap(*customer, rec.wrapped, out, rec.version, nullptr)))
         {
             err = sse_error("AccessDenied", "The SSE-C key provided does not match the key the object was stored with");
             return false;
@@ -235,13 +251,60 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
                                          "--sse-key-file to open it");
         return false;
     }
-    if (rec.kid != m_master_kid || !sse_unwrap(m_master, rec.wrapped, out))
+    if (rec.kid != m_master_kid)
     {
         err = sse_error("InternalError", "The object was encrypted under another master key than this runtime's "
                                          "--sse-key-file");
         return false;
     }
+    if (!sse_unwrap(m_master, rec.wrapped, out, rec.version, parts))
+    {
+        LOG_WARN("storage: an object's data key does not unwrap under the master key its record names, so its "
+                 "header was altered");
+        err = sse_error("InternalError", "The object's data key does not unwrap: its header was altered");
+        return false;
+    }
     return true;
+}
+
+s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key>& customer) const
+{
+    const std::string* v = sse_value(m);
+    sse_record rec;
+    if (!v)
+        return {};
+    if (!decode_sse(*v, rec))
+        return sse_error("InternalError", "The upload's encryption record cannot be read");
+    if (rec.version == sse_format_v1 || !rec.per_part)
+        return {};
+    sse_layout l;
+    if (!l.init(m))
+        return sse_error("InternalError", "The completed object's part list cannot be read");
+    const sse_digest parts = l.parts_digest();
+    const sse_key* kek = nullptr;
+    if (rec.mode == sse_mode::s3)
+    {
+        if (!m_has_master || rec.kid != m_master_kid)
+            return sse_error("InternalError", "The upload was encrypted under another master key than this "
+                                              "runtime's --sse-key-file");
+        kek = &m_master;
+    }
+    else if (customer)
+        kek = &*customer;
+    else
+        return {};   // S3 does not ask a completion for the client's key, and without it the list stays unbound.
+    sse_key data{};
+    if (!sse_unwrap(*kek, rec.wrapped, data, rec.version))
+        return rec.mode == sse_mode::c
+                   ? sse_error("AccessDenied", "The SSE-C key provided does not match the key the upload was "
+                                               "created with")
+                   : sse_error("InternalError", "The upload's data key does not unwrap");
+    if (!sse_wrap(*kek, data, rec.wrapped, rec.version, &parts))
+        return sse_error("InternalError", "The object's data key could not be wrapped");
+    for (auto& [n, val] : m.extra)
+        if (n == sse_extra)
+            val = encode_sse(rec);
+    return {};
 }
 
 bool storage_run::sse_read_key(const std::shared_ptr<conn>& c, const object_meta& m, std::string_view prefix,
@@ -263,8 +326,8 @@ bool storage_run::sse_read_key(const std::shared_ptr<conn>& c, const object_meta
     return sse_data_key(m, customer, out, err);
 }
 
-bool storage_run::sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, object_meta& meta,
-                               sse_seal_spec& seal, s3_error& err)
+bool storage_run::sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, uint32_t number,
+                               object_meta& meta, sse_seal_spec& seal, s3_error& err)
 {
     object_meta upload;
     if (!record.empty())
@@ -277,6 +340,8 @@ bool storage_run::sse_part_key(const std::shared_ptr<conn>& c, const std::string
         return false;
     seal.key         = key;
     seal.opaque_etag = sse_mode_of(upload) == sse_mode::c;
+    seal.version     = sse_version_of(upload);
+    seal.stream      = number;
     // The part's own header says it is sealed, which is what tells its length on disk after a restart.
     meta.extra.emplace_back(std::string(sse_extra), record);
     return true;
@@ -524,7 +589,8 @@ void storage_run::copy_sealed(const std::shared_ptr<conn>& c, std::string src_bu
 {
     s3_request& r = c->req;
     // The copy is one stream of its own, under a key of its own, and a version only its owner gives.
-    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra || e.first == part_sizes_extra; });
+    std::erase_if(meta.extra, [](const auto& e) { return e.first == sse_extra; });
+    clear_part_layout(meta);
     clear_version_extra(meta);
     sse_seal_spec seal;
     if (s3_error err; dst.mode != sse_mode::none && !sse_new_key(dst, false, meta, seal, err))
