@@ -1,0 +1,149 @@
+#pragma once
+// A bucket policy: S3's JSON document, checked and compiled once when it is set
+// or read back at start, into statements a request is judged against with no
+// parsing, no allocation and, unless a statement names aws:SourceIp, no syscall.
+//
+// What it takes is the subset that can be honoured exactly on this runtime:
+// Allow and Deny, a principal that is everyone or this runtime's access keys,
+// the actions the runtime implements, resources in this bucket, and the
+// aws:SourceIp and aws:SecureTransport conditions.  Anything else is refused as
+// MalformedPolicy, never accepted to do less than it says.
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "s3_auth.h"
+
+namespace socketley::storage
+{
+
+inline constexpr size_t policy_max_bytes = 20 * 1024;
+
+// The actions a request can be, by the IAM name a policy gives them.
+enum class s3_action : uint8_t
+{
+    none,
+    get_object,
+    put_object,
+    delete_object,
+    get_object_tagging,
+    put_object_tagging,
+    delete_object_tagging,
+    abort_multipart_upload,
+    list_multipart_upload_parts,
+    list_bucket,
+    list_bucket_multipart_uploads,
+    get_bucket_location,
+    create_bucket,
+    delete_bucket,
+    get_bucket_cors,
+    put_bucket_cors,
+    get_lifecycle_configuration,
+    put_lifecycle_configuration,
+    get_bucket_policy,
+    put_bucket_policy,
+    delete_bucket_policy,
+    get_bucket_policy_status,
+    count,
+};
+static_assert(static_cast<int>(s3_action::count) <= 64);
+
+// The action an operation, by the name storage_run::operation_name gives it, is checked as.
+s3_action action_of_operation(std::string_view operation);
+
+// Whether the action acts on an object, whose resource is bucket/key, rather than on the bucket.
+bool action_on_object(s3_action a);
+
+// A client's address as a condition compares it: an IPv4 address mapped into
+// IPv6 is the IPv4 address, and a unix socket has none.
+struct client_ip
+{
+    uint8_t family{0};   // 0 for none, 4 or 6
+    uint8_t addr[16]{};
+};
+
+// The address of the peer of a connected socket.
+client_ip client_ip_of(int fd);
+
+// One request as a policy sees it.
+struct policy_request
+{
+    s3_action        action{s3_action::none};
+    // The object's key, for an action on an object.
+    std::string_view key;
+    // The request carried no credentials.
+    bool             anonymous{false};
+    // The access key it was signed with.
+    std::string_view principal;
+    bool             tls{false};
+    const client_ip* ip{nullptr};
+    // The keys are named in the body, so only a statement over every key in the bucket can allow it.
+    bool             every_key{false};
+};
+
+enum class policy_effect : uint8_t
+{
+    none,
+    allow,
+    deny,
+};
+
+class bucket_policy
+{
+public:
+    // False with a MalformedPolicy `err` for a document this runtime cannot honour exactly.
+    static bool compile(std::string_view json, std::string_view bucket, bucket_policy& out, s3_error& err);
+
+    // Deny when a Deny statement matches, else allow when an Allow does, else none.
+    policy_effect evaluate(const policy_request& r) const;
+
+    // Whether some statement denies, which is all a signed request is checked for.
+    bool has_deny() const { return m_has_deny; }
+    // Whether some statement compares the client's address, so the caller has to know it.
+    bool needs_ip() const { return m_needs_ip; }
+    // Whether an Allow lets everyone in without narrowing them to some addresses, as GetBucketPolicyStatus answers.
+    bool is_public() const { return m_public; }
+    // The document as it was given.
+    const std::string& text() const { return m_text; }
+
+    struct cidr
+    {
+        uint8_t family{0};
+        uint8_t addr[16]{};
+        uint8_t bits{0};
+    };
+    struct key_pattern
+    {
+        enum class kind : uint8_t { all, exact, prefix, wild };
+        kind        k{kind::all};
+        std::string text;
+    };
+    struct statement
+    {
+        bool     deny{false};
+        bool     any_principal{false};
+        // Every request signed by any of this runtime's keys.
+        bool     any_signed{false};
+        std::vector<std::string> keys;
+        uint64_t actions{0};
+        bool     bucket_resource{false};
+        std::vector<key_pattern> objects;
+        bool     has_ip_in{false};
+        std::vector<cidr> ip_in;
+        bool     has_ip_out{false};
+        std::vector<cidr> ip_out;
+        // The values aws:SecureTransport may have for the statement to apply, both when it names none.
+        bool     tls_true{true};
+        bool     tls_false{true};
+    };
+
+private:
+    std::string m_text;
+    std::vector<statement> m_statements;
+    bool m_has_deny{false};
+    bool m_needs_ip{false};
+    bool m_public{false};
+};
+
+}   // namespace socketley::storage

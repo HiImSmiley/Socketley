@@ -11,6 +11,7 @@
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
+//   <dir>/<bucket>/policy             its bucket policy, likewise
 //   <dir>/<bucket>/data/ab/<hash>     header + bytes, hash = sha256(key) in hex; the 256 ab
 //                                     directories are made and synced with the bucket
 //   <dir>/.trash/                     a deleted bucket, removed at the next start
@@ -43,12 +44,14 @@ namespace socketley::storage
 
 struct cors_config;
 struct lifecycle_config;
+class bucket_policy;
 
 // The configuration documents a bucket keeps beside its objects, each in a file named for it.
 enum class bucket_doc : uint8_t
 {
     cors,
     lifecycle,
+    policy,
 };
 // The most a document may be, so it crosses to a sibling shard in one message.
 inline constexpr size_t doc_max_bytes = 4u << 20;
@@ -435,7 +438,7 @@ public:
     // Removes a body that will not become anything from the bucket's tmp directory.
     void remove_tmp(std::string_view bucket, std::string tmp_name);
 
-    // ── Configuration documents: CORS and lifecycle ─────────────────────────
+    // ── Configuration documents: CORS, lifecycle and policy ─────────────────
     // Makes `xml` the bucket's document of `kind` on disk, or removes it when it is empty, and then here; shard 0's half.
     void write_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
     // Takes up a document another shard wrote.
@@ -449,6 +452,10 @@ public:
     std::shared_ptr<const lifecycle_config> lifecycle(std::string_view name) const;
     // How many buckets have lifecycle rules.
     size_t lifecycle_buckets() const { return m_lifecycle_buckets; }
+    // Whether any bucket has a policy, so a request to a store without one looks nothing up.
+    bool any_policy() const { return m_policy_buckets != 0; }
+    // The bucket's policy, null when it has none; valid until it next changes.
+    const bucket_policy* policy(std::string_view name) const;
     // Told whenever a bucket's lifecycle rules change here.
     void set_lifecycle_listener(std::function<void()> fn) { m_lifecycle_listener = std::move(fn); }
 
@@ -633,6 +640,7 @@ private:
         bool        closing{false};
         std::shared_ptr<const cors_config> cors;
         std::shared_ptr<const lifecycle_config> lifecycle;
+        std::shared_ptr<const bucket_policy> policy;
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -759,9 +767,10 @@ private:
     uint64_t m_drop_epoch{0};
     uint64_t m_drop_ring[drop_ring_size]{};
     uint64_t m_reserved{0};
-    // Buckets with CORS rules and with lifecycle rules.
+    // Buckets with CORS rules, with lifecycle rules and with a policy.
     uint32_t m_cors_buckets{0};
     uint32_t m_lifecycle_buckets{0};
+    uint32_t m_policy_buckets{0};
     static const char* doc_file(bucket_doc kind);
     // The one place a bucket's document is parsed and taken up, an empty one removing it; false when it does not parse.
     bool take_doc(bucket& b, bucket_doc kind, std::string_view xml);

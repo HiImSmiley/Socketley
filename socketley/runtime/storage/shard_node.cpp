@@ -325,6 +325,22 @@ void shard_node::run_drop(std::string name, std::function<void(st)> cb)
 
 // ─── Configuration documents ────────────────────────────────────────────────
 
+namespace
+{
+
+std::string doc_label(bucket_doc kind)
+{
+    switch (kind)
+    {
+        case bucket_doc::cors:      return "CORS configuration";
+        case bucket_doc::lifecycle: return "lifecycle configuration";
+        case bucket_doc::policy:    return "policy";
+    }
+    return "configuration";
+}
+
+}   // namespace
+
 void shard_node::set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
 {
     if (m_store.shard() == 0)
@@ -377,7 +393,7 @@ void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std
                           st a = st::io_error;
                           if (!ok || !wire::decode_status(reply, a) || a != st::ok)
                               LOG_WARN(("storage: shard " + std::to_string(peer) + " did not take up the " +
-                                        (kind == bucket_doc::cors ? "CORS" : "lifecycle") + " configuration of " +
+                                        doc_label(kind) + " of " +
                                         name + "; it does when it next starts").c_str());
                       },
                       [this, alive, name, cb]()

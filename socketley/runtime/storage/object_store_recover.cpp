@@ -634,7 +634,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     // The configuration documents shard 0 last synced, and not what a write it was cut short in left.
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle})
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy})
     {
         const std::string file = base + "/" + doc_file(kind);
         if (m_opts.shard == 0 && ::unlink((file + ".new").c_str()) < 0) {}

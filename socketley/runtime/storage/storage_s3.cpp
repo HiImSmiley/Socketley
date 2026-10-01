@@ -28,14 +28,15 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "versioning", "versions",
-        "versionId", "policy", "policyStatus", "website", "notification",
+        "versionId", "website", "notification",
         "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
-    // CORS and lifecycle rules belong to a bucket and to nothing else.
-    if (object && (r.has_query("cors") || r.has_query("lifecycle")))
+    // CORS and lifecycle rules and a policy belong to a bucket and to nothing else.
+    if (object && (r.has_query("cors") || r.has_query("lifecycle") || r.has_query("policy") ||
+                   r.has_query("policyStatus")))
         return true;
     // A part number outside an upload asks a GET or HEAD for one part of a finished object.
     if (r.has_query("partNumber") && !r.has_query("uploadId") && (!object || (r.method != "GET" && r.method != "HEAD")))
@@ -207,6 +208,9 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
         cors_actual(c);
 
     auth_verdict v = m_auth->authorize(rv);
+    // A bucket's policy may let in a request that carries no credentials, and may refuse one that does.
+    if (m_store.any_policy() && (v.allowed || v.anonymous))
+        apply_policy(c, rv, v);
     if (!v.allowed)
     {
         deny_request(c, v.error.code.empty() ? make_error("AccessDenied") : v.error);
@@ -292,6 +296,26 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_put_cors(c);
         else if (m == "DELETE")
             op_delete_cors(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (bkt && q.has_query("policyStatus"))
+    {
+        if (m == "GET")
+            op_get_policy_status(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (bkt && q.has_query("policy"))
+    {
+        if (m == "GET")
+            op_get_policy(c);
+        else if (m == "PUT")
+            op_put_policy(c);
+        else if (m == "DELETE")
+            op_delete_policy(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
         return;

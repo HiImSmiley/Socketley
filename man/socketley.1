@@ -6177,7 +6177,9 @@ checksum checked; one signed in chunks
 because nobody is there to verify the signatures. Without
 .B \-\-anonymous
 a request with no credentials is
-.BR "403 AccessDenied" .
+.B "403 AccessDenied"
+unless its bucket's policy allows it, as described under
+.BR "Bucket policy" .
 .TP
 .BI \-\-mpu\-expire " duration"
 Abort a multipart upload that has been open this long (\fB24h\fR, \fB7d\fR; a bare
@@ -6391,9 +6393,25 @@ DeleteBucketLifecycle	DELETE /bucket?lifecycle	T{
 .ad l
 204 whether or not the bucket had rules.
 T}
+PutBucketPolicy	PUT /bucket?policy	T{
+.ad l
+A JSON policy of at most 20 KiB, replacing the one before; 204; MalformedPolicy (400) for one this runtime cannot honour exactly. See \fBBucket policy\fR below.
+T}
+GetBucketPolicy	GET /bucket?policy	T{
+.ad l
+The document as it was given; NoSuchBucketPolicy (404) when there is none.
+T}
+DeleteBucketPolicy	DELETE /bucket?policy	T{
+.ad l
+204 whether or not there was one.
+T}
+GetBucketPolicyStatus	GET /bucket?policyStatus	T{
+.ad l
+IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy (404) when there is none.
+T}
 .TE
 .PP
-Anything else \(em ACLs, versioning, a bucket's own tags, policies \(em is answered
+Anything else \(em ACLs, versioning, a bucket's own tags \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -6429,7 +6447,8 @@ The answers are S3's:
 .B RequestTimeTooSkewed
 (403) for a request dated more than fifteen minutes from the runtime's clock,
 .B AccessDenied
-(403) for an expired presigned URL or none at all, and
+(403) for an expired presigned URL, for none at all where no bucket policy allows
+the request, and for a request a bucket policy denies, and
 .B AuthorizationHeaderMalformed
 (400). A denied request is answered before its body is read and the connection is
 closed.
@@ -6770,6 +6789,171 @@ and each pass that removed anything says so in the log.
 is a test aid: read by the sweep alone, it makes a lifecycle day that many
 seconds (at most 86400) so a rule can be watched taking effect, with passes as
 often as every second. It is never meant for a runtime holding data anyone wants.
+.SS Bucket policy
+A bucket's policy is S3's JSON document, which can make a bucket or a part of it
+readable by anyone \(em static assets, downloads \(em while every other request to
+the runtime still has to be signed, and can refuse a signed key what it would
+otherwise be let do. For example, anyone may read the objects under
+.BR public/ :
+.PP
+.nf
+{
+  "Version": "2012\-10\-17",
+  "Statement": [{
+    "Sid": "PublicRead",
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::media/public/*"
+  }]
+}
+.fi
+.PP
+What it takes is the part of S3's grammar this runtime can honour exactly, and a
+document asking for anything else is refused as
+.B "400 MalformedPolicy"
+naming what it could not take, never accepted to do less than it says:
+.TP
+.B Version
+2012\-10\-17 or 2008\-10\-17, or none;
+.B Id
+any string.
+.TP
+.B Statement
+one statement or a list of them, each with an optional
+.B Sid
+(unique),
+.B Effect
+.RB ( Allow
+or
+.BR Deny ),
+.BR Principal ,
+.BR Action ,
+.B Resource
+and an optional
+.BR Condition .
+.BR NotPrincipal ,
+.B NotAction
+and
+.B NotResource
+are refused.
+.TP
+.B Principal
+.B *
+or
+.B {"AWS": "*"}
+for everyone, signed or not; or
+.B {"AWS": [...]}
+naming this runtime's access keys, each as the key itself, as
+.BI arn:aws:iam:: account :user/ key
+(the user name is the access key), or as
+.BI arn:aws:iam:: account :root
+for every key. Service, federated and canonical\-user principals and roles are refused.
+.TP
+.B Action
+one or a list of
+.BI s3: Name
+with
+.B *
+and
+.B ?
+wildcards, compared without case, or
+.B *
+alone. A name must be one of S3's, and those this runtime does not implement
+(s3:GetObjectVersion, s3:PutObjectAcl, .\|.\|.) are taken and match nothing.
+GetObject covers GetObject and HeadObject, by part too; PutObject covers PutObject,
+CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
+CompleteMultipartUpload; DeleteObject covers DeleteObject and DeleteObjects; ListBucket
+covers ListObjects, ListObjectsV2 and HeadBucket; PutBucketCORS and
+PutLifecycleConfiguration cover the deletes of those configurations; the rest are
+named as S3 names them (GetObjectTagging, AbortMultipartUpload,
+ListMultipartUploadParts, ListBucketMultipartUploads, GetBucketLocation, CreateBucket,
+DeleteBucket, .\|.\|.).
+.TP
+.B Resource
+one or a list of
+.BI arn:aws:s3::: bucket
+for the bucket itself and
+.BI arn:aws:s3::: bucket / pattern
+for its objects, with
+.B *
+for any run of characters and
+.B ?
+for one; the bucket must be this one, and a statement must have an action that applies
+to one of its resources (an object action to a key pattern, a bucket action to the
+bucket). Policy variables are refused.
+.TP
+.B Condition
+.B IpAddress
+and
+.B NotIpAddress
+on
+.B aws:SourceIp
+(addresses and CIDR ranges, IPv4 and IPv6, an IPv4 address mapped into IPv6 being
+the IPv4 address), and
+.B Bool
+on
+.B aws:SecureTransport
+(whether the connection is TLS). Every condition of a statement must hold. A client
+on a unix socket has no address, so it is in no range: an
+.B IpAddress
+never holds for it and a
+.B NotIpAddress
+always does. Any other operator or key is refused.
+.PP
+A request to a bucket with a policy is authenticated as it always is, and then
+judged: a statement applies when its action, principal and resource match the
+request and its conditions hold, an applying
+.B Deny
+refuses the request with
+.B "403 AccessDenied"
+whatever else applies, and an applying
+.B Allow
+lets in a request that carries no credentials, on a runtime without
+.BR \-\-anonymous .
+A signed request is never let in by a policy, since every key of the runtime may
+already do everything, and one whose signature is wrong is refused as before and
+never taken for an anonymous request; a presigned URL is a signed request. On a
+runtime with
+.B \-\-anonymous
+every request without credentials is already let in, and a
+.B Deny
+for
+.B *
+still refuses it. A copy is also judged as a GetObject of its source, by the
+source bucket's policy, so an anonymous copy needs both. DeleteObjects names its
+keys in the body, so it is judged over every key of the bucket: a
+.B Deny
+over any key refuses it, and only an
+.B Allow
+over
+.BI arn:aws:s3::: bucket /*
+lets an anonymous one in. A request a policy refuses is answered before its body
+is read. The policy's own four operations answer to the credentials alone, so a
+policy can neither let an anonymous request read or change it nor lock the keys out
+of removing it. A request let in by a policy is still the Lua
+.B on_request
+hook's to refuse (see
+.BR Lua ),
+which never sees one the policy refused.
+.PP
+The document is compiled when it is set, and again when a shard starts, so a
+request is judged against compiled statements: a runtime none of whose buckets has
+a policy looks nothing up, a signed request to a bucket whose policy has no
+.B Deny
+looks up the bucket and nothing more, and only a statement that compares
+.B aws:SourceIp
+asks the kernel for the client's address, once per connection. An anonymous GET
+of a key that is not there under an allowed prefix is
+.B "404 NoSuchKey"
+rather than S3's 403 for a caller without ListBucket.
+.PP
+The policy is kept in
+.IB dir / bucket /policy ,
+written beside it, synced and renamed over it, so it survives a restart and a
+crash leaves the old one or the new; it goes with the bucket, and with
+.B \-\-shards
+shard 0 writes it and every shard has it before the request is answered.
 .SS How objects are stored
 An object is one file at
 .IB dir / bucket /data/ ab / sha256(key)
@@ -6954,7 +7138,7 @@ reached fails the listing with a 500 rather than shortening it.
 .PP
 Buckets are made and dropped by shard 0 and told to the others before it answers;
 a bucket is dropped only when every shard agrees it holds nothing and is idle. A
-bucket's CORS and lifecycle configurations are written by shard 0 the same way, one change of a bucket at a time, whichever
+bucket's CORS and lifecycle configurations and its policy are written by shard 0 the same way, one change of a bucket at a time, whichever
 shard took the request, and each shard sweeps the keys it owns.
 Temporary files are named for the shard that wrote them, so a shard restarted by
 the supervisor removes only its own. A shard killed between a rename and its
@@ -7086,7 +7270,9 @@ A script attached with
 may define three hooks on a storage runtime.
 .TP
 .B on_request(req) \(-> nil | true | false | string | table
-Called for every request after it is authenticated and before anything is done,
+Called for every request after it is authenticated and judged by its bucket's
+policy, and before anything is done, so it sees only requests both let through and
+can refuse any of them but let in none they refused; it runs
 on a coroutine, so it may wait for another runtime (see
 .B socketley.storage
 below); the connection is not read from until it answers, so a refused upload is
@@ -7106,7 +7292,8 @@ and
 (as sent),
 .BR host ,
 .BR request_id ,
-.BR principal ,
+.B principal
+(the access key, empty for a request with no credentials),
 .B tls
 (boolean),
 .B client

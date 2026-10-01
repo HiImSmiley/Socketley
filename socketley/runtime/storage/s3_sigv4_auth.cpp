@@ -183,6 +183,7 @@ private:
 auth_verdict anonymous_authenticator::authorize(const request_view& req)
 {
     auth_verdict v;
+    v.anonymous = true;
     v.hook = unsigned_trailer_hook(req);
     return v;
 }
@@ -382,6 +383,7 @@ auth_verdict sigv4_authenticator::authorize(const request_view& req)
 
     auth_verdict v;
     const bool attempted = !req.header("authorization").empty() || query_names(req.raw_query, "X-Amz-Algorithm");
+    v.anonymous = !attempted;
     if (!attempted && m_cfg.anonymous)
     {
         v.hook = unsigned_trailer_hook(req);

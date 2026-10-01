@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "bucket_policy.h"
 #include "checksum.h"
 #include "multipart.h"
 #include "object_store.h"
@@ -321,6 +322,9 @@ struct conn
     std::string principal;
     // The CORS header lines every answer to this request carries, empty unless a rule allows its origin.
     std::string cors_head;
+    // The peer's address as a policy condition compares it, read the first time one does.
+    client_ip   ip;
+    bool        ip_known{false};
 };
 
 // An object's metadata as a script sees it: the user metadata without its
@@ -550,6 +554,13 @@ public:
     void op_preflight(const std::shared_ptr<conn>& c);
     // Fills the connection's CORS lines for an actual request from an origin a rule of its bucket allows.
     void cors_actual(const std::shared_ptr<conn>& c);
+    // PutBucketPolicy, GetBucketPolicy, DeleteBucketPolicy and GetBucketPolicyStatus, in storage_policy.cpp.
+    void op_put_policy(const std::shared_ptr<conn>& c);
+    void op_get_policy(const std::shared_ptr<conn>& c);
+    void op_delete_policy(const std::shared_ptr<conn>& c);
+    void op_get_policy_status(const std::shared_ptr<conn>& c);
+    // Judges an authenticated or anonymous request by the policies of the buckets it touches, changing `v`.
+    void apply_policy(const std::shared_ptr<conn>& c, const request_view& rv, auth_verdict& v);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                       bool replace, const object_meta& src_meta);

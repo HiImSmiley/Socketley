@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 
+#include "bucket_policy.h"
 #include "disk_chain.h"
 #include "lifecycle.h"
 #include "s3_cors.h"
@@ -2572,7 +2573,7 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle})
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy})
         if (take_doc(bb, kind, {})) {}
     hot_drop_bucket(name);
     m_buckets.erase(it);
@@ -2646,11 +2647,24 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 
 // ─── Bucket configuration documents ─────────────────────────────────────────
 
-static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes);
+static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes && policy_max_bytes <= doc_max_bytes);
 
 const char* object_store::doc_file(bucket_doc kind)
 {
-    return kind == bucket_doc::cors ? "cors" : "lifecycle";
+    switch (kind)
+    {
+        case bucket_doc::cors:      return "cors";
+        case bucket_doc::lifecycle: return "lifecycle";
+        case bucket_doc::policy:    return "policy";
+    }
+    return "?";
+}
+
+const bucket_policy* object_store::policy(std::string_view name) const
+{
+    // Kept while the bucket is being dropped, so its denials hold until it is gone.
+    const bucket* b = find_bucket(name);
+    return b ? b->policy.get() : nullptr;
 }
 
 const cors_config* object_store::bucket_cors(std::string_view name) const
@@ -2679,6 +2693,19 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
         }
         m_cors_buckets += (c != nullptr) - (b.cors != nullptr);
         b.cors = std::move(c);
+        return true;
+    }
+    if (kind == bucket_doc::policy)
+    {
+        std::shared_ptr<bucket_policy> p;
+        if (!xml.empty())
+        {
+            p = std::make_shared<bucket_policy>();
+            if (!bucket_policy::compile(xml, b.name, *p, err))
+                return false;
+        }
+        m_policy_buckets += (p != nullptr) - (b.policy != nullptr);
+        b.policy = std::move(p);
         return true;
     }
     std::shared_ptr<lifecycle_config> l;

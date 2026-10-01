@@ -179,8 +179,8 @@ expect_err("a Range past the end is InvalidRange 416",
 resp = expect_err("PutObjectAcl is NotImplemented 501",
                   lambda: s3.put_object_acl(Bucket="err-bucket", Key="present", ACL="private"),
                   "NotImplemented", 501)
-expect_err("GetBucketPolicy is NotImplemented or NoSuchBucketPolicy",
-           lambda: s3.get_bucket_policy(Bucket="err-bucket"), "NotImplemented", 501)
+expect_err("GetBucketPolicy on a bucket without one is NoSuchBucketPolicy 404",
+           lambda: s3.get_bucket_policy(Bucket="err-bucket"), "NoSuchBucketPolicy", 404)
 st_, hd_, body_ = raw("PUT", "/err-bucket/present", body=b"x", headers={"If-None-Match": "*"})
 check("PutObject with If-None-Match: * on an existing key is PreconditionFailed 412",
       st_ == 412 and b"<Code>PreconditionFailed</Code>" in body_, (st_, body_[:200]))

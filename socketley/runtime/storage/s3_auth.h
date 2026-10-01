@@ -100,6 +100,8 @@ struct auth_verdict
     s3_error                    error;
     // Who the request was made by, for the log and for scripts.
     std::string                 principal;
+    // The request carried no credentials, which a bucket policy may still let in.
+    bool                        anonymous{false};
     // Present when the body has to be decoded or verified on its way in.
     std::unique_ptr<body_hook>  hook;
 };

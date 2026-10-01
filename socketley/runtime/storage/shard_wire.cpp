@@ -160,7 +160,7 @@ bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string
 {
     bytes::reader r(payload);
     uint8_t k = 0;
-    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::lifecycle) ||
+    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::policy) ||
         !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes))
         return false;
     kind = static_cast<bucket_doc>(k);
