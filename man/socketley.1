@@ -6731,7 +6731,8 @@ a listing leaves the key out. A DELETE with a version id removes that version fo
 good: the marker, which undeletes the key, or the latest, after which the version
 behind it is the latest. An object written before versioning was enabled is the
 .B null
-version.
+version, which a GET, HEAD or GetObjectTagging of it names with
+.BR "x\-amz\-version\-id: null" .
 .B Suspended
 keeps the versions there are and writes the
 .B null
@@ -6756,18 +6757,37 @@ are made with the configuration, which shard 0 changes like the CORS and lifecyc
 documents (see
 .BR "Bucket policy" );
 the owner of a key writes nothing to it while unsure of the configuration, and a
-write through another shard is then answered 503. Each version's header carries its id and its order among the key's
-versions, written there by the key's owner, which answers only once the file, the
-link and both directories are synced; a versioned put therefore takes a header
-write and up to two syncs more than an unversioned one, and never a file of the pool. A
-version removed for good is unlinked, or for the latest the version behind it is
-renamed over it. The journal still indexes the latest objects only, so a bucket
-with
+write through another shard is then answered 503. Each version's header carries
+its id and its order among the key's versions. The shard a body lands on writes
+them into its header before the body is synced, and the key's owner keeps them
+unless a newer version of the key or a change of the bucket's versioning came
+first \(em including one it learns of only by reading the configuration again
+before the write \(em when it writes the header again with its own.
+A versioned put takes a file of the pool as an unversioned one does: it is answered
+at its rename, once the link of the version it replaces and that link's directory
+are synced, and the syncs of its own directory and of
+.B pool/
+follow the answer. A crash that takes the rename leaves the put whole in
+.BR pool/ ,
+and the next start links the version it would have replaced before moving it into
+place \(em also when the bucket was versioned only after the put was answered. A
+versioned put therefore waits for one sync more than an unversioned one when it
+replaces a version, and for none more when its key is new. A version removed for
+good is unlinked, or for the latest the version behind it is renamed over it.
+.PP
+The journal records each key's other versions and delete markers beside its
+latest object, so a start after a clean stop reads a versioned bucket from its
+journal as it does any other; a journal written before it did is read from the
+files once and written again. Any other start reads
 .B versions/
-is read from its files at every start, clean or not: the headers give each key's
-versions in order and its delete markers, a version left under both its names by a
-crash between the link and the rename is kept once (as the latest), and a key whose
-latest file is gone is given its newest version back. With
+in the same parallel walk as
+.BR data/ :
+the headers give each key's versions in order and its delete markers, a version
+left under both its names by a crash between the link and the rename is kept once
+(as the latest), and a key whose latest file is gone is given its newest version
+back. 100,000 keys of three versions each start in 0.19 s after a clean stop
+(1.3 s when every start read the files) and in 0.86 s after a kill (1.3 s), with a
+warm cache on four CPUs. With
 .BR \-\-shards ,
 all versions of a key are its owner's; a shard that does not own the key reads a
 version by its id from the file where it is, looking at the other place once if a
@@ -7376,7 +7396,10 @@ reports
 .BR zero_copy_bytes ,
 .BR journal_records ,
 .BR journal_compactions ,
-.BR fsyncs ,
+.B fsyncs
+(of files and directories alike),
+.B start_files_read
+(object and version files whose headers the last start read: 0 when every journal was trusted),
 .BR multipart_uploads ,
 .BR multipart_parts ,
 .BR multipart_bytes ,
