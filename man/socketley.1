@@ -6422,14 +6422,38 @@ to its number, so it is whole or not there; an upload is created, and its
 directory synced, before its id is given out. A part still arriving when the
 worker is killed leaves nothing behind. The upload id is 32 hex digits.
 .PP
-CompleteMultipartUpload checks the list against what was uploaded, then writes
-the object's header and copies the parts into a temporary file a megabyte at a
-time on the ring, syncs it and commits it exactly as a put is committed
-(rename, directory sync; the journal record behind the answer), so a crash during assembly leaves the upload
-intact and no object; only then are the parts removed. The ETag is the md5 of the
-parts' md5s with \fB\-N\fR, as S3's. The bytes pass through the process because
-io_uring has no copy between two files; the loop never blocks on the disk, and
-the worker holds two one\-megabyte buffers for it whatever the object's size.
+Most clients cut an object into parts of one size, and a part whose place in the
+object is known when it starts is written there: the upload also holds a
+.B data
+file with room for the object's header at the front, the first part of at least
+5 MiB fixes the part size, and part
+.I n
+of that size (or a smaller last part) goes into
+.B data
+at its offset, its numbered file then holding only a header that names the place.
+The shard that owns the upload hands each place out once, so a part sent again, a
+part of another size and a part sent by UploadPartCopy get files of their own as
+above.
+.PP
+CompleteMultipartUpload checks the list against what was uploaded. When the parts
+listed are exactly 1 to N, all in place and of the fixed size but the last, it
+writes the object's header in front of them, syncs
+.B data
+and commits it as the object itself, so the bytes are written to the disk once.
+Otherwise it writes the header and copies the parts into a temporary file a
+megabyte at a time on the ring, the placed ones read from
+.BR data ,
+syncs it and commits it; an upload that was open across a restart, or whose
+copy\-free completion failed, always copies. Either way the commit is a put's
+(rename, directory sync; the journal record behind the answer), so a crash during
+completion leaves the upload intact and no object; only then are the parts removed.
+The ETag is the md5 of the parts' md5s with \fB\-N\fR, as S3's. A copy passes the
+bytes through the process because io_uring has no copy between two files; the loop
+never blocks on the disk, and the worker holds two one\-megabyte buffers for it
+whatever the object's size. warp, the AWS CLI and boto3 upload anything above 8 to
+16 MiB this way, so this is the path of every large upload: on a 4\-vCPU VM,
+64 MiB puts at four connections went from 3.2 to 6.5 per second when the copy
+went, and 256 MiB puts at two from 0.90 to 1.81.
 An upload is kept until it is completed or aborted unless
 .B \-\-mpu\-expire
 is set; its parts count against
@@ -6544,6 +6568,20 @@ per second) and at 32 connections 1.7x with one shard and 3.6x with four, a 1 Mi
 GET 2x and 4x, a 64 MiB GET 1.4x and 3.8x, each at a tenth or less of the
 CPU. A 64 MiB put is 1.3x at one connection and 1.1x at 32 (about 600 MiB/s, which
 is what this disk takes), and 64 MiB mixed loads are level with MinIO.
+.PP
+On a second machine, a 4\-vCPU VM (AMD EPYC, Debian 12, kernel 7.2, warp 1.3.1 on
+the same four CPUs, one shard, three alternating passes), against the same MinIO:
+4 KiB GET 3.0x at one connection and 3.9x at 32, HEAD 3.9x, 1 MiB GET 2.5x,
+64 MiB GET 1.8x, listing 3.1x, multi\-object delete 2.7x, 4 KiB put 1.7x at one
+connection and 2.5x at 32 (about 900 and 3000 per second, this disk's sync being
+fast), 1 MiB put 1.2x, 64 MiB put level (6.5 against 6.6 per second) and mixed
+1 MiB loads 1.6x, with less CPU per request in every row: about nine tenths of
+MinIO's for large puts, a third to a half for small ones, a seventeenth for reads. Four
+shards are slower than one there, since the client shares the four CPUs; shards are
+for a machine with cores to spare. From a client 31 ms away over the internet
+(k6, 32 connections), 4 KiB GETs and puts run at what the round trip allows for
+both servers (about 800 to 880 per second), with socketley's p99 at 45 to 47 ms
+against MinIO's 48 to 147 and about 2.6x less CPU per put.
 .PP
 Small puts wait for the disk and for little else, so they move with it. A put of
 up to 1 MiB waits for one sync, of its pooled file, where it waited for two, the

@@ -111,6 +111,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   threshold of 64 KiB was measured and left (below it a read and a write are as
   fast, at 256 KiB splicing is 3.8x).
 
+  A multipart upload whose parts are of one size, as warp, the AWS CLI and boto3
+  send anything above 8 to 16 MiB, is written into the object's own file part by
+  part and completed by writing the header in front, where the parts used to be
+  copied into a new file: the worker writes 64.1 MiB for a 64 MiB object instead
+  of 128.0, and on a 4-vCPU VM (EPYC, kernel 7.2) 64 MiB puts at four connections
+  went from 3.2 to 6.5 per second (MinIO 6.6) and 256 MiB puts at two from 0.90
+  to 1.81 (MinIO 1.79). The storage worker no longer spins on the ring before it
+  sleeps, which bought nothing for requests that wait on the disk: on the same VM,
+  throughput is unchanged and CPU per request 1 to 22% lower. The same VM against
+  MinIO, one shard, three alternating passes, warp on the same four CPUs: 4 KiB
+  GET 3.0x at one connection and 3.9x at 32, HEAD 3.9x, 1 MiB GET 2.5x, 64 MiB
+  GET 1.8x, listing 3.1x, multi-object delete 2.7x, 4 KiB put 1.7x and 2.5x (about
+  900 and 3000 per second), 1 MiB put 1.2x, 64 MiB put level and mixed 1 MiB
+  1.6x, with less CPU per request in every row. From a client 31 ms away over the
+  internet (k6, 32 connections), 4 KiB GETs and puts run at what the round trip
+  allows for both (about 800 to 880 per second), socketley's p99 45 to 47 ms
+  against MinIO's 48 to 147.
+
 - **A storage runtime shares what the other runtimes have, and can be scripted.**
   `--tls --cert --key [--ca]` terminate TLS on the listener (sessions are made
   before the first byte is read, so a plaintext client is refused, certificates
