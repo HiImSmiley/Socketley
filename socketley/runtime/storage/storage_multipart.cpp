@@ -181,9 +181,9 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     uint32_t number = 0;
     if (!part_number_of(c, number))
         return;
-    std::string src_bucket, src_key;
+    std::string src_bucket, src_key, src_version;
     s3_error    err;
-    if (!parse_copy_source(r.header("x-amz-copy-source"), src_bucket, src_key, err))
+    if (!parse_copy_source(r.header("x-amz-copy-source"), src_bucket, src_key, err, &src_version))
     {
         send_error(c, err, false, "ArgumentName", "x-amz-copy-source");
         return;
@@ -195,14 +195,13 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     }
 
     std::weak_ptr<conn> weak = c;
-    with_open_upload(c, 0, [this, weak, number, src_bucket, src_key](checksum_algo algo, part_place)
+    with_open_upload(c, 0, [this, weak, number, src_bucket, src_key, src_version](checksum_algo algo, part_place)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
         // The source may be another shard's, whose header is then read from its file.
-        m_store.stat_object(src_bucket, src_key,
-            [this, weak, number, src_bucket, src_key, algo](st s, const object_meta& sm)
+        auto go = [this, weak, number, src_bucket, src_key, src_version, algo](st s, const object_meta& sm)
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -212,14 +211,18 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
                     send_error_st(c2, s);
                     return;
                 }
-                op_upload_part_copy_from(c2, number, algo, src_bucket, src_key, sm);
-            });
+                op_upload_part_copy_from(c2, number, algo, src_bucket, src_key, src_version, sm);
+            };
+        if (src_version.empty())
+            m_store.stat_object(src_bucket, src_key, std::move(go));
+        else
+            m_store.stat_version(src_bucket, src_key, src_version, std::move(go));
     });
 }
 
 void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
                                            const std::string& src_bucket, const std::string& src_key,
-                                           const object_meta& src_meta)
+                                           const std::string& src_version, const object_meta& src_meta)
 {
     s3_request& r = c->req;
     const object_meta* src = &src_meta;
@@ -402,7 +405,7 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     });
 
     // The source's file, opened with its header read so the bytes are found.
-    m_store.open_object(src_bucket, src_key, 0, [this, weak, first](open_result o)
+    auto opened = [this, weak, first](open_result o)
     {
         auto p = weak.lock();
         if (!p || p->ended)
@@ -419,7 +422,11 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
         p->fd  = o.fd;
         p->off = o.data_off + first;
         p->pump();
-    });
+    };
+    if (src_version.empty())
+        m_store.open_object(src_bucket, src_key, 0, std::move(opened));
+    else
+        m_store.open_version(src_bucket, src_key, src_version, 0, std::move(opened));
 }
 
 // ─── CompleteMultipartUpload ────────────────────────────────────────────────
@@ -475,6 +482,8 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
             }();
             response resp;
             resp.headers.emplace_back("Content-Type", "application/xml");
+            if (has_version(res.meta))
+                resp.headers.emplace_back("x-amz-version-id", version_of(res.meta).id);
             resp.body = complete_multipart_xml("http://" + host + "/" + bucket + "/" + key, bucket, key,
                                                res.meta.etag(), algo, res.checksum_b64);
             send_response(cc, std::move(resp));

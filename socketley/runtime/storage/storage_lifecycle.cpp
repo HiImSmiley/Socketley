@@ -217,25 +217,66 @@ bool storage_run::lifecycle_walk(lifecycle_pass& p)
             return true;
         }
 
-        while (p.rule < p.cfg->rules.size() && !p.cfg->rules[p.rule].expires())
-            ++p.rule;
         if (p.rule >= p.cfg->rules.size())
         {
             p.cfg.reset();
             ++p.bucket;
             continue;
         }
-
-        list_query q;
-        q.prefix     = p.cfg->rules[p.rule].prefix;
-        q.max_keys   = lc_page;
-        q.has_resume = p.has_resume;
-        q.resume_at  = p.resume;
-        due_finder finder(p, name, now, m_lc_day_ms);
-        const st s = m_store.list_walk(name, q, finder);
-        p.has_resume = s == st::ok && finder.more();
+        const lifecycle_rule& rule = p.cfg->rules[p.rule];
+        auto next_phase = [&p]()
+        {
+            p.has_resume = false;
+            p.resume.clear();
+            if (p.versions_phase)
+                ++p.rule;
+            p.versions_phase = !p.versions_phase;
+        };
+        if (!p.versions_phase)
+        {
+            if (!rule.expires())
+            {
+                next_phase();
+                continue;
+            }
+            list_query q;
+            q.prefix     = rule.prefix;
+            q.max_keys   = lc_page;
+            q.has_resume = p.has_resume;
+            q.resume_at  = p.resume;
+            due_finder finder(p, name, now, m_lc_day_ms);
+            const st s = m_store.list_walk(name, q, finder);
+            p.has_resume = s == st::ok && finder.more();
+            if (!p.has_resume)
+                next_phase();
+            return true;
+        }
+        if (!rule.versions())
+        {
+            next_phase();
+            continue;
+        }
+        // A version is noncurrent from the moment the one after it was made, and a marker with nothing behind it is spent.
+        const std::string more = m_store.walk_versioned_keys(name, rule.prefix, p.has_resume ? p.resume : std::string{},
+            lc_page, [&](const std::string& key, const object_meta* latest, const std::vector<object_meta>& versions)
+            {
+                p.scanned += versions.size() + 1;
+                const bool marker_latest = !latest && !versions.empty() && is_delete_marker(versions.front());
+                if (marker_latest && versions.size() == 1 && rule.delete_marker == 1)
+                    p.due.push_back({name, key, p.cfg, p.rule, false, version_of(versions.front()).id});
+                const object_meta* newer = latest;
+                for (const object_meta& v : versions)
+                {
+                    if (newer && !is_delete_marker(v) &&
+                        lifecycle_noncurrent_due(rule, key, v, newer->mtime_ms, now, m_lc_day_ms))
+                        p.due.push_back({name, key, p.cfg, p.rule, false, version_of(v).id});
+                    newer = &v;
+                }
+            });
+        p.has_resume = !more.empty();
+        p.resume     = more;
         if (!p.has_resume)
-            ++p.rule;
+            next_phase();
         return true;
     }
     return false;
@@ -272,6 +313,33 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
     ++p.inflight;
     const std::string bucket = d.bucket;
     const std::string key    = d.key;
+    if (!d.version_id.empty())
+    {
+        // Asked under the key's lane: the rules are still the bucket's and the version is still behind a newer one, or a lone marker.
+        auto still = [this, d](const object_meta& m)
+        {
+            if (m_store.lifecycle(d.bucket) != d.cfg)
+                return false;
+            const object_meta* marker = m_store.latest_marker(d.bucket, d.key);
+            if (is_delete_marker(m))
+                return marker == &m && m_store.find(d.bucket, d.key) == nullptr;
+            return m_store.find(d.bucket, d.key) != &m;
+        };
+        m_store.remove_version_local(bucket, key, d.version_id, [this, id, bucket, key](remove_result r)
+        {
+            if (r.status == st::ok && r.existed)
+            {
+                ++m_c.lifecycle_expired;
+                if (m_lc && m_lc->id == id)
+                    ++m_lc->expired;
+            }
+            else if (r.status != st::ok && r.status != st::no_such_bucket)
+                LOG_WARN(("storage: lifecycle could not remove a version of " + bucket + "/" + key + ": " +
+                          status_name(r.status)).c_str());
+            lifecycle_done(id);
+        }, std::move(still));
+        return;
+    }
     // Asked under the key's lane, so an object written again or retagged after the walk saw it is judged as it is.
     auto still_due = [this, d = std::move(d)](const object_meta& m)
     {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstring>
+#include <cstdio>
 
 #include "../../shared/raft_storage.h"
 
@@ -175,6 +176,95 @@ std::string encode_part_sizes(const std::vector<uint64_t>& sizes)
             return {};
     }
     return out;
+}
+
+namespace
+{
+
+// Sixteen hex digits of order, 'm' or 'v', then the id.
+constexpr size_t version_seq_digits = 16;
+
+const std::string* version_value(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == version_extra)
+            return &v;
+    return nullptr;
+}
+
+}   // namespace
+
+bool valid_version_id(std::string_view id)
+{
+    if (id == "null")
+        return true;
+    if (id.size() != 32)
+        return false;
+    for (char c : id)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+version_tag version_of(const object_meta& m)
+{
+    version_tag t;
+    const std::string* v = version_value(m);
+    if (v && v->size() > version_seq_digits + 1 && ((*v)[version_seq_digits] == 'm' || (*v)[version_seq_digits] == 'v'))
+    {
+        uint64_t seq = 0;
+        const auto r = std::from_chars(v->data(), v->data() + version_seq_digits, seq, 16);
+        const std::string_view id = std::string_view(*v).substr(version_seq_digits + 1);
+        if (r.ec == std::errc{} && r.ptr == v->data() + version_seq_digits && valid_version_id(id))
+        {
+            t.seq    = seq;
+            t.id     = std::string(id);
+            t.marker = (*v)[version_seq_digits] == 'm';
+            return t;
+        }
+    }
+    t.seq = m.mtime_ms > 0 ? static_cast<uint64_t>(m.mtime_ms) * 1000 : 0;
+    t.id  = "null";
+    return t;
+}
+
+bool has_version(const object_meta& m)
+{
+    return version_value(m) != nullptr;
+}
+
+bool is_delete_marker(const object_meta& m)
+{
+    const std::string* v = version_value(m);
+    return v && v->size() > version_seq_digits && (*v)[version_seq_digits] == 'm';
+}
+
+void set_version_extra(object_meta& m, const version_tag& v)
+{
+    char seq[version_seq_digits + 1];
+    std::snprintf(seq, sizeof seq, "%016llx", static_cast<unsigned long long>(v.seq));
+    std::string value(seq, version_seq_digits);
+    value.push_back(v.marker ? 'm' : 'v');
+    value += v.id;
+    clear_version_extra(m);
+    m.extra.emplace_back(std::string(version_extra), std::move(value));
+}
+
+void clear_version_extra(object_meta& m)
+{
+    std::erase_if(m.extra, [](const auto& e) { return e.first == version_extra; });
+}
+
+std::string version_rel_path(std::string_view key, std::string_view id)
+{
+    const std::string h = key_hash(key);
+    std::string p = "versions/";
+    p.append(h, 0, 2);
+    p.push_back('/');
+    p.append(h);
+    p.push_back('.');
+    p.append(id);
+    return p;
 }
 
 part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len)

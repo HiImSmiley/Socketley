@@ -79,53 +79,54 @@ void shard_node::commit(uint32_t owner, commit_request req, std::function<void(p
     {
         if (!*alive)
             return;
-        st s = st::io_error;
-        if (!ok || !wire::decode_status(reply, s))
+        put_result r;
+        if (!ok || !wire::decode_committed(reply, r))
         {
             ++m_c.peer_failures;
-            s = st::io_error;
+            r = put_result{st::io_error, {}};
         }
-        cb({s, {}});
+        cb(std::move(r));
     });
 }
 
-void shard_node::remove(uint32_t owner, std::string bucket, std::string key,
-                        std::function<void(st, bool)> cb)
+void shard_node::remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                        std::function<void(remove_result)> cb)
 {
     ++m_c.removes_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_remove(bucket, key), [this, alive, cb](bool ok, std::string_view reply)
+    m_transport.call(owner, wire::encode_remove(bucket, key, version_id),
+                     [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
             return;
-        st s = st::io_error;
-        bool existed = false;
-        if (!ok || !wire::decode_removed(reply, s, existed))
+        remove_result r;
+        if (!ok || !wire::decode_removed(reply, r))
         {
             ++m_c.peer_failures;
-            s = st::io_error;
-            existed = false;
+            r = remove_result{st::io_error};
         }
-        cb(s, existed);
+        cb(std::move(r));
     });
 }
 
-void shard_node::set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
-                          std::function<void(st)> cb)
+void shard_node::set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                          std::string tags, std::function<void(st, std::string)> cb)
 {
     ++m_c.tags_out;
     auto alive = m_alive;
-    m_transport.call(owner, wire::encode_set_tags(bucket, key, tags), [this, alive, cb](bool ok, std::string_view reply)
+    m_transport.call(owner, wire::encode_set_tags(bucket, key, version_id, tags),
+                     [this, alive, cb](bool ok, std::string_view reply)
     {
         if (!*alive)
             return;
         st s = st::io_error;
-        if (!ok || !wire::decode_status(reply, s))
+        std::string id;
+        if (!ok || !wire::decode_tagged(reply, s, id))
         {
             ++m_c.peer_failures;
             s = st::io_error;
         }
-        cb(s);
+        cb(s, std::move(id));
     });
 }
 
@@ -335,6 +336,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::cors:      return "CORS configuration";
         case bucket_doc::lifecycle: return "lifecycle configuration";
         case bucket_doc::policy:    return "policy";
+        case bucket_doc::versioning: return "versioning configuration";
     }
     return "configuration";
 }
@@ -475,6 +477,53 @@ void shard_node::list(std::string_view bucket, const list_query& q, std::functio
                       return;
                   }
                   cb(st::ok, wire::merge_pages(std::move(g->pages), max_keys));
+              });
+}
+
+void shard_node::list_versions(std::string_view bucket, const version_query& q,
+                               std::function<void(st, version_page)> cb)
+{
+    version_page mine;
+    const st s = m_store.list_versions(bucket, q, mine);
+    if (s != st::ok || m_store.shards() <= 1 || q.max_keys == 0)
+    {
+        cb(s, std::move(mine));
+        return;
+    }
+    ++m_c.list_fanouts;
+    struct gather
+    {
+        std::vector<version_page> pages;
+        st                        failed{st::ok};
+    };
+    auto g = std::make_shared<gather>();
+    g->pages.push_back(std::move(mine));
+    const size_t max_keys = q.max_keys;
+    const std::string payload = wire::encode_list_versions(bucket, q);
+    each_peer([payload](uint32_t) { return payload; },
+              [g](uint32_t, bool ok, std::string_view reply)
+              {
+                  st ps = st::io_error;
+                  version_page p;
+                  if (!ok || !wire::decode_version_page(reply, ps, p))
+                      ps = st::io_error;
+                  if (ps != st::ok)
+                  {
+                      if (g->failed == st::ok)
+                          g->failed = ps;
+                      return;
+                  }
+                  g->pages.push_back(std::move(p));
+              },
+              [g, max_keys, cb]()
+              {
+                  // A shard that could not answer would make the listing quietly short.
+                  if (g->failed != st::ok)
+                  {
+                      cb(g->failed, {});
+                      return;
+                  }
+                  cb(st::ok, wire::merge_version_pages(std::move(g->pages), max_keys));
               });
 }
 
@@ -926,32 +975,48 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             }
             ++m_c.commits_in;
             m_store.commit_local(std::move(req),
-                [reply](put_result r) { reply(true, wire::encode_status(r.status)); });
+                [reply](put_result r) { reply(true, wire::encode_committed(r)); });
             return;
         }
         case wire::op::remove:
         {
-            std::string bucket, key;
-            if (!wire::decode_remove(payload, bucket, key))
+            std::string bucket, key, version_id;
+            if (!wire::decode_remove(payload, bucket, key, &version_id))
             {
                 reply(false, {});
                 return;
             }
             ++m_c.removes_in;
-            m_store.remove_local(bucket, key,
-                [reply](st s, bool existed) { reply(true, wire::encode_removed(s, existed)); });
+            m_store.remove_version_local(bucket, key, std::move(version_id),
+                [reply](remove_result r) { reply(true, wire::encode_removed(r)); });
             return;
         }
         case wire::op::set_tags:
         {
-            std::string bucket, key, tags;
-            if (!wire::decode_set_tags(payload, bucket, key, tags))
+            std::string bucket, key, version_id, tags;
+            if (!wire::decode_set_tags(payload, bucket, key, version_id, tags))
             {
                 reply(false, {});
                 return;
             }
             ++m_c.tags_in;
-            m_store.set_tags_local(bucket, key, std::move(tags), [reply](st s) { reply(true, wire::encode_status(s)); });
+            m_store.set_tags_local(bucket, key, std::move(version_id), std::move(tags),
+                                   [reply](st s, std::string id) { reply(true, wire::encode_tagged(s, id)); });
+            return;
+        }
+        case wire::op::list_versions:
+        {
+            std::string bucket;
+            version_query q;
+            if (!wire::decode_list_versions(payload, bucket, q))
+            {
+                reply(false, {});
+                return;
+            }
+            version_page page;
+            const st s = m_store.list_versions(bucket, q, page);
+            ++m_c.list_pages_served;
+            reply(true, wire::encode_version_page(s, page));
             return;
         }
         case wire::op::hot_drop:

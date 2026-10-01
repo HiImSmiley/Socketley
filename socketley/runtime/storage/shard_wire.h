@@ -52,6 +52,8 @@ enum class op : uint8_t
     doc_adopt     = 21,
     // An object's new tags, to the owner of its key.
     set_tags      = 22,
+    // A shard's part of ListObjectVersions.
+    list_versions = 23,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -60,11 +62,29 @@ bool request_op(std::string_view payload, op& out);
 std::string encode_commit(const commit_request& req);
 bool        decode_commit(std::string_view payload, commit_request& out);
 
-std::string encode_remove(std::string_view bucket, std::string_view key);
-bool        decode_remove(std::string_view payload, std::string& bucket, std::string& key);
+// The owner's answer to a commit: its status and the version it gave, empty for none.
+std::string encode_committed(const put_result& r);
+bool        decode_committed(std::string_view reply, put_result& r);
 
-std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view tags);
-bool        decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& tags);
+// A delete of the key, or of its version `version_id` when that is not empty.
+std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id = {});
+bool        decode_remove(std::string_view payload, std::string& bucket, std::string& key,
+                          std::string* version_id = nullptr);
+
+std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
+                            std::string_view tags);
+bool        decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& version_id,
+                            std::string& tags);
+// The answer to a tag change: its status and the version it changed.
+std::string encode_tagged(st s, std::string_view version_id);
+bool        decode_tagged(std::string_view reply, st& s, std::string& version_id);
+
+std::string encode_list_versions(std::string_view bucket, const version_query& q);
+bool        decode_list_versions(std::string_view payload, std::string& bucket, version_query& q);
+std::string encode_version_page(st s, const version_page& page);
+bool        decode_version_page(std::string_view reply, st& s, version_page& page);
+// The page one shard holding every key would give, from each shard's; shorter than max_keys when a shard's was cut short.
+version_page merge_version_pages(std::vector<version_page> pages, size_t max_keys);
 
 std::string encode_hot_drop(std::string_view bucket, std::string_view key);
 bool        decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key);
@@ -132,12 +152,11 @@ std::string encode_upload_list(const std::vector<upload_stub>& uploads);
 bool        decode_upload_list(std::string_view reply, std::vector<upload_stub>& uploads);
 
 std::string encode_status(st s);
-// The remove's answer says whether there was anything to remove, and a
-// bucket's creation when it was made.
-std::string encode_removed(st s, bool existed);
+// The remove's answer says what it removed or made, and a bucket's creation when it was made.
+std::string encode_removed(const remove_result& r);
 std::string encode_created(st s, int64_t created_ms);
 bool        decode_status(std::string_view reply, st& s);
-bool        decode_removed(std::string_view reply, st& s, bool& existed);
+bool        decode_removed(std::string_view reply, remove_result& r);
 bool        decode_created(std::string_view reply, st& s, int64_t& created_ms);
 
 // The most of a page that goes in one reply, so a shard's answer fits in what a

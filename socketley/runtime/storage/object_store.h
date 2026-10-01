@@ -12,6 +12,10 @@
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
 //   <dir>/<bucket>/policy             its bucket policy, likewise
+//   <dir>/<bucket>/versioning         its VersioningConfiguration, likewise
+//   <dir>/<bucket>/versions/ab/<hash>.<id>
+//                                     a noncurrent version of a key in a versioned bucket, made
+//                                     with its 256 directories before the first configuration
 //   <dir>/<bucket>/data/ab/<hash>     header + bytes, hash = sha256(key) in hex; the 256 ab
 //                                     directories are made and synced with the bucket
 //   <dir>/.trash/                     a deleted bucket, removed at the next start
@@ -52,6 +56,15 @@ enum class bucket_doc : uint8_t
     cors,
     lifecycle,
     policy,
+    versioning,
+};
+
+// A bucket's versioning: never configured, keeping every version, or writing the null version.
+enum class versioning : uint8_t
+{
+    off,
+    enabled,
+    suspended,
 };
 // The most a document may be, so it crosses to a sibling shard in one message.
 inline constexpr size_t doc_max_bytes = 4u << 20;
@@ -76,6 +89,10 @@ enum class st : uint8_t
     precondition_failed,
     io_error,
     cancelled,
+    // A version id the key has no version of.
+    no_such_version,
+    // The version asked for is a delete marker, which has no bytes or tags.
+    delete_marker,
 };
 
 const char* status_name(st s);
@@ -135,6 +152,44 @@ struct put_result
     object_meta meta;
 };
 
+// What a delete did: removed a version, or put a delete marker in front of the key.
+struct remove_result
+{
+    st          status{st::ok};
+    bool        existed{false};
+    // The version removed, or the one made, is a delete marker.
+    bool        marker{false};
+    // The version removed or made, empty when the bucket keeps none.
+    std::string version_id{};
+};
+
+// A query of ListObjectVersions.
+struct version_query
+{
+    std::string prefix;
+    std::string delimiter;
+    // Exclusive: what a previous page returned last, a key alone or a key and one of its versions.
+    std::string key_marker;
+    std::string version_marker;
+    size_t      max_keys{1000};
+};
+
+struct version_item
+{
+    // The key, or the common prefix when `prefix`.
+    std::string key;
+    object_meta meta;
+    bool        latest{false};
+    bool        prefix{false};
+};
+
+// A page of ListObjectVersions, in S3's order: key ascending, each key's versions newest first.
+struct version_page
+{
+    std::vector<version_item> items;
+    bool                      truncated{false};
+};
+
 struct open_result
 {
     st          status{st::ok};
@@ -144,6 +199,8 @@ struct open_result
     // Bytes of the body that arrived with the header read, so a small object
     // needs no second read.
     std::string prefetch;
+    // The file is a delete marker, whose metadata `meta` holds and whose status is no_such_key.
+    bool        delete_marker{false};
 };
 
 // What has been stored, for `stats`.
@@ -176,6 +233,9 @@ struct recovery_report
     uint64_t corrupt_files{0};
     // Answered puts whose rename a crash took, moved into place from their pool file.
     uint64_t rolled_forward{0};
+    // Noncurrent versions and delete markers read from the files, and copies a crash left of a version kept elsewhere.
+    uint64_t versions{0};
+    uint64_t version_duplicates{0};
     bool     clean_start{false};
 };
 
@@ -390,10 +450,11 @@ class shard_peers
 public:
     virtual ~shard_peers() = default;
     virtual void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) = 0;
-    virtual void remove(uint32_t owner, std::string bucket, std::string key,
-                        std::function<void(st, bool existed)> cb) = 0;
-    virtual void set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
-                          std::function<void(st)> cb) = 0;
+    // `version_id` empty deletes the key as the bucket's versioning says, and otherwise that version of it.
+    virtual void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                        std::function<void(remove_result)> cb) = 0;
+    virtual void set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                          std::string tags, std::function<void(st, std::string version_id)> cb) = 0;
     // Tells every sibling to drop what it holds of the key, and `done` runs once each has answered or is gone.
     virtual void invalidate(std::string bucket, std::string key, std::function<void()> done) = 0;
 };
@@ -541,21 +602,64 @@ public:
     // The step itself, which only the owner of the key may run.
     void commit_local(commit_request req, std::function<void(put_result)> cb);
 
-    // `existed` says whether there was an object to remove.
+    // `existed` says whether there was an object to remove; in a versioned bucket a delete marker is put in front of it.
     void remove(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
     // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
     void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
                       std::function<bool(const object_meta&)> only_if = {});
+    // The same with the version: `version_id` empty deletes the key, and otherwise removes that version for good.
+    void remove_version(std::string_view bucket, std::string_view key, std::string version_id,
+                        std::function<void(remove_result)> cb);
+    // `only_if` is asked of the version that would be removed, or of the latest before a marker covers it.
+    void remove_version_local(std::string_view bucket, std::string_view key, std::string version_id,
+                              std::function<void(remove_result)> cb,
+                              std::function<bool(const object_meta&)> only_if = {});
 
-    // Makes `tags`, in the encoding of tags_of(), an object's tags, keeping its bytes, ETag and time.
-    void set_tags(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb);
+    // Makes `tags`, in the encoding of tags_of(), the tags of an object or of its version `version_id`, keeping
+    // its bytes, ETag and time; `cb` is told the version it changed.
+    void set_tags(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
+                  std::function<void(st, std::string)> cb);
     // The step itself, which only the owner of the key may run.
-    void set_tags_local(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb);
+    void set_tags_local(std::string_view bucket, std::string_view key, std::string version_id, std::string tags,
+                        std::function<void(st, std::string)> cb);
+    void set_tags(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb)
+    {
+        set_tags(bucket, key, {}, std::move(tags), [cb = std::move(cb)](st s, std::string) { cb(s); });
+    }
 
-    // A new body made of an existing object's, with the metadata `meta` names.
-    void copy(std::string_view src_bucket, std::string_view src_key,
+    // A new body made of an existing object's, or of its version `src_version` when that is not empty, with the
+    // metadata `meta` names.
+    void copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
               std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
               std::function<void(put_result)> cb);
+    void copy(std::string_view src_bucket, std::string_view src_key, std::string_view dst_bucket,
+              std::string_view dst_key, object_meta meta, std::function<void(put_result)> cb)
+    {
+        copy(src_bucket, src_key, {}, dst_bucket, dst_key, std::move(meta), std::move(cb));
+    }
+
+    // ── Versions ────────────────────────────────────────────────────────────
+    versioning bucket_versioning(std::string_view bucket) const;
+    // The delete marker that is the key's latest version, null when it has none; this shard's keys only.
+    const object_meta* latest_marker(std::string_view bucket, std::string_view key) const;
+    // Version `version_id` of a key this shard owns, from memory; null when there is none.
+    const object_meta* find_version(std::string_view bucket, std::string_view key, std::string_view version_id) const;
+    // Opens version `version_id` of any key, where its owner put it, as open_object does the latest; a delete
+    // marker is no_such_key with `delete_marker` set and its metadata.
+    void open_version(std::string_view bucket, std::string_view key, std::string version_id, size_t prefetch,
+                      std::function<void(open_result)> cb);
+    // The metadata of version `version_id` of any key; a delete marker is st::delete_marker with its metadata.
+    void stat_version(std::string_view bucket, std::string_view key, std::string version_id,
+                      std::function<void(st, const object_meta&)> cb);
+    // This shard's part of ListObjectVersions.
+    st list_versions(std::string_view bucket, const version_query& q, version_page& out) const;
+    // Each key at or after `from` under `prefix` with versions behind its latest or a delete marker as its latest,
+    // with its latest object (null when that is a marker) and its other versions newest first, at most `max_keys`;
+    // the key to go on at, empty when there are no more.
+    using version_walk = std::function<void(const std::string& key, const object_meta* latest,
+                                            const std::vector<object_meta>& versions)>;
+    std::string walk_versioned_keys(std::string_view bucket, std::string_view prefix, std::string_view from,
+                                    size_t max_keys, const version_walk& fn) const;
 
     // ── Reads ───────────────────────────────────────────────────────────────
     // Opens the object's file and reads its header, with up to `prefetch` bytes
@@ -641,6 +745,10 @@ private:
         std::shared_ptr<const cors_config> cors;
         std::shared_ptr<const lifecycle_config> lifecycle;
         std::shared_ptr<const bucket_policy> policy;
+        versioning  vstate{versioning::off};
+        // Per key, every version but a latest that is not a delete marker, newest first: the key's
+        // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
+        std::map<std::string, std::vector<object_meta>, std::less<>> versions;
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -665,6 +773,8 @@ private:
     bool finish_bucket(recovering& r, recovery_report& rep, std::string& err);
     bool load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt, bool& other_layout,
                       recovery_report& rep);
+    // Reads the noncurrent versions of a bucket that has versions/, and sets its delete markers apart from its objects.
+    bool load_versions(bucket& b, recovery_report& rep, bool& changed, std::string& err);
     // Reads every object file of the buckets that need it, on threads; false when a directory could not be read whole.
     bool reconcile_with_files(std::vector<recovering>& rs, recovery_report& rep, std::string& err);
     bool rewrite_journal_sync(bucket& b, std::string& err);
@@ -703,6 +813,36 @@ private:
                      std::function<void(int leaf_fd, st)> cb, bool repaired = false);
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
+    // Opens the object file at `rel` below `dir_fd` and reads its header, which must be `key`'s.
+    void open_file(int dir_fd, std::string rel, std::string key, size_t prefetch, std::function<void(open_result)> cb);
+
+    // The versioned halves of a commit and a delete, run under the key's lane by its owner.
+    struct vop;
+    // Whether the key is written and deleted as a versioned one.
+    static bool versioned(const bucket& b, std::string_view key)
+    {
+        return b.vstate != versioning::off || (!b.versions.empty() && b.versions.contains(key));
+    }
+    // The version a new latest of `key` is given, newer than every one it has.
+    version_tag next_version(const bucket& b, const std::string& key, bool marker) const;
+    void commit_versioned(std::string bucket, std::string key, std::string tmp, bool pooled, object_meta meta,
+                          std::function<void()> release, std::function<void(put_result)> cb);
+    void remove_versioned(std::string bucket, std::string key, std::string version_id,
+                          std::function<bool(const object_meta&)> only_if, std::function<void()> release,
+                          std::function<void(remove_result)> cb);
+    void vop_header(std::shared_ptr<vop> v);
+    void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
+    void vop_install(std::shared_ptr<vop> v);
+    void vop_end(std::shared_ptr<vop> v, st s);
+    // The index's half of a new latest, which `meta` is, once its file is in place.
+    void version_install(bucket& b, const std::string& key, const object_meta& meta);
+    // The index's half of a version removed for good, promoting the one behind it; true when the latest changed.
+    bool version_forget(bucket& b, const std::string& key, const std::string& id);
+    // A read of a version where it is, and where it moved to if a rename took it meanwhile.
+    struct version_probe;
+    void version_probe_step(std::shared_ptr<version_probe> p);
+    // The bytes of noncurrent versions, counted with the bucket's.
+    void version_bytes(bucket& b, int64_t delta);
     // A tag change whose header is read: written into one of its slots, or the object written again with it.
     struct tag_change;
     void tags_in_place(std::shared_ptr<tag_change> tc, std::string slot, uint64_t at);

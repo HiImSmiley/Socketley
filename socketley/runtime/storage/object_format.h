@@ -58,6 +58,32 @@ inline constexpr size_t max_part_sizes_bytes = 4096;
 // The entry for parts of these sizes, empty when it would be longer than the bound.
 std::string encode_part_sizes(const std::vector<uint64_t>& sizes);
 
+// The extra entry a version of a key in a versioned bucket is named by: its order among the
+// key's versions, whether it is a delete marker, and its id.
+inline constexpr std::string_view version_extra = "x-socketley-version";
+
+struct version_tag
+{
+    // Larger is newer, so a key's versions sort newest first by it.
+    uint64_t    seq{0};
+    // "null", or 32 lowercase hex digits.
+    std::string id;
+    bool        marker{false};
+};
+
+// The version `m` records; an object written without versioning is the null version of its own time.
+version_tag version_of(const object_meta& m);
+// Whether `m` records a version, which only an object written to a versioned bucket does.
+bool has_version(const object_meta& m);
+// Whether `m` is a delete marker, cheaply false for an object with no version.
+bool is_delete_marker(const object_meta& m);
+void set_version_extra(object_meta& m, const version_tag& v);
+void clear_version_extra(object_meta& m);
+// A version id the store could have given, which is also what keeps one out of a path.
+bool valid_version_id(std::string_view id);
+// The path of a key's noncurrent version below its bucket directory.
+std::string version_rel_path(std::string_view key, std::string_view id);
+
 enum class part_status : uint8_t
 {
     ok,

@@ -67,10 +67,10 @@ public:
 
     // ── Asked of the owner of a key ─────────────────────────────────────────
     void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) override;
-    void remove(uint32_t owner, std::string bucket, std::string key,
-                std::function<void(st, bool)> cb) override;
-    void set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
-                  std::function<void(st)> cb) override;
+    void remove(uint32_t owner, std::string bucket, std::string key, std::string version_id,
+                std::function<void(remove_result)> cb) override;
+    void set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id, std::string tags,
+                  std::function<void(st, std::string)> cb) override;
     // Sent by the owner before it answers a commit or a delete, so no sibling answers the old bytes after it.
     void invalidate(std::string bucket, std::string key, std::function<void()> done) override;
     // Tells the siblings this shard has started, so they drop the copies they hold of its keys, which a
@@ -85,6 +85,7 @@ public:
 
     // ── A listing is every shard's, merged ──────────────────────────────────
     void list(std::string_view bucket, const list_query& q, std::function<void(st, list_page)> cb);
+    void list_versions(std::string_view bucket, const version_query& q, std::function<void(st, version_page)> cb);
 
     // ── An upload lives on the shard that owns its key ─────────────────────
     // Every step that names an upload goes to that shard, so its parts and its

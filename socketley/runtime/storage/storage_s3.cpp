@@ -27,8 +27,7 @@ constexpr size_t   user_meta_limit  = 2048;
 bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
-        "acl", "tagging", "versioning", "versions",
-        "versionId", "website", "notification",
+        "acl", "tagging", "website", "notification",
         "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
@@ -40,6 +39,15 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     // A part number outside an upload asks a GET or HEAD for one part of a finished object.
     if (r.has_query("partNumber") && !r.has_query("uploadId") && (!object || (r.method != "GET" && r.method != "HEAD")))
+        return true;
+    // A bucket's versioning is read and set, its versions listed, and an object's version read, tagged or deleted.
+    if (r.has_query("versioning") && (object || (r.method != "GET" && r.method != "PUT")))
+        return true;
+    if (r.has_query("versions") && (object || r.method != "GET"))
+        return true;
+    if (r.has_query("versionId") &&
+        (!object || r.has_query("uploadId") ||
+         (r.method != "GET" && r.method != "HEAD" && r.method != "DELETE" && !r.has_query("tagging"))))
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
@@ -318,6 +326,19 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_delete_policy(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (bkt && q.has_query("versioning"))
+    {
+        if (m == "GET")
+            op_get_versioning(c);
+        else
+            op_put_versioning(c);
+        return;
+    }
+    if (bkt && q.has_query("versions"))
+    {
+        op_list_versions(c);
         return;
     }
     if (bkt && q.has_query("lifecycle"))
@@ -698,7 +719,8 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
     for (size_t i = 0; i < dr.keys.size(); ++i)
     {
         delete_result& res = b->results[i];
-        res.key = std::move(dr.keys[i]);
+        res.key        = std::move(dr.keys[i]);
+        res.version_id = std::move(dr.versions[i]);
         if (res.key.empty() || res.key.size() > max_key_bytes)
         {
             res.ok    = false;
@@ -706,17 +728,30 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
             done_one(b);
             continue;
         }
+        if (!res.version_id.empty() && !valid_version_id(res.version_id))
+        {
+            res.ok    = false;
+            res.error = make_error("NoSuchVersion");
+            done_one(b);
+            continue;
+        }
         ++m_c.deletes;
-        m_store.remove(b->bucket, res.key, [this, b, i, done_one](st s, bool existed)
+        m_store.remove_version(b->bucket, res.key, res.version_id, [this, b, i, done_one](remove_result rr)
         {
             delete_result& one = b->results[i];
-            if (s != st::ok)
+            if (rr.status != st::ok)
             {
                 one.ok    = false;
-                one.error = error_for(s);
+                one.error = error_for(rr.status);
             }
-            else if (existed)
-                notify_delete(b->bucket, one.key);
+            else
+            {
+                if (rr.existed)
+                    notify_delete(b->bucket, one.key);
+                one.delete_marker = rr.marker;
+                if (rr.marker)
+                    one.marker_version_id = rr.version_id;
+            }
             done_one(b);
         });
     }
@@ -925,13 +960,24 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
 
 // ─── CopyObject ─────────────────────────────────────────────────────────────
 
-bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err)
+bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err,
+                       std::string* version_id)
 {
     std::string src;
     std::string_view raw = header;
-    // A version id after the key is not supported and not ignored either.
+    // A version id after the key names the version copied, and is refused by a caller that cannot copy one.
     if (const size_t q = raw.find("?versionId="); q != std::string_view::npos)
+    {
+        const std::string_view id = raw.substr(q + 11);
+        if (!version_id || !valid_version_id(id))
+        {
+            err = make_error("InvalidArgument");
+            err.message = "Invalid version id specified";
+            return false;
+        }
+        *version_id = std::string(id);
         raw = raw.substr(0, q);
+    }
     if (!percent_decode(raw, src, false))
     {
         err = make_error("InvalidArgument");
@@ -964,9 +1010,9 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    std::string src_bucket, src_key;
+    std::string src_bucket, src_key, src_version;
     s3_error    copy_err;
-    if (!parse_copy_source(src_hdr, src_bucket, src_key, copy_err))
+    if (!parse_copy_source(src_hdr, src_bucket, src_key, copy_err, &src_version))
     {
         send_error(c, copy_err, false, "ArgumentName", "x-amz-copy-source");
         return;
@@ -997,27 +1043,39 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
     }
     // The source may be another shard's, whose header is then read from its file.
     std::weak_ptr<conn> weak = c;
-    m_store.stat_object(src_bucket, src_key,
-        [this, weak, src_bucket, src_key, replace](st s, const object_meta& sm)
+    auto go = [this, weak, src_bucket, src_key, src_version, replace](st s, const object_meta& sm)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead)
+            return;
+        // A delete marker is no object to copy: the latest is no such key, and one named by its id no valid source.
+        if (s == st::delete_marker)
         {
-            auto cc = weak.lock();
-            if (!cc || cc->dead)
-                return;
-            if (s != st::ok)
-            {
-                send_error_st(cc, s);
-                return;
-            }
-            op_copy_from(cc, src_bucket, src_key, replace, sm);
-        });
+            s3_error e = make_error("InvalidRequest");
+            e.message = "The source of a copy request may not specifically refer to a delete marker by version id.";
+            send_error(cc, e);
+            return;
+        }
+        if (s != st::ok)
+        {
+            send_error_st(cc, s);
+            return;
+        }
+        op_copy_from(cc, src_bucket, src_key, src_version, replace, sm);
+    };
+    if (src_version.empty())
+        m_store.stat_object(src_bucket, src_key, std::move(go));
+    else
+        m_store.stat_version(src_bucket, src_key, src_version, std::move(go));
 }
 
 void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket,
-                               std::string src_key, bool replace, const object_meta& src)
+                               std::string src_key, std::string src_version, bool replace, const object_meta& src)
 {
     s3_request& r = c->req;
     const object_meta* src_meta = &src;
-    if (src_bucket == r.bucket && src_key == r.key && !replace)
+    // A version copied over its own key is a new latest made of an old one, which S3 allows as it is.
+    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty())
     {
         s3_error e = make_error("InvalidRequest");
         e.message = "This copy request is illegal because it is trying to copy an object to itself "
@@ -1072,7 +1130,12 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
 
     ++m_c.copies;
     std::weak_ptr<conn> weak = c;
-    m_store.copy(src_bucket, src_key, r.bucket, r.key, std::move(meta), [this, weak](put_result p)
+    // The version copied, which a source in a bucket that never kept versions has none of.
+    const std::string source_id = !src_version.empty() ? src_version
+                                : has_version(src) || m_store.bucket_versioning(src_bucket) != versioning::off
+                                    ? version_of(src).id : std::string{};
+    m_store.copy(src_bucket, src_key, std::move(src_version), r.bucket, r.key, std::move(meta),
+                 [this, weak, source_id](put_result p)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -1084,6 +1147,10 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
         }
         response resp;
         resp.headers.emplace_back("Content-Type", "application/xml");
+        if (!source_id.empty())
+            resp.headers.emplace_back("x-amz-copy-source-version-id", source_id);
+        if (has_version(p.meta))
+            resp.headers.emplace_back("x-amz-version-id", version_of(p.meta).id);
         resp.body = copy_result_xml(p.meta);
         send_response(cc, std::move(resp));
         notify_put(cc->req.bucket, cc->req.key, p.meta);
@@ -1094,25 +1161,32 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
 
 void storage_run::op_delete_object(const std::shared_ptr<conn>& c)
 {
+    std::string version_id;
+    if (!version_param(c, version_id))
+        return;
     ++m_c.deletes;
     std::weak_ptr<conn> weak = c;
-    m_store.remove(c->req.bucket, c->req.key,
-                   [this, weak, bucket = c->req.bucket, key = c->req.key](st s, bool existed)
+    m_store.remove_version(c->req.bucket, c->req.key, std::move(version_id),
+                           [this, weak, bucket = c->req.bucket, key = c->req.key](remove_result rr)
     {
         // Told whether or not the client is still there to hear the answer: the
         // object is gone either way.
-        if (s == st::ok && existed)
+        if (rr.status == st::ok && rr.existed)
             notify_delete(bucket, key);
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
-        if (s != st::ok)
+        if (rr.status != st::ok)
         {
-            send_error_st(cc, s);
+            send_error_st(cc, rr.status);
             return;
         }
         response r;
         r.status = 204;
+        if (rr.marker)
+            r.headers.emplace_back("x-amz-delete-marker", "true");
+        if (!rr.version_id.empty())
+            r.headers.emplace_back("x-amz-version-id", rr.version_id);
         send_response(cc, std::move(r));
     });
 }
@@ -1180,6 +1254,11 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         }
         if (n == part_sizes_extra)
             continue;
+        if (n == version_extra)
+        {
+            r.headers.emplace_back("x-amz-version-id", version_of(m).id);
+            continue;
+        }
         std::string display;
         bool next_upper = true;
         for (char ch : n)
@@ -1283,24 +1362,14 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         part = static_cast<uint32_t>(n);
     }
 
+    std::string version_id;
+    if (!version_param(c, version_id))
+        return;
     if (!m_store.has_bucket(q.bucket))
     {
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    // A GET of a key held in memory finds the copy, and whose key it is, in one lookup.
-    object_store::hot_hit hot;
-    const bool held = !head && m_store.hot_find(q.bucket, q.key, hot) && hot.body;
-    // Memory holds this shard's keys only, so another shard's key is asked of
-    // its file, which is the truth and which any shard can read.
-    const bool mine = held ? !hot.foreign : m_store.owns(q.bucket, q.key);
-    const object_meta* mem = held ? (hot.foreign ? nullptr : hot.meta) : mine ? m_store.find(q.bucket, q.key) : nullptr;
-    if (mine && !mem)
-    {
-        send_error_st(c, st::no_such_key);
-        return;
-    }
-
     // Answers a request whose object is known, from a HEAD's memory or a GET's file.
     auto answer = [this, head, part](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
                                uint64_t data_off, const std::string& prefetch)
@@ -1417,6 +1486,64 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_file(cc, std::move(r), fd, data_off + first, len);
     };
 
+    // A version asked for by its id is read where it is, and never from or into a held copy, which is the latest's.
+    if (!version_id.empty())
+    {
+        std::weak_ptr<conn> weak = c;
+        if (head)
+        {
+            m_store.stat_version(q.bucket, q.key, std::move(version_id),
+                                 [this, weak, answer](st s, const object_meta& m)
+            {
+                auto cc = weak.lock();
+                if (!cc || cc->dead)
+                    return;
+                if (s == st::delete_marker)
+                    send_delete_marker(cc, m, true);
+                else if (s != st::ok)
+                    send_error_st(cc, s);
+                else
+                    answer(cc, m, -1, 0, std::string{});
+            });
+            return;
+        }
+        m_store.open_version(q.bucket, q.key, std::move(version_id), object_store::hot_max_object,
+                             [this, weak, answer](open_result o)
+        {
+            auto cc = weak.lock();
+            if (!cc || cc->dead)
+            {
+                if (o.fd >= 0)
+                    m_loop.close_fd(o.fd);
+                return;
+            }
+            if (o.status == st::delete_marker)
+                send_delete_marker(cc, o.meta, true);
+            else if (o.status != st::ok)
+                send_error_st(cc, o.status);
+            else
+                answer(cc, o.meta, o.fd, o.data_off, o.prefetch);
+        });
+        return;
+    }
+
+    // A GET of a key held in memory finds the copy, and whose key it is, in one lookup.
+    object_store::hot_hit hot;
+    const bool held = !head && m_store.hot_find(q.bucket, q.key, hot) && hot.body;
+    // Memory holds this shard's keys only, so another shard's key is asked of
+    // its file, which is the truth and which any shard can read.
+    const bool mine = held ? !hot.foreign : m_store.owns(q.bucket, q.key);
+    const object_meta* mem = held ? (hot.foreign ? nullptr : hot.meta) : mine ? m_store.find(q.bucket, q.key) : nullptr;
+    if (mine && !mem)
+    {
+        if (const object_meta* marker = m_store.latest_marker(q.bucket, q.key))
+            send_delete_marker(c, *marker, false);
+        else
+            send_error_st(c, st::no_such_key);
+        return;
+    }
+
+
     if (head)
     {
         if (mem)
@@ -1430,12 +1557,12 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             auto cc = weak.lock();
             if (!cc || cc->dead)
                 return;
-            if (s != st::ok)
-            {
+            if (s == st::no_such_key && is_delete_marker(m))
+                send_delete_marker(cc, m, false);
+            else if (s != st::ok)
                 send_error_st(cc, s);
-                return;
-            }
-            answer(cc, m, -1, 0, std::string{});
+            else
+                answer(cc, m, -1, 0, std::string{});
         });
         return;
     }
@@ -1479,6 +1606,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         {
             if (o.fd >= 0)
                 m_loop.close_fd(o.fd);
+            return;
+        }
+        if (o.delete_marker)
+        {
+            send_delete_marker(cc, o.meta, false);
             return;
         }
         if (o.status != st::ok)

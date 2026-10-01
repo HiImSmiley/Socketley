@@ -2040,6 +2040,8 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
         for (const auto& [n, v] : r.meta.extra)
             if (is_checksum_header(n))
                 resp.headers.emplace_back(n, v);
+            else if (n == version_extra)
+                resp.headers.emplace_back("x-amz-version-id", version_of(r.meta).id);
         const std::string bucket = cc->req.bucket;
         const std::string key    = cc->req.key;
         send_response(cc, std::move(resp));

@@ -10,9 +10,27 @@
 namespace socketley::storage
 {
 
+namespace
+{
+
+// The answer to a tag change of the version `id`, which a bucket that keeps none leaves out.
+response tagged(int status, const std::string& id)
+{
+    response r;
+    r.status = status;
+    if (!id.empty())
+        r.headers.emplace_back("x-amz-version-id", id);
+    return r;
+}
+
+}   // namespace
+
 void storage_run::op_put_object_tagging(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
+    std::string version_id;
+    if (!version_param(c, version_id))
+        return;
     if (!m_store.has_bucket(q.bucket))
     {
         send_error_st(c, st::no_such_bucket);
@@ -31,7 +49,7 @@ void storage_run::op_put_object_tagging(const std::shared_ptr<conn>& c)
         return;
     }
     std::weak_ptr<conn> weak = c;
-    m_store.set_tags(q.bucket, q.key, encode_tags(tags), [this, weak](st s)
+    m_store.set_tags(q.bucket, q.key, std::move(version_id), encode_tags(tags), [this, weak](st s, std::string id)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -41,16 +59,19 @@ void storage_run::op_put_object_tagging(const std::shared_ptr<conn>& c)
             send_error_st(cc, s);
             return;
         }
-        send_response(cc, response{});
+        send_response(cc, tagged(200, id));
     });
 }
 
 void storage_run::op_get_object_tagging(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
+    std::string version_id;
+    if (!version_param(c, version_id))
+        return;
     // The owner answers from memory, and any other shard from the object's header.
     std::weak_ptr<conn> weak = c;
-    m_store.stat_object(q.bucket, q.key, [this, weak](st s, const object_meta& m)
+    auto answer = [this, weak](st s, const object_meta& m)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -60,23 +81,30 @@ void storage_run::op_get_object_tagging(const std::shared_ptr<conn>& c)
             send_error_st(cc, s);
             return;
         }
-        response r;
+        response r = tagged(200, has_version(m) ? version_of(m).id : std::string{});
         r.headers.emplace_back("Content-Type", "application/xml");
         r.body = tagging_xml(decode_tags(tags_of(m)));
         send_response(cc, std::move(r));
-    });
+    };
+    if (version_id.empty())
+        m_store.stat_object(q.bucket, q.key, std::move(answer));
+    else
+        m_store.stat_version(q.bucket, q.key, std::move(version_id), std::move(answer));
 }
 
 void storage_run::op_delete_object_tagging(const std::shared_ptr<conn>& c)
 {
     const s3_request& q = c->req;
+    std::string version_id;
+    if (!version_param(c, version_id))
+        return;
     if (!m_store.has_bucket(q.bucket))
     {
         send_error_st(c, st::no_such_bucket);
         return;
     }
     std::weak_ptr<conn> weak = c;
-    m_store.set_tags(q.bucket, q.key, {}, [this, weak](st s)
+    m_store.set_tags(q.bucket, q.key, std::move(version_id), {}, [this, weak](st s, std::string id)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -86,9 +114,7 @@ void storage_run::op_delete_object_tagging(const std::shared_ptr<conn>& c)
             send_error_st(cc, s);
             return;
         }
-        response r;
-        r.status = 204;
-        send_response(cc, std::move(r));
+        send_response(cc, tagged(204, id));
     });
 }
 

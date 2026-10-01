@@ -83,6 +83,7 @@ inline s3_error make_error(std::string_view code)
     static constexpr row table[] = {
         {"NoSuchBucket", 404, "The specified bucket does not exist"},
         {"NoSuchKey", 404, "The specified key does not exist."},
+        {"NoSuchVersion", 404, "The specified version does not exist."},
         {"NoSuchLifecycleConfiguration", 404, "The lifecycle configuration does not exist"},
         {"NoSuchUpload", 404, "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."},
         {"BucketAlreadyOwnedByYou", 409, "Your previous request to create the named bucket succeeded and you already own it."},
@@ -149,6 +150,9 @@ inline s3_error error_for(st s)
         // the only way a cancelled body still has someone to answer.
         case st::cancelled:           return make_error("NoSuchUpload");
         case st::precondition_failed: return make_error("PreconditionFailed");
+        case st::no_such_version:     return make_error("NoSuchVersion");
+        // A delete marker has no bytes, tags or metadata to act on.
+        case st::delete_marker:       return make_error("MethodNotAllowed");
         case st::ok:
         case st::io_error:
             break;
@@ -453,6 +457,10 @@ struct delete_result
     std::string key;
     bool        ok{true};
     s3_error    error;
+    // The version the request named, and the delete marker it removed or made.
+    std::string version_id;
+    bool        delete_marker{false};
+    std::string marker_version_id;
 };
 
 inline std::string delete_result_xml(const std::vector<delete_result>& rs, bool quiet)
@@ -461,13 +469,21 @@ inline std::string delete_result_xml(const std::vector<delete_result>& rs, bool 
     x += "<DeleteResult xmlns=\"" + std::string(s3_xmlns) + "\">";
     for (const delete_result& r : rs)
     {
+        const std::string version = r.version_id.empty() ? std::string{}
+                                                         : "<VersionId>" + xml_escape(r.version_id) + "</VersionId>";
         if (r.ok)
         {
             if (!quiet)
-                x += "<Deleted><Key>" + xml_escape(r.key) + "</Key></Deleted>";
+            {
+                x += "<Deleted><Key>" + xml_escape(r.key) + "</Key>" + version;
+                if (r.delete_marker)
+                    x += "<DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>" +
+                         xml_escape(r.marker_version_id) + "</DeleteMarkerVersionId>";
+                x += "</Deleted>";
+            }
         }
         else
-            x += "<Error><Key>" + xml_escape(r.key) + "</Key><Code>" + xml_escape(r.error.code) +
+            x += "<Error><Key>" + xml_escape(r.key) + "</Key>" + version + "<Code>" + xml_escape(r.error.code) +
                  "</Code><Message>" + xml_escape(r.error.message) + "</Message></Error>";
     }
     x += "</DeleteResult>";
@@ -545,6 +561,8 @@ inline bool xml_unescape(std::string_view in, std::string& out)
 struct delete_request
 {
     std::vector<std::string> keys;
+    // Each key's <VersionId>, empty where it named none.
+    std::vector<std::string> versions;
     bool                     quiet{false};
 };
 
@@ -626,7 +644,7 @@ inline bool parse_delete_request(std::string_view x, delete_request& out)
         {
             pos = t.end;
             bool have_key = false;
-            std::string key;
+            std::string key, version;
             for (;;)
             {
                 tag u;
@@ -656,12 +674,23 @@ inline bool parse_delete_request(std::string_view x, delete_request& out)
                     have_key = true;
                     pos = u.end;
                 }
+                else if (u.name == "VersionId" && !u.closing && !u.self_closing)
+                {
+                    const size_t close = x.find('<', u.end);
+                    if (close == std::string_view::npos || !xml_unescape(x.substr(u.end, close - u.end), version))
+                        return false;
+                    const size_t gt = x.find('>', close);
+                    if (gt == std::string_view::npos)
+                        return false;
+                    pos = gt + 1;
+                }
                 else
                     pos = u.end;
             }
             if (!have_key)
                 return false;
             out.keys.push_back(std::move(key));
+            out.versions.push_back(std::move(version));
             if (out.keys.size() > 1000)
                 return false;
         }

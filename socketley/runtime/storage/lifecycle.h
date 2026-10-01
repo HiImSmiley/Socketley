@@ -1,10 +1,12 @@
 #pragma once
 // A bucket's lifecycle configuration, read, checked and written back, with no I/O.
 //
-// What it takes is the core of S3 lifecycle on a store with no versions and no
-// storage classes: expiration by days or by date and the abort of incomplete
-// multipart uploads, filtered by key prefix, object tags and object size.  A rule
-// asking for anything else is refused, never accepted to do less than it says.
+// What it takes is the core of S3 lifecycle on a store with one storage class:
+// expiration by days or by date, the removal of noncurrent versions some days
+// after they became noncurrent and of delete markers left with no version behind
+// them, and the abort of incomplete multipart uploads, filtered by key prefix,
+// object tags and object size.  A rule asking for anything else is refused,
+// never accepted to do less than it says.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -48,12 +50,16 @@ struct lifecycle_rule
     // The midnight from which every object under the rule expires, when has_date.
     bool        has_date{false};
     int64_t     expire_date_ms{0};
-    // <ExpiredObjectDeleteMarker>, kept to be written back: without versions there is no marker it could remove.
+    // <ExpiredObjectDeleteMarker>, -1 when absent: true removes a delete marker that is the only version of its key.
     int8_t      delete_marker{-1};
+    // Days after a version became noncurrent it is removed for good, zero for none.
+    uint32_t    noncurrent_days{0};
     // Days after an incomplete multipart upload began it is aborted, zero for none.
     uint32_t    abort_days{0};
 
     bool expires() const { return enabled && (expire_days != 0 || has_date); }
+    // The rule acts on the versions behind a key's latest, or on a delete marker that is its latest.
+    bool versions() const { return enabled && (noncurrent_days != 0 || delete_marker == 1); }
     bool aborts() const { return enabled && abort_days != 0; }
 };
 
@@ -75,6 +81,10 @@ int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms);
 // Whether the object `key` with metadata `m` has expired under `r` at `now_ms`.
 bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                           int64_t day_ms);
+
+// Whether the version `m` of `key`, noncurrent since `since_ms` when the one after it was made, is to be removed.
+bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
+                              int64_t now_ms, int64_t day_ms);
 
 // Whether an upload of `key` begun at `initiated_ms` is to be aborted under `r` at `now_ms`.
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

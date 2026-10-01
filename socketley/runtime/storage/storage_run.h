@@ -170,7 +170,8 @@ bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err);
 
 // The bucket and key an x-amz-copy-source header names, decoded; false with
 // `err` when it names neither or is not one.
-bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err);
+bool parse_copy_source(std::string_view header, std::string& bucket, std::string& key, s3_error& err,
+                       std::string* version_id = nullptr);
 
 enum class phase : uint8_t
 {
@@ -341,6 +342,8 @@ struct lifecycle_pass
     std::shared_ptr<const lifecycle_config> cfg;
     bool     uploads_done{false};
     size_t   rule{0};
+    // The rule's walk of the keys' versions, after its walk of their latest objects.
+    bool     versions_phase{false};
     std::string resume;
     bool     has_resume{false};
     // Found due and not yet removed, each with the rules that found it.
@@ -352,6 +355,8 @@ struct lifecycle_pass
         std::shared_ptr<const lifecycle_config> cfg;
         size_t      rule{0};
         bool        upload{false};
+        // A version removed for good, rather than the latest object expired.
+        std::string version_id{};
     };
     std::deque<due_key> due;
     uint32_t inflight{0};
@@ -563,7 +568,7 @@ public:
     void apply_policy(const std::shared_ptr<conn>& c, const request_view& rv, auth_verdict& v);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
-                      bool replace, const object_meta& src_meta);
+                      std::string src_version, bool replace, const object_meta& src_meta);
     void op_delete_objects(const std::shared_ptr<conn>& c);
     void op_put_object(const std::shared_ptr<conn>& c);
     void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
@@ -586,7 +591,7 @@ public:
                           std::function<void(checksum_algo, part_place)> go);
     void op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
                                   const std::string& src_bucket, const std::string& src_key,
-                                  const object_meta& src_meta);
+                                  const std::string& src_version, const object_meta& src_meta);
     bool part_number_of(const std::shared_ptr<conn>& c, uint32_t& number);
     void reap_uploads();
 
@@ -606,6 +611,15 @@ public:
     void lifecycle_done(uint64_t pass_id);
     void op_get_object(const std::shared_ptr<conn>& c, bool head);
     void op_delete_object(const std::shared_ptr<conn>& c);
+    // Versioning, in storage_versioning.cpp: the bucket's configuration, ListObjectVersions, and the
+    // answers a request naming a version or meeting a delete marker is given.
+    void op_get_versioning(const std::shared_ptr<conn>& c);
+    void op_put_versioning(const std::shared_ptr<conn>& c);
+    void op_list_versions(const std::shared_ptr<conn>& c);
+    // The request's versionId, empty when it names none; false once it has been refused as malformed.
+    bool version_param(const std::shared_ptr<conn>& c, std::string& out);
+    // A 404 for a key whose latest is the delete marker `m`, or a 405 for the marker asked for by its id.
+    void send_delete_marker(const std::shared_ptr<conn>& c, const object_meta& m, bool by_version);
     // PutObjectTagging, GetObjectTagging and DeleteObjectTagging, in storage_tagging.cpp.
     void op_put_object_tagging(const std::shared_ptr<conn>& c);
     void op_get_object_tagging(const std::shared_ptr<conn>& c);

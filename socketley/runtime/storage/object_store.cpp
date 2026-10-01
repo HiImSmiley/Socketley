@@ -14,6 +14,7 @@
 #include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
+#include "s3_versioning.h"
 #include "shard_owner.h"
 #include "../../shared/logging.h"
 #include "../../shared/random_id.h"
@@ -71,6 +72,8 @@ const char* status_name(st s)
         case st::precondition_failed: return "precondition failed";
         case st::io_error:            return "i/o error";
         case st::cancelled:           return "cancelled";
+        case st::no_such_version:     return "no such version";
+        case st::delete_marker:       return "delete marker";
     }
     return "unknown";
 }
@@ -160,6 +163,9 @@ void object_store::hot_put(std::string_view bucket_name, std::string_view key, c
 void object_store::hot_insert(const std::string& id, const object_meta& read, std::string_view body,
                               const object_meta* live)
 {
+    // A delete marker is answered as no object, which a held copy would answer as an empty one.
+    if (is_delete_marker(read))
+        return;
     if (auto it = m_hot_index.find(id); it != m_hot_index.end())
     {
         // A copy of the metadata alone gives way to one of the whole body.
@@ -634,7 +640,9 @@ void object_store::stat_object(std::string_view bucket_name, std::string_view ke
     if (owns(bucket_name, key))
     {
         const object_meta* m = find(bucket_name, key);
-        cb(m ? st::ok : st::no_such_key, m ? *m : object_meta{});
+        if (!m)
+            m = latest_marker(bucket_name, key);
+        cb(m && !is_delete_marker(*m) ? st::ok : st::no_such_key, m ? *m : object_meta{});
         return;
     }
     stat_foreign(bucket_name, key, std::move(cb));
@@ -658,6 +666,7 @@ void object_store::stat_foreign(std::string_view bucket_name, std::string_view k
             m_loop->close_fd(o.fd);
         if (o.status == st::ok)
             hot_put_foreign(b, k, epoch, o.meta, {});
+        // A delete marker's metadata goes with its no_such_key, for the headers that say what it is.
         cb(o.status, o.meta);
     });
 }
@@ -1227,7 +1236,11 @@ void object_store::commit(commit_request req, std::function<void(put_result)> cb
             if (r.status != st::ok)
                 if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
         }
+        // The owner's answer carries only the version it gave, which goes on the metadata the body was written with.
+        const object_meta given = std::move(r.meta);
         r.meta = meta;
+        if (has_version(given))
+            set_version_extra(r.meta, version_of(given));
         cb(std::move(r));
     });
 }
@@ -1316,6 +1329,11 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
                 refuse({st::storage_full, meta});
                 return;
             }
+        }
+        if (versioned(*bp, key))
+        {
+            commit_versioned(bname, key, tmp, pooled, meta, release, cb);
+            return;
         }
         const std::string rel = object_rel_path(key);
         ensure_dirs(bname, rel, [this, alive, bname, key, meta, tmp, rel, pooled, release, cb, done, refuse](int leaf, st why)
@@ -1450,48 +1468,63 @@ void object_store::commit_pooled(bucket& b, const std::string& key, const object
 void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
                           std::function<void(st, bool)> cb)
 {
+    remove_version(bucket_name, key_sv, {}, [cb = std::move(cb)](remove_result r) { cb(r.status, r.existed); });
+}
+
+void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
+                                std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if)
+{
+    remove_version_local(bucket_name, key_sv, {}, [cb = std::move(cb)](remove_result r) { cb(r.status, r.existed); },
+                         std::move(only_if));
+}
+
+void object_store::remove_version(std::string_view bucket_name, std::string_view key_sv, std::string version_id,
+                                  std::function<void(remove_result)> cb)
+{
     const uint32_t owner = owner_of(bucket_name, key_sv);
     if (owner == m_opts.shard)
     {
-        remove_local(bucket_name, key_sv, std::move(cb));
+        remove_version_local(bucket_name, key_sv, std::move(version_id), std::move(cb));
         return;
     }
 
     bucket* b = find_bucket(bucket_name);
     if (!m_peers || !b || b->closing)
     {
-        cb(b && !b->closing ? st::io_error : st::no_such_bucket, false);
+        cb({b && !b->closing ? st::io_error : st::no_such_bucket});
         return;
     }
     ++b->active_ops;
     ++m_inflight;
     auto alive = m_alive;
     const std::string bname(bucket_name);
-    m_peers->remove(owner, bname, std::string(key_sv), [this, alive, bname, cb](st s, bool existed)
+    m_peers->remove(owner, bname, std::string(key_sv), std::move(version_id),
+                    [this, alive, bname, cb](remove_result r)
     {
         if (!*alive)
             return;
         --m_inflight;
         if (bucket* bp = find_bucket(bname))
             --bp->active_ops;
-        cb(s, existed);
+        cb(std::move(r));
     });
 }
 
-void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
-                                std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if)
+void object_store::remove_version_local(std::string_view bucket_name, std::string_view key_sv,
+                                        std::string version_id, std::function<void(remove_result)> cb,
+                                        std::function<bool(const object_meta&)> only_if)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
     {
-        cb(st::no_such_bucket, false);
+        cb({st::no_such_bucket});
         return;
     }
     if (!owns(bucket_name, key_sv))
     {
         LOG_WARN(("storage: a delete for a key that shard " + std::to_string(owner_of(bucket_name, key_sv)) +
                   " owns reached shard " + std::to_string(m_opts.shard)).c_str());
-        cb(st::io_error, false);
+        cb({st::io_error});
         return;
     }
     ++b->active_ops;
@@ -1501,9 +1534,9 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
     struct removal
     {
         std::shared_ptr<bool>         alive;
-        std::string                   bname, key, dir;
+        std::string                   bname, key, dir, version_id;
         bool                          existed{false};
-        std::function<void(st, bool)> cb;
+        std::function<void(remove_result)> cb;
         std::function<bool(const object_meta&)> only_if;
     };
     using removal_ptr = std::shared_ptr<removal>;
@@ -1511,6 +1544,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
     rm->alive = m_alive;
     rm->bname = std::string(bucket_name);
     rm->key   = std::string(key_sv);
+    rm->version_id = std::move(version_id);
     rm->cb    = std::move(cb);
     rm->only_if = std::move(only_if);
 
@@ -1522,7 +1556,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
             --bp->active_ops;
         --m_inflight;
         lane_leave(r->bname, r->key);
-        r->cb(s, existed);
+        r->cb({s, existed});
     };
 
     // The unlink is durable, so the object cannot come back whatever happens to the record that says it is gone.
@@ -1547,6 +1581,19 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
         if (!bp)
         {
             done(rm, st::no_such_bucket, false);
+            return;
+        }
+        if (!rm->version_id.empty() || versioned(*bp, rm->key))
+        {
+            auto release = [this, bname = rm->bname, key = rm->key]()
+            {
+                if (bucket* bq = find_bucket(bname))
+                    --bq->active_ops;
+                --m_inflight;
+                lane_leave(bname, key);
+            };
+            remove_versioned(rm->bname, rm->key, rm->version_id, std::move(rm->only_if), std::move(release),
+                             std::move(rm->cb));
             return;
         }
         const auto found = bp->objects.find(rm->key);
@@ -1631,57 +1678,63 @@ struct object_store::tag_change
 {
     std::shared_ptr<bool>    alive;
     std::string              bname, key, tags, rel;
+    // The version asked for, empty for the latest, and the one changed, empty for an object with none.
+    std::string              version_id;
+    std::string              changed_id;
+    // The file is a noncurrent version's, below the bucket directory rather than data/.
+    bool                     noncurrent{false};
     // The index's metadata of the object with the new tags in it.
     object_meta              meta;
     int                      fd{-1};
     std::string              head;
-    std::function<void(st)>  cb;
+    std::function<void(st, std::string)> cb;
 };
 
-void object_store::set_tags(std::string_view bucket_name, std::string_view key, std::string tags,
-                            std::function<void(st)> cb)
+void object_store::set_tags(std::string_view bucket_name, std::string_view key, std::string version_id,
+                            std::string tags, std::function<void(st, std::string)> cb)
 {
     const uint32_t owner = owner_of(bucket_name, key);
     if (owner == m_opts.shard)
     {
-        set_tags_local(bucket_name, key, std::move(tags), std::move(cb));
+        set_tags_local(bucket_name, key, std::move(version_id), std::move(tags), std::move(cb));
         return;
     }
     bucket* b = find_bucket(bucket_name);
     if (!m_peers || !b || b->closing)
     {
-        cb(b && !b->closing ? st::io_error : st::no_such_bucket);
+        cb(b && !b->closing ? st::io_error : st::no_such_bucket, {});
         return;
     }
     ++b->active_ops;
     ++m_inflight;
     auto alive = m_alive;
     const std::string bname(bucket_name);
-    m_peers->set_tags(owner, bname, std::string(key), std::move(tags), [this, alive, bname, cb](st s)
+    m_peers->set_tags(owner, bname, std::string(key), std::move(version_id), std::move(tags),
+                      [this, alive, bname, cb](st s, std::string id)
     {
         if (!*alive)
             return;
         --m_inflight;
         if (bucket* bp = find_bucket(bname))
             --bp->active_ops;
-        cb(s);
+        cb(s, std::move(id));
     });
 }
 
-void object_store::set_tags_local(std::string_view bucket_name, std::string_view key, std::string tags,
-                                  std::function<void(st)> cb)
+void object_store::set_tags_local(std::string_view bucket_name, std::string_view key, std::string version_id,
+                                  std::string tags, std::function<void(st, std::string)> cb)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
     {
-        cb(st::no_such_bucket);
+        cb(st::no_such_bucket, {});
         return;
     }
     if (!owns(bucket_name, key))
     {
         LOG_WARN(("storage: a tag change for a key that shard " + std::to_string(owner_of(bucket_name, key)) +
                   " owns reached shard " + std::to_string(m_opts.shard)).c_str());
-        cb(st::io_error);
+        cb(st::io_error, {});
         return;
     }
     ++b->active_ops;
@@ -1691,6 +1744,7 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
     tc->alive = m_alive;
     tc->bname = std::string(bucket_name);
     tc->key   = std::string(key);
+    tc->version_id = std::move(version_id);
     tc->tags  = std::move(tags);
     tc->cb    = std::move(cb);
 
@@ -1702,21 +1756,35 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
             tags_written(tc, st::no_such_bucket, false);
             return;
         }
-        const auto found = bp->objects.find(tc->key);
-        if (found == bp->objects.end())
+        const auto latest = bp->objects.find(tc->key);
+        const object_meta* found = latest == bp->objects.end() ? nullptr : &latest->second;
+        if (!tc->version_id.empty())
+        {
+            found = find_version(tc->bname, tc->key, tc->version_id);
+            if (!found || is_delete_marker(*found))
+            {
+                tags_written(tc, found ? st::delete_marker : st::no_such_version, false);
+                return;
+            }
+            tc->noncurrent = latest == bp->objects.end() || &latest->second != found;
+        }
+        if (!found)
         {
             tags_written(tc, st::no_such_key, false);
             return;
         }
-        if (tags_of(found->second) == tc->tags)
+        if (has_version(*found) || bp->vstate != versioning::off)
+            tc->changed_id = version_of(*found).id;
+        if (tags_of(*found) == tc->tags)
         {
             tags_written(tc, st::ok, false);
             return;
         }
-        tc->meta = found->second;
+        tc->meta = *found;
         set_tags_extra(tc->meta, tc->tags);
-        tc->rel = object_rel_path(tc->key);
-        const bool q = m_io->openat(bp->data_fd, tc->rel, O_RDWR | O_CLOEXEC, 0, [this, tc](int64_t fd)
+        tc->rel = tc->noncurrent ? version_rel_path(tc->key, tc->changed_id) : object_rel_path(tc->key);
+        const bool q = m_io->openat(tc->noncurrent ? bp->dir_fd : bp->data_fd, tc->rel, O_RDWR | O_CLOEXEC, 0,
+                                    [this, tc](int64_t fd)
         {
             if (!*tc->alive)
                 return;
@@ -1805,7 +1873,7 @@ void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_of
     constexpr uint64_t chunk = 1u << 20;
     const int  src      = tc->fd;
     const int  tmp_dir  = b->tmp_fd;
-    const int  data_dir = b->data_fd;
+    const int  data_dir = tc->noncurrent ? b->dir_fd : b->data_fd;
     const std::string tmp = tmp_name();
     auto header  = std::make_shared<std::string>(encode_object_header(tc->key, tc->meta));
     auto buf     = std::shared_ptr<char[]>(new char[chunk]);
@@ -1849,7 +1917,7 @@ void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_of
             d(r);
         });
     });
-    ch->then([this, data_dir, dir = tc->rel.substr(0, 2), leaf](file_io::done d)
+    ch->then([this, data_dir, dir = tc->rel.substr(0, tc->rel.rfind('/')), leaf](file_io::done d)
     {
         return m_io->openat(data_dir, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, [leaf, d](int64_t r)
         {
@@ -1898,9 +1966,19 @@ void object_store::tags_written(std::shared_ptr<tag_change> tc, st s, bool chang
         --m_inflight;
         lane_leave(tc->bname, tc->key);
         auto cb = std::move(tc->cb);
-        cb(s);
+        cb(s, s == st::ok ? tc->changed_id : std::string{});
     };
     bucket* b = changed ? find_bucket(tc->bname) : nullptr;
+    // A noncurrent version is read by its id alone, which no shard holds a copy for.
+    if (b && tc->noncurrent)
+    {
+        if (const auto v = b->versions.find(tc->key); v != b->versions.end())
+            for (object_meta& m : v->second)
+                if (version_of(m).id == tc->changed_id)
+                    m = tc->meta;
+        finish();
+        return;
+    }
     const auto it = b ? b->objects.find(tc->key) : decltype(b->objects.end()){};
     if (!b || it == b->objects.end())
     {
@@ -1927,11 +2005,14 @@ void object_store::open_object(std::string_view bucket_name, std::string_view ke
         cb({st::no_such_bucket, -1, {}, 0, {}});
         return;
     }
-    auto alive = m_alive;
-    const std::string key = std::string(key_sv);
-    const std::string rel = object_rel_path(key);
+    open_file(b->data_fd, object_rel_path(key_sv), std::string(key_sv), prefetch, std::move(cb));
+}
 
-    const bool q = m_io->openat(b->data_fd, rel, O_RDONLY, 0,
+void object_store::open_file(int dir_fd, std::string rel, std::string key, size_t prefetch,
+                             std::function<void(open_result)> cb)
+{
+    auto alive = m_alive;
+    const bool q = m_io->openat(dir_fd, std::move(rel), O_RDONLY, 0,
         [this, alive, key, prefetch, cb](int64_t r)
         {
             if (!*alive)
@@ -1964,7 +2045,7 @@ void object_store::open_object(std::string_view bucket_name, std::string_view ke
                             return;
                         }
                         const std::string_view got(buf->data(), static_cast<size_t>(n));
-                        const decoded_header d = decode_object_header(got);
+                        decoded_header d = decode_object_header(got);
                         if (d.status == header_status::need_more && d.need > got.size() &&
                             d.need <= 64 * 1024 && self)
                         {
@@ -1986,6 +2067,12 @@ void object_store::open_object(std::string_view bucket_name, std::string_view ke
                             // the header is there to tell apart.
                             m_loop->close_fd(fd);
                             cb({st::no_such_key, -1, {}, 0, {}});
+                            return;
+                        }
+                        if (is_delete_marker(d.meta))
+                        {
+                            m_loop->close_fd(fd);
+                            cb({st::no_such_key, -1, std::move(d.meta), 0, {}, true});
                             return;
                         }
                         open_result out;
@@ -2053,6 +2140,9 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::storage_full;
         return nullptr;
     }
+    // A pooled file is answered at its rename and rolled forward after a crash, which a version's move cannot be.
+    if (b->vstate != versioning::off)
+        plain = false;
 
     std::shared_ptr<put_op> op(new put_op);
     op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain);
@@ -2087,7 +2177,7 @@ struct copy_state
 
 }   // namespace
 
-void object_store::copy(std::string_view src_bucket, std::string_view src_key,
+void object_store::copy(std::string_view src_bucket, std::string_view src_key, std::string src_version,
                         std::string_view dst_bucket, std::string_view dst_key, object_meta meta,
                         std::function<void(put_result)> cb)
 {
@@ -2109,6 +2199,8 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
     cs->dst_key    = std::string(dst_key);
     cs->meta       = std::move(meta);
     cs->cb         = std::move(cb);
+    // The copy is a new object, whose version only its owner gives.
+    clear_version_extra(cs->meta);
     ++db->active_ops;
     ++m_inflight;
 
@@ -2135,8 +2227,7 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
         cb2(std::move(r));
     };
 
-    open_object(src_bucket, src_key, 0,
-        [this, alive, cs, finish](open_result o)
+    auto opened = [this, alive, cs, finish](open_result o)
         {
             if (!*alive)
                 return;
@@ -2311,7 +2402,11 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
                 cs->tmp.clear();
                 (*finish)({st::io_error, cs->meta});
             }
-        });
+        };
+    if (src_version.empty())
+        open_object(src_bucket, src_key, 0, std::move(opened));
+    else
+        open_version(src_bucket, src_key, std::move(src_version), 0, std::move(opened));
 }
 
 // ─── Buckets ────────────────────────────────────────────────────────────────
@@ -2538,8 +2633,9 @@ st object_store::drop_check(std::string_view name)
     if (!b || b->closing)
         return st::no_such_bucket;
     if (b->active_puts || b->active_ops || b->j.frozen || !b->lanes.empty())
-        return b->objects.empty() ? st::busy : st::bucket_not_empty;
-    if (!b->objects.empty())
+        return b->objects.empty() && b->versions.empty() ? st::busy : st::bucket_not_empty;
+    // A noncurrent version or a delete marker is something the bucket still holds, as in S3.
+    if (!b->objects.empty() || !b->versions.empty())
         return st::bucket_not_empty;
     if (m_drop_guard && m_drop_guard(name))
         return st::bucket_not_empty;
@@ -2573,7 +2669,8 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy})
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
+                                  bucket_doc::versioning})
         if (take_doc(bb, kind, {})) {}
     hot_drop_bucket(name);
     m_buckets.erase(it);
@@ -2647,15 +2744,17 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 
 // ─── Bucket configuration documents ─────────────────────────────────────────
 
-static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes && policy_max_bytes <= doc_max_bytes);
+static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
+              policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes);
 
 const char* object_store::doc_file(bucket_doc kind)
 {
     switch (kind)
     {
-        case bucket_doc::cors:      return "cors";
-        case bucket_doc::lifecycle: return "lifecycle";
-        case bucket_doc::policy:    return "policy";
+        case bucket_doc::cors:       return "cors";
+        case bucket_doc::lifecycle:  return "lifecycle";
+        case bucket_doc::policy:     return "policy";
+        case bucket_doc::versioning: return "versioning";
     }
     return "?";
 }
@@ -2708,6 +2807,14 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
         b.policy = std::move(p);
         return true;
     }
+    if (kind == bucket_doc::versioning)
+    {
+        versioning v = versioning::off;
+        if (!xml.empty() && !parse_versioning(xml, v, err))
+            return false;
+        b.vstate = v;
+        return true;
+    }
     std::shared_ptr<lifecycle_config> l;
     if (!xml.empty())
     {
@@ -2746,6 +2853,35 @@ void object_store::write_doc(bucket_doc kind, std::string name, std::string xml,
     auto text = std::make_shared<std::string>(std::move(xml));
     auto fd   = std::make_shared<int>(-1);
     auto ch   = std::make_shared<disk_chain>(m_alive);
+    // The directories of noncurrent versions are there, and durable, before any version may need one.
+    if (kind == bucket_doc::versioning && !text->empty())
+    {
+        ch->then([this, dir_fd](file_io::done d) { return m_io->mkdirat(dir_fd, "versions", 0755, std::move(d)); },
+                 -EEXIST);
+        for (int i = 0; i < 256; ++i)
+            ch->then([this, dir_fd, i](file_io::done d)
+                     {
+                         return m_io->mkdirat(dir_fd, "versions/" + hex_byte(static_cast<uint8_t>(i)), 0755, std::move(d));
+                     },
+                     -EEXIST);
+        ch->then([this, dir_fd, fd](file_io::done d)
+        {
+            return m_io->openat(dir_fd, "versions", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                                [fd, d](int64_t r)
+                                {
+                                    if (r >= 0)
+                                        *fd = static_cast<int>(r);
+                                    d(r);
+                                });
+        });
+        ch->then([this, fd](file_io::done d) { return m_io->fsync(*fd, false, std::move(d)); });
+        ch->then([this, dir_fd, fd](file_io::done d)
+        {
+            m_loop->close_fd(*fd);
+            *fd = -1;
+            return m_io->fsync(dir_fd, false, std::move(d));
+        });
+    }
     // A document is written beside the file and renamed over it, so a crash leaves the old one or the new.
     if (!text->empty())
     {

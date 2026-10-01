@@ -44,7 +44,7 @@ bool decode_record(std::string_view record, std::string& key, object_meta& meta)
 bool status_byte(bytes::reader& r, st& s)
 {
     uint8_t b = 0;
-    if (!r.u8(b) || b > static_cast<uint8_t>(st::cancelled))
+    if (!r.u8(b) || b > static_cast<uint8_t>(st::delete_marker))
         return false;
     s = static_cast<st>(b);
     return true;
@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::set_tags))
+        o > static_cast<uint8_t>(op::list_versions))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -90,34 +90,43 @@ bool decode_commit(std::string_view payload, commit_request& out)
     return decode_record(rec, key, out.meta) && key == out.key;
 }
 
-std::string encode_remove(std::string_view bucket, std::string_view key)
+std::string encode_remove(std::string_view bucket, std::string_view key, std::string_view version_id)
 {
     bytes::writer w = begin(op::remove);
     w.bytes(bucket);
     w.bytes(key);
+    w.bytes(version_id);
     return w.take();
 }
 
-bool decode_remove(std::string_view payload, std::string& bucket, std::string& key)
+bool decode_remove(std::string_view payload, std::string& bucket, std::string& key, std::string* version_id)
 {
     bytes::reader r(payload);
-    return open_request(r, op::remove) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap);
+    std::string id;
+    if (!open_request(r, op::remove) || !r.bytes(bucket, name_cap) || !r.bytes(key, name_cap) || !r.bytes(id, 256))
+        return false;
+    if (version_id)
+        *version_id = std::move(id);
+    return true;
 }
 
-std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view tags)
+std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view version_id,
+                            std::string_view tags)
 {
     bytes::writer w = begin(op::set_tags);
     w.bytes(bucket);
     w.bytes(key);
+    w.bytes(version_id);
     w.bytes(tags);
     return w.take();
 }
 
-bool decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& tags)
+bool decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& version_id,
+                     std::string& tags)
 {
     bytes::reader r(payload);
     return open_request(r, op::set_tags) && r.bytes(bucket, name_cap) && r.bytes(key, name_cap) &&
-           r.bytes(tags, record_cap);
+           r.bytes(version_id, 256) && r.bytes(tags, record_cap);
 }
 
 std::string encode_hot_drop(std::string_view bucket, std::string_view key)
@@ -160,7 +169,7 @@ bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string
 {
     bytes::reader r(payload);
     uint8_t k = 0;
-    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::policy) ||
+    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::versioning) ||
         !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes))
         return false;
     kind = static_cast<bucket_doc>(k);
@@ -221,11 +230,13 @@ std::string encode_status(st s)
     return w.take();
 }
 
-std::string encode_removed(st s, bool existed)
+std::string encode_removed(const remove_result& r)
 {
     bytes::writer w;
-    w.u8(static_cast<uint8_t>(s));
-    w.u8(existed ? 1 : 0);
+    w.u8(static_cast<uint8_t>(r.status));
+    w.u8(r.existed ? 1 : 0);
+    w.u8(r.marker ? 1 : 0);
+    w.bytes(r.version_id);
     return w.take();
 }
 
@@ -243,10 +254,11 @@ bool decode_status(std::string_view reply, st& s)
     return status_byte(r, s);
 }
 
-bool decode_removed(std::string_view reply, st& s, bool& existed)
+bool decode_removed(std::string_view reply, remove_result& out)
 {
     bytes::reader r(reply);
-    return status_byte(r, s) && r.flag(existed);
+    out = remove_result{};
+    return status_byte(r, out.status) && r.flag(out.existed) && r.flag(out.marker) && r.bytes(out.version_id, 256);
 }
 
 bool decode_created(std::string_view reply, st& s, int64_t& created_ms)
@@ -775,6 +787,146 @@ bool decode_upload_list(std::string_view reply, std::vector<upload_stub>& upload
         uploads.push_back(std::move(u));
     }
     return true;
+}
+
+// ─── Versions ───────────────────────────────────────────────────────────────
+
+std::string encode_committed(const put_result& r)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(r.status));
+    std::string value;
+    for (const auto& [n, v] : r.meta.extra)
+        if (n == version_extra)
+            value = v;
+    w.bytes(value);
+    return w.take();
+}
+
+bool decode_committed(std::string_view reply, put_result& out)
+{
+    bytes::reader r(reply);
+    std::string value;
+    out = put_result{};
+    if (!status_byte(r, out.status) || !r.bytes(value, 256))
+        return false;
+    if (!value.empty())
+        out.meta.extra.emplace_back(std::string(version_extra), std::move(value));
+    return true;
+}
+
+std::string encode_tagged(st s, std::string_view version_id)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(s));
+    w.bytes(version_id);
+    return w.take();
+}
+
+bool decode_tagged(std::string_view reply, st& s, std::string& version_id)
+{
+    bytes::reader r(reply);
+    return status_byte(r, s) && r.bytes(version_id, 256);
+}
+
+std::string encode_list_versions(std::string_view bucket, const version_query& q)
+{
+    bytes::writer w = begin(op::list_versions);
+    w.bytes(bucket);
+    w.bytes(q.prefix);
+    w.bytes(q.delimiter);
+    w.bytes(q.key_marker);
+    w.bytes(q.version_marker);
+    w.u64(q.max_keys);
+    return w.take();
+}
+
+bool decode_list_versions(std::string_view payload, std::string& bucket, version_query& q)
+{
+    bytes::reader r(payload);
+    uint64_t max_keys = 0;
+    if (!open_request(r, op::list_versions) || !r.bytes(bucket, name_cap) || !r.bytes(q.prefix, query_cap) ||
+        !r.bytes(q.delimiter, query_cap) || !r.bytes(q.key_marker, query_cap) ||
+        !r.bytes(q.version_marker, 256) || !r.u64(max_keys))
+        return false;
+    q.max_keys = static_cast<size_t>(std::min<uint64_t>(max_keys, 1000));
+    return true;
+}
+
+std::string encode_version_page(st s, const version_page& page)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(s));
+    w.u8(page.truncated ? 1 : 0);
+    w.u32(static_cast<uint32_t>(page.items.size()));
+    for (const version_item& it : page.items)
+    {
+        w.u8(static_cast<uint8_t>((it.prefix ? 1 : 0) | (it.latest ? 2 : 0)));
+        if (it.prefix)
+            w.bytes(it.key);
+        else
+            put_meta(w, it.key, it.meta);
+    }
+    return w.take();
+}
+
+bool decode_version_page(std::string_view reply, st& s, version_page& page)
+{
+    bytes::reader r(reply);
+    uint32_t n = 0;
+    bool truncated = false;
+    page = version_page{};
+    if (!status_byte(r, s) || !r.flag(truncated) || !r.u32(n) || n > 1000 || n > r.left())
+        return false;
+    page.truncated = truncated;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint8_t f = 0;
+        version_item it;
+        if (!r.u8(f) || f > 3)
+            return false;
+        it.prefix = (f & 1) != 0;
+        it.latest = (f & 2) != 0;
+        if (it.prefix ? !r.bytes(it.key, query_cap) : !get_meta(r, it.key, it.meta))
+            return false;
+        page.items.push_back(std::move(it));
+    }
+    return true;
+}
+
+version_page merge_version_pages(std::vector<version_page> pages, size_t max_keys)
+{
+    // A key is one shard's, so its versions come from one page in order and only a common prefix repeats.
+    std::vector<version_item> all;
+    // A page cut short says nothing past its last key, so nothing past the first such key is known whole.
+    bool        cut = false;
+    std::string bound;
+    for (const version_page& p : pages)
+        if (p.truncated && !p.items.empty() && (!cut || p.items.back().key < bound))
+        {
+            cut   = true;
+            bound = p.items.back().key;
+        }
+    for (version_page& p : pages)
+        for (version_item& it : p.items)
+            if (!cut || it.key <= bound)
+                all.push_back(std::move(it));
+    std::stable_sort(all.begin(), all.end(), [](const version_item& a, const version_item& b) { return a.key < b.key; });
+    version_page out;
+    for (version_item& it : all)
+    {
+        if (it.prefix && !out.items.empty() && out.items.back().prefix && out.items.back().key == it.key)
+            continue;
+        if (out.items.size() == max_keys)
+        {
+            out.truncated = true;
+            break;
+        }
+        out.items.push_back(std::move(it));
+    }
+    if (cut)
+        out.truncated = true;
+    return out;
 }
 
 }   // namespace socketley::storage::wire

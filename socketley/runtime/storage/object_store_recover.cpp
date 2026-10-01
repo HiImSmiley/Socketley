@@ -480,6 +480,8 @@ struct object_store::recovering
     bool    scan{false};
     // The files said something the journal did not.
     bool    changed{false};
+    // The bucket has versions/, whose files are read after the latest ones.
+    bool    versions{false};
 };
 
 bool object_store::open(std::string& err, recovery_report* report)
@@ -634,7 +636,8 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     // The configuration documents shard 0 last synced, and not what a write it was cut short in left.
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy})
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
+                                  bucket_doc::versioning})
     {
         const std::string file = base + "/" + doc_file(kind);
         if (m_opts.shard == 0 && ::unlink((file + ".new").c_str()) < 0) {}
@@ -642,6 +645,31 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         if (!xml.empty() && !take_doc(*b, kind, xml))
             LOG_WARN(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + name +
                       " does not parse and is not applied").c_str());
+    }
+
+    // A versioned bucket has the directories of its noncurrent versions, which a start makes again when one is gone.
+    struct stat vsb{};
+    const bool has_versions = ::stat((base + "/versions").c_str(), &vsb) == 0 && S_ISDIR(vsb.st_mode);
+    if (b->vstate != versioning::off || has_versions)
+    {
+        bool made = ::mkdir((base + "/versions").c_str(), 0755) == 0;
+        static constexpr char digits[] = "0123456789abcdef";
+        for (int i = 0; i < 256; ++i)
+        {
+            const char n[3] = {digits[i >> 4], digits[i & 15], 0};
+            if (::mkdir((base + "/versions/" + n).c_str(), 0755) == 0)
+                made = true;
+            else if (errno != EEXIST)
+            {
+                err = "cannot create " + base + "/versions/" + n + ": " + errstr(errno);
+                return false;
+            }
+        }
+        if (made && (!fsync_dir_path(base + "/versions") || !fsync_dir_path(base)))
+        {
+            err = "cannot sync " + base + "/versions: " + errstr(errno);
+            return false;
+        }
     }
 
     b->dir_fd  = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -654,7 +682,9 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     std::unordered_set<std::string> keep;
-    const uint64_t rolled = roll_forward_pooled(*b, keep);
+    // A versioned commit answers only once its file is in place, so a pooled file there is one no client was told of.
+    const bool versioned_dir = b->vstate != versioning::off || has_versions;
+    const uint64_t rolled = versioned_dir ? 0 : roll_forward_pooled(*b, keep);
     rep.rolled_forward += rolled;
     rep.tmp_removed += clean_tmp(base + "/tmp", m_opts.shard, m_opts.nshards, {});
     // What is left in pool/ is empty, cut short or another shard's, and the last two are no refill's.
@@ -689,6 +719,9 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     // journal could not be trusted, when it was written for another split,
     // when it is missing, and when a pooled put was rolled forward.
     r.scan = !m_clean_start || r.corrupt || r.torn || r.other_layout || rolled > 0;
+    // The journal records a key's latest version only, so a versioned bucket is read from its files at every start.
+    r.versions = versioned_dir;
+    r.scan     = r.scan || r.versions;
     r.b    = b.get();
     m_buckets.emplace(name, std::move(b));
     out.push_back(std::move(r));
@@ -712,9 +745,15 @@ bool object_store::finish_bucket(recovering& r, recovery_report& rep, std::strin
                   " is damaged and was rebuilt from the object files").c_str());
     }
 
+    if (r.versions && !load_versions(b, rep, changed, err))
+        return false;
+
     uint64_t bytes = 0;
     for (const auto& [k, m] : b.objects)
         bytes += m.size;
+    for (const auto& [k, list] : b.versions)
+        for (const object_meta& m : list)
+            bytes += m.size;
     b.bytes = bytes;
 
     const bool garbage = b.j.records > m_opts.compact_floor &&
@@ -1067,6 +1106,146 @@ bool object_store::reconcile_with_files(std::vector<recovering>& rs, recovery_re
             }
         }
         r.changed = rep.adopted + rep.dropped != before;
+    }
+    return true;
+}
+
+bool object_store::load_versions(bucket& b, recovery_report& rep, bool& changed, std::string& err)
+{
+    // A delete marker the walk of data/ found is a key's latest version, and no object.
+    for (auto it = b.objects.begin(); it != b.objects.end();)
+    {
+        if (!is_delete_marker(it->second))
+        {
+            ++it;
+            continue;
+        }
+        b.versions[it->first].push_back(std::move(it->second));
+        it = b.objects.erase(it);
+        changed = true;
+        ++rep.versions;
+    }
+
+    const std::string base = m_opts.dir + "/" + b.name + "/";
+    struct found_version
+    {
+        object_meta meta;
+        std::string rel;
+    };
+    std::map<std::string, std::vector<found_version>> noncurrent;
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string head;
+    for (int sub = 0; sub < 256; ++sub)
+    {
+        const char dir[3] = {digits[sub >> 4], digits[sub & 15], 0};
+        const std::string path = base + "versions/" + dir;
+        DIR* d = ::opendir(path.c_str());
+        if (!d)
+        {
+            if (errno == ENOENT)
+                continue;
+            err = "cannot read " + path + ": " + errstr(errno);
+            return false;
+        }
+        while (const struct dirent* e = ::readdir(d))
+        {
+            const std::string_view name(e->d_name);
+            // <64 hex digits of the key's hash>.<version id>, in the directory of its first two.
+            if (name.size() < 66 || name[64] != '.' || name[0] != dir[0] || name[1] != dir[1] ||
+                !valid_version_id(name.substr(65)))
+                continue;
+            const std::string rel = std::string("versions/") + dir + "/" + std::string(name);
+            const int fd = ::openat(::dirfd(d), e->d_name, O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                continue;
+            struct stat sb{};
+            decoded_header h;
+            head.resize(object_header_align);
+            ssize_t n = ::fstat(fd, &sb) == 0 ? ::pread(fd, head.data(), head.size(), 0) : -1;
+            if (n >= 0)
+            {
+                head.resize(static_cast<size_t>(n));
+                h = decode_object_header(head);
+                if (h.status == header_status::need_more && h.need <= 64 * 1024)
+                {
+                    head.resize(h.need);
+                    n = ::pread(fd, head.data(), head.size(), 0);
+                    if (n >= 0)
+                    {
+                        head.resize(static_cast<size_t>(n));
+                        h = decode_object_header(head);
+                    }
+                }
+            }
+            ::close(fd);
+            const bool sound = n >= 0 && h.status == header_status::ok &&
+                               static_cast<uint64_t>(sb.st_size) == h.header_len + h.meta.size &&
+                               key_hash(h.key) == name.substr(0, 64) && version_of(h.meta).id == name.substr(65);
+            if (!sound)
+            {
+                // Every shard walks every file, so one of them says so.
+                if (m_opts.shard == 0)
+                {
+                    ++rep.corrupt_files;
+                    LOG_WARN(("storage: " + base + rel + " is not a whole object version and is left unserved").c_str());
+                }
+                continue;
+            }
+            if (!owns(b.name, h.key))
+                continue;
+            noncurrent[h.key].push_back({std::move(h.meta), rel});
+        }
+        ::closedir(d);
+    }
+
+    for (auto& [key, list] : noncurrent)
+    {
+        auto o = b.objects.find(key);
+        auto& kept = b.versions[key];
+        const object_meta* latest = o != b.objects.end() ? &o->second : kept.empty() ? nullptr : &kept.front();
+        const std::string latest_id = latest ? version_of(*latest).id : std::string{};
+        std::vector<object_meta> older;
+        for (found_version& f : list)
+        {
+            // Linked before the rename that replaced it, and the rename then landed: the copy at the usual path wins.
+            if (version_of(f.meta).id == latest_id)
+            {
+                if (::unlink((base + f.rel).c_str()) < 0) {}
+                ++rep.version_duplicates;
+                changed = true;
+                continue;
+            }
+            older.push_back(std::move(f.meta));
+            ++rep.versions;
+        }
+        std::sort(older.begin(), older.end(), [](const object_meta& a, const object_meta& z)
+        {
+            return version_of(a).seq > version_of(z).seq;
+        });
+        for (object_meta& m : older)
+            kept.push_back(std::move(m));
+
+        // Versions with no latest at all, which only a file removed by hand leaves: the newest goes back in place.
+        if (!latest && !kept.empty())
+        {
+            const std::string from = base + version_rel_path(key, version_of(kept.front()).id);
+            const std::string rel  = object_rel_path(key);
+            if (::rename(from.c_str(), (base + "data/" + rel).c_str()) == 0)
+            {
+                if (!fsync_dir_path(base + "data/" + rel.substr(0, 2))) {}
+                if (!is_delete_marker(kept.front()))
+                {
+                    b.objects.emplace(key, std::move(kept.front()));
+                    kept.erase(kept.begin());
+                }
+                changed = true;
+            }
+            else
+                LOG_WARN(("storage: the newest version of \"" + key + "\" in bucket " + b.name +
+                          " could not be made its latest again: " + errstr(errno)).c_str());
+        }
+        if (kept.empty())
+            b.versions.erase(key);
     }
     return true;
 }

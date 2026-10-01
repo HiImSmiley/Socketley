@@ -188,6 +188,7 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
     const xml_node* filter = nullptr;
     const xml_node* prefix = nullptr;
     const xml_node* expiration = nullptr;
+    const xml_node* noncurrent = nullptr;
     const xml_node* abort = nullptr;
     auto once = [&](const xml_node*& slot, const xml_node& k) -> bool
     {
@@ -217,10 +218,7 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
             return false;
         }
         else if (k.name == "NoncurrentVersionExpiration")
-        {
-            err = fail("NotImplemented", "Noncurrent version actions are not supported: this storage keeps no versions");
-            return false;
-        }
+            fresh = once(noncurrent, k);
         else
         {
             err = fail("MalformedXML");
@@ -368,6 +366,34 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         }
     }
 
+    if (noncurrent)
+    {
+        const xml_node* days = nullptr;
+        for (const xml_node& k : noncurrent->kids)
+        {
+            if (k.name == "NewerNoncurrentVersions")
+            {
+                err = fail("NotImplemented", "NewerNoncurrentVersions is not supported");
+                return false;
+            }
+            if (k.name != "NoncurrentDays" || !once(days, k) || !k.kids.empty())
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+        }
+        if (!days)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (!positive_days(*days, r.noncurrent_days))
+        {
+            err = fail("InvalidArgument", "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer");
+            return false;
+        }
+    }
+
     if (abort)
     {
         if (abort->kids.size() != 1 || abort->kids[0].name != "DaysAfterInitiation" || !abort->kids[0].kids.empty())
@@ -383,7 +409,7 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         }
     }
 
-    if (!expiration && !abort)
+    if (!expiration && !abort && !noncurrent)
     {
         err = fail("InvalidRequest", "At least one action needs to be specified in a rule");
         return false;
@@ -514,6 +540,9 @@ std::string lifecycle_xml(const lifecycle_config& c)
         else if (r.delete_marker >= 0)
             x += r.delete_marker ? "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"
                                  : "<Expiration><ExpiredObjectDeleteMarker>false</ExpiredObjectDeleteMarker></Expiration>";
+        if (r.noncurrent_days != 0)
+            x += "<NoncurrentVersionExpiration><NoncurrentDays>" + std::to_string(r.noncurrent_days) +
+                 "</NoncurrentDays></NoncurrentVersionExpiration>";
         if (r.abort_days != 0)
             x += "<AbortIncompleteMultipartUpload><DaysAfterInitiation>" + std::to_string(r.abort_days) +
                  "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
@@ -549,6 +578,23 @@ bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const o
     if (r.has_date)
         return now_ms >= r.expire_date_ms;
     return now_ms >= lifecycle_due_ms(m.mtime_ms, r.expire_days, day_ms);
+}
+
+bool lifecycle_noncurrent_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t since_ms,
+                              int64_t now_ms, int64_t day_ms)
+{
+    if (!r.enabled || r.noncurrent_days == 0 || !key.starts_with(r.prefix))
+        return false;
+    if ((r.has_size_gt && m.size <= r.size_gt) || (r.has_size_lt && m.size >= r.size_lt))
+        return false;
+    if (!r.tags.empty())
+    {
+        const std::string_view stored = tags_of(m);
+        for (const auto& [k, v] : r.tags)
+            if (!tags_have(stored, k, v))
+                return false;
+    }
+    return now_ms >= lifecycle_due_ms(since_ms, r.noncurrent_days, day_ms);
 }
 
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

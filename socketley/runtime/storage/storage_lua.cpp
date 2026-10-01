@@ -63,6 +63,10 @@ std::string_view storage_run::operation_name(const s3_request& r)
         return m == "GET" ? "GetBucketPolicyStatus" : "Unknown";
     if (bucket_level && r.has_query("policy"))
         return m == "GET" ? "GetBucketPolicy" : m == "PUT" ? "PutBucketPolicy" : m == "DELETE" ? "DeleteBucketPolicy" : "Unknown";
+    if (bucket_level && r.has_query("versioning"))
+        return m == "GET" ? "GetBucketVersioning" : m == "PUT" ? "PutBucketVersioning" : "Unknown";
+    if (bucket_level && r.has_query("versions"))
+        return m == "GET" ? "ListObjectVersions" : "Unknown";
     if (bucket_level && r.has_query("lifecycle"))
         return m == "GET" ? "GetBucketLifecycleConfiguration" : m == "PUT" ? "PutBucketLifecycleConfiguration"
              : m == "DELETE" ? "DeleteBucketLifecycle" : "Unknown";
