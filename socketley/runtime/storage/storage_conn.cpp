@@ -202,6 +202,7 @@ void storage_run::tell_started()
     if (++m_start_tries > 30)
     {
         m_start_note = start_note::told;
+        m_node.trust_holders();
         return;
     }
     m_start_note = start_note::telling;

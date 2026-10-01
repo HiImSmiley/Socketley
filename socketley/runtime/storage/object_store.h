@@ -457,8 +457,11 @@ public:
                         std::function<void(remove_result)> cb) = 0;
     virtual void set_tags(uint32_t owner, std::string bucket, std::string key, std::string version_id,
                           std::string tags, std::function<void(st, std::string version_id)> cb) = 0;
-    // Tells every sibling to drop what it holds of the key, and `done` runs once each has answered or is gone.
+    // Tells every sibling that may hold the key to drop it, and `done` runs once each has answered or is gone.
     virtual void invalidate(std::string bucket, std::string key, std::function<void()> done) = 0;
+    // Asks the owner whether `read` is the version it indexes, which also has it tell this shard when that changes.
+    virtual void hold(uint32_t owner, std::string bucket, std::string key, const object_meta& read,
+                      std::function<void(bool)> cb) = 0;
 };
 
 class object_store
@@ -579,8 +582,8 @@ public:
     void hot_charge(size_t n) { m_hot_bytes += n; }
     // Read before a read of another shard's key starts, and handed back to hot_put_foreign when it ends.
     uint64_t hot_epoch() const { return m_drop_epoch; }
-    // Keeps what a read of another shard's key brought in, unless a drop of that key or of its bucket arrived since `epoch`;
-    // an empty `body` keeps the metadata alone, for an object of any size.
+    // Keeps what a read of another shard's key brought in once its owner has said it is current, unless a drop of
+    // that key or of its bucket arrived since `epoch`; an empty `body` keeps the metadata alone, for an object of any size.
     void hot_put_foreign(std::string_view bucket, std::string_view key, uint64_t epoch, const object_meta& read,
                          std::string_view body);
     // The owner's word that the key changed: drops it and refuses the reads that were in flight.
@@ -923,6 +926,8 @@ private:
     // The keys dropped last, so a read can ask whether its own was among those that arrived while it ran.
     static constexpr size_t drop_ring_size = 64;
     void hot_note_drop(uint64_t id_hash);
+    // Whether a read of another shard's key that began at `epoch` may still be kept: no drop of it or of its bucket since.
+    bool hot_foreign_fresh(std::string_view bucket, std::string_view key, uint64_t epoch);
     uint64_t m_drop_epoch{0};
     uint64_t m_drop_ring[drop_ring_size]{};
     uint64_t m_reserved{0};

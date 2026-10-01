@@ -7185,11 +7185,14 @@ later GETs on that shard are answered from the copy without opening the file. On
 shard that owns the key a copy is answered only while it is the version the index
 names. With
 .B \-\-shards
-a shard that does not own the key has no index entry to compare with, so the owner
-tells every other shard to drop its copy of a key after it has committed or deleted it
-and before it answers the client (one round trip to the siblings, in parallel, against
-the milliseconds of the syncs), and a read that a drop of its key arrived during is not
-kept. A PUT, copy, multipart completion or DELETE that was answered is therefore never
+a shard that does not own the key has no index entry to compare with, so it keeps a
+copy only once the key's owner has said the version it read is the one indexed, and
+the owner tells every shard it said that to to drop its copy after it has committed or
+deleted the key and before it answers the client (one round trip to those siblings, in
+parallel, against the milliseconds of the syncs; none for a key no sibling has read),
+and a read that a drop of its key arrived during is not kept. An owner remembers the
+readers of at most 65536 keys, past which it has every sibling drop all its copies of
+the owner's keys and starts again. A PUT, copy, multipart completion or DELETE that was answered is therefore never
 followed by a GET on any shard that returns the bytes it replaced. A sibling that is down
 is not waited for and holds nothing when it starts again, and a shard that starts tells
 the others to drop every copy of its keys, since it may have died between renaming a new
@@ -7323,7 +7326,13 @@ section per shard with
 .B shard_hot_drops_sent
 and
 .B shard_hot_drops_served
-(a sibling told to drop its copy of a key, once per sibling) and
+(a sibling told to drop its copy of a key, once per sibling),
+.B shard_hot_holds_sent
+and
+.B shard_hot_holds_served
+(a sibling asking the owner to keep a copy),
+.B shard_hot_holder_resets
+and
 .BR shard_peer_failures ;
 at one shard nothing is sent and they read zero.
 .PP

@@ -1,6 +1,7 @@
 #include "../../shared/byte_codec.h"
 #include "shard_node.h"
 
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -39,7 +40,7 @@ void shard_node::stop()
 
 void shard_node::each_peer(const std::function<std::string(uint32_t)>& make,
                            std::function<void(uint32_t, bool, std::string_view)> one,
-                           std::function<void()> done)
+                           std::function<void()> done, uint64_t mask)
 {
     struct state
     {
@@ -53,7 +54,7 @@ void shard_node::each_peer(const std::function<std::string(uint32_t)>& make,
 
     std::vector<uint32_t> peers;
     for (uint32_t j = 0; j < m_store.shards(); ++j)
-        if (j != m_store.shard())
+        if (j != m_store.shard() && (mask >> j & 1u))
             peers.push_back(j);
     if (peers.empty())
     {
@@ -146,19 +147,118 @@ void shard_node::invalidate(std::string bucket, std::string key, std::function<v
         done();
         return;
     }
-    m_c.hot_drops_out += m_store.shards() - 1;
-    // A sibling that is gone holds nothing when it comes back, so it is not waited for.
+    const std::string id = holder_id(bucket, key);
+    uint64_t held = take_holders(id);
+    // A sibling an earlier drop of the key is still on its way to is told again, or this change could be answered first.
+    const auto inflight = m_dropping.find(id);
+    if (inflight != m_dropping.end())
+        held |= inflight->second.mask;
+    // Until every sibling has answered this shard's start, one may hold a copy it never asked about.
+    const uint64_t mask = (m_holders_known ? held : ~uint64_t{0}) & ~(uint64_t{1} << m_store.shard()) &
+                          (m_store.shards() >= 64 ? ~uint64_t{0} : (uint64_t{1} << m_store.shards()) - 1);
+    if (mask == 0)
+    {
+        done();
+        return;
+    }
+    m_c.hot_drops_out += static_cast<uint64_t>(std::popcount(mask));
+    dropping& d = inflight != m_dropping.end() ? inflight->second : m_dropping[id];
+    d.mask |= mask;
+    ++d.count;
+    // A sibling that is gone holds nothing when it comes back, so it is not waited for, and is told again next time.
     const std::string payload = wire::encode_hot_drop(bucket, key);
-    each_peer([payload](uint32_t) { return payload; }, [](uint32_t, bool, std::string_view) {},
-              std::move(done));
+    each_peer([payload](uint32_t) { return payload; },
+              [this, id](uint32_t peer, bool ok, std::string_view)
+              {
+                  if (!ok)
+                      m_holders[id] |= uint64_t{1} << peer;
+              },
+              [this, id, done = std::move(done)]()
+              {
+                  if (const auto it = m_dropping.find(id); it != m_dropping.end() && --it->second.count == 0)
+                      m_dropping.erase(it);
+                  done();
+              },
+              mask);
+}
+
+const std::string& shard_node::holder_id(std::string_view bucket, std::string_view key)
+{
+    m_holder_id.assign(bucket);
+    m_holder_id.push_back('\0');
+    m_holder_id.append(key);
+    return m_holder_id;
+}
+
+uint64_t shard_node::take_holders(const std::string& id)
+{
+    uint64_t held = 0;
+    for (holder_map* m : {&m_holders, &m_holders_old})
+        if (const auto it = m->find(id); it != m->end())
+        {
+            held |= it->second;
+            m->erase(it);
+        }
+    return held;
+}
+
+void shard_node::hold(uint32_t owner, std::string bucket, std::string key, const object_meta& read,
+                      std::function<void(bool)> cb)
+{
+    ++m_c.hot_holds_out;
+    auto alive = m_alive;
+    m_transport.call(owner, wire::encode_hot_hold(m_store.shard(), bucket, key, read),
+        [this, alive, cb = std::move(cb)](bool ok, std::string_view reply)
+        {
+            if (!*alive)
+                return;
+            st s = st::io_error;
+            if (!ok || !wire::decode_status(reply, s))
+            {
+                ++m_c.peer_failures;
+                s = st::io_error;
+            }
+            cb(s == st::ok);
+        });
+}
+
+void shard_node::reset_holders()
+{
+    ++m_c.hot_holder_resets;
+    m_resetting = true;
+    m_holders_old.swap(m_holders);
+    m_holders.clear();
+    auto failed = std::make_shared<uint64_t>(0);
+    auto alive  = m_alive;
+    each_peer([this](uint32_t) { return wire::encode_hot_owner_started(m_store.shard()); },
+              [failed](uint32_t peer, bool ok, std::string_view) { if (!ok) *failed |= uint64_t{1} << peer; },
+              [this, alive, failed]()
+              {
+                  if (!*alive)
+                      return;
+                  // A sibling that did not answer may still hold what it asked about, so that much is kept.
+                  if (*failed)
+                      for (const auto& [id, held] : m_holders_old)
+                          if (held & *failed)
+                              m_holders[id] |= held & *failed;
+                  m_holders_old.clear();
+                  m_resetting = false;
+                  m_reset_at = m_holders.size() + m_holders_cap;
+              });
 }
 
 void shard_node::announce_start(std::function<void(bool)> done)
 {
-    auto all = std::make_shared<bool>(true);
+    auto all   = std::make_shared<bool>(true);
+    auto alive = m_alive;
     each_peer([this](uint32_t) { return wire::encode_hot_owner_started(m_store.shard()); },
               [all](uint32_t, bool ok, std::string_view) { *all = *all && ok; },
-              [all, done = std::move(done)]() { done(*all); });
+              [this, alive, all, done = std::move(done)]()
+              {
+                  if (*alive && *all)
+                      trust_holders();
+                  done(*all);
+              });
 }
 
 // ─── Buckets ────────────────────────────────────────────────────────────────
@@ -1102,6 +1202,31 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             }
             ++m_c.hot_drops_in;
             m_store.hot_invalidate(bucket, key);
+            reply(true, wire::encode_status(st::ok));
+            return;
+        }
+        case wire::op::hot_hold:
+        {
+            uint32_t from = 0;
+            std::string bucket, key;
+            object_meta read;
+            if (!wire::decode_hot_hold(payload, from, bucket, key, read) || from >= m_store.shards() ||
+                from == m_store.shard())
+            {
+                reply(false, {});
+                return;
+            }
+            ++m_c.hot_holds_in;
+            // Only the version the index names may be kept, and the change that replaces it will drop it.
+            const object_meta* cur = m_store.owns(bucket, key) ? m_store.find(bucket, key) : nullptr;
+            if (!cur || !(*cur == read))
+            {
+                reply(true, wire::encode_status(st::no_such_key));
+                return;
+            }
+            m_holders[holder_id(bucket, key)] |= uint64_t{1} << from;
+            if (!m_resetting && m_holders.size() > m_reset_at)
+                reset_holders();
             reply(true, wire::encode_status(st::ok));
             return;
         }

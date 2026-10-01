@@ -57,6 +57,8 @@ enum class op : uint8_t
     list_versions = 23,
     doc_prepare   = 24,
     doc_abort     = 25,
+    // From a sibling to the owner of a key: may I keep this version, and tell me when it changes.
+    hot_hold      = 26,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -93,6 +95,10 @@ std::string encode_hot_drop(std::string_view bucket, std::string_view key);
 bool        decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key);
 std::string encode_hot_owner_started(uint32_t shard);
 bool        decode_hot_owner_started(std::string_view payload, uint32_t& shard);
+// The shard asking, and the version of the key it read.
+std::string encode_hot_hold(uint32_t shard, std::string_view bucket, std::string_view key, const object_meta& meta);
+bool        decode_hot_hold(std::string_view payload, uint32_t& shard, std::string& bucket, std::string& key,
+                            object_meta& meta);
 
 std::string encode_list(std::string_view bucket, const list_query& q);
 bool        decode_list(std::string_view payload, std::string& bucket, list_query& q);

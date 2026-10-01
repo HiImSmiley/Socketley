@@ -105,9 +105,14 @@ struct cluster : shard_transport
     std::function<int(uint32_t peer, wire::op o)> fault;
     std::deque<task>                     withheld;
     uint64_t                             calls{0};
+    // Whether each shard tells the others it started, after which its drops go only to the siblings that asked.
+    bool                                 announce{true};
+    // Requests the transport keeps back, delivered in order once `release` is called, for the cases that race one.
+    std::function<bool(const task&)>     hold_back;
+    std::deque<task>                     held_back;
 
-    cluster(std::string d, uint32_t shards, uint64_t max_bytes = 0)
-        : dir(std::move(d))
+    cluster(std::string d, uint32_t shards, uint64_t max_bytes = 0, bool announce_starts = true)
+        : dir(std::move(d)), announce(announce_starts)
     {
         start(shards, max_bytes);
     }
@@ -140,6 +145,10 @@ struct cluster : shard_transport
             mb->store->set_drop_guard([mp](std::string_view bucket) { return mp->bucket_has_uploads(bucket); });
             m.push_back(std::move(mb));
         }
+        if (announce)
+            for (auto& mb : m)
+                mb->node->announce_start([](bool) {});
+        settle();
     }
 
     void stop(bool clean)
@@ -175,6 +184,11 @@ struct cluster : shard_transport
         {
             task t = std::move(queue.front());
             queue.pop_front();
+            if (hold_back && hold_back(t))
+            {
+                held_back.push_back(std::move(t));
+                continue;
+            }
             if (unreachable.contains(t.peer) || t.peer >= m.size())
             {
                 t.cb(false, {});
@@ -205,6 +219,16 @@ struct cluster : shard_transport
         {
             queue.push_back(std::move(withheld.front()));
             withheld.pop_front();
+        }
+    }
+
+    void release()
+    {
+        hold_back = nullptr;
+        while (!held_back.empty())
+        {
+            queue.push_back(std::move(held_back.front()));
+            held_back.pop_front();
         }
     }
 
@@ -253,10 +277,10 @@ struct cluster : shard_transport
     // Starts a put and returns before it ends, for the ones that race.
     std::shared_ptr<put_op> begin(uint32_t s, const std::string& bucket, const std::string& key,
                                   const std::string& body, bool create_only,
-                                  std::function<void(put_result)> done, object_meta meta = {})
+                                  std::function<void(put_result)> done, object_meta meta = {}, bool plain = false)
     {
         st why = st::ok;
-        auto op = m[s]->store->begin_put(bucket, key, std::move(meta), body.size(), true, why);
+        auto op = m[s]->store->begin_put(bucket, key, std::move(meta), body.size(), true, why, plain);
         if (!op)
         {
             done({why, {}});
@@ -324,6 +348,7 @@ struct cluster : shard_transport
         if (get(s, bucket, key, body, &meta) != st::ok)
             return false;
         m[s]->store->hot_put_foreign(bucket, key, epoch, meta, body);
+        settle();
         return held(s, bucket, key);
     }
 
@@ -352,6 +377,8 @@ struct cluster : shard_transport
         bool fired = false;
         m[s]->store->stat_object(bucket, key, [&](st r, const object_meta& mm) { got = r; meta = mm; fired = true; });
         REQUIRE(until([&] { return fired; }));
+        // The copy a stat keeps is kept once the owner has answered for it.
+        settle();
         return got;
     }
 
@@ -724,6 +751,174 @@ TEST_CASE("a commit or a delete is answered only after every sibling has dropped
     CHECK(in > 0);
 }
 
+namespace {
+
+uint64_t drops_sent(cluster& c)
+{
+    uint64_t n = 0;
+    for (uint32_t s = 0; s < c.n; ++s)
+        n += c.m[s]->node->counters().hot_drops_out;
+    return n;
+}
+
+}   // namespace
+
+TEST_CASE("a change is dropped only on the siblings that asked to keep the key, and on none for a key nobody read")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = "k";
+    const uint32_t owner = object_owner("bkt", key, 4);
+    const uint32_t a = (owner + 1) % 4, b = (owner + 2) % 4;
+
+    // Writes landed on every shard of a key no sibling has read cross only to commit.
+    for (uint32_t landing = 0; landing < 4; ++landing)
+        REQUIRE(c.put(landing, "bkt", key, pattern(3000, landing)).status == st::ok);
+    REQUIRE(c.del(a, "bkt", key) == st::ok);
+    CHECK(drops_sent(c) == 0);
+
+    // One sibling reads it, and only that one is told of the next change, wherever it lands.
+    REQUIRE(c.put(owner, "bkt", key, pattern(3000, 7)).status == st::ok);
+    REQUIRE(c.warm(a, "bkt", key));
+    REQUIRE(c.put(b, "bkt", key, pattern(3000, 8)).status == st::ok);
+    CHECK(drops_sent(c) == 1);
+    CHECK(c.copies("bkt", key) == 0);
+    // A drop empties what the owner remembers, so the change after it is told to nobody.
+    REQUIRE(c.put(b, "bkt", key, pattern(3000, 9)).status == st::ok);
+    CHECK(drops_sent(c) == 1);
+
+    // Two readers, and a delete landed on one of them drops both.
+    REQUIRE(c.warm(a, "bkt", key));
+    REQUIRE(c.warm(b, "bkt", key));
+    REQUIRE(c.del(a, "bkt", key) == st::ok);
+    CHECK(drops_sent(c) == 3);
+    CHECK(c.copies("bkt", key) == 0);
+    std::string body;
+    CHECK(c.get(b, "bkt", key, body) == st::no_such_key);
+}
+
+TEST_CASE("a change made while a drop of the key is on its way is answered only after that sibling has dropped it")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = "k";
+    const uint32_t owner = object_owner("bkt", key, 4);
+    const uint32_t reader = (owner + 1) % 4;
+    // A put that takes a file from the pool answers before its syncs, so the next put of the key starts before its
+    // drops are answered; the first puts make the pool.
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        bool filled = false;
+        auto fill = c.begin(owner, "bkt", key, pattern(3000, 1), false, [&](put_result) { filled = true; }, {}, true);
+        REQUIRE(c.until([&] { return filled; }));
+        c.settle();
+    }
+    REQUIRE(c.warm(reader, "bkt", key));
+
+    // The reader's drops are kept back while two puts from the pool land on the owner, one behind the other.
+    c.hold_back = [&](const cluster::task& t)
+    {
+        wire::op o{};
+        return t.peer == reader && wire::request_op(t.payload, o) && o == wire::op::hot_drop;
+    };
+    bool one = false, two = false;
+    auto p1 = c.begin(owner, "bkt", key, pattern(3000, 2), false, [&](put_result r) { CHECK(r.status == st::ok); one = true; }, {}, true);
+    auto p2 = c.begin(owner, "bkt", key, pattern(3000, 3), false, [&](put_result r) { CHECK(r.status == st::ok); two = true; }, {}, true);
+    c.until([&] { return one || two; }, 500);
+    // Neither may be answered while the reader still answers the version both replaced.
+    CHECK_FALSE(one);
+    CHECK_FALSE(two);
+    REQUIRE(c.held(reader, "bkt", key));
+
+    c.release();
+    REQUIRE(c.until([&] { return one && two; }));
+    CHECK_FALSE(c.held(reader, "bkt", key));
+}
+
+TEST_CASE("until its siblings have answered its start, an owner drops a change on every one of them")
+{
+    tmpdir d;
+    cluster c(d.path, 4, 0, false);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    REQUIRE(c.put(1, "bkt", "k", pattern(3000, 1)).status == st::ok);
+    CHECK(drops_sent(c) == 3);
+    const uint32_t owner = object_owner("bkt", "k", 4);
+    bool all = false;
+    c.m[owner]->node->announce_start([&](bool ok) { all = ok; });
+    c.settle();
+    REQUIRE(all);
+    REQUIRE(c.put(1, "bkt", "k", pattern(3000, 2)).status == st::ok);
+    CHECK(drops_sent(c) == 3);
+}
+
+TEST_CASE("a sibling keeps nothing of a version its owner had replaced by the time it asked")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const uint32_t owner = object_owner("bkt", "k", 4);
+    const uint32_t reader = (owner + 1) % 4;
+    REQUIRE(c.put(0, "bkt", "k", pattern(3000, 1)).status == st::ok);
+
+    // The reader is no holder, so the overwrite tells it nothing and the epoch cannot catch the old read.
+    const uint64_t epoch = c.m[reader]->store->hot_epoch();
+    std::string old_body;
+    object_meta old_meta;
+    REQUIRE(c.get(reader, "bkt", "k", old_body, &old_meta) == st::ok);
+    REQUIRE(c.put(2, "bkt", "k", pattern(3000, 2)).status == st::ok);
+    REQUIRE(drops_sent(c) == 0);
+    REQUIRE(c.m[reader]->store->hot_epoch() == epoch);
+    c.m[reader]->store->hot_put_foreign("bkt", "k", epoch, old_meta, old_body);
+    c.settle();
+    CHECK_FALSE(c.held(reader, "bkt", "k"));
+    // Nor of one deleted.
+    REQUIRE(c.warm(reader, "bkt", "k"));
+    std::string cur_body;
+    object_meta cur_meta;
+    REQUIRE(c.get(reader, "bkt", "k", cur_body, &cur_meta) == st::ok);
+    REQUIRE(c.del(3, "bkt", "k") == st::ok);
+    CHECK_FALSE(c.held(reader, "bkt", "k"));
+    c.m[reader]->store->hot_put_foreign("bkt", "k", c.m[reader]->store->hot_epoch(), cur_meta, cur_body);
+    c.settle();
+    CHECK_FALSE(c.held(reader, "bkt", "k"));
+}
+
+TEST_CASE("an owner that remembers too many readers has every sibling drop its keys, and tracks the readers after it")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const uint32_t owner = 0;
+    std::vector<std::string> keys;
+    for (int i = 0; keys.size() < 6; ++i)
+        if (object_owner("bkt", "obj" + std::to_string(i), 3) == owner)
+            keys.push_back("obj" + std::to_string(i));
+    for (const auto& k : keys)
+        REQUIRE(c.put(1, "bkt", k, pattern(1000, static_cast<unsigned>(k.size()))).status == st::ok);
+    c.m[owner]->node->set_holders_cap(4);
+
+    for (size_t i = 0; i < 4; ++i)
+        REQUIRE(c.warm(1, "bkt", keys[i]));
+    CHECK(c.m[owner]->node->counters().hot_holder_resets == 0);
+    CHECK(c.m[owner]->node->holders() == 4);
+    // The fifth goes past the cap: the siblings drop every copy of the owner's keys, that one too, and the owner forgets them.
+    CHECK_FALSE(c.warm(2, "bkt", keys[4]));
+    CHECK(c.m[owner]->node->counters().hot_holder_resets == 1);
+    for (size_t i = 0; i < 5; ++i)
+        CHECK(c.copies("bkt", keys[i]) == 0);
+    CHECK(c.m[owner]->node->holders() == 0);
+
+    // A copy kept after the reset is remembered and dropped by the next change.
+    REQUIRE(c.warm(1, "bkt", keys[5]));
+    CHECK(c.m[owner]->node->holders() == 1);
+    const uint64_t before = drops_sent(c);
+    REQUIRE(c.put(2, "bkt", keys[5], pattern(1000, 99)).status == st::ok);
+    CHECK(drops_sent(c) == before + 1);
+    CHECK(c.copies("bkt", keys[5]) == 0);
+}
+
 TEST_CASE("a read of the old file that ends after the overwrite was answered is not kept")
 {
     tmpdir d;
@@ -744,6 +939,7 @@ TEST_CASE("a read of the old file that ends after the overwrite was answered is 
     REQUIRE(c.put(0, "bkt", "k", v2).status == st::ok);
     // ...and only then does the read end.
     c.m[reader]->store->hot_put_foreign("bkt", "k", epoch, old_meta, old_body);
+    c.settle();
     CHECK_FALSE(c.held(reader, "bkt", "k"));
     // The next read keeps the new version.
     REQUIRE(c.warm(reader, "bkt", "k"));
@@ -808,6 +1004,7 @@ TEST_CASE("a stat of another shard's key reads its header once and never answers
         REQUIRE(c.stat(owner, "bkt", key, old) == st::ok);
         REQUIRE(c.put(owner, "bkt", key, pattern(size + 9, 30)).status == st::ok);
         c.m[reader]->store->hot_put_foreign("bkt", key, epoch, old, {});
+        c.settle();
         object_meta now;
         REQUIRE(c.stat(reader, "bkt", key, now) == st::ok);
         CHECK(now.size == size + 9);

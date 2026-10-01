@@ -204,27 +204,42 @@ void object_store::hot_note_drop(uint64_t id_hash)
     ++m_drop_epoch;
 }
 
+bool object_store::hot_foreign_fresh(std::string_view bucket_name, std::string_view key, uint64_t epoch)
+{
+    const bucket* b = find_bucket(bucket_name);
+    if (m_hot_budget == 0 || !b || b->closing)
+        return false;
+    // A read that began before a drop and ended after it may hold the version the drop replaced.
+    if (m_drop_epoch == epoch)
+        return true;
+    if (m_drop_epoch - epoch > drop_ring_size)
+        return false;
+    const uint64_t h = drop_hash(hot_id(bucket_name, key));
+    for (uint64_t e = epoch; e != m_drop_epoch; ++e)
+        if (m_drop_ring[e % drop_ring_size] == 0 || m_drop_ring[e % drop_ring_size] == h)
+            return false;
+    return true;
+}
+
 void object_store::hot_put_foreign(std::string_view bucket_name, std::string_view key, uint64_t epoch,
                                    const object_meta& read, std::string_view body)
 {
     const bool whole = body.size() == read.size && read.size <= hot_max_object;
-    if (m_hot_budget == 0 || (!whole && !body.empty()))
+    if ((!whole && !body.empty()) || !hot_foreign_fresh(bucket_name, key, epoch))
         return;
-    const bucket* b = find_bucket(bucket_name);
-    if (!b || b->closing)
-        return;
-    const std::string& id = hot_id(bucket_name, key);
-    // A read that began before a drop and ended after it may hold the version the drop replaced.
-    if (m_drop_epoch != epoch)
+    if (!m_peers)
     {
-        if (m_drop_epoch - epoch > drop_ring_size)
-            return;
-        const uint64_t h = drop_hash(id);
-        for (uint64_t e = epoch; e != m_drop_epoch; ++e)
-            if (m_drop_ring[e % drop_ring_size] == 0 || m_drop_ring[e % drop_ring_size] == h)
-                return;
+        hot_insert(hot_id(bucket_name, key), read, body, nullptr);
+        return;
     }
-    hot_insert(id, read, body, nullptr);
+    // The owner drops only the copies it was asked about, so a copy is kept once the owner has heard of it.
+    auto alive = m_alive;
+    m_peers->hold(owner_of(bucket_name, key), std::string(bucket_name), std::string(key), read,
+        [this, alive, epoch, read, b = std::string(bucket_name), k = std::string(key), kept = std::string(body)](bool current)
+        {
+            if (*alive && current && hot_foreign_fresh(b, k, epoch))
+                hot_insert(hot_id(b, k), read, kept, nullptr);
+        });
 }
 
 void object_store::hot_invalidate(std::string_view bucket_name, std::string_view key)
