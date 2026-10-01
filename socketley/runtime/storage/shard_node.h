@@ -123,7 +123,12 @@ private:
     void run_drop(std::string name, std::function<void(st)> cb);
     // Shard 0's half of set_doc, one change of a bucket at a time so every shard hears them in one order.
     void run_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
+    // Removes a change no shard will make and tells the others so, then runs `then` and the next change.
+    void abandon_doc(bucket_doc kind, std::string name, uint64_t seq, std::function<void()> then);
+    void tell_abandoned(bucket_doc kind, const std::string& name, uint64_t seq);
     void doc_next(const std::string& name);
+    // Whether SOCKETLEY_STORAGE_DOC_FAULT, a test hook, says a document message of `phase` is lost on its way here.
+    bool doc_fault(std::string_view phase) const;
 
     // Asks every shard but this one, and `done` runs when the last has answered.
     void each_peer(const std::function<std::string(uint32_t peer)>& make,
@@ -139,6 +144,9 @@ private:
     shard_counters   m_c;
     // The document changes of a bucket waiting behind the one being made.
     std::map<std::string, std::deque<std::function<void()>>> m_doc_lanes;
+    // The number of the last change shard 0 asked the others to prepare for.
+    uint64_t m_doc_seq{0};
+    std::string m_doc_fault;
     std::shared_ptr<bool> m_alive;
 };
 

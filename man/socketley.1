@@ -6501,9 +6501,11 @@ written beside it, synced and renamed over it, so they survive a restart and a
 crash leaves the old rules or the new ones; they go with the bucket when it is
 deleted, and a bucket made again under the name has none. With
 .B \-\-shards
-shard 0 writes them, whichever shard took the request, and every shard has them
-before the request is answered; a shard that was not running reads them from the
-file when it starts.
+shard 0 writes them, whichever shard took the request, as described for the
+policy under
+.BR "Bucket policy" :
+the request is answered once no shard can go on with the old rules, and a shard
+that was not running reads them from the file when it starts.
 .PP
 A preflight,
 .B OPTIONS
@@ -6750,8 +6752,11 @@ new latest replaces is linked to
 and that directory synced before the new file is renamed over it, and the 256
 directories of
 .B versions/
-are made with the configuration, which shard 0 writes like the CORS and lifecycle
-documents. Each version's header carries its id and its order among the key's
+are made with the configuration, which shard 0 changes like the CORS and lifecycle
+documents (see
+.BR "Bucket policy" );
+the owner of a key writes nothing to it while unsure of the configuration, and a
+write through another shard is then answered 503. Each version's header carries its id and its order among the key's
 versions, written there by the key's owner, which answers only once the file, the
 link and both directories are synced; a versioned put therefore takes a header
 write and up to two syncs more than an unversioned one, and never a file of the pool. A
@@ -6840,7 +6845,11 @@ aborts uploads (an upload has neither yet) or one with
 The rules are synced into
 .IB dir / bucket /lifecycle
 before the answer, so they survive a stop or a crash, and go with the bucket
-when it is deleted.
+when it is deleted. With
+.B \-\-shards
+a change is answered once no shard can go on with the old rules, and a shard
+unsure of them expires nothing in the bucket until it has read them (see
+.BR "Bucket policy" ).
 .PP
 The rules are carried out by a sweep in each shard over the keys and uploads it
 owns. An object expires
@@ -7041,17 +7050,62 @@ a policy looks nothing up, a signed request to a bucket whose policy has no
 .B Deny
 looks up the bucket and nothing more, and only a statement that compares
 .B aws:SourceIp
-asks the kernel for the client's address, once per connection. An anonymous GET
-of a key that is not there under an allowed prefix is
+asks the kernel for the client's address, once per connection.
+.PP
+As in S3, a request a policy lets in is told a key is not there only if it may
+list the bucket the key would be in: a GET, HEAD or other object request for a
+missing key is
 .B "404 NoSuchKey"
-rather than S3's 403 for a caller without ListBucket.
+when
+.B s3:ListBucket
+on the bucket applies to the requester (an
+.B Allow
+for an anonymous request, no
+.B Deny
+for a signed one or on a runtime with
+.BR \-\-anonymous ),
+and
+.B "403 AccessDenied"
+when it does not. For a copy the bucket is the source's.
 .PP
 The policy is kept in
 .IB dir / bucket /policy ,
 written beside it, synced and renamed over it, so it survives a restart and a
-crash leaves the old one or the new; it goes with the bucket, and with
+crash leaves the old one or the new; it goes with the bucket. A stored policy that
+does not compile when a shard starts, because the file was edited or this version
+refuses what an older one took, is not skipped: the bucket refuses every request
+with
+.B "403 AccessDenied"
+naming why, except Put, Get and Delete BucketPolicy and GetBucketPolicyStatus by
+the runtime's keys, so it can be read back and replaced or removed, and the log has
+an error saying so.
+.PP
+With
 .B \-\-shards
-shard 0 writes it and every shard has it before the request is answered.
+shard 0 makes every change of a bucket's policy and CORS, lifecycle and versioning configuration,
+one at a time per bucket, whichever shard took the request, and answers it only once
+no running shard can go on with the old document. It writes the new one beside the
+file as
+.IB kind .new
+(empty for a removal), asks every other shard to stop serving the bucket until it
+learns how the change ended, and only when all of them have promised renames it over
+the file (or removes the file), tells them the new document and answers; a shard it
+cannot reach, because it is stopped, starting, wedged or cut off, fails the change
+with
+.B "503 ServiceUnavailable"
+and nothing changes anywhere, since the file is removed and the shards that promised
+are released. A shard that promised and is never told the outcome serves nothing of
+that bucket (503 ServiceUnavailable, which clients retry) until it reads the outcome
+from the files: while
+.IB kind .new
+exists the change is undecided, and once it is gone the file is the document. A
+shard re-reads them at its next request to the bucket and at its periodic sweep, so a
+lost message delays a shard and never leaves it with the old document; a request on
+another shard during the moment between a shard's promise and the rename can be
+answered 503 the same way. A shard that starts while a change is undecided, or takes a
+bucket up later than the others, reads the bucket's documents the same way before
+serving it. This costs a runtime with no change in flight one counter load per
+request.
 .SS How objects are stored
 An object is one file at
 .IB dir / bucket /data/ ab / sha256(key)
@@ -7236,8 +7290,11 @@ reached fails the listing with a 500 rather than shortening it.
 .PP
 Buckets are made and dropped by shard 0 and told to the others before it answers;
 a bucket is dropped only when every shard agrees it holds nothing and is idle. A
-bucket's CORS, lifecycle and versioning configurations and its policy are written by shard 0 the same way, one change of a bucket at a time, whichever
-shard took the request, and each shard sweeps the keys it owns.
+bucket's CORS, lifecycle and versioning configurations and its policy are changed by shard 0, one change of a bucket at a time, whichever
+shard took the request, and answered only once no shard can go on with the old document; a change a running shard
+cannot be told of is refused with 503 and changes nothing (see
+.BR "Bucket policy" ).
+Each shard sweeps the keys it owns.
 Temporary files are named for the shard that wrote them, so a shard restarted by
 the supervisor removes only its own. A shard killed between a rename and its
 journal record leaves the object in the directory, and its restart adopts it from
@@ -11585,6 +11642,16 @@ string kills the worker with
 after renaming the body into place and before the journal record, so a test can
 put a crash at the one step that leaves a file the journal does not name. Unset
 by default.
+.TP
+.B SOCKETLEY_STORAGE_DOC_FAULT
+A test hook: a directory in which a file named
+.IB shard . phase
+(\fBprepare\fR, \fBcommit\fR or \fBabort\fR) makes that shard of a sharded storage
+runtime answer the message of that phase of a bucket document change as a sibling
+that could not be reached would, without acting on it, for as long as the file
+exists, so a test can lose a message at each step of the change. Unset by default.
+.IP
+Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_SPLICE_MIN
 The size in bytes from which a storage GET is sent by splice from the file to

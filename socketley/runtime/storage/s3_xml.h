@@ -153,6 +153,7 @@ inline s3_error error_for(st s)
         case st::no_such_version:     return make_error("NoSuchVersion");
         // A delete marker has no bytes, tags or metadata to act on.
         case st::delete_marker:       return make_error("MethodNotAllowed");
+        case st::unavailable:         return make_error("ServiceUnavailable");
         case st::ok:
         case st::io_error:
             break;

@@ -641,10 +641,23 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     {
         const std::string file = base + "/" + doc_file(kind);
         if (m_opts.shard == 0 && ::unlink((file + ".new").c_str()) < 0) {}
+        // A change shard 0 has not decided yet leaves this shard serving nothing of the bucket until it has.
+        if (m_opts.shard != 0 && ::access((file + ".new").c_str(), F_OK) == 0)
+        {
+            set_doubt(*b, kind, 0);
+            continue;
+        }
         const std::string xml = slurp(file, doc_max_bytes);
-        if (!xml.empty() && !take_doc(*b, kind, xml))
+        std::string why;
+        if (xml.empty() || take_doc(*b, kind, xml, &why))
+            continue;
+        if (kind == bucket_doc::policy)
+            LOG_ERROR(("storage: the policy of bucket " + name + " does not compile (" + why +
+                       "), so the bucket refuses every request but the policy's own until it is replaced or deleted")
+                          .c_str());
+        else
             LOG_WARN(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + name +
-                      " does not parse and is not applied").c_str());
+                      " does not parse and is not applied: " + why).c_str());
     }
 
     // A versioned bucket has the directories of its noncurrent versions, which a start makes again when one is gone.

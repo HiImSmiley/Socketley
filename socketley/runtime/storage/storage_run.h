@@ -329,6 +329,8 @@ struct conn
     // The request carried no credentials, and was let in by a bucket policy rather than by the runtime.
     bool        anonymous{false};
     bool        policy_admitted{false};
+    // A missing key is answered AccessDenied, for a requester a policy lets read and not list, as S3 does.
+    bool        hide_missing{false};
 };
 
 // An object's metadata as a script sees it: the user metadata without its
@@ -573,6 +575,8 @@ public:
     policy_effect policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q);
     // Whether this request's policies let it remove version `version_id`'s key, which DeleteObjects names only in its body.
     bool policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key);
+    // False, with the request refused, while a bucket it touches is waiting to learn of a change to its documents.
+    bool docs_settled(const std::shared_ptr<conn>& c);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                       std::string src_version, bool replace, const object_meta& src_meta);

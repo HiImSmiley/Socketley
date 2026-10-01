@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -105,7 +106,9 @@ private:
         };
         if (m_pos < m_in.size() && m_in[m_pos] == '-')
             ++m_pos;
-        if (!digits())
+        const size_t first = m_pos;
+        // JSON writes no leading zero, so "01" is not a number some other reader would take as one.
+        if (!digits() || (m_in[first] == '0' && m_pos - first > 1))
             return false;
         if (m_pos < m_in.size() && m_in[m_pos] == '.')
         {
@@ -171,6 +174,35 @@ private:
         }
     }
 
+    // One character of raw UTF-8 whose first byte was just read, refused unless it is the shortest form of a scalar value.
+    bool utf8_char(unsigned char lead, std::string& out)
+    {
+        size_t   n  = 0;
+        uint32_t cp = 0;
+        if (lead >= 0xC2 && lead <= 0xDF)
+            n = 1, cp = lead & 0x1Fu;
+        else if (lead >= 0xE0 && lead <= 0xEF)
+            n = 2, cp = lead & 0x0Fu;
+        else if (lead >= 0xF0 && lead <= 0xF4)
+            n = 3, cp = lead & 0x07u;
+        else
+            return false;
+        if (n > m_in.size() - m_pos)
+            return false;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const auto b = static_cast<unsigned char>(m_in[m_pos + i]);
+            if ((b & 0xC0) != 0x80)
+                return false;
+            cp = (cp << 6) | (b & 0x3Fu);
+        }
+        if ((n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+        out.append(m_in.data() + m_pos - 1, n + 1);
+        m_pos += n;
+        return true;
+    }
+
     bool string(std::string& out)
     {
         ++m_pos;
@@ -182,6 +214,12 @@ private:
                 return true;
             if (static_cast<unsigned char>(c) < 0x20)
                 return false;
+            if (static_cast<unsigned char>(c) >= 0x80)
+            {
+                if (!utf8_char(static_cast<unsigned char>(c), out))
+                    return false;
+                continue;
+            }
             if (c != '\\')
             {
                 out += c;
@@ -269,10 +307,6 @@ private:
             std::string name;
             if (!string(name))
                 return false;
-            // A field given twice would be read one way here and another way by whoever wrote it.
-            for (const auto& m : v.members)
-                if (m.first == name)
-                    return false;
             ws();
             if (m_pos >= m_in.size() || m_in[m_pos++] != ':')
                 return false;
@@ -285,11 +319,22 @@ private:
             if (m_in[m_pos] == '}')
             {
                 ++m_pos;
-                return true;
+                return unique_names(v);
             }
             if (m_in[m_pos++] != ',')
                 return false;
         }
+    }
+
+    // A field given twice would be read one way here and another way by whoever wrote it.
+    static bool unique_names(const jvalue& v)
+    {
+        std::vector<std::string_view> names;
+        names.reserve(v.members.size());
+        for (const auto& m : v.members)
+            names.emplace_back(m.first);
+        std::sort(names.begin(), names.end());
+        return std::adjacent_find(names.begin(), names.end()) == names.end();
     }
 
     std::string_view m_in;
@@ -993,8 +1038,19 @@ bool bucket_policy::compile(std::string_view json, std::string_view bucket, buck
     return true;
 }
 
+bucket_policy bucket_policy::refusing(std::string_view json, std::string why)
+{
+    bucket_policy p;
+    p.m_text     = std::string(json);
+    p.m_broken   = why.empty() ? std::string("it does not compile") : std::move(why);
+    p.m_has_deny = true;
+    return p;
+}
+
 policy_effect bucket_policy::evaluate(const policy_request& r) const
 {
+    if (!m_broken.empty())
+        return policy_effect::deny;
     const uint64_t bit = action_bit(r.action);
     const bool object  = action_on_object(r.action);
     bool allowed = false;

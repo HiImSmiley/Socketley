@@ -147,9 +147,10 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     // A copy reads its source, which the source bucket's policy has its say on as a GetObject.
     const bool copy = copy_from && action == s3_action::put_object;
     policy_effect src = policy_effect::none;
+    std::string sb, sk;
     if (copy)
     {
-        std::string sb, sk, sv;
+        std::string sv;
         s3_error    ignored;
         if (parse_copy_source(r.header("x-amz-copy-source"), sb, sk, ignored, &sv))
         {
@@ -164,18 +165,51 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     {
         v.allowed = false;
         v.error   = make_error("AccessDenied");
+        const bucket_policy* broken = m_store.policy(dest == policy_effect::deny ? std::string_view(r.bucket)
+                                                                                 : std::string_view(sb));
+        if (broken && !broken->broken().empty())
+            v.error.message = "The policy stored for this bucket cannot be applied (" + broken->broken() +
+                              "), so only the bucket policy operations are served until it is replaced or deleted";
         v.hook.reset();
         return;
     }
-    if (v.allowed || !v.anonymous)
-        return;
-    if (dest == policy_effect::allow && (!copy || src == policy_effect::allow))
+    // Whether the credentials alone let the request in, which is to have every permission no Deny takes away.
+    const bool by_credentials = v.allowed;
+    if (!v.allowed && v.anonymous && dest == policy_effect::allow && (!copy || src == policy_effect::allow))
     {
         v.allowed = true;
         v.error   = {};
         v.hook    = unsigned_trailer_hook(rv);
         c->policy_admitted = true;
     }
+    if (!v.allowed || !(copy || action_on_object(action)))
+        return;
+    // A key that is not there is told only to whoever may list the bucket it would be in.
+    policy_request lq = pr;
+    lq.action    = s3_action::list_bucket;
+    lq.key       = {};
+    lq.every_key = false;
+    const policy_effect list = judge(copy ? std::string_view(sb) : std::string_view(r.bucket), lq);
+    c->hide_missing = list == policy_effect::deny || (!by_credentials && list != policy_effect::allow);
+}
+
+bool storage_run::docs_settled(const std::shared_ptr<conn>& c)
+{
+    const s3_request& r = c->req;
+    bool settled = r.bucket.empty() || m_store.docs_settled(r.bucket);
+    if (settled && r.method == "PUT" && !r.key.empty() && r.has_header("x-amz-copy-source"))
+    {
+        std::string sb, sk;
+        s3_error    ignored;
+        if (parse_copy_source(r.header("x-amz-copy-source"), sb, sk, ignored))
+            settled = m_store.docs_settled(sb);
+    }
+    if (settled)
+        return true;
+    s3_error e = make_error("ServiceUnavailable");
+    e.message  = "A change to the configuration of this bucket is being made, so retry the request";
+    deny_request(c, e);
+    return false;
 }
 
 policy_effect storage_run::policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket,

@@ -1,8 +1,12 @@
 #include "../../shared/byte_codec.h"
 #include "shard_node.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <vector>
+
+#include <unistd.h>
 
 #include "s3_names.h"
 #include "shard_wire.h"
@@ -15,6 +19,11 @@ shard_node::shard_node(object_store& store, shard_transport& transport)
     : m_store(store), m_transport(transport), m_alive(std::make_shared<bool>(true))
 {
     m_store.set_peers(this);
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_DOC_FAULT"))
+        m_doc_fault = e;
+    // Begun past any number an earlier run of shard 0 handed out, so a late word from it is never taken for a new change.
+    m_doc_seq = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 shard_node::~shard_node()
@@ -379,7 +388,9 @@ void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std
     auto alive = m_alive;
     auto run = [this, alive, kind, name, xml = std::move(xml), cb = std::move(cb)]()
     {
-        m_store.write_doc(kind, name, xml, [this, alive, kind, name, xml, cb](st s)
+        // The change is a file beside the document until every shard has promised to serve nothing of the bucket
+        // without first learning how it ended, so no shard that missed the outcome can go on with the old one.
+        m_store.stage_doc(kind, name, xml, [this, alive, kind, name, xml, cb](st s)
         {
             if (!*alive)
                 return;
@@ -389,21 +400,55 @@ void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std
                 doc_next(name);
                 return;
             }
-            each_peer([kind, name, xml](uint32_t) { return wire::encode_doc(wire::op::doc_adopt, kind, name, xml); },
-                      [kind, name](uint32_t peer, bool ok, std::string_view reply)
+            const uint64_t seq = ++m_doc_seq;
+            auto all = std::make_shared<bool>(true);
+            each_peer([kind, name, seq](uint32_t) { return wire::encode_doc(wire::op::doc_prepare, kind, name, {}, seq); },
+                      [all](uint32_t, bool ok, std::string_view reply)
                       {
                           st a = st::io_error;
-                          if (!ok || !wire::decode_status(reply, a) || a != st::ok)
-                              LOG_WARN(("storage: shard " + std::to_string(peer) + " did not take up the " +
-                                        doc_label(kind) + " of " +
-                                        name + "; it does when it next starts").c_str());
+                          *all = *all && ok && wire::decode_status(reply, a) && a == st::ok;
                       },
-                      [this, alive, name, cb]()
+                      [this, alive, kind, name, xml, cb, seq, all]()
                       {
                           if (!*alive)
                               return;
-                          cb(st::ok);
-                          doc_next(name);
+                          if (!*all)
+                          {
+                              LOG_WARN(("storage: a shard could not be reached, so the " + doc_label(kind) + " of " +
+                                        name + " is left as it was").c_str());
+                              abandon_doc(kind, name, seq, [cb]() { cb(st::unavailable); });
+                              return;
+                          }
+                          m_store.commit_doc(kind, name, xml, [this, alive, kind, name, xml, cb, seq](bool visible, st c)
+                          {
+                              if (!*alive)
+                                  return;
+                              if (!visible)
+                              {
+                                  tell_abandoned(kind, name, seq);
+                                  cb(c);
+                                  doc_next(name);
+                                  return;
+                              }
+                              // A shard this misses is still waiting, and settles from the file before it serves the bucket.
+                              each_peer([kind, name, xml, seq](uint32_t)
+                                        { return wire::encode_doc(wire::op::doc_adopt, kind, name, xml, seq); },
+                                        [kind, name](uint32_t peer, bool ok, std::string_view)
+                                        {
+                                            if (!ok)
+                                                LOG_WARN(("storage: shard " + std::to_string(peer) + " was not told the " +
+                                                          doc_label(kind) + " of " + name +
+                                                          "; it reads it from the file before it serves the bucket")
+                                                             .c_str());
+                                        },
+                                        [this, alive, name, cb, c]()
+                                        {
+                                            if (!*alive)
+                                                return;
+                                            cb(c);
+                                            doc_next(name);
+                                        });
+                          });
                       });
         });
     };
@@ -412,6 +457,34 @@ void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std
         run();
     else
         it->second.push_back(std::move(run));
+}
+
+void shard_node::abandon_doc(bucket_doc kind, std::string name, uint64_t seq, std::function<void()> then)
+{
+    auto alive = m_alive;
+    m_store.abandon_doc(kind, name, [this, alive, kind, name, seq, then]()
+    {
+        if (!*alive)
+            return;
+        tell_abandoned(kind, name, seq);
+        then();
+        doc_next(name);
+    });
+}
+
+void shard_node::tell_abandoned(bucket_doc kind, const std::string& name, uint64_t seq)
+{
+    // Not waited for: a shard this misses settles from the file, which no longer has the change.
+    const std::string payload = wire::encode_doc(wire::op::doc_abort, kind, name, {}, seq);
+    for (uint32_t j = 0; j < m_store.shards(); ++j)
+        if (j != m_store.shard())
+            m_transport.call(j, payload, [](bool, std::string_view) {});
+}
+
+bool shard_node::doc_fault(std::string_view phase) const
+{
+    return !m_doc_fault.empty() &&
+           ::access((m_doc_fault + "/" + std::to_string(m_store.shard()) + "." + std::string(phase)).c_str(), F_OK) == 0;
 }
 
 void shard_node::doc_next(const std::string& name)
@@ -1045,21 +1118,36 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             return;
         }
         case wire::op::doc_put:
+        case wire::op::doc_prepare:
         case wire::op::doc_adopt:
+        case wire::op::doc_abort:
         {
             bucket_doc kind{};
             std::string bucket, xml;
-            if (!wire::decode_doc(payload, o, kind, bucket, xml) || (o == wire::op::doc_put && m_store.shard() != 0))
+            uint64_t seq = 0;
+            if (!wire::decode_doc(payload, o, kind, bucket, xml, seq) || (o == wire::op::doc_put) != (m_store.shard() == 0))
             {
                 reply(false, {});
                 return;
             }
-            if (o == wire::op::doc_adopt)
+            if (o == wire::op::doc_put)
             {
-                reply(true, wire::encode_status(m_store.adopt_doc(kind, bucket, xml)));
+                run_doc(kind, std::move(bucket), std::move(xml), [reply](st s) { reply(true, wire::encode_status(s)); });
                 return;
             }
-            run_doc(kind, std::move(bucket), std::move(xml), [reply](st s) { reply(true, wire::encode_status(s)); });
+            // A test hook: a message of this phase is lost on its way to this shard while the hook's file exists.
+            if (doc_fault(o == wire::op::doc_prepare ? "prepare" : o == wire::op::doc_adopt ? "commit" : "abort"))
+            {
+                reply(false, {});
+                return;
+            }
+            if (o == wire::op::doc_prepare)
+                reply(true, wire::encode_status(m_store.doubt_doc(kind, bucket, seq)));
+            else
+            {
+                m_store.decided_doc(kind, bucket, seq, o == wire::op::doc_adopt ? &xml : nullptr);
+                reply(true, wire::encode_status(st::ok));
+            }
             return;
         }
         case wire::op::list:

@@ -8,6 +8,7 @@
 #include <csignal>
 
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "bucket_policy.h"
 #include "disk_chain.h"
@@ -74,6 +75,7 @@ const char* status_name(st s)
         case st::cancelled:           return "cancelled";
         case st::no_such_version:     return "no such version";
         case st::delete_marker:       return "delete marker";
+        case st::unavailable:         return "unavailable";
     }
     return "unknown";
 }
@@ -1263,6 +1265,13 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
         cb({st::io_error, req.meta});
         return;
     }
+    // The owner decides whether a write makes a version, so it writes nothing by a versioning it may hold an old copy of.
+    if (!versioning_settled(*b))
+    {
+        if (!m_io->unlinkat(b->tmp_fd, req.tmp_name, 0, [](int64_t) {})) {}
+        cb({st::unavailable, req.meta});
+        return;
+    }
     ++b->active_ops;
     ++m_inflight;
 
@@ -1527,6 +1536,11 @@ void object_store::remove_version_local(std::string_view bucket_name, std::strin
         cb({st::io_error});
         return;
     }
+    if (!versioning_settled(*b))
+    {
+        cb({st::unavailable});
+        return;
+    }
     ++b->active_ops;
     ++m_inflight;
 
@@ -1735,6 +1749,11 @@ void object_store::set_tags_local(std::string_view bucket_name, std::string_view
         LOG_WARN(("storage: a tag change for a key that shard " + std::to_string(owner_of(bucket_name, key)) +
                   " owns reached shard " + std::to_string(m_opts.shard)).c_str());
         cb(st::io_error, {});
+        return;
+    }
+    if (!versioning_settled(*b))
+    {
+        cb(st::unavailable, {});
         return;
     }
     ++b->active_ops;
@@ -2422,6 +2441,8 @@ struct create_state
     int64_t     created_ms{0};
     // The next of the 256 object directories to make; 256 when they are all there.
     int         fan{256};
+    // Taken up from shard 0 rather than made here.
+    bool        adopt{false};
     std::string text;
     std::function<void(st)> cb;
 };
@@ -2469,6 +2490,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
     auto cs  = std::make_shared<create_state>();
     cs->name = std::move(name);
     cs->cb   = std::move(cb);
+    cs->adopt = adopt;
     cs->created_ms = adopt ? created_ms : static_cast<int64_t>(now_ms());
     cs->text = std::to_string(cs->created_ms);
     // The directories and the creation stamp are shard 0's, so an adopting
@@ -2602,6 +2624,11 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 b->j.fd       = cs->fd;
                 b->j.off      = journal_header_len;
                 cs->fd        = -1;
+                // A bucket taken up late may already have documents, which are read before it serves anything.
+                if (cs->adopt)
+                    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
+                                                  bucket_doc::versioning})
+                        set_doubt(*b, kind, 0);
                 m_buckets.emplace(cs->name, std::move(b));
                 m_creating.erase(cs->name);
                 --m_inflight;
@@ -2671,7 +2698,10 @@ void object_store::forget_bucket(const std::string& name)
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
     for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
                                   bucket_doc::versioning})
+    {
         if (take_doc(bb, kind, {})) {}
+        clear_doubt(bb, kind);
+    }
     hot_drop_bucket(name);
     m_buckets.erase(it);
 }
@@ -2774,11 +2804,14 @@ const cors_config* object_store::bucket_cors(std::string_view name) const
 
 std::shared_ptr<const lifecycle_config> object_store::lifecycle(std::string_view name) const
 {
+    // Rules this shard may hold an old copy of expire nothing until they are settled.
     const bucket* b = find_bucket(name);
-    return b && !b->closing ? b->lifecycle : nullptr;
+    if (!b || b->closing || (b->doc_doubt & (1u << static_cast<unsigned>(bucket_doc::lifecycle))))
+        return nullptr;
+    return b->lifecycle;
 }
 
-bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
+bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, std::string* why)
 {
     s3_error err;
     if (kind == bucket_doc::cors)
@@ -2788,7 +2821,11 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
         {
             c = std::make_shared<cors_config>();
             if (!parse_cors_xml(xml, *c, err))
+            {
+                if (why)
+                    *why = err.message;
                 return false;
+            }
         }
         m_cors_buckets += (c != nullptr) - (b.cors != nullptr);
         b.cors = std::move(c);
@@ -2797,15 +2834,22 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
     if (kind == bucket_doc::policy)
     {
         std::shared_ptr<bucket_policy> p;
+        bool compiled = true;
         if (!xml.empty())
         {
             p = std::make_shared<bucket_policy>();
             if (!bucket_policy::compile(xml, b.name, *p, err))
-                return false;
+            {
+                // A policy that cannot be honoured refuses what it may have denied, rather than nothing.
+                *p       = bucket_policy::refusing(xml, err.message);
+                compiled = false;
+                if (why)
+                    *why = err.message;
+            }
         }
         m_policy_buckets += (p != nullptr) - (b.policy != nullptr);
         b.policy = std::move(p);
-        return true;
+        return compiled;
     }
     if (kind == bucket_doc::versioning)
     {
@@ -2820,7 +2864,11 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
     {
         l = std::make_shared<lifecycle_config>();
         if (!parse_lifecycle(xml, *l, err))
+        {
+            if (why)
+                *why = err.message;
             return false;
+        }
     }
     m_lifecycle_buckets += (l != nullptr) - (b.lifecycle != nullptr);
     b.lifecycle = std::move(l);
@@ -2837,7 +2885,7 @@ st object_store::adopt_doc(bucket_doc kind, std::string_view name, std::string_v
     return take_doc(*b, kind, xml) ? st::ok : st::io_error;
 }
 
-void object_store::write_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
+void object_store::stage_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
 {
     bucket* b = find_bucket(name);
     if (!b || b->closing)
@@ -2845,11 +2893,10 @@ void object_store::write_doc(bucket_doc kind, std::string name, std::string xml,
         cb(st::no_such_bucket);
         return;
     }
-    // Counted as work in the bucket, so a drop waits for the file to settle.
+    // Counted as work in the bucket until the change is committed or abandoned, so a drop waits for it.
     ++b->active_ops;
-    const uint64_t gen    = b->gen;
-    const int      dir_fd = b->dir_fd;
-    const std::string file = doc_file(kind);
+    const int dir_fd = b->dir_fd;
+    const std::string file = std::string(doc_file(kind)) + ".new";
     auto text = std::make_shared<std::string>(std::move(xml));
     auto fd   = std::make_shared<int>(-1);
     auto ch   = std::make_shared<disk_chain>(m_alive);
@@ -2882,55 +2929,231 @@ void object_store::write_doc(bucket_doc kind, std::string name, std::string xml,
             return m_io->fsync(dir_fd, false, std::move(d));
         });
     }
-    // A document is written beside the file and renamed over it, so a crash leaves the old one or the new.
-    if (!text->empty())
+    ch->then([this, dir_fd, fd, file](file_io::done d)
     {
-        ch->then([this, dir_fd, fd, file](file_io::done d)
-        {
-            return m_io->openat(dir_fd, file + ".new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
-                                [fd, d](int64_t r)
-                                {
-                                    if (r >= 0)
-                                        *fd = static_cast<int>(r);
-                                    d(r);
-                                });
-        });
-        // The bytes are held by the completion, since a launched step lets go of its captures.
+        return m_io->openat(dir_fd, file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
+                            [fd, d](int64_t r)
+                            {
+                                if (r >= 0)
+                                    *fd = static_cast<int>(r);
+                                d(r);
+                            });
+    });
+    // An empty file is a removal being decided, and the bytes are held by the completion, since a launched step lets go of its captures.
+    if (!text->empty())
         ch->then([this, fd, text](file_io::done d)
         {
             return m_io->pwrite(*fd, text->data(), static_cast<uint32_t>(text->size()), 0,
-                                [text, d](int64_t r) { d(r); });
+                                [text, d](int64_t r) { d(r >= 0 && static_cast<size_t>(r) != text->size() ? -EIO : r); });
         });
-        ch->then([this, fd](file_io::done d) { return m_io->fsync(*fd, true, std::move(d)); });
-        ch->then([this, dir_fd, file](file_io::done d)
-        {
-            return m_io->renameat(dir_fd, file + ".new", dir_fd, file, std::move(d));
-        });
-    }
-    else
-        ch->then([this, dir_fd, file](file_io::done d) { return m_io->unlinkat(dir_fd, file, 0, std::move(d)); },
-                 -ENOENT);
-    ch->then([this, dir_fd](file_io::done d) { return m_io->fsync(dir_fd, false, std::move(d)); });
-    ch->run([this, kind, name, gen, text, fd, cb](int64_t r)
+    ch->then([this, fd](file_io::done d) { return m_io->fsync(*fd, true, std::move(d)); });
+    ch->run([this, kind, name, fd, cb](int64_t r)
     {
         if (*fd >= 0)
             m_loop->close_fd(*fd);
         *fd = -1;
-        bucket* bp = find_bucket(name);
-        if (!bp || bp->gen != gen)
+        if (r < 0)
         {
-            cb(st::no_such_bucket);
+            abandon_doc(kind, name, [cb, r]() { cb(errno_status(r)); });
+            return;
+        }
+        ++m_totals.fsyncs;
+        cb(st::ok);
+    });
+}
+
+void object_store::commit_doc(bucket_doc kind, std::string name, std::string xml,
+                              std::function<void(bool, st)> cb)
+{
+    bucket* b = find_bucket(name);
+    if (!b)
+    {
+        cb(false, st::no_such_bucket);
+        return;
+    }
+    const int dir_fd = b->dir_fd;
+    const std::string file = doc_file(kind);
+    auto text    = std::make_shared<std::string>(std::move(xml));
+    auto visible = std::make_shared<bool>(false);
+    auto ch      = std::make_shared<disk_chain>(m_alive);
+    // The rename, or for a removal the unlink, is the moment the change is made, and the marker goes after it.
+    if (!text->empty())
+        ch->then([this, dir_fd, file, visible](file_io::done d)
+        {
+            return m_io->renameat(dir_fd, file + ".new", dir_fd, file, [visible, d](int64_t r)
+            {
+                *visible = r >= 0;
+                d(r);
+            });
+        });
+    else
+    {
+        ch->then([this, dir_fd, file, visible](file_io::done d)
+        {
+            return m_io->unlinkat(dir_fd, file, 0, [visible, d](int64_t r)
+            {
+                *visible = r >= 0 || r == -ENOENT;
+                d(r);
+            });
+        }, -ENOENT);
+        ch->then([this, dir_fd, file](file_io::done d) { return m_io->unlinkat(dir_fd, file + ".new", 0, std::move(d)); },
+                 -ENOENT);
+    }
+    ch->then([this, dir_fd](file_io::done d) { return m_io->fsync(dir_fd, false, std::move(d)); });
+    ch->run([this, kind, name, text, visible, cb](int64_t r)
+    {
+        if (!*visible)
+        {
+            abandon_doc(kind, name, [cb, r]() { cb(false, errno_status(r)); });
+            return;
+        }
+        bucket* bp = find_bucket(name);
+        if (!bp)
+        {
+            cb(true, st::no_such_bucket);
             return;
         }
         --bp->active_ops;
-        if (r < 0)
-        {
-            cb(errno_status(r));
-            return;
-        }
-        m_totals.fsyncs += text->empty() ? 1 : 2;
-        cb(take_doc(*bp, kind, *text) ? st::ok : st::io_error);
+        // What is in the file is what every other shard settles by, so it is taken up here whatever the sync said.
+        const bool taken = take_doc(*bp, kind, *text);
+        if (r >= 0)
+            m_totals.fsyncs += 1;
+        cb(true, r < 0 ? errno_status(r) : taken ? st::ok : st::io_error);
     });
+}
+
+void object_store::abandon_doc(bucket_doc kind, std::string name, std::function<void()> cb)
+{
+    bucket* b = find_bucket(name);
+    if (!b)
+    {
+        cb();
+        return;
+    }
+    const std::string file = std::string(doc_file(kind)) + ".new";
+    auto alive = m_alive;
+    // A marker that cannot be removed is removed by shard 0's next start, and until then the bucket waits for it.
+    const bool q = m_io->unlinkat(b->dir_fd, file, 0, [this, alive, name, cb](int64_t)
+    {
+        if (!*alive)
+            return;
+        if (bucket* bp = find_bucket(name))
+            --bp->active_ops;
+        cb();
+    });
+    if (!q)
+    {
+        --b->active_ops;
+        cb();
+    }
+}
+
+void object_store::set_doubt(bucket& b, bucket_doc kind, uint64_t seq)
+{
+    if (b.doc_doubt == 0)
+        ++m_doubt_buckets;
+    b.doc_doubt |= static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    b.doc_doubt_seq[static_cast<size_t>(kind)] = seq;
+}
+
+void object_store::clear_doubt(bucket& b, bucket_doc kind)
+{
+    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    if (!(b.doc_doubt & bit))
+        return;
+    b.doc_doubt &= static_cast<uint8_t>(~bit);
+    if (b.doc_doubt == 0)
+        --m_doubt_buckets;
+}
+
+st object_store::doubt_doc(bucket_doc kind, std::string_view name, uint64_t seq)
+{
+    // A bucket this shard does not hold serves nothing, and is settled from the files when it is taken up.
+    if (bucket* b = find_bucket(name))
+        set_doubt(*b, kind, seq);
+    return st::ok;
+}
+
+void object_store::decided_doc(bucket_doc kind, std::string_view name, uint64_t seq, const std::string* xml)
+{
+    bucket* b = find_bucket(name);
+    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(kind));
+    // Word of an earlier change, overtaken by a later one this shard was told of, settles nothing.
+    if (!b || !(b->doc_doubt & bit) || b->doc_doubt_seq[static_cast<size_t>(kind)] != seq)
+        return;
+    if (!xml)
+    {
+        if (settle_bucket(*b)) {}
+        return;
+    }
+    std::string why;
+    if (!take_doc(*b, kind, *xml, &why))
+        LOG_ERROR(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + b->name +
+                   " does not parse here: " + why).c_str());
+    clear_doubt(*b, kind);
+}
+
+bool object_store::read_decided_doc(int dir_fd, bucket_doc kind, std::string& xml)
+{
+    const std::string file = doc_file(kind);
+    if (::faccessat(dir_fd, (file + ".new").c_str(), F_OK, 0) == 0 || errno != ENOENT)
+        return false;
+    xml.clear();
+    const int fd = ::openat(dir_fd, file.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT;
+    char buf[16384];
+    bool ok = true;
+    while (xml.size() < doc_max_bytes)
+    {
+        const ssize_t n = ::read(fd, buf, std::min(sizeof(buf), doc_max_bytes - xml.size()));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0)
+            ok = false;
+        if (n <= 0)
+            break;
+        xml.append(buf, static_cast<size_t>(n));
+    }
+    ::close(fd);
+    return ok;
+}
+
+bool object_store::settle_bucket(bucket& b)
+{
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
+                                  bucket_doc::versioning})
+    {
+        if (!(b.doc_doubt & (1u << static_cast<unsigned>(kind))))
+            continue;
+        std::string xml;
+        if (!read_decided_doc(b.dir_fd, kind, xml))
+            continue;
+        std::string why;
+        if (!take_doc(b, kind, xml, &why))
+            LOG_ERROR(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + b.name +
+                       " does not parse: " + why).c_str());
+        clear_doubt(b, kind);
+    }
+    return b.doc_doubt == 0;
+}
+
+bool object_store::versioning_settled(bucket& b)
+{
+    const uint8_t bit = static_cast<uint8_t>(1u << static_cast<unsigned>(bucket_doc::versioning));
+    return !(b.doc_doubt & bit) || settle_bucket(b) || !(b.doc_doubt & bit);
+}
+
+bool object_store::docs_settled(std::string_view name)
+{
+    bucket* b = find_bucket(name);
+    return !b || b->doc_doubt == 0 || settle_bucket(*b);
+}
+
+void object_store::settle_all_docs()
+{
+    for (auto& [name, b] : m_buckets)
+        if (b->doc_doubt && settle_bucket(*b)) {}
 }
 
 }   // namespace socketley::storage

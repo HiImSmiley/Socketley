@@ -44,7 +44,7 @@ bool decode_record(std::string_view record, std::string& key, object_meta& meta)
 bool status_byte(bytes::reader& r, st& s)
 {
     uint8_t b = 0;
-    if (!r.u8(b) || b > static_cast<uint8_t>(st::delete_marker))
+    if (!r.u8(b) || b > static_cast<uint8_t>(st::unavailable))
         return false;
     s = static_cast<st>(b);
     return true;
@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::list_versions))
+        o > static_cast<uint8_t>(op::doc_abort))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -156,21 +156,23 @@ bool decode_hot_owner_started(std::string_view payload, uint32_t& shard)
     return open_request(r, op::hot_owner_started) && r.u32(shard);
 }
 
-std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml)
+std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml, uint64_t seq)
 {
     bytes::writer w = begin(o);
     w.u8(static_cast<uint8_t>(kind));
     w.bytes(bucket);
     w.bytes(xml);
+    w.u64(seq);
     return w.take();
 }
 
-bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string& bucket, std::string& xml)
+bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string& bucket, std::string& xml,
+                uint64_t& seq)
 {
     bytes::reader r(payload);
     uint8_t k = 0;
     if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::versioning) ||
-        !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes))
+        !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes) || !r.u64(seq))
         return false;
     kind = static_cast<bucket_doc>(k);
     return true;

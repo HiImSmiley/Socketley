@@ -106,6 +106,8 @@ class bucket_policy
 public:
     // False with a MalformedPolicy `err` for a document this runtime cannot honour exactly.
     static bool compile(std::string_view json, std::string_view bucket, bucket_policy& out, s3_error& err);
+    // A stored document that no longer compiles, which denies every request it is asked about.
+    static bucket_policy refusing(std::string_view json, std::string why);
 
     // Deny when a Deny statement matches, else allow when an Allow does, else none.
     policy_effect evaluate(const policy_request& r) const;
@@ -118,6 +120,8 @@ public:
     bool is_public() const { return m_public; }
     // The document as it was given.
     const std::string& text() const { return m_text; }
+    // Why a refusing policy refuses, empty for one that compiled.
+    const std::string& broken() const { return m_broken; }
 
     struct cidr
     {
@@ -152,6 +156,7 @@ public:
 
 private:
     std::string m_text;
+    std::string m_broken;
     std::vector<statement> m_statements;
     bool m_has_deny{false};
     bool m_needs_ip{false};

@@ -523,7 +523,7 @@ void storage_run::sweep()
     lifecycle_tick();
     tell_started();
     if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
-        m_store.lifecycle_buckets() != 0)
+        m_store.lifecycle_buckets() != 0 || m_store.any_doubt())
         arm_sweep();
 }
 
@@ -1405,6 +1405,11 @@ void storage_run::send_response(const std::shared_ptr<conn>& c, response r)
 void storage_run::send_error(const std::shared_ptr<conn>& c, const s3_error& e, bool close,
                              std::string_view extra_name, std::string_view extra_value)
 {
+    if (c->hide_missing && e.code == "NoSuchKey")
+    {
+        send_error(c, make_error("AccessDenied"), close, extra_name, extra_value);
+        return;
+    }
     count_error(e.code);
     response r;
     r.status = e.status;
@@ -1481,6 +1486,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->anonymous       = false;
     c->policy_admitted = false;
     c->cors_head.clear();
+    c->hide_missing = false;
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)

@@ -93,6 +93,8 @@ enum class st : uint8_t
     no_such_version,
     // The version asked for is a delete marker, which has no bytes or tags.
     delete_marker,
+    // A shard that had to take part could not be reached, so nothing was changed.
+    unavailable,
 };
 
 const char* status_name(st s);
@@ -500,10 +502,24 @@ public:
     void remove_tmp(std::string_view bucket, std::string tmp_name);
 
     // ── Configuration documents: CORS, lifecycle and policy ─────────────────
-    // Makes `xml` the bucket's document of `kind` on disk, or removes it when it is empty, and then here; shard 0's half.
-    void write_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
+    // Shard 0 changes a document in three steps, and the file `<kind>.new` exists exactly while a change is
+    // undecided: staged writes it, committed makes it the document (an empty one removes it), abandoned removes it.
+    void stage_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
+    // `cb` hears whether the change is now the file every shard settles by, and how the syncs went.
+    void commit_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(bool visible, st)> cb);
+    void abandon_doc(bucket_doc kind, std::string name, std::function<void()> cb);
     // Takes up a document another shard wrote.
     st adopt_doc(bucket_doc kind, std::string_view name, std::string_view xml);
+
+    // A shard told that change `seq` may happen serves nothing of the bucket until it knows how it ended.
+    st doubt_doc(bucket_doc kind, std::string_view name, uint64_t seq);
+    // How change `seq` ended: `xml` is the document it made, or null when it was abandoned.
+    void decided_doc(bucket_doc kind, std::string_view name, uint64_t seq, const std::string* xml);
+    // Whether any bucket here is in doubt, so a request to a store with none looks nothing up.
+    bool any_doubt() const { return m_doubt_buckets != 0; }
+    // Settles a bucket in doubt from the files shard 0 decides by; false while a change to it is undecided.
+    bool docs_settled(std::string_view name);
+    void settle_all_docs();
 
     // Whether any bucket has CORS rules, so a request to a store without them looks nothing up.
     bool any_cors() const { return m_cors_buckets != 0; }
@@ -749,6 +765,9 @@ private:
         // Per key, every version but a latest that is not a delete marker, newest first: the key's
         // noncurrent versions, behind its latest when that is a marker; empty unless the bucket was versioned.
         std::map<std::string, std::vector<object_meta>, std::less<>> versions;
+        // The documents, a bit per kind, this shard may hold an old copy of, and the change each is waiting on.
+        uint8_t     doc_doubt{0};
+        uint64_t    doc_doubt_seq[4]{};
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -911,9 +930,18 @@ private:
     uint32_t m_cors_buckets{0};
     uint32_t m_lifecycle_buckets{0};
     uint32_t m_policy_buckets{0};
+    // Buckets with a document in doubt.
+    uint32_t m_doubt_buckets{0};
     static const char* doc_file(bucket_doc kind);
-    // The one place a bucket's document is parsed and taken up, an empty one removing it; false when it does not parse.
-    bool take_doc(bucket& b, bucket_doc kind, std::string_view xml);
+    // The one place a bucket's document is parsed and taken up, an empty one removing it; false with `why` when it
+    // does not parse, and a policy that does not then refuses everything but its own operations.
+    bool take_doc(bucket& b, bucket_doc kind, std::string_view xml, std::string* why = nullptr);
+    void set_doubt(bucket& b, bucket_doc kind, uint64_t seq);
+    void clear_doubt(bucket& b, bucket_doc kind);
+    // Reads a document of `kind` as shard 0 decided it into `xml`; false while it is undecided or cannot be read.
+    static bool read_decided_doc(int dir_fd, bucket_doc kind, std::string& xml);
+    bool settle_bucket(bucket& b);
+    bool versioning_settled(bucket& b);
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.
     std::shared_ptr<bool> m_alive;

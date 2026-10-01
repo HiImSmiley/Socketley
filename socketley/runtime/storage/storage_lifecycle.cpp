@@ -155,6 +155,9 @@ void storage_run::lifecycle_changed()
 
 void storage_run::lifecycle_tick()
 {
+    // A bucket this shard was unsure of and no request has come to since is settled here, so its rules run.
+    if (m_store.any_doubt())
+        m_store.settle_all_docs();
     if (m_lc)
     {
         // A pass waiting out its in-flight removals is moved on by their answers, and one between steps by its timer.
