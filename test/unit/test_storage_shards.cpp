@@ -1060,19 +1060,62 @@ TEST_CASE("merging pages keeps a prefix once and stops at the nearest shard that
 
 TEST_CASE("a page is cut back to the bytes a reply may carry and says it was")
 {
-    list_page p;
+    // What a sibling receives of a page written to at most `max_bytes`.
+    auto sent = [](const list_page& in, size_t max_bytes)
+    {
+        list_page out;
+        st s = st::io_error;
+        REQUIRE(wire::decode_page(wire::encode_page(st::ok, in, max_bytes), s, out));
+        CHECK(s == st::ok);
+        return out;
+    };
+    list_page whole_page;
     for (int i = 0; i < 100; ++i)
     {
         list_entry e;
         e.key = "key" + std::to_string(1000 + i);
         e.meta.content_type = std::string(200, 'x');
-        p.objects.push_back(std::move(e));
+        whole_page.objects.push_back(std::move(e));
     }
-    wire::limit_page(p, 4000);
+    const list_page p = sent(whole_page, 4000);
     CHECK(p.objects.size() < 100);
     CHECK(p.objects.size() > 5);
     CHECK(p.truncated);
     CHECK(p.resume_at == "key" + std::to_string(1000 + p.objects.size()));
+
+    // Objects and prefixes are counted in the order their names interleave, and cut at one name.
+    list_page mixed;
+    for (int i = 0; i < 60; ++i)
+    {
+        const std::string n = "k" + std::to_string(100 + i);
+        if (i % 3 == 0)
+        {
+            mixed.prefixes.push_back(n + "/");
+            continue;
+        }
+        list_entry e;
+        e.key = n;
+        e.meta.content_type = std::string(150, 'y');
+        mixed.objects.push_back(std::move(e));
+    }
+    // A prefix costs 13 and an object 250, so k117 is the first name past 3000.
+    mixed = sent(mixed, 3000);
+    CHECK(mixed.truncated);
+    CHECK(mixed.resume_at == "k117");
+    CHECK(mixed.objects.size() == 11);
+    CHECK(mixed.prefixes.size() == 6);
+    CHECK(mixed.objects.back().key == "k116");
+    CHECK(mixed.prefixes.back() == "k115/");
+
+    // A page that fits keeps the end its walk gave it.
+    list_page small = whole_page;
+    small.objects.resize(3);
+    small.truncated = true;
+    small.resume_at = "key1003";
+    const list_page kept = sent(small, 4000);
+    CHECK(kept.objects.size() == 3);
+    CHECK(kept.truncated);
+    CHECK(kept.resume_at == "key1003");
 
     // And a page of every shard's that was cut merges without losing an entry.
     list_page whole;

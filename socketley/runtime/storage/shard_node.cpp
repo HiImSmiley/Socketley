@@ -458,7 +458,7 @@ void shard_node::list(std::string_view bucket, const list_query& q, std::functio
                       cb(g->failed, {});
                       return;
                   }
-                  cb(st::ok, wire::merge_pages(g->pages, max_keys));
+                  cb(st::ok, wire::merge_pages(std::move(g->pages), max_keys));
               });
 }
 
@@ -990,12 +990,10 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
                 reply(false, {});
                 return;
             }
-            list_page page;
-            const st s = m_store.list(bucket, q, page);
-            if (s == st::ok)
-                wire::limit_page(page);
+            wire::page_writer page;
+            const st s = m_store.list_walk(bucket, q, page);
             ++m_c.list_pages_served;
-            reply(true, wire::encode_page(s, page));
+            reply(true, page.finish(s));
             return;
         }
         default:

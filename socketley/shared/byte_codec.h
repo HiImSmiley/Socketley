@@ -88,10 +88,20 @@ public:
 
     bool bytes(std::string& s, size_t cap)
     {
+        std::string_view v;
+        if (!view(v, cap))
+            return false;
+        s.assign(v);
+        return true;
+    }
+
+    // The same field without a copy, valid as long as the buffer the reader was given.
+    bool view(std::string_view& s, size_t cap)
+    {
         uint32_t n = 0;
         if (!u32(n) || n > cap || n > left())
             return false;
-        s.assign(m_in.substr(m_off, n));
+        s = m_in.substr(m_off, n);
         m_off += n;
         return true;
     }

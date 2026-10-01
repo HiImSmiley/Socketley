@@ -33,11 +33,11 @@ bool open_request(bytes::reader& r, op want)
 
 bool decode_record(std::string_view record, std::string& key, object_meta& meta)
 {
-    const decoded_record d = decode_journal_record(record);
+    decoded_record d = decode_journal_record(record);
     if (d.status != record_status::ok || d.rec.type != record_type::put || d.consumed != record.size())
         return false;
-    key  = d.rec.key;
-    meta = d.rec.meta;
+    key  = std::move(d.rec.key);
+    meta = std::move(d.rec.meta);
     return true;
 }
 
@@ -80,10 +80,11 @@ std::string encode_commit(const commit_request& req)
 bool decode_commit(std::string_view payload, commit_request& out)
 {
     bytes::reader r(payload);
-    std::string rec, key;
+    std::string_view rec;
+    std::string key;
     bool create_only = false;
     if (!open_request(r, op::commit) || !r.bytes(out.bucket, name_cap) || !r.bytes(out.key, name_cap) ||
-        !r.bytes(out.tmp_name, name_cap) || !r.flag(create_only) || !r.bytes(rec, record_cap))
+        !r.bytes(out.tmp_name, name_cap) || !r.flag(create_only) || !r.view(rec, record_cap))
         return false;
     out.create_only = create_only;
     return decode_record(rec, key, out.meta) && key == out.key;
@@ -258,55 +259,83 @@ bool decode_created(std::string_view reply, st& s, int64_t& created_ms)
     return true;
 }
 
-void limit_page(list_page& page, size_t max_bytes)
+bool page_writer::fits(const std::string& name, size_t cost)
 {
-    struct entry { const std::string* name; size_t cost; };
-    std::vector<entry> all;
-    all.reserve(page.objects.size() + page.prefixes.size());
-    for (const list_entry& e : page.objects)
-    {
-        size_t cost = e.key.size() + e.meta.content_type.size() + 96;
-        for (const auto& [n, v] : e.meta.extra)
-            cost += n.size() + v.size() + 8;
-        all.push_back({&e.key, cost});
-    }
-    for (const std::string& p : page.prefixes)
-        all.push_back({&p, p.size() + 8});
-    std::sort(all.begin(), all.end(), [](const entry& a, const entry& b) { return *a.name < *b.name; });
-
-    size_t total = 0;
-    for (const entry& e : all)
-    {
-        total += e.cost;
-        if (total <= max_bytes)
-            continue;
-        // The first entry that does not fit is where the page now ends.
-        const std::string cutoff = *e.name;
-        std::erase_if(page.objects, [&](const list_entry& o) { return o.key >= cutoff; });
-        std::erase_if(page.prefixes, [&](const std::string& p) { return p >= cutoff; });
-        page.truncated = true;
-        page.resume_at = cutoff;
-        return;
-    }
+    if (m_cut)
+        return false;
+    m_total += cost;
+    if (m_total <= m_max)
+        return true;
+    // The first entry that does not fit is where the page now ends.
+    m_cut       = true;
+    m_truncated = true;
+    m_resume    = name;
+    return false;
 }
 
-std::string encode_page(st s, const list_page& page)
+void page_writer::object(const std::string& key, const object_meta& meta)
 {
-    bytes::writer w;
-    w.u8(static_cast<uint8_t>(s));
-    w.u8(page.truncated ? 1 : 0);
-    w.bytes(page.resume_at);
-    w.u32(static_cast<uint32_t>(page.prefixes.size()));
-    for (const std::string& p : page.prefixes)
-        w.bytes(p);
-    w.u32(static_cast<uint32_t>(page.objects.size()));
-    for (const list_entry& e : page.objects)
+    size_t cost = key.size() + meta.content_type.size() + 96;
+    for (const auto& [n, v] : meta.extra)
+        cost += n.size() + v.size() + 8;
+    if (!fits(key, cost))
+        return;
+    m_record.clear();
+    encode_put_record(m_record, key, meta);
+    m_objects.bytes(m_record);
+    ++m_object_count;
+}
+
+void page_writer::prefix(std::string common)
+{
+    if (!fits(common, common.size() + 8))
+        return;
+    m_prefixes.bytes(common);
+    ++m_prefix_count;
+}
+
+void page_writer::truncated(const std::string& resume_at)
+{
+    if (m_cut)
+        return;
+    m_truncated = true;
+    m_resume    = resume_at;
+}
+
+std::string page_writer::finish(st s)
+{
+    bytes::writer head;
+    head.u8(static_cast<uint8_t>(s));
+    head.u8(m_truncated ? 1 : 0);
+    head.bytes(m_resume);
+    head.u32(m_prefix_count);
+    bytes::writer count;
+    count.u32(m_object_count);
+    std::string out = head.take();
+    out += m_prefixes.take();
+    out += count.take();
+    out += m_objects.take();
+    return out;
+}
+
+std::string encode_page(st s, const list_page& page, size_t max_bytes)
+{
+    page_writer w(max_bytes);
+    // Objects and prefixes are each sorted, so merging the two gives them in the name order a walk would.
+    size_t o = 0, p = 0;
+    while (o < page.objects.size() || p < page.prefixes.size())
     {
-        std::string rec;
-        encode_put_record(rec, e.key, e.meta);
-        w.bytes(rec);
+        if (p == page.prefixes.size() || (o < page.objects.size() && page.objects[o].key < page.prefixes[p]))
+        {
+            w.object(page.objects[o].key, page.objects[o].meta);
+            ++o;
+        }
+        else
+            w.prefix(page.prefixes[p++]);
     }
-    return w.take();
+    if (page.truncated)
+        w.truncated(page.resume_at);
+    return w.finish(s);
 }
 
 bool decode_page(std::string_view reply, st& s, list_page& out)
@@ -330,23 +359,23 @@ bool decode_page(std::string_view reply, st& s, list_page& out)
     }
     if (!r.u32(no) || no > r.left() / 4)
         return false;
+    out.objects.reserve(no);
     for (uint32_t i = 0; i < no; ++i)
     {
-        std::string rec;
-        list_entry e;
-        if (!r.bytes(rec, record_cap) || !decode_record(rec, e.key, e.meta))
+        std::string_view rec;
+        list_entry& e = out.objects.emplace_back();
+        if (!r.view(rec, record_cap) || !decode_record(rec, e.key, e.meta))
             return false;
-        out.objects.push_back(std::move(e));
     }
     return true;
 }
 
-list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys)
+list_page merge_pages(std::vector<list_page> pages, size_t max_keys)
 {
     struct item
     {
         const std::string* name;
-        const list_entry*  object;   // null for a rolled-up prefix
+        list_entry*        object;   // null for a rolled-up prefix
     };
 
     // The furthest a truncated shard is known to: its own last name.
@@ -354,10 +383,12 @@ list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys)
     bool        bounded       = false;
     std::string horizon;
     std::vector<item> items;
-    for (const list_page& p : pages)
+    size_t            objects = 0;
+    for (list_page& p : pages)
     {
         const std::string* last = nullptr;
-        for (const list_entry& e : p.objects)
+        objects += p.objects.size();
+        for (list_entry& e : p.objects)
         {
             items.push_back({&e.key, &e});
             last = &e.key;
@@ -383,6 +414,8 @@ list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys)
                      [](const item& a, const item& b) { return *a.name < *b.name; });
 
     list_page out;
+    // Reserved whole, so the name of the last object taken stays where it was moved to.
+    out.objects.reserve(std::min(objects, max_keys));
     const std::string* taken_last = nullptr;
     bool               taken_prefix = false;
     size_t             count = 0;
@@ -402,10 +435,15 @@ list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys)
             break;
         }
         if (it.object)
-            out.objects.push_back(*it.object);
+        {
+            out.objects.push_back(std::move(*it.object));
+            taken_last = &out.objects.back().key;
+        }
         else
+        {
             out.prefixes.push_back(*it.name);
-        taken_last   = it.name;
+            taken_last = it.name;
+        }
         taken_prefix = !it.object;
         ++count;
     }
@@ -442,8 +480,8 @@ void put_meta(bytes::writer& w, std::string_view key, const object_meta& m)
 
 bool get_meta(bytes::reader& r, std::string& key, object_meta& m)
 {
-    std::string rec;
-    return r.bytes(rec, record_cap) && decode_record(rec, key, m);
+    std::string_view rec;
+    return r.view(rec, record_cap) && decode_record(rec, key, m);
 }
 
 void put_part(bytes::writer& w, const mpu_part& p)

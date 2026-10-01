@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../../shared/byte_codec.h"
 #include "multipart.h"
 #include "object_store.h"
 
@@ -143,13 +144,39 @@ bool        decode_created(std::string_view reply, st& s, int64_t& created_ms);
 // link carries whatever the metadata of its objects weighs.
 inline constexpr size_t max_page_bytes = 1u << 20;
 
-// A page cut back to `max_bytes` from the end, marked truncated when it was.
-void limit_page(list_page& page, size_t max_bytes = max_page_bytes);
+// A walk's entries written straight into a page reply, in the name order a walk
+// gives them, and cut back to `max_bytes` from the end, marked truncated when it was.
+class page_writer final : public list_visitor
+{
+public:
+    explicit page_writer(size_t max_bytes = max_page_bytes) : m_max(max_bytes) {}
 
-std::string encode_page(st s, const list_page& page);
+    void object(const std::string& key, const object_meta& meta) override;
+    void prefix(std::string common) override;
+    void truncated(const std::string& resume_at) override;
+    std::string finish(st s);
+
+private:
+    // Whether an entry of `cost` still fits, and otherwise the page ends at `name`.
+    bool fits(const std::string& name, size_t cost);
+
+    size_t        m_max;
+    size_t        m_total{0};
+    bool          m_cut{false};
+    bool          m_truncated{false};
+    std::string   m_resume;
+    uint32_t      m_prefix_count{0};
+    uint32_t      m_object_count{0};
+    bytes::writer m_prefixes;
+    bytes::writer m_objects;
+    std::string   m_record;
+};
+
+// A built page as a page_writer would have written it.
+std::string encode_page(st s, const list_page& page, size_t max_bytes = max_page_bytes);
 bool        decode_page(std::string_view reply, st& s, list_page& out);
 
 // The page one shard holding every key would give, from each shard's page for the query, and shorter than max_keys when a shard's page was cut short.
-list_page merge_pages(const std::vector<list_page>& pages, size_t max_keys);
+list_page merge_pages(std::vector<list_page> pages, size_t max_keys);
 
 }   // namespace socketley::storage::wire
