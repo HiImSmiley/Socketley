@@ -15,18 +15,7 @@ namespace socketley::storage
 // A bucket name cannot contain '/', so the joined string is unambiguous.
 inline uint32_t object_slot(std::string_view bucket, std::string_view key)
 {
-    uint16_t crc = 0;
-    auto feed = [&crc](std::string_view s)
-    {
-        for (const char c : s)
-            crc = static_cast<uint16_t>(
-                static_cast<uint16_t>(crc << 8)
-                ^ cache_crc16_tab.v[((crc >> 8) ^ static_cast<uint8_t>(c)) & 0xFFu]);
-    };
-    feed(bucket);
-    feed("/");
-    feed(key);
-    return crc & (cache_slot_count - 1);
+    return cache_crc16_update(cache_crc16_update(cache_crc16_update(0, bucket), "/"), key) & (cache_slot_count - 1);
 }
 
 inline uint32_t object_owner(std::string_view bucket, std::string_view key, uint32_t shards)

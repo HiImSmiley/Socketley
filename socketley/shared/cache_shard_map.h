@@ -34,14 +34,48 @@ inline constexpr cache_crc16_table cache_make_crc16_table()
 
 inline constexpr cache_crc16_table cache_crc16_tab = cache_make_crc16_table();
 
-inline constexpr uint16_t cache_crc16(std::string_view s)
+// Row k is the register after a byte and k zero bytes, so eight bytes fold in with eight independent lookups.
+struct cache_crc16_slices
 {
-    uint16_t crc = 0;
-    for (const char c : s)
+    uint16_t v[8][256];
+};
+
+inline constexpr cache_crc16_slices cache_make_crc16_slices()
+{
+    cache_crc16_slices t{};
+    for (int i = 0; i < 256; ++i)
+        t.v[0][i] = cache_crc16_tab.v[i];
+    for (int k = 1; k < 8; ++k)
+        for (int i = 0; i < 256; ++i)
+            t.v[k][i] = static_cast<uint16_t>(static_cast<uint16_t>(t.v[k - 1][i] << 8)
+                                              ^ cache_crc16_tab.v[t.v[k - 1][i] >> 8]);
+    return t;
+}
+
+inline constexpr cache_crc16_slices cache_crc16_slice = cache_make_crc16_slices();
+
+// The register after `s` is fed into `crc`, so a key in pieces hashes as it would joined.
+inline constexpr uint16_t cache_crc16_update(uint16_t crc, std::string_view s)
+{
+    const auto& t = cache_crc16_slice.v;
+    const size_t n = s.size();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+    {
+        const auto b = [&](size_t k) { return static_cast<uint8_t>(s[i + k]); };
+        crc = static_cast<uint16_t>(t[7][b(0) ^ (crc >> 8)] ^ t[6][b(1) ^ (crc & 0xFFu)] ^ t[5][b(2)] ^
+                                    t[4][b(3)] ^ t[3][b(4)] ^ t[2][b(5)] ^ t[1][b(6)] ^ t[0][b(7)]);
+    }
+    for (; i < n; ++i)
         crc = static_cast<uint16_t>(
             static_cast<uint16_t>(crc << 8)
-            ^ cache_crc16_tab.v[((crc >> 8) ^ static_cast<uint8_t>(c)) & 0xFFu]);
+            ^ cache_crc16_tab.v[((crc >> 8) ^ static_cast<uint8_t>(s[i])) & 0xFFu]);
     return crc;
+}
+
+inline constexpr uint16_t cache_crc16(std::string_view s)
+{
+    return cache_crc16_update(0, s);
 }
 
 // The number of hash slots, fixed at Redis's 16384 because the clients that

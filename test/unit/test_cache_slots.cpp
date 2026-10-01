@@ -84,6 +84,56 @@ TEST_CASE("the table agrees with the bitwise definition it was generated from")
               == cache_crc16_bitwise(0, static_cast<uint8_t>(i)));
 }
 
+TEST_CASE("eight bytes at a time is the bitwise CRC, for every length, every byte and a key fed in pieces")
+{
+    auto bitwise = [](std::string_view s)
+    {
+        uint16_t crc = 0;
+        for (const char c : s)
+            crc = cache_crc16_bitwise(crc, static_cast<uint8_t>(c));
+        return crc;
+    };
+    static_assert(cache_crc16("123456789") == 0x31C3);
+
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto next = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<std::string> inputs;
+    // Every length across several blocks and tails, of random bytes, of all zeros and of all ones.
+    for (size_t len = 0; len <= 70; ++len)
+    {
+        std::string r(len, '\0');
+        for (auto& c : r)
+            c = static_cast<char>(next());
+        inputs.push_back(r);
+        inputs.push_back(std::string(len, '\0'));
+        inputs.push_back(std::string(len, '\xff'));
+    }
+    // Every byte value in every position of a block.
+    for (int pos = 0; pos < 9; ++pos)
+        for (int b = 0; b < 256; ++b)
+        {
+            std::string s(9, 'k');
+            s[static_cast<size_t>(pos)] = static_cast<char>(b);
+            inputs.push_back(s);
+        }
+    for (int i = 0; i < 2000; ++i)
+    {
+        std::string r(next() % 300, '\0');
+        for (auto& c : r)
+            c = static_cast<char>(next());
+        inputs.push_back(r);
+    }
+
+    for (const std::string& s : inputs)
+    {
+        REQUIRE(cache_crc16(s) == bitwise(s));
+        // Split anywhere and fed in two pieces, as a storage key is fed as bucket, "/" and key.
+        const size_t cut = s.empty() ? 0 : next() % (s.size() + 1);
+        const std::string_view v(s);
+        CHECK(cache_crc16_update(cache_crc16_update(0, v.substr(0, cut)), v.substr(cut)) == bitwise(s));
+    }
+}
+
 TEST_CASE("an unsharded cache is shard 0 of one, not a special case")
 {
     CHECK(cache_shard_of("anything", 0) == 0);
