@@ -212,6 +212,10 @@ def mode_main(port, data):
     check("a PUT to an unversioned bucket names no version", (st, vid) == (200, None), (st, vid))
     st, h, _ = get("pre")
     check("a GET from an unversioned bucket names no version", "x-amz-version-id" not in h, h)
+    # Read twice, so a held copy has its headers rendered before the bucket is versioned.
+    put("keep", b"kept from before")
+    for _ in range(2):
+        st, h, _ = get("keep")
 
     st, _, body = set_versioning("Enabled", extra="<MfaDelete>Enabled</MfaDelete>")
     check("MFA delete is refused", (st, xml_code(body)) == (501, "NotImplemented"), (st, body[:200]))
@@ -223,6 +227,14 @@ def mode_main(port, data):
     st, _, _ = set_versioning("Enabled", extra="<MfaDelete>Disabled</MfaDelete>")
     check("versioning is enabled", st == 200, st)
     check("GetBucketVersioning says Enabled", get_versioning() == (200, "Enabled"), get_versioning())
+
+    # An object from before versioning is named as the null version once the bucket is versioned, held copy or not.
+    named = [get("keep")[1].get("x-amz-version-id") for _ in range(3)]
+    named.append(get("keep", method="HEAD")[1].get("x-amz-version-id"))
+    named.append(req("GET", "/%s/keep?tagging" % B)[1].get("x-amz-version-id"))
+    check("GET, HEAD and GetObjectTagging of an object from before versioning say x-amz-version-id: null",
+          named == ["null"] * 5, named)
+    expect["keep"] = [("null", md5(b"kept from before"))]
 
     # Three versions of one key.
     bodies = [blob(1000 + i, "k%d" % i) for i in range(3)]
@@ -397,6 +409,32 @@ def mode_main(port, data):
     expect["d/a"] = [(v_b, md5(b"a2"))]
     expect["d/c"] = [(dmv, None), (v_c, md5(b"c1"))]
 
+    # Racing writers of one key: each answered PUT is a version, and the order is the order of the commits, which a
+    # writer's version taken before its body was synced does not decide.
+    race_ids, race_bad = [], []
+
+    def racer(t):
+        for i in range(4):
+            st, v = put("race", blob(3000 + t, "race%d-%d" % (t, i)))
+            (race_ids if st == 200 and vid_ok(v) else race_bad).append(v if st == 200 else st)
+    import threading
+    ths = [threading.Thread(target=racer, args=(t,)) for t in range(16)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    st, p = list_versions(prefix="race")
+    listed = [e[2] for e in p["entries"]] if p else []
+    st2, h, _ = get("race")
+    check("16 racing writers of one key: every answered PUT is one version, listed once",
+          not race_bad and len(race_ids) == 64 and sorted(listed) == sorted(race_ids), (race_bad, len(race_ids), len(listed)))
+    # The first sixteen hex digits of an id are its version's order, so newest first is descending.
+    seqs = [v[:16] for v in listed]
+    check("and newest first, the latest being the one GET reads",
+          seqs == sorted(seqs, reverse=True) and len(set(seqs)) == len(seqs) and h.get("x-amz-version-id") == listed[0],
+          (listed[:4], h.get("x-amz-version-id")))
+    expect["race"] = [(e[2], e[4]) for e in p["entries"]] if p else None
+
     # The listing, whole and paged.
     full = all_versions()
     by_key = {}
@@ -565,6 +603,18 @@ def stats():
     return d
 
 
+def worker_stat(name):
+    """A figure of the running worker, once its count of requests moves: until then stats may show the last one's."""
+    before = stats().get("requests")
+
+    def live():
+        probe(NODE)
+        d = stats()
+        return d if d.get("requests") not in (None, before) else None
+    s = wait_for(live, 20)
+    return s.get(name) if s else None
+
+
 def remove_journals(data):
     removed = 0
     for root, _, files in os.walk(data):
@@ -633,6 +683,8 @@ def mode_recovery(port, data):
     check("it starts again", wait_for(lambda: probe(port), 30))
     compare("after a clean restart", expect, snapshot(), before)
     check("GetBucketVersioning survives a restart", get_versioning() == (200, "Enabled"), get_versioning())
+    read = worker_stat("start_files_read")
+    check("a clean restart of a versioned bucket reads its journal and not one file", read == "0", read)
 
     # A crash with every journal gone: the files are all there is.
     pid = stats().get("pid")
@@ -641,6 +693,11 @@ def mode_recovery(port, data):
     newpid = wait_for(lambda: (lambda p: p if p and p != pid and probe(port) else None)(stats().get("pid")), 40)
     check("a SIGKILL with %d journal files removed is restarted" % removed, newpid and removed > 0, (pid, newpid, removed))
     compare("after a SIGKILL with the journals removed", expect, snapshot(), before)
+    files = sum(len(fs) for _, _, fs in os.walk(os.path.join(data, B, "versions"))) + len(latest_files(data, B))
+    read = worker_stat("start_files_read")
+    # At least, since the other buckets' files are read too.
+    check("and that start read the header of every file, versions/ included",
+          read is not None and int(read) >= files, (read, files))
     st, h, _ = get("d/c")
     check("a delete marker is still the latest after the crash", (st, h.get("x-amz-delete-marker")) == (404, "true"),
           (st, h))
@@ -659,7 +716,56 @@ def mode_recovery(port, data):
     check("it starts with a version under both its names", wait_for(lambda: probe(port), 30))
     compare("after a start that found a version twice", expect, snapshot(), before)
     check("the second name is removed", not os.path.exists(dup), dup)
+    rollforward(port, data)
     os.unlink(os.path.join(data, STATE))
+
+
+def key_file(data, bucket, key):
+    h = hashlib.sha256(key.encode()).hexdigest()
+    return os.path.join(data, bucket, "data", h[:2], h)
+
+
+def rollforward(port, data):
+    """What a power cut leaves of a put answered at its rename, the rename lost and the pool file whole: in a bucket
+    versioned since that put, and in one versioned before it, the next start puts it in place and keeps what it
+    replaced."""
+    import shutil
+    rb = "verroll"
+    req("PUT", "/" + rb)
+    put("rf", b"the old latest", bucket=rb)
+    old = open(key_file(data, rb, "rf"), "rb").read()
+    put("rf", b"the answered put", bucket=rb)
+    new = open(key_file(data, rb, "rf"), "rb").read()
+    set_versioning("Enabled", bucket=rb)
+    st, v_old = put("rv", b"the version it replaced")
+    old_v = open(key_file(data, B, "rv"), "rb").read()
+    st, v_new = put("rv", b"the answered version")
+    new_v = open(key_file(data, B, "rv"), "rb").read()
+    subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
+    time.sleep(0.5)
+    # The rename never reached the disk: the old file at the key's path, the answered one under its pool name.
+    for bucket, key, was, answered in ((rb, "rf", old, new), (B, "rv", old_v, new_v)):
+        os.makedirs(os.path.join(data, bucket, "pool"), exist_ok=True)
+        with open(os.path.join(data, bucket, "pool", "0.rolltest"), "wb") as f:
+            f.write(answered)
+        with open(key_file(data, bucket, key), "wb") as f:
+            f.write(was)
+    subprocess.run([BIN, "start", RUNTIME], capture_output=True)
+    check("it starts with answered puts left in pool/", wait_for(lambda: probe(port), 30))
+    st, h, body = get("rf", bucket=rb)
+    st2, p = list_versions(bucket=rb, prefix="rf")
+    check("a pooled put from before the bucket was versioned is rolled forward, as its null version",
+          (st, body, h.get("x-amz-version-id")) == (200, b"the answered put", "null") and
+          [(e[2], e[3]) for e in p["entries"]] == [("null", True)], (st, body, h, p))
+    st, h, body = get("rv")
+    st2, _, body2 = get("rv", v_old)
+    st3, p = list_versions(prefix="rv")
+    check("a pooled version is rolled forward over the latest, which is kept behind it",
+          (st, body, h.get("x-amz-version-id"), st2, body2) == (200, b"the answered version", v_new, 200,
+                                                                  b"the version it replaced") and
+          [e[2] for e in p["entries"]] == [v_new, v_old], (st, h.get("x-amz-version-id"), st2, p))
+    left = [b for b in (rb, B) if os.path.exists(os.path.join(data, b, "pool", "0.rolltest"))]
+    check("and neither pool file is left", not left, left)
 
 
 # ─── shards ─────────────────────────────────────────────────────────────────
@@ -669,10 +775,20 @@ def mode_shards(nodes):
     NODE = nodes[0]
     st, _, _ = req("PUT", "/" + B)
     check("the bucket is made", st == 200, st)
+    pre = ["pre%d" % i for i in range(4)]
+    for k in pre:
+        put(k, b"from before", node=nodes[0])
+        for n in nodes:
+            get(k, node=n)
+            get(k, node=n, method="HEAD")
     st, _, _ = set_versioning("Enabled", node=nodes[1])
     check("versioning enabled through shard 1 is every shard's",
           st == 200 and all(get_versioning(node=n) == (200, "Enabled") for n in nodes),
           [get_versioning(node=n) for n in nodes])
+    named = [(k, n, m, get(k, node=n, method=m)[1].get("x-amz-version-id"))
+             for k in pre for n in nodes for m in ("GET", "HEAD")]
+    check("an object from before versioning is the null version through the owner and the other shard",
+          all(v == "null" for _, _, _, v in named), [x for x in named if x[3] != "null"][:4])
 
     keys = ["sk%d" % i for i in range(8)]
     written = {}
@@ -735,7 +851,9 @@ def mode_shards(nodes):
 
     lists = [all_versions(node=n) for n in nodes]
     expect = []
-    for k in sorted(keys):
+    for k in pre:
+        written[k] = [("null", b"from before")]
+    for k in sorted(keys + pre):
         for v, b in written[k]:
             expect.append((k, v))
     check("ListObjectVersions through either shard merges both, in order",
@@ -744,7 +862,7 @@ def mode_shards(nodes):
         got = [all_versions(node=n, page=page) for n in nodes]
         check("paged %d at a time across shards, the listing is the same" % page,
               bool(lists[0]) and all(g == lists[0] for g in got), [len(g or []) for g in got])
-    for i, k in enumerate(keys):
+    for i, k in enumerate(keys + pre):
         delete(k, node=nodes[i % 2])
     st, _, body = req("GET", "/%s?list-type=2" % B)
     st2, _, body2 = req("DELETE", "/" + B)

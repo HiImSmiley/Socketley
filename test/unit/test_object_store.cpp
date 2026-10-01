@@ -17,6 +17,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <fcntl.h>
@@ -191,6 +192,21 @@ struct rig : io_handler
         store->set_tags(bucket, key, tags, [&](st s) { got = s; fired = true; });
         REQUIRE(until([&] { return fired; }));
         return got;
+    }
+
+    // A bucket document changed as shard 0 changes one with no siblings: staged, then committed.
+    void set_doc(bucket_doc kind, const std::string& bucket, const std::string& xml)
+    {
+        bool staged = false, committed = false;
+        store->stage_doc(kind, bucket, xml, [&](st s) { CHECK(s == st::ok); staged = true; });
+        REQUIRE(until([&] { return staged; }));
+        store->commit_doc(kind, bucket, xml, [&](bool visible, st s)
+        {
+            CHECK(visible);
+            CHECK(s == st::ok);
+            committed = true;
+        });
+        REQUIRE(until([&] { return committed; }));
     }
 
     void settle(int turns = 50)
@@ -2347,4 +2363,139 @@ TEST_CASE("the next operation on a key waits until the pooled put before it is s
         }));
         CHECK_FALSE(early);
     }
+}
+
+TEST_CASE("the version a writer put in a body's header stands unless a newer one of the key was committed first")
+{
+    tmpdir d;
+    rig r(d.path);
+    REQUIRE(r.make_bucket("bkt") == st::ok);
+    r.set_doc(bucket_doc::versioning, "bkt", "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
+    REQUIRE(r.put("bkt", "k", "first").status == st::ok);
+    // A body written to tmp/ with the version given, handed to the commit as a landing shard hands it.
+    auto commit = [&](uint64_t seq, std::string& id)
+    {
+        char hex[17];
+        std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(seq));
+        id = std::string(hex) + "0123456789abcdef";
+        object_meta m;
+        m.size     = 4;
+        m.md5      = md5_of("body");
+        m.mtime_ms = static_cast<int64_t>(r.store->now_ms());
+        set_version_extra(m, version_tag{seq, id, false});
+        commit_request req;
+        req.bucket   = "bkt";
+        req.key      = "k";
+        req.tmp_name = r.store->tmp_name();
+        req.meta     = m;
+        spill(d.path + "/bkt/tmp/" + req.tmp_name, encode_object_header("k", m) + "body");
+        put_result out;
+        bool done = false;
+        r.store->commit(std::move(req), [&](put_result p) { out = std::move(p); done = true; });
+        REQUIRE(r.until([&] { return done; }));
+        return out;
+    };
+    auto on_disk = [&]
+    {
+        std::string body;
+        object_meta m;
+        REQUIRE(r.get("bkt", "k", body, &m) == st::ok);
+        CHECK(body == "body");
+        return version_of(m).id;
+    };
+    const uint64_t newest = version_of(*r.store->find("bkt", "k")).seq;
+
+    // Older than the key's newest, as a writer whose sync ended after a later one's leaves it: the owner gives another.
+    std::string stale_id;
+    const put_result stale = commit(newest - 1, stale_id);
+    REQUIRE(stale.status == st::ok);
+    CHECK(version_of(stale.meta).id != stale_id);
+    CHECK(version_of(stale.meta).seq > newest);
+    CHECK(on_disk() == version_of(stale.meta).id);
+
+    // Newer than every version the key has: kept as the writer wrote it.
+    std::string fresh_id;
+    const put_result fresh = commit(version_of(stale.meta).seq + 1000, fresh_id);
+    REQUIRE(fresh.status == st::ok);
+    CHECK(version_of(fresh.meta).id == fresh_id);
+    CHECK(on_disk() == fresh_id);
+
+    // Written while the bucket was Enabled, committed by an owner that missed the change to Suspended and settles
+    // it from the file first: the version is the null one the file says, not the id the writer chose.
+    r.store->doubt_doc(bucket_doc::versioning, "bkt", 7);
+    spill(d.path + "/bkt/versioning", "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>");
+    std::string enabled_id;
+    const put_result settled = commit(version_of(fresh.meta).seq + 1000, enabled_id);
+    REQUIRE(settled.status == st::ok);
+    CHECK(r.store->bucket_versioning("bkt") == versioning::suspended);
+    CHECK(version_of(settled.meta).id == "null");
+    CHECK(on_disk() == "null");
+}
+
+TEST_CASE("a versioned bucket's journal holds every version through a compaction, and a clean start reads no file")
+{
+    tmpdir d;
+    using entry = std::tuple<std::string, std::string, bool, std::string>;
+    auto listing = [](rig& r)
+    {
+        version_page p;
+        version_query q;
+        REQUIRE(r.store->list_versions("bkt", q, p) == st::ok);
+        std::vector<entry> out;
+        for (const version_item& i : p.items)
+            out.emplace_back(i.key, version_of(i.meta).id, i.latest, is_delete_marker(i.meta) ? "" : i.meta.etag());
+        return out;
+    };
+    auto purge = [](rig& r, const std::string& key, const std::string& id)
+    {
+        bool fired = false;
+        r.store->remove_version("bkt", key, id, [&](remove_result rr) { CHECK(rr.status == st::ok); fired = true; });
+        REQUIRE(r.until([&] { return fired; }));
+    };
+    std::vector<entry> before;
+    {
+        rig r(d.path, /*compact_floor=*/16);
+        r.plain = true;
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        r.set_doc(bucket_doc::versioning, "bkt",
+                  "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
+        std::vector<std::string> ids;
+        for (int i = 0; i < 12; ++i)
+        {
+            const put_result p = r.put("bkt", "a", "a" + std::to_string(i));
+            REQUIRE(p.status == st::ok);
+            ids.push_back(version_of(p.meta).id);
+        }
+        REQUIRE(r.put("bkt", "b", "b").status == st::ok);
+        REQUIRE(r.put("bkt", "c", "c").status == st::ok);
+        REQUIRE(r.del("bkt", "c") == st::ok);
+        // Removed for good: garbage enough for a compaction, which must carry the versions left.
+        for (size_t i = 1; i < 10; ++i)
+            purge(r, "a", ids[i]);
+        r.settle(200);
+        CHECK(r.store->totals().compactions >= 1);
+        before = listing(r);
+        // The latest of a and the two left behind it, b, and c's marker in front of its one version.
+        REQUIRE(before.size() == 6);
+        r.store->close(true);
+    }
+    {
+        rig r(d.path, 16);
+        CHECK(r.report.clean_start);
+        CHECK(r.report.files_read == 0);
+        CHECK(listing(r) == before);
+        std::string got;
+        REQUIRE(r.get("bkt", "a", got) == st::ok);
+        CHECK(got == "a11");
+        // Stopped without its marker, as a crash leaves it.
+        r.store->close(false);
+    }
+    const std::string journal = slurp(journal_path(d.path, "bkt"));
+    rig r(d.path, 16);
+    CHECK_FALSE(r.report.clean_start);
+    // The latest of a and of b, c's marker, a's two versions behind its latest and c's behind its marker.
+    CHECK(r.report.files_read == 6);
+    CHECK(listing(r) == before);
+    // The files said what the journal did, so it was not written again.
+    CHECK(slurp(journal_path(d.path, "bkt")) == journal);
 }
