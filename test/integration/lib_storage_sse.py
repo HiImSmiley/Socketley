@@ -14,6 +14,16 @@ usage: lib_storage_sse.py MODE ARGS...
   nokey PORT                a runtime without a master key refuses SSE-S3 and a bucket default
   shards NODE0 NODE1 DATA   two shards, one unix node each: a default set through one is honoured
                             by both, and every object reads alike through the owner and the other
+  tamper PORT DATA          object files rewritten as someone who can write the disk would: a header
+                            cut to a chunk boundary or to empty, two parts' chunks swapped, a part
+                            dropped from the header, a record set back to format 1; none reads
+  layout PORT DATA          an encrypted upload whose part list is too long for the header
+                            (SOCKETLEY_STORAGE_PART_LIST_MAX) completes, reads by range and
+                            partNumber before and after a restart, and a bent list reads nothing
+  pool PORT DATA            small SSE-S3 puts take a pooled file and sync as plain ones do; one killed
+                            after its rename (SOCKETLEY_STORAGE_KILL_AFTER_RENAME=killme/) whose rename
+                            is then lost is rolled forward, and a torn one is not
+  policy PORT               a bucket policy requiring AES256 through s3:x-amz-server-side-encryption
 
 Prints one PASS or FAIL line per assertion and exits with the number of failures.
 """
@@ -26,6 +36,7 @@ import re
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -134,9 +145,9 @@ def on_disk(data, key, bucket=B):
         return f.read()
 
 
-def sealed_len(n):
-    """Version 2: whole chunks, then the short one that ends the stream."""
-    return n + (n // 65536 + 1) * 28
+def sealed_len(n, version=2):
+    """Version 2: whole chunks, then the short one that ends the stream; version 1 had no chunk for the end."""
+    return n + ((n // 65536 + 1) if version == 2 else (n + 65535) // 65536) * 28
 
 
 def boto(port, https=False):
@@ -204,16 +215,17 @@ def ranges_ok(s3, key, body, extra=None):
 KEYARGS = None
 
 
-def mpu(s3, key, parts, create=None, part_args=None):
+def mpu(s3, key, parts, create=None, part_args=None, bucket=None):
     create = create or {}
     part_args = part_args or {}
-    up = s3.create_multipart_upload(Bucket=B, Key=key, **create)
+    bucket = bucket or B
+    up = s3.create_multipart_upload(Bucket=bucket, Key=key, **create)
     uid = up["UploadId"]
     done = []
     for i, p in enumerate(parts, 1):
-        r = s3.upload_part(Bucket=B, Key=key, UploadId=uid, PartNumber=i, Body=p, **part_args)
+        r = s3.upload_part(Bucket=bucket, Key=key, UploadId=uid, PartNumber=i, Body=p, **part_args)
         done.append({"PartNumber": i, "ETag": r["ETag"]})
-    r = s3.complete_multipart_upload(Bucket=B, Key=key, UploadId=uid, MultipartUpload={"Parts": done})
+    r = s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=uid, MultipartUpload={"Parts": done})
     return up, r
 
 
@@ -795,6 +807,423 @@ def mode_shards(nodes, data):
               st == 200 and "x-amz-server-side-encryption" not in h, (st, h))
 
 
+# ─── an object header as object_format.cpp writes it ────────────────────────
+
+def crc32c(data, crc=0):
+    global CRC_TABLE
+    try:
+        CRC_TABLE
+    except NameError:
+        CRC_TABLE = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+            CRC_TABLE.append(c)
+    crc ^= 0xFFFFFFFF
+    for b in data:
+        crc = CRC_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+def read_header(path):
+    with open(path, "rb") as f:
+        head = f.read(65536)
+    if head[:8] != b"SKLOBJ\x01\x00":
+        return None
+    _, header_len, body_len, crc = struct.unpack_from("<IIII", head, 8)
+    body = head[24:24 + body_len]
+    r = 0
+    size, mtime = struct.unpack_from("<QQ", body, r)
+    r += 16
+    md5d = body[r:r + 16]
+    r += 16
+    parts, = struct.unpack_from("<I", body, r)
+    r += 4
+
+    def s():
+        nonlocal r
+        n, = struct.unpack_from("<I", body, r)
+        v = body[r + 4:r + 4 + n]
+        r += 4 + n
+        return v
+    key = s()
+    ctype = s()
+    n, = struct.unpack_from("<I", body, r)
+    r += 4
+    extra = [(s(), s()) for _ in range(n)]
+    return dict(header_len=header_len, crc_ok=crc32c(head[:20] + body) == crc, size=size, mtime=mtime, md5=md5d,
+                parts=parts, key=key, ctype=ctype, extra=extra)
+
+
+def write_header(path, h):
+    """Writes `h` over the header of the file at `path`, its checksum made again, as someone who can write the disk can."""
+    def s(v):
+        return struct.pack("<I", len(v)) + v
+    body = struct.pack("<QQ", h["size"], h["mtime"]) + h["md5"] + struct.pack("<I", h["parts"]) + s(h["key"]) + \
+        s(h["ctype"]) + struct.pack("<I", len(h["extra"])) + b"".join(s(n) + s(v) for n, v in h["extra"])
+    pre = b"SKLOBJ\x01\x00" + struct.pack("<III", 1, h["header_len"], len(body))
+    out = pre + struct.pack("<I", crc32c(pre + body)) + body
+    out += b"\0" * (h["header_len"] - len(out))
+    with open(path, "r+b") as f:
+        f.write(out)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def extra_of(h, name):
+    return dict(h["extra"]).get(name)
+
+
+def set_extra(h, name, value):
+    h["extra"] = [(n, value if n == name else v) for n, v in h["extra"]]
+
+
+def fetch(path, headers=None):
+    """A GET's status and body, or "cut" when the connection ends inside a body its headers promised."""
+    try:
+        st, _, body = req("GET", path, headers=headers)
+        return st, body
+    except (http.client.IncompleteRead, http.client.RemoteDisconnected, ConnectionError) as e:
+        return "cut", type(e).__name__
+
+
+def swap(path, a, b, n):
+    with open(path, "r+b") as f:
+        f.seek(a)
+        x = f.read(n)
+        f.seek(b)
+        y = f.read(n)
+        f.seek(a)
+        f.write(y)
+        f.seek(b)
+        f.write(x)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def flip(path, at):
+    with open(path, "r+b") as f:
+        f.seek(at)
+        c = f.read(1)
+        f.seek(at)
+        f.write(bytes([c[0] ^ 1]))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def restart_runtime(port, data=None):
+    """Stops and starts the runtime, every journal removed in between when `data` is given."""
+    subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
+    time.sleep(0.5)
+    removed = remove_journals(data) if data else 0
+    subprocess.run([BIN, "start", RUNTIME], capture_output=True)
+    return wait_for(lambda: probe(port), 30), removed
+
+
+# ─── tampering with what is on the disk ─────────────────────────────────────
+
+TB = "ssetamper"
+
+
+def mode_tamper(port, data):
+    global NODE
+    NODE = port
+    s3 = boto(port)
+    s3.create_bucket(Bucket=TB)
+    aes = {"ServerSideEncryption": "AES256"}
+
+    # A header cut back to a chunk boundary: every chunk before it still opens, and none of them ends the stream.
+    body = marked(3 * 65536 + 100, "cut")
+    s3.put_object(Bucket=TB, Key="cut", Body=body, **aes)
+    path = obj_file(data, "cut", TB)
+    h = read_header(path)
+    check("the header this test rewrites is the one the runtime wrote", h and h["crc_ok"] and h["size"] == len(body))
+    h["size"] = 2 * 65536
+    write_header(path, h)
+    st, got = fetch("/%s/cut" % TB)
+    check("an object whose header was cut to a chunk boundary does not read as the shorter object",
+          st != 200 and got != body[:2 * 65536], (st, len(got) if isinstance(got, bytes) else got))
+    st, got = fetch("/%s/cut" % TB, {"Range": "bytes=131000-131071"})
+    check("and nor does a range read to its claimed end", st not in (200, 206), (st, got[:80]))
+    st, got = fetch("/%s/cut" % TB, {"Range": "bytes=0-99"})
+    check("while a range inside it is still the object's own bytes", (st, got) == (206, body[:100]), st)
+
+    # A small object, read whole with its header, is refused before a header is sent: cut to empty, it is a 500.
+    small = marked(3000, "smallcut")
+    s3.put_object(Bucket=TB, Key="small", Body=small, **aes)
+    path = obj_file(data, "small", TB)
+    h = read_header(path)
+    h["size"] = 0
+    write_header(path, h)
+    st, got = fetch("/%s/small" % TB)
+    check("a small object whose header says it is empty is a 500, not an empty object",
+          (st, xml_code(got)) == (500, "InternalError"), (st, got[:200]))
+
+    # Two parts of one upload share its data key, so their chunks at one index were interchangeable.
+    p = [marked(5 * MIB, "sp1"), marked(5 * MIB + 1000, "sp2")]
+    mpu(s3, "spliced", p, create=aes, bucket=TB)
+    path = obj_file(data, "spliced", TB)
+    h = read_header(path)
+    hl = h["header_len"]
+    # Where part 2's stream begins depends on the format the record names, so the swap is exact for either.
+    swap(path, hl, hl + sealed_len(len(p[0]), int(extra_of(h, b"x-socketley-sse")[:1])), 65536 + 28)
+    st, got = fetch("/%s/spliced" % TB, {"Range": "bytes=0-99"})
+    check("chunk 0 of part 2 put in the place of chunk 0 of part 1 does not open there",
+          st not in (200, 206) and got != p[1][:100], (st, got[:40]))
+    st, got = fetch("/%s/spliced" % TB, {"Range": "bytes=%d-%d" % (len(p[0]), len(p[0]) + 99)})
+    check("and nor does chunk 0 of part 1 in part 2's place", st not in (200, 206), (st, got[:40]))
+    st, got = fetch("/%s/spliced" % TB)
+    check("so the whole object does not read as a mix of both", st != 200, st)
+
+    # A header that names fewer parts than were completed: the data key is wrapped with the list it had.
+    p = [marked(5 * MIB, "dp1"), marked(5 * MIB, "dp2"), marked(MIB + 7, "dp3")]
+    mpu(s3, "dropped", p, create=aes, bucket=TB)
+    path = obj_file(data, "dropped", TB)
+    h = read_header(path)
+    check("a completed upload's header records its part sizes", extra_of(h, b"x-socketley-part-sizes") is not None,
+          h["extra"])
+    h["parts"] = 2
+    h["size"] = 2 * 5 * MIB
+    set_extra(h, b"x-socketley-part-sizes", str(5 * MIB).encode())
+    write_header(path, h)
+    st, got = fetch("/%s/dropped" % TB)
+    check("a header that drops the last part is a 500, not the first two parts",
+          (st, xml_code(got)) == (500, "InternalError"), (st, got[:200]))
+    st, got = fetch("/%s/dropped?partNumber=1" % TB)
+    check("and nor does partNumber read a part of it", st == 500, (st, got[:200]))
+
+    # A record set back to format 1, whose chunks were bound to their index alone.
+    body = marked(200000, "downgrade")
+    s3.put_object(Bucket=TB, Key="downgrade", Body=body, **aes)
+    path = obj_file(data, "downgrade", TB)
+    h = read_header(path)
+    rec = extra_of(h, b"x-socketley-sse")
+    check("a new object is written in format 2", rec is not None and rec.startswith(b"2;"), rec)
+    set_extra(h, b"x-socketley-sse", b"1" + rec[1:])
+    write_header(path, h)
+    st, got = fetch("/%s/downgrade" % TB)
+    check("a record set back to format 1 opens nothing", st != 200, st)
+
+
+# ─── a part list too long for the header ────────────────────────────────────
+
+LB = "sselayout"
+# Part numbers with gaps, and every size its own, so the list is long and the numbers have to be kept.
+LAYOUT_NUMBERS = [1, 2, 4, 5, 7, 8, 10, 11, 13]
+
+
+def layout_parts():
+    return [marked(5 * MIB + 4099 * i + 1, "lay%d" % n) for i, n in enumerate(LAYOUT_NUMBERS[:-1])] + \
+        [marked(12345, "laylast")]
+
+
+def mode_layout(port, data):
+    global NODE
+    NODE = port
+    s3 = boto(port)
+    s3.create_bucket(Bucket=LB)
+    parts = layout_parts()
+    whole = b"".join(parts)
+    trailers = stat_int("multipart_list_trailers")
+    up = s3.create_multipart_upload(Bucket=LB, Key="varied", ServerSideEncryption="AES256")
+    done = []
+    for n, p in zip(LAYOUT_NUMBERS, parts):
+        r = s3.upload_part(Bucket=LB, Key="varied", UploadId=up["UploadId"], PartNumber=n, Body=p)
+        done.append({"PartNumber": n, "ETag": r["ETag"]})
+    r = s3.complete_multipart_upload(Bucket=LB, Key="varied", UploadId=up["UploadId"], MultipartUpload={"Parts": done})
+    check("an encrypted upload of %d parts, each its own size and numbered with gaps, completes" % len(parts),
+          r.get("ServerSideEncryption") == "AES256" and r["ETag"].strip('"').endswith("-%d" % len(parts)), r)
+    path = obj_file(data, "varied", LB)
+    h = read_header(path)
+    check("its part list is kept after the body, its header naming where and its digest",
+          extra_of(h, b"x-socketley-part-layout") is not None and extra_of(h, b"x-socketley-part-sizes") is None,
+          h["extra"])
+    check("which the stats count", wait_stat("multipart_list_trailers", trailers + 1),
+          (trailers, stat_int("multipart_list_trailers")))
+    with open(path, "rb") as f:
+        raw = f.read()
+    check("the file does not hold its plaintext", MARK not in raw, raw.count(MARK))
+    check("and is the header, every part's sealed stream and the list",
+          len(raw) == h["header_len"] + sum(sealed_len(len(p)) for p in parts) + 20 + 12 * len(parts),
+          len(raw))
+
+    def reads(label):
+        g = s3.get_object(Bucket=LB, Key="varied")
+        check("%s: it reads back whole" % label, g["Body"].read() == whole)
+        bad = []
+        at = 0
+        for i, p in enumerate(parts):
+            if i:
+                got = s3.get_object(Bucket=LB, Key="varied", Range="bytes=%d-%d" % (at - 50, at + 49))["Body"].read()
+                if got != whole[at - 50:at + 50]:
+                    bad.append(("across", i))
+            got = s3.get_object(Bucket=LB, Key="varied", PartNumber=i + 1)
+            if got["Body"].read() != p or got["ContentLength"] != len(p):
+                bad.append(("part", i + 1))
+            hd = s3.head_object(Bucket=LB, Key="varied", PartNumber=i + 1)
+            if hd["ContentLength"] != len(p) or hd.get("PartsCount") != len(parts):
+                bad.append(("head", i + 1, hd["ContentLength"]))
+            at += len(p)
+        check("%s: every part by partNumber, GET and HEAD, and every range across a part boundary" % label, not bad, bad)
+
+    reads("before a restart")
+    ok, removed = restart_runtime(port, data)
+    check("it starts again with %d journal files removed" % removed, ok and removed > 0, (ok, removed))
+    reads("after it, from the header and the list in the file")
+
+    # The list is checked against its digest, so one bent by a byte places nothing.
+    flip(path, len(raw) - 5)
+    st, got = fetch("/%s/varied?partNumber=2" % LB)
+    check("a list bent by a byte is a 500 for a partNumber read", (st, xml_code(got)) == (500, "InternalError"),
+          (st, got[:200]))
+    st, got = fetch("/%s/varied" % LB)
+    check("and the whole object is not read through it", st != 200, st)
+
+
+# ─── encrypted puts through a pooled file ───────────────────────────────────
+
+PB = "ssepool"
+
+
+def mode_pool(port, data):
+    global NODE
+    NODE = port
+    s3 = boto(port)
+    s3.create_bucket(Bucket=PB)
+
+    def puts(n, sse):
+        extra = {"ServerSideEncryption": "AES256"} if sse else {}
+        s3.put_object(Bucket=PB, Key="warm%d" % sse, Body=b"w", **extra)
+        time.sleep(0.3)
+        f0 = stat_int("fsyncs")
+        t0 = time.time()
+        for i in range(n):
+            s3.put_object(Bucket=PB, Key="f%d/%d" % (sse, i), Body=marked(4096, "f%d%d" % (sse, i)), **extra)
+        took = (time.time() - t0) / n
+        time.sleep(0.5)
+        return (stat_int("fsyncs") - f0) / n, took
+
+    plain_syncs, plain_ms = puts(40, False)
+    sse_syncs, sse_ms = puts(40, True)
+    pooled = 0
+    for i in range(40):
+        h = read_header(obj_file(data, "f1/%d" % i, PB))
+        digest = extra_of(h, b"x-socketley-stored-md5")
+        with open(obj_file(data, "f1/%d" % i, PB), "rb") as f:
+            f.seek(h["header_len"])
+            stored = f.read()
+        pooled += 1 if digest == md5(stored).encode() else 0
+    # A pool refilled behind a slow sync of pool/ can run dry for a put or two, which then take the long way.
+    check("small SSE-S3 puts go through a pooled file, each naming the digest of its sealed bytes (%d of 40)" % pooled,
+          pooled >= 30, pooled)
+    check("and sync as plain ones do: %.2f fsyncs and %.2f ms a put against %.2f and %.2f in the clear" %
+          (sse_syncs, sse_ms * 1000, plain_syncs, plain_ms * 1000), abs(sse_syncs - plain_syncs) < 0.5,
+          (sse_syncs, plain_syncs))
+
+    # SOCKETLEY_STORAGE_KILL_AFTER_RENAME=killme/ kills the worker right after the rename that answers a pooled put.
+    def killed_put(key, body):
+        pid = stats().get("pid")
+        try:
+            s3.put_object(Bucket=PB, Key=key, Body=body, ServerSideEncryption="AES256")
+            answered = True
+        except Exception:  # noqa: BLE001
+            answered = False
+        back = wait_for(lambda: (lambda p: p if p and p != pid and probe(port) else None)(stats().get("pid")), 40)
+        return answered, back
+
+    pool_dir = os.path.join(data, PB, "pool")
+    # The descriptors every bucket's pool holds are bounded together, so the kills begin from a start, with every pool empty.
+    restart_runtime(port)
+    for key, torn in (("killme/whole", False), ("killme/torn", True)):
+        body = marked(100000, key)
+        # A start leaves the pool empty and a put fills it once pool/ is synced, which a busy disk makes slow, so
+        # puts are made until one took a file; the pool then holds more than the one put after it takes.
+        warm = iter(range(1000))
+
+        def pooled_put():
+            k = "warm/%s/%d" % (key, next(warm))
+            s3.put_object(Bucket=PB, Key=k, Body=b"w", ServerSideEncryption="AES256")
+            return extra_of(read_header(obj_file(data, k, PB)), b"x-socketley-stored-md5") is not None
+        check("%s: the pool is filled again" % key, wait_for(pooled_put, 20))
+        answered, back = killed_put(key, body)
+        check("%s: the worker is killed after the rename, before it answers, and comes back" % key,
+              not answered and back, (answered, back))
+        path = obj_file(data, key, PB)
+        h = read_header(path) if path and os.path.exists(path) else None
+        check("%s: its file names the digest of its sealed bytes" % key,
+              h is not None and extra_of(h, b"x-socketley-stored-md5") is not None, h and h["extra"])
+        # A process killed keeps its renames; a crash of the machine may not, which leaves the file in pool/.
+        subprocess.run([BIN, "stop", RUNTIME], capture_output=True)
+        time.sleep(0.5)
+        lost = os.path.join(pool_dir, "0.000000000000000000000000000000%02d" % (77 + torn))
+        os.rename(path, lost)
+        if torn:
+            flip(lost, os.path.getsize(lost) - 1000)
+        remove_journals(data)
+        subprocess.run([BIN, "start", RUNTIME], capture_output=True)
+        check("%s: it starts again" % key, wait_for(lambda: probe(port), 30))
+        st, got = fetch("/%s/%s" % (PB, key))
+        if torn:
+            check("a sealed pooled file with a page lost is not rolled forward", st == 404, (st, got[:120]))
+        else:
+            check("a whole sealed pooled file is rolled forward with no key at hand, and reads back",
+                  (st, got) == (200, body), (st, len(got)))
+        check("%s: and the pool holds no file it left" % key, not os.path.exists(lost), os.listdir(pool_dir))
+
+
+# ─── a bucket policy that requires encryption ───────────────────────────────
+
+YB = "ssepolicy"
+
+
+def mode_policy(port):
+    global NODE
+    NODE = port
+    s3 = boto(port)
+    s3.create_bucket(Bucket=YB)
+    res = "arn:aws:s3:::%s/*" % YB
+    # The policy S3's documentation gives for requiring SSE-S3 on every upload.
+    pol = {"Version": "2012-10-17", "Statement": [
+        {"Sid": "DenyIncorrectEncryptionHeader", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+         "Resource": res, "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}}},
+        {"Sid": "DenyUnencryptedObjectUploads", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+         "Resource": res, "Condition": {"Null": {"s3:x-amz-server-side-encryption": "true"}}}]}
+    st, _, body = req("PUT", "/%s?policy" % YB, json.dumps(pol).encode())
+    check("a policy conditioned on s3:x-amz-server-side-encryption is taken", st == 204, (st, body[:300]))
+    aes = {"x-amz-server-side-encryption": "AES256"}
+    st, _, body = req("PUT", "/%s/clear" % YB, b"x")
+    check("a PUT that does not ask for encryption is refused by it", (st, xml_code(body)) == (403, "AccessDenied"),
+          (st, body[:200]))
+    st, _, _ = req("PUT", "/%s/sealed" % YB, b"x", aes)
+    check("one that asks for AES256 is not", st == 200, st)
+    st, _, body = req("PUT", "/%s/kms" % YB, b"x", {"x-amz-server-side-encryption": "aws:kms"})
+    check("one that asks for another method is refused by it", (st, xml_code(body)) == (403, "AccessDenied"), st)
+    st, _, body = req("PUT", "/%s/copy" % YB, b"", {"x-amz-copy-source": "/%s/sealed" % YB})
+    check("a copy that does not ask is refused", (st, xml_code(body)) == (403, "AccessDenied"), st)
+    st, _, _ = req("PUT", "/%s/copy" % YB, b"", dict(aes, **{"x-amz-copy-source": "/%s/sealed" % YB}))
+    check("and one that does is not", st == 200, st)
+    st, _, body = req("POST", "/%s/mp?uploads" % YB)
+    check("an upload begun without it is refused", (st, xml_code(body)) == (403, "AccessDenied"), st)
+    # The parts and the completion carry no header: the encryption was chosen, and judged, at the creation.
+    part = marked(5 * MIB, "polpart")
+    r = s3.create_multipart_upload(Bucket=YB, Key="mp", ServerSideEncryption="AES256")
+    p1 = s3.upload_part(Bucket=YB, Key="mp", UploadId=r["UploadId"], PartNumber=1, Body=part)
+    p2 = s3.upload_part(Bucket=YB, Key="mp", UploadId=r["UploadId"], PartNumber=2, Body=b"tail")
+    c = s3.complete_multipart_upload(Bucket=YB, Key="mp", UploadId=r["UploadId"], MultipartUpload={"Parts": [
+        {"PartNumber": 1, "ETag": p1["ETag"]}, {"PartNumber": 2, "ETag": p2["ETag"]}]})
+    check("one begun with it takes its parts and completes", c.get("ServerSideEncryption") == "AES256", c)
+    check("and the policy says nothing of reads", s3.get_object(Bucket=YB, Key="mp")["Body"].read() == part + b"tail")
+    st, _, body = req("PUT", "/%s?policy" % YB, json.dumps({"Statement": [dict(pol["Statement"][0], Condition={
+        "StringEquals": {"s3:x-amz-server-side-encryption-aws-kms-key-id": "k"}})]}).encode())
+    check("a condition on a key it cannot honour is still refused", (st, xml_code(body)) == (400, "MalformedPolicy"),
+          (st, body[:200]))
+    st, _, _ = req("DELETE", "/%s?policy" % YB)
+    check("the policy is removed", st == 204, st)
+    st, _, _ = req("PUT", "/%s/clear" % YB, b"x")
+    check("after which a PUT in the clear is taken", st == 200, st)
+
+
 def main():
     if MODE == "main":
         mode_main(int(sys.argv[2]), sys.argv[3])
@@ -806,6 +1235,14 @@ def main():
         mode_nokey(int(sys.argv[2]))
     elif MODE == "shards":
         mode_shards(sys.argv[2:4], sys.argv[4])
+    elif MODE == "tamper":
+        mode_tamper(int(sys.argv[2]), sys.argv[3])
+    elif MODE == "layout":
+        mode_layout(int(sys.argv[2]), sys.argv[3])
+    elif MODE == "pool":
+        mode_pool(int(sys.argv[2]), sys.argv[3])
+    elif MODE == "policy":
+        mode_policy(int(sys.argv[2]))
     print("  %d passed, %d failed" % (passed, failed))
     sys.exit(min(failed, 100))
 

@@ -17,6 +17,9 @@
 #               its bytes as ETag, under either metadata directive
 #   legacy      an object whose header records no part sizes, as one completed
 #               before they were, answers partNumber with 501 and is whole
+#   long list   parts of nine sizes, whose list does not fit the header (made
+#               small here by SOCKETLEY_STORAGE_PART_LIST_MAX), keep it after the
+#               body and are answered from it, after restarts and on two shards
 #   restart     the boundaries survive a restart, and a start with every journal
 #               removed reads them from the object headers
 #   shards      with --shards 2 every part is answered alike by the shard that
@@ -79,6 +82,8 @@ run_lib() {   # label runtime mode args...
 
 echo "=== Integration: GetObject and HeadObject by partNumber ==="
 command -v python3 >/dev/null 2>&1 || { echo "  FAIL: python3 is required"; exit 1; }
+# Read by the workers the daemon starts: a part list over 48 bytes goes after the body.
+export SOCKETLEY_STORAGE_PART_LIST_MAX=48
 daemon_start "$BIN"
 
 DATA="$SOCKETLEY_TMPD/objects"

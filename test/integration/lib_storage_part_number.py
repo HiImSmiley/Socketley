@@ -161,6 +161,8 @@ def blob(n, seed):
 EQUAL = [blob(5 * MiB, "e1"), blob(5 * MiB, "e2"), blob(5 * MiB, "e3"), blob(MiB + 7, "e4")]
 UNEQUAL = [blob(6 * MiB, "u1"), blob(5 * MiB, "u2"), blob(7 * MiB + 3, "u3"), blob(100, "u4")]
 SINGLE = blob(10000, "s")
+# Every size its own, so the list is longer than the 48 bytes SOCKETLEY_STORAGE_PART_LIST_MAX leaves it in the header.
+VARIED = [blob(5 * MiB + 4099 * i + 1, "v%d" % i) for i in range(8)] + [blob(100, "vlast")]
 
 
 # ── an object header as object_format.cpp writes it ─────────────────────────
@@ -292,6 +294,24 @@ def mode_main(port, data):
     st, hd, _ = req("GET", "/%s/equal" % B)
     check("which is no response header", not any("socketley" in k for k in hd), list(hd))
 
+    # ── a part list too long for the header follows the body ──
+    etag, _ = upload("varied", VARIED, data=data)
+    check("parts of nine sizes complete", etag == mp_etag(VARIED), etag)
+    h = read_header(object_file(data, "varied"))
+    extra = dict(h["extra"])
+    check("their list is kept after the body, which the header names, and not in it",
+          b"x-socketley-part-layout" in extra and b"x-socketley-part-sizes" not in extra, h["extra"])
+    with open(object_file(data, "varied"), "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+    check("the file is the header, the body and the list",
+          size == h["header_len"] + sum(len(p) for p in VARIED) + 20 + 12 * len(VARIED), size)
+    wrong = part_answers("varied", VARIED) + part_answers("varied", VARIED, "HEAD")
+    check("each of its parts is answered by GET and HEAD from the list", not wrong, wrong[:2])
+    st, h2, body = req("GET", "/%s/varied" % B)
+    check("and a plain GET of it is the body without the list", (st, body == b"".join(VARIED)) == (200, True), st)
+    st, _, body = req("GET", "/%s/varied?partNumber=10" % B)
+    check("partNumber=10 of its nine is 416", (st, xml_code(body)) == (416, "InvalidPartNumber"), (st, body[:200]))
+
     # ── a single-part object is its own part 1 ──
     req("PUT", "/%s/single" % B, SINGLE)
     MULTI["single"] = False
@@ -411,12 +431,14 @@ def mode_restart(port, data):
     MULTI["single"] = False
     ok, _ = restart(port)
     check("it starts again", ok)
-    wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL) + part_answers("single", [SINGLE])
+    wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL) + part_answers("single", [SINGLE]) + \
+        part_answers("varied", VARIED)
     check("after a restart every part is answered as before", not wrong, wrong[:2])
     ok, removed = restart(port, data)
     check("and again with every journal removed", ok and removed > 0, (ok, removed))
-    wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD")
-    check("after which the boundaries come from the object headers", not wrong, wrong[:2])
+    wrong = part_answers("equal", EQUAL) + part_answers("unequal", UNEQUAL, "HEAD") + \
+        part_answers("varied", VARIED, "HEAD")
+    check("after which the boundaries come from the object headers and the list after a body", not wrong, wrong[:2])
 
 
 def mode_shards(nodes):
@@ -437,6 +459,12 @@ def mode_shards(nodes):
             wrong += [(key, node, w) for w in part_answers(key, parts, node=node)]
             wrong += [(key, node, w) for w in part_answers(key, parts, "HEAD", node=node)]
     check("every part of every object is answered alike by both shards, owner or not", not wrong, wrong[:3])
+    upload("s-var", VARIED, node=nodes[1])
+    wrong = []
+    for node in nodes:
+        wrong += [(node, w) for w in part_answers("s-var", VARIED, node=node)]
+        wrong += [(node, w) for w in part_answers("s-var", VARIED, "HEAD", node=node)]
+    check("and an object whose list follows its body is answered alike by both", not wrong, wrong[:3])
     for node in nodes:
         st, _, body = req("GET", "/%s/s-eq-0?partNumber=4" % B, node=node)
         check("part 4 of 3 is 416 on %s" % os.path.basename(node), (st, xml_code(body)) == (416, "InvalidPartNumber"),

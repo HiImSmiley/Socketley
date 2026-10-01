@@ -22,6 +22,18 @@
 #   shards      with --shards 2 a default set through one shard is the other's,
 #               and every object reads alike through its owner and the other
 #   versioning  every version of an encrypted key reads back by its id
+#   tampering   a header cut to a chunk boundary or to empty, two parts' chunks
+#               swapped, a part dropped from the header and a record set back to
+#               format 1 are each an error, never shorter or mixed data
+#   part list   an encrypted upload of parts of nine sizes, numbered with gaps,
+#               whose list does not fit the header (made small here by
+#               SOCKETLEY_STORAGE_PART_LIST_MAX) completes and reads by range and
+#               partNumber, after a restart too
+#   pool        small SSE-S3 puts take a pooled file, and one whose worker is
+#               killed after its rename (SOCKETLEY_STORAGE_KILL_AFTER_RENAME) and
+#               whose rename is then lost is rolled forward by the next start
+#   policy      a bucket policy with s3:x-amz-server-side-encryption refuses
+#               uploads that do not ask for AES256
 #
 # The assertions live in lib_storage_sse.py, which prints one line each.
 set -uo pipefail
@@ -101,6 +113,9 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout "$CERTS/srv-key.pem" -
 KEY="$T/master.key"
 head -c 32 /dev/urandom > "$KEY"
 chmod 600 "$KEY"
+# Read by the workers the daemon starts: a part list over 48 bytes goes after the body, and a put of a
+# killme/ key kills its worker right after its rename.
+export SOCKETLEY_STORAGE_PART_LIST_MAX=48 SOCKETLEY_STORAGE_KILL_AFTER_RENAME=killme/
 daemon_start "$BIN"
 
 # ── the key file ────────────────────────────────────────────────────────────
@@ -131,6 +146,10 @@ out=$("$BIN" edit sse --sse-key-file "$T/hex.key" 2>&1)
 contains "edit refuses the key file and points at import" "$out" "import"
 run_lib "the main half ran" sse main "$P1" "$DATA"
 run_lib "the recovery half ran" sse recovery "$P1" "$DATA"
+run_lib "the tamper half ran" sse tamper "$P1" "$DATA"
+run_lib "the layout half ran" sse layout "$P1" "$DATA"
+run_lib "the pool half ran" sse pool "$P1" "$DATA"
+run_lib "the policy half ran" sse policy "$P1"
 "$BIN" stop sse >/dev/null 2>&1
 
 # ── a TLS runtime with a master key, for SSE-C ──────────────────────────────
