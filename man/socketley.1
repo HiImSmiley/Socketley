@@ -6735,9 +6735,16 @@ The part sizes are recorded in the object's header at CompleteMultipartUpload
 .BR x\-socketley\-part\-sizes ,
 never sent to a client): one size when every part but the last has it, which
 is every in\-place completion, and otherwise the list, up to 4 KiB of it. The
-journal carries them as it carries the rest of the header. A multipart object
-completed before they were recorded, or with a list longer than that, answers
-any part number within its count with
+journal carries them as it carries the rest of the header. A longer list, which
+any upload S3 takes may need, follows the object's body in the file instead, 20
+bytes and 12 more per part, with the header naming where it begins and its
+SHA\-256
+.RB ( x\-socketley\-part\-layout );
+a part number of such an object reads the list from the file first, and a list
+that does not match its digest is
+.BR "500 InternalError" .
+A multipart object completed before part sizes were recorded answers any part
+number within its count with
 .B "501 NotImplemented"
 rather than a guess; a plain GET or a Range reads it as before.
 .PP
@@ -6888,19 +6895,31 @@ of one is refused, since it has no key to give.
 .PP
 On disk an encrypted object is its header, which records the scheme
 .RB ( x\-socketley\-sse :
-version, SSE\-S3 or SSE\-C, the chunk size, whether the body is one stream or one per
+format, SSE\-S3 or SSE\-C, the chunk size, whether the body is one stream or one per
 part, the master key's id and the wrapped data key), and then its plaintext in chunks
 of 64 KiB, each sealed with AES\-256\-GCM on its own as a random 12\-byte nonce, the
-ciphertext and a 16\-byte tag, with the chunk's index in the authenticated data: 28
-bytes per 64 KiB. A range or a part reads and opens only the chunks it touches, and a
-chunk that does not open \(em a changed byte, a chunk moved to another place \(em ends
-the response there with a line in the log. The parts of a multipart upload are each a
-stream of their own, written where the object needs them as unencrypted ones are, and
-found again by the part sizes the object records; an encrypted upload whose part sizes
-are too varied to record (see
-.BR "Reading by part number" )
-is refused at completion with
-.BR "400 InvalidRequest" .
+ciphertext and a 16\-byte tag: 28 bytes per 64 KiB. In format 2, which every new
+object and upload is written in, a chunk is sealed with the part number its stream
+was uploaded as (0 for an object that is one stream), its index there and whether it
+ends the stream, and every stream ends in a chunk shorter than 64 KiB, empty when its
+length is whole chunks; a completed upload's data key is wrapped again with the
+digest of its part list, sizes and numbers. So a header cut back to a chunk
+boundary, chunks moved to another place or swapped between two parts of one upload,
+and a header that names fewer parts or other ones all fail to open rather than read
+as a shorter or mixed object. A range or a part reads and opens only the chunks it
+touches, and the empty chunk that ends a stream when the range reaches that end; a
+chunk that does not open ends the response there with a line in the log, and an
+object small enough to be read whole with its header, or whose data key does not
+unwrap, is answered
+.B "500 InternalError"
+before anything else. An SSE\-C completion that does not carry the customer's key,
+which S3 does not ask of it, leaves the key wrapped as the upload had it, so the part
+list of such an object is bound only by its parts' own chunks. Objects written in
+format 1, which bound a chunk to its index alone, are read as they were, and so are
+parts of an upload begun under it. The parts of a multipart upload are each a stream
+of their own, written where the object needs them as unencrypted ones are, and found
+again by the part sizes and numbers the object records (see
+.BR "Reading by part number" ).
 A copy of an encrypted object, or into an encrypted one, is opened and sealed again
 on its way through, under a key of its own; a tag change, a new version and the
 assembly of an upload move the sealed bytes as they are. The chunks are sealed and
@@ -7139,8 +7158,27 @@ the IPv4 address), and
 .B Bool
 on
 .B aws:SecureTransport
-(whether the connection is TLS). Every condition of a statement must hold. A client
-on a unix socket has no address, so it is in no range: an
+(whether the connection is TLS), and
+.BR StringEquals ,
+.B StringNotEquals
+and
+.B Null
+on
+.B s3:x\-amz\-server\-side\-encryption
+(the request's
+.B x\-amz\-server\-side\-encryption
+header, compared as given: a request that does not send it equals no value, so
+.B StringNotEquals
+holds for it, and
+.B Null
+\fB"true"\fR holds for it alone). PutObject, CopyObject and CreateMultipartUpload
+carry the header; UploadPart, UploadPartCopy and CompleteMultipartUpload take the
+encryption their upload's creation chose and was judged on, so no statement with a
+condition on it applies to them, Allow or Deny. A bucket's default encryption is
+not the header, so S3's two statements that deny a PutObject without
+.B AES256
+refuse a put that leaves it to the default. Every condition of a statement must
+hold. A client on a unix socket has no address, so it is in no range: an
 .B IpAddress
 never holds for it and a
 .B NotIpAddress
@@ -7257,14 +7295,17 @@ from which listings are answered out of memory.
 A put writes a temporary file, syncs it, renames it into place and syncs the
 directory, and only then answers 200; a delete removes the file and syncs the
 directory. A put of up to 1 MiB whose length is known and that carries no
-condition (no \fBIf\-None\-Match\fR, not a part, not encrypted) is written instead into one of a
+condition (no \fBIf\-None\-Match\fR, not a part) is written instead into one of a
 few empty files the bucket keeps ready in \fBpool/\fR, whose names were synced
 before any put took one; once that file is synced and renamed into place the put
 is answered, and the syncs of \fBpool/\fR and of the object's directory follow the
 answer, with the key's next put or delete waiting for them. The answered object is
 on disk either way: a crash that takes the rename leaves it whole in \fBpool/\fR,
 and the next start moves it into place (a file there counts as whole only when its
-length and MD5 are those its header names). The journal record of either is
+length and MD5 are those its header names, which for an encrypted body is the MD5 of
+its sealed bytes, kept in its header as
+.BR x\-socketley\-stored\-md5 ,
+since a start holds no key that opens it). The journal record of either is
 appended behind the answer and synced once a megabyte of records has gathered,
 before a compaction and at a stop, and never merely because the queue drained,
 since that sync would sit in front of the next put's own: the object files are the
@@ -11795,6 +11836,16 @@ string kills the worker with
 after renaming the body into place and before the journal record, so a test can
 put a crash at the one step that leaves a file the journal does not name. Unset
 by default.
+.TP
+.B SOCKETLEY_STORAGE_PART_LIST_MAX
+A test hook: the bytes a multipart object's part sizes, and the numbers of an
+encrypted one's parts, may take in its header before the list is kept after its
+body instead. Default
+.BR 4096 ,
+which takes some five hundred parts of unequal sizes to pass; a small value lets a
+test reach the list after the body with a few parts.
+.IP
+Inherited by worker processes, which have no command line of their own.
 .TP
 .B SOCKETLEY_STORAGE_DOC_FAULT
 A test hook: a directory in which a file named
