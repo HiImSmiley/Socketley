@@ -1804,3 +1804,43 @@ TEST_CASE("a lifecycle day is rounded up to the next boundary, which for a real 
     r.enabled = false;
     CHECK_FALSE(lifecycle_object_due(r, "logs/a", m, 1767398400000, lifecycle_day_ms));
 }
+
+TEST_CASE("a lifecycle filter by tags and size matches what S3's does, and is written back as it came")
+{
+    s3_error err;
+    lifecycle_config c;
+    const std::string doc =
+        "<LifecycleConfiguration><Rule><ID>a</ID><Filter><And><Prefix>p/</Prefix>"
+        "<Tag><Key>k</Key><Value>v</Value></Tag><Tag><Key>j</Key><Value></Value></Tag>"
+        "<ObjectSizeGreaterThan>10</ObjectSizeGreaterThan><ObjectSizeLessThan>20</ObjectSizeLessThan>"
+        "</And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
+        "<Rule><ID>t</ID><Filter><Tag><Key>only</Key><Value>1</Value></Tag></Filter><Status>Enabled</Status>"
+        "<Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>";
+    REQUIRE(parse_lifecycle(doc, c, err));
+    lifecycle_config again;
+    REQUIRE(parse_lifecycle(lifecycle_xml(c), again, err));
+    CHECK(lifecycle_xml(again) == lifecycle_xml(c));
+    CHECK(lifecycle_xml(c).find("<Filter><And><Prefix>p/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag>") !=
+          std::string::npos);
+    CHECK(lifecycle_xml(c).find("<Filter><Tag><Key>only</Key><Value>1</Value></Tag></Filter>") != std::string::npos);
+
+    const lifecycle_rule& r = c.rules[0];
+    const int64_t later = 1767398400000;
+    auto obj = [](uint64_t size, std::string tags)
+    {
+        object_meta m;
+        m.size = size;
+        set_tags_extra(m, tags);
+        return m;
+    };
+    const std::string both = std::string("j\0\0k\0v\0", 7);
+    CHECK(lifecycle_object_due(r, "p/x", obj(15, both), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "q/x", obj(15, both), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "p/x", obj(10, both), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "p/x", obj(20, both), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "p/x", obj(15, std::string("k\0v\0", 4)), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "p/x", obj(15, std::string("j\0\0k\0w\0", 7)), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "p/x", obj(15, ""), later, lifecycle_day_ms));
+    CHECK(lifecycle_object_due(c.rules[1], "any", obj(0, std::string("only\0" "1\0", 7)), later, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(c.rules[1], "any", obj(0, std::string("only\0" "2\0", 7)), later, lifecycle_day_ms));
+}

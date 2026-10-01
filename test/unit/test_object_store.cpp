@@ -184,6 +184,15 @@ struct rig : io_handler
         return got;
     }
 
+    st tag(const std::string& bucket, const std::string& key, const std::string& tags)
+    {
+        st got = st::io_error;
+        bool fired = false;
+        store->set_tags(bucket, key, tags, [&](st s) { got = s; fired = true; });
+        REQUIRE(until([&] { return fired; }));
+        return got;
+    }
+
     void settle(int turns = 50)
     {
         for (int i = 0; i < turns; ++i)
@@ -287,6 +296,126 @@ TEST_CASE("a journal record decodes whole, torn and corrupt")
     std::string flipped = rec;
     flipped[12] ^= 0x40;
     CHECK(decode_journal_record(flipped).status == record_status::corrupt);
+}
+
+TEST_CASE("tag slots in a header's padding take changes in turn, and a torn one leaves the one before")
+{
+    object_meta m;
+    m.size     = 99;
+    m.mtime_ms = 1700000000000;
+    m.md5      = md5_of("x");
+    m.content_type = "text/plain";
+    set_tags_extra(m, std::string("a\0" "1\0", 4));
+    std::string h = encode_object_header("key", m);
+
+    decoded_header d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK(d.tag_slot == -1);
+    CHECK(d.meta == m);
+
+    // Each change goes to the slot the last one did not use, with the next number.
+    const std::string sets[] = {std::string("b\0" "2\0", 4), std::string("c\0" "3\0", 4), std::string()};
+    std::vector<uint64_t> where;
+    for (const std::string& t : sets)
+    {
+        uint64_t at = 0;
+        const std::string slot = encode_tag_slot(d, t, at);
+        REQUIRE_FALSE(slot.empty());
+        CHECK(at % 512 == 0);
+        CHECK(at + slot.size() <= object_header_align);
+        h.replace(at, slot.size(), slot);
+        where.push_back(at);
+        d = decode_object_header(h);
+        REQUIRE(d.status == header_status::ok);
+        CHECK(tags_of(d.meta) == t);
+        object_meta want = m;
+        set_tags_extra(want, t);
+        CHECK(d.meta == want);
+    }
+    CHECK(where[0] != where[1]);
+    CHECK(where[0] == where[2]);
+    CHECK(d.tag_seq == 3);
+
+    // The newest slot torn: the one before it is the truth again.
+    h[where[2] + 10] ^= 0x10;
+    d = decode_object_header(h);
+    REQUIRE(d.status == header_status::ok);
+    CHECK(tags_of(d.meta) == sets[1]);
+    CHECK(d.tag_seq == 2);
+    // And a header read short of its slots is the header as it was written.
+    CHECK(tags_of(decode_object_header(std::string_view(h).substr(0, 300)).meta) == std::string("a\0" "1\0", 4));
+
+    uint64_t at = 0;
+    CHECK(encode_tag_slot(d, std::string(4000, 'v'), at).empty());
+    object_meta fat = m;
+    fat.extra.emplace_back("x-amz-meta-big", std::string(3500, 'm'));
+    CHECK(encode_tag_slot(decode_object_header(encode_object_header("key", fat)), "t", at).empty());
+}
+
+TEST_CASE("a tag change keeps the object's bytes, ETag and time, and its file alone brings it back after a crash")
+{
+    tmpdir d;
+    const std::string small(std::string("env\0" "prod\0", 9));
+    // Ten tags of 128-byte keys and 256-byte values outgrow every slot, so the object is written again.
+    std::string big;
+    for (int i = 0; i < 10; ++i)
+        big += std::string(127, 'k') + char('0' + i) + '\0' + std::string(256, 'v') + '\0';
+    object_meta first;
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        object_meta m;
+        m.content_type = "text/plain";
+        m.extra = {{"x-amz-meta-who", "me"}};
+        REQUIRE(r.put("bkt", "small", pattern(10000)).status == st::ok);
+        REQUIRE(r.put("bkt", "big", pattern(3u << 20, 2), m).status == st::ok);
+        first = *r.store->find("bkt", "big");
+
+        CHECK(r.tag("bkt", "small", small) == st::ok);
+        CHECK(r.store->totals().tag_writes == 1);
+        CHECK(r.tag("bkt", "big", big) == st::ok);
+        CHECK(r.store->totals().tag_rewrites == 1);
+        CHECK(r.tag("bkt", "nothing", small) == st::no_such_key);
+        CHECK(r.tag("nobkt", "small", small) == st::no_such_bucket);
+
+        std::string body;
+        object_meta read;
+        REQUIRE(r.get("bkt", "big", body, &read) == st::ok);
+        CHECK(body == pattern(3u << 20, 2));
+        CHECK(read == *r.store->find("bkt", "big"));
+        CHECK(tags_of(read) == big);
+        CHECK(read.etag() == first.etag());
+        CHECK(read.mtime_ms == first.mtime_ms);
+        REQUIRE(r.get("bkt", "small", body, &read) == st::ok);
+        CHECK(body == pattern(10000));
+        CHECK(tags_of(read) == small);
+        CHECK(fs::is_empty(d.path + "/bkt/tmp"));
+
+        // A header that holds a big set has no room for slots, and the one written for a small set has.
+        CHECK(r.tag("bkt", "big", std::string("x\0" "y\0", 4)) == st::ok);
+        CHECK(r.store->totals().tag_rewrites == 2);
+        CHECK(r.tag("bkt", "big", small) == st::ok);
+        CHECK(r.store->totals().tag_writes == 2);
+        CHECK(r.store->totals().tag_rewrites == 2);
+        r.settle();
+    }
+    // A crash with the journal gone: only the object files say what the tags are.
+    fs::remove(journal_path(d.path, "bkt"));
+    rig again(d.path);
+    CHECK_FALSE(again.report.clean_start);
+    REQUIRE(again.store->find("bkt", "big") != nullptr);
+    CHECK(tags_of(*again.store->find("bkt", "big")) == small);
+    CHECK(again.store->find("bkt", "big")->etag() == first.etag());
+    CHECK(again.store->find("bkt", "big")->mtime_ms == first.mtime_ms);
+    CHECK(tags_of(*again.store->find("bkt", "small")) == small);
+
+    // Removing them is a change like any other.
+    CHECK(again.tag("bkt", "small", "") == st::ok);
+    std::string body;
+    object_meta read;
+    REQUIRE(again.get("bkt", "small", body, &read) == st::ok);
+    CHECK(tags_of(read).empty());
+    CHECK(body == pattern(10000));
 }
 
 TEST_CASE("bucket names follow the S3 rules")
