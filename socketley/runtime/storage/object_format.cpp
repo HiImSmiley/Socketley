@@ -444,14 +444,15 @@ std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint
 std::string encode_journal_header(uint32_t shard, uint32_t nshards)
 {
     std::string h(journal_magic);
-    put_u32(h, 2);
+    put_u32(h, journal_format);
     put_u32(h, shard);
     put_u32(h, nshards);
     put_u32(h, 0);
     return h;
 }
 
-journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards)
+journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards,
+                                           uint32_t* format)
 {
     if (bytes.size() < journal_header_len || bytes.substr(0, 8) != journal_magic)
         return journal_header_status::bad;
@@ -459,8 +460,10 @@ journal_header_status journal_header_check(std::string_view bytes, uint32_t shar
     std::memcpy(&version, bytes.data() + 8, 4);
     std::memcpy(&sh, bytes.data() + 12, 4);
     std::memcpy(&n, bytes.data() + 16, 4);
-    if (version != 2 || n == 0)
+    if ((version != 2 && version != journal_format) || n == 0)
         return journal_header_status::bad;
+    if (format)
+        *format = version;
     if (sh != shard || n != nshards)
         return journal_header_status::other_layout;
     return journal_header_status::ok;
@@ -495,6 +498,23 @@ void encode_delete_record(std::string& out, std::string_view key, int64_t mtime_
     frame_record(out, p);
 }
 
+void encode_version_record(std::string& out, std::string_view key, const object_meta& m)
+{
+    std::string p;
+    p.push_back(static_cast<char>(record_type::vput));
+    encode_meta(p, key, m);
+    frame_record(out, p);
+}
+
+void encode_version_drop_record(std::string& out, std::string_view key, std::string_view version_id)
+{
+    std::string p;
+    p.push_back(static_cast<char>(record_type::vdel));
+    put_str(p, key);
+    put_str(p, version_id);
+    frame_record(out, p);
+}
+
 decoded_record decode_journal_record(std::string_view bytes)
 {
     decoded_record d;
@@ -522,9 +542,20 @@ decoded_record decode_journal_record(std::string_view bytes)
     const auto type = static_cast<record_type>(static_cast<uint8_t>(payload[0]));
     const std::string_view rest = payload.substr(1);
     d.rec.type = type;
-    if (type == record_type::put)
+    if (type == record_type::put || type == record_type::vput)
     {
         if (!decode_meta(rest, d.rec.key, d.rec.meta))
+        {
+            d.status = record_status::corrupt;
+            return d;
+        }
+    }
+    else if (type == record_type::vdel)
+    {
+        reader r{rest};
+        d.rec.key        = std::string(r.str());
+        d.rec.version_id = std::string(r.str());
+        if (!r.ok || !r.in.empty() || !valid_version_id(d.rec.version_id))
         {
             d.status = record_status::corrupt;
             return d;

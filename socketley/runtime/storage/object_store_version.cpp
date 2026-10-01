@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 
 #include <fcntl.h>
@@ -50,8 +51,9 @@ std::string parent_of(const std::string& rel)
     return rel.substr(0, rel.rfind('/'));
 }
 
-// Steps that make the names in directory `dir` below `base` durable.
-void sync_dir(disk_chain& ch, file_io* io, event_loop* loop, int base, std::string dir)
+// Steps that make the names in directory `dir` below `base` durable, each sync counted in `fsyncs` while `alive`.
+void sync_dir(disk_chain& ch, file_io* io, event_loop* loop, int base, std::string dir, std::shared_ptr<bool> alive,
+              uint64_t* fsyncs)
 {
     auto fd = std::make_shared<int>(-1);
     ch.then([io, base, dir = std::move(dir), fd](file_io::done d)
@@ -63,12 +65,14 @@ void sync_dir(disk_chain& ch, file_io* io, event_loop* loop, int base, std::stri
             d(r);
         });
     });
-    ch.then([io, loop, fd](file_io::done d)
+    ch.then([io, loop, fd, alive = std::move(alive), fsyncs](file_io::done d)
     {
-        const bool q = io->fsync(*fd, false, [loop, fd, d](int64_t r)
+        const bool q = io->fsync(*fd, false, [loop, fd, d, alive, fsyncs](int64_t r)
         {
             loop->close_fd(*fd);
             *fd = -1;
+            if (*alive && r >= 0)
+                ++*fsyncs;
             d(r);
         });
         if (!q)
@@ -140,19 +144,58 @@ const object_meta* object_store::find_version(std::string_view bucket_name, std:
     return nullptr;
 }
 
-version_tag object_store::next_version(const bucket& b, const std::string& key, bool marker) const
+uint64_t object_store::newest_seq(const bucket& b, std::string_view key)
 {
     uint64_t top = 0;
     if (const auto o = b.objects.find(key); o != b.objects.end())
         top = version_of(o->second).seq;
     if (const auto v = b.versions.find(key); v != b.versions.end() && !v->second.empty())
         top = std::max(top, version_of(v->second.front()).seq);
+    return top;
+}
+
+version_tag object_store::next_version(const bucket& b, const std::string& key, bool marker) const
+{
     version_tag t;
     // Newer than every version the key has even when the clock stepped back.
-    t.seq    = std::max(now_us(), top + 1);
+    t.seq    = std::max(now_us(), newest_seq(b, key) + 1);
     t.marker = marker;
     t.id     = b.vstate == versioning::enabled ? hex16(t.seq) + hex16(random_u64()) : "null";
     return t;
+}
+
+bool object_store::stamp_holds(const bucket& b, const std::string& key, const object_meta& meta) const
+{
+    if (!has_version(meta))
+        return false;
+    const version_tag t = version_of(meta);
+    // An enabled bucket gives an id and a suspended one the null version, whichever it was when the body was written.
+    const bool kind = b.vstate == versioning::enabled ? t.id != "null"
+                                                      : b.vstate == versioning::suspended && t.id == "null";
+    return kind && !t.marker && t.seq > newest_seq(b, key);
+}
+
+bool object_store::place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size)
+{
+    const version_tag t = version_of(m);
+    const bool replaced = erase_version(list, t.id, replaced_size);
+    const auto at = std::find_if(list.begin(), list.end(),
+                                 [&](const object_meta& o) { return version_of(o).seq < t.seq; });
+    list.insert(at, m);
+    return replaced;
+}
+
+bool object_store::erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size)
+{
+    for (auto it = list.begin(); it != list.end(); ++it)
+        if (version_of(*it).id == id)
+        {
+            if (size)
+                *size = it->size;
+            list.erase(it);
+            return true;
+        }
+    return false;
 }
 
 void object_store::version_bytes(bucket& b, int64_t delta)
@@ -161,34 +204,48 @@ void object_store::version_bytes(bucket& b, int64_t delta)
     m_totals.bytes = static_cast<uint64_t>(static_cast<int64_t>(m_totals.bytes) + delta);
 }
 
+void object_store::version_add(bucket& b, const std::string& key, const object_meta& m)
+{
+    uint64_t old = 0;
+    if (place_version(b.versions[key], m, &old))
+        version_bytes(b, -static_cast<int64_t>(old));
+    else
+        ++b.nversions;
+    version_bytes(b, static_cast<int64_t>(m.size));
+    std::string rec;
+    encode_version_record(rec, key, m);
+    journal_append(b, rec, nullptr);
+}
+
+void object_store::version_drop(bucket& b, const std::string& key, std::string_view id)
+{
+    const auto v = b.versions.find(key);
+    uint64_t size = 0;
+    if (v == b.versions.end() || !erase_version(v->second, id, &size))
+        return;
+    --b.nversions;
+    version_bytes(b, -static_cast<int64_t>(size));
+    if (v->second.empty())
+        b.versions.erase(v);
+    std::string rec;
+    encode_version_drop_record(rec, key, id);
+    journal_append(b, rec, nullptr);
+}
+
 void object_store::version_install(bucket& b, const std::string& key, const object_meta& meta)
 {
+    // A null version replaces the key's one null version, wherever that is behind the latest.
     const bool null_new = version_of(meta).id == "null";
-    std::vector<object_meta>& list = b.versions[key];
-    if (const auto o = b.objects.find(key); o != b.objects.end())
-    {
-        // The latest moves behind the new one, unless both are the key's one null version.
-        if (!(null_new && version_of(o->second).id == "null"))
-        {
-            list.insert(list.begin(), o->second);
-            version_bytes(b, static_cast<int64_t>(o->second.size));
-        }
-    }
-    else if (!list.empty() && null_new && is_delete_marker(list.front()) && version_of(list.front()).id == "null")
-        list.erase(list.begin());
     if (null_new)
-        std::erase_if(list, [&](const object_meta& m)
-        {
-            if (version_of(m).id != "null")
-                return false;
-            version_bytes(b, -static_cast<int64_t>(m.size));
-            return true;
-        });
+        version_drop(b, key, "null");
+    // The latest moves behind the new one, unless both are the key's one null version.
+    if (const auto o = b.objects.find(key); o != b.objects.end() && !(null_new && version_of(o->second).id == "null"))
+        version_add(b, key, o->second);
 
     std::string rec;
     if (is_delete_marker(meta))
     {
-        list.insert(list.begin(), meta);
+        version_add(b, key, meta);
         if (b.objects.find(key) != b.objects.end())
         {
             encode_delete_record(rec, key, meta.mtime_ms);
@@ -202,17 +259,15 @@ void object_store::version_install(bucket& b, const std::string& key, const obje
         journal_append(b, rec, nullptr);
         apply_put(b, key, meta);
     }
-    if (list.empty())
-        b.versions.erase(key);
     hot_drop(b.name, key);
 }
 
 bool object_store::version_forget(bucket& b, const std::string& key, const std::string& id)
 {
     bool latest = false;
-    std::string rec;
     if (const auto o = b.objects.find(key); o != b.objects.end() && version_of(o->second).id == id)
     {
+        std::string rec;
         encode_delete_record(rec, key, static_cast<int64_t>(now_ms()));
         journal_append(b, rec, nullptr);
         apply_delete(b, key);
@@ -220,32 +275,21 @@ bool object_store::version_forget(bucket& b, const std::string& key, const std::
     }
     else if (const auto v = b.versions.find(key); v != b.versions.end())
     {
-        auto& list = v->second;
-        for (size_t i = 0; i < list.size(); ++i)
-        {
-            if (version_of(list[i]).id != id)
-                continue;
-            latest = i == 0 && is_delete_marker(list[0]) && b.objects.find(key) == b.objects.end();
-            if (!is_delete_marker(list[i]))
-                version_bytes(b, -static_cast<int64_t>(list[i].size));
-            list.erase(list.begin() + static_cast<ptrdiff_t>(i));
-            break;
-        }
+        const object_meta& front = v->second.front();
+        latest = is_delete_marker(front) && version_of(front).id == id && b.objects.find(key) == b.objects.end();
+        version_drop(b, key, id);
     }
     // The newest version left is the latest now, which a delete marker stays as at the front.
-    const auto v = b.versions.find(key);
-    if (latest && v != b.versions.end() && !v->second.empty() && !is_delete_marker(v->second.front()))
+    if (const auto v = b.versions.find(key);
+        latest && v != b.versions.end() && !is_delete_marker(v->second.front()))
     {
-        object_meta p = std::move(v->second.front());
-        v->second.erase(v->second.begin());
-        version_bytes(b, -static_cast<int64_t>(p.size));
-        rec.clear();
+        const object_meta p = v->second.front();
+        version_drop(b, key, version_of(p).id);
+        std::string rec;
         encode_put_record(rec, key, p);
         journal_append(b, rec, nullptr);
         apply_put(b, key, p);
     }
-    if (v != b.versions.end() && v->second.empty())
-        b.versions.erase(v);
     if (latest)
         hot_drop(b.name, key);
     return latest;
@@ -272,6 +316,13 @@ void object_store::commit_versioned(std::string bucket_name, std::string key, st
         return;
     }
     v->what = vop::kind::commit;
+    // The version the writer put in the header before the body was synced, unless a newer one or a change of
+    // the bucket's versioning came between, when the header is written again.
+    if (stamp_holds(*b, v->key, v->meta))
+    {
+        vop_install(std::move(v));
+        return;
+    }
     set_version_extra(v->meta, next_version(*b, v->key, false));
     vop_header(std::move(v));
 }
@@ -410,10 +461,12 @@ void object_store::vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off)
             return;
         }
         ++m_totals.fsyncs;
-        if (!m_io->unlinkat(v->pooled ? bp->pool_fd : bp->tmp_fd, v->tmp, 0, [](int64_t) {})) {}
+        // A whole pool file left behind would be rolled forward after a crash, so its removal is durable first.
+        const std::string old = v->tmp;
+        const bool pooled = v->pooled;
         v->tmp    = fresh;
         v->pooled = false;
-        vop_install(v);
+        drop_tmp(*bp, old, pooled, [this, v]() { vop_install(v); });
     });
 }
 
@@ -456,23 +509,79 @@ void object_store::vop_install(std::shared_ptr<vop> v)
         ch->then([this, data_fd, dir_fd, rel, vrel](file_io::done d)
                  { return m_io->linkat(data_fd, rel, dir_fd, vrel, std::move(d)); },
                  -EEXIST);
-        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel));
+        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel), m_alive, &m_totals.fsyncs);
     }
     ch->then([this, v, src_dir, data_fd, rel](file_io::done d)
     {
-        return m_io->renameat(src_dir, v->tmp, data_fd, rel, [v, d](int64_t r)
+        return m_io->renameat(src_dir, v->tmp, data_fd, rel, [this, v, d](int64_t r)
         {
             v->changed = r >= 0;
+            if (r >= 0 && !m_kill_after_rename.empty() && v->key.starts_with(m_kill_after_rename))
+                ::raise(SIGKILL);
             d(r);
         });
     });
-    sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel));
+    // A pooled file is answered at its rename, since a crash that takes the rename leaves it to be rolled forward.
+    if (v->pooled)
+    {
+        ch->run([this, v, drop_null](int64_t r)
+        {
+            if (r < 0 || !v->changed)
+                vop_end(v, errno_status(r));
+            else
+                vop_pooled(v, drop_null);
+        });
+        return;
+    }
+    sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel), m_alive, &m_totals.fsyncs);
     // A start that finds the old null version beside the new one keeps the newer, so this is not waited on.
     if (drop_null)
         ch->then([this, dir_fd, key = v->key](file_io::done d)
                  { return m_io->unlinkat(dir_fd, version_rel_path(key, "null"), 0, std::move(d)); },
                  -ENOENT);
     ch->run([this, v](int64_t r) { vop_end(v, r < 0 ? errno_status(r) : st::ok); });
+}
+
+void object_store::vop_pooled(std::shared_ptr<vop> v, bool drop_null)
+{
+    bucket* b = find_bucket(v->bname);
+    if (!b)
+    {
+        vop_end(std::move(v), st::no_such_bucket);
+        return;
+    }
+    version_install(*b, v->key, v->meta);
+    // The key's next operation waits for both syncs, since a pool file whose removal is not durable would be
+    // rolled forward over it.
+    auto left = std::make_shared<int>(2);
+    auto ok   = std::make_shared<bool>(true);
+    auto part = [this, v, left, ok, drop_null](bool good)
+    {
+        if (!*v->alive)
+            return;
+        *ok = *ok && good;
+        if (--*left > 0)
+            return;
+        if (!*ok)
+        {
+            m_sync_lost = true;
+            LOG_WARN(("storage: syncing the directories of an answered put to " + v->bname + "/" + v->key +
+                      " failed; the next start reads the files again").c_str());
+        }
+        // A start that finds the old null version beside the new one keeps the newer, so this is not waited on.
+        if (const bucket* bp = find_bucket(v->bname); bp && drop_null)
+            if (!m_io->unlinkat(bp->dir_fd, version_rel_path(v->key, "null"), 0, [](int64_t) {})) {}
+        v->release();
+    };
+    auto ch = std::make_shared<disk_chain>(m_alive);
+    sync_dir(*ch, m_io, m_loop, b->data_fd, parent_of(object_rel_path(v->key)), m_alive, &m_totals.fsyncs);
+    ch->run([part](int64_t r) { part(r >= 0); });
+    sync_pool(*b, part);
+    invalidate_siblings(v->bname, v->key, [v]()
+    {
+        if (*v->alive)
+            v->put_cb({st::ok, v->meta});
+    });
 }
 
 void object_store::vop_end(std::shared_ptr<vop> v, st s)
@@ -488,14 +597,19 @@ void object_store::vop_end(std::shared_ptr<vop> v, st s)
     const bool put = v->what == vop::kind::commit;
     if (!v->changed)
     {
+        auto refuse = [v, s, put]()
+        {
+            v->release();
+            if (put)
+                v->put_cb({s == st::ok ? st::io_error : s, v->meta});
+            else
+                v->rm_cb({s == st::ok ? st::io_error : s});
+        };
         // The new file did not become anything and is nobody's.
         if (b && !v->tmp.empty())
-            if (!m_io->unlinkat(v->pooled ? b->pool_fd : b->tmp_fd, v->tmp, 0, [](int64_t) {})) {}
-        v->release();
-        if (put)
-            v->put_cb({s == st::ok ? st::io_error : s, v->meta});
+            drop_tmp(*b, v->tmp, v->pooled, std::move(refuse));
         else
-            v->rm_cb({s == st::ok ? st::io_error : s});
+            refuse();
         return;
     }
     // Renamed into place, it is the latest whether or not a sync after the rename failed.
@@ -626,19 +740,19 @@ void object_store::remove_versioned(std::string bucket_name, std::string key, st
         const std::string vrel = version_rel_path(v->key, next_id);
         ch->then([this, data_fd, dir_fd, rel, vrel, mark](file_io::done d)
                  { return m_io->renameat(dir_fd, vrel, data_fd, rel, mark(std::move(d))); });
-        sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel));
-        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel));
+        sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel), m_alive, &m_totals.fsyncs);
+        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel), m_alive, &m_totals.fsyncs);
     }
     else if (latest)
     {
         ch->then([this, data_fd, rel, mark](file_io::done d) { return m_io->unlinkat(data_fd, rel, 0, mark(std::move(d))); });
-        sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel));
+        sync_dir(*ch, m_io, m_loop, data_fd, parent_of(rel), m_alive, &m_totals.fsyncs);
     }
     else
     {
         const std::string vrel = version_rel_path(v->key, v->version_id);
         ch->then([this, dir_fd, vrel, mark](file_io::done d) { return m_io->unlinkat(dir_fd, vrel, 0, mark(std::move(d))); });
-        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel));
+        sync_dir(*ch, m_io, m_loop, dir_fd, parent_of(vrel), m_alive, &m_totals.fsyncs);
     }
     ch->run([this, v](int64_t r)
     {

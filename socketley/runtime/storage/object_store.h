@@ -220,6 +220,8 @@ struct store_totals
     // Tag changes written into their object's header, and those that needed the object written again.
     uint64_t tag_writes{0};
     uint64_t tag_rewrites{0};
+    // Object and version files whose headers the start read, zero when every journal was trusted.
+    uint64_t start_files_read{0};
 };
 
 struct recovery_report
@@ -239,6 +241,8 @@ struct recovery_report
     // Noncurrent versions and delete markers read from the files, and copies a crash left of a version kept elsewhere.
     uint64_t versions{0};
     uint64_t version_duplicates{0};
+    // Files whose headers were read.
+    uint64_t files_read{0};
     bool     clean_start{false};
 };
 
@@ -772,8 +776,12 @@ private:
         // The documents, a bit per kind, this shard may hold an old copy of, and the change each is waiting on.
         uint8_t     doc_doubt{0};
         uint64_t    doc_doubt_seq[4]{};
-        // The compaction's cursor, valid while journal.frozen.
-        std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
+        // How many entries `versions` holds across its keys.
+        uint64_t    nversions{0};
+        // The compaction's cursor: the key it goes on at, in objects and then in versions, valid while journal.frozen.
+        std::string dump_key;
+        bool        dump_versions{false};
+        bool        dump_done{false};
         int         dump_fd{-1};
         uint64_t    dump_off{0};
         // pool/, made by the first refill, and its empty files, open, whose
@@ -795,9 +803,9 @@ private:
                         std::string& err);
     bool finish_bucket(recovering& r, recovery_report& rep, std::string& err);
     bool load_journal(bucket& b, std::string& bad_why, bool& torn, bool& corrupt, bool& other_layout,
-                      recovery_report& rep);
-    // Reads the noncurrent versions of a bucket that has versions/, and sets its delete markers apart from its objects.
-    bool load_versions(bucket& b, recovery_report& rep, bool& changed, std::string& err);
+                      uint32_t& format, recovery_report& rep);
+    // Makes the versions the walk found of a bucket that has versions/ its index, and repairs what a crash left of them.
+    void load_versions(recovering& r, recovery_report& rep, bool& changed);
     // Reads every object file of the buckets that need it, on threads; false when a directory could not be read whole.
     bool reconcile_with_files(std::vector<recovering>& rs, recovery_report& rep, std::string& err);
     bool rewrite_journal_sync(bucket& b, std::string& err);
@@ -841,7 +849,8 @@ private:
     void commit_refuse(const commit_ptr& c, st s);
     // The rest of a pooled commit once its rename is done: the answer, then the syncs.
     void commit_pooled(bucket& b, const commit_ptr& c, int leaf);
-    uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep);
+    // `versioned` keeps the version a pool file replaces, as a versioned commit would have.
+    uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep, bool versioned);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
     void compact_finish(const std::string& name, bool ok);
 
@@ -863,8 +872,18 @@ private:
     {
         return b.vstate != versioning::off || (!b.versions.empty() && b.versions.contains(key));
     }
+    // The order of the newest version `key` has, zero for none.
+    static uint64_t newest_seq(const bucket& b, std::string_view key);
     // The version a new latest of `key` is given, newer than every one it has.
     version_tag next_version(const bucket& b, const std::string& key, bool marker) const;
+    // Whether the version a writer put in a body's header is one the owner can give it as it stands.
+    bool stamp_holds(const bucket& b, const std::string& key, const object_meta& meta) const;
+    // The index's other versions of a key, each change journaled: `m` in its place by order, or the version `id` gone.
+    void version_add(bucket& b, const std::string& key, const object_meta& m);
+    void version_drop(bucket& b, const std::string& key, std::string_view id);
+    // The same on a list alone, for the journal's replay: the version of `m`'s id replaced, or false when it was not there.
+    static bool place_version(std::vector<object_meta>& list, const object_meta& m, uint64_t* replaced_size = nullptr);
+    static bool erase_version(std::vector<object_meta>& list, std::string_view id, uint64_t* size = nullptr);
     void commit_versioned(std::string bucket, std::string key, std::string tmp, bool pooled, object_meta meta,
                           std::function<void()> release, std::function<void(put_result)> cb);
     void remove_versioned(std::string bucket, std::string key, std::string version_id,
@@ -873,6 +892,8 @@ private:
     void vop_header(std::shared_ptr<vop> v);
     void vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off);
     void vop_install(std::shared_ptr<vop> v);
+    // A pooled version renamed into place: the answer, then the syncs, then the lane.
+    void vop_pooled(std::shared_ptr<vop> v, bool drop_null);
     void vop_end(std::shared_ptr<vop> v, st s);
     // The index's half of a new latest, which `meta` is, once its file is in place.
     void version_install(bucket& b, const std::string& key, const object_meta& meta);

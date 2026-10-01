@@ -156,6 +156,9 @@ inline constexpr size_t           journal_header_len = 24;
 // wrong keys.
 std::string encode_journal_header(uint32_t shard, uint32_t nshards);
 
+// The journal format that records every version of a key, where format 2 recorded only its latest object.
+inline constexpr uint32_t journal_format = 3;
+
 enum class journal_header_status : uint8_t
 {
     ok,
@@ -164,18 +167,25 @@ enum class journal_header_status : uint8_t
     bad,
 };
 
-journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards);
+// `format`, when given, is told the format of a sound header.
+journal_header_status journal_header_check(std::string_view bytes, uint32_t shard, uint32_t nshards,
+                                           uint32_t* format = nullptr);
 
-enum class record_type : uint8_t { put = 1, del = 2 };
+// put and del name a key's latest object; vput and vdel add and remove one of its other versions.
+enum class record_type : uint8_t { put = 1, del = 2, vput = 3, vdel = 4 };
 
 struct journal_record
 {
     record_type type{record_type::put};
     std::string key;
-    object_meta meta;        // put
+    object_meta meta;        // put, vput
     int64_t     mtime_ms{0}; // del
+    std::string version_id;  // vdel
 };
 
+// A version of `key` that is not its latest object: a noncurrent one, or a delete marker.
+void encode_version_record(std::string& out, std::string_view key, const object_meta& m);
+void encode_version_drop_record(std::string& out, std::string_view key, std::string_view version_id);
 void encode_put_record(std::string& out, std::string_view key, const object_meta& m);
 void encode_delete_record(std::string& out, std::string_view key, int64_t mtime_ms);
 

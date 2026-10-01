@@ -40,7 +40,12 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_meta.md5   = {};
     m_meta.parts = 0;
 
+    // A versioned bucket's header has room for the version finish_now() puts in it, which is as long as an id makes it.
+    clear_version_extra(m_meta);
+    if (const object_store::bucket* vb = store->find_bucket(m_bucket); vb && vb->vstate != versioning::off)
+        set_version_extra(m_meta, version_tag{0, std::string(32, '0'), false});
     m_header_len = object_header_len(m_key, m_meta);
+    clear_version_extra(m_meta);
 
     // Sized to the object when it is known and small, so a 4 KiB object does
     // not hold a megabyte, and to a megabyte otherwise -- with a second buffer
@@ -503,6 +508,17 @@ void put_op::finish_now()
             }
         if (!stored)
             m_meta.extra.emplace_back(std::string(name), got);
+    }
+
+    // The version goes into the header before the body is synced, so the owner need not write the header again
+    // unless a newer version of the key or a change of the bucket's versioning comes before its commit.
+    if (const object_store::bucket* vb = m_store->find_bucket(m_bucket);
+        vb && vb->vstate != versioning::off && !m_committer)
+    {
+        set_version_extra(m_meta, m_store->next_version(*vb, m_key, false));
+        // A bucket versioned since the room was reserved leaves the version to the owner.
+        if (object_header_len(m_key, m_meta) > m_header_len)
+            clear_version_extra(m_meta);
     }
 
     // The header goes into the first buffer when that is still in memory, and

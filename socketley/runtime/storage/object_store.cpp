@@ -910,7 +910,7 @@ void object_store::journal_kick(bucket& b)
 
 bool object_store::compact_due(const bucket& b) const
 {
-    return b.j.records >= m_opts.compact_floor && b.j.records >= 2 * (b.objects.size() + 1) &&
+    return b.j.records >= m_opts.compact_floor && b.j.records >= 2 * (b.objects.size() + b.nversions + 1) &&
            b.j.records >= b.j.compact_after;
 }
 
@@ -939,8 +939,10 @@ void object_store::maybe_compact(bucket& b)
                 return;
             }
             bp->dump_fd  = static_cast<int>(fd);
-            bp->dump_off = 0;
-            bp->dump_it  = bp->objects.cbegin();
+            bp->dump_off      = 0;
+            bp->dump_key.clear();
+            bp->dump_versions = false;
+            bp->dump_done     = false;
             compact_step(alive, name);
         });
     if (!queued)
@@ -956,12 +958,25 @@ void object_store::compact_step(std::shared_ptr<bool> alive, const std::string& 
     auto buf = std::make_shared<std::string>();
     if (b->dump_off == 0)
         *buf = encode_journal_header(m_opts.shard, m_opts.nshards);
+    // The cursor is a key and not an iterator, since a delete between two pieces may erase the entry it is at.
     bool wrote_records = false;
-    while (b->dump_it != b->objects.cend() && buf->size() < compact_chunk)
+    if (!b->dump_versions)
     {
-        encode_put_record(*buf, b->dump_it->first, b->dump_it->second);
-        ++b->dump_it;
-        wrote_records = true;
+        auto it = b->objects.lower_bound(b->dump_key);
+        for (; it != b->objects.end() && buf->size() < compact_chunk; ++it, wrote_records = true)
+            encode_put_record(*buf, it->first, it->second);
+        b->dump_versions = it == b->objects.end();
+        b->dump_key      = b->dump_versions ? std::string{} : it->first;
+    }
+    if (b->dump_versions && !b->dump_done && buf->size() < compact_chunk)
+    {
+        auto it = b->versions.lower_bound(b->dump_key);
+        for (; it != b->versions.end() && buf->size() < compact_chunk; ++it, wrote_records = true)
+            for (const object_meta& m : it->second)
+                encode_version_record(*buf, it->first, m);
+        b->dump_done = it == b->versions.end();
+        if (!b->dump_done)
+            b->dump_key = it->first;
     }
 
     if (buf->empty() || (!wrote_records && b->dump_off != 0))
@@ -1047,10 +1062,10 @@ void object_store::compact_finish(const std::string& name, bool ok)
         // whatever the old one's tail said that is still true.
         if (b->j.fd >= 0)
             m_loop->close_fd(b->j.fd);
-        m_totals.journal_records = m_totals.journal_records - b->j.records + b->objects.size();
+        m_totals.journal_records = m_totals.journal_records - b->j.records + b->objects.size() + b->nversions;
         b->j.fd      = b->dump_fd;
         b->j.off     = b->dump_off;
-        b->j.records = b->objects.size();
+        b->j.records = b->objects.size() + b->nversions;
         b->dump_fd   = -1;
         ++m_totals.compactions;
     }
@@ -2007,10 +2022,8 @@ void object_store::tags_written(std::shared_ptr<tag_change> tc, st s, bool chang
     // A noncurrent version is read by its id alone, which no shard holds a copy for.
     if (b && tc->noncurrent)
     {
-        if (const auto v = b->versions.find(tc->key); v != b->versions.end())
-            for (object_meta& m : v->second)
-                if (version_of(m).id == tc->changed_id)
-                    m = tc->meta;
+        if (find_version(tc->bname, tc->key, tc->changed_id))
+            version_add(*b, tc->key, tc->meta);
         finish();
         return;
     }
@@ -2175,10 +2188,6 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::storage_full;
         return nullptr;
     }
-    // A pooled file is answered at its rename and rolled forward after a crash, which a version's move cannot be.
-    if (b->vstate != versioning::off)
-        plain = false;
-
     std::shared_ptr<put_op> op(new put_op);
     op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain);
     why = st::ok;
