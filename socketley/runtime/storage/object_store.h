@@ -480,6 +480,7 @@ public:
     struct hot_hit
     {
         const object_meta* meta{nullptr};
+        // Null when only the metadata of another shard's key is held, which is what a HEAD of it keeps.
         const std::string* body{nullptr};
         // The response headers of this version as text, empty until a reader renders them.
         std::string*       head{nullptr};
@@ -494,7 +495,8 @@ public:
     void hot_charge(size_t n) { m_hot_bytes += n; }
     // Read before a read of another shard's key starts, and handed back to hot_put_foreign when it ends.
     uint64_t hot_epoch() const { return m_drop_epoch; }
-    // Keeps what a read of another shard's key brought in, unless a drop of that key or of its bucket arrived since `epoch`.
+    // Keeps what a read of another shard's key brought in, unless a drop of that key or of its bucket arrived since `epoch`;
+    // an empty `body` keeps the metadata alone, for an object of any size.
     void hot_put_foreign(std::string_view bucket, std::string_view key, uint64_t epoch, const object_meta& read,
                          std::string_view body);
     // The owner's word that the key changed: drops it and refuses the reads that were in flight.
@@ -506,6 +508,9 @@ public:
     // from the object's own header otherwise.
     void stat_object(std::string_view bucket, std::string_view key,
                      std::function<void(st, const object_meta&)> cb);
+    // The same for a key the caller knows is another shard's, whose header is read once and kept until its owner's drop.
+    void stat_foreign(std::string_view bucket, std::string_view key,
+                      std::function<void(st, const object_meta&)> cb);
     st list(std::string_view bucket, const list_query& q, list_page& out) const;
     // The same walk, reported to `v` as it goes.
     st list_walk(std::string_view bucket, const list_query& q, list_visitor& v) const;
@@ -728,8 +733,17 @@ private:
         // The index's record of the key, null for another shard's: valid until hot_drop, which every change to that record makes first.
         const object_meta* live;
     };
-    // What an entry counts against the budget: its bytes, its name and the headers rendered for it.
-    static uint64_t held_bytes(const hot_entry& e) { return e.body.size() + e.id.size() + e.head.size(); }
+    // What an entry counts against the budget: its bytes, its name, the headers rendered for it and, with no body, its metadata.
+    static uint64_t held_bytes(const hot_entry& e)
+    {
+        uint64_t n = e.body.size() + e.id.size() + e.head.size();
+        if (!e.body.empty())
+            return n;
+        n += sizeof(hot_entry) + e.meta.content_type.size();
+        for (const auto& [name, value] : e.meta.extra)
+            n += name.size() + value.size();
+        return n;
+    }
     void hot_insert(const std::string& id, const object_meta& read, std::string_view body, const object_meta* live);
     void hot_drop(std::string_view bucket, std::string_view key);
     void hot_drop_bucket(std::string_view bucket);

@@ -138,7 +138,7 @@ bool object_store::hot_find(std::string_view bucket_name, std::string_view key, 
     }
     m_hot_lru.splice(m_hot_lru.begin(), m_hot_lru, it->second);
     out.meta    = e.live ? e.live : &e.meta;
-    out.body    = &e.body;
+    out.body    = e.body.size() == e.meta.size ? &e.body : nullptr;
     out.head    = &e.head;
     out.foreign = !e.live;
     return true;
@@ -159,11 +159,20 @@ void object_store::hot_put(std::string_view bucket_name, std::string_view key, c
 void object_store::hot_insert(const std::string& id, const object_meta& read, std::string_view body,
                               const object_meta* live)
 {
-    if (m_hot_index.count(id))
-        return;
+    if (auto it = m_hot_index.find(id); it != m_hot_index.end())
+    {
+        // A copy of the metadata alone gives way to one of the whole body.
+        const hot_entry& e = *it->second;
+        if (e.body.size() == e.meta.size || body.size() != read.size)
+            return;
+        m_hot_bytes -= held_bytes(e);
+        const auto lit = it->second;
+        m_hot_index.erase(it);
+        m_hot_lru.erase(lit);
+    }
     m_hot_lru.push_front(hot_entry{id, std::string(body), read, {}, live});
     m_hot_index.emplace(m_hot_lru.front().id, m_hot_lru.begin());
-    m_hot_bytes += body.size() + m_hot_lru.front().id.size();
+    m_hot_bytes += held_bytes(m_hot_lru.front());
     while (m_hot_bytes > m_hot_budget && !m_hot_lru.empty())
     {
         hot_entry& old = m_hot_lru.back();
@@ -189,7 +198,8 @@ void object_store::hot_note_drop(uint64_t id_hash)
 void object_store::hot_put_foreign(std::string_view bucket_name, std::string_view key, uint64_t epoch,
                                    const object_meta& read, std::string_view body)
 {
-    if (m_hot_budget == 0 || body.size() != read.size || read.size > hot_max_object)
+    const bool whole = body.size() == read.size && read.size <= hot_max_object;
+    if (m_hot_budget == 0 || (!whole && !body.empty()))
         return;
     const bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -626,11 +636,27 @@ void object_store::stat_object(std::string_view bucket_name, std::string_view ke
         cb(m ? st::ok : st::no_such_key, m ? *m : object_meta{});
         return;
     }
+    stat_foreign(bucket_name, key, std::move(cb));
+}
+
+void object_store::stat_foreign(std::string_view bucket_name, std::string_view key,
+                                std::function<void(st, const object_meta&)> cb)
+{
+    hot_hit hot;
+    if (hot_find(bucket_name, key, hot))
+    {
+        cb(st::ok, *hot.meta);
+        return;
+    }
     // Another shard's key: its file is the truth and any shard may read it.
-    open_object(bucket_name, key, 0, [this, cb](open_result o)
+    const uint64_t epoch = m_drop_epoch;
+    open_object(bucket_name, key, 0,
+                [this, cb, epoch, b = std::string(bucket_name), k = std::string(key)](open_result o)
     {
         if (o.fd >= 0)
             m_loop->close_fd(o.fd);
+        if (o.status == st::ok)
+            hot_put_foreign(b, k, epoch, o.meta, {});
         cb(o.status, o.meta);
     });
 }

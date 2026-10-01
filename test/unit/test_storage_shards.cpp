@@ -301,7 +301,7 @@ struct cluster : shard_transport
     bool held(uint32_t s, const std::string& bucket, const std::string& key, std::string* body = nullptr)
     {
         object_store::hot_hit hit;
-        const bool h = m[s]->store->hot_find(bucket, key, hit) && hit.foreign;
+        const bool h = m[s]->store->hot_find(bucket, key, hit) && hit.foreign && hit.body;
         if (h && body)
             *body = *hit.body;
         return h;
@@ -721,6 +721,80 @@ TEST_CASE("a read of the old file that ends after the overwrite was answered is 
     std::string body;
     REQUIRE(c.held(reader, "bkt", "k", &body));
     CHECK(body == v2);
+}
+
+TEST_CASE("a stat of another shard's key reads its header once and never answers a version its owner replaced")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    // One object too big to be held whole, and one small enough.
+    for (const std::string key : {"big", "small"})
+    {
+        const uint32_t owner = object_owner("bkt", key, 4);
+        const size_t size = key == "big" ? object_store::hot_max_object + 5000 : 3000;
+        REQUIRE(c.put(0, "bkt", key, pattern(size, 1)).status == st::ok);
+
+        auto meta_held = [&](uint32_t s)
+        {
+            object_store::hot_hit hit;
+            return c.m[s]->store->hot_find("bkt", key, hit) && hit.foreign && !hit.body;
+        };
+        auto stat_all = [&](uint64_t size_now)
+        {
+            for (uint32_t s = 0; s < 4; ++s)
+            {
+                object_meta meta;
+                REQUIRE(c.stat(s, "bkt", key, meta) == st::ok);
+                CHECK(meta.size == size_now);
+                if (s != owner)
+                    CHECK(meta_held(s));
+            }
+        };
+        stat_all(size);
+
+        // An overwrite landed anywhere is what every shard's next stat says.
+        for (uint32_t landing = 0; landing < 4; ++landing)
+        {
+            const size_t next = size + 1 + landing;
+            REQUIRE(c.put(landing, "bkt", key, pattern(next, 10 + landing)).status == st::ok);
+            for (uint32_t s = 0; s < 4; ++s)
+                CHECK_FALSE(meta_held(s));
+            stat_all(next);
+        }
+
+        // A GET of a small object takes the place of its metadata with the whole copy.
+        const uint32_t reader = (owner + 1) % 4;
+        if (key == "small")
+        {
+            REQUIRE(c.warm(reader, "bkt", key));
+            object_meta meta;
+            REQUIRE(c.stat(reader, "bkt", key, meta) == st::ok);
+            CHECK(c.held(reader, "bkt", key));
+        }
+
+        // A stat whose read ends after an overwrite was answered is not kept.
+        const uint64_t epoch = c.m[reader]->store->hot_epoch();
+        object_meta old;
+        REQUIRE(c.stat(owner, "bkt", key, old) == st::ok);
+        REQUIRE(c.put(owner, "bkt", key, pattern(size + 9, 30)).status == st::ok);
+        c.m[reader]->store->hot_put_foreign("bkt", key, epoch, old, {});
+        object_meta now;
+        REQUIRE(c.stat(reader, "bkt", key, now) == st::ok);
+        CHECK(now.size == size + 9);
+
+        // And a delete is what every shard's next stat says.
+        REQUIRE(c.del((owner + 2) % 4, "bkt", key) == st::ok);
+        for (uint32_t s = 0; s < 4; ++s)
+        {
+            object_meta gone;
+            CHECK(c.stat(s, "bkt", key, gone) == st::no_such_key);
+            CHECK_FALSE(meta_held(s));
+        }
+    }
+    // What the copies of metadata were charged is given back when they go.
+    for (uint32_t s = 0; s < 4; ++s)
+        CHECK(c.m[s]->store->hot_bytes() == 0);
 }
 
 TEST_CASE("a sibling that cannot be reached does not stop a commit or a delete from being answered")

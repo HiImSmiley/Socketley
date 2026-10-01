@@ -1266,7 +1266,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     }
     // A GET of a key held in memory finds the copy, and whose key it is, in one lookup.
     object_store::hot_hit hot;
-    const bool held = !head && m_store.hot_find(q.bucket, q.key, hot);
+    const bool held = !head && m_store.hot_find(q.bucket, q.key, hot) && hot.body;
     // Memory holds this shard's keys only, so another shard's key is asked of
     // its file, which is the truth and which any shard can read.
     const bool mine = held ? !hot.foreign : m_store.owns(q.bucket, q.key);
@@ -1401,7 +1401,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             return;
         }
         std::weak_ptr<conn> weak = c;
-        m_store.stat_object(q.bucket, q.key, [this, weak, answer](st s, const object_meta& m)
+        m_store.stat_foreign(q.bucket, q.key, [this, weak, answer](st s, const object_meta& m)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
