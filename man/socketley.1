@@ -1323,6 +1323,10 @@ max_bytes	number	T{
 .ad l
 Quota on the bytes held, as \fB\-\-max\-bytes\fR (0 = none); takes effect on a serving runtime
 T}
+sse_key_file	string	T{
+.ad l
+The SSE\-S3 master key file, as \fB\-\-sse\-key\-file\fR \fB(requires restart)\fR
+T}
 .TE
 .PP
 .B Cache fields:
@@ -6163,6 +6167,26 @@ so a half\-written edit locks nobody out. A key given with
 .B \-\-access\-key
 is one of the set too.
 .TP
+.BI \-\-sse\-key\-file " file"
+The master key every object's data key is wrapped with under server\-side
+encryption with S3\-managed keys (SSE\-S3): a file of exactly 32 bytes, or of 64 hex
+digits and an optional newline, that only its owner may read. A file the group or
+others may read, or of any other length, is refused at
+.B create
+and
+.BR start ,
+so the key is never on a command line or in the state file \(em only its path,
+made absolute against the caller's directory. It is read at every start. Without
+it a request for
+.B AES256
+and a bucket default that would need one are refused with
+.BR "501 NotImplemented" ;
+SSE\-C needs no master key. Keep the file: an object sealed under one key is not
+opened by another, and is answered
+.B "500 InternalError"
+saying so. See
+.BR "Server\-side encryption" .
+.TP
 .B \-\-anonymous
 Accept requests that carry no credentials at all. Required unless
 credentials are given: a runtime made with neither is refused, so an endpoint is
@@ -6201,8 +6225,8 @@ and stores nothing, and the quota can be changed on a serving runtime with
 .PP
 .B edit
 does not change these; \fBimport\fR does, as it does for a cache, and
-refuses to move \fBdir\fR, \fBanonymous\fR or the access key, secret key or
-credentials file while the runtime is running (the contents of a credentials
+refuses to move \fBdir\fR, \fBanonymous\fR or the access key, secret key,
+credentials file or SSE key file while the runtime is running (the contents of a credentials
 file are re\-read by themselves). The quota and the expiry move under a serving
 runtime.
 .B \-\-shards
@@ -6297,6 +6321,18 @@ GetBucketVersioning	GET /bucket?versioning	T{
 .ad l
 An empty VersioningConfiguration for a bucket never versioned.
 T}
+PutBucketEncryption	PUT /bucket?encryption	T{
+.ad l
+A ServerSideEncryptionConfiguration whose one rule is AES256; aws:kms is 501 NotImplemented, and so is any rule on a runtime without \fB\-\-sse\-key\-file\fR. See \fBServer\-side encryption\fR below.
+T}
+GetBucketEncryption	GET /bucket?encryption	T{
+.ad l
+The rule; ServerSideEncryptionConfigurationNotFoundError (404) for a bucket without one.
+T}
+DeleteBucketEncryption	DELETE /bucket?encryption	T{
+.ad l
+204; the objects keep the encryption they were written with.
+T}
 ListObjectVersions	GET /bucket?versions	T{
 .ad l
 prefix, delimiter, key\-marker, version\-id\-marker, max\-keys (at most 1000), encoding\-type=url; Version and DeleteMarker entries by key, each key's newest first.
@@ -6327,11 +6363,11 @@ marker and NextMarker.
 T}
 PutObject	PUT /bucket/key	T{
 .ad l
-Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite.
+Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite; x\-amz\-server\-side\-encryption: AES256 or the SSE\-C headers encrypt it.
 T}
 GetObject	GET /bucket/key	T{
 .ad l
-Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it.
+Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it; an object stored under a client's key needs the SSE\-C headers, on HEAD too.
 T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
@@ -6351,7 +6387,7 @@ Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE or from an older version; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes.
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE, from an older version or naming an encryption; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes, encrypted as its own request or its bucket asks whatever its source's was; x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* open an SSE\-C source.
 T}
 PutObjectTagging	PUT /bucket/key?tagging	T{
 .ad l
@@ -6367,11 +6403,11 @@ DeleteObjectTagging	DELETE /bucket/key?tagging	T{
 T}
 CreateMultipartUpload	POST /bucket/key?uploads	T{
 .ad l
-Content\-Type, the stored headers, x\-amz\-meta\-* and x\-amz\-tagging are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes.
+Content\-Type, the stored headers, x\-amz\-meta\-* and x\-amz\-tagging are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes; x\-amz\-server\-side\-encryption or the SSE\-C headers encrypt every part and the object.
 T}
 UploadPart	PUT /bucket/key?partNumber=N&uploadId=ID	T{
 .ad l
-Streamed like a put, Content\-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000.
+Streamed like a put, Content\-MD5 and the checksums checked; a part sent again replaces the old one. N is 1 to 10000. A part of an SSE\-C upload carries the upload's key.
 T}
 UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
 .ad l
@@ -6795,6 +6831,87 @@ rename moved it meanwhile, and a held copy of a latest is dropped on every shard
 before a new version, a marker or a removal that changes the latest is answered.
 .B ListObjectVersions
 asks every shard and merges their pages.
+.SS Server\-side encryption
+.B "x\-amz\-server\-side\-encryption: AES256"
+on PutObject, CreateMultipartUpload or CopyObject (SSE\-S3) stores the object
+encrypted under a key of its own, which is wrapped by the runtime's master key
+(\fB\-\-sse\-key\-file\fR), and every answer about it \(em the PUT, the upload's
+steps, GET, HEAD, the copy \(em says so with the same header. A GET needs nothing:
+the plaintext comes back, its ETag is the MD5 of the plaintext as for any object,
+and ranges, partNumber and conditions work as they do in the clear.
+.B aws:kms
+is
+.BR "501 NotImplemented" ,
+another value
+.BR "400 InvalidArgument" ,
+and the header on a GET or HEAD, which only what writes an object chooses,
+.BR "400 InvalidArgument" .
+.PP
+.B PutBucketEncryption
+with an
+.B AES256
+rule makes every new object of the bucket SSE\-S3 when its request asks nothing else:
+puts, copies into it, uploads begun in it and a script's
+.BR socketley.storage.put .
+A bucket's rule is a document like its CORS rules, changed by shard 0 with every
+shard told first (see
+.BR "Bucket policy" ),
+kept in
+.IB dir / bucket /encryption
+and read at every start; one that no longer parses still encrypts, with an error in the
+log.
+.B DeleteBucketEncryption
+stops it for new objects and leaves the ones it encrypted as they are.
+.PP
+SSE\-C is the client's own key, sent with every request that touches the object as
+.BR "x\-amz\-server\-side\-encryption\-customer\-algorithm: AES256" ,
+.B \-customer\-key
+(the 32 bytes in base64) and
+.BR \-customer\-key\-MD5 ,
+as boto3 and the AWS CLI send them. It is taken over TLS only: the headers over plain
+HTTP or a unix node are
+.BR "400 InvalidRequest" ,
+and nothing is written. The key is never stored: the object's data key is wrapped
+under it, which only that key opens, so a GET or HEAD without the headers is
+.BR "400 InvalidRequest" ,
+with another key
+.BR "403 AccessDenied" ,
+and with a key\-MD5 that is not the key's
+.BR "400 InvalidArgument" .
+CopyObject and UploadPartCopy open an SSE\-C source with
+.BR x\-amz\-copy\-source\-server\-side\-encryption\-customer\-* ,
+and the parts of an SSE\-C upload carry its key. As in S3, the ETag of an SSE\-C object
+or part is not the MD5 of its bytes (it is derived from that MD5 under the data key),
+nothing of such an object is kept in memory between requests, and a script's
+.B socketley.storage.get
+of one is refused, since it has no key to give.
+.PP
+On disk an encrypted object is its header, which records the scheme
+.RB ( x\-socketley\-sse :
+version, SSE\-S3 or SSE\-C, the chunk size, whether the body is one stream or one per
+part, the master key's id and the wrapped data key), and then its plaintext in chunks
+of 64 KiB, each sealed with AES\-256\-GCM on its own as a random 12\-byte nonce, the
+ciphertext and a 16\-byte tag, with the chunk's index in the authenticated data: 28
+bytes per 64 KiB. A range or a part reads and opens only the chunks it touches, and a
+chunk that does not open \(em a changed byte, a chunk moved to another place \(em ends
+the response there with a line in the log. The parts of a multipart upload are each a
+stream of their own, written where the object needs them as unencrypted ones are, and
+found again by the part sizes the object records; an encrypted upload whose part sizes
+are too varied to record (see
+.BR "Reading by part number" )
+is refused at completion with
+.BR "400 InvalidRequest" .
+A copy of an encrypted object, or into an encrypted one, is opened and sealed again
+on its way through, under a key of its own; a tag change, a new version and the
+assembly of an upload move the sealed bytes as they are. The chunks are sealed and
+opened on the hashing threads (\fBSOCKETLEY_STORAGE_HASH_THREADS\fR) for bodies and
+windows of more than 64 KiB, and in line below. A GET of an encrypted object cannot be
+spliced from the file, so it is read a megabyte at a time, opened and written from
+memory, with the next megabyte read while one is sent; an SSE\-S3 object of up to
+60000 bytes is kept opened in memory like any other.
+.PP
+Not supported: SSE\-KMS and bucket keys, and changing the master key \(em an object
+opens only under the key that wrapped its data key.
 .SS Bucket lifecycle
 A bucket's lifecycle configuration is S3's
 .B LifecycleConfiguration
@@ -6986,7 +7103,8 @@ GetObject covers GetObject and HeadObject, by part too; PutObject covers PutObje
 CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
 CompleteMultipartUpload; DeleteObject covers DeleteObject and DeleteObjects; ListBucket
 covers ListObjects, ListObjectsV2 and HeadBucket; PutBucketCORS and
-PutLifecycleConfiguration cover the deletes of those configurations; the rest are
+PutLifecycleConfiguration and PutEncryptionConfiguration cover the deletes of those
+configurations, and GetEncryptionConfiguration covers GetBucketEncryption; the rest are
 named as S3 names them (GetObjectTagging, AbortMultipartUpload,
 ListMultipartUploadParts, ListBucketMultipartUploads, GetBucketLocation, CreateBucket,
 DeleteBucket, GetBucketVersioning, PutBucketVersioning, .\|.\|.). A request that names a
@@ -7139,7 +7257,7 @@ from which listings are answered out of memory.
 A put writes a temporary file, syncs it, renames it into place and syncs the
 directory, and only then answers 200; a delete removes the file and syncs the
 directory. A put of up to 1 MiB whose length is known and that carries no
-condition (no \fBIf\-None\-Match\fR, not a part) is written instead into one of a
+condition (no \fBIf\-None\-Match\fR, not a part, not encrypted) is written instead into one of a
 few empty files the bucket keeps ready in \fBpool/\fR, whose names were synced
 before any put took one; once that file is synced and renamed into place the put
 is answered, and the syncs of \fBpool/\fR and of the object's directory follow the
@@ -7417,6 +7535,12 @@ reports
 (receives that brought bytes of an upload's body) and
 .B hash_handoffs
 (pieces of digest work handed to the hashing threads),
+.B sse
+(1 when the runtime has a master key),
+.B sse_puts
+and
+.B sse_gets
+(bodies written encrypted, and GETs answered by opening an object's chunks),
 and one line
 .BI error_ Code
 for every S3 error code the runtime has answered, such as
