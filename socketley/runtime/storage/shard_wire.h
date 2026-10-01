@@ -49,6 +49,8 @@ enum class op : uint8_t
     // A bucket's configuration document (CORS, lifecycle), to shard 0 to be written and from it to the others.
     doc_put       = 20,
     doc_adopt     = 21,
+    // An object's new tags, to the owner of its key.
+    set_tags      = 22,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -59,6 +61,9 @@ bool        decode_commit(std::string_view payload, commit_request& out);
 
 std::string encode_remove(std::string_view bucket, std::string_view key);
 bool        decode_remove(std::string_view payload, std::string& bucket, std::string& key);
+
+std::string encode_set_tags(std::string_view bucket, std::string_view key, std::string_view tags);
+bool        decode_set_tags(std::string_view payload, std::string& bucket, std::string& key, std::string& tags);
 
 std::string encode_hot_drop(std::string_view bucket, std::string_view key);
 bool        decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key);

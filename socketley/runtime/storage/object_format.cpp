@@ -1,5 +1,6 @@
 #include "object_format.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "../../shared/raft_storage.h"
@@ -16,6 +17,31 @@ constexpr uint32_t         object_version = 1;
 constexpr size_t           prelude_len = 24;
 // The sanity bound on one journal record: a key, its metadata and slack.
 constexpr size_t           max_record_bytes = 64 * 1024;
+
+constexpr std::string_view slot_magic = std::string_view("SKLTAG\x01\x00", 8);
+// magic, sequence, payload length, crc.
+constexpr size_t           slot_head  = 24;
+constexpr size_t           sector     = 512;
+
+// Where an object's two tag slots begin and how long each is, room 0 when its padding has no two sectors for them.
+struct slot_layout
+{
+    size_t off[2]{};
+    size_t room{0};
+};
+
+slot_layout layout_of(size_t meta_end, size_t header_len)
+{
+    slot_layout l;
+    const size_t begin = (meta_end + sector - 1) / sector * sector;
+    const size_t end   = std::min(header_len, object_header_align);
+    if (end < begin + 2 * sector)
+        return l;
+    l.room   = (end - begin) / 2 / sector * sector;
+    l.off[0] = begin;
+    l.off[1] = begin + l.room;
+    return l;
+}
 
 void put_u32(std::string& out, uint32_t v)
 {
@@ -96,6 +122,22 @@ bool decode_meta(std::string_view body, std::string& key, object_meta& m)
 }
 
 }   // namespace
+
+std::string_view tags_of(const object_meta& m)
+{
+    for (const auto& [n, v] : m.extra)
+        if (n == tags_extra)
+            return v;
+    return {};
+}
+
+void set_tags_extra(object_meta& m, std::string_view tags)
+{
+    std::string kept(tags);
+    std::erase_if(m.extra, [](const auto& e) { return e.first == tags_extra; });
+    if (!kept.empty())
+        m.extra.emplace_back(std::string(tags_extra), std::move(kept));
+}
 
 void encode_meta(std::string& out, std::string_view key, const object_meta& m)
 {
@@ -183,8 +225,52 @@ decoded_header decode_object_header(std::string_view bytes)
         return d;
 
     d.header_len = header_len;
+    d.meta_end   = prelude_len + body_len;
     d.status     = header_status::ok;
+
+    // The newest whole slot within the bytes given wins over the tags the header was written with.
+    const slot_layout l = layout_of(d.meta_end, header_len);
+    std::string_view tags;
+    for (int i = 0; i < 2 && l.room; ++i)
+    {
+        const size_t off = l.off[i];
+        if (bytes.size() < off + slot_head || bytes.substr(off, 8) != slot_magic)
+            continue;
+        uint64_t seq;
+        uint32_t len, scrc;
+        std::memcpy(&seq, bytes.data() + off + 8, 8);
+        std::memcpy(&len, bytes.data() + off + 16, 4);
+        std::memcpy(&scrc, bytes.data() + off + 20, 4);
+        if (slot_head + len > l.room || bytes.size() < off + slot_head + len || seq <= d.tag_seq)
+            continue;
+        const std::string_view payload = bytes.substr(off + slot_head, len);
+        uint32_t c = raft::storage::crc32c(bytes.data() + off, 20);
+        c          = raft::storage::crc32c(payload.data(), payload.size(), c);
+        if (c != scrc)
+            continue;
+        d.tag_slot = static_cast<int8_t>(i);
+        d.tag_seq  = seq;
+        tags       = payload;
+    }
+    if (d.tag_slot >= 0)
+        set_tags_extra(d.meta, tags);
     return d;
+}
+
+std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint64_t& at)
+{
+    const slot_layout l = layout_of(d.meta_end, d.header_len);
+    if (d.status != header_status::ok || l.room == 0 || slot_head + tags.size() > l.room)
+        return {};
+    std::string s(slot_magic);
+    put_u64(s, d.tag_seq + 1);
+    put_u32(s, static_cast<uint32_t>(tags.size()));
+    uint32_t c = raft::storage::crc32c(s.data(), s.size());
+    c          = raft::storage::crc32c(tags.data(), tags.size(), c);
+    put_u32(s, c);
+    s.append(tags);
+    at = l.off[d.tag_slot == 0 ? 1 : 0];
+    return s;
 }
 
 std::string encode_journal_header(uint32_t shard, uint32_t nshards)

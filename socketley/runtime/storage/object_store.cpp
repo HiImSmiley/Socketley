@@ -1598,6 +1598,297 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
     });
 }
 
+// ─── Tags ───────────────────────────────────────────────────────────────────
+
+struct object_store::tag_change
+{
+    std::shared_ptr<bool>    alive;
+    std::string              bname, key, tags, rel;
+    // The index's metadata of the object with the new tags in it.
+    object_meta              meta;
+    int                      fd{-1};
+    std::string              head;
+    std::function<void(st)>  cb;
+};
+
+void object_store::set_tags(std::string_view bucket_name, std::string_view key, std::string tags,
+                            std::function<void(st)> cb)
+{
+    const uint32_t owner = owner_of(bucket_name, key);
+    if (owner == m_opts.shard)
+    {
+        set_tags_local(bucket_name, key, std::move(tags), std::move(cb));
+        return;
+    }
+    bucket* b = find_bucket(bucket_name);
+    if (!m_peers || !b || b->closing)
+    {
+        cb(b && !b->closing ? st::io_error : st::no_such_bucket);
+        return;
+    }
+    ++b->active_ops;
+    ++m_inflight;
+    auto alive = m_alive;
+    const std::string bname(bucket_name);
+    m_peers->set_tags(owner, bname, std::string(key), std::move(tags), [this, alive, bname, cb](st s)
+    {
+        if (!*alive)
+            return;
+        --m_inflight;
+        if (bucket* bp = find_bucket(bname))
+            --bp->active_ops;
+        cb(s);
+    });
+}
+
+void object_store::set_tags_local(std::string_view bucket_name, std::string_view key, std::string tags,
+                                  std::function<void(st)> cb)
+{
+    bucket* b = find_bucket(bucket_name);
+    if (!b || b->closing)
+    {
+        cb(st::no_such_bucket);
+        return;
+    }
+    if (!owns(bucket_name, key))
+    {
+        LOG_WARN(("storage: a tag change for a key that shard " + std::to_string(owner_of(bucket_name, key)) +
+                  " owns reached shard " + std::to_string(m_opts.shard)).c_str());
+        cb(st::io_error);
+        return;
+    }
+    ++b->active_ops;
+    ++m_inflight;
+
+    auto tc   = std::make_shared<tag_change>();
+    tc->alive = m_alive;
+    tc->bname = std::string(bucket_name);
+    tc->key   = std::string(key);
+    tc->tags  = std::move(tags);
+    tc->cb    = std::move(cb);
+
+    lane_enter(*b, tc->key, [this, tc]()
+    {
+        bucket* bp = find_bucket(tc->bname);
+        if (!bp)
+        {
+            tags_written(tc, st::no_such_bucket, false);
+            return;
+        }
+        const auto found = bp->objects.find(tc->key);
+        if (found == bp->objects.end())
+        {
+            tags_written(tc, st::no_such_key, false);
+            return;
+        }
+        if (tags_of(found->second) == tc->tags)
+        {
+            tags_written(tc, st::ok, false);
+            return;
+        }
+        tc->meta = found->second;
+        set_tags_extra(tc->meta, tc->tags);
+        tc->rel = object_rel_path(tc->key);
+        const bool q = m_io->openat(bp->data_fd, tc->rel, O_RDWR | O_CLOEXEC, 0, [this, tc](int64_t fd)
+        {
+            if (!*tc->alive)
+                return;
+            if (fd < 0)
+            {
+                tags_written(tc, errno_status(fd), false);
+                return;
+            }
+            tc->fd = static_cast<int>(fd);
+            // Every header fits in this, and the header's first 4 KiB are where its tag slots are.
+            tc->head.resize(64 * 1024);
+            const bool q2 = m_io->pread(tc->fd, tc->head.data(), static_cast<uint32_t>(tc->head.size()), 0,
+                [this, tc](int64_t n)
+                {
+                    if (!*tc->alive)
+                        return;
+                    if (n < 0)
+                    {
+                        tags_written(tc, st::io_error, false);
+                        return;
+                    }
+                    tc->head.resize(static_cast<size_t>(n));
+                    const decoded_header d = decode_object_header(tc->head);
+                    // Under the key's lane the file is the version the index names, or the store is not what it thinks.
+                    if (d.status != header_status::ok || d.key != tc->key || !same_version(d.meta, tc->meta))
+                    {
+                        LOG_WARN(("storage: the header of the object \"" + tc->key +
+                                  "\" is not the version its index names; its tags are left").c_str());
+                        tags_written(tc, st::io_error, false);
+                        return;
+                    }
+                    uint64_t at = 0;
+                    std::string slot = encode_tag_slot(d, tc->tags, at);
+                    if (slot.empty())
+                        tags_rewrite(tc, d.header_len);
+                    else
+                        tags_in_place(tc, std::move(slot), at);
+                });
+            if (!q2)
+                tags_written(tc, st::io_error, false);
+        });
+        if (!q)
+            tags_written(tc, st::io_error, false);
+    });
+}
+
+void object_store::tags_in_place(std::shared_ptr<tag_change> tc, std::string slot, uint64_t at)
+{
+    auto buf = std::make_shared<std::string>(std::move(slot));
+    const bool q = m_io->pwrite(tc->fd, buf->data(), static_cast<uint32_t>(buf->size()), at,
+        [this, tc, buf](int64_t r)
+        {
+            if (!*tc->alive)
+                return;
+            // A short write leaves a slot whose checksum fails, which is the tags as they were.
+            if (r != static_cast<int64_t>(buf->size()))
+            {
+                tags_written(tc, r < 0 ? errno_status(r) : st::io_error, false);
+                return;
+            }
+            const bool q2 = m_io->fsync(tc->fd, true, [this, tc](int64_t r2)
+            {
+                if (!*tc->alive)
+                    return;
+                ++m_totals.fsyncs;
+                if (r2 >= 0)
+                    ++m_totals.tag_writes;
+                tags_written(tc, r2 < 0 ? st::io_error : st::ok, true);
+            });
+            if (!q2)
+                tags_written(tc, st::io_error, true);
+        });
+    if (!q)
+        tags_written(tc, st::io_error, false);
+}
+
+void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_off)
+{
+    bucket* b = find_bucket(tc->bname);
+    if (!b)
+    {
+        tags_written(tc, st::no_such_bucket, false);
+        return;
+    }
+    // A header with no room for a slot is written again with the tags in it, and the bytes copied behind it.
+    constexpr uint64_t chunk = 1u << 20;
+    const int  src      = tc->fd;
+    const int  tmp_dir  = b->tmp_fd;
+    const int  data_dir = b->data_fd;
+    const std::string tmp = tmp_name();
+    auto header  = std::make_shared<std::string>(encode_object_header(tc->key, tc->meta));
+    auto buf     = std::shared_ptr<char[]>(new char[chunk]);
+    auto dst     = std::make_shared<int>(-1);
+    auto leaf    = std::make_shared<int>(-1);
+    auto renamed = std::make_shared<bool>(false);
+    auto ch      = std::make_shared<disk_chain>(m_alive);
+    ch->then([this, tmp_dir, tmp, dst](file_io::done d)
+    {
+        return m_io->openat(tmp_dir, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600, [dst, d](int64_t r)
+        {
+            if (r >= 0)
+                *dst = static_cast<int>(r);
+            d(r);
+        });
+    });
+    // The bytes are held by each completion, since a launched step lets go of its captures.
+    ch->then([this, dst, header](file_io::done d)
+    {
+        return m_io->pwrite(*dst, header->data(), static_cast<uint32_t>(header->size()), 0,
+                            [header, d](int64_t r) { d(r == static_cast<int64_t>(header->size()) ? 0 : r < 0 ? r : -EIO); });
+    });
+    for (uint64_t off = 0; off < tc->meta.size; off += chunk)
+    {
+        const uint32_t n = static_cast<uint32_t>(std::min(chunk, tc->meta.size - off));
+        ch->then([this, src, buf, n, at = data_off + off](file_io::done d)
+        {
+            return m_io->pread(src, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });
+        });
+        ch->then([this, dst, buf, n, at = header->size() + off](file_io::done d)
+        {
+            return m_io->pwrite(*dst, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });
+        });
+    }
+    ch->then([this, dst](file_io::done d) { return m_io->fsync(*dst, true, std::move(d)); });
+    ch->then([this, tmp_dir, tmp, data_dir, rel = tc->rel, renamed](file_io::done d)
+    {
+        return m_io->renameat(tmp_dir, tmp, data_dir, rel, [renamed, d](int64_t r)
+        {
+            *renamed = r >= 0;
+            d(r);
+        });
+    });
+    ch->then([this, data_dir, dir = tc->rel.substr(0, 2), leaf](file_io::done d)
+    {
+        return m_io->openat(data_dir, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, [leaf, d](int64_t r)
+        {
+            if (r >= 0)
+                *leaf = static_cast<int>(r);
+            d(r);
+        });
+    });
+    ch->then([this, leaf](file_io::done d) { return m_io->fsync(*leaf, false, std::move(d)); });
+    ch->run([this, tc, tmp, dst, leaf, renamed](int64_t r)
+    {
+        for (int* fd : {dst.get(), leaf.get()})
+            if (*fd >= 0)
+            {
+                m_loop->close_fd(*fd);
+                *fd = -1;
+            }
+        if (!*renamed)
+            if (bucket* bp = find_bucket(tc->bname))
+                if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
+        if (r >= 0)
+        {
+            m_totals.fsyncs += 2;
+            ++m_totals.tag_rewrites;
+        }
+        // Renamed into place, the file holds the new tags whether or not its directory's sync then failed.
+        tags_written(tc, r < 0 ? errno_status(r) : st::ok, *renamed);
+    });
+}
+
+void object_store::tags_written(std::shared_ptr<tag_change> tc, st s, bool changed)
+{
+    if (!*tc->alive)
+        return;
+    if (tc->fd >= 0)
+    {
+        m_loop->close_fd(tc->fd);
+        tc->fd = -1;
+    }
+    auto finish = [this, tc, s]()
+    {
+        if (!*tc->alive)
+            return;
+        if (bucket* bp = find_bucket(tc->bname))
+            --bp->active_ops;
+        --m_inflight;
+        lane_leave(tc->bname, tc->key);
+        auto cb = std::move(tc->cb);
+        cb(s);
+    };
+    bucket* b = changed ? find_bucket(tc->bname) : nullptr;
+    const auto it = b ? b->objects.find(tc->key) : decltype(b->objects.end()){};
+    if (!b || it == b->objects.end())
+    {
+        finish();
+        return;
+    }
+    // The file says it now, so the index follows behind it as a commit's does, and no shard keeps the old headers.
+    std::string rec;
+    encode_put_record(rec, tc->key, tc->meta);
+    journal_append(*b, rec, nullptr);
+    hot_drop(b->name, tc->key);
+    it->second = tc->meta;
+    invalidate_siblings(tc->bname, tc->key, std::move(finish));
+}
+
 // ─── Reading an object ──────────────────────────────────────────────────────
 
 void object_store::open_object(std::string_view bucket_name, std::string_view key_sv,
@@ -1714,9 +2005,11 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::key_too_long;
         return nullptr;
     }
+    // Tags have limits of their own, checked where they are parsed.
     size_t meta_bytes = meta.content_type.size();
     for (const auto& [n, v] : meta.extra)
-        meta_bytes += n.size() + v.size();
+        if (n != tags_extra)
+            meta_bytes += n.size() + v.size();
     if (meta_bytes > max_meta_bytes)
     {
         why = st::metadata_too_large;

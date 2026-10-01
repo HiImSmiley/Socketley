@@ -5,7 +5,9 @@
 
 #include "object_format.h"
 #include "s3_names.h"
+#include "s3_tagging.h"
 #include "s3_xml.h"
+#include "s3_xml_tree.h"
 #include "../../shared/random_id.h"
 
 namespace socketley::storage
@@ -13,138 +15,6 @@ namespace socketley::storage
 
 namespace
 {
-
-// An element of the document, with its text unescaped and namespaces and attributes dropped.
-struct xml_node
-{
-    std::string name;
-    std::string text;
-    std::vector<xml_node> kids;
-    bool has_text{false};
-};
-
-// A reader of plain elements and text, refusing what a configuration never holds: CDATA, a doctype, a mismatched close.
-class xml_reader
-{
-public:
-    explicit xml_reader(std::string_view x) : m_x(x) {}
-
-    bool document(xml_node& root)
-    {
-        skip_misc();
-        if (!element(root, 0))
-            return false;
-        skip_misc();
-        return m_pos == m_x.size();
-    }
-
-private:
-    static constexpr int max_depth = 16;
-
-    void skip_ws()
-    {
-        while (m_pos < m_x.size() && (m_x[m_pos] == ' ' || m_x[m_pos] == '\t' || m_x[m_pos] == '\r' || m_x[m_pos] == '\n'))
-            ++m_pos;
-    }
-
-    // Whitespace, the declaration and comments, which may stand outside and between elements.
-    bool skip_misc()
-    {
-        for (;;)
-        {
-            skip_ws();
-            if (m_x.substr(m_pos, 5) == "<?xml")
-            {
-                const size_t e = m_x.find("?>", m_pos);
-                if (e == std::string_view::npos)
-                    return false;
-                m_pos = e + 2;
-                continue;
-            }
-            if (m_x.substr(m_pos, 4) == "<!--")
-            {
-                const size_t e = m_x.find("-->", m_pos + 4);
-                if (e == std::string_view::npos)
-                    return false;
-                m_pos = e + 3;
-                continue;
-            }
-            return true;
-        }
-    }
-
-    static std::string_view local_name(std::string_view n)
-    {
-        const size_t colon = n.find(':');
-        return colon == std::string_view::npos ? n : n.substr(colon + 1);
-    }
-
-    bool element(xml_node& out, int depth)
-    {
-        if (depth > max_depth || m_pos >= m_x.size() || m_x[m_pos] != '<')
-            return false;
-        const size_t gt = m_x.find('>', m_pos);
-        if (gt == std::string_view::npos)
-            return false;
-        std::string_view inner = m_x.substr(m_pos + 1, gt - m_pos - 1);
-        m_pos = gt + 1;
-        const bool self_closing = !inner.empty() && inner.back() == '/';
-        if (self_closing)
-            inner.remove_suffix(1);
-        const size_t sp = inner.find_first_of(" \t\r\n");
-        const std::string_view qname = inner.substr(0, sp);
-        if (qname.empty() || qname.front() == '/' || qname.front() == '!' || qname.front() == '?')
-            return false;
-        out.name = std::string(local_name(qname));
-        if (self_closing)
-            return true;
-
-        std::string raw;
-        for (;;)
-        {
-            const size_t lt = m_x.find('<', m_pos);
-            if (lt == std::string_view::npos)
-                return false;
-            raw.append(m_x.substr(m_pos, lt - m_pos));
-            m_pos = lt;
-            if (m_x.substr(m_pos, 4) == "<!--")
-            {
-                const size_t e = m_x.find("-->", m_pos + 4);
-                if (e == std::string_view::npos)
-                    return false;
-                m_pos = e + 3;
-                continue;
-            }
-            if (m_x.substr(m_pos, 2) == "</")
-            {
-                const size_t e = m_x.find('>', m_pos);
-                if (e == std::string_view::npos)
-                    return false;
-                std::string_view close = m_x.substr(m_pos + 2, e - m_pos - 2);
-                while (!close.empty() && (close.back() == ' ' || close.back() == '\t' || close.back() == '\r' ||
-                                          close.back() == '\n'))
-                    close.remove_suffix(1);
-                if (close != qname)
-                    return false;
-                m_pos = e + 1;
-                break;
-            }
-            if (m_x.substr(m_pos, 2) == "<!" || m_x.substr(m_pos, 2) == "<?")
-                return false;
-            out.kids.emplace_back();
-            if (!element(out.kids.back(), depth + 1))
-                return false;
-        }
-        // Text beside child elements is only the indentation between them.
-        if (!out.kids.empty())
-            return raw.find_first_not_of(" \t\r\n") == std::string::npos;
-        out.has_text = true;
-        return xml_unescape(raw, out.text);
-    }
-
-    std::string_view m_x;
-    size_t           m_pos{0};
-};
 
 s3_error fail(std::string_view code, std::string message = {})
 {
@@ -246,6 +116,70 @@ std::string new_rule_id()
     return id;
 }
 
+// One condition of a <Filter> or of its <And> into `r`, false with `err` when it is none S3 knows or is not well formed.
+bool filter_condition(const xml_node& k, lifecycle_rule& r, s3_error& err)
+{
+    if (k.name == "Prefix" && k.kids.empty() && !r.filter_prefix)
+    {
+        r.prefix        = k.text;
+        r.filter_prefix = true;
+        return true;
+    }
+    if (k.name == "Tag")
+    {
+        const xml_node* key   = nullptr;
+        const xml_node* value = nullptr;
+        for (const xml_node& f : k.kids)
+        {
+            const xml_node** slot = f.name == "Key" ? &key : f.name == "Value" ? &value : nullptr;
+            if (!slot || *slot || !f.kids.empty())
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+            *slot = &f;
+        }
+        if (!key || !value)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        for (const auto& t : r.tags)
+            if (t.first == key->text)
+            {
+                err = fail("InvalidRequest", "Duplicate Tag Keys are not allowed.");
+                return false;
+            }
+        const tag_set one{{key->text, value->text}};
+        if (!check_tags(one, err))
+            return false;
+        r.tags.push_back(one.front());
+        return true;
+    }
+    const bool gt = k.name == "ObjectSizeGreaterThan";
+    if ((gt || k.name == "ObjectSizeLessThan") && k.kids.empty() && !(gt ? r.has_size_gt : r.has_size_lt))
+    {
+        std::string_view t = k.text;
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\n' || t.front() == '\t' || t.front() == '\r'))
+            t.remove_prefix(1);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\n' || t.back() == '\t' || t.back() == '\r'))
+            t.remove_suffix(1);
+        uint64_t v = 0;
+        const auto res = std::from_chars(t.data(), t.data() + t.size(), v);
+        if (t.empty() || res.ec != std::errc{} || res.ptr != t.data() + t.size() || (!gt && v == 0))
+        {
+            err = fail("InvalidArgument", std::string("'") + k.name + "' must be " +
+                                              (gt ? "a non-negative integer" : "a positive integer"));
+            return false;
+        }
+        (gt ? r.has_size_gt : r.has_size_lt) = true;
+        (gt ? r.size_gt : r.size_lt)         = v;
+        return true;
+    }
+    err = fail("MalformedXML");
+    return false;
+}
+
 // One <Rule>, or the error the whole document is refused with.
 bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
 {
@@ -343,27 +277,30 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         }
         for (const xml_node& k : filter->kids)
         {
-            if (k.name == "Prefix" && k.kids.empty())
+            if (k.name != "And")
             {
-                r.prefix = k.text;
-                r.filter_prefix = true;
+                if (!filter_condition(k, r, err))
+                    return false;
+                continue;
             }
-            else if (k.name == "Tag" || k.name == "And" || k.name == "ObjectSizeGreaterThan" ||
-                     k.name == "ObjectSizeLessThan")
-            {
-                err = fail("NotImplemented",
-                           "Lifecycle filters by tag or by object size are not supported; filter by Prefix");
-                return false;
-            }
-            else
+            r.filter_and = true;
+            if (k.kids.empty())
             {
                 err = fail("MalformedXML");
                 return false;
             }
+            for (const xml_node& a : k.kids)
+                if (!filter_condition(a, r, err))
+                    return false;
         }
         if (filter->has_text && filter->text.find_first_not_of(" \t\r\n") != std::string::npos)
         {
             err = fail("MalformedXML");
+            return false;
+        }
+        if (r.has_size_gt && r.has_size_lt && r.size_gt >= r.size_lt)
+        {
+            err = fail("InvalidRequest", "ObjectSizeLessThan must be greater than ObjectSizeGreaterThan");
             return false;
         }
     }
@@ -451,7 +388,45 @@ bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
         err = fail("InvalidRequest", "At least one action needs to be specified in a rule");
         return false;
     }
+    // An upload has no tags and no size yet, so a rule that asks for them cannot abort one.
+    if (abort && !r.tags.empty())
+    {
+        err = fail("InvalidRequest", "AbortIncompleteMultipartUpload cannot be specified with Tags.");
+        return false;
+    }
+    if (abort && (r.has_size_gt || r.has_size_lt))
+    {
+        err = fail("InvalidRequest", "AbortIncompleteMultipartUpload cannot be specified with an object size filter.");
+        return false;
+    }
+    if (r.delete_marker >= 0 && !r.tags.empty())
+    {
+        err = fail("InvalidRequest", "ExpiredObjectDeleteMarker cannot be specified with Tags.");
+        return false;
+    }
     return true;
+}
+
+void filter_condition_xml(std::string& x, const lifecycle_rule& r)
+{
+    if (r.filter_prefix)
+    {
+        x += "<Prefix>";
+        xml_escape_to(x, r.prefix);
+        x += "</Prefix>";
+    }
+    for (const auto& [k, v] : r.tags)
+    {
+        x += "<Tag><Key>";
+        xml_escape_to(x, k);
+        x += "</Key><Value>";
+        xml_escape_to(x, v);
+        x += "</Value></Tag>";
+    }
+    if (r.has_size_gt)
+        x += "<ObjectSizeGreaterThan>" + std::to_string(r.size_gt) + "</ObjectSizeGreaterThan>";
+    if (r.has_size_lt)
+        x += "<ObjectSizeLessThan>" + std::to_string(r.size_lt) + "</ObjectSizeLessThan>";
 }
 
 }   // namespace
@@ -525,14 +500,12 @@ std::string lifecycle_xml(const lifecycle_config& c)
             xml_escape_to(x, r.prefix);
             x += "</Prefix>";
         }
-        else if (r.filter_prefix)
-        {
-            x += "<Filter><Prefix>";
-            xml_escape_to(x, r.prefix);
-            x += "</Prefix></Filter>";
-        }
         else
-            x += "<Filter></Filter>";
+        {
+            x += r.filter_and ? "<Filter><And>" : "<Filter>";
+            filter_condition_xml(x, r);
+            x += r.filter_and ? "</And></Filter>" : "</Filter>";
+        }
         x += r.enabled ? "<Status>Enabled</Status>" : "<Status>Disabled</Status>";
         if (r.expire_days != 0)
             x += "<Expiration><Days>" + std::to_string(r.expire_days) + "</Days></Expiration>";
@@ -559,14 +532,23 @@ int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms)
     return at + (rem > 0 ? day_ms - rem : -rem);
 }
 
-bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, int64_t mtime_ms, int64_t now_ms,
+bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                           int64_t day_ms)
 {
     if (!r.expires() || !key.starts_with(r.prefix))
         return false;
+    if ((r.has_size_gt && m.size <= r.size_gt) || (r.has_size_lt && m.size >= r.size_lt))
+        return false;
+    if (!r.tags.empty())
+    {
+        const std::string_view stored = tags_of(m);
+        for (const auto& [k, v] : r.tags)
+            if (!tags_have(stored, k, v))
+                return false;
+    }
     if (r.has_date)
         return now_ms >= r.expire_date_ms;
-    return now_ms >= lifecycle_due_ms(mtime_ms, r.expire_days, day_ms);
+    return now_ms >= lifecycle_due_ms(m.mtime_ms, r.expire_days, day_ms);
 }
 
 bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,

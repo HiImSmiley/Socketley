@@ -6313,11 +6313,11 @@ marker and NextMarker.
 T}
 PutObject	PUT /bucket/key	T{
 .ad l
-Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite.
+Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposition, Content\-Encoding, Content\-Language, Expires and x\-amz\-meta\-* stored and returned; x\-amz\-tagging sets the object's tags; Expect: 100\-continue and chunked request bodies accepted; If\-None\-Match: * refuses to overwrite.
 T}
 GetObject	GET /bucket/key	T{
 .ad l
-Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides.
+Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too).
 T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
@@ -6333,11 +6333,23 @@ Up to 1000 keys, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE.
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE.
+T}
+PutObjectTagging	PUT /bucket/key?tagging	T{
+.ad l
+A Tagging document replacing the object's tags; Content\-MD5 checked. See \fBObject tags\fR below.
+T}
+GetObjectTagging	GET /bucket/key?tagging	T{
+.ad l
+The tags in the order they were set; an empty TagSet for none.
+T}
+DeleteObjectTagging	DELETE /bucket/key?tagging	T{
+.ad l
+204 whether or not the object had tags.
 T}
 CreateMultipartUpload	POST /bucket/key?uploads	T{
 .ad l
-Content\-Type, the stored headers and x\-amz\-meta\-* are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes.
+Content\-Type, the stored headers, x\-amz\-meta\-* and x\-amz\-tagging are kept for the object; x\-amz\-checksum\-algorithm names the checksum every part takes.
 T}
 UploadPart	PUT /bucket/key?partNumber=N&uploadId=ID	T{
 .ad l
@@ -6377,7 +6389,7 @@ DeleteBucketLifecycle	DELETE /bucket?lifecycle	T{
 T}
 .TE
 .PP
-Anything else \(em ACLs, versioning, tagging, policies, the part\-number form of
+Anything else \(em ACLs, versioning, a bucket's own tags, policies, the part\-number form of
 GetObject \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
@@ -6520,6 +6532,59 @@ answer, and returned by GetObject and HeadObject when the request has
 has the checksum of its parts' checksums, and \fB\-N\fR after it for the number
 of parts, as S3 does; a part with no checksum of its own gets the upload's
 algorithm anyway.
+.SS Object tags
+An object has at most 10 tags, set with PutObjectTagging or with
+.B x\-amz\-tagging
+(a URL\-encoded query string,
+.IR k1 = v1 & k2 = v2 )
+on a PutObject, a CreateMultipartUpload (they land on the completed object) or a
+CopyObject under
+.BR "x\-amz\-tagging\-directive: REPLACE" .
+A key is 1 to 128 characters and a value at most 256, counted as characters and
+not bytes, of letters, digits, spaces and
+.B "+ \- = . _ : / @"
+(outside ASCII every character but a control, a format or private\-use
+character is taken, which is wider than S3's letters, digits and spaces of every
+script); keys are unique and none begins
+.BR aws: .
+Eleven tags are
+.BR "400 BadRequest" ,
+any other breach
+.BR "400 InvalidTag" ,
+a Tagging document that is not one
+.BR MalformedXML ,
+and a repeated key or a broken escape in
+.B x\-amz\-tagging
+.BR InvalidArgument ;
+a refused put stores nothing and a refused PutObjectTagging leaves the tags
+there were. GetObject and HeadObject say how many tags an object has in
+.BR x\-amz\-tagging\-count .
+.PP
+Tags live in the object's own header, beside its other metadata, and the journal
+record mirrors them like the rest, so they survive a stop, a crash and a lost
+journal. A tag change keeps the object's bytes, ETag and Last\-Modified, as S3
+does, by not rewriting the object: the padding of the header's first 4 KiB holds
+two tag slots of whole 512\-byte sectors, and a change is written into the one
+the last change did not use, with a sequence number and a CRC32C, then synced
+(one write and one
+.BR fdatasync (2)).
+A crash in the middle leaves a slot whose checksum fails, so the tags are those
+before the change, never a torn header, and the key's file is the truth a start
+after a crash reads them from. A set too big for the slots that are left (above
+about 1.5 KiB of tags with little other metadata, or any change to a header that
+fills its first 4 KiB) is written instead as a new file with the tags in its
+header and the bytes copied behind it, renamed into place like a put. On ext4 a
+change in place took 2.4 to 2.7 ms whatever the object's size, and a rewrite
+12.6 ms for 4 KiB, 102 ms for 64 MiB and 1.07 s for 1 GiB.
+.B stats
+counts the two as
+.B tag_writes
+and
+.BR tag_rewrites .
+A change goes to the shard that owns the key, waits behind its other writes in
+the key's lane, and is answered once the file says it and every shard has
+dropped what it holds of the key, so a GET or a GetObjectTagging on any shard
+sees it at once.
 .SS Multipart uploads
 An upload is a directory
 .IB dir / bucket /mpu/ id
@@ -6581,13 +6646,26 @@ document, of at most 1000 rules, each with an
 .RB ( Enabled
 or
 .BR Disabled ),
-the keys it covers as a
+the objects it covers as a
 .B Filter
-with a
+\(em empty for the whole bucket, or one of a
+.BR Prefix ,
+a
+.B Tag
+(a
+.B Key
+and a
+.B Value
+the object's tags must have),
+.B ObjectSizeGreaterThan
+and
+.B ObjectSizeLessThan
+(each in bytes and exclusive), or an
+.B And
+of a prefix, any number of tags and the two sizes, all of which must hold (or
+the older form, a
 .B Prefix
-or empty for the whole bucket (or the older form, a
-.B Prefix
-of the rule's own), and at least one action:
+of the rule's own) \(em and at least one action:
 .B Expiration
 by
 .B Days
@@ -6598,18 +6676,24 @@ or by
 by
 .BR DaysAfterInitiation .
 .B ExpiredObjectDeleteMarker
-is kept and does nothing, since there are no versions. A filter by
-.BR Tag ,
-.B And
-or object size,
+is kept and does nothing, since there are no versions.
 .B Transition
 and the noncurrent\-version actions are refused with
 .B "501 NotImplemented"
 and the configuration that was there stays; a document that is not one is
 .BR MalformedXML ,
-and a value S3 would not take (Days of zero, a Date that is not midnight, a
-repeated ID, 1001 rules) is
-.BR InvalidArgument .
+a value S3 would not take (Days of zero, a Date that is not midnight, a
+repeated ID, 1001 rules, an ObjectSizeLessThan of 0) is
+.BR InvalidArgument ,
+a tag key or value an object could not have is
+.BR InvalidTag ,
+and what S3 refuses as
+.B InvalidRequest
+is: one tag key twice in an
+.BR And ,
+sizes with nothing between them, and a tag or size filter on a rule that
+aborts uploads (an upload has neither yet) or one with
+.BR ExpiredObjectDeleteMarker .
 The rules are synced into
 .IB dir / bucket /lifecycle
 before the answer, so they survive a stop or a crash, and go with the bucket
@@ -6625,8 +6709,10 @@ every object under the rule goes from that midnight on, those written later
 too. It is removed exactly as a DeleteObject removes it \(em the unlink synced,
 then the journal record \(em and a script's
 .B on_delete
-is told. An object written again after the sweep found it is judged by its new
-time, and a configuration changed or removed meanwhile is obeyed. An upload is
+is told. An object written again or given other tags after the sweep found it
+is judged as it is then, and a configuration changed or removed meanwhile is
+obeyed. The tags and size a filter asks about are the index's, in memory, so a
+filter on them costs the walk no reads. An upload is
 aborted
 .B DaysAfterInitiation
 days after it began, rounded the same way. A pass runs at each start, within a
@@ -6649,7 +6735,7 @@ often as every second. It is never meant for a runtime holding data anyone wants
 An object is one file at
 .IB dir / bucket /data/ ab / sha256(key)
 whose first bytes are a checksummed header carrying the key, size, ETag, content
-type, user metadata and time, so the file says what it is and any byte sequence is
+type, user metadata, tags and time, so the file says what it is and any byte sequence is
 a valid key; the 256 directories \fBab\fR (the first two hex digits of the hash) are made
 and synced with the bucket, so a put never makes one. Each bucket also keeps an append\-only journal of puts and deletes
 (\fBindex.0\fR, or \fBindex.\fIshard\fR for a sharded runtime; CRC32C\-framed, rewritten when garbage passes the live objects),

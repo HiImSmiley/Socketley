@@ -38,7 +38,7 @@ public:
     void object(const std::string& key, const object_meta& meta) override
     {
         ++m_p.scanned;
-        if (lifecycle_object_due(m_rule, key, meta.mtime_ms, m_now, m_day))
+        if (lifecycle_object_due(m_rule, key, meta, m_now, m_day))
             m_p.due.push_back({m_bucket, key, m_p.cfg, m_p.rule, false});
     }
     void prefix(std::string) override {}
@@ -272,11 +272,11 @@ void storage_run::lifecycle_issue(lifecycle_pass& p)
     ++p.inflight;
     const std::string bucket = d.bucket;
     const std::string key    = d.key;
-    // Asked under the key's lane, so an object written again after the walk saw it is judged by its own mtime.
+    // Asked under the key's lane, so an object written again or retagged after the walk saw it is judged as it is.
     auto still_due = [this, d = std::move(d)](const object_meta& m)
     {
         return m_store.lifecycle(d.bucket) == d.cfg &&
-               lifecycle_object_due(d.cfg->rules[d.rule], d.key, m.mtime_ms,
+               lifecycle_object_due(d.cfg->rules[d.rule], d.key, m,
                                     static_cast<int64_t>(m_store.now_ms()), m_lc_day_ms);
     };
     m_store.remove_local(bucket, key, [this, id, bucket, key](st s, bool existed)

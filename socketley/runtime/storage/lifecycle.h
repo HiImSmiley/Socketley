@@ -3,18 +3,21 @@
 //
 // What it takes is the core of S3 lifecycle on a store with no versions and no
 // storage classes: expiration by days or by date and the abort of incomplete
-// multipart uploads, filtered by key prefix.  A rule asking for anything else is
-// refused, never accepted to do less than it says.
+// multipart uploads, filtered by key prefix, object tags and object size.  A rule
+// asking for anything else is refused, never accepted to do less than it says.
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "s3_auth.h"
 
 namespace socketley::storage
 {
+
+struct object_meta;
 
 inline constexpr size_t lifecycle_max_rules  = 1000;
 inline constexpr size_t lifecycle_max_id     = 255;
@@ -31,6 +34,15 @@ struct lifecycle_rule
     bool        legacy_prefix{false};
     // The <Filter> named a <Prefix>, which an empty filter written back does not.
     bool        filter_prefix{false};
+    // Tags an object must all carry, with these values.
+    std::vector<std::pair<std::string, std::string>> tags;
+    // Bounds on an object's size, each exclusive.
+    bool        has_size_gt{false};
+    uint64_t    size_gt{0};
+    bool        has_size_lt{false};
+    uint64_t    size_lt{0};
+    // The filter's conditions came inside an <And>, and are written back that way.
+    bool        filter_and{false};
     // Days after an object's mtime it expires, zero for none.
     uint32_t    expire_days{0};
     // The midnight from which every object under the rule expires, when has_date.
@@ -60,8 +72,8 @@ std::string lifecycle_xml(const lifecycle_config& c);
 // does: with a real day that boundary is midnight UTC, and `day_ms` is shorter only for a test.
 int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms);
 
-// Whether an object of `key` written at `mtime_ms` has expired under `r` at `now_ms`.
-bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, int64_t mtime_ms, int64_t now_ms,
+// Whether the object `key` with metadata `m` has expired under `r` at `now_ms`.
+bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, const object_meta& m, int64_t now_ms,
                           int64_t day_ms);
 
 // Whether an upload of `key` begun at `initiated_ms` is to be aborted under `r` at `now_ms`.

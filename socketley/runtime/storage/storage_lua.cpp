@@ -78,6 +78,9 @@ std::string_view storage_run::operation_name(const s3_request& r)
             return "DeleteObjects";
         return "Unknown";
     }
+    if (r.has_query("tagging"))
+        return m == "GET" ? "GetObjectTagging" : m == "PUT" ? "PutObjectTagging"
+             : m == "DELETE" ? "DeleteObjectTagging" : "Unknown";
     const bool upload = r.has_query("uploadId");
     if (m == "GET")
         return upload ? "ListParts" : "GetObject";

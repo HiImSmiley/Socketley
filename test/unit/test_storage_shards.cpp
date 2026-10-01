@@ -1796,9 +1796,11 @@ TEST_CASE("a lifecycle day is rounded up to the next boundary, which for a real 
     r.enabled     = true;
     r.prefix      = "logs/";
     r.expire_days = 1;
-    CHECK(lifecycle_object_due(r, "logs/a", written, 1767398400000, lifecycle_day_ms));
-    CHECK_FALSE(lifecycle_object_due(r, "logs/a", written, 1767398399999, lifecycle_day_ms));
-    CHECK_FALSE(lifecycle_object_due(r, "other/a", written, 1767398400000, lifecycle_day_ms));
+    object_meta m;
+    m.mtime_ms = written;
+    CHECK(lifecycle_object_due(r, "logs/a", m, 1767398400000, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "logs/a", m, 1767398399999, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "other/a", m, 1767398400000, lifecycle_day_ms));
     r.enabled = false;
-    CHECK_FALSE(lifecycle_object_due(r, "logs/a", written, 1767398400000, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "logs/a", m, 1767398400000, lifecycle_day_ms));
 }

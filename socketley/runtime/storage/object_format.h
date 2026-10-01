@@ -41,6 +41,14 @@ struct object_meta
     bool operator==(const object_meta&) const = default;
 };
 
+// The extra entry an object's tags are kept in: each tag's key and value, each followed by a NUL.
+inline constexpr std::string_view tags_extra = "x-amz-tagging";
+
+// The object's tags in that encoding, empty when it has none.
+std::string_view tags_of(const object_meta& m);
+// Makes `tags` the object's tags, as the last extra entry, or removes them when it is empty.
+void set_tags_extra(object_meta& m, std::string_view tags);
+
 inline constexpr size_t object_header_align = 4096;
 inline constexpr size_t max_key_bytes       = 1024;
 // User metadata is 2 KB in S3 and the system fields ride beside it, so this is
@@ -74,9 +82,22 @@ struct decoded_header
     size_t        need{0};
     std::string   key;
     object_meta   meta;
+    // Where the header's own fields end and its zero padding begins.
+    size_t        meta_end{0};
+    // The slot in that padding whose tags replaced the ones the header was written with, -1 for none.
+    int8_t        tag_slot{-1};
+    uint64_t      tag_seq{0};
 };
 
+// Tags changed after an object was written go into one of two slots in the
+// padding of its header's first 4 KiB, whole 512-byte sectors written in turn
+// and checksummed with a sequence number, so a torn write of one leaves the
+// other and the object's bytes, ETag and time never move.
 decoded_header decode_object_header(std::string_view bytes);
+
+// The bytes that make `tags` the tags of the object `d` decoded, and the offset
+// they go at, or empty when its header has no room for them.
+std::string encode_tag_slot(const decoded_header& d, std::string_view tags, uint64_t& at);
 
 // ─── The index journal ──────────────────────────────────────────────────────
 inline constexpr std::string_view journal_magic = std::string_view("SKLIDX\x01\x00", 8);

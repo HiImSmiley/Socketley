@@ -154,6 +154,9 @@ struct store_totals
     uint64_t fsyncs{0};
     uint64_t puts{0};
     uint64_t deletes{0};
+    // Tag changes written into their object's header, and those that needed the object written again.
+    uint64_t tag_writes{0};
+    uint64_t tag_rewrites{0};
 };
 
 struct recovery_report
@@ -382,6 +385,8 @@ public:
     virtual void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) = 0;
     virtual void remove(uint32_t owner, std::string bucket, std::string key,
                         std::function<void(st, bool existed)> cb) = 0;
+    virtual void set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
+                          std::function<void(st)> cb) = 0;
     // Tells every sibling to drop what it holds of the key, and `done` runs once each has answered or is gone.
     virtual void invalidate(std::string bucket, std::string key, std::function<void()> done) = 0;
 };
@@ -525,6 +530,11 @@ public:
     // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
     void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
                       std::function<bool(const object_meta&)> only_if = {});
+
+    // Makes `tags`, in the encoding of tags_of(), an object's tags, keeping its bytes, ETag and time.
+    void set_tags(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb);
+    // The step itself, which only the owner of the key may run.
+    void set_tags_local(std::string_view bucket, std::string_view key, std::string tags, std::function<void(st)> cb);
 
     // A new body made of an existing object's, with the metadata `meta` names.
     void copy(std::string_view src_bucket, std::string_view src_key,
@@ -676,6 +686,11 @@ private:
                      std::function<void(int leaf_fd, st)> cb, bool repaired = false);
     void apply_put(bucket& b, const std::string& key, const object_meta& meta);
     void apply_delete(bucket& b, const std::string& key);
+    // A tag change whose header is read: written into one of its slots, or the object written again with it.
+    struct tag_change;
+    void tags_in_place(std::shared_ptr<tag_change> tc, std::string slot, uint64_t at);
+    void tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_off);
+    void tags_written(std::shared_ptr<tag_change> tc, st s, bool changed);
     // Runs `next` once every sibling has dropped its copy of a key this shard just changed.
     void invalidate_siblings(const std::string& bucket_name, const std::string& key, std::function<void()> next);
 

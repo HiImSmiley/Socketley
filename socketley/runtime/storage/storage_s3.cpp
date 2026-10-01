@@ -8,6 +8,7 @@
 
 #include "s3_cors.h"
 #include "s3_names.h"
+#include "s3_tagging.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
 #include "../../shared/logging.h"
@@ -41,7 +42,8 @@ bool unsupported_subresource(const s3_request& r, bool object)
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
-            if (q.first == n)
+            // An object's tags are implemented, and a bucket's are not.
+            if (q.first == n && (n != "tagging" || r.key.empty()))
                 return true;
     return false;
 }
@@ -146,6 +148,17 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
     return true;
 }
 
+bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err)
+{
+    if (!r.has_header("x-amz-tagging"))
+        return true;
+    tag_set tags;
+    if (!parse_tagging_header(r.header("x-amz-tagging"), tags, err))
+        return false;
+    set_tags_extra(m, encode_tags(tags));
+    return true;
+}
+
 bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err)
 {
     const std::string_view md5h = r.header("content-md5");
@@ -232,14 +245,15 @@ void storage_run::route(const std::shared_ptr<conn>& c)
 
     // A part's body streams into the upload like an object's into a file.
     const bool part_request = !service && !bucket_level && r.has_query("uploadId") && r.has_query("partNumber");
-    if (r.method == "PUT" && part_request && !r.has_header("x-amz-copy-source") && !unsupported_subresource(r, true))
+    if (r.method == "PUT" && part_request && !r.has_header("x-amz-copy-source") && !r.has_query("tagging") &&
+        !unsupported_subresource(r, true))
     {
         op_upload_part(c);
         return;
     }
 
     if (r.method == "PUT" && !service && !bucket_level && !r.has_header("x-amz-copy-source") &&
-        !unsupported_subresource(r, true))
+        !r.has_query("tagging") && !unsupported_subresource(r, true))
     {
         op_put_object(c);
         return;
@@ -323,6 +337,18 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_head_bucket(c);
         else if (m == "POST" && q.has_query("delete"))
             op_delete_objects(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (q.has_query("tagging"))
+    {
+        if (m == "GET")
+            op_get_object_tagging(c);
+        else if (m == "PUT")
+            op_put_object_tagging(c);
+        else if (m == "DELETE")
+            op_delete_object_tagging(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
         return;
@@ -744,7 +770,7 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     s3_error err;
     // Refused before the body is read, and the body is read off after the
     // answer, so a client still sending it hears the refusal and not a reset.
-    if (!object_meta_from_headers(c, meta, err))
+    if (!object_meta_from_headers(c, meta, err) || !tagging_from_header(r, meta, err))
     {
         deny_request(c, err);
         return;
@@ -931,6 +957,13 @@ void storage_run::op_copy_object(const std::shared_ptr<conn>& c)
         return;
     }
     const bool replace = directive == "REPLACE";
+    if (const std::string_view td = r.header("x-amz-tagging-directive"); !td.empty() && td != "COPY" && td != "REPLACE")
+    {
+        s3_error e = make_error("InvalidArgument");
+        e.message = "Unknown tagging directive.";
+        send_error(c, e, false, "ArgumentName", "x-amz-tagging-directive");
+        return;
+    }
 
     if (!m_store.has_bucket(src_bucket) || !m_store.has_bucket(r.bucket))
     {
@@ -1000,6 +1033,18 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     }
     else
         meta = *src_meta;
+    // The tags follow their own directive, whatever the metadata's says.
+    if (r.header("x-amz-tagging-directive") == "REPLACE")
+    {
+        set_tags_extra(meta, {});
+        if (s3_error err; !tagging_from_header(r, meta, err))
+        {
+            send_error(c, err);
+            return;
+        }
+    }
+    else
+        set_tags_extra(meta, tags_of(*src_meta));
 
     ++m_c.copies;
     std::weak_ptr<conn> weak = c;
@@ -1095,6 +1140,12 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         if (n.starts_with("x-amz-meta-"))
         {
             r.headers.emplace_back(n, v);
+            continue;
+        }
+        // The tags themselves are GetObjectTagging's to tell, and a GET says how many there are.
+        if (n == tags_extra)
+        {
+            r.headers.emplace_back("x-amz-tagging-count", std::to_string(tag_count(v)));
             continue;
         }
         if (is_checksum_header(n))

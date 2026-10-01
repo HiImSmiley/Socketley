@@ -110,6 +110,25 @@ void shard_node::remove(uint32_t owner, std::string bucket, std::string key,
     });
 }
 
+void shard_node::set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
+                          std::function<void(st)> cb)
+{
+    ++m_c.tags_out;
+    auto alive = m_alive;
+    m_transport.call(owner, wire::encode_set_tags(bucket, key, tags), [this, alive, cb](bool ok, std::string_view reply)
+    {
+        if (!*alive)
+            return;
+        st s = st::io_error;
+        if (!ok || !wire::decode_status(reply, s))
+        {
+            ++m_c.peer_failures;
+            s = st::io_error;
+        }
+        cb(s);
+    });
+}
+
 void shard_node::invalidate(std::string bucket, std::string key, std::function<void()> done)
 {
     if (m_store.shards() <= 1)
@@ -905,6 +924,18 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             ++m_c.removes_in;
             m_store.remove_local(bucket, key,
                 [reply](st s, bool existed) { reply(true, wire::encode_removed(s, existed)); });
+            return;
+        }
+        case wire::op::set_tags:
+        {
+            std::string bucket, key, tags;
+            if (!wire::decode_set_tags(payload, bucket, key, tags))
+            {
+                reply(false, {});
+                return;
+            }
+            ++m_c.tags_in;
+            m_store.set_tags_local(bucket, key, std::move(tags), [reply](st s) { reply(true, wire::encode_status(s)); });
             return;
         }
         case wire::op::hot_drop:

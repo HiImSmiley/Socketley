@@ -40,6 +40,8 @@ struct shard_counters
     uint64_t commits_in{0};
     uint64_t removes_out{0};
     uint64_t removes_in{0};
+    uint64_t tags_out{0};
+    uint64_t tags_in{0};
     // Listings this shard fanned out, and pages it gave to a sibling's.
     uint64_t list_fanouts{0};
     uint64_t list_pages_served{0};
@@ -67,6 +69,8 @@ public:
     void commit(uint32_t owner, commit_request req, std::function<void(put_result)> cb) override;
     void remove(uint32_t owner, std::string bucket, std::string key,
                 std::function<void(st, bool)> cb) override;
+    void set_tags(uint32_t owner, std::string bucket, std::string key, std::string tags,
+                  std::function<void(st)> cb) override;
     // Sent by the owner before it answers a commit or a delete, so no sibling answers the old bytes after it.
     void invalidate(std::string bucket, std::string key, std::function<void()> done) override;
     // Tells the siblings this shard has started, so they drop the copies they hold of its keys, which a

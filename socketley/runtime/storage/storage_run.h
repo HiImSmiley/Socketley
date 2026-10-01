@@ -159,6 +159,9 @@ struct checksum_request
 // or names two that disagree.
 bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error& err);
 
+// The tags an x-amz-tagging header names, put into `m`; false with `err` when S3 would refuse them.
+bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err);
+
 // False with `err` when the request carries a Content-MD5 its body does not match.
 bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err);
 
@@ -577,6 +580,10 @@ public:
     void lifecycle_done(uint64_t pass_id);
     void op_get_object(const std::shared_ptr<conn>& c, bool head);
     void op_delete_object(const std::shared_ptr<conn>& c);
+    // PutObjectTagging, GetObjectTagging and DeleteObjectTagging, in storage_tagging.cpp.
+    void op_put_object_tagging(const std::shared_ptr<conn>& c);
+    void op_get_object_tagging(const std::shared_ptr<conn>& c);
+    void op_delete_object_tagging(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
     void new_request_id(std::string& id);
 
