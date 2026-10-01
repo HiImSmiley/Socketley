@@ -322,8 +322,11 @@ for i in won:
 check("every stored upload reads back whole with the MD5 it was sent", not bad, bad)
 check("every refused one is absent", all(request("HEAD", "/full/race%d" % i)[0] == 404 for i in lost))
 check("and no temporary file is left", wait_for(lambda: not tmp_files("full"), 10), tmp_files("full"))
+# ext4 hands freed blocks back when its journal commits, seconds after the unlink.
+room = free3 - len(won) * (per + 65536) - (512 << 10)
+wait_for(lambda: free_bytes() >= room, 10)
 check("the room the refused ones held was given back (%d KiB free of the %d KiB that only the %d stored took)" %
-      (free_bytes() >> 10, free3 >> 10, len(won)), free_bytes() >= free3 - len(won) * (per + 65536) - (512 << 10),
+      (free_bytes() >> 10, free3 >> 10, len(won)), free_bytes() >= room,
       (free_bytes(), free3, len(won), per))
 for i in won:
     extra_ok["race%d" % i] = None
