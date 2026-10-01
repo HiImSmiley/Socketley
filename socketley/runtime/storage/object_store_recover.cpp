@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
 #include "shard_owner.h"
@@ -68,8 +69,8 @@ bool fsync_dir_path(const std::string& path)
     return ok;
 }
 
-// A whole small file, empty on any failure.
-std::string slurp(const std::string& path)
+// A whole small file, empty on any failure, and cut after `max` bytes.
+std::string slurp(const std::string& path, size_t max = 4096)
 {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -82,7 +83,7 @@ std::string slurp(const std::string& path)
         if (n <= 0)
             break;
         out.append(buf, static_cast<size_t>(n));
-        if (out.size() > 4096)
+        if (out.size() > max)
             break;
     }
     ::close(fd);
@@ -632,16 +633,15 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
         b->created_ms = ms;
     }
 
-    // The CORS rules, which shard 0 writes beside the file and renames over it.
+    // The configuration documents shard 0 last synced, and not what a write it was cut short in left.
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle})
     {
-        if (m_opts.shard == 0 && ::unlink((base + "/cors.new").c_str()) < 0) {}
-        const std::string xml = slurp(base + "/cors");
-        auto c = std::make_shared<cors_config>();
-        s3_error why;
-        if (!xml.empty() && parse_cors_xml(xml, *c, why))
-            set_bucket_cors(*b, std::move(c));
-        else if (!xml.empty())
-            LOG_WARN(("storage: the CORS rules of bucket " + name + " do not parse and are not applied").c_str());
+        const std::string file = base + "/" + doc_file(kind);
+        if (m_opts.shard == 0 && ::unlink((file + ".new").c_str()) < 0) {}
+        const std::string xml = slurp(file, doc_max_bytes);
+        if (!xml.empty() && !take_doc(*b, kind, xml))
+            LOG_WARN(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + name +
+                      " does not parse and is not applied").c_str());
     }
 
     b->dir_fd  = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

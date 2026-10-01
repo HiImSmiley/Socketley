@@ -42,7 +42,7 @@ void storage_run::op_put_cors(const std::shared_ptr<conn>& c)
         return;
     }
     std::weak_ptr<conn> weak = c;
-    m_node.set_cors(q.bucket, std::move(cfg.xml), [this, weak](st s)
+    m_node.set_doc(bucket_doc::cors, q.bucket, std::move(cfg.xml), [this, weak](st s)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -83,7 +83,7 @@ void storage_run::op_delete_cors(const std::shared_ptr<conn>& c)
         return;
     }
     std::weak_ptr<conn> weak = c;
-    m_node.set_cors(c->req.bucket, {}, [this, weak](st s)
+    m_node.set_doc(bucket_doc::cors, c->req.bucket, {}, [this, weak](st s)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)

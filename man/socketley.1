@@ -6363,9 +6363,21 @@ ListMultipartUploads	GET /bucket?uploads	T{
 .ad l
 prefix, delimiter, key\-marker, upload\-id\-marker, max\-uploads, encoding\-type=url.
 T}
+PutBucketLifecycleConfiguration	PUT /bucket?lifecycle	T{
+.ad l
+Replaces the bucket's rules; see Bucket lifecycle. Content\-MD5 checked.
+T}
+GetBucketLifecycleConfiguration	GET /bucket?lifecycle	T{
+.ad l
+NoSuchLifecycleConfiguration (404) for a bucket without rules.
+T}
+DeleteBucketLifecycle	DELETE /bucket?lifecycle	T{
+.ad l
+204 whether or not the bucket had rules.
+T}
 .TE
 .PP
-Anything else \(em ACLs, versioning, tagging, lifecycle, the part\-number form of
+Anything else \(em ACLs, versioning, tagging, policies, the part\-number form of
 GetObject \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
@@ -6559,6 +6571,80 @@ is set; its parts count against
 while they are held, and a bucket with an open upload cannot be deleted
 .RB ( BucketNotEmpty ).
 A part sent again needs room for both copies until the new one lands.
+.SS Bucket lifecycle
+A bucket's lifecycle configuration is S3's
+.B LifecycleConfiguration
+document, of at most 1000 rules, each with an
+.B ID
+(at most 255 bytes, unique, generated when left out),
+.B Status
+.RB ( Enabled
+or
+.BR Disabled ),
+the keys it covers as a
+.B Filter
+with a
+.B Prefix
+or empty for the whole bucket (or the older form, a
+.B Prefix
+of the rule's own), and at least one action:
+.B Expiration
+by
+.B Days
+or by
+.B Date
+(midnight UTC), and
+.B AbortIncompleteMultipartUpload
+by
+.BR DaysAfterInitiation .
+.B ExpiredObjectDeleteMarker
+is kept and does nothing, since there are no versions. A filter by
+.BR Tag ,
+.B And
+or object size,
+.B Transition
+and the noncurrent\-version actions are refused with
+.B "501 NotImplemented"
+and the configuration that was there stays; a document that is not one is
+.BR MalformedXML ,
+and a value S3 would not take (Days of zero, a Date that is not midnight, a
+repeated ID, 1001 rules) is
+.BR InvalidArgument .
+The rules are synced into
+.IB dir / bucket /lifecycle
+before the answer, so they survive a stop or a crash, and go with the bucket
+when it is deleted.
+.PP
+The rules are carried out by a sweep in each shard over the keys and uploads it
+owns. An object expires
+.B Days
+days after its last write, rounded up to the next midnight UTC as S3 does (one
+written on the 1st at 10:30 with Days 1 goes at the midnight that begins the 3rd); with a
+.B Date
+every object under the rule goes from that midnight on, those written later
+too. It is removed exactly as a DeleteObject removes it \(em the unlink synced,
+then the journal record \(em and a script's
+.B on_delete
+is told. An object written again after the sweep found it is judged by its new
+time, and a configuration changed or removed meanwhile is obeyed. An upload is
+aborted
+.B DaysAfterInitiation
+days after it began, rounded the same way. A pass runs at each start, within a
+second of a change to the rules and then hourly; it walks the index a page at a
+time with at most eight removals in flight and a pause between steps, so a
+bucket with a great many expiring keys is worked through without holding up
+other requests.
+.B stats
+counts what it did in
+.B lifecycle_expired
+and
+.BR lifecycle_aborted ,
+and each pass that removed anything says so in the log.
+.PP
+.B SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS
+is a test aid: read by the sweep alone, it makes a lifecycle day that many
+seconds (at most 86400) so a rule can be watched taking effect, with passes as
+often as every second. It is never meant for a runtime holding data anyone wants.
 .SS How objects are stored
 An object is one file at
 .IB dir / bucket /data/ ab / sha256(key)
@@ -6734,7 +6820,9 @@ are merged, so it is the listing one shard would give; a shard that cannot be
 reached fails the listing with a 500 rather than shortening it.
 .PP
 Buckets are made and dropped by shard 0 and told to the others before it answers;
-a bucket is dropped only when every shard agrees it holds nothing and is idle.
+a bucket is dropped only when every shard agrees it holds nothing and is idle. A
+bucket's CORS and lifecycle configurations are written by shard 0 the same way, one change of a bucket at a time, whichever
+shard took the request, and each shard sweeps the keys it owns.
 Temporary files are named for the shard that wrote them, so a shard restarted by
 the supervisor removes only its own. A shard killed between a rename and its
 journal record leaves the object in the directory, and its restart adopts it from
@@ -6816,7 +6904,9 @@ reports
 .BR multipart_bytes ,
 .BR multipart_created ,
 .BR multipart_completed ,
-.B multipart_aborted
+.BR multipart_aborted ,
+.BR lifecycle_expired ,
+.BR lifecycle_aborted ,
 .BR timeouts ,
 .B tls
 (1 when the listener is TLS),
@@ -6871,7 +6961,7 @@ has
 .B operation
 (the name S3 gives it: GetObject, PutObject, DeleteObjects, ListObjectsV2, CreateMultipartUpload,
 UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts,
-ListMultipartUploads, .\|.\|.),
+ListMultipartUploads, PutBucketLifecycleConfiguration, .\|.\|.),
 .BR bucket ,
 .BR key ,
 .B path

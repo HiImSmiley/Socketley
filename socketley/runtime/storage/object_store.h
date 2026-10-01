@@ -7,9 +7,10 @@
 //
 // ─── LAYOUT ─────────────────────────────────────────────────────────────────
 //   <dir>/<bucket>/created            decimal milliseconds since the epoch
-//   <dir>/<bucket>/cors               the bucket's CORSConfiguration, when it has one
+//   <dir>/<bucket>/cors               the bucket's CORSConfiguration, when it has one, written by shard 0
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
+//   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
 //   <dir>/<bucket>/data/ab/<hash>     header + bytes, hash = sha256(key) in hex; the 256 ab
 //                                     directories are made and synced with the bucket
 //   <dir>/.trash/                     a deleted bucket, removed at the next start
@@ -41,6 +42,16 @@ namespace socketley::storage
 {
 
 struct cors_config;
+struct lifecycle_config;
+
+// The configuration documents a bucket keeps beside its objects, each in a file named for it.
+enum class bucket_doc : uint8_t
+{
+    cors,
+    lifecycle,
+};
+// The most a document may be, so it crosses to a sibling shard in one message.
+inline constexpr size_t doc_max_bytes = 4u << 20;
 
 // What an operation came to, named for the S3 error a client is given.
 enum class st : uint8_t
@@ -415,15 +426,22 @@ public:
     // Removes a body that will not become anything from the bucket's tmp directory.
     void remove_tmp(std::string_view bucket, std::string tmp_name);
 
-    // ── CORS ────────────────────────────────────────────────────────────────
-    // Whether any bucket has rules, so a request to a store without them looks nothing up.
+    // ── Configuration documents: CORS and lifecycle ─────────────────────────
+    // Makes `xml` the bucket's document of `kind` on disk, or removes it when it is empty, and then here; shard 0's half.
+    void write_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb);
+    // Takes up a document another shard wrote.
+    st adopt_doc(bucket_doc kind, std::string_view name, std::string_view xml);
+
+    // Whether any bucket has CORS rules, so a request to a store without them looks nothing up.
     bool any_cors() const { return m_cors_buckets != 0; }
-    // The bucket's rules, null when it has none; valid until they next change.
+    // The bucket's CORS rules, null when it has none; valid until they next change.
     const cors_config* bucket_cors(std::string_view name) const;
-    // Makes `xml` the bucket's rules on disk, or removes them when it is empty, and then here; shard 0's half.
-    void write_cors(std::string name, std::string xml, std::function<void(st)> cb);
-    // Takes up rules another shard wrote, from their document.
-    st adopt_cors(std::string_view name, std::string_view xml);
+    // The bucket's lifecycle rules, null when it has none.
+    std::shared_ptr<const lifecycle_config> lifecycle(std::string_view name) const;
+    // How many buckets have lifecycle rules.
+    size_t lifecycle_buckets() const { return m_lifecycle_buckets; }
+    // Told whenever a bucket's lifecycle rules change here.
+    void set_lifecycle_listener(std::function<void()> fn) { m_lifecycle_listener = std::move(fn); }
 
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
@@ -504,7 +522,9 @@ public:
 
     // `existed` says whether there was an object to remove.
     void remove(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
-    void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb);
+    // `only_if`, when given, is asked under the key's lane and keeps an object it says no to.
+    void remove_local(std::string_view bucket, std::string_view key, std::function<void(st, bool existed)> cb,
+                      std::function<bool(const object_meta&)> only_if = {});
 
     // A new body made of an existing object's, with the metadata `meta` names.
     void copy(std::string_view src_bucket, std::string_view src_key,
@@ -593,6 +613,7 @@ private:
         uint32_t    active_ops{0};
         bool        closing{false};
         std::shared_ptr<const cors_config> cors;
+        std::shared_ptr<const lifecycle_config> lifecycle;
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -674,6 +695,7 @@ private:
     shard_peers* m_peers{nullptr};
     hash_pool*   m_hash{nullptr};
     std::function<bool(std::string_view)> m_drop_guard;
+    std::function<void()> m_lifecycle_listener;
     // A test hook: a commit of a key with this prefix kills the process after
     // its rename and before its journal record.
     std::string m_kill_after_rename;
@@ -704,9 +726,12 @@ private:
     uint64_t m_drop_epoch{0};
     uint64_t m_drop_ring[drop_ring_size]{};
     uint64_t m_reserved{0};
-    // Buckets whose rules are set.
+    // Buckets with CORS rules and with lifecycle rules.
     uint32_t m_cors_buckets{0};
-    void set_bucket_cors(bucket& b, std::shared_ptr<const cors_config> c);
+    uint32_t m_lifecycle_buckets{0};
+    static const char* doc_file(bucket_doc kind);
+    // The one place a bucket's document is parsed and taken up, an empty one removing it; false when it does not parse.
+    bool take_doc(bucket& b, bucket_doc kind, std::string_view xml);
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.
     std::shared_ptr<bool> m_alive;

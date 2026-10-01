@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::cors_adopt))
+        o > static_cast<uint8_t>(op::doc_adopt))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -130,18 +130,24 @@ bool decode_hot_owner_started(std::string_view payload, uint32_t& shard)
     return open_request(r, op::hot_owner_started) && r.u32(shard);
 }
 
-std::string encode_cors(op o, std::string_view bucket, std::string_view xml)
+std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml)
 {
     bytes::writer w = begin(o);
+    w.u8(static_cast<uint8_t>(kind));
     w.bytes(bucket);
     w.bytes(xml);
     return w.take();
 }
 
-bool decode_cors(std::string_view payload, op want, std::string& bucket, std::string& xml)
+bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string& bucket, std::string& xml)
 {
     bytes::reader r(payload);
-    return open_request(r, want) && r.bytes(bucket, name_cap) && r.bytes(xml, record_cap);
+    uint8_t k = 0;
+    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::lifecycle) ||
+        !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes))
+        return false;
+    kind = static_cast<bucket_doc>(k);
+    return true;
 }
 
 std::string encode_list(std::string_view bucket, const list_query& q)

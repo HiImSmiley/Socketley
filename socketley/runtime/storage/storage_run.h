@@ -8,6 +8,7 @@
 // nothing, and the next run is a different object with a different identity.
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -64,6 +65,9 @@ struct storage_counters
     uint64_t mpu_parts{0};
     uint64_t mpu_completed{0};
     uint64_t mpu_aborted{0};
+    // Objects a lifecycle rule expired and incomplete uploads one aborted.
+    uint64_t lifecycle_expired{0};
+    uint64_t lifecycle_aborted{0};
     // TLS handshakes that completed and that did not.
     uint64_t tls_handshakes{0};
     uint64_t tls_failures{0};
@@ -154,6 +158,9 @@ struct checksum_request
 // False with `err` when the request names a checksum the runtime cannot take
 // or names two that disagree.
 bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error& err);
+
+// False with `err` when the request carries a Content-MD5 its body does not match.
+bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err);
 
 // The bucket and key an x-amz-copy-source header names, decoded; false with
 // `err` when it names neither or is not one.
@@ -305,6 +312,37 @@ struct conn
 // An object's metadata as a script sees it: the user metadata without its
 // header prefix, and the fields S3 reports.
 storage_rpc::object_info rpc_info_of(const object_meta& m, std::string key = {});
+
+// A pass of the lifecycle sweep over every bucket with rules, which keeps its place between steps.
+struct lifecycle_pass
+{
+    uint64_t id{0};
+    std::vector<std::string> buckets;
+    size_t   bucket{0};
+    // The rules of the bucket being walked, null until its walk begins.
+    std::shared_ptr<const lifecycle_config> cfg;
+    bool     uploads_done{false};
+    size_t   rule{0};
+    std::string resume;
+    bool     has_resume{false};
+    // Found due and not yet removed, each with the rules that found it.
+    struct due_key
+    {
+        std::string bucket;
+        // The object's key, or the upload's id when `upload`.
+        std::string key;
+        std::shared_ptr<const lifecycle_config> cfg;
+        size_t      rule{0};
+        bool        upload{false};
+    };
+    std::deque<due_key> due;
+    uint32_t inflight{0};
+    // Entries looked at since the step began, which a step does not exceed.
+    size_t   scanned{0};
+    bool     pumping{false};
+    uint64_t expired{0};
+    uint64_t aborted{0};
+};
 
 // One request's result, which every operation ends by giving to respond().
 struct response
@@ -522,6 +560,21 @@ public:
                                   const object_meta& src_meta);
     bool part_number_of(const std::shared_ptr<conn>& c, uint32_t& number);
     void reap_uploads();
+
+    // Lifecycle: the configuration's three operations, and the sweep that carries it out, in storage_lifecycle.cpp.
+    void op_put_lifecycle(const std::shared_ptr<conn>& c);
+    void op_get_lifecycle(const std::shared_ptr<conn>& c);
+    void op_delete_lifecycle(const std::shared_ptr<conn>& c);
+    // Starts a pass when one is due, from the sweep's tick.
+    void lifecycle_tick();
+    // Moves the pass on by a bounded step: deletes up to the in-flight cap, and a bounded walk to find more.
+    void lifecycle_pump();
+    // A bucket's rules changed, so a pass runs soon.
+    void lifecycle_changed();
+    void lifecycle_issue(lifecycle_pass& p);
+    // False when the pass has nothing left to walk.
+    bool lifecycle_walk(lifecycle_pass& p);
+    void lifecycle_done(uint64_t pass_id);
     void op_get_object(const std::shared_ptr<conn>& c, bool head);
     void op_delete_object(const std::shared_ptr<conn>& c);
     bool object_meta_from_headers(const std::shared_ptr<conn>& c, object_meta& m, s3_error& err);
@@ -549,6 +602,13 @@ private:
     anonymous_authenticator m_anon;
     uint32_t          m_mpu_expire_secs{0};
     std::chrono::steady_clock::time_point m_last_reap{};
+    // What a lifecycle day is, shorter only under SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS, a test aid.
+    int64_t           m_lc_day_ms{0};
+    std::unique_ptr<lifecycle_pass> m_lc;
+    uint64_t          m_lc_passes{0};
+    std::chrono::steady_clock::time_point m_lc_next{};
+    // The rules changed during a pass, so the next starts when it ends.
+    bool              m_lc_again{false};
     std::unique_ptr<tls_context> m_tls;
 
     int         m_listen_fd{-1};
@@ -573,6 +633,8 @@ private:
     };
     timer       m_sweep_timer;
     timer       m_accept_backoff;
+    // The pause between the steps of a lifecycle pass.
+    timer       m_lc_timer;
 
     // Asked again at each sweep until every sibling has heard this shard started, or it gave up.
     void tell_started();

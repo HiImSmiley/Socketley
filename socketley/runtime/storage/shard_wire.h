@@ -46,9 +46,9 @@ enum class op : uint8_t
     hot_drop      = 18,
     // From a shard that has just started: drop every copy you hold of my keys.
     hot_owner_started = 19,
-    // A bucket's CORS rules, to shard 0 to be written and from it to the others to be taken up.
-    cors_put      = 20,
-    cors_adopt    = 21,
+    // A bucket's configuration document (CORS, lifecycle), to shard 0 to be written and from it to the others.
+    doc_put       = 20,
+    doc_adopt     = 21,
 };
 
 // The op of a request, false when the payload is not one of ours.
@@ -72,9 +72,9 @@ bool        decode_list(std::string_view payload, std::string& bucket, list_quer
 std::string encode_bucket(op o, std::string_view bucket, int64_t created_ms = 0);
 bool        decode_bucket(std::string_view payload, std::string& bucket, int64_t& created_ms);
 
-// A bucket's CORS document, empty for none.
-std::string encode_cors(op o, std::string_view bucket, std::string_view xml);
-bool        decode_cors(std::string_view payload, op want, std::string& bucket, std::string& xml);
+// A bucket's configuration document of one kind, empty for none.
+std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml);
+bool        decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string& bucket, std::string& xml);
 
 // ── Multipart ───────────────────────────────────────────────────────────────
 // An upload as a listing names it.

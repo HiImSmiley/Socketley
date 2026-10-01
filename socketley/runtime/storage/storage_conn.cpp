@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "lifecycle.h"
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -112,6 +113,15 @@ storage_run::storage_run(storage_instance& owner, event_loop& loop, store_option
     // only when no shard holds one.
     m_node.set_multipart(&m_mpu);
     m_store.set_drop_guard([this](std::string_view bucket) { return m_mpu.bucket_has_uploads(bucket); });
+    m_store.set_lifecycle_listener([this]() { lifecycle_changed(); });
+    m_lc_day_ms = lifecycle_day_ms;
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS"))
+    {
+        char* end;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && v > 0 && v <= 86400)
+            m_lc_day_ms = static_cast<int64_t>(v) * 1000;
+    }
     m_rid_seq = random_u64();
     m_store.set_hash_pool(&m_hash);
     if (!m_hash.attach(m_io))
@@ -254,6 +264,16 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
         m_sweep_timer.armed = false;
         if (!m_stopped)
             sweep();
+        return;
+    }
+    if (req == &m_lc_timer.req)
+    {
+        m_lc_timer.armed = false;
+        if (!m_stopped && m_lc)
+        {
+            m_lc->scanned = 0;
+            lifecycle_pump();
+        }
         return;
     }
     if (req == &m_accept_backoff.req)
@@ -485,8 +505,10 @@ void storage_run::sweep()
             reap_uploads();
         }
     }
+    lifecycle_tick();
     tell_started();
-    if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told)
+    if (!m_conns.empty() || m_mpu_expire_secs != 0 || m_start_note != start_note::told || m_lc ||
+        m_store.lifecycle_buckets() != 0)
         arm_sweep();
 }
 
@@ -512,6 +534,9 @@ void storage_run::stop()
         m_loop.submit_timeout_remove(&m_sweep_timer.req);
     if (m_accept_backoff.armed)
         m_loop.submit_timeout_remove(&m_accept_backoff.req);
+    if (m_lc_timer.armed)
+        m_loop.submit_timeout_remove(&m_lc_timer.req);
+    m_lc.reset();
 
     std::vector<std::shared_ptr<conn>> all;
     for (auto& [id, c] : m_conns)

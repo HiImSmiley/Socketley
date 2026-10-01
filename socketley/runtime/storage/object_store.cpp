@@ -9,6 +9,8 @@
 
 #include <fcntl.h>
 
+#include "disk_chain.h"
+#include "lifecycle.h"
 #include "s3_cors.h"
 #include "s3_names.h"
 #include "shard_owner.h"
@@ -1450,7 +1452,7 @@ void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
 }
 
 void object_store::remove_local(std::string_view bucket_name, std::string_view key_sv,
-                                std::function<void(st, bool)> cb)
+                                std::function<void(st, bool)> cb, std::function<bool(const object_meta&)> only_if)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -1475,6 +1477,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
         std::string                   bname, key, dir;
         bool                          existed{false};
         std::function<void(st, bool)> cb;
+        std::function<bool(const object_meta&)> only_if;
     };
     using removal_ptr = std::shared_ptr<removal>;
     auto rm   = std::make_shared<removal>();
@@ -1482,6 +1485,7 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
     rm->bname = std::string(bucket_name);
     rm->key   = std::string(key_sv);
     rm->cb    = std::move(cb);
+    rm->only_if = std::move(only_if);
 
     const auto done = [this](const removal_ptr& r, st s, bool existed)
     {
@@ -1518,7 +1522,13 @@ void object_store::remove_local(std::string_view bucket_name, std::string_view k
             done(rm, st::no_such_bucket, false);
             return;
         }
-        rm->existed = bp->objects.contains(rm->key);
+        const auto found = bp->objects.find(rm->key);
+        rm->existed = found != bp->objects.end();
+        if (rm->only_if && (!rm->existed || !rm->only_if(found->second)))
+        {
+            done(rm, st::ok, false);
+            return;
+        }
         std::string rel = object_rel_path(rm->key);
         rm->dir = rel.substr(0, 2);
         const bool q = m_io->unlinkat(bp->data_fd, std::move(rel), 0,
@@ -2212,7 +2222,8 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
-    set_bucket_cors(bb, nullptr);
+    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle})
+        if (take_doc(bb, kind, {})) {}
     hot_drop_bucket(name);
     m_buckets.erase(it);
 }
@@ -2283,7 +2294,14 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
     }
 }
 
-// ─── CORS ───────────────────────────────────────────────────────────────────
+// ─── Bucket configuration documents ─────────────────────────────────────────
+
+static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes);
+
+const char* object_store::doc_file(bucket_doc kind)
+{
+    return kind == bucket_doc::cors ? "cors" : "lifecycle";
+}
 
 const cors_config* object_store::bucket_cors(std::string_view name) const
 {
@@ -2291,49 +2309,51 @@ const cors_config* object_store::bucket_cors(std::string_view name) const
     return b && !b->closing ? b->cors.get() : nullptr;
 }
 
-void object_store::set_bucket_cors(bucket& b, std::shared_ptr<const cors_config> c)
+std::shared_ptr<const lifecycle_config> object_store::lifecycle(std::string_view name) const
 {
-    if (b.cors)
-        --m_cors_buckets;
-    if (c)
-        ++m_cors_buckets;
-    b.cors = std::move(c);
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->lifecycle : nullptr;
 }
 
-st object_store::adopt_cors(std::string_view name, std::string_view xml)
+bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml)
+{
+    s3_error err;
+    if (kind == bucket_doc::cors)
+    {
+        std::shared_ptr<cors_config> c;
+        if (!xml.empty())
+        {
+            c = std::make_shared<cors_config>();
+            if (!parse_cors_xml(xml, *c, err))
+                return false;
+        }
+        m_cors_buckets += (c != nullptr) - (b.cors != nullptr);
+        b.cors = std::move(c);
+        return true;
+    }
+    std::shared_ptr<lifecycle_config> l;
+    if (!xml.empty())
+    {
+        l = std::make_shared<lifecycle_config>();
+        if (!parse_lifecycle(xml, *l, err))
+            return false;
+    }
+    m_lifecycle_buckets += (l != nullptr) - (b.lifecycle != nullptr);
+    b.lifecycle = std::move(l);
+    if (m_lifecycle_listener)
+        m_lifecycle_listener();
+    return true;
+}
+
+st object_store::adopt_doc(bucket_doc kind, std::string_view name, std::string_view xml)
 {
     bucket* b = find_bucket(name);
     if (!b)
         return st::no_such_bucket;
-    if (xml.empty())
-    {
-        set_bucket_cors(*b, nullptr);
-        return st::ok;
-    }
-    auto c = std::make_shared<cors_config>();
-    s3_error err;
-    if (!parse_cors_xml(xml, *c, err))
-        return st::io_error;
-    set_bucket_cors(*b, std::move(c));
-    return st::ok;
+    return take_doc(*b, kind, xml) ? st::ok : st::io_error;
 }
 
-namespace
-{
-
-struct cors_write
-{
-    std::string name;
-    std::string xml;
-    uint64_t    gen{0};
-    int         stage{0};
-    int         fd{-1};
-    std::function<void(st)> cb;
-};
-
-}   // namespace
-
-void object_store::write_cors(std::string name, std::string xml, std::function<void(st)> cb)
+void object_store::write_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
 {
     bucket* b = find_bucket(name);
     if (!b || b->closing)
@@ -2343,86 +2363,61 @@ void object_store::write_cors(std::string name, std::string xml, std::function<v
     }
     // Counted as work in the bucket, so a drop waits for the file to settle.
     ++b->active_ops;
-    auto ws  = std::make_shared<cors_write>();
-    ws->name = std::move(name);
-    ws->xml  = std::move(xml);
-    ws->gen  = b->gen;
-    ws->cb   = std::move(cb);
-    // Rules are written beside the file and renamed over it, so a crash leaves the old ones or the new.
-    ws->stage = ws->xml.empty() ? 10 : 0;
-
-    auto alive = m_alive;
-    auto step  = std::make_shared<std::function<void(int64_t)>>();
-    std::weak_ptr<std::function<void(int64_t)>> wstep = step;
-    *step = [this, alive, ws, wstep](int64_t res)
+    const uint64_t gen    = b->gen;
+    const int      dir_fd = b->dir_fd;
+    const std::string file = doc_file(kind);
+    auto text = std::make_shared<std::string>(std::move(xml));
+    auto fd   = std::make_shared<int>(-1);
+    auto ch   = std::make_shared<disk_chain>(m_alive);
+    // A document is written beside the file and renamed over it, so a crash leaves the old one or the new.
+    if (!text->empty())
     {
-        if (!*alive)
-            return;
-        auto self = wstep.lock();
-        bucket* bp = find_bucket(ws->name);
-        if (bp && bp->gen != ws->gen)
-            bp = nullptr;
-        auto finish = [this, ws, bp](st s)
+        ch->then([this, dir_fd, fd, file](file_io::done d)
         {
-            if (ws->fd >= 0)
-                m_loop->close_fd(ws->fd);
-            ws->fd = -1;
-            if (bp)
-            {
-                --bp->active_ops;
-                if (s == st::ok)
-                    s = adopt_cors(ws->name, ws->xml);
-            }
-            ws->cb(bp ? s : st::no_such_bucket);
-        };
-        if (!bp)
+            return m_io->openat(dir_fd, file + ".new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644,
+                                [fd, d](int64_t r)
+                                {
+                                    if (r >= 0)
+                                        *fd = static_cast<int>(r);
+                                    d(r);
+                                });
+        });
+        // The bytes are held by the completion, since a launched step lets go of its captures.
+        ch->then([this, fd, text](file_io::done d)
         {
-            finish(st::no_such_bucket);
+            return m_io->pwrite(*fd, text->data(), static_cast<uint32_t>(text->size()), 0,
+                                [text, d](int64_t r) { d(r); });
+        });
+        ch->then([this, fd](file_io::done d) { return m_io->fsync(*fd, true, std::move(d)); });
+        ch->then([this, dir_fd, file](file_io::done d)
+        {
+            return m_io->renameat(dir_fd, file + ".new", dir_fd, file, std::move(d));
+        });
+    }
+    else
+        ch->then([this, dir_fd, file](file_io::done d) { return m_io->unlinkat(dir_fd, file, 0, std::move(d)); },
+                 -ENOENT);
+    ch->then([this, dir_fd](file_io::done d) { return m_io->fsync(dir_fd, false, std::move(d)); });
+    ch->run([this, kind, name, gen, text, fd, cb](int64_t r)
+    {
+        if (*fd >= 0)
+            m_loop->close_fd(*fd);
+        *fd = -1;
+        bucket* bp = find_bucket(name);
+        if (!bp || bp->gen != gen)
+        {
+            cb(st::no_such_bucket);
             return;
         }
-        auto next = [self](int64_t r) { if (self) (*self)(r); };
-        const int stage = ws->stage++;
-        bool queued = true;
-        switch (stage)
+        --bp->active_ops;
+        if (r < 0)
         {
-            case 0:
-                queued = m_io->openat(bp->dir_fd, "cors.new", O_WRONLY | O_CREAT | O_TRUNC, 0644, next);
-                break;
-            case 1:
-                if (res < 0) { finish(errno_status(res)); return; }
-                ws->fd = static_cast<int>(res);
-                queued = m_io->pwrite(ws->fd, ws->xml.data(), static_cast<uint32_t>(ws->xml.size()), 0, next);
-                break;
-            case 2:
-                if (res != static_cast<int64_t>(ws->xml.size())) { finish(errno_status(res < 0 ? res : -EIO)); return; }
-                queued = m_io->fsync(ws->fd, true, next);
-                break;
-            case 3:
-                if (res < 0) { finish(errno_status(res)); return; }
-                m_loop->close_fd(ws->fd);
-                ws->fd = -1;
-                queued = m_io->renameat(bp->dir_fd, "cors.new", bp->dir_fd, "cors", next);
-                break;
-            case 4:
-            case 11:
-                if (res < 0 && !(stage == 11 && res == -ENOENT)) { finish(errno_status(res)); return; }
-                ++m_totals.fsyncs;
-                ws->stage = 20;
-                queued = m_io->fsync(bp->dir_fd, false, next);
-                break;
-            case 10:
-                queued = m_io->unlinkat(bp->dir_fd, "cors", 0, next);
-                break;
-            default:
-                finish(res < 0 ? st::io_error : st::ok);
-                return;
+            cb(errno_status(r));
+            return;
         }
-        if (!queued)
-            finish(st::io_error);
-    };
-    (*step)(0);
-    // The sequence outlives this frame through the completion each step queues.
-    (void)step;
+        m_totals.fsyncs += text->empty() ? 1 : 2;
+        cb(take_doc(*bp, kind, *text) ? st::ok : st::io_error);
+    });
 }
 
 }   // namespace socketley::storage

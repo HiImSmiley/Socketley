@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include "runtime/storage/lifecycle.h"
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/multipart.h"
 #include "runtime/storage/object_store.h"
@@ -1675,4 +1676,129 @@ TEST_CASE("the wire carries a part's place and a plan made without a copy")
     CHECK(pb.parts[0].data_off == 8192);
     for (size_t cut = 0; cut < pe.size(); ++cut)
         CHECK_FALSE(wire::decode_mpu_plan(std::string_view(pe).substr(0, cut), err, pb));
+}
+
+TEST_CASE("a lifecycle configuration put through any shard is synced by shard 0 and held by every shard")
+{
+    tmpdir d;
+    auto doc = [](const std::string& id, const std::string& prefix, int days)
+    {
+        return "<LifecycleConfiguration><Rule><ID>" + id + "</ID><Filter><Prefix>" + prefix +
+               "</Prefix></Filter><Status>Enabled</Status><Expiration><Days>" + std::to_string(days) +
+               "</Days></Expiration></Rule></LifecycleConfiguration>";
+    };
+    auto set = [](cluster& c, uint32_t s, bucket_doc kind, const std::string& xml)
+    {
+        st got = st::io_error;
+        bool fired = false;
+        c.m[s]->node->set_doc(kind, "bkt", xml, [&](st r) { got = r; fired = true; });
+        REQUIRE(c.until([&] { return fired; }));
+        return got;
+    };
+    auto rule_id = [](cluster& c, uint32_t s) -> std::string
+    {
+        const auto cfg = c.m[s]->store->lifecycle("bkt");
+        return cfg ? cfg->rules.at(0).id : std::string("none");
+    };
+
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(1, "bkt") == st::ok);
+    // Answered only once every shard has it, so nothing is settled before looking.
+    REQUIRE(set(c, 2, bucket_doc::lifecycle, doc("first", "a/", 3)) == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+        CHECK(rule_id(c, s) == "first");
+    CHECK(fs::exists(d.path + "/bkt/lifecycle"));
+    CHECK_FALSE(fs::exists(d.path + "/bkt/lifecycle.new"));
+
+    // Two changes asked at once through different shards end the same everywhere, in the order shard 0 took them.
+    bool f1 = false, f2 = false;
+    c.m[1]->node->set_doc(bucket_doc::lifecycle, "bkt", doc("second", "b/", 4), [&](st) { f1 = true; });
+    c.m[2]->node->set_doc(bucket_doc::lifecycle, "bkt", doc("third", "c/", 5), [&](st) { f2 = true; });
+    REQUIRE(c.until([&] { return f1 && f2; }));
+    const std::string last = rule_id(c, 0);
+    CHECK((last == "second" || last == "third"));
+    for (uint32_t s = 1; s < 3; ++s)
+        CHECK(rule_id(c, s) == last);
+
+    // A CORS document beside it is a document of its own, and a document that does not parse is not taken.
+    REQUIRE(set(c, 1, bucket_doc::cors,
+                "<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>"
+                "</CORSRule></CORSConfiguration>") == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        CHECK(c.m[s]->store->bucket_cors("bkt") != nullptr);
+        CHECK(rule_id(c, s) == last);
+    }
+    CHECK(c.m[2]->store->adopt_doc(bucket_doc::lifecycle, "bkt", "<NotLifecycle/>") == st::io_error);
+    CHECK(rule_id(c, 2) == last);
+
+    // A removal through a shard other than 0 reaches every shard and the disk, and leaves the other document.
+    REQUIRE(set(c, 2, bucket_doc::lifecycle, "") == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        CHECK(rule_id(c, s) == "none");
+        CHECK(c.m[s]->store->bucket_cors("bkt") != nullptr);
+    }
+    CHECK_FALSE(fs::exists(d.path + "/bkt/lifecycle"));
+
+    // What is synced is what every shard reads at its next start, however many there are.
+    REQUIRE(set(c, 0, bucket_doc::lifecycle, doc("kept", "k/", 6)) == st::ok);
+    c.restart(2);
+    for (uint32_t s = 0; s < 2; ++s)
+    {
+        CHECK(rule_id(c, s) == "kept");
+        CHECK(c.m[s]->store->lifecycle_buckets() == 1);
+        CHECK(c.m[s]->store->bucket_cors("bkt") != nullptr);
+    }
+    // And a bucket that is dropped takes both with it.
+    REQUIRE(set(c, 1, bucket_doc::cors, "") == st::ok);
+    REQUIRE(c.drop_bucket(1, "bkt") == st::ok);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    for (uint32_t s = 0; s < 2; ++s)
+    {
+        CHECK(rule_id(c, s) == "none");
+        CHECK(c.m[s]->store->lifecycle_buckets() == 0);
+        CHECK_FALSE(c.m[s]->store->any_cors());
+    }
+}
+
+TEST_CASE("a conditional delete keeps an object its condition refuses, decided under the key's lane")
+{
+    tmpdir d;
+    cluster c(d.path, 1);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    REQUIRE(c.put(0, "bkt", "k", "v").status == st::ok);
+    auto remove_if = [&](bool verdict)
+    {
+        bool existed = true, fired = false;
+        st got = st::io_error;
+        c.m[0]->store->remove_local("bkt", "k", [&](st r, bool e) { got = r; existed = e; fired = true; },
+                                    [verdict](const object_meta&) { return verdict; });
+        REQUIRE(c.until([&] { return fired; }));
+        CHECK(got == st::ok);
+        return existed;
+    };
+    CHECK_FALSE(remove_if(false));
+    std::string body;
+    CHECK(c.get(0, "bkt", "k", body) == st::ok);
+    CHECK(remove_if(true));
+    CHECK(c.get(0, "bkt", "k", body) == st::no_such_key);
+}
+
+TEST_CASE("a lifecycle day is rounded up to the next boundary, which for a real day is midnight UTC")
+{
+    // 2026-01-01T10:30:00Z with Days 1 is due at 2026-01-03T00:00:00Z.
+    const int64_t written = 1767263400000;
+    CHECK(lifecycle_due_ms(written, 1, lifecycle_day_ms) == 1767398400000);
+    // A write exactly at midnight is due exactly N days later.
+    CHECK(lifecycle_due_ms(1767225600000, 2, lifecycle_day_ms) == 1767225600000 + 2 * lifecycle_day_ms);
+    lifecycle_rule r;
+    r.enabled     = true;
+    r.prefix      = "logs/";
+    r.expire_days = 1;
+    CHECK(lifecycle_object_due(r, "logs/a", written, 1767398400000, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "logs/a", written, 1767398399999, lifecycle_day_ms));
+    CHECK_FALSE(lifecycle_object_due(r, "other/a", written, 1767398400000, lifecycle_day_ms));
+    r.enabled = false;
+    CHECK_FALSE(lifecycle_object_due(r, "logs/a", written, 1767398400000, lifecycle_day_ms));
 }

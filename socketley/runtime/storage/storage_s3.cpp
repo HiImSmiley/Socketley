@@ -27,14 +27,14 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "versioning", "versions",
-        "versionId", "policy", "policyStatus", "lifecycle", "website", "notification",
+        "versionId", "policy", "policyStatus", "website", "notification",
         "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
-    // CORS rules belong to a bucket and to nothing else.
-    if (object && r.has_query("cors"))
+    // CORS and lifecycle rules belong to a bucket and to nothing else.
+    if (object && (r.has_query("cors") || r.has_query("lifecycle")))
         return true;
     // A part number outside an upload asks for one part of a finished object.
     if (r.has_query("partNumber") && !r.has_query("uploadId"))
@@ -142,6 +142,26 @@ bool parse_checksum_request(const s3_request& r, checksum_request& out, s3_error
         if (!choose(a))
             return false;
         out.trailer_name = std::move(name);
+    }
+    return true;
+}
+
+bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err)
+{
+    const std::string_view md5h = r.header("content-md5");
+    if (md5h.empty())
+        return true;
+    std::string raw;
+    if (!base64_decode(md5h, raw) || raw.size() != 16)
+    {
+        err = make_error("InvalidDigest");
+        return false;
+    }
+    const md5_t got = md5_of(body);
+    if (std::string_view(reinterpret_cast<const char*>(got.data()), 16) != raw)
+    {
+        err = make_error("BadDigest");
+        return false;
     }
     return true;
 }
@@ -258,6 +278,18 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_put_cors(c);
         else if (m == "DELETE")
             op_delete_cors(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (bkt && q.has_query("lifecycle"))
+    {
+        if (m == "GET")
+            op_get_lifecycle(c);
+        else if (m == "PUT")
+            op_put_lifecycle(c);
+        else if (m == "DELETE")
+            op_delete_lifecycle(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
         return;
@@ -571,20 +603,10 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
     }
 
     // The digest S3 requires on this call, checked when the client sent one.
-    if (const std::string_view md5h = q.header("content-md5"); !md5h.empty())
+    if (s3_error err; !body_md5_ok(q, c->body, err))
     {
-        std::string raw;
-        if (!base64_decode(md5h, raw) || raw.size() != 16)
-        {
-            send_error(c, make_error("InvalidDigest"));
-            return;
-        }
-        const md5_t got = md5_of(c->body);
-        if (std::string_view(reinterpret_cast<const char*>(got.data()), 16) != raw)
-        {
-            send_error(c, make_error("BadDigest"));
-            return;
-        }
+        send_error(c, err);
+        return;
     }
 
     delete_request dr;

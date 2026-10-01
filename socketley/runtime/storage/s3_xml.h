@@ -83,6 +83,7 @@ inline s3_error make_error(std::string_view code)
     static constexpr row table[] = {
         {"NoSuchBucket", 404, "The specified bucket does not exist"},
         {"NoSuchKey", 404, "The specified key does not exist."},
+        {"NoSuchLifecycleConfiguration", 404, "The lifecycle configuration does not exist"},
         {"NoSuchUpload", 404, "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."},
         {"BucketAlreadyOwnedByYou", 409, "Your previous request to create the named bucket succeeded and you already own it."},
         {"BucketAlreadyExists", 409, "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."},
@@ -169,7 +170,7 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
         x += "<" + std::string(c.extra_name) + ">" + xml_escape(c.extra_value) + "</" +
              std::string(c.extra_name) + ">";
     if (e.code == "NoSuchBucket" || e.code == "BucketNotEmpty" || e.code == "InvalidBucketName" ||
-        e.code == "NoSuchCORSConfiguration")
+        e.code == "NoSuchCORSConfiguration" || e.code == "NoSuchLifecycleConfiguration")
         x += "<BucketName>" + xml_escape(c.bucket) + "</BucketName>";
     if (e.code == "NoSuchKey")
         x += "<Key>" + xml_escape(c.key) + "</Key>";

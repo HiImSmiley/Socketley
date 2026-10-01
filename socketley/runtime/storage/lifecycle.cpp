@@ -1,0 +1,579 @@
+#include "lifecycle.h"
+
+#include <charconv>
+#include <set>
+
+#include "object_format.h"
+#include "s3_names.h"
+#include "s3_xml.h"
+#include "../../shared/random_id.h"
+
+namespace socketley::storage
+{
+
+namespace
+{
+
+// An element of the document, with its text unescaped and namespaces and attributes dropped.
+struct xml_node
+{
+    std::string name;
+    std::string text;
+    std::vector<xml_node> kids;
+    bool has_text{false};
+};
+
+// A reader of plain elements and text, refusing what a configuration never holds: CDATA, a doctype, a mismatched close.
+class xml_reader
+{
+public:
+    explicit xml_reader(std::string_view x) : m_x(x) {}
+
+    bool document(xml_node& root)
+    {
+        skip_misc();
+        if (!element(root, 0))
+            return false;
+        skip_misc();
+        return m_pos == m_x.size();
+    }
+
+private:
+    static constexpr int max_depth = 16;
+
+    void skip_ws()
+    {
+        while (m_pos < m_x.size() && (m_x[m_pos] == ' ' || m_x[m_pos] == '\t' || m_x[m_pos] == '\r' || m_x[m_pos] == '\n'))
+            ++m_pos;
+    }
+
+    // Whitespace, the declaration and comments, which may stand outside and between elements.
+    bool skip_misc()
+    {
+        for (;;)
+        {
+            skip_ws();
+            if (m_x.substr(m_pos, 5) == "<?xml")
+            {
+                const size_t e = m_x.find("?>", m_pos);
+                if (e == std::string_view::npos)
+                    return false;
+                m_pos = e + 2;
+                continue;
+            }
+            if (m_x.substr(m_pos, 4) == "<!--")
+            {
+                const size_t e = m_x.find("-->", m_pos + 4);
+                if (e == std::string_view::npos)
+                    return false;
+                m_pos = e + 3;
+                continue;
+            }
+            return true;
+        }
+    }
+
+    static std::string_view local_name(std::string_view n)
+    {
+        const size_t colon = n.find(':');
+        return colon == std::string_view::npos ? n : n.substr(colon + 1);
+    }
+
+    bool element(xml_node& out, int depth)
+    {
+        if (depth > max_depth || m_pos >= m_x.size() || m_x[m_pos] != '<')
+            return false;
+        const size_t gt = m_x.find('>', m_pos);
+        if (gt == std::string_view::npos)
+            return false;
+        std::string_view inner = m_x.substr(m_pos + 1, gt - m_pos - 1);
+        m_pos = gt + 1;
+        const bool self_closing = !inner.empty() && inner.back() == '/';
+        if (self_closing)
+            inner.remove_suffix(1);
+        const size_t sp = inner.find_first_of(" \t\r\n");
+        const std::string_view qname = inner.substr(0, sp);
+        if (qname.empty() || qname.front() == '/' || qname.front() == '!' || qname.front() == '?')
+            return false;
+        out.name = std::string(local_name(qname));
+        if (self_closing)
+            return true;
+
+        std::string raw;
+        for (;;)
+        {
+            const size_t lt = m_x.find('<', m_pos);
+            if (lt == std::string_view::npos)
+                return false;
+            raw.append(m_x.substr(m_pos, lt - m_pos));
+            m_pos = lt;
+            if (m_x.substr(m_pos, 4) == "<!--")
+            {
+                const size_t e = m_x.find("-->", m_pos + 4);
+                if (e == std::string_view::npos)
+                    return false;
+                m_pos = e + 3;
+                continue;
+            }
+            if (m_x.substr(m_pos, 2) == "</")
+            {
+                const size_t e = m_x.find('>', m_pos);
+                if (e == std::string_view::npos)
+                    return false;
+                std::string_view close = m_x.substr(m_pos + 2, e - m_pos - 2);
+                while (!close.empty() && (close.back() == ' ' || close.back() == '\t' || close.back() == '\r' ||
+                                          close.back() == '\n'))
+                    close.remove_suffix(1);
+                if (close != qname)
+                    return false;
+                m_pos = e + 1;
+                break;
+            }
+            if (m_x.substr(m_pos, 2) == "<!" || m_x.substr(m_pos, 2) == "<?")
+                return false;
+            out.kids.emplace_back();
+            if (!element(out.kids.back(), depth + 1))
+                return false;
+        }
+        // Text beside child elements is only the indentation between them.
+        if (!out.kids.empty())
+            return raw.find_first_not_of(" \t\r\n") == std::string::npos;
+        out.has_text = true;
+        return xml_unescape(raw, out.text);
+    }
+
+    std::string_view m_x;
+    size_t           m_pos{0};
+};
+
+s3_error fail(std::string_view code, std::string message = {})
+{
+    s3_error e = make_error(code);
+    if (!message.empty())
+        e.message = std::move(message);
+    return e;
+}
+
+bool positive_days(const xml_node& n, uint32_t& out)
+{
+    std::string_view t = n.text;
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\n' || t.front() == '\t' || t.front() == '\r'))
+        t.remove_prefix(1);
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\n' || t.back() == '\t' || t.back() == '\r'))
+        t.remove_suffix(1);
+    int64_t v = 0;
+    const auto r = std::from_chars(t.data(), t.data() + t.size(), v);
+    if (t.empty() || r.ec != std::errc{} || r.ptr != t.data() + t.size() || v <= 0 || v > INT32_MAX)
+        return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
+{
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const auto yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+// YYYY-MM-DD, optionally with THH:MM:SS, a fraction and Z or +00:00; `midnight` says whether the time was 00:00:00.000.
+bool parse_date(std::string_view s, int64_t& ms, bool& midnight)
+{
+    auto num = [&](size_t at, size_t n, unsigned& v) -> bool
+    {
+        if (at + n > s.size())
+            return false;
+        v = 0;
+        for (size_t i = at; i < at + n; ++i)
+        {
+            if (s[i] < '0' || s[i] > '9')
+                return false;
+            v = v * 10 + static_cast<unsigned>(s[i] - '0');
+        }
+        return true;
+    };
+    unsigned y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (!num(0, 4, y) || s.size() < 10 || s[4] != '-' || !num(5, 2, mo) || s[7] != '-' || !num(8, 2, d))
+        return false;
+    static constexpr unsigned month_days[] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (mo < 1 || mo > 12 || d < 1 || d > month_days[mo - 1])
+        return false;
+    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    if (mo == 2 && d == 29 && !leap)
+        return false;
+    size_t at = 10;
+    bool zero_fraction = true;
+    if (at < s.size())
+    {
+        if (s[at] != 'T' || !num(at + 1, 2, h) || s.size() < at + 9 || s[at + 3] != ':' || !num(at + 4, 2, mi) ||
+            s[at + 6] != ':' || !num(at + 7, 2, se) || h > 23 || mi > 59 || se > 59)
+            return false;
+        at += 9;
+        if (at < s.size() && s[at] == '.')
+        {
+            ++at;
+            const size_t from = at;
+            while (at < s.size() && s[at] >= '0' && s[at] <= '9')
+            {
+                zero_fraction = zero_fraction && s[at] == '0';
+                ++at;
+            }
+            if (at == from)
+                return false;
+        }
+        const std::string_view zone = s.substr(at);
+        if (zone != "Z" && zone != "+00:00" && zone != "-00:00" && !zone.empty())
+            return false;
+    }
+    ms = (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se) * 1000;
+    midnight = h == 0 && mi == 0 && se == 0 && zero_fraction;
+    return true;
+}
+
+std::string new_rule_id()
+{
+    static constexpr char digits[] = "abcdefghijklmnopqrstuvwxyz234567";
+    std::string id;
+    for (int w = 0; w < 2; ++w)
+    {
+        uint64_t v = random_u64();
+        for (int i = 0; i < 12; ++i, v >>= 5)
+            id.push_back(digits[v & 31]);
+    }
+    return id;
+}
+
+// One <Rule>, or the error the whole document is refused with.
+bool parse_rule(const xml_node& n, lifecycle_rule& r, s3_error& err)
+{
+    const xml_node* id = nullptr;
+    const xml_node* status = nullptr;
+    const xml_node* filter = nullptr;
+    const xml_node* prefix = nullptr;
+    const xml_node* expiration = nullptr;
+    const xml_node* abort = nullptr;
+    auto once = [&](const xml_node*& slot, const xml_node& k) -> bool
+    {
+        if (slot)
+            return false;
+        slot = &k;
+        return true;
+    };
+    for (const xml_node& k : n.kids)
+    {
+        bool fresh = true;
+        if (k.name == "ID")
+            fresh = once(id, k);
+        else if (k.name == "Status")
+            fresh = once(status, k);
+        else if (k.name == "Filter")
+            fresh = once(filter, k);
+        else if (k.name == "Prefix")
+            fresh = once(prefix, k);
+        else if (k.name == "Expiration")
+            fresh = once(expiration, k);
+        else if (k.name == "AbortIncompleteMultipartUpload")
+            fresh = once(abort, k);
+        else if (k.name == "Transition" || k.name == "NoncurrentVersionTransition")
+        {
+            err = fail("NotImplemented", "Lifecycle transitions are not supported: this storage has one storage class");
+            return false;
+        }
+        else if (k.name == "NoncurrentVersionExpiration")
+        {
+            err = fail("NotImplemented", "Noncurrent version actions are not supported: this storage keeps no versions");
+            return false;
+        }
+        else
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (!fresh)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+    }
+
+    if (id && !id->kids.empty())
+    {
+        err = fail("MalformedXML");
+        return false;
+    }
+    r.id = id ? id->text : std::string{};
+    if (r.id.size() > lifecycle_max_id)
+    {
+        err = fail("InvalidArgument", "ID length should not exceed allowed limit of 255");
+        return false;
+    }
+
+    if (!status || !status->kids.empty() || (status->text != "Enabled" && status->text != "Disabled"))
+    {
+        err = fail("MalformedXML");
+        return false;
+    }
+    r.enabled = status->text == "Enabled";
+
+    // Exactly one of the rule's own <Prefix> and a <Filter> says what the rule covers.
+    if ((filter != nullptr) == (prefix != nullptr))
+    {
+        err = fail("MalformedXML");
+        return false;
+    }
+    if (prefix)
+    {
+        if (!prefix->kids.empty())
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        r.prefix = prefix->text;
+        r.legacy_prefix = true;
+    }
+    else
+    {
+        if (filter->kids.size() > 1)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        for (const xml_node& k : filter->kids)
+        {
+            if (k.name == "Prefix" && k.kids.empty())
+            {
+                r.prefix = k.text;
+                r.filter_prefix = true;
+            }
+            else if (k.name == "Tag" || k.name == "And" || k.name == "ObjectSizeGreaterThan" ||
+                     k.name == "ObjectSizeLessThan")
+            {
+                err = fail("NotImplemented",
+                           "Lifecycle filters by tag or by object size are not supported; filter by Prefix");
+                return false;
+            }
+            else
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+        }
+        if (filter->has_text && filter->text.find_first_not_of(" \t\r\n") != std::string::npos)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+    }
+    if (r.prefix.size() > max_key_bytes)
+    {
+        err = fail("InvalidArgument", "The prefix is longer than a key can be");
+        return false;
+    }
+
+    if (expiration)
+    {
+        const xml_node* days = nullptr;
+        const xml_node* date = nullptr;
+        const xml_node* marker = nullptr;
+        for (const xml_node& k : expiration->kids)
+        {
+            bool fresh = true;
+            if (k.name == "Days")
+                fresh = once(days, k);
+            else if (k.name == "Date")
+                fresh = once(date, k);
+            else if (k.name == "ExpiredObjectDeleteMarker")
+                fresh = once(marker, k);
+            else
+                fresh = false;
+            if (!fresh || !k.kids.empty())
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+        }
+        if ((days != nullptr) + (date != nullptr) + (marker != nullptr) != 1)
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (days && !positive_days(*days, r.expire_days))
+        {
+            err = fail("InvalidArgument", "'Days' for Expiration action must be a positive integer");
+            return false;
+        }
+        if (date)
+        {
+            bool midnight = false;
+            if (!parse_date(date->text, r.expire_date_ms, midnight))
+            {
+                err = fail("InvalidArgument", "'Date' must be an ISO 8601 date");
+                return false;
+            }
+            if (!midnight)
+            {
+                err = fail("InvalidArgument", "'Date' must be at midnight GMT");
+                return false;
+            }
+            r.has_date = true;
+        }
+        if (marker)
+        {
+            if (marker->text != "true" && marker->text != "false")
+            {
+                err = fail("MalformedXML");
+                return false;
+            }
+            r.delete_marker = marker->text == "true" ? 1 : 0;
+        }
+    }
+
+    if (abort)
+    {
+        if (abort->kids.size() != 1 || abort->kids[0].name != "DaysAfterInitiation" || !abort->kids[0].kids.empty())
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+        if (!positive_days(abort->kids[0], r.abort_days))
+        {
+            err = fail("InvalidArgument",
+                       "'DaysAfterInitiation' for AbortIncompleteMultipartUpload action must be a positive integer");
+            return false;
+        }
+    }
+
+    if (!expiration && !abort)
+    {
+        err = fail("InvalidRequest", "At least one action needs to be specified in a rule");
+        return false;
+    }
+    return true;
+}
+
+}   // namespace
+
+bool parse_lifecycle(std::string_view xml, lifecycle_config& out, s3_error& err)
+{
+    out = lifecycle_config{};
+    xml_node root;
+    xml_reader reader(xml);
+    if (!reader.document(root) || root.name != "LifecycleConfiguration" || root.kids.empty())
+    {
+        err = fail("MalformedXML");
+        return false;
+    }
+    for (const xml_node& k : root.kids)
+        if (k.name != "Rule")
+        {
+            err = fail("MalformedXML");
+            return false;
+        }
+    if (root.kids.size() > lifecycle_max_rules)
+    {
+        err = fail("InvalidArgument", "A lifecycle configuration may hold at most 1000 rules");
+        return false;
+    }
+
+    std::set<std::string, std::less<>> ids;
+    out.rules.reserve(root.kids.size());
+    for (const xml_node& k : root.kids)
+    {
+        lifecycle_rule r;
+        if (!parse_rule(k, r, err))
+            return false;
+        if (!r.id.empty() && !ids.insert(r.id).second)
+        {
+            err = fail("InvalidArgument", "Rule ID must be unique. Found same ID for more than one rule");
+            return false;
+        }
+        out.rules.push_back(std::move(r));
+    }
+    // A rule without an ID is given one, as S3 does, once every given ID is known.
+    for (lifecycle_rule& r : out.rules)
+        while (r.id.empty())
+        {
+            r.id = new_rule_id();
+            if (!ids.insert(r.id).second)
+                r.id.clear();
+        }
+    if (lifecycle_xml(out).size() > lifecycle_max_bytes)
+    {
+        err = fail("InvalidArgument", "The lifecycle configuration is larger than 4 MiB");
+        return false;
+    }
+    return true;
+}
+
+std::string lifecycle_xml(const lifecycle_config& c)
+{
+    std::string x(xml_decl);
+    x += "<LifecycleConfiguration xmlns=\"";
+    x += s3_xmlns;
+    x += "\">";
+    for (const lifecycle_rule& r : c.rules)
+    {
+        x += "<Rule><ID>";
+        xml_escape_to(x, r.id);
+        x += "</ID>";
+        if (r.legacy_prefix)
+        {
+            x += "<Prefix>";
+            xml_escape_to(x, r.prefix);
+            x += "</Prefix>";
+        }
+        else if (r.filter_prefix)
+        {
+            x += "<Filter><Prefix>";
+            xml_escape_to(x, r.prefix);
+            x += "</Prefix></Filter>";
+        }
+        else
+            x += "<Filter></Filter>";
+        x += r.enabled ? "<Status>Enabled</Status>" : "<Status>Disabled</Status>";
+        if (r.expire_days != 0)
+            x += "<Expiration><Days>" + std::to_string(r.expire_days) + "</Days></Expiration>";
+        else if (r.has_date)
+            x += "<Expiration><Date>" + iso8601(r.expire_date_ms) + "</Date></Expiration>";
+        else if (r.delete_marker >= 0)
+            x += r.delete_marker ? "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"
+                                 : "<Expiration><ExpiredObjectDeleteMarker>false</ExpiredObjectDeleteMarker></Expiration>";
+        if (r.abort_days != 0)
+            x += "<AbortIncompleteMultipartUpload><DaysAfterInitiation>" + std::to_string(r.abort_days) +
+                 "</DaysAfterInitiation></AbortIncompleteMultipartUpload>";
+        x += "</Rule>";
+    }
+    x += "</LifecycleConfiguration>";
+    return x;
+}
+
+int64_t lifecycle_due_ms(int64_t from_ms, uint32_t days, int64_t day_ms)
+{
+    const int64_t at = from_ms + static_cast<int64_t>(days) * day_ms;
+    const int64_t rem = at % day_ms;
+    if (rem == 0)
+        return at;
+    return at + (rem > 0 ? day_ms - rem : -rem);
+}
+
+bool lifecycle_object_due(const lifecycle_rule& r, std::string_view key, int64_t mtime_ms, int64_t now_ms,
+                          int64_t day_ms)
+{
+    if (!r.expires() || !key.starts_with(r.prefix))
+        return false;
+    if (r.has_date)
+        return now_ms >= r.expire_date_ms;
+    return now_ms >= lifecycle_due_ms(mtime_ms, r.expire_days, day_ms);
+}
+
+bool lifecycle_upload_due(const lifecycle_rule& r, std::string_view key, int64_t initiated_ms, int64_t now_ms,
+                          int64_t day_ms)
+{
+    return r.aborts() && key.starts_with(r.prefix) &&
+           now_ms >= lifecycle_due_ms(initiated_ms, r.abort_days, day_ms);
+}
+
+}   // namespace socketley::storage

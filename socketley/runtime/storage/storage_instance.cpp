@@ -365,6 +365,8 @@ std::string storage_instance::stats_lines() const
         << "multipart_created:" << c.mpu_created << "\n"
         << "multipart_completed:" << c.mpu_completed << "\n"
         << "multipart_aborted:" << c.mpu_aborted << "\n"
+        << "lifecycle_expired:" << c.lifecycle_expired << "\n"
+        << "lifecycle_aborted:" << c.lifecycle_aborted << "\n"
         << "tls:" << (m_run->tls_enabled() ? 1 : 0) << "\n"
         << "tls_handshakes:" << c.tls_handshakes << "\n"
         << "tls_failures:" << c.tls_failures << "\n"

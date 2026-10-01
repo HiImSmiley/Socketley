@@ -304,13 +304,13 @@ void shard_node::run_drop(std::string name, std::function<void(st)> cb)
               });
 }
 
-// ─── CORS ───────────────────────────────────────────────────────────────────
+// ─── Configuration documents ────────────────────────────────────────────────
 
-void shard_node::set_cors(std::string name, std::string xml, std::function<void(st)> cb)
+void shard_node::set_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
 {
     if (m_store.shard() == 0)
     {
-        run_cors(std::move(name), std::move(xml), std::move(cb));
+        run_doc(kind, std::move(name), std::move(xml), std::move(cb));
         return;
     }
     if (!m_store.has_bucket(name))
@@ -321,7 +321,7 @@ void shard_node::set_cors(std::string name, std::string xml, std::function<void(
     ++m_c.bucket_ops;
     // This shard takes the change up when shard 0 tells it, which is before shard 0 answers.
     auto alive = m_alive;
-    m_transport.call(0, wire::encode_cors(wire::op::cors_put, name, xml),
+    m_transport.call(0, wire::encode_doc(wire::op::doc_put, kind, name, xml),
         [this, alive, cb](bool ok, std::string_view reply)
         {
             if (!*alive)
@@ -336,28 +336,29 @@ void shard_node::set_cors(std::string name, std::string xml, std::function<void(
         });
 }
 
-void shard_node::run_cors(std::string name, std::string xml, std::function<void(st)> cb)
+void shard_node::run_doc(bucket_doc kind, std::string name, std::string xml, std::function<void(st)> cb)
 {
     ++m_c.bucket_ops;
     auto alive = m_alive;
-    auto run = [this, alive, name, xml = std::move(xml), cb = std::move(cb)]()
+    auto run = [this, alive, kind, name, xml = std::move(xml), cb = std::move(cb)]()
     {
-        m_store.write_cors(name, xml, [this, alive, name, xml, cb](st s)
+        m_store.write_doc(kind, name, xml, [this, alive, kind, name, xml, cb](st s)
         {
             if (!*alive)
                 return;
             if (s != st::ok)
             {
                 cb(s);
-                cors_next(name);
+                doc_next(name);
                 return;
             }
-            each_peer([name, xml](uint32_t) { return wire::encode_cors(wire::op::cors_adopt, name, xml); },
-                      [name](uint32_t peer, bool ok, std::string_view reply)
+            each_peer([kind, name, xml](uint32_t) { return wire::encode_doc(wire::op::doc_adopt, kind, name, xml); },
+                      [kind, name](uint32_t peer, bool ok, std::string_view reply)
                       {
                           st a = st::io_error;
                           if (!ok || !wire::decode_status(reply, a) || a != st::ok)
-                              LOG_WARN(("storage: shard " + std::to_string(peer) + " did not take up the CORS rules of " +
+                              LOG_WARN(("storage: shard " + std::to_string(peer) + " did not take up the " +
+                                        (kind == bucket_doc::cors ? "CORS" : "lifecycle") + " configuration of " +
                                         name + "; it does when it next starts").c_str());
                       },
                       [this, alive, name, cb]()
@@ -365,25 +366,25 @@ void shard_node::run_cors(std::string name, std::string xml, std::function<void(
                           if (!*alive)
                               return;
                           cb(st::ok);
-                          cors_next(name);
+                          doc_next(name);
                       });
         });
     };
-    auto [it, fresh] = m_cors_lanes.try_emplace(name);
+    auto [it, fresh] = m_doc_lanes.try_emplace(name);
     if (fresh)
         run();
     else
         it->second.push_back(std::move(run));
 }
 
-void shard_node::cors_next(const std::string& name)
+void shard_node::doc_next(const std::string& name)
 {
-    auto it = m_cors_lanes.find(name);
-    if (it == m_cors_lanes.end())
+    auto it = m_doc_lanes.find(name);
+    if (it == m_doc_lanes.end())
         return;
     if (it->second.empty())
     {
-        m_cors_lanes.erase(it);
+        m_doc_lanes.erase(it);
         return;
     }
     auto run = std::move(it->second.front());
@@ -931,21 +932,22 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
             reply(true, wire::encode_status(st::ok));
             return;
         }
-        case wire::op::cors_put:
-        case wire::op::cors_adopt:
+        case wire::op::doc_put:
+        case wire::op::doc_adopt:
         {
+            bucket_doc kind{};
             std::string bucket, xml;
-            if (!wire::decode_cors(payload, o, bucket, xml) || (o == wire::op::cors_put && m_store.shard() != 0))
+            if (!wire::decode_doc(payload, o, kind, bucket, xml) || (o == wire::op::doc_put && m_store.shard() != 0))
             {
                 reply(false, {});
                 return;
             }
-            if (o == wire::op::cors_adopt)
+            if (o == wire::op::doc_adopt)
             {
-                reply(true, wire::encode_status(m_store.adopt_cors(bucket, xml)));
+                reply(true, wire::encode_status(m_store.adopt_doc(kind, bucket, xml)));
                 return;
             }
-            run_cors(std::move(bucket), std::move(xml), [reply](st s) { reply(true, wire::encode_status(s)); });
+            run_doc(kind, std::move(bucket), std::move(xml), [reply](st s) { reply(true, wire::encode_status(s)); });
             return;
         }
         case wire::op::list:
