@@ -3466,7 +3466,7 @@ int daemon_handler::cmd_edit([[maybe_unused]] ipc_connection* conn,
                 (pa.hashes[i] == fnv1a("--dir") || pa.hashes[i] == fnv1a("--anonymous") ||
                  pa.hashes[i] == fnv1a("--max-bytes") || pa.hashes[i] == fnv1a("--access-key") ||
                  pa.hashes[i] == fnv1a("--secret-key") || pa.hashes[i] == fnv1a("--credentials") ||
-                 pa.hashes[i] == fnv1a("--mpu-expire")))
+                 pa.hashes[i] == fnv1a("--mpu-expire") || pa.hashes[i] == fnv1a("--sse-key-file")))
             {
                 restore_edit();
                 std::cout << pa.args[i] << " cannot be changed with `edit`\n"
@@ -3936,6 +3936,12 @@ int daemon_handler::cmd_import(ipc_connection* conn, const parsed_args& pa)
             {
                 conn->write_buf = "cannot change the access key, secret key or credentials file while running; "
                                   "edit the credentials file, which is re-read when it changes, or stop and start\n";
+                return 1;
+            }
+            // The master key the running workers hold is the one they read at start.
+            if (cfg.has("sse_key_file") && cfg.storage_sse_key_file != std::string(stg->get_sse_key_file()))
+            {
+                conn->write_buf = "cannot change the SSE key file while running; stop, import, and start\n";
                 return 1;
             }
         }

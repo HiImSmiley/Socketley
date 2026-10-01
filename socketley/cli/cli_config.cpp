@@ -111,6 +111,7 @@ constexpr config_key config_keys[] = {
     { "access_key",         "--access-key",         key_kind::text    },
     { "secret_key",         "--secret-key",         key_kind::text    },
     { "credentials",        "--credentials",        key_kind::text    },
+    { "sse_key_file",       "--sse-key-file",       key_kind::text    },
     { "mpu_expire",         "--mpu-expire",         key_kind::scalar  },
 };
 

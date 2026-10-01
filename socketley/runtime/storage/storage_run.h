@@ -12,12 +12,14 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "body_reader.h"
 #include "bucket_policy.h"
 #include "checksum.h"
 #include "multipart.h"
@@ -80,6 +82,9 @@ struct storage_counters
     uint64_t recv_direct_bytes{0};
     // Receives that brought bytes of a body being streamed into an object.
     uint64_t body_recvs{0};
+    // Bodies written encrypted, and GETs answered by opening an encrypted object's chunks.
+    uint64_t sse_puts{0};
+    uint64_t sse_gets{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -167,6 +172,23 @@ bool tagging_from_header(const s3_request& r, object_meta& m, s3_error& err);
 
 // False with `err` when the request carries a Content-MD5 its body does not match.
 bool body_md5_ok(const s3_request& r, std::string_view body, s3_error& err);
+
+// The encryption a request names for what it writes, or the one its bucket gives it.
+struct sse_ask
+{
+    sse_mode mode{sse_mode::none};
+    std::optional<sse_key> customer;
+    // The request said so itself, which lets a copy of an object onto itself change nothing else.
+    bool     named{false};
+};
+
+// The prefixes of the SSE-C headers that name the key of what a request writes or reads, and of its copy source.
+inline constexpr std::string_view sse_c_prefix      = "x-amz-server-side-encryption-customer-";
+inline constexpr std::string_view sse_c_copy_prefix = "x-amz-copy-source-server-side-encryption-customer-";
+
+// The headers that tell a client how `m` is encrypted, its key's MD5 as the request gave it under `prefix`.
+void sse_headers(const s3_request& r, const object_meta& m, std::vector<std::pair<std::string, std::string>>& out,
+                 std::string_view prefix = sse_c_prefix);
 
 // The bucket and key an x-amz-copy-source header names, decoded; false with
 // `err` when it names neither or is not one.
@@ -305,6 +327,8 @@ struct conn
     std::string ck_trailer;
 
     // ── A file being sent ───────────────────────────────────────────────────
+    // The chunks of an encrypted object, opened a window at a time, which the file's bytes are sent through.
+    std::shared_ptr<body_reader> dec;
     int         file_fd{-1};
     uint64_t    file_off{0};
     uint64_t    file_left{0};
@@ -584,10 +608,49 @@ public:
     void op_put_object(const std::shared_ptr<conn>& c);
     void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
                    put_op::committer committer, checksum_algo forced_algo = checksum_algo::none,
-                   bool create_only = false, const part_place& place = {});
+                   bool create_only = false, const part_place& place = {}, const sse_seal_spec* seal = nullptr);
     // The size the body will have, and whether the request says it.
     static bool body_length(const conn& c, uint64_t& expected);
     void op_copy_object(const std::shared_ptr<conn>& c);
+
+    // Server-side encryption, in storage_sse.cpp.
+    void set_sse_master(const sse_key& k);
+    bool has_sse_master() const { return m_has_master; }
+    // PutBucketEncryption, GetBucketEncryption and DeleteBucketEncryption.
+    void op_put_encryption(const std::shared_ptr<conn>& c);
+    void op_get_encryption(const std::shared_ptr<conn>& c);
+    void op_delete_encryption(const std::shared_ptr<conn>& c);
+    // What a new object of `bucket` is encrypted with; false with `err` once the request is refused.
+    bool sse_for_write(const std::shared_ptr<conn>& c, std::string_view bucket, sse_ask& out, s3_error& err);
+    // A fresh data key for a new object or upload, wrapped into the record `meta` is given.
+    bool sse_new_key(const sse_ask& ask, bool per_part, object_meta& meta, sse_seal_spec& seal, s3_error& err);
+    // The key a part of an upload is sealed with, from the upload's `record`, which the part's `meta` is given too;
+    // an empty record seals nothing.
+    bool sse_part_key(const std::shared_ptr<conn>& c, const std::string& record, object_meta& meta,
+                      sse_seal_spec& seal, s3_error& err);
+    // The key the SSE-C headers under `prefix` give, none when they are absent; false with `err` when they are refused.
+    bool sse_customer(const std::shared_ptr<conn>& c, std::string_view prefix, std::optional<sse_key>& out,
+                      s3_error& err);
+    // The data key of `m`, opened with the master key or with `customer`, whichever its record names.
+    bool sse_data_key(const object_meta& m, const std::optional<sse_key>& customer, sse_key& out, s3_error& err) const;
+    // Both, for a read of `m` whose key headers are under `prefix`; an object stored in the clear takes none, and
+    // one under the master key is not opened unless `need_key`, since only its bytes need it.
+    bool sse_read_key(const std::shared_ptr<conn>& c, const object_meta& m, std::string_view prefix, sse_key& out,
+                      s3_error& err, bool need_key = true);
+    // Sends [first, first + len) of an encrypted object through its chunks, as send_file sends a clear one.
+    void send_sealed(const std::shared_ptr<conn>& c, response head, int fd, uint64_t data_off, const object_meta& m,
+                     const sse_key& key, uint64_t first, uint64_t len);
+    void sealed_pump(const std::shared_ptr<conn>& c);
+    // Feeds [first, first + len) of a source object's plaintext into `op`, opening it with the key `customer`
+    // or the master gives, and runs `done` with the put's result; a failure on the way is answered here.
+    struct copy_feed;
+    void feed_copy(const std::shared_ptr<conn>& c, std::shared_ptr<put_op> op, const std::string& src_bucket,
+                   const std::string& src_key, const std::string& src_version, std::optional<sse_key> customer,
+                   uint64_t first, uint64_t len, std::function<void(const std::shared_ptr<conn>&, put_result)> done);
+    // CopyObject when the source or the copy is encrypted, which a copy of the bytes cannot be.
+    void copy_sealed(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
+                     std::string src_version, object_meta meta, const object_meta& src, const sse_ask& dst,
+                     std::optional<sse_key> src_customer, std::string source_id);
 
     // Multipart, in storage_multipart.cpp.
     void op_create_multipart(const std::shared_ptr<conn>& c);
@@ -602,7 +665,8 @@ public:
                           std::function<void(checksum_algo, part_place)> go);
     void op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
                                   const std::string& src_bucket, const std::string& src_key,
-                                  const std::string& src_version, const object_meta& src_meta);
+                                  const std::string& src_version, const object_meta& src_meta,
+                                  const std::string& record);
     bool part_number_of(const std::shared_ptr<conn>& c, uint32_t& number);
     void reap_uploads();
 
@@ -668,6 +732,10 @@ private:
     // The rules changed during a pass, so the next starts when it ends.
     bool              m_lc_again{false};
     std::unique_ptr<tls_context> m_tls;
+    // The key every SSE-S3 data key is wrapped with, and its name, when the runtime was given one.
+    bool        m_has_master{false};
+    sse_key     m_master{};
+    std::array<uint8_t, 4> m_master_kid{};
 
     int         m_listen_fd{-1};
     io_request  m_accept_req{};

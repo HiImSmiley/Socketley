@@ -54,6 +54,8 @@ enum class s3_action : uint8_t
     list_bucket_versions,
     get_bucket_versioning,
     put_bucket_versioning,
+    get_encryption_configuration,
+    put_encryption_configuration,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);

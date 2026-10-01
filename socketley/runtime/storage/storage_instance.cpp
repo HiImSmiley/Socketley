@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "s3_sigv4_auth.h"
+#include "sse.h"
 #include "shard_wire.h"
 #include "storage_run.h"
 #include "../../shared/runtime_manager.h"
@@ -77,6 +78,12 @@ std::string storage_instance::config_refusal() const
         if (const std::string why = socketley::storage::sigv4_config_error(
                 {m_access_key, m_secret_key, m_credentials_file, m_anonymous}); !why.empty())
             return "storage: " + why + "\n";
+    if (!m_sse_key_file.empty())
+    {
+        socketley::storage::sse_key key{};
+        if (std::string why; !socketley::storage::load_sse_master(m_sse_key_file, key, why))
+            return "storage: " + why + "\n";
+    }
     return {};
 }
 
@@ -217,6 +224,20 @@ bool storage_instance::setup(event_loop& loop)
         run->adopt_authenticator(std::move(signed_auth));
     run->set_mpu_expire_secs(m_mpu_expire_secs);
     run->set_tls(std::move(tls));
+    // Read here, at every start, so a replaced key file is the one a restart serves with.
+    if (!m_sse_key_file.empty())
+    {
+        socketley::storage::sse_key key{};
+        std::string why;
+        if (!socketley::storage::load_sse_master(m_sse_key_file, key, why))
+        {
+            LOG_ERROR(("storage: " + why).c_str());
+            run->stop();
+            m_graveyard.push_back(std::move(run));
+            return false;
+        }
+        run->set_sse_master(key);
+    }
 
     // The one blocking step: reading the directory and reconciling the journals
     // happens here, before the listener exists, so no connection waits behind it.
@@ -377,7 +398,10 @@ std::string storage_instance::stats_lines() const
         << "recv_cancels:" << c.recv_cancels << "\n"
         << "recv_direct_bytes:" << c.recv_direct_bytes << "\n"
         << "body_recvs:" << c.body_recvs << "\n"
-        << "hash_handoffs:" << m_run->hash_handoffs() << "\n";
+        << "hash_handoffs:" << m_run->hash_handoffs() << "\n"
+        << "sse:" << (m_run->has_sse_master() ? 1 : 0) << "\n"
+        << "sse_puts:" << c.sse_puts << "\n"
+        << "sse_gets:" << c.sse_gets << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)

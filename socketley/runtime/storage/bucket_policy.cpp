@@ -488,8 +488,8 @@ constexpr action_name action_names[] = {
     {"PutBucketNotification", res_kind::bucket, s3_action::none},
     {"GetBucketLogging", res_kind::bucket, s3_action::none},
     {"PutBucketLogging", res_kind::bucket, s3_action::none},
-    {"GetEncryptionConfiguration", res_kind::bucket, s3_action::none},
-    {"PutEncryptionConfiguration", res_kind::bucket, s3_action::none},
+    {"GetEncryptionConfiguration", res_kind::bucket, s3_action::get_encryption_configuration},
+    {"PutEncryptionConfiguration", res_kind::bucket, s3_action::put_encryption_configuration},
     {"GetReplicationConfiguration", res_kind::bucket, s3_action::none},
     {"PutReplicationConfiguration", res_kind::bucket, s3_action::none},
     {"GetBucketObjectLockConfiguration", res_kind::bucket, s3_action::none},
@@ -901,6 +901,9 @@ s3_action action_of_operation(std::string_view op)
         {"GetBucketVersioning", s3_action::get_bucket_versioning},
         {"PutBucketVersioning", s3_action::put_bucket_versioning},
         {"ListObjectVersions", s3_action::list_bucket_versions},
+        {"GetBucketEncryption", s3_action::get_encryption_configuration},
+        {"PutBucketEncryption", s3_action::put_encryption_configuration},
+        {"DeleteBucketEncryption", s3_action::put_encryption_configuration},
     };
     for (const row& r : table)
         if (r.op == op)

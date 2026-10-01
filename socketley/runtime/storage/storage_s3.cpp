@@ -28,14 +28,14 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "website", "notification",
-        "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
+        "object-lock", "retention", "legal-hold", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
-    // CORS and lifecycle rules and a policy belong to a bucket and to nothing else.
+    // CORS and lifecycle rules, a policy and a default encryption belong to a bucket and to nothing else.
     if (object && (r.has_query("cors") || r.has_query("lifecycle") || r.has_query("policy") ||
-                   r.has_query("policyStatus")))
+                   r.has_query("policyStatus") || r.has_query("encryption")))
         return true;
     // A part number outside an upload asks a GET or HEAD for one part of a finished object.
     if (r.has_query("partNumber") && !r.has_query("uploadId") && (!object || (r.method != "GET" && r.method != "HEAD")))
@@ -338,6 +338,18 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
             op_get_versioning(c);
         else
             op_put_versioning(c);
+        return;
+    }
+    if (bkt && q.has_query("encryption"))
+    {
+        if (m == "GET")
+            op_get_encryption(c);
+        else if (m == "PUT")
+            op_put_encryption(c);
+        else if (m == "DELETE")
+            op_delete_encryption(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
         return;
     }
     if (bkt && q.has_query("versions"))
@@ -857,7 +869,16 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
         return;
     }
 
-    start_put(c, r.key, std::move(meta), {}, checksum_algo::none, create_only);
+    sse_ask ask;
+    sse_seal_spec seal;
+    if (!sse_for_write(c, r.bucket, ask, err) ||
+        (ask.mode != sse_mode::none && !sse_new_key(ask, false, meta, seal, err)))
+    {
+        deny_request(c, err);
+        return;
+    }
+    start_put(c, r.key, std::move(meta), {}, checksum_algo::none, create_only, {},
+              ask.mode != sse_mode::none ? &seal : nullptr);
 }
 
 bool storage_run::body_length(const conn& c, uint64_t& expected)
@@ -879,7 +900,7 @@ bool storage_run::body_length(const conn& c, uint64_t& expected)
 // algorithm is taken whether or not the client named one when `forced_algo` says so.
 void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
                             put_op::committer committer, checksum_algo forced_algo, bool create_only,
-                            const part_place& place)
+                            const part_place& place, const sse_seal_spec* seal)
 {
     s3_request& r = c->req;
 
@@ -943,7 +964,7 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     }
 
     st why = st::ok;
-    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why, !committer && !create_only);
+    auto op = m_store.begin_put(r.bucket, key, std::move(meta), expected, known, why, !committer && !create_only, seal);
     if (!op)
     {
         // The body is not read, so the connection cannot be reused.
@@ -967,6 +988,8 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     op->set_create_only(create_only);
     if (place.off)
         op->place_body(place.path, place.off, place.room);
+    if (seal)
+        ++m_c.sse_puts;
     begin_put_body(c, std::move(op));
 }
 
@@ -1086,8 +1109,32 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
 {
     s3_request& r = c->req;
     const object_meta* src_meta = &src;
-    // A version copied over its own key is a new latest made of an old one, which S3 allows as it is.
-    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty())
+    // What the copy is encrypted with, and the key that opens its source, are refused before anything is read.
+    sse_ask dst;
+    std::optional<sse_key> src_customer;
+    if (s3_error err; !sse_for_write(c, r.bucket, dst, err) || !sse_customer(c, sse_c_copy_prefix, src_customer, err))
+    {
+        send_error(c, err);
+        return;
+    }
+    if (sse_key probe{}; is_encrypted(src) || src_customer)
+    {
+        s3_error err;
+        const bool opens = is_encrypted(src) ? sse_data_key(src, src_customer, probe, err) : false;
+        if (!opens)
+        {
+            if (!is_encrypted(src))
+            {
+                err = make_error("InvalidRequest");
+                err.message = "The encryption parameters are not applicable to this object.";
+            }
+            send_error(c, err);
+            return;
+        }
+    }
+    // A version copied over its own key is a new latest made of an old one, which S3 allows as it is, and so is a
+    // copy that names the encryption it changes to.
+    if (src_bucket == r.bucket && src_key == r.key && !replace && src_version.empty() && !dst.named)
     {
         s3_error e = make_error("InvalidRequest");
         e.message = "This copy request is illegal because it is trying to copy an object to itself "
@@ -1146,6 +1193,13 @@ void storage_run::op_copy_from(const std::shared_ptr<conn>& c, std::string src_b
     const std::string source_id = !src_version.empty() ? src_version
                                 : has_version(src) || m_store.bucket_versioning(src_bucket) != versioning::off
                                     ? version_of(src).id : std::string{};
+    // Bytes sealed under one key, or to be sealed under another, are opened and sealed again on their way through.
+    if (is_encrypted(src) || dst.mode != sse_mode::none)
+    {
+        copy_sealed(c, std::move(src_bucket), std::move(src_key), std::move(src_version), std::move(meta), src, dst,
+                    std::move(src_customer), source_id);
+        return;
+    }
     m_store.copy(src_bucket, src_key, std::move(src_version), r.bucket, r.key, std::move(meta),
                  [this, weak, source_id](put_result p)
     {
@@ -1269,6 +1323,11 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
         }
         if (n == part_sizes_extra)
             continue;
+        if (n == sse_extra)
+        {
+            sse_headers(q, m, r.headers);
+            continue;
+        }
         if (n == version_extra)
         {
             r.headers.emplace_back("x-amz-version-id", version_of(m).id);
@@ -1385,13 +1444,32 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         send_error_st(c, st::no_such_bucket);
         return;
     }
-    // Answers a request whose object is known, from a HEAD's memory or a GET's file.
+    // A read names the key it opens with and never an encryption, which only what writes an object chooses.
+    if (q.has_header("x-amz-server-side-encryption"))
+    {
+        s3_error e = make_error("InvalidArgument");
+        e.message = "The x-amz-server-side-encryption header is not supported for this operation";
+        send_error(c, e);
+        return;
+    }
+    // Answers a request whose object is known, from a HEAD's memory or a GET's file; `clear` says the bytes
+    // already in hand are the object's own rather than what its file holds.
     auto answer = [this, head, part](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
-                               uint64_t data_off, const std::string& prefetch)
+                               uint64_t data_off, const std::string& prefetch, bool clear)
     {
         const s3_request& rq = cc->req;
 
         auto close_file = [&] { if (fd >= 0) m_loop.close_fd(fd); };
+
+        // An encrypted object is read only with the key its record names, and a clear one with none.
+        sse_key key{};
+        const bool sealed = is_encrypted(m);
+        if (s3_error err; !sse_read_key(cc, m, sse_c_prefix, key, err, !head && !clear))
+        {
+            close_file();
+            send_error(cc, err);
+            return;
+        }
 
         response r;
         const cond cd = evaluate(rq, m);
@@ -1484,7 +1562,20 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         }
 
         // A body the header read already brought in, or the hot copy, is sent from memory in one write.
-        if (!prefetch.empty() && first + len <= prefetch.size())
+        if (sealed && !clear)
+        {
+            std::string plain;
+            if (len > 0 && prefetch.size() >= stored_size(m) && sse_open_body(m, key, prefetch, plain))
+            {
+                close_file();
+                r.body = plain.substr(static_cast<size_t>(first), static_cast<size_t>(len));
+                ++m_c.copied_gets;
+                ++m_c.sse_gets;
+                send_response(cc, std::move(r));
+                return;
+            }
+        }
+        else if (!prefetch.empty() && first + len <= prefetch.size())
         {
             close_file();
             r.body_view = std::string_view(prefetch).substr(static_cast<size_t>(first), static_cast<size_t>(len));
@@ -1496,6 +1587,11 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         {
             close_file();
             send_response(cc, std::move(r));
+            return;
+        }
+        if (sealed)
+        {
+            send_sealed(cc, std::move(r), fd, data_off, m, key, first, len);
             return;
         }
         send_file(cc, std::move(r), fd, data_off + first, len);
@@ -1518,7 +1614,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
                 else if (s != st::ok)
                     send_error_st(cc, s);
                 else
-                    answer(cc, m, -1, 0, std::string{});
+                    answer(cc, m, -1, 0, std::string{}, true);
             });
             return;
         }
@@ -1537,7 +1633,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             else if (o.status != st::ok)
                 send_error_st(cc, o.status);
             else
-                answer(cc, o.meta, o.fd, o.data_off, o.prefetch);
+                answer(cc, o.meta, o.fd, o.data_off, o.prefetch, false);
         });
         return;
     }
@@ -1563,7 +1659,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     {
         if (mem)
         {
-            answer(c, *mem, -1, 0, std::string{});
+            answer(c, *mem, -1, 0, std::string{}, true);
             return;
         }
         std::weak_ptr<conn> weak = c;
@@ -1577,7 +1673,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             else if (s != st::ok)
                 send_error_st(cc, s);
             else
-                answer(cc, m, -1, 0, std::string{});
+                answer(cc, m, -1, 0, std::string{}, true);
         });
         return;
     }
@@ -1589,7 +1685,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         ++m_c.hot_gets;
         // A GET that asks for nothing but the object gets the headers kept with the copy.
         if (q.query.empty() && q.header("range").empty() && q.header("x-amz-checksum-mode").empty() &&
-            evaluate(q, *hot.meta) == cond::proceed)
+            !q.has_header("x-amz-server-side-encryption-customer-algorithm") && evaluate(q, *hot.meta) == cond::proceed)
         {
             if (hot.head->empty())
             {
@@ -1603,7 +1699,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_response(c, std::move(r));
             return;
         }
-        answer(c, *hot.meta, -1, 0, *hot.body);
+        answer(c, *hot.meta, -1, 0, *hot.body, true);
         return;
     }
     const uint64_t drop_epoch = m_store.hot_epoch();
@@ -1611,7 +1707,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     // Small objects are read whole with their header, in one read; a key whose
     // size is not known here is read that way too, since the read is short for
     // a small object and only a little long for a large one.
-    const size_t prefetch = mem ? (mem->size <= object_store::hot_max_object ? static_cast<size_t>(mem->size) : 0)
+    const size_t prefetch = mem ? (mem->size <= object_store::hot_max_object ? static_cast<size_t>(stored_size(*mem)) : 0)
                                 : object_store::hot_max_object;
     std::weak_ptr<conn> weak = c;
     m_store.open_object(q.bucket, q.key, prefetch, [this, weak, answer, mine, drop_epoch, b = q.bucket, k = q.key](open_result o)
@@ -1633,6 +1729,26 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             send_error_st(cc, o.status);
             return;
         }
+        // An object under the master key is held opened, and one under a client's key is never held at all.
+        if (is_encrypted(o.meta))
+        {
+            sse_key key{};
+            std::string plain;
+            if (s3_error err; o.meta.size > 0 && o.meta.size <= object_store::hot_max_object &&
+                              sse_mode_of(o.meta) == sse_mode::s3 && o.prefetch.size() >= stored_size(o.meta) &&
+                              sse_read_key(cc, o.meta, sse_c_prefix, key, err) &&
+                              sse_open_body(o.meta, key, o.prefetch, plain))
+            {
+                if (mine)
+                    m_store.hot_put(b, k, o.meta, plain);
+                else
+                    m_store.hot_put_foreign(b, k, drop_epoch, o.meta, plain);
+                answer(cc, o.meta, o.fd, o.data_off, plain, true);
+                return;
+            }
+            answer(cc, o.meta, o.fd, o.data_off, o.prefetch, false);
+            return;
+        }
         if (o.meta.size > 0 && o.prefetch.size() >= o.meta.size)
         {
             const std::string_view whole = std::string_view(o.prefetch).substr(0, static_cast<size_t>(o.meta.size));
@@ -1641,7 +1757,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             else
                 m_store.hot_put_foreign(b, k, drop_epoch, o.meta, whole);
         }
-        answer(cc, o.meta, o.fd, o.data_off, o.prefetch);
+        answer(cc, o.meta, o.fd, o.data_off, o.prefetch, false);
     });
 }
 

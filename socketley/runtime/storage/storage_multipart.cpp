@@ -104,6 +104,14 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
         send_error(c, err);
         return;
     }
+    // The upload's data key is made now, so every part is sealed under it and the object it completes opens with it.
+    sse_ask ask;
+    sse_seal_spec seal;
+    if (!sse_for_write(c, r.bucket, ask, err) || (ask.mode != sse_mode::none && !sse_new_key(ask, true, meta, seal, err)))
+    {
+        send_error(c, err);
+        return;
+    }
     checksum_algo algo = checksum_algo::none;
     if (const std::string_view name = r.header("x-amz-checksum-algorithm"); !name.empty())
     {
@@ -122,7 +130,10 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
     std::weak_ptr<conn> weak = c;
     const std::string bucket = r.bucket;
     const std::string key    = r.key;
-    m_node.mpu_create(bucket, key, std::move(meta), algo, [this, weak, bucket, key](st s, std::string id)
+    object_meta shown;
+    if (const std::string* v = sse_value(meta))
+        shown.extra.emplace_back(std::string(sse_extra), *v);
+    m_node.mpu_create(bucket, key, std::move(meta), algo, [this, weak, bucket, key, shown](st s, std::string id)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -134,6 +145,7 @@ void storage_run::op_create_multipart(const std::shared_ptr<conn>& c)
         }
         response resp;
         resp.headers.emplace_back("Content-Type", "application/xml");
+        sse_headers(cc->req, shown, resp.headers);
         resp.body = initiate_multipart_xml(bucket, key, id);
         send_response(cc, std::move(resp));
     });
@@ -167,9 +179,16 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
         const std::string id = std::string(q.get_query("uploadId"));
         // The part's own header names it by upload and number, since it is not an object.
         const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
+        object_meta   meta;
+        sse_seal_spec seal;
+        if (s3_error err; !sse_part_key(cc, place.sse, meta, seal, err))
+        {
+            deny_request(cc, err);
+            return;
+        }
         ++m_c.mpu_parts;
-        start_put(cc, part_key, object_meta{}, m_node.mpu_part_committer(q.bucket, q.key, id, number), algo, false,
-                  place);
+        start_put(cc, part_key, std::move(meta), m_node.mpu_part_committer(q.bucket, q.key, id, number), algo, false,
+                  place, place.sse.empty() ? nullptr : &seal);
     });
 }
 
@@ -195,13 +214,14 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     }
 
     std::weak_ptr<conn> weak = c;
-    with_open_upload(c, 0, [this, weak, number, src_bucket, src_key, src_version](checksum_algo algo, part_place)
+    with_open_upload(c, 0, [this, weak, number, src_bucket, src_key, src_version](checksum_algo algo, part_place place)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
             return;
         // The source may be another shard's, whose header is then read from its file.
-        auto go = [this, weak, number, src_bucket, src_key, src_version, algo](st s, const object_meta& sm)
+        auto go = [this, weak, number, src_bucket, src_key, src_version, algo, record = std::move(place.sse)]
+            (st s, const object_meta& sm)
             {
                 auto c2 = weak.lock();
                 if (!c2 || c2->dead)
@@ -211,7 +231,7 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
                     send_error_st(c2, s);
                     return;
                 }
-                op_upload_part_copy_from(c2, number, algo, src_bucket, src_key, src_version, sm);
+                op_upload_part_copy_from(c2, number, algo, src_bucket, src_key, src_version, sm, record);
             };
         if (src_version.empty())
             m_store.stat_object(src_bucket, src_key, std::move(go));
@@ -222,7 +242,8 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
 
 void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
                                            const std::string& src_bucket, const std::string& src_key,
-                                           const std::string& src_version, const object_meta& src_meta)
+                                           const std::string& src_version, const object_meta& src_meta,
+                                           const std::string& record)
 {
     s3_request& r = c->req;
     const object_meta* src = &src_meta;
@@ -252,9 +273,20 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     object_meta meta;
     if (algo != checksum_algo::none)
         meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+    // The key that opens the source and the one the part is sealed under, both refused before a byte is read.
+    std::optional<sse_key> src_customer;
+    sse_seal_spec seal;
+    sse_key probe{};
+    if (s3_error err; !sse_customer(c, sse_c_copy_prefix, src_customer, err) ||
+                      !sse_read_key(c, *src, sse_c_copy_prefix, probe, err) || !sse_part_key(c, record, meta, seal, err))
+    {
+        send_error(c, err);
+        return;
+    }
     const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
     st why = st::ok;
-    auto op = m_store.begin_put(r.bucket, part_key, std::move(meta), len, true, why);
+    auto op = m_store.begin_put(r.bucket, part_key, std::move(meta), len, true, why, false,
+                                record.empty() ? nullptr : &seal);
     if (!op)
     {
         send_error_st(c, why);
@@ -265,168 +297,26 @@ void storage_run::op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint3
     op->set_committer(m_node.mpu_part_committer(r.bucket, r.key, id, number));
     ++m_c.mpu_parts;
     ++m_c.copies;
+    if (!record.empty())
+        ++m_c.sse_puts;
 
-    // The source is read a piece at a time into the part, with the put's own
-    // staging deciding how fast.  The run holds itself until it ends, so it
-    // is alive while a read or a wait for the put is owed to it.
-    struct copy_run : std::enable_shared_from_this<copy_run>
+    // The source is read a window at a time into the part, with the put's own staging deciding how fast.
+    feed_copy(c, std::move(op), src_bucket, src_key, src_version, std::move(src_customer), first, len,
+              [this](const std::shared_ptr<conn>& cc, put_result pr)
     {
-        storage_run*            run{nullptr};
-        std::shared_ptr<put_op> op;
-        std::weak_ptr<conn>     owner;
-        int         fd{-1};
-        uint64_t    off{0};
-        uint64_t    left{0};
-        std::string buf;
-        size_t      buf_off{0};
-        bool        reading{false};
-        bool        ended{false};
-        std::shared_ptr<copy_run> keep;
-
-        void retire()
-        {
-            ended = true;
-            if (fd >= 0)
-                run->m_loop.close_fd(fd);
-            fd = -1;
-            keep.reset();
-        }
-
-        void fail(st why)
-        {
-            if (ended)
-                return;
-            auto self = shared_from_this();
-            op->abort();
-            retire();
-            if (auto cc = owner.lock(); cc && !cc->dead)
-                run->send_error_st(cc, why);
-        }
-
-        void answer(put_result pr)
-        {
-            auto self = shared_from_this();
-            retire();
-            auto cc = owner.lock();
-            if (!cc || cc->dead)
-                return;
-            if (pr.status != st::ok)
-            {
-                run->send_error_st(cc, pr.status);
-                return;
-            }
-            response resp;
-            resp.headers.emplace_back("Content-Type", "application/xml");
-            std::string x(xml_decl);
-            x += "<CopyPartResult xmlns=\"" + std::string(s3_xmlns) + "\"><LastModified>" + iso8601(pr.meta.mtime_ms) +
-                 "</LastModified><ETag>" + quoted_etag(pr.meta) + "</ETag>";
-            for (const auto& [n, v] : pr.meta.extra)
-                if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
-                    x += checksum_element(a, v);
-            x += "</CopyPartResult>";
-            resp.body = std::move(x);
-            run->send_response(cc, std::move(resp));
-        }
-
-        void pump()
-        {
-            auto self = shared_from_this();
-            for (;;)
-            {
-                if (ended || reading)
-                    return;
-                auto cc = owner.lock();
-                if (!cc || cc->dead)
-                {
-                    op->abort();
-                    retire();
-                    return;
-                }
-                if (op->failed())
-                {
-                    fail(op->status());
-                    return;
-                }
-                if (buf_off < buf.size())
-                {
-                    buf_off += op->append(buf.data() + buf_off, buf.size() - buf_off);
-                    if (op->failed())
-                        continue;
-                    if (buf_off < buf.size())
-                        return;   // the put's ready callback comes back here
-                }
-                if (left == 0)
-                {
-                    // The put answers through the callback, which holds the run until then.
-                    op->finish(nullptr, [self](put_result pr) { self->answer(std::move(pr)); });
-                    ended = true;
-                    return;
-                }
-                const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(left, 1u << 20));
-                buf.resize(n);
-                buf_off = 0;
-                reading = true;
-                if (!run->m_io.pread(fd, buf.data(), n, off, [self, n](int64_t rn)
-                    {
-                        self->reading = false;
-                        if (rn != static_cast<int64_t>(n))
-                        {
-                            self->fail(st::io_error);
-                            return;
-                        }
-                        self->off  += n;
-                        self->left -= n;
-                        self->pump();
-                    }))
-                {
-                    reading = false;
-                    fail(st::io_error);
-                }
-                return;
-            }
-        }
-    };
-    auto cr = std::make_shared<copy_run>();
-    cr->run   = this;
-    cr->op    = std::move(op);
-    cr->owner = c;
-    cr->left  = len;
-    cr->keep  = cr;
-    std::weak_ptr<copy_run> weak = cr;
-    cr->op->on_ready([weak]()
-    {
-        if (auto p = weak.lock())
-            p->pump();
+        response resp;
+        resp.headers.emplace_back("Content-Type", "application/xml");
+        sse_headers(cc->req, pr.meta, resp.headers);
+        std::string x(xml_decl);
+        x += "<CopyPartResult xmlns=\"" + std::string(s3_xmlns) + "\"><LastModified>" + iso8601(pr.meta.mtime_ms) +
+             "</LastModified><ETag>" + quoted_etag(pr.meta) + "</ETag>";
+        for (const auto& [n, v] : pr.meta.extra)
+            if (const checksum_algo a = checksum_from_header(n); a != checksum_algo::none)
+                x += checksum_element(a, v);
+        x += "</CopyPartResult>";
+        resp.body = std::move(x);
+        send_response(cc, std::move(resp));
     });
-    cr->op->on_failed([weak](st why)
-    {
-        if (auto p = weak.lock())
-            p->fail(why);
-    });
-
-    // The source's file, opened with its header read so the bytes are found.
-    auto opened = [this, weak, first](open_result o)
-    {
-        auto p = weak.lock();
-        if (!p || p->ended)
-        {
-            if (o.fd >= 0)
-                m_loop.close_fd(o.fd);
-            return;
-        }
-        if (o.status != st::ok)
-        {
-            p->fail(o.status);
-            return;
-        }
-        p->fd  = o.fd;
-        p->off = o.data_off + first;
-        p->pump();
-    };
-    if (src_version.empty())
-        m_store.open_object(src_bucket, src_key, 0, std::move(opened));
-    else
-        m_store.open_version(src_bucket, src_key, src_version, 0, std::move(opened));
 }
 
 // ─── CompleteMultipartUpload ────────────────────────────────────────────────
@@ -484,6 +374,7 @@ void storage_run::op_complete_multipart(const std::shared_ptr<conn>& c)
             resp.headers.emplace_back("Content-Type", "application/xml");
             if (has_version(res.meta))
                 resp.headers.emplace_back("x-amz-version-id", version_of(res.meta).id);
+            sse_headers(cc->req, res.meta, resp.headers);
             resp.body = complete_multipart_xml("http://" + host + "/" + bucket + "/" + key, bucket, key,
                                                res.meta.etag(), algo, res.checksum_b64);
             send_response(cc, std::move(resp));

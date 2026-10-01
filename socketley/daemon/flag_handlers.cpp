@@ -1294,6 +1294,17 @@ int parse_storage_flags(storage_instance* stg, const parsed_args& pa, size_t& i,
             stg->set_credentials_file(pa.args[++i]);
             return 0;
         }
+        // The master key of SSE-S3, a file only its owner may read, so the key itself is never on a command line.
+        case fnv1a("--sse-key-file"):
+        {
+            if (i + 1 >= pa.count || pa.args[i + 1].empty())
+            {
+                std::cout << "--sse-key-file requires a file path\n";
+                return 1;
+            }
+            stg->set_sse_key_file(pa.args[++i]);
+            return 0;
+        }
         // Open multipart uploads are aborted after this long, and never when it is absent.
         case fnv1a("--mpu-expire"):
         {

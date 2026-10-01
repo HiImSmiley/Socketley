@@ -218,7 +218,7 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
             state->bucket = rq.bucket;
             state->key    = rq.key;
             m_rpc[ticket] = state;
-            const size_t want = mem ? static_cast<size_t>(mem->size) : 60000;
+            const size_t want = mem ? static_cast<size_t>(stored_size(*mem)) : 60000;
             m_store.open_object(rq.bucket, rq.key, want,
                 [this, state, answer, too_large](open_result o)
                 {
@@ -241,6 +241,15 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                         answer(op::get, too_large(o.meta.size));
                         return;
                     }
+                    // A script holds no client's key, so an object sealed under one is not its to read.
+                    if (sse_mode_of(o.meta) == sse_mode::c)
+                    {
+                        state->done = true;
+                        m_loop.close_fd(o.fd);
+                        answer(op::get, refusal("InvalidRequest", "the object is encrypted with a customer key -- "
+                                                                  "read it over the S3 port with that key"));
+                        return;
+                    }
                     state->fd       = o.fd;
                     state->data_off = o.data_off;
                     state->meta     = o.meta;
@@ -254,18 +263,32 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                         if (state->done || !self)
                             return;
                         const size_t have = state->body.size();
-                        if (have >= state->meta.size)
+                        const uint64_t whole = stored_size(state->meta);
+                        if (have >= whole)
                         {
                             state->done = true;
                             m_loop.close_fd(state->fd);
                             state->fd = -1;
                             storage_rpc::reply r;
                             r.info = rpc_info_of(state->meta);
-                            r.data = std::move(state->body);
+                            if (is_encrypted(state->meta))
+                            {
+                                sse_key key{};
+                                s3_error err;
+                                if (!sse_data_key(state->meta, std::nullopt, key, err) ||
+                                    !sse_open_body(state->meta, key, state->body, r.data))
+                                {
+                                    answer(op::get, err.code.empty() ? refusal_for(st::io_error)
+                                                                     : refusal(err.code, err.message));
+                                    return;
+                                }
+                            }
+                            else
+                                r.data = std::move(state->body);
                             answer(op::get, r);
                             return;
                         }
-                        const size_t n = static_cast<size_t>(std::min<uint64_t>(state->meta.size - have, 1u << 20));
+                        const size_t n = static_cast<size_t>(std::min<uint64_t>(whole - have, 1u << 20));
                         state->body.resize(have + n);
                         if (!m_io.pread(state->fd, state->body.data() + have, static_cast<uint32_t>(n),
                                         state->data_off + have,
@@ -313,8 +336,18 @@ bool storage_run::serve_rpc(uint64_t ticket, std::string_view payload)
                 answer(rq.kind, refusal_for(st::metadata_too_large));
                 return true;
             }
+            // A bucket that encrypts its new objects encrypts a script's too.
+            sse_seal_spec seal;
+            const bool sealed = m_store.bucket_encrypts(rq.bucket);
+            if (s3_error err; sealed && (!m_has_master || !sse_new_key({sse_mode::s3, std::nullopt, false}, false, meta, seal, err)))
+            {
+                answer(rq.kind, refusal("NotImplemented", "the bucket encrypts its objects and this runtime has no "
+                                                          "--sse-key-file"));
+                return true;
+            }
             st why = st::ok;
-            auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why, true);
+            auto op_ptr = m_store.begin_put(rq.bucket, rq.key, std::move(meta), rq.data.size(), true, why, true,
+                                            sealed ? &seal : nullptr);
             if (!op_ptr)
             {
                 answer(rq.kind, refusal_for(why));

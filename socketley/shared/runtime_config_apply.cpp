@@ -108,6 +108,8 @@ void apply_storage_config(storage_instance& stg, const runtime_config& cfg, bool
         stg.set_secret_key(cfg.storage_secret_key);
     if (asked("credentials", !cfg.storage_credentials.empty()))
         stg.set_credentials_file(cfg.storage_credentials);
+    if (asked("sse_key_file", !cfg.storage_sse_key_file.empty()))
+        stg.set_sse_key_file(cfg.storage_sse_key_file);
     if (asked("mpu_expire", cfg.storage_mpu_expire_secs > 0))
         stg.set_mpu_expire_secs(cfg.storage_mpu_expire_secs);
 }

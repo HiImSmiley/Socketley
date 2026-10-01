@@ -592,6 +592,7 @@ void storage_run::close_conn(const std::shared_ptr<conn>& c)
     // Aborted but not dropped: a receive may still be landing in its buffer.
     if (c->put)
         c->put->abort();
+    c->dec.reset();
     if (c->file_fd >= 0)
     {
         m_loop.close_fd(c->file_fd);
@@ -1480,6 +1481,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->decoded_total = 0;
     c->ck_trailer.clear();
     c->sent_body = 0;
+    c->dec.reset();
     c->rd_direct = false;
     c->hfill = 0;
     c->trickle  = false;
@@ -2052,6 +2054,8 @@ void storage_run::put_body_complete(const std::shared_ptr<conn>& c)
                 resp.headers.emplace_back(n, v);
             else if (n == version_extra)
                 resp.headers.emplace_back("x-amz-version-id", version_of(r.meta).id);
+            else if (n == sse_extra)
+                sse_headers(cc->req, r.meta, resp.headers);
         const std::string bucket = cc->req.bucket;
         const std::string key    = cc->req.key;
         send_response(cc, std::move(resp));
@@ -2222,6 +2226,11 @@ void storage_run::file_pump(const std::shared_ptr<conn>& c)
     if (c->file_left == 0)
     {
         file_done(c);
+        return;
+    }
+    if (c->dec)
+    {
+        sealed_pump(c);
         return;
     }
 

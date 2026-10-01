@@ -62,6 +62,10 @@ public:
     void set_max_bytes(uint64_t bytes) { m_max_bytes = bytes; }
     uint64_t get_max_bytes() const { return m_max_bytes; }
 
+    // The file of the master key SSE-S3 data keys are wrapped with, read at every start; none refuses SSE-S3.
+    void set_sse_key_file(std::string_view f) { m_sse_key_file = std::string(f); }
+    std::string_view get_sse_key_file() const { return m_sse_key_file; }
+
     // What decides whether a request may go on.  Given, it is used instead of
     // the anonymous default; the SigV4 authenticator arrives here.
     void set_authenticator(std::unique_ptr<socketley::storage::authenticator> a);
@@ -110,6 +114,7 @@ private:
     std::string m_access_key;
     std::string m_secret_key;
     std::string m_credentials_file;
+    std::string m_sse_key_file;
     uint32_t    m_mpu_expire_secs{0};
     std::unique_ptr<socketley::storage::authenticator> m_auth;
     std::unique_ptr<socketley::storage::anonymous_authenticator> m_anon;
