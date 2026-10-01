@@ -1,6 +1,7 @@
 #include "object_format.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 
 #include "../../shared/raft_storage.h"
@@ -153,6 +154,83 @@ void encode_meta(std::string& out, std::string_view key, const object_meta& m)
         put_str(out, n);
         put_str(out, v);
     }
+}
+
+std::string encode_part_sizes(const std::vector<uint64_t>& sizes)
+{
+    if (sizes.empty())
+        return {};
+    bool uniform = true;
+    for (size_t i = 1; i + 1 < sizes.size(); ++i)
+        uniform = uniform && sizes[i] == sizes[0];
+    if (uniform)
+        return std::to_string(sizes[0]);
+    std::string out;
+    for (uint64_t s : sizes)
+    {
+        if (!out.empty())
+            out += ',';
+        out += std::to_string(s);
+        if (out.size() > max_part_sizes_bytes)
+            return {};
+    }
+    return out;
+}
+
+part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len)
+{
+    const uint32_t count = m.parts ? m.parts : 1;
+    if (n < 1 || n > count)
+        return part_status::out_of_range;
+    if (count == 1)
+    {
+        first = 0;
+        len   = m.size;
+        return part_status::ok;
+    }
+    std::string_view v;
+    for (const auto& [name, value] : m.extra)
+        if (name == part_sizes_extra)
+            v = value;
+    if (v.empty())
+        return part_status::unknown;
+
+    auto number = [](std::string_view s, uint64_t& out)
+    {
+        const auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+        return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
+    };
+    if (v.find(',') == std::string_view::npos)
+    {
+        uint64_t each = 0;
+        if (!number(v, each) || each == 0 || each > m.size / (count - 1))
+            return part_status::unknown;
+        first = (n - 1) * each;
+        len   = n < count ? each : m.size - first;
+        return part_status::ok;
+    }
+    // A list that does not add up to the object is trusted for no part of it.
+    uint64_t total = 0;
+    uint32_t i     = 0;
+    bool     found = false;
+    for (;;)
+    {
+        const size_t comma = v.find(',');
+        uint64_t s = 0;
+        if (!number(v.substr(0, comma), s) || s > m.size - total)
+            return part_status::unknown;
+        if (++i == n)
+        {
+            first = total;
+            len   = s;
+            found = true;
+        }
+        total += s;
+        if (comma == std::string_view::npos)
+            break;
+        v.remove_prefix(comma + 1);
+    }
+    return found && i == count && total == m.size ? part_status::ok : part_status::unknown;
 }
 
 size_t object_header_len(std::string_view key, const object_meta& m)

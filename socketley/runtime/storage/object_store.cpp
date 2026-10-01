@@ -2051,6 +2051,10 @@ struct copy_state
     uint64_t    copied{0};
     uint64_t    reserved{0};
     std::string buf;
+    // The ETag is taken from the bytes, and the header written again with it.
+    bool        rehash{false};
+    md5_stream  digest;
+    std::string header;
     std::function<void(put_result)> cb;
 };
 
@@ -2126,8 +2130,11 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
             cs->meta.size = o.meta.size;
             cs->reserved  = o.meta.size;
             m_reserved += o.meta.size;
-            cs->meta.md5   = o.meta.md5;
-            cs->meta.parts = o.meta.parts;
+            // A copy is one part, as in S3, so a multipart source's ETag is replaced by the MD5 of its bytes.
+            cs->meta.md5    = o.meta.md5;
+            cs->meta.parts  = 0;
+            cs->rehash      = o.meta.parts != 0;
+            std::erase_if(cs->meta.extra, [](const auto& e) { return e.first == part_sizes_extra; });
             cs->meta.mtime_ms = static_cast<int64_t>(now_ms());
 
             bucket* bp = find_bucket(cs->dst_bucket);
@@ -2161,6 +2168,28 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
                     *pump = [this, alive, cs, finish, wpump]()
                     {
                         auto self = wpump.lock();
+                        if (cs->copied >= cs->meta.size && cs->rehash)
+                        {
+                            cs->rehash   = false;
+                            cs->meta.md5 = cs->digest.finish();
+                            cs->header   = encode_object_header(cs->dst_key, cs->meta);
+                            const bool qh = cs->header.size() == cs->hdr_len &&
+                                m_io->pwrite(cs->dst_fd, cs->header.data(), static_cast<uint32_t>(cs->header.size()), 0,
+                                    [alive, cs, finish, self](int64_t rh)
+                                    {
+                                        if (!*alive)
+                                            return;
+                                        if (rh < 0)
+                                        {
+                                            (*finish)({errno_status(rh), cs->meta});
+                                            return;
+                                        }
+                                        (*self)();
+                                    });
+                            if (!qh)
+                                (*finish)({st::io_error, cs->meta});
+                            return;
+                        }
                         if (cs->copied >= cs->meta.size)
                         {
                             const bool qs = m_io->fsync(cs->dst_fd, true,
@@ -2221,6 +2250,8 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key,
                                             (*finish)({errno_status(rw), cs->meta});
                                             return;
                                         }
+                                        if (cs->rehash)
+                                            cs->digest.update(cs->buf.data(), static_cast<size_t>(rn));
                                         cs->copied += static_cast<uint64_t>(rn);
                                         if (self)
                                             (*self)();

@@ -91,6 +91,7 @@ inline s3_error make_error(std::string_view code)
         {"OperationAborted", 409, "A conflicting conditional operation is currently in progress against this resource. Please try again."},
         {"InvalidBucketName", 400, "The specified bucket is not valid."},
         {"InvalidRange", 416, "The requested range is not satisfiable"},
+        {"InvalidPartNumber", 416, "The requested partnumber is not satisfiable"},
         {"InvalidArgument", 400, "Invalid Argument"},
         {"InvalidRequest", 400, "Invalid Request"},
         {"InvalidDigest", 400, "The Content-MD5 you specified is not valid."},

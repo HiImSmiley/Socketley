@@ -298,6 +298,66 @@ TEST_CASE("a journal record decodes whole, torn and corrupt")
     CHECK(decode_journal_record(flipped).status == record_status::corrupt);
 }
 
+TEST_CASE("part sizes are one number when all but the last agree, and a list that does not add up is trusted for nothing")
+{
+    CHECK(encode_part_sizes({}).empty());
+    CHECK(encode_part_sizes({7}) == "7");
+    CHECK(encode_part_sizes({5, 5, 5, 2}) == "5");
+    CHECK(encode_part_sizes({5, 5, 9}) == "5");
+    CHECK(encode_part_sizes({6, 5, 7, 1}) == "6,5,7,1");
+    CHECK(encode_part_sizes(std::vector<uint64_t>(1000, 5242880 + 1) ).size() == 7);
+    std::vector<uint64_t> varied;
+    for (uint64_t i = 0; i < 1000; ++i)
+        varied.push_back(5242880 + i);
+    CHECK(encode_part_sizes(varied).empty());
+
+    auto with = [](uint64_t size, uint32_t parts, std::string sizes)
+    {
+        object_meta m;
+        m.size  = size;
+        m.parts = parts;
+        if (!sizes.empty())
+            m.extra.emplace_back(std::string(part_sizes_extra), std::move(sizes));
+        return m;
+    };
+    uint64_t first = 0, len = 0;
+    auto at = [&](const object_meta& m, uint32_t n)
+    {
+        const part_status s = part_range(m, n, first, len);
+        return std::pair(s, std::pair(first, len));
+    };
+    using r = std::pair<part_status, std::pair<uint64_t, uint64_t>>;
+
+    // A single-part object, and a multipart one of one part, are their own part 1.
+    CHECK(at(with(10, 0, ""), 1) == r{part_status::ok, {0, 10}});
+    CHECK(part_range(with(10, 0, ""), 2, first, len) == part_status::out_of_range);
+    CHECK(at(with(10, 1, ""), 1) == r{part_status::ok, {0, 10}});
+    CHECK(part_range(with(10, 3, ""), 0, first, len) == part_status::out_of_range);
+
+    const object_meta uniform = with(23, 3, "10");
+    CHECK(at(uniform, 1) == r{part_status::ok, {0, 10}});
+    CHECK(at(uniform, 2) == r{part_status::ok, {10, 10}});
+    CHECK(at(uniform, 3) == r{part_status::ok, {20, 3}});
+    CHECK(part_range(uniform, 4, first, len) == part_status::out_of_range);
+    // A last part larger than the others is still described by the one size.
+    CHECK(at(with(29, 3, "10"), 3) == r{part_status::ok, {20, 9}});
+
+    const object_meta list = with(19, 4, "6,5,7,1");
+    CHECK(at(list, 1) == r{part_status::ok, {0, 6}});
+    CHECK(at(list, 3) == r{part_status::ok, {11, 7}});
+    CHECK(at(list, 4) == r{part_status::ok, {18, 1}});
+
+    // What a header could say and the object not bear out is unknown, never a guess.
+    CHECK(part_range(with(10, 3, ""), 2, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 3, "10"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 3, "0"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 3, "x"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(20, 4, "6,5,7,1"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 3, "6,5,7,1"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 4, "6,5,,8"), 1, first, len) == part_status::unknown);
+    CHECK(part_range(with(19, 4, "6,5,7,1,"), 1, first, len) == part_status::unknown);
+}
+
 TEST_CASE("tag slots in a header's padding take changes in turn, and a torn one leaves the one before")
 {
     object_meta m;

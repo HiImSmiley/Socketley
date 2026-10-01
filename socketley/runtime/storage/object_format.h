@@ -49,6 +49,28 @@ std::string_view tags_of(const object_meta& m);
 // Makes `tags` the object's tags, as the last extra entry, or removes them when it is empty.
 void set_tags_extra(object_meta& m, std::string_view tags);
 
+// The extra entry a multipart object's part sizes are kept in: one size when
+// every part but the last has it, else every size, comma-separated.
+inline constexpr std::string_view part_sizes_extra = "x-socketley-part-sizes";
+// The longest list kept, so the header stays within its bounds; a longer one is not recorded.
+inline constexpr size_t max_part_sizes_bytes = 4096;
+
+// The entry for parts of these sizes, empty when it would be longer than the bound.
+std::string encode_part_sizes(const std::vector<uint64_t>& sizes);
+
+enum class part_status : uint8_t
+{
+    ok,
+    // The object has fewer parts than the one asked for.
+    out_of_range,
+    // A multipart object completed without its sizes recorded.
+    unknown,
+};
+
+// Where part `n` (from 1) of the object begins and how long it is; a
+// single-part object is its own part 1.
+part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len);
+
 inline constexpr size_t object_header_align = 4096;
 inline constexpr size_t max_key_bytes       = 1024;
 // User metadata is 2 KB in S3 and the system fields ride beside it, so this is

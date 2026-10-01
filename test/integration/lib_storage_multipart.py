@@ -380,8 +380,12 @@ def main_mode():
     check("create_multipart_upload with an algorithm that is not one is InvalidRequest", status == 400 and xml_code(body_) == "InvalidRequest", (status, body_[:200]))
 
     # Other things an upload id must not do.
-    check("an upload id is not something get_object serves",
-          code_of(lambda: c.get_object(Bucket=B, Key="manual/obj", PartNumber=1))[0] == "NotImplemented")
+    # A part number without an upload id reads that part of the completed object.
+    got = c.get_object(Bucket=B, Key="manual/obj", PartNumber=2)
+    check("get_object by PartNumber answers that part of the completed object",
+          (got["Body"].read() == p2b, got.get("PartsCount"), got.get("ContentRange")) ==
+          (True, 3, "bytes %d-%d/%d" % (len(p1), len(p1 + p2b) - 1, len(p1 + p2b + p3))),
+          (got.get("PartsCount"), got.get("ContentRange")))
 
     # Two uploads left open for the restarts.
     u1 = c.create_multipart_upload(Bucket=B, Key="resume/one", ContentType="text/one")["UploadId"]

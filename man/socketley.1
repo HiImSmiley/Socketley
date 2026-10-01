@@ -6323,6 +6323,10 @@ HeadObject	HEAD /bucket/key	T{
 .ad l
 The headers of a GET, from memory, or from the object's header when another shard owns the key.
 T}
+GetObject, HeadObject by part	GET|HEAD /bucket/key?partNumber=N	T{
+.ad l
+Part N of a multipart object as a 206 with its Content\-Range and x\-amz\-mp\-parts\-count; see \fBReading by part number\fR below.
+T}
 DeleteObject	DELETE /bucket/key	T{
 .ad l
 204 whether or not the key existed.
@@ -6333,7 +6337,7 @@ Up to 1000 keys, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE.
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE. The copy is a single\-part object whose ETag is the md5 of its bytes.
 T}
 PutObjectTagging	PUT /bucket/key?tagging	T{
 .ad l
@@ -6389,8 +6393,7 @@ DeleteBucketLifecycle	DELETE /bucket?lifecycle	T{
 T}
 .TE
 .PP
-Anything else \(em ACLs, versioning, a bucket's own tags, policies, the part\-number form of
-GetObject \(em is answered
+Anything else \(em ACLs, versioning, a bucket's own tags, policies \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -6636,6 +6639,42 @@ is set; its parts count against
 while they are held, and a bucket with an open upload cannot be deleted
 .RB ( BucketNotEmpty ).
 A part sent again needs room for both copies until the new one lands.
+.SS Reading by part number
+.B "GET /bucket/key?partNumber=N"
+(and HEAD) answers part
+.I N
+of the object as S3 does, which is how the AWS CRT, the Java transfer manager and
+several Go clients download a multipart object in parallel: a
+.B 206
+of the part's bytes, with
+.BI "Content\-Range: bytes " first \- last / size ,
+the part's Content\-Length, the whole object's ETag and
+.BR x\-amz\-mp\-parts\-count .
+Parts are numbered 1 to the part count in the order the completion listed them.
+A single\-part object (a put, or any copy) is its own part 1, answered the same
+way without the parts count; an empty one is a 200 of nothing. A number past the
+part count is
+.BR "416 InvalidPartNumber" ,
+one outside 1 to 10000
+.BR "400 InvalidArgument" ,
+and a Range header beside it
+.BR "400 InvalidRequest" .
+The conditional headers apply as on a plain GET, before the part is looked at.
+.PP
+The part sizes are recorded in the object's header at CompleteMultipartUpload
+(as
+.BR x\-socketley\-part\-sizes ,
+never sent to a client): one size when every part but the last has it, which
+is every in\-place completion, and otherwise the list, up to 4 KiB of it. The
+journal carries them as it carries the rest of the header. A multipart object
+completed before they were recorded, or with a list longer than that, answers
+any part number within its count with
+.B "501 NotImplemented"
+rather than a guess; a plain GET or a Range reads it as before.
+.PP
+CopyObject makes a single\-part object, as S3 does: a multipart source's bytes
+are hashed on the way through and the copy's ETag is their md5, with no
+.BR \-N .
 .SS Bucket lifecycle
 A bucket's lifecycle configuration is S3's
 .B LifecycleConfiguration

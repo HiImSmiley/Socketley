@@ -472,8 +472,13 @@ TEST_CASE("parts are assembled into one object with the multipart ETag and the m
     CHECK(body == p1 + p2 + p3);
     CHECK(got.content_type == "text/x");
     CHECK(got.parts == 3);
-    REQUIRE(got.extra.size() == 1);
+    REQUIRE(got.extra.size() == 2);
     CHECK(got.extra[0].first == "x-amz-meta-a");
+    // Part 2 differs from part 1, so the header lists every size.
+    CHECK(got.extra[1] == std::pair<std::string, std::string>(std::string(part_sizes_extra), "5242880,5242891,999"));
+    uint64_t first = 0, len = 0;
+    REQUIRE(part_range(got, 2, first, len) == part_status::ok);
+    CHECK(body.substr(first, len) == p2);
 
     // The upload goes away: its directory, its bytes in the quota, its place in the map.
     REQUIRE(r.until([&] { return r.mp->find("bkt", id) == nullptr; }));

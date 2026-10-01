@@ -120,6 +120,8 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
     if (algo != checksum_algo::none)
         m.extra.emplace_back(std::string(checksum_header(algo)),
                              std::string(checksum_b64_len(algo) + std::to_string(mpu_max_parts).size() + 1, 'A'));
+    // Parts placed in the data file are of one size, so their sizes are one number.
+    m.extra.emplace_back(std::string(part_sizes_extra), std::string(20, '9'));
     return object_header_len(key, m);
 }
 
@@ -1039,6 +1041,12 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             plan.checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
             plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
         }
+        std::vector<uint64_t> sizes;
+        sizes.reserve(plan.parts.size());
+        for (const mpu_part& p : plan.parts)
+            sizes.push_back(p.size);
+        if (std::string v = encode_part_sizes(sizes); !v.empty())
+            plan.meta.extra.emplace_back(std::string(part_sizes_extra), std::move(v));
         plan.in_place = copy_free(*u, plan.parts);
         u->place_planned = plan.in_place;
         cb({}, std::move(plan));

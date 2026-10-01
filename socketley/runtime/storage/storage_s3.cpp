@@ -37,8 +37,8 @@ bool unsupported_subresource(const s3_request& r, bool object)
     // CORS and lifecycle rules belong to a bucket and to nothing else.
     if (object && (r.has_query("cors") || r.has_query("lifecycle")))
         return true;
-    // A part number outside an upload asks for one part of a finished object.
-    if (r.has_query("partNumber") && !r.has_query("uploadId"))
+    // A part number outside an upload asks a GET or HEAD for one part of a finished object.
+    if (r.has_query("partNumber") && !r.has_query("uploadId") && (!object || (r.method != "GET" && r.method != "HEAD")))
         return true;
     for (const auto& q : r.query)
         for (std::string_view n : names)
@@ -1154,6 +1154,8 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
                 r.headers.emplace_back(n, v);
             continue;
         }
+        if (n == part_sizes_extra)
+            continue;
         std::string display;
         bool next_upper = true;
         for (char ch : n)
@@ -1235,6 +1237,28 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     else
         ++m_c.gets;
 
+    // One part of the object asked for by its number, which S3 allows instead of a range and never beside one.
+    uint32_t part = 0;
+    if (q.has_query("partNumber"))
+    {
+        uint64_t n = 0;
+        if (!parse_uint(q.get_query("partNumber"), n) || n < 1 || n > mpu_max_parts)
+        {
+            s3_error e = make_error("InvalidArgument");
+            e.message = "Part number must be an integer between 1 and 10000, inclusive";
+            send_error(c, e, false, "ArgumentName", "partNumber");
+            return;
+        }
+        if (q.has_header("range"))
+        {
+            s3_error e = make_error("InvalidRequest");
+            e.message = "Cannot specify both Range header and partNumber query parameter";
+            send_error(c, e);
+            return;
+        }
+        part = static_cast<uint32_t>(n);
+    }
+
     if (!m_store.has_bucket(q.bucket))
     {
         send_error_st(c, st::no_such_bucket);
@@ -1254,7 +1278,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
     }
 
     // Answers a request whose object is known, from a HEAD's memory or a GET's file.
-    auto answer = [this, head](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
+    auto answer = [this, head, part](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
                                uint64_t data_off, const std::string& prefetch)
     {
         const s3_request& rq = cc->req;
@@ -1282,7 +1306,22 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
 
         uint64_t first = 0, len = m.size;
         bool ranged = false;
-        if (const std::string_view rh = rq.header("range"); !rh.empty())
+        if (part)
+        {
+            const part_status ps = part_range(m, part, first, len);
+            if (ps != part_status::ok)
+            {
+                close_file();
+                s3_error e = make_error(ps == part_status::out_of_range ? "InvalidPartNumber" : "NotImplemented");
+                if (ps == part_status::unknown)
+                    e.message = "This object's part sizes were not recorded when it was completed, so it cannot be read by partNumber";
+                send_error(cc, e, false, "PartNumberRequested", std::to_string(part));
+                return;
+            }
+            // An empty part has no byte a Content-Range could name.
+            ranged = len > 0;
+        }
+        else if (const std::string_view rh = rq.header("range"); !rh.empty())
         {
             const http_range hr = http_parse_range(rh, static_cast<size_t>(m.size));
             if (hr.unsatisfiable)
