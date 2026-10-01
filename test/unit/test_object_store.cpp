@@ -1,10 +1,12 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include "runtime/storage/body_reader.h"
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/object_store.h"
 #include "runtime/storage/s3_names.h"
 #include "runtime/storage/s3_xml.h"
+#include "runtime/storage/sse.h"
 #include "shared/event_loop.h"
 #include "shared/file_io.h"
 #include "shared/hash_pool.h"
@@ -2498,4 +2500,200 @@ TEST_CASE("a versioned bucket's journal holds every version through a compaction
     CHECK(listing(r) == before);
     // The files said what the journal did, so it was not written again.
     CHECK(slurp(journal_path(d.path, "bkt")) == journal);
+}
+
+// ─── Server-side encryption ─────────────────────────────────────────────────
+
+namespace {
+
+// A record and a seal for a new object under `kek`, as the S3 layer makes them.
+object_meta sealed_meta(const sse_key& kek, sse_seal_spec& seal, sse_mode mode = sse_mode::s3, bool per_part = false)
+{
+    sse_record rec;
+    rec.mode     = mode;
+    rec.per_part = per_part;
+    rec.kid      = sse_key_id(kek);
+    seal.key         = sse_random_key();
+    seal.opaque_etag = mode == sse_mode::c;
+    REQUIRE(sse_wrap(kek, seal.key, rec.wrapped));
+    object_meta m;
+    m.extra.emplace_back(std::string(sse_extra), encode_sse(rec));
+    return m;
+}
+
+}   // namespace
+
+TEST_CASE("a sealed chunk opens only under its key and its index, and a flipped bit fails it")
+{
+    const sse_key key = sse_random_key();
+    const std::string plain = pattern(3 * sse_chunk + 777, 3);
+    std::string sealed(sse_stored_len(plain.size()), '\0');
+    REQUIRE(sse_seal(key, 5, plain.data(), plain.size(), sealed.data()));
+    std::string back(plain.size(), '\0');
+    REQUIRE(sse_open(key, 5, sealed.data(), sealed.size(), back.data()));
+    CHECK(back == plain);
+    CHECK(sealed.find(plain.substr(1000, 64)) == std::string::npos);
+
+    CHECK_FALSE(sse_open(sse_random_key(), 5, sealed.data(), sealed.size(), back.data()));
+    // A chunk moved to another place in the stream does not open there.
+    CHECK_FALSE(sse_open(key, 6, sealed.data(), sealed.size(), back.data()));
+    std::string flipped = sealed;
+    flipped[sse_chunk + sse_overhead + 100] ^= 1;
+    CHECK_FALSE(sse_open(key, 5, flipped.data(), flipped.size(), back.data()));
+
+    // Nonces are drawn per chunk, so one plaintext sealed twice is two ciphertexts.
+    std::string again(sealed.size(), '\0');
+    REQUIRE(sse_seal(key, 5, plain.data(), plain.size(), again.data()));
+    CHECK(again != sealed);
+}
+
+TEST_CASE("a data key unwraps only under the key that wrapped it, and a record decodes only whole")
+{
+    const sse_key master = sse_random_key();
+    const sse_key data   = sse_random_key();
+    std::string wrapped;
+    REQUIRE(sse_wrap(master, data, wrapped));
+    CHECK(wrapped.size() == sse_wrapped_bytes);
+    sse_key out{};
+    REQUIRE(sse_unwrap(master, wrapped, out));
+    CHECK(out == data);
+    CHECK_FALSE(sse_unwrap(sse_random_key(), wrapped, out));
+    std::string bent = wrapped;
+    bent[20] ^= 0x40;
+    CHECK_FALSE(sse_unwrap(master, bent, out));
+
+    sse_record r;
+    r.mode     = sse_mode::c;
+    r.per_part = true;
+    r.kid      = sse_key_id(master);
+    r.wrapped  = wrapped;
+    const std::string text = encode_sse(r);
+    sse_record back;
+    REQUIRE(decode_sse(text, back));
+    CHECK((back.mode == sse_mode::c && back.per_part && back.kid == r.kid && back.wrapped == wrapped));
+    for (const std::string& bad : {text.substr(0, text.size() - 1), "2" + text.substr(1), text + ";x",
+                                   std::string("1;s3;4096;o;00000000;") + text.substr(text.rfind(';') + 1)})
+        CHECK_FALSE(decode_sse(bad, back));
+}
+
+TEST_CASE("the chunks of a multipart object are found at each part's own offsets")
+{
+    sse_seal_spec seal;
+    object_meta m = sealed_meta(sse_random_key(), seal, sse_mode::s3, true);
+    const uint64_t part = 5u << 20;
+    m.size  = 2 * part + 1000;
+    m.parts = 3;
+    m.extra.emplace_back(std::string(part_sizes_extra), std::to_string(part));
+    sse_layout l;
+    REQUIRE(l.init(m));
+    CHECK(l.stored() == 2 * sse_stored_len(part) + sse_stored_len(1000));
+    CHECK(stored_size(m) == l.stored());
+    const sse_layout::chunk c = l.at(part + 70000);
+    CHECK(c.index == 1);
+    CHECK(c.plain_off == part + sse_chunk);
+    CHECK(c.cipher_off == sse_stored_len(part) + sse_chunk + sse_overhead);
+    const sse_layout::chunk last = l.at(m.size - 1);
+    CHECK((last.index == 0 && last.plain_len == 1000 && last.cipher_off == 2 * sse_stored_len(part)));
+
+    // Unequal parts, listed one by one, and a list that does not add up locates nothing.
+    m.extra.back().second = std::to_string(part) + "," + std::to_string(part - 3) + ",1003";
+    REQUIRE(l.init(m));
+    CHECK(l.at(2 * part - 3).plain_off == 2 * part - 3);
+    CHECK(l.at(2 * part - 3).cipher_off == sse_stored_len(part) + sse_stored_len(part - 3));
+    m.extra.back().second = std::to_string(part) + ",1,2";
+    CHECK_FALSE(l.init(m));
+    CHECK(stored_size(m) == UINT64_MAX);
+    m.extra.pop_back();
+    CHECK_FALSE(l.init(m));
+}
+
+TEST_CASE("a sealed put at every edge of its buffers reads back through its chunks and stores no plaintext")
+{
+    for (unsigned threads : {0u, 2u})
+    {
+        tmpdir d;
+        rig r(d.path, 4096, 0, threads);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        const sse_key master = sse_random_key();
+        for (size_t n : {size_t{0}, size_t{1}, sse_chunk - 1, sse_chunk, sse_chunk + 1, size_t{(1u << 20) - 1},
+                         size_t{1u << 20}, size_t{(1u << 20) + 1}, size_t{(3u << 20) + 17}})
+        {
+            INFO("threads " << threads << ", size " << n);
+            sse_seal_spec seal;
+            const object_meta m = sealed_meta(master, seal);
+            const std::string key = "k" + std::to_string(n);
+            const std::string body = pattern(n, static_cast<unsigned>(n) + 11);
+            st why = st::ok;
+            auto op = r.store->begin_put("bkt", key, m, n, true, why, true, &seal);
+            REQUIRE(op);
+            size_t off = 0;
+            while (off < n && !op->failed())
+            {
+                const size_t took = op->append(body.data() + off, std::min<size_t>(333333, n - off));
+                off += took;
+                if (took == 0)
+                {
+                    bool ready = false;
+                    op->on_ready([&] { ready = true; });
+                    REQUIRE(r.until([&] { return ready || op->failed(); }));
+                }
+            }
+            put_result p;
+            bool fired = false;
+            op->finish(nullptr, [&](put_result res) { p = std::move(res); fired = true; });
+            REQUIRE(r.until([&] { return fired; }));
+            REQUIRE(p.status == st::ok);
+            CHECK(p.meta.md5 == md5_of(body));
+            const std::string file = slurp(data_path(d.path, "bkt", key));
+            const decoded_header h = decode_object_header(file);
+            REQUIRE(h.status == header_status::ok);
+            CHECK(file.size() == h.header_len + sse_stored_len(n));
+            if (n >= 64)
+                CHECK(file.find(body.substr(n / 2, 32)) == std::string::npos);
+            std::string back;
+            REQUIRE(sse_open_body(h.meta, seal.key, std::string_view(file).substr(h.header_len), back));
+            CHECK(back == body);
+            // Nothing went to the pool, whose roll forward could not check a sealed body.
+            CHECK(count_pool_files(d.path, "bkt") == 0);
+        }
+    }
+}
+
+TEST_CASE("an SSE-C put's ETag is not its MD5, and a sealed object comes back from its file after a crash")
+{
+    tmpdir d;
+    const sse_key customer = sse_random_key();
+    sse_seal_spec seal;
+    const std::string body = pattern(200000, 9);
+    md5_t etag{};
+    {
+        rig r(d.path);
+        REQUIRE(r.make_bucket("bkt") == st::ok);
+        const object_meta m = sealed_meta(customer, seal, sse_mode::c);
+        st why = st::ok;
+        auto op = r.store->begin_put("bkt", "c", m, body.size(), true, why, false, &seal);
+        REQUIRE(op);
+        REQUIRE(op->append(body.data(), body.size()) == body.size());
+        put_result p;
+        bool fired = false;
+        const md5_t right = md5_of(body);
+        op->finish(&right, [&](put_result res) { p = std::move(res); fired = true; });
+        REQUIRE(r.until([&] { return fired; }));
+        REQUIRE(p.status == st::ok);
+        CHECK(p.meta.md5 != md5_of(body));
+        CHECK(p.meta.md5 == sse_opaque_etag(seal.key, md5_of(body)));
+        etag = p.meta.md5;
+        r.settle();
+    }
+    fs::remove(journal_path(d.path, "bkt"));
+    rig again(d.path);
+    CHECK(again.report.corrupt_files == 0);
+    const object_meta* m = again.store->find("bkt", "c");
+    REQUIRE(m != nullptr);
+    CHECK(m->md5 == etag);
+    CHECK(sse_mode_of(*m) == sse_mode::c);
+    const std::string file = slurp(data_path(d.path, "bkt", "c"));
+    std::string back;
+    REQUIRE(sse_open_body(*m, seal.key, std::string_view(file).substr(file.size() - sse_stored_len(body.size())), back));
+    CHECK(back == body);
 }

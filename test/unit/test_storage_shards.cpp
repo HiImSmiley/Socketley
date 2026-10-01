@@ -2038,7 +2038,8 @@ TEST_CASE("the wire carries a part's place and a plan made without a copy")
     CHECK(back.flag);
     CHECK(back.size == 5ull << 30);
 
-    part_place place{4096 + (6ull << 30), 5u << 20, "ignored"};
+    // The upload's encryption record crosses with the place, so a part fed on another shard is sealed as its upload is.
+    part_place place{4096 + (6ull << 30), 5u << 20, "ignored", "1;s3;65536;p;0a0b0c0d;" + std::string(80, 'Q')};
     st s = st::io_error;
     checksum_algo algo = checksum_algo::none;
     part_place got;
@@ -2049,6 +2050,7 @@ TEST_CASE("the wire carries a part's place and a plan made without a copy")
     CHECK(got.off == place.off);
     CHECK(got.room == place.room);
     CHECK(got.path.empty());
+    CHECK(got.sse == place.sse);
     for (size_t cut = 0; cut < enc.size(); ++cut)
         CHECK_FALSE(wire::decode_mpu_begin(std::string_view(enc).substr(0, cut), s, algo, got));
 
