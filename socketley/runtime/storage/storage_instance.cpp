@@ -401,7 +401,6 @@ std::string storage_instance::stats_lines() const
             << "shard_hot_drops_served:" << n.hot_drops_in << "\n"
             << "shard_hot_holds_sent:" << n.hot_holds_out << "\n"
             << "shard_hot_holds_served:" << n.hot_holds_in << "\n"
-            << "shard_hot_holder_resets:" << n.hot_holder_resets << "\n"
             << "shard_peer_failures:" << n.peer_failures << "\n";
     }
     return out.str();

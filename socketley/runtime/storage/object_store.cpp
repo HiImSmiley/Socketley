@@ -191,11 +191,11 @@ void object_store::hot_insert(const std::string& id, const object_meta& read, st
     }
 }
 
-// Zero stands for every key, which a dropped bucket is, so no key's hash is zero.
+// Zero stands for every key, which a dropped bucket is, and all ones for no key, so no key's hash is either.
 static uint64_t drop_hash(std::string_view id)
 {
     const uint64_t h = std::hash<std::string_view>{}(id);
-    return h ? h : 1;
+    return h == 0 ? 1 : h == ~uint64_t{0} ? h - 1 : h;
 }
 
 void object_store::hot_note_drop(uint64_t id_hash)
@@ -227,18 +227,26 @@ void object_store::hot_put_foreign(std::string_view bucket_name, std::string_vie
     const bool whole = body.size() == read.size && read.size <= hot_max_object;
     if ((!whole && !body.empty()) || !hot_foreign_fresh(bucket_name, key, epoch))
         return;
-    if (!m_peers)
+    // A read that began after the owner started dropping this shard for the key's slot is caught by the drop epoch alone.
+    const uint32_t slot = object_slot(bucket_name, key);
+    if (!m_peers || (m_held_since[slot] != 0 && epoch >= m_held_since[slot]))
     {
         hot_insert(hot_id(bucket_name, key), read, body, nullptr);
         return;
     }
-    // The owner drops only the copies it was asked about, so a copy is kept once the owner has heard of it.
+    // Otherwise the owner first says the version read is current, and from then on drops this shard for the slot.
     auto alive = m_alive;
     m_peers->hold(owner_of(bucket_name, key), std::string(bucket_name), std::string(key), read,
-        [this, alive, epoch, read, b = std::string(bucket_name), k = std::string(key), kept = std::string(body)](bool current)
+        [this, alive, epoch, slot, read, b = std::string(bucket_name), k = std::string(key), kept = std::string(body)](bool current)
         {
-            if (*alive && current && hot_foreign_fresh(b, k, epoch))
-                hot_insert(hot_id(b, k), read, kept, nullptr);
+            if (!*alive || !current || !hot_foreign_fresh(b, k, epoch))
+                return;
+            if (m_held_since[slot] == 0)
+            {
+                hot_note_drop(~uint64_t{0});
+                m_held_since[slot] = m_drop_epoch;
+            }
+            hot_insert(hot_id(b, k), read, kept, nullptr);
         });
 }
 
@@ -251,6 +259,10 @@ void object_store::hot_invalidate(std::string_view bucket_name, std::string_view
 void object_store::hot_forget_owner(uint32_t shard)
 {
     hot_note_drop(0);
+    // The owner started again and drops nobody for a slot until it is asked again.
+    for (uint32_t slot = 0; slot < cache_slot_count; ++slot)
+        if (cache_shard_of_slot(slot, m_opts.nshards) == shard)
+            m_held_since[slot] = 0;
     for (auto it = m_hot_lru.begin(); it != m_hot_lru.end();)
     {
         const std::string_view id(it->id);

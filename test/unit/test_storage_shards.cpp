@@ -180,6 +180,8 @@ struct cluster : shard_transport
 
     void pump()
     {
+        for (auto& mb : m)
+            mb->node->flush_holds();
         while (!queue.empty())
         {
             task t = std::move(queue.front());
@@ -763,12 +765,24 @@ uint64_t drops_sent(cluster& c)
 
 }   // namespace
 
-TEST_CASE("a change is dropped only on the siblings that asked to keep the key, and on none for a key nobody read")
+// A key of the same bucket in the same slot as `key`, and one in another slot owned by the same shard.
+static std::string same_slot(const std::string& bucket, const std::string& key, bool same)
+{
+    const uint32_t slot = object_slot(bucket, key), owner = object_owner(bucket, key, 4);
+    for (int i = 0;; ++i)
+    {
+        const std::string k = "other" + std::to_string(i);
+        if (same ? object_slot(bucket, k) == slot : object_slot(bucket, k) != slot && object_owner(bucket, k, 4) == owner)
+            return k;
+    }
+}
+
+TEST_CASE("a change is dropped only on the siblings that read from its slot, and on none for a slot nobody read")
 {
     tmpdir d;
     cluster c(d.path, 4);
     REQUIRE(c.make_bucket(0, "bkt") == st::ok);
-    const std::string key = "k";
+    const std::string key = "k", near = same_slot("bkt", key, true), far = same_slot("bkt", key, false);
     const uint32_t owner = object_owner("bkt", key, 4);
     const uint32_t a = (owner + 1) % 4, b = (owner + 2) % 4;
 
@@ -778,24 +792,43 @@ TEST_CASE("a change is dropped only on the siblings that asked to keep the key, 
     REQUIRE(c.del(a, "bkt", key) == st::ok);
     CHECK(drops_sent(c) == 0);
 
-    // One sibling reads it, and only that one is told of the next change, wherever it lands.
+    // One sibling reads it, and only that one is told of the next change, wherever it lands, and of every one after.
     REQUIRE(c.put(owner, "bkt", key, pattern(3000, 7)).status == st::ok);
     REQUIRE(c.warm(a, "bkt", key));
+    CHECK(c.m[owner]->node->holders(object_slot("bkt", key)) == uint64_t{1} << a);
     REQUIRE(c.put(b, "bkt", key, pattern(3000, 8)).status == st::ok);
     CHECK(drops_sent(c) == 1);
     CHECK(c.copies("bkt", key) == 0);
-    // A drop empties what the owner remembers, so the change after it is told to nobody.
     REQUIRE(c.put(b, "bkt", key, pattern(3000, 9)).status == st::ok);
-    CHECK(drops_sent(c) == 1);
+    CHECK(drops_sent(c) == 2);
+
+    // Another key of the slot is kept without asking and dropped like the first; one of another slot is told to nobody.
+    REQUIRE(c.put(owner, "bkt", near, pattern(3000, 10)).status == st::ok);
+    CHECK(drops_sent(c) == 3);
+    const uint64_t asked = c.m[a]->node->counters().hot_holds_out;
+    REQUIRE(c.warm(a, "bkt", near));
+    CHECK(c.m[a]->node->counters().hot_holds_out == asked);
+    REQUIRE(c.put(b, "bkt", near, pattern(3000, 11)).status == st::ok);
+    CHECK(drops_sent(c) == 4);
+    CHECK(c.copies("bkt", near) == 0);
+    REQUIRE(c.put(owner, "bkt", far, pattern(3000, 12)).status == st::ok);
+    CHECK(drops_sent(c) == 4);
 
     // Two readers, and a delete landed on one of them drops both.
     REQUIRE(c.warm(a, "bkt", key));
     REQUIRE(c.warm(b, "bkt", key));
     REQUIRE(c.del(a, "bkt", key) == st::ok);
-    CHECK(drops_sent(c) == 3);
+    CHECK(drops_sent(c) == 6);
     CHECK(c.copies("bkt", key) == 0);
     std::string body;
     CHECK(c.get(b, "bkt", key, body) == st::no_such_key);
+
+    // An owner that started again is asked again before a copy of its keys is kept.
+    REQUIRE(c.put(owner, "bkt", key, pattern(3000, 13)).status == st::ok);
+    c.m[a]->store->hot_forget_owner(owner);
+    const uint64_t before = c.m[a]->node->counters().hot_holds_out;
+    REQUIRE(c.warm(a, "bkt", key));
+    CHECK(c.m[a]->node->counters().hot_holds_out == before + 1);
 }
 
 TEST_CASE("a change made while a drop of the key is on its way is answered only after that sibling has dropped it")
@@ -873,50 +906,36 @@ TEST_CASE("a sibling keeps nothing of a version its owner had replaced by the ti
     c.m[reader]->store->hot_put_foreign("bkt", "k", epoch, old_meta, old_body);
     c.settle();
     CHECK_FALSE(c.held(reader, "bkt", "k"));
-    // Nor of one deleted.
+    // Nor of one deleted while it was being read.
     REQUIRE(c.warm(reader, "bkt", "k"));
+    const uint64_t before_delete = c.m[reader]->store->hot_epoch();
     std::string cur_body;
     object_meta cur_meta;
     REQUIRE(c.get(reader, "bkt", "k", cur_body, &cur_meta) == st::ok);
     REQUIRE(c.del(3, "bkt", "k") == st::ok);
     CHECK_FALSE(c.held(reader, "bkt", "k"));
-    c.m[reader]->store->hot_put_foreign("bkt", "k", c.m[reader]->store->hot_epoch(), cur_meta, cur_body);
+    c.m[reader]->store->hot_put_foreign("bkt", "k", before_delete, cur_meta, cur_body);
     c.settle();
     CHECK_FALSE(c.held(reader, "bkt", "k"));
-}
 
-TEST_CASE("an owner that remembers too many readers has every sibling drop its keys, and tracks the readers after it")
-{
-    tmpdir d;
-    cluster c(d.path, 3);
-    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
-    const uint32_t owner = 0;
-    std::vector<std::string> keys;
-    for (int i = 0; keys.size() < 6; ++i)
-        if (object_owner("bkt", "obj" + std::to_string(i), 3) == owner)
-            keys.push_back("obj" + std::to_string(i));
-    for (const auto& k : keys)
-        REQUIRE(c.put(1, "bkt", k, pattern(1000, static_cast<unsigned>(k.size()))).status == st::ok);
-    c.m[owner]->node->set_holders_cap(4);
-
-    for (size_t i = 0; i < 4; ++i)
-        REQUIRE(c.warm(1, "bkt", keys[i]));
-    CHECK(c.m[owner]->node->counters().hot_holder_resets == 0);
-    CHECK(c.m[owner]->node->holders() == 4);
-    // The fifth goes past the cap: the siblings drop every copy of the owner's keys, that one too, and the owner forgets them.
-    CHECK_FALSE(c.warm(2, "bkt", keys[4]));
-    CHECK(c.m[owner]->node->counters().hot_holder_resets == 1);
-    for (size_t i = 0; i < 5; ++i)
-        CHECK(c.copies("bkt", keys[i]) == 0);
-    CHECK(c.m[owner]->node->holders() == 0);
-
-    // A copy kept after the reset is remembered and dropped by the next change.
-    REQUIRE(c.warm(1, "bkt", keys[5]));
-    CHECK(c.m[owner]->node->holders() == 1);
-    const uint64_t before = drops_sent(c);
-    REQUIRE(c.put(2, "bkt", keys[5], pattern(1000, 99)).status == st::ok);
-    CHECK(drops_sent(c) == before + 1);
-    CHECK(c.copies("bkt", keys[5]) == 0);
+    // A read of another key of the slot that began before the reader was dropped for the slot still asks, and is refused.
+    const std::string near = same_slot("bkt", "k", true);
+    REQUIRE(c.put(0, "bkt", near, pattern(3000, 3)).status == st::ok);
+    tmpdir d2;
+    cluster c2(d2.path, 4);
+    REQUIRE(c2.make_bucket(0, "bkt") == st::ok);
+    REQUIRE(c2.put(0, "bkt", "k", pattern(3000, 4)).status == st::ok);
+    REQUIRE(c2.put(0, "bkt", near, pattern(3000, 5)).status == st::ok);
+    const uint64_t early = c2.m[reader]->store->hot_epoch();
+    std::string near_body;
+    object_meta near_meta;
+    REQUIRE(c2.get(reader, "bkt", near, near_body, &near_meta) == st::ok);
+    REQUIRE(c2.put(2, "bkt", near, pattern(3000, 6)).status == st::ok);
+    REQUIRE(c2.warm(reader, "bkt", "k"));
+    REQUIRE(drops_sent(c2) == 0);
+    c2.m[reader]->store->hot_put_foreign("bkt", near, early, near_meta, near_body);
+    c2.settle();
+    CHECK_FALSE(c2.held(reader, "bkt", near));
 }
 
 TEST_CASE("a read of the old file that ends after the overwrite was answered is not kept")
@@ -1421,6 +1440,42 @@ TEST_CASE("the wire forms round-trip and refuse what is not theirs")
     CHECK_FALSE(wire::decode_hot_drop(wire::encode_remove("bkt", "a/key"), bucket, dk));
     for (size_t cut = 0; cut < drop.size(); ++cut)
         CHECK_FALSE(wire::decode_hot_drop(std::string_view(drop).substr(0, cut), bucket, dk));
+
+    // Holds asked together, each with the whole version read, and their answer a byte each.
+    {
+        std::vector<wire::hold_entry> asked(3);
+        for (size_t i = 0; i < asked.size(); ++i)
+        {
+            asked[i].bucket = "bkt" + std::to_string(i);
+            asked[i].key = "a/key" + std::to_string(i);
+            asked[i].meta.size = 100 + i;
+            asked[i].meta.mtime_ms = 1700000000000 + static_cast<int64_t>(i);
+            asked[i].meta.content_type = "text/plain";
+            asked[i].meta.extra = {{"x-amz-meta-n", std::to_string(i)}};
+        }
+        const std::string holds = wire::encode_hot_hold(2, asked.data(), asked.size());
+        uint32_t from = 0;
+        std::vector<wire::hold_entry> got;
+        REQUIRE(wire::decode_hot_hold(holds, from, got));
+        CHECK(from == 2);
+        REQUIRE(got.size() == asked.size());
+        for (size_t i = 0; i < got.size(); ++i)
+        {
+            CHECK(got[i].bucket == asked[i].bucket);
+            CHECK(got[i].key == asked[i].key);
+            CHECK(got[i].meta == asked[i].meta);
+        }
+        REQUIRE(wire::request_op(holds, o));
+        CHECK(o == wire::op::hot_hold);
+        for (size_t cut = 0; cut < holds.size(); ++cut)
+            CHECK_FALSE(wire::decode_hot_hold(std::string_view(holds).substr(0, cut), from, got));
+        CHECK_FALSE(wire::decode_hot_hold(holds + "x", from, got));
+        CHECK_FALSE(wire::decode_hot_hold(wire::encode_hot_hold(2, asked.data(), 0), from, got));
+        std::vector<uint8_t> held;
+        REQUIRE(wire::decode_held(wire::encode_held({1, 0, 1}), held));
+        CHECK(held == std::vector<uint8_t>{1, 0, 1});
+        CHECK_FALSE(wire::decode_held(wire::encode_status(st::io_error), held));
+    }
 
     REQUIRE(wire::decode_list(wire::encode_list("bkt", q), bucket, qb));
     CHECK(bucket == "bkt");

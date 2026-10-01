@@ -531,6 +531,7 @@ void storage_run::sweep()
 void storage_run::on_turn()
 {
     m_max_conns = m_owner.get_max_connections();
+    m_node.flush_holds();
 }
 
 void storage_run::stop()

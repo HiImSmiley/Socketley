@@ -13,9 +13,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
-#include "../../shared/transparent_string.h"
+#include "../../shared/cache_shard_map.h"
 #include "multipart.h"
 #include "object_store.h"
 #include "shard_wire.h"
@@ -59,8 +58,6 @@ struct shard_counters
     // Copies of another shard's key this shard asked to keep, and asks it answered for its own keys.
     uint64_t hot_holds_out{0};
     uint64_t hot_holds_in{0};
-    // Times this shard had every sibling drop its copies of this shard's keys because it remembered too many.
-    uint64_t hot_holder_resets{0};
 };
 
 class shard_node : public shard_peers
@@ -85,11 +82,12 @@ public:
     // Tells the siblings this shard has started, so they drop the copies they hold of its keys, which a
     // commit this shard died in may have replaced without their being told; `done` hears whether all answered.
     void announce_start(std::function<void(bool)> done);
-    // Every copy a sibling holds of this shard's keys is now one it asked about, so a drop goes only to those.
+    // Sends the holds asked for since the last call, one message per owner, which the runtime does once a turn.
+    void flush_holds();
+    // Every copy a sibling holds of this shard's keys is now in a slot it asked about, so a drop goes only to those.
     void trust_holders() { m_holders_known = true; }
-    // The most keys whose holders are remembered before the siblings are told to drop every copy of this shard's keys.
-    void set_holders_cap(size_t n) { m_holders_cap = m_reset_at = n; }
-    size_t holders() const { return m_holders.size() + m_holders_old.size(); }
+    // The siblings that may hold a copy of a key in `slot`.
+    uint64_t holders(uint32_t slot) const { return m_holders[slot]; }
 
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
     void create_bucket(std::string name, std::function<void(st)> cb);
@@ -149,11 +147,6 @@ private:
                    std::function<void(uint32_t peer, bool ok, std::string_view reply)> one,
                    std::function<void()> done, uint64_t mask = ~uint64_t{0});
 
-    const std::string& holder_id(std::string_view bucket, std::string_view key);
-    // The siblings that may hold a copy of the key, forgotten as they are returned because the drop empties them.
-    uint64_t take_holders(const std::string& id);
-    // Has every sibling drop its copies of this shard's keys, after which only the copies asked about since are remembered.
-    void reset_holders();
 
     void serve_mpu(wire::op o, std::string_view payload, std::function<void(bool ok, std::string reply)> reply);
     const mpu_upload* mpu_find(const std::string& bucket, const std::string& key, const std::string& id) const;
@@ -167,24 +160,13 @@ private:
     // The number of the last change shard 0 asked the others to prepare for.
     uint64_t m_doc_seq{0};
     std::string m_doc_fault;
-    // The siblings that may hold a copy of each of this shard's keys, by "bucket\0key", one bit per shard.
-    using holder_map = std::unordered_map<std::string, uint64_t, string_hash, string_equal>;
-    holder_map  m_holders;
-    // What was remembered before a reset, still told of a change until every sibling has answered the reset.
-    holder_map  m_holders_old;
-    // The siblings drops of a key are on their way to, until the last of those drops is answered.
-    struct dropping
-    {
-        uint64_t mask{0};
-        uint32_t count{0};
-    };
-    std::unordered_map<std::string, dropping, string_hash, string_equal> m_dropping;
+    // The siblings that may hold a copy of a key of each slot, one bit per shard, kept for the life of this shard
+    // so that a change never finds a sibling missing that an earlier change of the slot still had to tell.
+    std::vector<uint64_t> m_holders = std::vector<uint64_t>(cache_slot_count, 0);
     bool        m_holders_known{false};
-    bool        m_resetting{false};
-    size_t      m_holders_cap{size_t{1} << 16};
-    // The size past which the next reset starts, above the cap by what a sibling that did not answer one still holds.
-    size_t      m_reset_at{size_t{1} << 16};
-    std::string m_holder_id;
+    // The holds waiting for the end of the turn, by owner, and what each was asked with.
+    std::vector<std::vector<wire::hold_entry>>          m_hold_q;
+    std::vector<std::vector<std::function<void(bool)>>> m_hold_cb;
     std::shared_ptr<bool> m_alive;
 };
 

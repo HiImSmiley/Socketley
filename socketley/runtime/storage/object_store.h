@@ -41,6 +41,7 @@
 #include "object_format.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
+#include "../../shared/cache_shard_map.h"
 #include "../../shared/hash_pool.h"
 
 namespace socketley::storage
@@ -947,6 +948,8 @@ private:
     bool hot_foreign_fresh(std::string_view bucket, std::string_view key, uint64_t epoch);
     uint64_t m_drop_epoch{0};
     uint64_t m_drop_ring[drop_ring_size]{};
+    // For each slot of another shard, the drop epoch from which its owner drops this shard for any key of it, or 0.
+    std::vector<uint64_t> m_held_since = std::vector<uint64_t>(cache_slot_count, 0);
     uint64_t m_reserved{0};
     // Buckets with CORS rules, with lifecycle rules and with a policy.
     uint32_t m_cors_buckets{0};

@@ -1,6 +1,7 @@
 #include "../../shared/byte_codec.h"
 #include "shard_node.h"
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 
 #include "s3_names.h"
+#include "shard_owner.h"
 #include "shard_wire.h"
 #include "../../shared/logging.h"
 
@@ -147,14 +149,9 @@ void shard_node::invalidate(std::string bucket, std::string key, std::function<v
         done();
         return;
     }
-    const std::string id = holder_id(bucket, key);
-    uint64_t held = take_holders(id);
-    // A sibling an earlier drop of the key is still on its way to is told again, or this change could be answered first.
-    const auto inflight = m_dropping.find(id);
-    if (inflight != m_dropping.end())
-        held |= inflight->second.mask;
     // Until every sibling has answered this shard's start, one may hold a copy it never asked about.
-    const uint64_t mask = (m_holders_known ? held : ~uint64_t{0}) & ~(uint64_t{1} << m_store.shard()) &
+    const uint64_t held = m_holders_known ? m_holders[object_slot(bucket, key)] : ~uint64_t{0};
+    const uint64_t mask = held & ~(uint64_t{1} << m_store.shard()) &
                           (m_store.shards() >= 64 ? ~uint64_t{0} : (uint64_t{1} << m_store.shards()) - 1);
     if (mask == 0)
     {
@@ -162,89 +159,56 @@ void shard_node::invalidate(std::string bucket, std::string key, std::function<v
         return;
     }
     m_c.hot_drops_out += static_cast<uint64_t>(std::popcount(mask));
-    dropping& d = inflight != m_dropping.end() ? inflight->second : m_dropping[id];
-    d.mask |= mask;
-    ++d.count;
-    // A sibling that is gone holds nothing when it comes back, so it is not waited for, and is told again next time.
+    // A sibling that is gone holds nothing when it comes back, so it is not waited for.
     const std::string payload = wire::encode_hot_drop(bucket, key);
-    each_peer([payload](uint32_t) { return payload; },
-              [this, id](uint32_t peer, bool ok, std::string_view)
-              {
-                  if (!ok)
-                      m_holders[id] |= uint64_t{1} << peer;
-              },
-              [this, id, done = std::move(done)]()
-              {
-                  if (const auto it = m_dropping.find(id); it != m_dropping.end() && --it->second.count == 0)
-                      m_dropping.erase(it);
-                  done();
-              },
-              mask);
-}
-
-const std::string& shard_node::holder_id(std::string_view bucket, std::string_view key)
-{
-    m_holder_id.assign(bucket);
-    m_holder_id.push_back('\0');
-    m_holder_id.append(key);
-    return m_holder_id;
-}
-
-uint64_t shard_node::take_holders(const std::string& id)
-{
-    uint64_t held = 0;
-    for (holder_map* m : {&m_holders, &m_holders_old})
-        if (const auto it = m->find(id); it != m->end())
-        {
-            held |= it->second;
-            m->erase(it);
-        }
-    return held;
+    each_peer([payload](uint32_t) { return payload; }, [](uint32_t, bool, std::string_view) {}, std::move(done), mask);
 }
 
 void shard_node::hold(uint32_t owner, std::string bucket, std::string key, const object_meta& read,
                       std::function<void(bool)> cb)
 {
     ++m_c.hot_holds_out;
-    auto alive = m_alive;
-    m_transport.call(owner, wire::encode_hot_hold(m_store.shard(), bucket, key, read),
-        [this, alive, cb = std::move(cb)](bool ok, std::string_view reply)
-        {
-            if (!*alive)
-                return;
-            st s = st::io_error;
-            if (!ok || !wire::decode_status(reply, s))
-            {
-                ++m_c.peer_failures;
-                s = st::io_error;
-            }
-            cb(s == st::ok);
-        });
+    if (m_hold_q.size() < m_store.shards())
+    {
+        m_hold_q.resize(m_store.shards());
+        m_hold_cb.resize(m_store.shards());
+    }
+    m_hold_q[owner].push_back({std::move(bucket), std::move(key), read});
+    m_hold_cb[owner].push_back(std::move(cb));
 }
 
-void shard_node::reset_holders()
+void shard_node::flush_holds()
 {
-    ++m_c.hot_holder_resets;
-    m_resetting = true;
-    m_holders_old.swap(m_holders);
-    m_holders.clear();
-    auto failed = std::make_shared<uint64_t>(0);
-    auto alive  = m_alive;
-    each_peer([this](uint32_t) { return wire::encode_hot_owner_started(m_store.shard()); },
-              [failed](uint32_t peer, bool ok, std::string_view) { if (!ok) *failed |= uint64_t{1} << peer; },
-              [this, alive, failed]()
-              {
-                  if (!*alive)
-                      return;
-                  // A sibling that did not answer may still hold what it asked about, so that much is kept.
-                  if (*failed)
-                      for (const auto& [id, held] : m_holders_old)
-                          if (held & *failed)
-                              m_holders[id] |= held & *failed;
-                  m_holders_old.clear();
-                  m_resetting = false;
-                  m_reset_at = m_holders.size() + m_holders_cap;
-              });
+    for (uint32_t owner = 0; owner < m_hold_q.size(); ++owner)
+    {
+        auto& q = m_hold_q[owner];
+        if (q.empty())
+            continue;
+        auto alive = m_alive;
+        for (size_t at = 0; at < q.size(); at += wire::max_holds)
+        {
+            const size_t n = std::min(wire::max_holds, q.size() - at);
+            auto cbs = std::make_shared<std::vector<std::function<void(bool)>>>(
+                std::make_move_iterator(m_hold_cb[owner].begin() + static_cast<ptrdiff_t>(at)),
+                std::make_move_iterator(m_hold_cb[owner].begin() + static_cast<ptrdiff_t>(at + n)));
+            m_transport.call(owner, wire::encode_hot_hold(m_store.shard(), q.data() + at, n),
+                [this, alive, cbs](bool ok, std::string_view reply)
+                {
+                    if (!*alive)
+                        return;
+                    std::vector<uint8_t> held;
+                    if (!ok || !wire::decode_held(reply, held) || held.size() != cbs->size())
+                    {
+                        ++m_c.peer_failures;
+                        held.assign(cbs->size(), 0);
+                    }
+                    for (size_t i = 0; i < cbs->size(); ++i)
+                        (*cbs)[i](held[i] != 0);
+                });
+        }
+        q.clear();
+        m_hold_cb[owner].clear();
+    }
 }
 
 void shard_node::announce_start(std::function<void(bool)> done)
@@ -1208,26 +1172,25 @@ void shard_node::serve(std::string_view payload, std::function<void(bool, std::s
         case wire::op::hot_hold:
         {
             uint32_t from = 0;
-            std::string bucket, key;
-            object_meta read;
-            if (!wire::decode_hot_hold(payload, from, bucket, key, read) || from >= m_store.shards() ||
-                from == m_store.shard())
+            std::vector<wire::hold_entry> asked;
+            if (!wire::decode_hot_hold(payload, from, asked) || from >= m_store.shards() || from == m_store.shard())
             {
                 reply(false, {});
                 return;
             }
-            ++m_c.hot_holds_in;
-            // Only the version the index names may be kept, and the change that replaces it will drop it.
-            const object_meta* cur = m_store.owns(bucket, key) ? m_store.find(bucket, key) : nullptr;
-            if (!cur || !(*cur == read))
+            m_c.hot_holds_in += asked.size();
+            std::vector<uint8_t> held(asked.size(), 0);
+            for (size_t i = 0; i < asked.size(); ++i)
             {
-                reply(true, wire::encode_status(st::no_such_key));
-                return;
+                const wire::hold_entry& e = asked[i];
+                // Only the version the index names may be kept, and the change that replaces it will drop it.
+                const object_meta* cur = m_store.owns(e.bucket, e.key) ? m_store.find(e.bucket, e.key) : nullptr;
+                if (!cur || !(*cur == e.meta))
+                    continue;
+                m_holders[object_slot(e.bucket, e.key)] |= uint64_t{1} << from;
+                held[i] = 1;
             }
-            m_holders[holder_id(bucket, key)] |= uint64_t{1} << from;
-            if (!m_resetting && m_holders.size() > m_reset_at)
-                reset_holders();
-            reply(true, wire::encode_status(st::ok));
+            reply(true, wire::encode_held(held));
             return;
         }
         case wire::op::hot_owner_started:

@@ -156,24 +156,55 @@ bool decode_hot_owner_started(std::string_view payload, uint32_t& shard)
     return open_request(r, op::hot_owner_started) && r.u32(shard);
 }
 
-std::string encode_hot_hold(uint32_t shard, std::string_view bucket, std::string_view key, const object_meta& meta)
+std::string encode_hot_hold(uint32_t shard, const hold_entry* entries, size_t n)
 {
     bytes::writer w = begin(op::hot_hold);
     w.u32(shard);
-    w.bytes(bucket);
+    w.u32(static_cast<uint32_t>(n));
     std::string rec;
-    encode_put_record(rec, key, meta);
-    w.bytes(rec);
+    for (size_t i = 0; i < n; ++i)
+    {
+        w.bytes(entries[i].bucket);
+        rec.clear();
+        encode_put_record(rec, entries[i].key, entries[i].meta);
+        w.bytes(rec);
+    }
     return w.take();
 }
 
-bool decode_hot_hold(std::string_view payload, uint32_t& shard, std::string& bucket, std::string& key,
-                     object_meta& meta)
+bool decode_hot_hold(std::string_view payload, uint32_t& shard, std::vector<hold_entry>& out)
 {
     bytes::reader r(payload);
-    std::string_view rec;
-    return open_request(r, op::hot_hold) && r.u32(shard) && r.bytes(bucket, name_cap) && r.view(rec, record_cap) &&
-           decode_record(rec, key, meta);
+    uint32_t n = 0;
+    if (!open_request(r, op::hot_hold) || !r.u32(shard) || !r.u32(n) || n == 0 || n > max_holds)
+        return false;
+    out.resize(n);
+    for (hold_entry& e : out)
+    {
+        std::string_view rec;
+        if (!r.bytes(e.bucket, name_cap) || !r.view(rec, record_cap) || !decode_record(rec, e.key, e.meta))
+            return false;
+    }
+    return r.left() == 0;
+}
+
+std::string encode_held(const std::vector<uint8_t>& held)
+{
+    bytes::writer w;
+    w.u8(static_cast<uint8_t>(st::ok));
+    w.bytes(std::string_view(reinterpret_cast<const char*>(held.data()), held.size()));
+    return w.take();
+}
+
+bool decode_held(std::string_view reply, std::vector<uint8_t>& held)
+{
+    bytes::reader r(reply);
+    st s = st::io_error;
+    std::string_view v;
+    if (!status_byte(r, s) || s != st::ok || !r.view(v, max_holds))
+        return false;
+    held.assign(v.begin(), v.end());
+    return true;
 }
 
 std::string encode_doc(op o, bucket_doc kind, std::string_view bucket, std::string_view xml, uint64_t seq)

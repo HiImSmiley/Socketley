@@ -95,10 +95,20 @@ std::string encode_hot_drop(std::string_view bucket, std::string_view key);
 bool        decode_hot_drop(std::string_view payload, std::string& bucket, std::string& key);
 std::string encode_hot_owner_started(uint32_t shard);
 bool        decode_hot_owner_started(std::string_view payload, uint32_t& shard);
-// The shard asking, and the version of the key it read.
-std::string encode_hot_hold(uint32_t shard, std::string_view bucket, std::string_view key, const object_meta& meta);
-bool        decode_hot_hold(std::string_view payload, uint32_t& shard, std::string& bucket, std::string& key,
-                            object_meta& meta);
+// A key a sibling read and the version it read, one of the holds it asks an owner for in one message.
+struct hold_entry
+{
+    std::string bucket;
+    std::string key;
+    object_meta meta;
+};
+// The most holds one message carries.
+inline constexpr size_t max_holds = 256;
+std::string encode_hot_hold(uint32_t shard, const hold_entry* entries, size_t n);
+bool        decode_hot_hold(std::string_view payload, uint32_t& shard, std::vector<hold_entry>& out);
+// The answer to a message of holds: a byte per hold, 1 where the version read is the one indexed.
+std::string encode_held(const std::vector<uint8_t>& held);
+bool        decode_held(std::string_view reply, std::vector<uint8_t>& held);
 
 std::string encode_list(std::string_view bucket, const list_query& q);
 bool        decode_list(std::string_view payload, std::string& bucket, list_query& q);
