@@ -45,6 +45,10 @@
 #     while it lasts; a pair tainted by the global budget; a fast pair entered
 #     and never tainted -- red with the sk_msg program's taint count removed,
 #     and with the sockops program's entry count removed
+#   * fast_lo_held_bytes not what the stalled receiver's socket holds, which
+#     after the taint is whatever it has not yet read -- red with the sweep's
+#     store of the held gauge removed, which leaves the answer's figure stale
+#     once the receiver reads below it (every Sanitize run; Release by chance)
 #
 # The bound cases need CAP_BPF and CAP_NET_ADMIN, given to a copy of the binary
 # with `sudo -n setcap`; without sudo they are skipped.
@@ -81,6 +85,10 @@ MPORT=$((SL_PORT_BASE + 1838))
 cat >"$WORK/metrics.lua" <<LUA
 daemon = { metrics_port = $MPORT }
 LUA
+
+# A socket's receive memory as the kernel counts it, the redirected backlog
+# included: the largest among the established sockets on local port $1.
+rmem_of(){ local v; v=$(ss -tmnH "( sport = :$1 )" | grep -oE 'skmem:\(r[0-9]+' | grep -oE '[0-9]+$' | sort -n | tail -1) || true; echo "${v:-0}"; }
 
 # One figure out of `daemon stats`.
 figure(){ { grep -oE "^$1:[0-9]+" <<<"$2" || echo "$1:-1"; } | head -1 | cut -d: -f2; }
@@ -254,9 +262,20 @@ attached
 backend "$WORK/pecho.py" "$BEPORT" 3
 "$BIN" create proxy px -p "$PXPORT" --backend "127.0.0.1:$BEPORT" --protocol tcp -s >/dev/null; wait_port "$PXPORT" || true
 python3 "$WORK/flood.py" "$PXPORT" 3 64 "$PXPORT" >"$WORK/flood.out" 2>&1 & FLPID=$!
-# Mid-stall, after at least one sweep: the figures an operator would read.
-sleep 2
-MID=$("$BIN" daemon stats 2>&1 || true)
+# Mid-stall, once a sweep has seen the taint and the receiver's queue holds
+# still across the read: held_bytes is that sweep's measurement of the queue,
+# which the receiver may have drained below the bound since the taint.
+MID=""; HELD=-1; KERN=-1
+while kill -0 "$FLPID" 2>/dev/null; do
+    K1=$(rmem_of "$PXPORT"); S=$("$BIN" daemon stats 2>&1 || true); K2=$(rmem_of "$PXPORT")
+    MID=$S
+    if [ $(( $(figure fast_lo_tainted_bound "$S") + $(figure fast_lo_tainted_unanswered "$S") )) -ge 1 ] &&
+       [ "$(figure fast_lo_sockets_tcp "$S")" -ge 1 ] && [ "$K1" = "$K2" ] && [ "$K1" -ge 262144 ]; then
+        HELD=$(figure fast_lo_held_bytes "$S"); KERN=$K1
+        [ $(( HELD > KERN ? HELD - KERN : KERN - HELD )) -le 65536 ] && break
+    fi
+    sleep 0.05
+done
 SCRAPE=$(python3 -c "import sys,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:%s/metrics' % sys.argv[1], timeout=5).read().decode())" "$MPORT" 2>&1 || true)
 wait "$FLPID" || true
 R=$(cat "$WORK/flood.out")
@@ -270,9 +289,9 @@ else fail "per-pair bound" "the proxy's backlog stays near the 4 MiB ceiling and
 if grep -q '^fast_lo:all$' <<<"$MID" && [ "$(figure fast_lo_entered "$MID")" -ge 2 ] &&
    [ $(( $(figure fast_lo_tainted_bound "$MID") + $(figure fast_lo_tainted_unanswered "$MID") )) -ge 1 ] &&
    [ "$(figure fast_lo_sockets_tcp "$MID")" -ge 1 ] &&
-   [ "$(figure fast_lo_held_bytes "$MID")" -ge 3145728 ]; then pass
-else fail "stats: stalled" "daemon stats shows the pair entered, stopped at its bound (bound, or unanswered on a loaded box), on TCP, and ~4 MiB held" \
-    "$(tr '\n' ' ' <<<"$MID")"; fi
+   [ "$KERN" -ge 262144 ] && [ $(( HELD > KERN ? HELD - KERN : KERN - HELD )) -le 65536 ]; then pass
+else fail "stats: stalled" "daemon stats shows the pair entered, stopped at its bound (bound, or unanswered on a loaded box), on TCP, and held_bytes equal to the stalled receiver's queue" \
+    "held=$HELD kernel=$KERN (kernel>=256 KiB, within 64 KiB)" "$(tr '\n' ' ' <<<"$MID")"; fi
 if grep -q 'socketley_fast_lo_info{mode="all"} 1' <<<"$SCRAPE" &&
    grep -qE 'socketley_fast_lo_tainted_total\{reason="(bound|unanswered)"\} [1-9]' <<<"$SCRAPE" &&
    grep -qE 'socketley_fast_lo_sockets\{path="tcp"\} [1-9]' <<<"$SCRAPE"; then pass
