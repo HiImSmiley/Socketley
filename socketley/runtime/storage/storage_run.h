@@ -492,7 +492,9 @@ public:
     void op_put_object(const std::shared_ptr<conn>& c);
     void start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
                    put_op::committer committer, checksum_algo forced_algo = checksum_algo::none,
-                   bool create_only = false);
+                   bool create_only = false, const part_place& place = {});
+    // The size the body will have, and whether the request says it.
+    static bool body_length(const conn& c, uint64_t& expected);
     void op_copy_object(const std::shared_ptr<conn>& c);
 
     // Multipart, in storage_multipart.cpp.
@@ -503,7 +505,9 @@ public:
     void op_abort_multipart(const std::shared_ptr<conn>& c);
     void op_list_parts(const std::shared_ptr<conn>& c);
     void op_list_uploads(const std::shared_ptr<conn>& c);
-    void with_open_upload(const std::shared_ptr<conn>& c, std::function<void(checksum_algo)> go);
+    // `number` and its body's size ask for a place in the upload's data file, which `go` is given.
+    void with_open_upload(const std::shared_ptr<conn>& c, uint32_t number,
+                          std::function<void(checksum_algo, part_place)> go);
     void op_upload_part_copy_from(const std::shared_ptr<conn>& c, uint32_t number, checksum_algo algo,
                                   const std::string& src_bucket, const std::string& src_key,
                                   const object_meta& src_meta);

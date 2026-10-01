@@ -288,6 +288,7 @@ public:
     bool submit_renameat(int olddir, const char* oldpath, int newdir, const char* newpath,
                          io_request* req, bool link);
     bool submit_unlinkat(int dir, const char* path, io_request* req, int flags = 0);
+    bool submit_linkat(int olddir, const char* oldpath, int newdir, const char* newpath, io_request* req);
     // Completes with the new descriptor or a negative errno, and the path must
     // stay valid until it does because the kernel may read it late.
     bool submit_openat(int dir, const char* path, int flags, mode_t mode, io_request* req);

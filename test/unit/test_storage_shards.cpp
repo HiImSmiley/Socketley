@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // N stores on one directory in one process, as N shards of one runtime are on
@@ -361,14 +362,35 @@ struct cluster : shard_transport
         return id;
     }
 
+    // Asks the upload's owner first, as the runtime does, and writes into the data file where it is given a place.
     st mpu_put_part(uint32_t s, const std::string& bucket, const std::string& key, const std::string& id,
-                    uint32_t number, const std::string& body)
+                    uint32_t number, const std::string& body, part_place* given = nullptr)
     {
+        st began = st::io_error;
+        part_place place;
+        bool asked = false;
+        m[s]->node->mpu_begin(bucket, key, id, number, body.size(), true, [&](st r, checksum_algo, part_place p)
+        {
+            began = r;
+            place = std::move(p);
+            asked = true;
+        });
+        REQUIRE(until([&] { return asked; }));
+        if (began != st::ok)
+            return began;
+        if (given)
+            *given = place;
+        object_meta meta;
+        if (place.off)
+            meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(place.off));
         st why = st::ok;
-        auto op = m[s]->store->begin_put(bucket, "mpu/" + id + "/" + std::to_string(number), {}, body.size(), true, why);
+        auto op = m[s]->store->begin_put(bucket, "mpu/" + id + "/" + std::to_string(number), std::move(meta),
+                                         body.size(), true, why);
         if (!op)
             return why;
         op->set_committer(m[s]->node->mpu_part_committer(bucket, key, id, number));
+        if (place.off)
+            op->place_body(place.path, place.off, place.room);
         size_t off = 0;
         while (off < body.size() && !op->failed())
         {
@@ -1543,4 +1565,114 @@ TEST_CASE("a restarted shard leaves a sibling's upload being made alone, and rem
         cluster c(d.path, 1);
         CHECK_FALSE(fs::exists(d.path + "/bkt/mpu/0123456789abcdef0123456789abcdef"));
     }
+}
+
+TEST_CASE("parts written in place through any shard become the object without a copy, completed through another")
+{
+    tmpdir d;
+    cluster c(d.path, 4);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    const std::string key = key_owned_by("bkt", 2, 4, "inplace");
+    const std::string id = c.mpu_create(3, "bkt", key);
+    const uint64_t base = c.m[2]->mpu->find("bkt", id)->place_base;
+
+    // Each part through another shard, and the owner says where each goes.
+    const size_t P = 5u << 20;
+    const std::string p1 = pattern(P, 41), p2 = pattern(P, 42), p3 = pattern(P, 43), p4 = pattern(4321, 44);
+    const std::vector<std::pair<uint32_t, const std::string*>> parts = {{3, &p3}, {1, &p1}, {4, &p4}, {2, &p2}};
+    uint32_t via = 0;
+    for (const auto& [n, body] : parts)
+    {
+        part_place g;
+        REQUIRE(c.mpu_put_part(via++ % 4, "bkt", key, id, n, *body, &g) == st::ok);
+        CHECK(g.off == base + (n - 1) * P);
+    }
+    // A second upload of a number through yet another shard is not given its place again.
+    part_place again;
+    REQUIRE(c.mpu_put_part(1, "bkt", key, id, 2, p2, &again) == st::ok);
+    CHECK(again.off == 0);
+    REQUIRE(c.mpu_put_part(0, "bkt", key, id, 2, p2, &again) == st::ok);
+    CHECK(again.off == 0);
+    // So part 2 is in its own file now, and the completion copies.
+    CHECK(!c.m[2]->mpu->find("bkt", id)->parts.at(2).in_place);
+
+    const std::string id2 = c.mpu_create(0, "bkt", key);
+    via = 1;
+    for (const auto& [n, body] : parts)
+        REQUIRE(c.mpu_put_part(via++ % 4, "bkt", key, id2, n, *body) == st::ok);
+    struct stat sb{};
+    REQUIRE(::stat((d.path + "/bkt/mpu/" + id2 + "/data").c_str(), &sb) == 0);
+    const ino_t data_ino = sb.st_ino;
+
+    // Completed through shard 1, which links the data file and has the key's owner commit it.
+    const complete_result done = c.mpu_complete(1, "bkt", key, id2, {{1, p1}, {2, p2}, {3, p3}, {4, p4}});
+    REQUIRE(done.error.code.empty());
+    CHECK(done.meta.parts == 4);
+    struct stat ob{};
+    REQUIRE(::stat((d.path + "/bkt/data/" + object_rel_path(key)).c_str(), &ob) == 0);
+    CHECK(ob.st_ino == data_ino);
+    for (uint32_t s = 0; s < 4; ++s)
+    {
+        std::string got;
+        REQUIRE(c.get(s, "bkt", key, got) == st::ok);
+        CHECK(got == p1 + p2 + p3 + p4);
+    }
+    CHECK(c.until([&] { return !fs::exists(d.path + "/bkt/mpu/" + id2); }));
+
+    // The first upload, whose part 2 was sent again, completes by copying through shard 3.
+    const complete_result done1 = c.mpu_complete(3, "bkt", key, id, {{1, p1}, {2, p2}, {3, p3}, {4, p4}});
+    REQUIRE(done1.error.code.empty());
+    REQUIRE(::stat((d.path + "/bkt/data/" + object_rel_path(key)).c_str(), &ob) == 0);
+    CHECK(ob.st_ino != data_ino);
+    std::string got;
+    REQUIRE(c.get(2, "bkt", key, got) == st::ok);
+    CHECK(got == p1 + p2 + p3 + p4);
+    CHECK(c.tmp_empties("bkt"));
+}
+
+TEST_CASE("the wire carries a part's place and a plan made without a copy")
+{
+    wire::mpu_ref ref{"bkt", "k", std::string(32, 'a'), 7, 0, true, 5ull << 30};
+    wire::mpu_ref back;
+    REQUIRE(wire::decode_mpu_ref(wire::encode_mpu_ref(wire::op::mpu_begin, ref), wire::op::mpu_begin, back));
+    CHECK(back.a == 7);
+    CHECK(back.flag);
+    CHECK(back.size == 5ull << 30);
+
+    part_place place{4096 + (6ull << 30), 5u << 20, "ignored"};
+    st s = st::io_error;
+    checksum_algo algo = checksum_algo::none;
+    part_place got;
+    const std::string enc = wire::encode_mpu_begin(st::ok, checksum_algo::crc32c, place);
+    REQUIRE(wire::decode_mpu_begin(enc, s, algo, got));
+    CHECK(s == st::ok);
+    CHECK(algo == checksum_algo::crc32c);
+    CHECK(got.off == place.off);
+    CHECK(got.room == place.room);
+    CHECK(got.path.empty());
+    for (size_t cut = 0; cut < enc.size(); ++cut)
+        CHECK_FALSE(wire::decode_mpu_begin(std::string_view(enc).substr(0, cut), s, algo, got));
+
+    assemble_plan plan;
+    plan.bucket = "bkt";
+    plan.id     = std::string(32, 'b');
+    plan.key    = "k";
+    plan.in_place = true;
+    mpu_part p;
+    p.number   = 1;
+    p.size     = 5u << 20;
+    p.data_off = 8192;
+    p.in_place = true;
+    plan.parts.push_back(p);
+    s3_error err;
+    assemble_plan pb;
+    const std::string pe = wire::encode_mpu_plan({}, plan);
+    REQUIRE(wire::decode_mpu_plan(pe, err, pb));
+    CHECK(err.code.empty());
+    CHECK(pb.in_place);
+    REQUIRE(pb.parts.size() == 1);
+    CHECK(pb.parts[0].in_place);
+    CHECK(pb.parts[0].data_off == 8192);
+    for (size_t cut = 0; cut < pe.size(); ++cut)
+        CHECK_FALSE(wire::decode_mpu_plan(std::string_view(pe).substr(0, cut), err, pb));
 }

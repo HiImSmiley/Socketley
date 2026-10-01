@@ -86,9 +86,11 @@ public:
     void set_multipart(multipart_store* mpu) { m_mpu = mpu; }
     void mpu_create(std::string bucket, std::string key, object_meta meta, checksum_algo algo,
                     std::function<void(st, std::string)> cb);
-    // no_such_key when the upload is missing, on its way out, or sealed.
-    void mpu_begin(std::string bucket, std::string key, std::string id,
-                   std::function<void(st, checksum_algo)> cb);
+    // no_such_key when the upload is missing, on its way out, or sealed.  Part `number`
+    // (0 for one that is copied) of `expected` bytes when `known` is given its place in
+    // the upload's data file, decided by the owner so each place is given once.
+    void mpu_begin(std::string bucket, std::string key, std::string id, uint32_t number, uint64_t expected,
+                   bool known, std::function<void(st, checksum_algo, part_place)> cb);
     put_op::committer mpu_part_committer(std::string bucket, std::string key, std::string id, uint32_t number);
     void mpu_complete(std::string bucket, std::string key, std::string id, std::vector<complete_part> parts,
                       std::function<void()> progress, std::function<void(complete_result)> cb);

@@ -83,8 +83,8 @@ std::string encode_mpu_create(std::string_view bucket, std::string_view key, con
 bool        decode_mpu_create(std::string_view payload, std::string& bucket, std::string& key,
                               object_meta& meta, checksum_algo& algo);
 
-// The requests that name an upload and carry at most two numbers and a flag:
-// begin, abort, a page of parts (marker, max) and finish (ok).
+// The requests that name an upload and carry at most three numbers and a flag:
+// begin (part number, body size, size known), abort, a page of parts (marker, max) and finish (ok).
 struct mpu_ref
 {
     std::string bucket;
@@ -93,6 +93,7 @@ struct mpu_ref
     uint32_t    a{0};
     uint32_t    b{0};
     bool        flag{false};
+    uint64_t    size{0};
 };
 std::string encode_mpu_ref(op o, const mpu_ref& r);
 bool        decode_mpu_ref(std::string_view payload, op want, mpu_ref& r);
@@ -106,8 +107,9 @@ bool        decode_mpu_prepare(std::string_view payload, mpu_ref& r, std::vector
 // ── Replies ─────────────────────────────────────────────────────────────────
 std::string encode_mpu_created(st s, std::string_view id);
 bool        decode_mpu_created(std::string_view reply, st& s, std::string& id);
-std::string encode_mpu_begin(st s, checksum_algo algo);
-bool        decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo);
+// The place is the part's in the upload's data file, off 0 for a file of its own; the path is not sent.
+std::string encode_mpu_begin(st s, checksum_algo algo, const part_place& place = {});
+bool        decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo, part_place& place);
 // An empty error code is a plan.
 std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan);
 bool        decode_mpu_plan(std::string_view reply, s3_error& err, assemble_plan& plan);

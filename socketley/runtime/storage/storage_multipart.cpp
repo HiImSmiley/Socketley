@@ -37,7 +37,8 @@ bool parse_u64(std::string_view s, uint64_t& out) { return parse_number(s, out);
 // Asks the shard that owns the upload whether it can take a part, and runs `go`
 // with the checksum algorithm the upload has; answers NoSuchUpload itself when it
 // cannot.  The body of a part is not read while the owner is being asked.
-void storage_run::with_open_upload(const std::shared_ptr<conn>& c, std::function<void(checksum_algo)> go)
+void storage_run::with_open_upload(const std::shared_ptr<conn>& c, uint32_t number,
+                                   std::function<void(checksum_algo, part_place)> go)
 {
     const s3_request& r = c->req;
     if (!m_store.has_bucket(r.bucket))
@@ -48,9 +49,11 @@ void storage_run::with_open_upload(const std::shared_ptr<conn>& c, std::function
     const bool remote = !m_store.owns(r.bucket, r.key);
     if (remote)
         c->ph = phase::hook_wait;
+    uint64_t expected = 0;
+    const bool known  = number != 0 && body_length(*c, expected);
     std::weak_ptr<conn> weak = c;
-    m_node.mpu_begin(r.bucket, r.key, std::string(r.get_query("uploadId")),
-        [this, weak, go = std::move(go)](st s, checksum_algo algo)
+    m_node.mpu_begin(r.bucket, r.key, std::string(r.get_query("uploadId")), number, expected, known,
+        [this, weak, go = std::move(go)](st s, checksum_algo algo, part_place place)
         {
             auto cc = weak.lock();
             if (!cc || cc->dead)
@@ -66,7 +69,7 @@ void storage_run::with_open_upload(const std::shared_ptr<conn>& c, std::function
                 send_error(cc, make_error("NoSuchUpload"), false, "UploadId", cc->req.get_query("uploadId"));
                 return;
             }
-            go(algo);
+            go(algo, std::move(place));
         });
 }
 
@@ -153,7 +156,7 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
         return;
 
     std::weak_ptr<conn> weak = c;
-    with_open_upload(c, [this, weak, number, keep_alive](checksum_algo algo)
+    with_open_upload(c, number, [this, weak, number, keep_alive](checksum_algo algo, part_place place)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)
@@ -164,7 +167,8 @@ void storage_run::op_upload_part(const std::shared_ptr<conn>& c)
         // The part's own header names it by upload and number, since it is not an object.
         const std::string part_key = "mpu/" + id + "/" + std::to_string(number);
         ++m_c.mpu_parts;
-        start_put(cc, part_key, object_meta{}, m_node.mpu_part_committer(q.bucket, q.key, id, number), algo);
+        start_put(cc, part_key, object_meta{}, m_node.mpu_part_committer(q.bucket, q.key, id, number), algo, false,
+                  place);
     });
 }
 
@@ -190,7 +194,7 @@ void storage_run::op_upload_part_copy(const std::shared_ptr<conn>& c)
     }
 
     std::weak_ptr<conn> weak = c;
-    with_open_upload(c, [this, weak, number, src_bucket, src_key](checksum_algo algo)
+    with_open_upload(c, 0, [this, weak, number, src_bucket, src_key](checksum_algo algo, part_place)
     {
         auto cc = weak.lock();
         if (!cc || cc->dead)

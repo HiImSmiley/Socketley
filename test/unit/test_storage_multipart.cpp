@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // The pieces multipart and SigV4 are made of that need no daemon: the checksums
@@ -331,22 +332,30 @@ struct rig : io_handler
         return id;
     }
 
-    // A part through the streaming path, the way the runtime takes one.
+    // A part through the streaming path, the way the runtime takes one: written into
+    // the upload's data file when its owner gives it a place there.
     put_result part(const std::string& b, const std::string& id, uint32_t n, const std::string& body,
-                    bool wait = true)
+                    bool wait = true, part_place* given = nullptr)
     {
         checksum_algo algo = checksum_algo::none;
-        if (mp->begin_part(b, id, algo) != st::ok)
+        part_place place;
+        if (mp->begin_part(b, id, n, body.size(), true, algo, place) != st::ok)
             return {st::cancelled, {}};
+        if (given)
+            *given = place;
         object_meta meta;
         if (algo != checksum_algo::none)
             meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
+        if (place.off)
+            meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(place.off));
         st why = st::ok;
         auto op = store->begin_put(b, "mpu/" + id + "/" + std::to_string(n), std::move(meta), body.size(), true, why);
         REQUIRE(op);
         if (algo != checksum_algo::none)
             op->track_checksum(algo, {});
         op->set_committer(mp->part_committer(b, id, n));
+        if (place.off)
+            op->place_body(place.path, place.off, place.room);
         size_t off = 0;
         while (off < body.size())
         {
@@ -444,7 +453,11 @@ TEST_CASE("parts are assembled into one object with the multipart ETag and the m
     CHECK(up->parts.size() == 3);
     CHECK(up->held == p1.size() + p2.size() + p3.size());
     CHECK(r.mp->totals().bytes == up->held);
-    CHECK(names_in(d.path + "/bkt/mpu/" + id) == std::vector<std::string>{"1", "2", "3", "meta"});
+    CHECK(names_in(d.path + "/bkt/mpu/" + id) == std::vector<std::string>{"1", "2", "3", "data", "meta"});
+    // Part 3 came first and is too small to fix a part size, part 1 fixed it and part 2 is bigger than it.
+    CHECK(!up->parts.at(3).in_place);
+    CHECK(up->parts.at(1).in_place);
+    CHECK(!up->parts.at(2).in_place);
 
     const complete_result done = r.finish("bkt", id, {{1, hex(md5_of(p1)), {}, {}}, {2, hex(md5_of(p2)), {}, {}}, {3, hex(md5_of(p3)), {}, {}}});
     REQUIRE(done.error.code.empty());
@@ -464,6 +477,7 @@ TEST_CASE("parts are assembled into one object with the multipart ETag and the m
 
     // The upload goes away: its directory, its bytes in the quota, its place in the map.
     REQUIRE(r.until([&] { return r.mp->find("bkt", id) == nullptr; }));
+    CHECK(r.until([&] { return !r.mp->busy(); }));
     CHECK(!fs::exists(d.path + "/bkt/mpu/" + id));
     CHECK(r.mp->totals().uploads == 0);
     CHECK(names_in(d.path + "/bkt/tmp").empty());
@@ -632,6 +646,10 @@ TEST_CASE("uploads and their parts are found again by a new store on the same di
     CHECK(u1->parts.at(1).md5 == md5_of(p1));
     CHECK(u1->parts.at(2).size == p2.size());
     CHECK(u1->parts.at(1).checksum_b64 == b64_of(checksum_algo::sha256, p1));
+    // Both were written in the data file, which a start reads from and gives no more places in.
+    CHECK(u1->parts.at(1).in_place);
+    CHECK(u1->parts.at(2).in_place);
+    CHECK(u1->place_frozen);
     CHECK(u2->parts.empty());
     CHECK(!fs::exists(d.path + "/bkt/mpu/" + junk));
     CHECK(!fs::exists(d.path + "/bkt/mpu/" + id2 + "/stray"));
@@ -641,6 +659,9 @@ TEST_CASE("uploads and their parts are found again by a new store on the same di
     CHECK(again.mp->totals().bytes == p1.size() + p2.size());
 
     // A restored upload is a working one.
+    part_place g;
+    REQUIRE(again.part("bkt", id1, 3, std::string(5 * MiB, 't'), true, &g).status == st::ok);
+    CHECK(g.off == 0);
     REQUIRE(again.part("bkt", id1, 3, "tail").status == st::ok);
     // Part 2 is small and not used; the object is parts 1 and 3.
     const complete_result done = again.finish("bkt", id1, {{1, hex(md5_of(p1)), checksum_algo::sha256, b64_of(checksum_algo::sha256, p1)},
@@ -700,4 +721,222 @@ TEST_CASE("the parts count against the quota and complete gives them back")
         op2->abort();
     for (int i = 0; i < 100; ++i)
         r.loop.poll_completions(1);
+}
+
+// ─── Parts written where the object needs them ──────────────────────────────
+
+namespace {
+
+ino_t inode_of(const std::string& path)
+{
+    struct stat sb{};
+    return ::stat(path.c_str(), &sb) == 0 ? sb.st_ino : 0;
+}
+
+complete_part listed(uint32_t n, const std::string& body)
+{
+    return {n, hex(md5_of(body)), {}, {}};
+}
+
+}   // namespace
+
+TEST_CASE("equal parts are written into the data file at their place and the file becomes the object")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.bucket("bkt");
+    object_meta meta;
+    meta.content_type = "text/y";
+    meta.extra.emplace_back("x-amz-meta-z", "1");
+    const std::string id = r.create("bkt", "in/place", checksum_algo::crc32, meta);
+    const mpu_upload* up = r.mp->find("bkt", id);
+    REQUIRE(up);
+    REQUIRE(up->place_base >= 4096);
+
+    // Out of order, and the short last part before two of the others.
+    const size_t P = 5 * MiB;
+    const std::string p1 = pattern(P, 1), p2 = pattern(P, 2), p3 = pattern(P, 3), p4 = pattern(777777, 4);
+    const std::vector<std::pair<uint32_t, const std::string*>> order = {{2, &p2}, {4, &p4}, {1, &p1}, {3, &p3}};
+    for (const auto& [n, body] : order)
+    {
+        part_place g;
+        REQUIRE(r.part("bkt", id, n, *body, true, &g).status == st::ok);
+        CHECK(g.off == up->place_base + (n - 1) * P);
+        CHECK(up->parts.at(n).in_place);
+        CHECK(up->parts.at(n).data_off == g.off);
+    }
+    // The numbered files are headers alone, and the data file ends where the last part does.
+    CHECK(fs::file_size(d.path + "/bkt/mpu/" + id + "/1") == 4096);
+    CHECK(fs::file_size(d.path + "/bkt/mpu/" + id + "/data") == up->place_base + 3 * P + p4.size());
+    const ino_t data_ino = inode_of(d.path + "/bkt/mpu/" + id + "/data");
+    REQUIRE(data_ino != 0);
+
+    const complete_result done = r.finish("bkt", id, {listed(1, p1), listed(2, p2), listed(3, p3), listed(4, p4)});
+    REQUIRE(done.error.code.empty());
+    CHECK(done.meta.parts == 4);
+    // No byte was copied: the object's file is the data file.
+    CHECK(inode_of(d.path + "/bkt/data/" + object_rel_path("in/place")) == data_ino);
+
+    std::string body;
+    object_meta got;
+    REQUIRE(r.object("bkt", "in/place", body, &got) == st::ok);
+    CHECK(body == p1 + p2 + p3 + p4);
+    CHECK(got.content_type == "text/y");
+    CHECK(got.parts == 4);
+    CHECK(got.etag() == done.meta.etag());
+    bool has_ck = false;
+    for (const auto& [n, v] : got.extra)
+        has_ck = has_ck || n == "x-amz-checksum-crc32";
+    CHECK(has_ck);
+    REQUIRE(r.until([&] { return r.mp->find("bkt", id) == nullptr; }));
+    // Nothing of the completion is still counted as in flight.
+    CHECK(r.until([&] { return !r.mp->busy(); }));
+    CHECK(!fs::exists(d.path + "/bkt/mpu/" + id));
+    CHECK(r.until([&] { return names_in(d.path + "/bkt/tmp").empty(); }));
+}
+
+TEST_CASE("parts that are not where the object needs them are copied, from the data file and their own")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.bucket("bkt");
+    const size_t P = 5 * MiB;
+    const std::string a = pattern(P, 11), b = pattern(P, 12), c = pattern(P + 4096, 13), e = pattern(1000, 14);
+
+    SUBCASE("a gap in the numbers")
+    {
+        const std::string id = r.create("bkt", "k");
+        REQUIRE(r.part("bkt", id, 1, a).status == st::ok);
+        REQUIRE(r.part("bkt", id, 3, b).status == st::ok);
+        CHECK(r.mp->find("bkt", id)->parts.at(3).in_place);
+        const ino_t data_ino = inode_of(d.path + "/bkt/mpu/" + id + "/data");
+        REQUIRE(r.finish("bkt", id, {listed(1, a), listed(3, b)}).error.code.empty());
+        CHECK(inode_of(d.path + "/bkt/data/" + object_rel_path("k")) != data_ino);
+        std::string body;
+        REQUIRE(r.object("bkt", "k", body) == st::ok);
+        CHECK(body == a + b);
+    }
+    SUBCASE("a part bigger than the first")
+    {
+        const std::string id = r.create("bkt", "k");
+        REQUIRE(r.part("bkt", id, 1, a).status == st::ok);
+        REQUIRE(r.part("bkt", id, 2, c).status == st::ok);
+        REQUIRE(r.part("bkt", id, 3, e).status == st::ok);
+        CHECK(!r.mp->find("bkt", id)->parts.at(2).in_place);
+        CHECK(r.mp->find("bkt", id)->parts.at(3).in_place);
+        REQUIRE(r.finish("bkt", id, {listed(1, a), listed(2, c), listed(3, e)}).error.code.empty());
+        std::string body;
+        REQUIRE(r.object("bkt", "k", body) == st::ok);
+        CHECK(body == a + c + e);
+    }
+    SUBCASE("the last part first, smaller than any part size")
+    {
+        const std::string id = r.create("bkt", "k");
+        REQUIRE(r.part("bkt", id, 3, e).status == st::ok);
+        REQUIRE(r.part("bkt", id, 1, a).status == st::ok);
+        REQUIRE(r.part("bkt", id, 2, b).status == st::ok);
+        const mpu_upload* up = r.mp->find("bkt", id);
+        CHECK(!up->parts.at(3).in_place);
+        CHECK(up->parts.at(1).in_place);
+        CHECK(up->parts.at(2).in_place);
+        REQUIRE(r.finish("bkt", id, {listed(1, a), listed(2, b), listed(3, e)}).error.code.empty());
+        std::string body;
+        REQUIRE(r.object("bkt", "k", body) == st::ok);
+        CHECK(body == a + b + e);
+    }
+    SUBCASE("a last part over the minimum first fixes a part size the others do not fit")
+    {
+        const std::string id = r.create("bkt", "k");
+        const std::string big1 = pattern(P + 8192, 15), big2 = pattern(P + 8192, 16);
+        REQUIRE(r.part("bkt", id, 3, a).status == st::ok);
+        REQUIRE(r.part("bkt", id, 1, big1).status == st::ok);
+        REQUIRE(r.part("bkt", id, 2, big2).status == st::ok);
+        const mpu_upload* up = r.mp->find("bkt", id);
+        CHECK(up->parts.at(3).in_place);
+        CHECK(!up->parts.at(1).in_place);
+        REQUIRE(r.finish("bkt", id, {listed(1, big1), listed(2, big2), listed(3, a)}).error.code.empty());
+        std::string body;
+        REQUIRE(r.object("bkt", "k", body) == st::ok);
+        CHECK(body == big1 + big2 + a);
+    }
+    SUBCASE("the data file holds a part the list leaves out")
+    {
+        const std::string id = r.create("bkt", "k");
+        REQUIRE(r.part("bkt", id, 1, a).status == st::ok);
+        REQUIRE(r.part("bkt", id, 2, b).status == st::ok);
+        const ino_t data_ino = inode_of(d.path + "/bkt/mpu/" + id + "/data");
+        REQUIRE(r.finish("bkt", id, {listed(1, a)}).error.code.empty());
+        CHECK(inode_of(d.path + "/bkt/data/" + object_rel_path("k")) != data_ino);
+        std::string body;
+        REQUIRE(r.object("bkt", "k", body) == st::ok);
+        CHECK(body == a);
+    }
+}
+
+TEST_CASE("a part number is written in place once, and another upload of it goes to its own file")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.bucket("bkt");
+    const size_t P = 5 * MiB;
+    const std::string id = r.create("bkt", "k");
+    const std::string a1 = pattern(P, 21), a2 = pattern(P, 22), b1 = pattern(P, 23), b2 = pattern(P, 24),
+                      c1 = pattern(P / 2, 25);
+    part_place g;
+    REQUIRE(r.part("bkt", id, 1, a1, true, &g).status == st::ok);
+    CHECK(g.off != 0);
+
+    // Again after it landed, the same size: its own file.
+    REQUIRE(r.part("bkt", id, 1, a2, true, &g).status == st::ok);
+    CHECK(g.off == 0);
+    const mpu_upload* up = r.mp->find("bkt", id);
+    CHECK(!up->parts.at(1).in_place);
+    CHECK(up->parts.at(1).md5 == md5_of(a2));
+    // And another size.
+    REQUIRE(r.part("bkt", id, 1, c1, true, &g).status == st::ok);
+    CHECK(g.off == 0);
+    REQUIRE(r.part("bkt", id, 1, a2).status == st::ok);
+
+    // Two uploads of one number at once: one is given the place, and whichever lands last is the part.
+    part_place g1, g2;
+    r.part("bkt", id, 2, b1, false, &g1);
+    r.part("bkt", id, 2, b2, false, &g2);
+    CHECK((g1.off != 0) != (g2.off != 0));
+    REQUIRE(r.until([&] { return *r.pending[0].fired && *r.pending[1].fired; }));
+    CHECK(r.pending[0].out->status == st::ok);
+    CHECK(r.pending[1].out->status == st::ok);
+    const std::string& won = up->parts.at(2).md5 == md5_of(b1) ? b1 : b2;
+    CHECK(up->parts.at(2).md5 == md5_of(won));
+
+    REQUIRE(r.finish("bkt", id, {listed(1, a2), listed(2, won)}).error.code.empty());
+    std::string body;
+    REQUIRE(r.object("bkt", "k", body) == st::ok);
+    CHECK(body == a2 + won);
+}
+
+TEST_CASE("a commit that names a place its owner never gave is refused")
+{
+    tmpdir d;
+    rig r(d.path);
+    r.bucket("bkt");
+    const std::string id = r.create("bkt", "k");
+    REQUIRE(r.part("bkt", id, 1, pattern(5 * MiB, 31)).status == st::ok);
+    const mpu_upload* up = r.mp->find("bkt", id);
+    const uint64_t off = up->place_base + 6 * 5 * MiB;
+    const std::string body = pattern(1000, 32);
+    object_meta meta;
+    meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(off));
+    st why = st::ok;
+    auto op = r.store->begin_put("bkt", "mpu/" + id + "/7", std::move(meta), body.size(), true, why);
+    REQUIRE(op);
+    op->set_committer(r.mp->part_committer("bkt", id, 7));
+    op->place_body(r.mp->data_path("bkt", id), off, body.size());
+    REQUIRE(op->append(body.data(), body.size()) == body.size());
+    put_result out;
+    bool fired = false;
+    op->finish(nullptr, [&](put_result p) { out = std::move(p); fired = true; });
+    REQUIRE(r.until([&] { return fired; }));
+    CHECK(out.status == st::io_error);
+    CHECK(!up->parts.contains(7));
+    CHECK(r.until([&] { return names_in(d.path + "/bkt/tmp").empty(); }));
 }

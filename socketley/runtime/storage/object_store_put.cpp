@@ -140,6 +140,41 @@ void put_op::release()
     --m_store->m_puts_active;
 }
 
+void put_op::place_body(std::string path, uint64_t off, uint64_t room)
+{
+    if (m_status != st::ok)
+        return;
+    m_placed     = true;
+    m_placing    = true;
+    m_place_off  = off;
+    m_place_room = room;
+    auto self = shared_from_this();
+    const bool queued = m_store->m_io->openat(AT_FDCWD, std::move(path), O_WRONLY, 0, [self](int64_t r)
+    {
+        if (!*self->m_alive)
+            return;
+        self->m_placing = false;
+        if (r < 0)
+        {
+            self->fail(write_status(r));
+            return;
+        }
+        self->m_place_fd = static_cast<int>(r);
+        if (self->m_status != st::ok)
+        {
+            self->cleanup_tmp();
+            return;
+        }
+        self->pump();
+        self->maybe_finish();
+    });
+    if (!queued)
+    {
+        m_placing = false;
+        fail(st::io_error);
+    }
+}
+
 void put_op::cleanup_tmp()
 {
     if (!*m_alive)
@@ -148,6 +183,11 @@ void put_op::cleanup_tmp()
     {
         m_store->m_loop->close_fd(m_tmp_fd);
         m_tmp_fd = -1;
+    }
+    if (m_place_fd >= 0)
+    {
+        m_store->m_loop->close_fd(m_place_fd);
+        m_place_fd = -1;
     }
     if (!m_tmp_name.empty() && !m_tmp_committed)
     {
@@ -211,6 +251,12 @@ void put_op::staged(size_t n)
         fail(st::too_large);
         return;
     }
+    // A placed body past its room would write over the next part's.
+    if (m_placed && m_received > m_place_room)
+    {
+        fail(st::io_error);
+        return;
+    }
     // A body of unknown length is held to the quota as it grows.
     if (m_store->m_opts.max_bytes && m_reserved < m_received)
     {
@@ -261,7 +307,7 @@ void put_op::pump()
         bool progress = false;
 
         // A full buffer goes to the file as soon as there is one.
-        if (!m_opening && m_tmp_fd >= 0)
+        if (!m_opening && m_tmp_fd >= 0 && (!m_placed || m_place_fd >= 0))
         {
             for (stage& s : m_stage)
                 if (s.state == stage_state::full)
@@ -313,8 +359,20 @@ void put_op::flush(stage& s)
         m_first_written = true;
     auto self = shared_from_this();
     stage* sp = &s;
-    const bool queued = m_store->m_io->pwrite(m_tmp_fd, s.data.get(), static_cast<uint32_t>(s.fill),
-                                              s.file_off,
+    int         fd  = m_tmp_fd;
+    const char* p   = s.data.get();
+    size_t      n   = s.fill;
+    uint64_t    off = s.file_off;
+    if (m_placed)
+    {
+        // The room the header has at the front of the first buffer stays out of the placed file.
+        const size_t skip = s.file_off == 0 ? m_header_len : 0;
+        fd  = m_place_fd;
+        p  += skip;
+        n  -= skip;
+        off = m_place_off + s.file_off + skip - m_header_len;
+    }
+    const bool queued = m_store->m_io->pwrite(fd, p, static_cast<uint32_t>(n), off,
         [self, sp](int64_t r)
         {
             if (!*self->m_alive)
@@ -438,7 +496,7 @@ void put_op::finish_now()
         return;
     }
     stage& first = m_stage[0];
-    if (!m_first_written && first.state != stage_state::writing)
+    if (!m_placed && !m_first_written && first.state != stage_state::writing)
     {
         std::memcpy(first.data.get(), m_header.data(), m_header_len);
         m_header_done = true;
@@ -462,7 +520,7 @@ void put_op::finish_now()
 
 void put_op::maybe_finish()
 {
-    if (!m_eof || m_status != st::ok || m_sync_started || m_opening)
+    if (!m_eof || m_status != st::ok || m_sync_started || m_opening || m_placing)
         return;
     for (const stage& s : m_stage)
         if (s.state == stage_state::full || s.state == stage_state::writing ||
@@ -497,47 +555,61 @@ void put_op::maybe_finish()
     }
 
     m_sync_started = true;
-    const bool queued = m_store->m_io->fsync(m_tmp_fd, true,
-        [self](int64_t r)
-        {
-            if (!*self->m_alive)
-                return;
-            if (self->m_status != st::ok)
-                return;
-            ++self->m_store->m_totals.fsyncs;
-            if (r < 0)
-            {
-                self->fail(write_status(r));
-                return;
-            }
-            // The descriptor is done with, and the commit owns the name from
-            // here: a failure inside it removes the temporary file itself.
-            self->m_store->m_loop->close_fd(self->m_tmp_fd);
-            self->m_tmp_fd = -1;
-            self->m_tmp_committed = true;
-
-            commit_request req;
-            req.bucket   = self->m_bucket;
-            req.key      = self->m_key;
-            req.tmp_name = self->m_tmp_name;
-            req.meta     = self->m_meta;
-            req.create_only = self->m_create_only;
-            req.pooled      = self->m_pooled;
-            auto done = [self](put_result r2)
-            {
-                self->release();
-                auto d = std::move(self->m_done);
-                self->m_done = nullptr;
-                if (d)
-                    d(std::move(r2));
-            };
-            if (self->m_committer)
-                self->m_committer(std::move(req), std::move(done));
-            else
-                self->m_store->commit(std::move(req), std::move(done));
-        });
-    if (!queued)
+    m_syncs_left   = m_placed ? 2 : 1;
+    auto on_sync = [self](int64_t r)
+    {
+        if (!*self->m_alive)
+            return;
+        self->synced(r);
+    };
+    if (!m_store->m_io->fsync(m_tmp_fd, true, on_sync) ||
+        (m_placed && !m_store->m_io->fsync(m_place_fd, true, on_sync)))
         fail(st::io_error);
+}
+
+void put_op::synced(int64_t res)
+{
+    if (m_status != st::ok)
+        return;
+    ++m_store->m_totals.fsyncs;
+    if (res < 0)
+    {
+        fail(write_status(res));
+        return;
+    }
+    if (--m_syncs_left > 0)
+        return;
+    // The descriptors are done with, and the commit owns the name from
+    // here: a failure inside it removes the temporary file itself.
+    m_store->m_loop->close_fd(m_tmp_fd);
+    m_tmp_fd = -1;
+    if (m_place_fd >= 0)
+    {
+        m_store->m_loop->close_fd(m_place_fd);
+        m_place_fd = -1;
+    }
+    m_tmp_committed = true;
+
+    commit_request req;
+    req.bucket   = m_bucket;
+    req.key      = m_key;
+    req.tmp_name = m_tmp_name;
+    req.meta     = m_meta;
+    req.create_only = m_create_only;
+    req.pooled      = m_pooled;
+    auto self = shared_from_this();
+    auto done = [self](put_result r2)
+    {
+        self->release();
+        auto d = std::move(self->m_done);
+        self->m_done = nullptr;
+        if (d)
+            d(std::move(r2));
+    };
+    if (m_committer)
+        m_committer(std::move(req), std::move(done));
+    else
+        m_store->commit(std::move(req), std::move(done));
 }
 
 void put_op::fail(st why)

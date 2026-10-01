@@ -716,12 +716,26 @@ void storage_run::op_put_object(const std::shared_ptr<conn>& c)
     start_put(c, r.key, std::move(meta), {}, checksum_algo::none, create_only);
 }
 
+bool storage_run::body_length(const conn& c, uint64_t& expected)
+{
+    expected   = c.req.content_length;
+    bool known = c.req.has_content_length && !c.req.chunked;
+    if (c.hook)
+        if (auto d = c.hook->decoded_length())
+        {
+            expected = *d;
+            known    = true;
+        }
+    return known;
+}
+
 // Begins streaming the request's body into a temporary file for `key`, after
 // the checks every body that becomes a file has passed; `committer` says where
 // the finished file goes when it is not the object namespace, and a checksum
 // algorithm is taken whether or not the client named one when `forced_algo` says so.
 void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, object_meta meta,
-                            put_op::committer committer, checksum_algo forced_algo, bool create_only)
+                            put_op::committer committer, checksum_algo forced_algo, bool create_only,
+                            const part_place& place)
 {
     s3_request& r = c->req;
 
@@ -772,14 +786,11 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     if (ck.algo != checksum_algo::none)
         meta.extra.emplace_back(std::string(checksum_header(ck.algo)), std::string(checksum_b64_len(ck.algo), 'A'));
 
-    uint64_t expected = r.content_length;
-    bool     known    = r.has_content_length && !r.chunked;
-    if (c->hook)
-        if (auto d = c->hook->decoded_length())
-        {
-            expected = *d;
-            known    = true;
-        }
+    uint64_t expected = 0;
+    const bool known  = body_length(*c, expected);
+    // Room for the place in the part's header, which the part's owner reads back at its commit.
+    if (place.off)
+        meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(place.off));
     if (m_store.active_puts() >= m_max_active_puts)
     {
         r.keep_alive = false;
@@ -810,6 +821,8 @@ void storage_run::start_put(const std::shared_ptr<conn>& c, std::string key, obj
     if (committer)
         op->set_committer(std::move(committer));
     op->set_create_only(create_only);
+    if (place.off)
+        op->place_body(place.path, place.off, place.room);
     begin_put_body(c, std::move(op));
 }
 

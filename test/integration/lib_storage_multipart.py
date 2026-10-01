@@ -443,8 +443,8 @@ def killed_mode():
     lp = c.list_parts(Bucket=B, Key="resume/two", UploadId=st["u2"])
     check("a part cut by a kill is not a part: only the whole ones are listed", [p["PartNumber"] for p in lp["Parts"]] == [1, 2], lp["Parts"])
     check("and no temporary file of it is left", os.listdir(os.path.join(DATA, B, "tmp")) == [], os.listdir(os.path.join(DATA, B, "tmp")))
-    check("and the disk holds exactly the two parts and the meta file",
-          sorted(os.listdir(os.path.join(mpu_dir(), st["u2"]))) == ["1", "2", "meta"], os.listdir(os.path.join(mpu_dir(), st["u2"])))
+    check("and the disk holds exactly the two parts, the data file and the meta file",
+          sorted(os.listdir(os.path.join(mpu_dir(), st["u2"]))) == ["1", "2", "data", "meta"], os.listdir(os.path.join(mpu_dir(), st["u2"])))
     last = os.urandom(4321)
     t3 = c.upload_part(Bucket=B, Key="resume/two", UploadId=st["u2"], PartNumber=3, Body=last)["ETag"]
     complete(c, "resume/two", st["u2"], st["t2"] + [t3])

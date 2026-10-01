@@ -257,6 +257,10 @@ public:
             fail(st::io_error);
     }
 
+    // The body goes to `path` at `off`, at most `room` bytes of it, and the temporary
+    // file holds the header alone: a multipart part written where its object will read it.
+    void place_body(std::string path, uint64_t off, uint64_t room);
+
     // The object's key and bucket, for the caller's log line.
     const std::string& key() const { return m_key; }
 
@@ -296,6 +300,7 @@ private:
     void on_write_done(stage& s, int64_t res);
     void fail(st why);
     void maybe_finish();
+    void synced(int64_t res);
     void cleanup_tmp();
     void release();
 
@@ -333,6 +338,13 @@ private:
     std::string m_ck_expect;
     committer   m_committer;
     st         m_status{st::ok};
+    // A body placed into another file by place_body(), and the syncs still owed before the commit.
+    bool        m_placed{false};
+    bool        m_placing{false};
+    int         m_place_fd{-1};
+    uint64_t    m_place_off{0};
+    uint64_t    m_place_room{0};
+    int         m_syncs_left{0};
 
     bool                             m_eof{false};
     bool                             m_first_written{false};

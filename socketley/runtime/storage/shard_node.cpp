@@ -399,38 +399,43 @@ void shard_node::mpu_create(std::string bucket, std::string key, object_meta met
         });
 }
 
-void shard_node::mpu_begin(std::string bucket, std::string key, std::string id,
-                           std::function<void(st, checksum_algo)> cb)
+void shard_node::mpu_begin(std::string bucket, std::string key, std::string id, uint32_t number, uint64_t expected,
+                           bool known, std::function<void(st, checksum_algo, part_place)> cb)
 {
     if (!m_mpu)
     {
-        cb(st::io_error, checksum_algo::none);
+        cb(st::io_error, checksum_algo::none, {});
         return;
     }
     if (m_store.owns(bucket, key))
     {
         checksum_algo algo = checksum_algo::none;
-        const st s = mpu_find(bucket, key, id) ? m_mpu->begin_part(bucket, id, algo) : st::no_such_key;
-        cb(s, algo);
+        part_place place;
+        const st s = mpu_find(bucket, key, id) ? m_mpu->begin_part(bucket, id, number, expected, known, algo, place)
+                                               : st::no_such_key;
+        cb(s, algo, std::move(place));
         return;
     }
     ++m_c.mpu_out;
     auto alive = m_alive;
-    wire::mpu_ref ref{bucket, key, id, 0, 0, false};
+    wire::mpu_ref ref{bucket, key, id, number, 0, known, expected};
     m_transport.call(m_store.owner_of(bucket, key), wire::encode_mpu_ref(wire::op::mpu_begin, ref),
-        [this, alive, cb](bool ok, std::string_view reply)
+        [this, alive, bucket, id, cb](bool ok, std::string_view reply)
         {
             if (!*alive)
                 return;
             st s = st::io_error;
             checksum_algo algo = checksum_algo::none;
-            if (!ok || !wire::decode_mpu_begin(reply, s, algo))
+            part_place place;
+            if (!ok || !wire::decode_mpu_begin(reply, s, algo, place))
             {
                 ++m_c.peer_failures;
-                cb(st::io_error, checksum_algo::none);
+                cb(st::io_error, checksum_algo::none, {});
                 return;
             }
-            cb(s, algo);
+            if (place.off)
+                place.path = m_mpu->data_path(bucket, id);
+            cb(s, algo, std::move(place));
         });
 }
 
@@ -681,8 +686,11 @@ void shard_node::serve_mpu(wire::op o, std::string_view payload, std::function<v
                 return;
             }
             checksum_algo algo = checksum_algo::none;
-            const st s = mpu_find(r.bucket, r.key, r.id) ? m_mpu->begin_part(r.bucket, r.id, algo) : st::no_such_key;
-            reply(true, wire::encode_mpu_begin(s, algo));
+            part_place place;
+            const st s = mpu_find(r.bucket, r.key, r.id)
+                             ? m_mpu->begin_part(r.bucket, r.id, r.a, r.size, r.flag, algo, place)
+                             : st::no_such_key;
+            reply(true, wire::encode_mpu_begin(s, algo, place));
             return;
         }
         case wire::op::mpu_part:

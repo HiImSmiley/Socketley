@@ -64,6 +64,9 @@ bool file_io::submit(op* o)
             queued = m_loop->submit_renameat(o->fd, o->path.c_str(), o->fd2, o->path2.c_str(),
                                              &o->req, false);
             break;
+        case op_link:
+            queued = m_loop->submit_linkat(o->fd, o->path.c_str(), o->fd2, o->path2.c_str(), &o->req);
+            break;
         case op_fsync:
             queued = m_loop->submit_fsync(o->fd, o->datasync, &o->req, false);
             break;
@@ -136,6 +139,24 @@ bool file_io::renameat(int olddirfd, std::string oldpath, int newdirfd, std::str
 {
     auto* o = new op;
     o->kind = op_rename;
+    o->fd = olddirfd;
+    o->fd2 = newdirfd;
+    o->path = std::move(oldpath);
+    o->path2 = std::move(newpath);
+    o->cb = std::move(cb);
+    if (!submit(o))
+    {
+        delete o;
+        return false;
+    }
+    m_live.insert(o);
+    return true;
+}
+
+bool file_io::linkat(int olddirfd, std::string oldpath, int newdirfd, std::string newpath, done cb)
+{
+    auto* o = new op;
+    o->kind = op_link;
     o->fd = olddirfd;
     o->fd2 = newdirfd;
     o->path = std::move(oldpath);

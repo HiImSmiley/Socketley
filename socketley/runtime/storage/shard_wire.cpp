@@ -419,6 +419,7 @@ void put_part(bytes::writer& w, const mpu_part& p)
     w.u64(static_cast<uint64_t>(p.mtime_ms));
     w.u64(p.data_off);
     w.bytes(p.checksum_b64);
+    w.u8(p.in_place ? 1 : 0);
 }
 
 bool get_part(bytes::reader& r, mpu_part& p)
@@ -429,7 +430,7 @@ bool get_part(bytes::reader& r, mpu_part& p)
     for (uint8_t& b : p.md5)
         if (!r.u8(b))
             return false;
-    if (!r.u64(mt) || !r.u64(off) || !r.bytes(p.checksum_b64, 256))
+    if (!r.u64(mt) || !r.u64(off) || !r.bytes(p.checksum_b64, 256) || !r.flag(p.in_place))
         return false;
     p.mtime_ms = static_cast<int64_t>(mt);
     p.data_off = static_cast<size_t>(off);
@@ -476,6 +477,7 @@ std::string encode_mpu_ref(op o, const mpu_ref& ref)
     w.u32(ref.a);
     w.u32(ref.b);
     w.u8(ref.flag ? 1 : 0);
+    w.u64(ref.size);
     return w.take();
 }
 
@@ -483,7 +485,7 @@ bool decode_mpu_ref(std::string_view payload, op want, mpu_ref& ref)
 {
     bytes::reader r(payload);
     return open_request(r, want) && r.bytes(ref.bucket, name_cap) && r.bytes(ref.key, name_cap) &&
-           r.bytes(ref.id, id_cap) && r.u32(ref.a) && r.u32(ref.b) && r.flag(ref.flag);
+           r.bytes(ref.id, id_cap) && r.u32(ref.a) && r.u32(ref.b) && r.flag(ref.flag) && r.u64(ref.size);
 }
 
 std::string encode_mpu_part(const commit_request& req, std::string_view id, uint32_t number)
@@ -557,18 +559,21 @@ bool decode_mpu_created(std::string_view reply, st& s, std::string& id)
     return status_byte(r, s) && r.bytes(id, id_cap);
 }
 
-std::string encode_mpu_begin(st s, checksum_algo algo)
+std::string encode_mpu_begin(st s, checksum_algo algo, const part_place& place)
 {
     bytes::writer w;
     w.u8(static_cast<uint8_t>(s));
     w.u8(static_cast<uint8_t>(algo));
+    w.u64(place.off);
+    w.u64(place.room);
     return w.take();
 }
 
-bool decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo)
+bool decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo, part_place& place)
 {
     bytes::reader r(reply);
-    return status_byte(r, s) && algo_byte(r, algo);
+    place = part_place{};
+    return status_byte(r, s) && algo_byte(r, algo) && r.u64(place.off) && r.u64(place.room);
 }
 
 std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan)
@@ -586,6 +591,7 @@ std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan)
     w.u32(static_cast<uint32_t>(plan.parts.size()));
     for (const mpu_part& p : plan.parts)
         put_part(w, p);
+    w.u8(plan.in_place ? 1 : 0);
     return w.take();
 }
 
@@ -616,7 +622,7 @@ bool decode_mpu_plan(std::string_view reply, s3_error& err, assemble_plan& plan)
             return false;
         plan.parts.push_back(std::move(p));
     }
-    return true;
+    return r.flag(plan.in_place);
 }
 
 std::string encode_parts_page(const parts_page& pg)

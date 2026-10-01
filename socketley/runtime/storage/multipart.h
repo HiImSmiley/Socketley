@@ -5,9 +5,16 @@
 // ─── LAYOUT ─────────────────────────────────────────────────────────────────
 //   <dir>/<bucket>/mpu/<upload-id>/meta   the object-to-be, in an object header
 //   <dir>/<bucket>/mpu/<upload-id>/<n>    part n: an object header, then its bytes
+//   <dir>/<bucket>/mpu/<upload-id>/data   the object being made, its header's room first
 //
 // A part is written like any object body, to a temporary file that is synced,
 // and is then renamed to its number, so a part is either whole or not there.
+//
+// A part whose place in the object is known when it starts is written there
+// instead, into `data` at its offset, and its numbered file is the header alone,
+// naming that offset; the shard that owns the upload hands out each place once.
+// A completion whose parts all sit where the object needs them writes the header
+// in front and commits `data` as the object, so its bytes are written once.
 // An upload exists once its meta file and directory are on the disk, which is
 // before the client is told its id, and a crash leaves every acknowledged
 // upload and part.  A start reads the directory to find them again.
@@ -22,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,14 +47,30 @@ namespace socketley::storage
 inline constexpr uint64_t mpu_min_part_bytes = 5ull << 20;
 inline constexpr uint32_t mpu_max_parts      = 10000;
 
+// The header entry of a part written into the upload's data file: where its bytes begin there.
+inline constexpr std::string_view mpu_place_extra = "x-socketley-mpu-at";
+// Fixed width, so the header's room is reserved before the part's offset is written into it.
+std::string encode_place(uint64_t off);
+// 0 when the meta names no place, which no part has since the object's header comes first.
+uint64_t place_of(const object_meta& meta);
+
+// Where a part's body goes when it is written into the upload's data file; off 0 is a file of its own.
+struct part_place
+{
+    uint64_t    off{0};
+    uint64_t    room{0};
+    std::string path;
+};
+
 struct mpu_part
 {
     uint32_t    number{0};
     uint64_t    size{0};
     md5_t       md5{};
     int64_t     mtime_ms{0};
-    // Where the bytes begin in the part's file.
+    // Where the bytes begin in the part's file, or in the upload's data file when in_place.
     size_t      data_off{0};
+    bool        in_place{false};
     // In the upload's algorithm, empty when it has none.
     std::string checksum_b64;
 
@@ -86,6 +110,19 @@ struct mpu_upload
     // Commits of one part number wait behind each other, so the disk and the
     // list of parts end in the same state.
     std::map<uint32_t, std::vector<std::function<void()>>> lanes;
+    // Parts written into the data file: where part 1 begins there (0 when the upload
+    // has no data file), and the size the first part placed fixed for every other.
+    uint64_t    place_base{0};
+    uint64_t    place_size{0};
+    // Every number ever given a place, since a place is written by one body only.
+    std::set<uint32_t> placed;
+    // Places given whose part has not been committed, with the room each was given.
+    std::map<uint32_t, uint64_t> placing;
+    // No place is given and no completion is made without a copy: a start or a failed
+    // completion cannot know who may still write into the data file.
+    bool        place_frozen{false};
+    // The completion under way commits the data file itself.
+    bool        place_planned{false};
 };
 
 struct complete_result
@@ -108,6 +145,9 @@ struct assemble_plan
     object_meta meta;
     std::string checksum_b64;
     std::vector<mpu_part> parts;
+    // The parts are where the object needs them in the upload's data file, which
+    // becomes the object once its header is written in front.
+    bool        in_place{false};
 };
 
 // One page of an upload's parts, as ListParts answers it.
@@ -161,6 +201,11 @@ public:
     // checksum is taken with; no_such_key stands for an upload that is missing
     // or on its way out.
     st begin_part(std::string_view bucket, std::string_view id, checksum_algo& algo) const;
+    // The same for an UploadPart of `expected` bytes (when `known`), which is given a
+    // place in the data file in `place` when it can be written there.
+    st begin_part(std::string_view bucket, std::string_view id, uint32_t number, uint64_t expected, bool known,
+                  checksum_algo& algo, part_place& place);
+    std::string data_path(std::string_view bucket, std::string_view id) const;
 
     // What a part's body is given, in place of the store's own commit: the file
     // is renamed into the upload and remembered.  `st::cancelled` reaches `done`
@@ -221,6 +266,11 @@ private:
     void run_part_commit(std::shared_ptr<part_commit> pc);
     void finish_part(const std::shared_ptr<part_commit>& pc, int64_t res, bool renamed);
     void assemble(std::shared_ptr<assemble_state> a);
+    void assemble_copy(std::shared_ptr<assemble_state> a);
+    void assemble_commit(const std::shared_ptr<assemble_state>& a);
+    void assemble_fail(const std::shared_ptr<assemble_state>& a, st why);
+    // The upload is open again after a completion that did not finish.
+    void reopen(mpu_upload& u);
     void assemble_pump(const std::shared_ptr<assemble_state>& a);
     void assemble_finish(const std::shared_ptr<assemble_state>& a);
 

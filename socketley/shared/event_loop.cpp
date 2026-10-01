@@ -2027,6 +2027,19 @@ bool event_loop::submit_renameat(int olddir, const char* oldpath, int newdir, co
     return true;
 }
 
+bool event_loop::submit_linkat(int olddir, const char* oldpath, int newdir, const char* newpath,
+                               io_request* req)
+{
+    struct io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    io_uring_prep_linkat(sqe, olddir, oldpath, newdir, newpath, 0);
+    io_uring_sqe_set_data(sqe, req);
+    req->type = op_link;
+    arm(req, raw_target(olddir), raw_target(newdir));
+    return true;
+}
+
 bool event_loop::submit_unlinkat(int dir, const char* path, io_request* req, int flags)
 {
     struct io_uring_sqe* sqe = get_sqe();

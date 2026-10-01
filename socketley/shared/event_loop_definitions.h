@@ -251,10 +251,12 @@ enum op_type : uint8_t
     op_mkdir                 = 28,
     // A splice whose input is a regular file at an offset, kept apart from
     // op_splice because that one names a pipe and a socket and takes no offset.
-    op_splice_file           = 29
+    op_splice_file           = 29,
+    // A second name for a file, which a rename may then move without the first.
+    op_link                  = 30
 };
 
-inline constexpr uint8_t op_type_count = 30;
+inline constexpr uint8_t op_type_count = 31;
 
 // For diagnostics only, because a count says an owner cannot be released yet
 // and the kind says where to look.
@@ -290,6 +292,7 @@ inline const char* io_op_name(uint8_t t)
         case op_openat:                  return "openat";
         case op_mkdir:                   return "mkdir";
         case op_splice_file:             return "splice-file";
+        case op_link:                    return "link";
         default:                         return "unknown";
     }
 }
