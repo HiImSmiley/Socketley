@@ -106,6 +106,10 @@ bool decode_part_trailer(std::string_view bytes, const object_meta& m, const par
 std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_stored, bool numbers,
                              size_t max = max_part_sizes_bytes);
 
+// The extra entry of a sealed body written to a pooled file: the MD5 of its bytes as they lie on disk, in hex,
+// which is how a start knows the file is whole without the key that opens it.
+inline constexpr std::string_view stored_md5_extra = "x-socketley-stored-md5";
+
 // The extra entry a version of a key in a versioned bucket is named by: its order among the
 // key's versions, whether it is a delete marker, and its id.
 inline constexpr std::string_view version_extra = "x-socketley-version";

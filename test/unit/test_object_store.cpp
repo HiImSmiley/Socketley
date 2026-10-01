@@ -2740,6 +2740,7 @@ TEST_CASE("a sealed put at every edge of its buffers reads back through its chun
 {
     // A body of unknown length fills whole buffers and can end on one's edge, which leaves its last chunk to write alone.
     struct way { unsigned threads; bool known; uint8_t version; };
+    int pooled = 0;
     for (const way& w : {way{0, true, sse_format}, way{2, true, sse_format}, way{0, false, sse_format},
                          way{2, false, sse_format}, way{2, false, sse_format_v1}})
     {
@@ -2789,10 +2790,19 @@ TEST_CASE("a sealed put at every edge of its buffers reads back through its chun
             std::string back;
             REQUIRE(sse_open_body(h.meta, seal.key, std::string_view(file).substr(h.header_len), back));
             CHECK(back == body);
-            // Nothing went to the pool, whose roll forward could not check a sealed body.
-            CHECK(count_pool_files(d.path, "bkt") == 0);
+            // A body that went through a pooled file names the digest of its sealed bytes, which its roll forward checks.
+            const auto sd = std::find_if(h.meta.extra.begin(), h.meta.extra.end(),
+                                         [](const auto& e) { return e.first == stored_md5_extra; });
+            if (sd != h.meta.extra.end())
+            {
+                ++pooled;
+                CHECK(sd->second == hex(md5_of(std::string_view(file).substr(h.header_len))));
+            }
+            CHECK((sd == h.meta.extra.end() || (known && n <= (1u << 20))));
         }
     }
+    // The pool is filled on first use, so most of the small sealed puts of known length took a file from it.
+    CHECK(pooled >= 8);
 }
 
 TEST_CASE("an SSE-C put's ETag is not its MD5, and a sealed object comes back from its file after a crash")
@@ -2832,4 +2842,81 @@ TEST_CASE("an SSE-C put's ETag is not its MD5, and a sealed object comes back fr
     std::string back;
     REQUIRE(sse_open_body(*m, seal.key, std::string_view(file).substr(file.size() - sse_stored_len(body.size(), sse_format)), back));
     CHECK(back == body);
+}
+
+TEST_CASE("a sealed pooled put whose rename a crash took is rolled forward by the digest of its sealed bytes")
+{
+    // SSE-C, so the start that rolls it forward holds no key that could open it.
+    const sse_key customer = sse_random_key();
+    for (int variant = 0; variant < 4; ++variant)
+    {
+        INFO("variant " << variant);
+        tmpdir d;
+        sse_seal_spec seal;
+        const std::string v1 = pattern(3000, 1), v2 = pattern(70000, 2);
+        std::string file_v1;
+        md5_t etag{};
+        {
+            rig r(d.path);
+            r.plain = true;
+            REQUIRE(r.make_bucket("bkt") == st::ok);
+            REQUIRE(r.put("bkt", "key", v1).status == st::ok);
+            REQUIRE(r.until([&] { return !r.store->busy(); }));
+            file_v1 = slurp(data_path(d.path, "bkt", "key"));
+            const object_meta m = sealed_meta(customer, seal, sse_mode::c);
+            // The first pooled put fills the pool, so the one after it is the one that takes a file from it.
+            for (int i = 0; i < 2; ++i)
+            {
+                st why = st::ok;
+                auto op = r.store->begin_put("bkt", "key", m, v2.size(), true, why, true, &seal);
+                REQUIRE(op);
+                REQUIRE(op->append(v2.data(), v2.size()) == v2.size());
+                put_result p;
+                bool fired = false;
+                op->finish(nullptr, [&](put_result res) { p = std::move(res); fired = true; });
+                REQUIRE(r.until([&] { return fired; }));
+                REQUIRE(p.status == st::ok);
+                etag = p.meta.md5;
+                REQUIRE(r.until([&] { return !r.store->busy(); }));
+            }
+            r.store->close(false);
+        }
+        const std::string pool = d.path + "/bkt/pool/0.00000000000000000000000000000001";
+        std::string f = slurp(data_path(d.path, "bkt", "key"));
+        const decoded_header h = decode_object_header(f);
+        REQUIRE(h.status == header_status::ok);
+        const bool named = std::any_of(h.meta.extra.begin(), h.meta.extra.end(),
+                                       [](const auto& e) { return e.first == stored_md5_extra; });
+        REQUIRE(named);
+        if (variant == 1)
+            f[f.size() - 100] ^= 1;          // a page of the sealed body that never reached the disk
+        else if (variant == 2)
+            f.resize(f.size() - 1);          // cut short
+        else if (variant == 3)
+        {
+            // A header that names no digest of its sealed bytes cannot be checked at all.
+            object_meta m = h.meta;
+            std::erase_if(m.extra, [](const auto& e) { return e.first == stored_md5_extra; });
+            f = encode_object_header(h.key, m, h.header_len) + f.substr(h.header_len);
+        }
+        fs::rename(data_path(d.path, "bkt", "key"), pool);
+        spill(pool, f);
+        spill(data_path(d.path, "bkt", "key"), file_v1);
+
+        rig again(d.path);
+        CHECK(again.report.rolled_forward == (variant == 0 ? 1u : 0u));
+        CHECK(count_pool_files(d.path, "bkt") == 0);
+        const object_meta* m = again.store->find("bkt", "key");
+        REQUIRE(m != nullptr);
+        if (variant != 0)
+        {
+            CHECK(m->md5 == md5_of(v1));
+            continue;
+        }
+        CHECK(m->md5 == etag);
+        const std::string file = slurp(data_path(d.path, "bkt", "key"));
+        std::string back;
+        REQUIRE(sse_open_body(*m, seal.key, std::string_view(file).substr(file.size() - stored_size(*m)), back));
+        CHECK(back == v2);
+    }
 }

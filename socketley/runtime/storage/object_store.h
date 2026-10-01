@@ -403,6 +403,8 @@ private:
     void write_sealed(stage& s, size_t lead, size_t n, bool last);
     // Writes the empty chunk that ends a sealed body whose length is whole chunks and whose buffers are written.
     void write_sealed_tail();
+    // Puts the digest of a pooled body's sealed bytes into its header, in front of them in the buffer.
+    bool seal_pooled_header(stage& s, size_t lead, bool last, const md5_t& digest);
     void on_write_done(stage& s, int64_t res);
     void fail(st why);
     void maybe_finish();

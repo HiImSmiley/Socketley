@@ -2193,10 +2193,6 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::storage_full;
         return nullptr;
     }
-    // A pooled file is rolled forward after a crash only once its digest checks, which a sealed body's cannot without its key.
-    if (seal)
-        plain = false;
-
     std::shared_ptr<put_op> op(new put_op);
     op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain, seal);
     why = st::ok;

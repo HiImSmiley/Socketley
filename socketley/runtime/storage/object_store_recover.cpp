@@ -817,6 +817,23 @@ bool object_store::finish_bucket(recovering& r, recovery_report& rep, std::strin
     return true;
 }
 
+namespace
+{
+
+// Whether a pooled file's body is the one its header describes: the MD5 of its bytes, or of a sealed body's
+// bytes as they lie on disk, since a start holds no key that opens it.
+bool pooled_body_whole(const object_meta& m, std::string_view body)
+{
+    if (!is_encrypted(m))
+        return md5_of(body) == m.md5;
+    for (const auto& [n, v] : m.extra)
+        if (n == stored_md5_extra)
+            return v == hex(md5_of(body));
+    return false;
+}
+
+}   // namespace
+
 // A put answered at its rename leaves, until its directories are synced, the
 // whole object in pool/, which the shard owning its key moves into place; any
 // shard's file is looked at, since the split may have changed.
@@ -829,13 +846,13 @@ uint64_t object_store::roll_forward_pooled(bucket& b, std::unordered_set<std::st
     for (const auto& e : fs::directory_iterator(base + "/pool", ec))
     {
         const std::string name = e.path().filename().string();
-        const std::string all  = slurp(e.path().string(), 64 * 1024 + pooled_max);
+        const std::string all  = slurp(e.path().string(), 64 * 1024 + sse_stored_len(pooled_max, sse_format));
 
         // Whole means the length the header gives and the digest it names, so
         // neither a body cut short nor one whose pages never reached the disk passes.
         const decoded_header d = decode_object_header(all);
-        const bool whole = d.status == header_status::ok && all.size() == d.header_len + d.meta.size &&
-                           md5_of(std::string_view(all).substr(d.header_len)) == d.meta.md5;
+        const bool whole = d.status == header_status::ok && all.size() == d.header_len + stored_size(d.meta) &&
+                           pooled_body_whole(d.meta, std::string_view(all).substr(d.header_len));
         if (!whole)
             continue;
         if (!owns(b.name, d.key))

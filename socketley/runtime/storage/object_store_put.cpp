@@ -40,6 +40,11 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_meta.md5   = {};
     m_meta.parts = 0;
 
+    // A sealed body that may go to a pooled file has room in its header for the digest its roll forward checks.
+    std::erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
+    const bool may_pool = plain && size_known && expected <= object_store::pooled_max && store->owns(m_bucket, m_key);
+    if (seal && may_pool)
+        m_meta.extra.emplace_back(std::string(stored_md5_extra), std::string(2 * sizeof(md5_t), '0'));
     // A versioned bucket's header has room for the version finish_now() puts in it, which is as long as an id makes it.
     clear_version_extra(m_meta);
     if (const object_store::bucket* vb = store->find_bucket(m_bucket); vb && vb->vstate != versioning::off)
@@ -97,13 +102,14 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     ++store->m_puts_active;
 
     object_store::bucket* b = store->find_bucket(m_bucket);
-    if (plain && size_known && expected <= object_store::pooled_max && store->owns(m_bucket, m_key) &&
-        store->take_pooled(*b, m_tmp_name, m_tmp_fd))
+    if (may_pool && store->take_pooled(*b, m_tmp_name, m_tmp_fd))
     {
         m_pooled  = true;
         m_opening = false;
         return;
     }
+    // The room stays reserved, which a header that pads to it does not miss.
+    std::erase_if(m_meta.extra, [](const auto& e) { return e.first == stored_md5_extra; });
     m_tmp_name = store->tmp_name();
     auto self = shared_from_this();
     const bool queued = store->m_io->openat(b->tmp_fd, m_tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0600,
@@ -438,20 +444,25 @@ void put_op::flush_sealed(stage& s)
     if (!s.out)
         s.out = std::make_shared_for_overwrite<char[]>(m_header_len + sse_stored_len(m_cap - m_header_len, sse_format));
     auto bad  = std::make_shared<bool>(false);
+    // A pooled body is one buffer, header and all, whose sealed bytes are digested beside the sealing.
+    auto digest = m_pooled ? std::make_shared<md5_t>() : nullptr;
+    const size_t sealed = static_cast<size_t>(sse_sealed_len(n, m_seal->version, last));
     // The header's room goes along as it is, which finish() may already have filled.
-    auto work = [seal = m_seal, data = s.data, out = s.out, lead, n, index, last, bad]
+    auto work = [seal = m_seal, data = s.data, out = s.out, lead, n, index, last, sealed, digest, bad]
     {
         std::memcpy(out.get(), data.get(), lead);
         *bad = !sse_seal(seal->key, seal->version, seal->stream, index, data.get() + lead, n, last, out.get() + lead);
+        if (digest && !*bad)
+            *digest = md5_of(std::string_view(out.get() + lead, sealed));
     };
     stage* sp = &s;
     if (m_async)
     {
-        m_store->m_hash->submit(m_seal_lane, std::move(work), [self = shared_from_this(), sp, lead, n, last, bad]
+        m_store->m_hash->submit(m_seal_lane, std::move(work), [self = shared_from_this(), sp, lead, n, last, digest, bad]
         {
             if (!*self->m_alive || self->m_status != st::ok)
                 return;
-            if (*bad)
+            if (*bad || (digest && !self->seal_pooled_header(*sp, lead, last, *digest)))
                 self->fail(st::io_error);
             else
                 self->write_sealed(*sp, lead, n, last);
@@ -459,10 +470,25 @@ void put_op::flush_sealed(stage& s)
         return;
     }
     work();
-    if (*bad)
+    if (*bad || (digest && !seal_pooled_header(s, lead, last, *digest)))
         fail(st::io_error);
     else
         write_sealed(s, lead, n, last);
+}
+
+bool put_op::seal_pooled_header(stage& s, size_t lead, bool last, const md5_t& digest)
+{
+    // The digest is of the whole sealed body, which only a buffer holding the header and the end has seen.
+    if (lead != m_header_len || !last)
+        return false;
+    for (auto& [n, v] : m_meta.extra)
+        if (n == stored_md5_extra)
+            v = hex(digest);
+    m_header = encode_object_header(m_key, m_meta, m_header_len);
+    if (m_header.size() != m_header_len)
+        return false;
+    std::memcpy(s.out.get(), m_header.data(), m_header_len);
+    return true;
 }
 
 void put_op::write_sealed_tail()
