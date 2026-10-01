@@ -140,6 +140,11 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     pr.tls       = c->ssl != nullptr;
     pr.ip        = &c->ip;
     pr.every_key = action == s3_action::delete_object && r.key.empty();
+    pr.sse_sent  = r.has_header("x-amz-server-side-encryption");
+    pr.sse       = r.header("x-amz-server-side-encryption");
+    // A part, or the completion of an upload, takes the encryption its creation chose and was judged on.
+    const std::string_view op = operation_name(r);
+    pr.sse_inherited = op == "UploadPart" || op == "UploadPartCopy" || op == "CompleteMultipartUpload";
 
     auto judge = [this, &c](std::string_view bucket, const policy_request& q) { return policy_effect_of(c, bucket, q); };
 
@@ -155,6 +160,10 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         if (parse_copy_source(r.header("x-amz-copy-source"), sb, sk, ignored, &sv))
         {
             policy_request sq = pr;
+            // The read of the source is no write, so it carries no encryption of its own.
+            sq.sse_sent      = false;
+            sq.sse           = {};
+            sq.sse_inherited = false;
             sq.action = sv.empty() ? s3_action::get_object : s3_action::get_object_version;
             sq.key    = sk;
             src       = judge(sb, sq);
@@ -189,6 +198,9 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     lq.action    = s3_action::list_bucket;
     lq.key       = {};
     lq.every_key = false;
+    lq.sse_sent      = false;
+    lq.sse           = {};
+    lq.sse_inherited = false;
     const policy_effect list = judge(copy ? std::string_view(sb) : std::string_view(r.bucket), lq);
     c->hide_missing = list == policy_effect::deny || (!by_credentials && list != policy_effect::allow);
 }

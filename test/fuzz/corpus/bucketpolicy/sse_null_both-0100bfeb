@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::pub/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":["true","false"]}}}}

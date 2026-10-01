@@ -6,8 +6,9 @@
 // What it takes is the subset that can be honoured exactly on this runtime:
 // Allow and Deny, a principal that is everyone or this runtime's access keys,
 // the actions the runtime implements, resources in this bucket, and the
-// aws:SourceIp and aws:SecureTransport conditions.  Anything else is refused as
-// MalformedPolicy, never accepted to do less than it says.
+// aws:SourceIp, aws:SecureTransport and s3:x-amz-server-side-encryption
+// conditions.  Anything else is refused as MalformedPolicy, never accepted to
+// do less than it says.
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -94,6 +95,12 @@ struct policy_request
     const client_ip* ip{nullptr};
     // The keys are named in the body, so only a statement over every key in the bucket can allow it.
     bool             every_key{false};
+    // The request's x-amz-server-side-encryption, which a condition finds absent when it was not sent.
+    bool             sse_sent{false};
+    std::string_view sse;
+    // A part or the completion of an upload, whose encryption its creation chose and was judged on, so a
+    // statement conditioned on the encryption is not about it.
+    bool             sse_inherited{false};
 };
 
 enum class policy_effect : uint8_t
@@ -154,9 +161,20 @@ public:
         // The values aws:SecureTransport may have for the statement to apply, both when it names none.
         bool     tls_true{true};
         bool     tls_false{true};
+        // s3:x-amz-server-side-encryption under StringEquals and StringNotEquals, and Null on it: -1 for no
+        // Null, 1 for a statement about requests that do not send it, 0 for ones that do.
+        bool     has_sse_eq{false};
+        std::vector<std::string> sse_eq;
+        bool     has_sse_ne{false};
+        std::vector<std::string> sse_ne;
+        int8_t   sse_null{-1};
+        bool sse_conditioned() const { return has_sse_eq || has_sse_ne || sse_null >= 0; }
     };
 
 private:
+    // Whether the request's encryption is what the statement's conditions on it ask for.
+    static bool sse_matches(const statement& s, const policy_request& r);
+
     std::string m_text;
     std::string m_broken;
     std::vector<statement> m_statements;

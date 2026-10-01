@@ -13,7 +13,9 @@
 //   * the flags the runtime skips work by hold: a policy without has_deny() never denies, so a signed request may
 //     skip it, and one without needs_ip() judges a request the same whatever its address, so getpeername may be skipped;
 //   * a policy GetBucketPolicyStatus calls not public lets no anonymous request in that has no address to be judged by;
-//   * a refusing policy, what a stored document that stops compiling becomes, denies every request.
+//   * a refusing policy, what a stored document that stops compiling becomes, denies every request;
+//   * a part or a completion of an upload, which takes the encryption its creation chose, is judged as though
+//     no statement conditioned on the encryption were there, so changing its header changes nothing.
 //
 // WHAT THIS TARGET DOES NOT COVER: the order the runtime applies a verdict in (authentication, policy, on_request),
 // which the integration test reads off the wire, and whether a policy means what its author wanted.
@@ -67,6 +69,7 @@ sp::client_ip ip_of(const char* text)
 
 constexpr std::array<std::string_view, 7> keys = {"", "public/a", "private/b", "v1/x", "zz/q", "a*b?c", "public/"};
 constexpr std::array<std::string_view, 3> principals = {"AKIAPOLICYKEYONE0001", "AKIAPOLICYKEYTWO0002", "other"};
+constexpr std::array<std::string_view, 4> methods = {"AES256", "aws:kms", "", "aes256"};
 
 // Every judgement a fixed set of requests gets, packed two bits each.
 std::string judgements(const sp::bucket_policy& p, uint64_t pick)
@@ -87,7 +90,18 @@ std::string judgements(const sp::bucket_policy& p, uint64_t pick)
             const sp::client_ip& ip = ips[(pick >> 46) % ips.size()];
             r.ip        = (pick >> 48) & 1 ? nullptr : &ip;
             r.every_key = r.action == sp::s3_action::delete_object && ((pick >> 49) & 1);
+            r.sse_sent  = (pick >> 50) & 1;
+            r.sse       = r.sse_sent ? methods[(pick >> 51) % methods.size()] : std::string_view();
+            r.sse_inherited = r.action == sp::s3_action::put_object && ((pick >> 54) & 1);
             const sp::policy_effect e = p.evaluate(r);
+            if (r.sse_inherited)
+                for (const std::string_view m : methods)
+                {
+                    sp::policy_request q = r;
+                    q.sse_sent = !m.empty();
+                    q.sse      = m;
+                    FUZZ_CHECK(p.evaluate(q) == e, "a part was judged by the encryption header it does not choose");
+                }
             out += static_cast<char>('0' + static_cast<int>(e));
 
             if (!p.has_deny())

@@ -750,6 +750,8 @@ struct compiler
         return true;
     }
 
+    static constexpr std::string_view sse_key = "s3:x-amz-server-side-encryption";
+
     bool condition(const jvalue& v, bucket_policy::statement& s)
     {
         if (v.k != jvalue::kind::object)
@@ -796,9 +798,43 @@ struct compiler
                 }
                 continue;
             }
+            if (op == "StringEquals" || op == "StringNotEquals")
+            {
+                if (!only_key(block, op, sse_key, val))
+                    return false;
+                std::vector<std::string>& into = op == "StringEquals" ? s.sse_eq : s.sse_ne;
+                if (!strings(*val, sse_key, into))
+                    return false;
+                (op == "StringEquals" ? s.has_sse_eq : s.has_sse_ne) = true;
+                continue;
+            }
+            if (op == "Null")
+            {
+                if (!only_key(block, op, sse_key, val))
+                    return false;
+                std::vector<std::string> list;
+                if (val->k == jvalue::kind::boolean)
+                    list.push_back(val->b ? "true" : "false");
+                else if (!strings(*val, sse_key, list))
+                    return false;
+                bool absent = false, present = false;
+                for (const std::string& t : list)
+                {
+                    if (t == "true")
+                        absent = true;
+                    else if (t == "false")
+                        present = true;
+                    else
+                        return fail("Null takes \"true\" or \"false\", not " + t);
+                }
+                // Both values are every request, which is no condition at all.
+                s.sse_null = absent && present ? -1 : absent ? 1 : 0;
+                continue;
+            }
             return fail("Condition operator " + op +
-                        " is not supported (only IpAddress and NotIpAddress on aws:SourceIp, and Bool on "
-                        "aws:SecureTransport)");
+                        " is not supported (only IpAddress and NotIpAddress on aws:SourceIp, Bool on "
+                        "aws:SecureTransport, and StringEquals, StringNotEquals and Null on "
+                        "s3:x-amz-server-side-encryption)");
         }
         return true;
     }
@@ -1041,6 +1077,20 @@ bool bucket_policy::compile(std::string_view json, std::string_view bucket, buck
     return true;
 }
 
+bool bucket_policy::sse_matches(const statement& s, const policy_request& r)
+{
+    if (r.sse_inherited)
+        return false;
+    auto listed = [&](const std::vector<std::string>& values)
+    { return r.sse_sent && std::find(values.begin(), values.end(), r.sse) != values.end(); };
+    // A key the request does not carry equals nothing, and so differs from everything, as IAM judges it.
+    if (s.has_sse_eq && !listed(s.sse_eq))
+        return false;
+    if (s.has_sse_ne && listed(s.sse_ne))
+        return false;
+    return s.sse_null < 0 || (s.sse_null == 1) == !r.sse_sent;
+}
+
 bucket_policy bucket_policy::refusing(std::string_view json, std::string why)
 {
     bucket_policy p;
@@ -1091,6 +1141,8 @@ policy_effect bucket_policy::evaluate(const policy_request& r) const
         if (s.has_ip_in && !any_cidr(s.ip_in, r.ip))
             continue;
         if (s.has_ip_out && any_cidr(s.ip_out, r.ip))
+            continue;
+        if (s.sse_conditioned() && !sse_matches(s, r))
             continue;
         if (s.deny)
             return policy_effect::deny;

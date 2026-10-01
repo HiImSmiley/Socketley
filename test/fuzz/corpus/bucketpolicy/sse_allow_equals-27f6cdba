@@ -1,0 +1,1 @@
+{"Statement":{"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::pub/*","Condition":{"StringEquals":{"S3:X-Amz-Server-Side-Encryption":["AES256","aws:kms"]},"Null":{"s3:x-amz-server-side-encryption":false},"Bool":{"aws:SecureTransport":"true"}}}}

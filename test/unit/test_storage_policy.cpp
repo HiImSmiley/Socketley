@@ -192,3 +192,95 @@ TEST_CASE("a refusing policy denies everything it is asked and keeps the stored 
         }
     CHECK_FALSE(bucket_policy::refusing(text, "").broken().empty());
 }
+
+namespace {
+
+// A policy of one statement on PutObject in "pub" whose Condition is `cond`.
+std::string put_policy(std::string_view effect, std::string_view cond)
+{
+    return R"({"Version":"2012-10-17","Statement":{"Effect":")" + std::string(effect) +
+           R"(","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::pub/*","Condition":)" +
+           std::string(cond) + "}}";
+}
+
+// What an anonymous PutObject (or a part, when `inherited`) is judged, with the encryption header `sse` when `sent`.
+policy_effect anonymous_put(const bucket_policy& p, bool sent, std::string_view sse = {}, bool inherited = false)
+{
+    policy_request r;
+    r.action        = s3_action::put_object;
+    r.key           = "k";
+    r.anonymous     = true;
+    r.sse_sent      = sent;
+    r.sse           = sse;
+    r.sse_inherited = inherited;
+    return p.evaluate(r);
+}
+
+bucket_policy compiled(const std::string& json)
+{
+    bucket_policy p;
+    s3_error err;
+    INFO(err.message);
+    REQUIRE(bucket_policy::compile(json, "pub", p, err));
+    return p;
+}
+
+}   // namespace
+
+TEST_CASE("s3:x-amz-server-side-encryption under StringEquals, StringNotEquals and Null judges a put by its header")
+{
+    // The policy S3's documentation gives for requiring SSE-S3: deny a put that names another method, or none.
+    const bucket_policy ne = compiled(put_policy("Deny", R"({"StringNotEquals":{"s3:x-amz-server-side-encryption":"AES256"}})"));
+    CHECK(anonymous_put(ne, true, "AES256") == policy_effect::none);
+    CHECK(anonymous_put(ne, true, "aws:kms") == policy_effect::deny);
+    // A header that is not sent equals nothing, so it differs from AES256 too.
+    CHECK(anonymous_put(ne, false) == policy_effect::deny);
+    // Values are compared as given, as StringEquals compares them.
+    CHECK(anonymous_put(ne, true, "aes256") == policy_effect::deny);
+
+    const bucket_policy null_true = compiled(put_policy("Deny", R"({"Null":{"s3:x-amz-server-side-encryption":"true"}})"));
+    CHECK(anonymous_put(null_true, false) == policy_effect::deny);
+    CHECK(anonymous_put(null_true, true, "AES256") == policy_effect::none);
+    const bucket_policy null_false = compiled(put_policy("Deny", R"({"Null":{"s3:x-amz-server-side-encryption":false}})"));
+    CHECK(anonymous_put(null_false, false) == policy_effect::none);
+    CHECK(anonymous_put(null_false, true, "AES256") == policy_effect::deny);
+    // Both values are every request.
+    const bucket_policy null_both = compiled(put_policy("Deny", R"({"Null":{"s3:x-amz-server-side-encryption":["true","false"]}})"));
+    CHECK(anonymous_put(null_both, false) == policy_effect::deny);
+    CHECK(anonymous_put(null_both, true, "AES256") == policy_effect::deny);
+
+    const bucket_policy eq = compiled(put_policy("Allow", R"({"StringEquals":{"s3:x-amz-server-side-encryption":["AES256","aws:kms"]}})"));
+    CHECK(anonymous_put(eq, true, "AES256") == policy_effect::allow);
+    CHECK(anonymous_put(eq, true, "aws:kms") == policy_effect::allow);
+    CHECK(anonymous_put(eq, true, "x") == policy_effect::none);
+    CHECK(anonymous_put(eq, false) == policy_effect::none);
+
+    // Two operators in one Condition must both hold, and the key is named in any case, as IAM names it.
+    const bucket_policy both = compiled(put_policy("Deny", R"({"StringNotEquals":{"S3:X-Amz-Server-Side-Encryption":"AES256"},"Null":{"s3:x-amz-server-side-encryption":"false"}})"));
+    CHECK(anonymous_put(both, false) == policy_effect::none);
+    CHECK(anonymous_put(both, true, "aws:kms") == policy_effect::deny);
+    CHECK(anonymous_put(both, true, "AES256") == policy_effect::none);
+
+    // A part or a completion was judged when its upload was created, so neither a Deny nor an Allow on the header is about it.
+    for (const bucket_policy* p : {&ne, &null_true, &null_false, &eq})
+        CHECK(anonymous_put(*p, false, {}, true) == policy_effect::none);
+}
+
+TEST_CASE("a condition on the encryption is refused where it cannot be honoured exactly")
+{
+    for (const char* cond : {R"({"StringEquals":{"s3:x-amz-server-side-encryption-aws-kms-key-id":"k"}})",
+                             R"({"StringEquals":{"s3:prefix":"a"}})",
+                             R"({"StringEqualsIgnoreCase":{"s3:x-amz-server-side-encryption":"aes256"}})",
+                             R"({"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption":"AES256"}})",
+                             R"({"Null":{"s3:x-amz-server-side-encryption":"maybe"}})",
+                             R"({"Null":{"aws:SourceIp":"true"}})",
+                             R"({"StringEquals":{"s3:x-amz-server-side-encryption":[]}})",
+                             R"({"StringEquals":{"s3:x-amz-server-side-encryption":7}})",
+                             R"({"StringEquals":{"s3:x-amz-server-side-encryption":"AES256","aws:SourceIp":"1.2.3.4"}})"})
+    {
+        INFO(cond);
+        s3_error err;
+        CHECK_FALSE(compiles(put_policy("Deny", cond), &err));
+        CHECK_FALSE(err.message.empty());
+    }
+}
