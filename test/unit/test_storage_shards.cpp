@@ -1961,3 +1961,258 @@ TEST_CASE("a lifecycle filter by tags and size matches what S3's does, and is wr
     CHECK(lifecycle_object_due(c.rules[1], "any", obj(0, std::string("only\0" "1\0", 7)), later, lifecycle_day_ms));
     CHECK_FALSE(lifecycle_object_due(c.rules[1], "any", obj(0, std::string("only\0" "2\0", 7)), later, lifecycle_day_ms));
 }
+
+TEST_CASE("a version tag is named by its owner, kept out of a path, and an unversioned object is its null version")
+{
+    CHECK(valid_version_id("null"));
+    CHECK(valid_version_id(std::string(32, 'a')));
+    CHECK_FALSE(valid_version_id(""));
+    CHECK_FALSE(valid_version_id(std::string(32, 'A')));
+    CHECK_FALSE(valid_version_id("../../data/ab/" + std::string(18, 'a')));
+    CHECK_FALSE(valid_version_id(std::string(31, 'a') + "/"));
+
+    object_meta m;
+    m.mtime_ms = 1234;
+    CHECK_FALSE(has_version(m));
+    CHECK(version_of(m).id == "null");
+    CHECK(version_of(m).seq == 1234000);
+    CHECK_FALSE(is_delete_marker(m));
+
+    version_tag t;
+    t.seq    = 0x1122334455667788ull;
+    t.id     = std::string(16, '0') + "0123456789abcdef";
+    t.marker = true;
+    set_version_extra(m, t);
+    set_version_extra(m, t);
+    CHECK(std::count_if(m.extra.begin(), m.extra.end(), [](const auto& e) { return e.first == version_extra; }) == 1);
+    const version_tag back = version_of(m);
+    CHECK(back.seq == t.seq);
+    CHECK(back.id == t.id);
+    CHECK(back.marker);
+    CHECK(is_delete_marker(m));
+    // Through the header, as a start reads it back.
+    const decoded_header h = decode_object_header(encode_object_header("k", m));
+    REQUIRE(h.status == header_status::ok);
+    CHECK(version_of(h.meta).id == t.id);
+    CHECK(version_rel_path("k", t.id) == "versions/" + key_hash("k").substr(0, 2) + "/" + key_hash("k") + "." + t.id);
+    clear_version_extra(m);
+    CHECK_FALSE(has_version(m));
+}
+
+TEST_CASE("the versioned wire forms round-trip, and merged version pages stop at the nearest shard cut short")
+{
+    put_result pr;
+    pr.status = st::ok;
+    version_tag t{77, std::string(32, 'c'), false};
+    set_version_extra(pr.meta, t);
+    put_result pb;
+    REQUIRE(wire::decode_committed(wire::encode_committed(pr), pb));
+    CHECK(pb.status == st::ok);
+    CHECK(version_of(pb.meta).id == t.id);
+    REQUIRE(wire::decode_committed(wire::encode_committed(put_result{st::busy, {}}), pb));
+    CHECK(pb.status == st::busy);
+    CHECK_FALSE(has_version(pb.meta));
+
+    std::string bucket, key, id, tags;
+    REQUIRE(wire::decode_remove(wire::encode_remove("bkt", "a/key", "null"), bucket, key, &id));
+    CHECK((bucket == "bkt" && key == "a/key" && id == "null"));
+    remove_result rr{st::ok, true, true, std::string(32, 'd')}, rb;
+    REQUIRE(wire::decode_removed(wire::encode_removed(rr), rb));
+    CHECK((rb.status == rr.status && rb.existed && rb.marker && rb.version_id == rr.version_id));
+    REQUIRE(wire::decode_set_tags(wire::encode_set_tags("bkt", "k", "null", std::string("a\0b\0", 4)), bucket, key, id,
+                                  tags));
+    CHECK((id == "null" && tags == std::string("a\0b\0", 4)));
+    st s = st::ok;
+    REQUIRE(wire::decode_tagged(wire::encode_tagged(st::delete_marker, "null"), s, id));
+    CHECK(s == st::delete_marker);
+
+    version_query q;
+    q.prefix = "p/";
+    q.delimiter = "/";
+    q.key_marker = "p/k";
+    q.version_marker = std::string(32, 'e');
+    q.max_keys = 9;
+    version_query qb;
+    const std::string lv = wire::encode_list_versions("bkt", q);
+    REQUIRE(wire::decode_list_versions(lv, bucket, qb));
+    CHECK((qb.prefix == q.prefix && qb.delimiter == q.delimiter && qb.key_marker == q.key_marker &&
+           qb.version_marker == q.version_marker && qb.max_keys == 9));
+    wire::op o{};
+    REQUIRE(wire::request_op(lv, o));
+    CHECK(o == wire::op::list_versions);
+    for (size_t cut = 0; cut < lv.size(); ++cut)
+        CHECK_FALSE(wire::decode_list_versions(std::string_view(lv).substr(0, cut), bucket, qb));
+
+    auto item = [](const std::string& key, uint64_t seq, bool latest)
+    {
+        version_item it;
+        it.key = key;
+        it.meta.size = seq;
+        set_version_extra(it.meta, {seq, std::string(16, '0') + std::string(16, static_cast<char>('0' + seq % 10)), false});
+        it.latest = latest;
+        return it;
+    };
+    version_page a, b;
+    a.items = {item("a", 2, true), item("a", 1, false), item("c", 1, true)};
+    b.items = {item("b", 1, true), item("d", 1, true), item("e", 1, true)};
+    b.items.push_back({"p/", {}, false, true});
+    a.items.push_back({"p/", {}, false, true});
+    st ps = st::io_error;
+    version_page back;
+    REQUIRE(wire::decode_version_page(wire::encode_version_page(st::ok, a), ps, back));
+    REQUIRE(back.items.size() == a.items.size());
+    CHECK((back.items[1].key == "a" && !back.items[1].latest && version_of(back.items[1].meta).seq == 1));
+    CHECK(back.items.back().prefix);
+
+    // Whole pages: one sorted listing, the common prefix once.
+    const version_page whole = wire::merge_version_pages({a, b}, 100);
+    std::vector<std::string> keys;
+    for (const auto& it : whole.items)
+        keys.push_back(it.key);
+    CHECK(keys == std::vector<std::string>{"a", "a", "b", "c", "d", "e", "p/"});
+    CHECK_FALSE(whole.truncated);
+    // A page cut short after "c" says nothing about what sorts after it, so the merge stops there.
+    a.items.pop_back();
+    a.truncated = true;
+    const version_page cut = wire::merge_version_pages({a, b}, 100);
+    CHECK(cut.items.size() == 4);
+    CHECK(cut.items.back().key == "c");
+    CHECK(cut.truncated);
+    CHECK(wire::merge_version_pages({b}, 2).items.size() == 2);
+    CHECK(wire::merge_version_pages({b}, 2).truncated);
+}
+
+TEST_CASE("a key's versions through any shard: markers, removal for good, a listing, and a start from the files alone")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    st got = st::io_error;
+    bool fired = false;
+    c.m[2]->node->set_doc(bucket_doc::versioning, "bkt",
+                          "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                          [&](st r) { got = r; fired = true; });
+    REQUIRE(c.until([&] { return fired; }));
+    REQUIRE(got == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+        CHECK(c.m[s]->store->bucket_versioning("bkt") == versioning::enabled);
+    CHECK(fs::is_directory(d.path + "/bkt/versions/ff"));
+
+    const std::string key = "some/key";
+    const uint32_t owner = object_owner("bkt", key, 3);
+    std::vector<std::string> ids, bodies;
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        bodies.push_back(pattern(100 + i, i + 1));
+        const put_result r = c.put(i % 3, "bkt", key, bodies.back());
+        REQUIRE(r.status == st::ok);
+        ids.push_back(version_of(r.meta).id);
+        CHECK(valid_version_id(ids.back()));
+        CHECK(ids.back() != "null");
+    }
+    CHECK(std::set<std::string>(ids.begin(), ids.end()).size() == 4);
+
+    auto read_version = [&](uint32_t s, const std::string& id, std::string& body) -> st
+    {
+        open_result r;
+        bool done = false;
+        c.m[s]->store->open_version("bkt", key, id, 0, [&](open_result o) { r = std::move(o); done = true; });
+        REQUIRE(c.until([&] { return done; }));
+        if (r.status != st::ok)
+            return r.status;
+        body.assign(r.meta.size, '\0');
+        CHECK(::pread(r.fd, body.data(), body.size(), static_cast<off_t>(r.data_off)) == static_cast<ssize_t>(body.size()));
+        ::close(r.fd);
+        return st::ok;
+    };
+    auto remove = [&](uint32_t s, const std::string& id) -> remove_result
+    {
+        remove_result r;
+        bool done = false;
+        c.m[s]->store->remove_version("bkt", key, id, [&](remove_result o) { r = std::move(o); done = true; });
+        REQUIRE(c.until([&] { return done; }));
+        return r;
+    };
+    auto listing = [&](uint32_t s, size_t page) -> std::vector<std::pair<std::string, bool>>
+    {
+        std::vector<std::pair<std::string, bool>> out;
+        version_query q;
+        q.max_keys = page;
+        for (;;)
+        {
+            version_page p;
+            st ls = st::io_error;
+            bool done = false;
+            c.m[s]->node->list_versions("bkt", q, [&](st r, version_page pg) { ls = r; p = std::move(pg); done = true; });
+            REQUIRE(c.until([&] { return done; }));
+            REQUIRE(ls == st::ok);
+            for (const auto& it : p.items)
+                out.emplace_back(it.key + "#" + version_of(it.meta).id, it.latest);
+            if (!p.truncated)
+                return out;
+            REQUIRE(!p.items.empty());
+            q.key_marker     = p.items.back().key;
+            q.version_marker = version_of(p.items.back().meta).id;
+        }
+    };
+
+    for (uint32_t s = 0; s < 3; ++s)
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            std::string body;
+            REQUIRE(read_version(s, ids[i], body) == st::ok);
+            CHECK(body == bodies[i]);
+        }
+
+    // A marker through a shard that does not own the key, read by all of them as no such key.
+    const uint32_t other = (owner + 1) % 3;
+    const remove_result mk = remove(other, "");
+    REQUIRE(mk.status == st::ok);
+    CHECK(mk.marker);
+    CHECK(c.m[owner]->store->find("bkt", key) == nullptr);
+    REQUIRE(c.m[owner]->store->latest_marker("bkt", key) != nullptr);
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        open_result r;
+        bool done = false;
+        c.m[s]->store->open_object("bkt", key, 0, [&](open_result o) { r = std::move(o); done = true; });
+        REQUIRE(c.until([&] { return done; }));
+        CHECK(r.status == st::no_such_key);
+        CHECK(r.delete_marker);
+        std::string body;
+        CHECK(read_version(s, mk.version_id, body) == st::delete_marker);
+    }
+
+    // The marker removed is the key back; the latest removed for good is the one behind it.
+    CHECK(remove(owner, mk.version_id).marker);
+    std::string body;
+    REQUIRE(c.get(other, "bkt", key, body) == st::ok);
+    CHECK(body == bodies[3]);
+    CHECK_FALSE(remove(other, ids[3]).marker);
+    REQUIRE(c.get(other, "bkt", key, body) == st::ok);
+    CHECK(body == bodies[2]);
+    CHECK(remove(other, ids[0]).existed);
+    CHECK(read_version(owner, ids[0], body) == st::no_such_version);
+    CHECK(c.put(other, "bkt", "zz", "z").status == st::ok);
+    REQUIRE(remove(owner, "").status == st::ok);
+
+    const auto before = listing(1, 1000);
+    REQUIRE(before.size() == 4);
+    CHECK(before[0].second);
+    CHECK_FALSE(before[1].second);
+    CHECK(before.back().first.starts_with("zz#"));
+    CHECK(listing(2, 1) == before);
+    CHECK(listing(0, 2) == before);
+    CHECK(c.drop_bucket(0, "bkt") == st::bucket_not_empty);
+
+    // A crash with every journal gone: the files alone give the versions back in their order.
+    c.stop(false);
+    for (const auto& e : fs::recursive_directory_iterator(d.path))
+        if (e.path().filename().string().starts_with("index."))
+            fs::remove(e.path());
+    c.start(3);
+    CHECK(listing(0, 1000) == before);
+    REQUIRE(c.m[owner]->store->latest_marker("bkt", key) != nullptr);
+    CHECK(read_version(other, ids[2], body) == st::ok);
+    CHECK(body == bodies[2]);
+}
