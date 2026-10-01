@@ -20,6 +20,10 @@
 #               paged by key-marker and version-id-marker and by boto3's
 #               paginator, with delimiter and prefix
 #   batch       DeleteObjects with VersionId entries, and without one
+#   policy      a bucket policy's Deny of s3:GetObjectVersion, DeleteObjectVersion,
+#               GetObjectVersionTagging, ListBucketVersions and PutBucketVersioning
+#               refuses the requests that name a version (a copy's source and a
+#               DeleteObjects entry too) and leaves the plain ones alone
 #   lifecycle   with a lifecycle day of two seconds, NoncurrentVersionExpiration
 #               removes the versions behind a latest and ExpiredObjectDeleteMarker
 #               a marker with nothing behind it, and nothing outside their rules

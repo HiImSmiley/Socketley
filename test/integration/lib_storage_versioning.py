@@ -460,6 +460,57 @@ def mode_main(port, data):
     with open(os.path.join(data, STATE), "w") as f:
         json.dump({k: v for k, v in expect.items() if v is not None}, f)
     lifecycle()
+    policy()
+
+
+def policy():
+    pb = "verpol"
+    req("PUT", "/" + pb)
+    set_versioning("Enabled", bucket=pb)
+    st, v1 = put("k", b"one", bucket=pb)
+    st, v2 = put("k", b"two", bucket=pb)
+    st, w1 = put("w", b"w", bucket=pb)
+    doc = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Deny", "Principal": "*", "Resource": "arn:aws:s3:::%s/*" % pb,
+         "Action": ["s3:GetObjectVersion", "s3:DeleteObjectVersion", "s3:GetObjectVersionTagging"]},
+        {"Effect": "Deny", "Principal": "*", "Resource": "arn:aws:s3:::%s" % pb,
+         "Action": ["s3:ListBucketVersions", "s3:PutBucketVersioning"]}]})
+    st, _, body = req("PUT", "/%s?policy" % pb, doc.encode())
+    check("a policy naming the versioning actions is taken", st == 204, (st, body[:300]))
+    st, _, body = get("k", bucket=pb)
+    st2, _, _ = get("k", v1, bucket=pb)
+    st3, _, _ = get("k", v1, bucket=pb, method="HEAD")
+    check("a Deny of s3:GetObjectVersion refuses GET and HEAD by version id and not the latest",
+          (st, body, st2, st3) == (200, b"two", 403, 403), (st, st2, st3))
+    st, _, _ = req("GET", "/%s/k?tagging&versionId=%s" % (pb, v1))
+    st2, _, _ = req("GET", "/%s/k?tagging" % pb)
+    check("a Deny of s3:GetObjectVersionTagging refuses tags by version id only", (st, st2) == (403, 200), (st, st2))
+    st, _, _ = req("PUT", "/%s/c" % pb, headers={"x-amz-copy-source": "/%s/k?versionId=%s" % (pb, v1)})
+    st2, _, _ = req("PUT", "/%s/c" % pb, headers={"x-amz-copy-source": "/%s/k" % pb})
+    check("a copy from a source version is judged as s3:GetObjectVersion of it", (st, st2) == (403, 200), (st, st2))
+    st, _, _ = req("GET", "/%s?versions" % pb)
+    st2, _, _ = req("GET", "/%s?list-type=2" % pb)
+    st3, _, _ = set_versioning("Suspended", bucket=pb)
+    st4, _ = get_versioning(bucket=pb)
+    check("a Deny of s3:ListBucketVersions and s3:PutBucketVersioning refuses those and nothing else",
+          (st, st2, st3, st4) == (403, 200, 403, 200), (st, st2, st3, st4))
+    st, dm, _ = delete("k", v1, bucket=pb)
+    st2, dm2, _ = delete("k", bucket=pb)
+    check("a Deny of s3:DeleteObjectVersion refuses a DELETE by version id and not a delete marker",
+          (st, st2, dm2) == (403, 204, "true"), (st, st2, dm2))
+    body = ("<Delete><Object><Key>w</Key><VersionId>%s</VersionId></Object><Object><Key>w</Key></Object></Delete>"
+            % w1).encode()
+    st, _, out = req("POST", "/%s?delete" % pb, body)
+    root = ET.fromstring(out) if st == 200 else None
+    errors = [] if root is None else [(e.findtext(NS + "Key"), e.findtext(NS + "Code")) for e in root.findall(NS + "Error")]
+    deleted = [] if root is None else [d.findtext(NS + "DeleteMarker") for d in root.findall(NS + "Deleted")]
+    check("DeleteObjects refuses the entry that names a version and does the one that does not",
+          errors == [("w", "AccessDenied")] and deleted == ["true"], (st, out[:500]))
+    st2, _, body2 = get("w", w1, bucket=pb)
+    req("DELETE", "/%s?policy" % pb)
+    st3, _, body3 = get("w", w1, bucket=pb)
+    check("the version it refused is still there, and readable once the policy is gone",
+          st2 == 403 and (st3, body3) == (200, b"w"), (st2, st3))
 
 
 def lifecycle():
