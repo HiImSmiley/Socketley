@@ -32,6 +32,14 @@ constexpr size_t   stream_chunk        = 256 * 1024;
 // What one recv brings a heavy hook, so the hop to its thread is paid per quarter megabyte.
 constexpr size_t   hook_read_bytes     = 256 * 1024;
 constexpr size_t   hook_buffers_kept   = 32;
+// What a heavy hook is given at least, unless the body ends first.
+constexpr size_t   recv_batch_bytes    = 64 * 1024;
+// A body arriving slower than 4 MB/s is trickling in, and its next recv waits for the pace tick.
+constexpr uint64_t trickle_ns_per_byte = 250;
+// How long a trickling body is left to gather in the socket, where what it holds is bounded by the rate above.
+constexpr long     pace_ns             = 10'000'000;
+// What a trickling body must still owe for its next recv to wait, so the end of a body is never held.
+constexpr uint64_t pace_tail_bytes     = 64 * 1024;
 // What a body already refused is read and thrown away up to, so the client that
 // sent it hears the answer instead of a reset; beyond it the connection closes.
 constexpr uint64_t discard_limit       = 64ull << 20;
@@ -274,6 +282,13 @@ void storage_run::on_cqe(struct io_uring_cqe* cqe)
             m_lc->scanned = 0;
             lifecycle_pump();
         }
+        return;
+    }
+    if (req == &m_pace_timer.req)
+    {
+        m_pace_timer.armed = false;
+        if (!m_stopped)
+            pace_tick();
         return;
     }
     if (req == &m_accept_backoff.req)
@@ -537,6 +552,9 @@ void storage_run::stop()
     if (m_lc_timer.armed)
         m_loop.submit_timeout_remove(&m_lc_timer.req);
     m_lc.reset();
+    if (m_pace_timer.armed)
+        m_loop.submit_timeout_remove(&m_pace_timer.req);
+    m_paced.clear();
 
     std::vector<std::shared_ptr<conn>> all;
     for (auto& [id, c] : m_conns)
@@ -648,15 +666,15 @@ storage_run::read_plan storage_run::plan_read(const conn& c) const
                 }
             }
             else if (c.hook && c.hook->heavy() && !c.req.chunked && m_hash.enabled() && c.put &&
-                     !c.put->failed() && c.put_failed == st::ok && c.body_left >= direct_min)
+                     !c.put->failed() && c.put_failed == st::ok && (c.body_left >= direct_min || c.hfill > 0))
             {
-                // A signed body is verified on a helper thread, a quarter megabyte at a time.
+                // A signed body is verified on a helper thread, up to a quarter megabyte at a time.
                 if (c.park_off < c.park.size() || c.hook_busy)
                     p.k = read_plan::kind::none;   // resumed when the hook has reported and the put has taken its bytes
                 else
                 {
                     p.k    = read_plan::kind::own;
-                    p.len  = static_cast<uint32_t>(std::min<uint64_t>(hook_read_bytes, c.body_left));
+                    p.len  = static_cast<uint32_t>(std::min<uint64_t>(hook_read_bytes - c.hfill, c.body_left));
                     p.hook = true;
                 }
             }
@@ -667,6 +685,22 @@ storage_run::read_plan storage_run::plan_read(const conn& c) const
             break;
     }
     return p;
+}
+
+void storage_run::pace_tick()
+{
+    std::vector<uint64_t> due;
+    due.swap(m_paced);
+    for (const uint64_t id : due)
+    {
+        auto c = find(id);
+        if (!c || c->dead || !c->paced)
+            continue;
+        c->paced    = false;
+        // Whatever gathered while it waited is taken now, however little it is.
+        c->pace_due = true;
+        arm_read(c);
+    }
 }
 
 void storage_run::cancel_read(const std::shared_ptr<conn>& c)
@@ -684,12 +718,14 @@ void storage_run::cancel_read(const std::shared_ptr<conn>& c)
 
 void storage_run::arm_read(const std::shared_ptr<conn>& c)
 {
-    if (c->dead || c->fd < 0)
+    if (c->dead || c->fd < 0 || c->paced)
         return;
+    // A body that trickles in is left to gather in the socket until the next tick, so a recv and a wakeup are not paid per segment.
+    const bool pace = c->ph == phase::body_put && c->trickle && c->body_left > pace_tail_bytes && !m_stopped;
     if (c->rd_pending)
     {
-        // A recv that keeps delivering is left standing, unless the phase now wants a buffer of its own.
-        if (c->rd_multi && !c->rd_cancel && plan_read(*c).k == read_plan::kind::own)
+        // A recv that keeps delivering is left standing, unless the phase now wants a buffer of its own or a pace.
+        if (c->rd_multi && !c->rd_cancel && (pace || plan_read(*c).k == read_plan::kind::own))
             cancel_read(c);
         return;
     }
@@ -713,6 +749,24 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
         close_conn(c);
         return;
     }
+    if (pace && !c->pace_due)
+    {
+        if (!m_pace_timer.armed)
+        {
+            m_pace_timer.ts  = {0, pace_ns};
+            m_pace_timer.req = io_request{};
+            m_pace_timer.req.owner = this;
+            m_pace_timer.req.type  = op_timeout;
+            m_pace_timer.armed     = m_loop.submit_timeout(&m_pace_timer.ts, &m_pace_timer.req);
+        }
+        if (m_pace_timer.armed)
+        {
+            c->paced = true;
+            m_paced.push_back(c->id);
+            return;
+        }
+    }
+    c->pace_due  = false;
     c->rd_direct = plan.direct;
     c->rd_hook   = plan.hook;
     c->rd_multi  = false;
@@ -721,7 +775,7 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     {
         if (!c->hbuf)
             c->hbuf = take_hook_buffer();
-        plan.buf = c->hbuf.get();
+        plan.buf = c->hbuf.get() + c->hfill;
     }
 
     c->rd_req = io_request{};
@@ -731,7 +785,7 @@ void storage_run::arm_read(const std::shared_ptr<conn>& c)
     if (plan.k == read_plan::kind::ring && m_ring && !c->rd_fallback)
     {
         // Nothing is held for an idle connection: the kernel picks a buffer when bytes arrive.
-        if (m_multishot && !c->ssl)
+        if (m_multishot && !c->ssl && !pace)
             queued = c->rd_multi = m_loop.submit_recv_multishot(c->fd, ring_group, &c->rd_req);
         if (!queued)
             queued = m_loop.submit_read_provided(c->fd, ring_group, &c->rd_req, c->rd_drained);
@@ -817,9 +871,27 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
     c->rd_drained = event_loop::recv_drained(cqe);
     // A request being answered is not progress by the client, or a stalled write would never be reaped.
     if (c->ph != phase::respond && c->ph != phase::hook_wait)
-        c->last_progress = std::chrono::steady_clock::now();
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (c->ph == phase::body_put)
+        {
+            // The rate is judged over a pace interval at the least, so a burst of a few segments is not taken for speed.
+            c->rate_bytes += n;
+            const auto ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - c->rate_since).count());
+            if (ns >= static_cast<uint64_t>(pace_ns))
+            {
+                c->trickle    = c->rate_bytes * trickle_ns_per_byte < ns;
+                c->rate_since = now;
+                c->rate_bytes = 0;
+            }
+        }
+        c->last_progress = now;
+    }
     runtime_instance::stat_add(m_owner.m_stat_bytes_in, n);
     m_c.bytes_in += n;
+    if (c->ph == phase::body_put)
+        ++m_c.body_recvs;
 
     const char* data = nullptr;
     if (lend.held)
@@ -854,10 +926,15 @@ void storage_run::read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe*
         if (c->ph == phase::body_put)
         {
             c->body_left -= n;
-            hook_async(c, n);
+            c->hfill     += n;
+            if (c->hfill >= recv_batch_bytes || c->body_left == 0 || c->hfill == hook_read_bytes)
+                hook_async(c, std::exchange(c->hfill, 0));
+            else
+                arm_read(c);
             return;
         }
         // The answer was decided while this was in flight, so what it brought is counted and dropped.
+        c->hfill = 0;
         if (c->ph == phase::body_discard)
         {
             // Such a recv asks for no more than the body's rest, so none of what it brought can be the next request.
@@ -1397,6 +1474,9 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->ck_trailer.clear();
     c->sent_body = 0;
     c->rd_direct = false;
+    c->hfill = 0;
+    c->trickle  = false;
+    c->pace_due = false;
     c->principal.clear();
     c->cors_head.clear();
 }
@@ -1720,6 +1800,8 @@ void storage_run::begin_put_body(const std::shared_ptr<conn>& c, std::shared_ptr
     c->chunk_in.clear();
     c->park.clear();
     c->park_off = 0;
+    c->rate_since = std::chrono::steady_clock::now();
+    c->rate_bytes = 0;
     ++m_c.puts;
 
     std::weak_ptr<conn> weak = c;

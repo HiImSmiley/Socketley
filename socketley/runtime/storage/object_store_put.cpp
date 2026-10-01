@@ -16,6 +16,11 @@ namespace socketley::storage
 namespace
 {
 
+// What a trickling body gathers before its digests are handed to a helper thread.
+constexpr size_t hash_batch      = 64 * 1024;
+// What the end of a body may be hashed on the loop up to, rather than paying a hop for it.
+constexpr size_t hash_inline_max = 16 * 1024;
+
 st write_status(int64_t res)
 {
     return (res == -ENOSPC || res == -EDQUOT) ? st::storage_full : st::io_error;
@@ -58,6 +63,7 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_stage[0].data = std::make_shared_for_overwrite<char[]>(m_cap);
     std::memset(m_stage[0].data.get(), 0, m_header_len);
     m_stage[0].fill     = m_header_len;
+    m_stage[0].hashed   = m_header_len;
     m_stage[0].file_off = 0;
     m_stage[0].state    = stage_state::filling;
     if (!size_known || m_header_len + expected > m_cap)
@@ -221,30 +227,11 @@ void put_op::staged(size_t n)
     if (n == 0 || m_status != st::ok)
         return;
     stage& s = m_stage[m_active];
-    if (m_async)
-    {
-        // Behind the earlier pieces of this body on one thread, reading the
-        // bytes where they landed; the buffer is held until it reports.
-        ++s.hash_out;
-        ++m_hash_out;
-        const int index = m_active;
-        m_store->m_hash->submit(m_lane,
-            [hs = m_hs, buf = s.data, p = s.data.get() + s.fill, n]
-            {
-                hs->md5.update(p, n);
-                if (hs->ck)
-                    hs->ck->update(p, n);
-            },
-            [self = shared_from_this(), index] { self->on_hashed(index); });
-    }
-    else
-    {
-        m_hs->md5.update(s.data.get() + s.fill, n);
-        if (m_hs->ck)
-            m_hs->ck->update(s.data.get() + s.fill, n);
-    }
     s.fill += n;
     m_received += n;
+    // A body that trickles in is handed over in batches, so a hop to a helper thread is not paid per segment.
+    if (s.fill - s.hashed >= hash_batch || s.fill == m_cap || !m_async)
+        hash_staged(false);
 
     if (m_received > m_store->m_opts.max_object_bytes)
     {
@@ -277,6 +264,37 @@ void put_op::staged(size_t n)
         m_next_off = s.file_off + s.fill;
         pump();
     }
+}
+
+void put_op::hash_staged(bool last)
+{
+    stage& s = m_stage[m_active];
+    const size_t n = s.fill - s.hashed;
+    if (n == 0)
+        return;
+    const char* p = s.data.get() + s.hashed;
+    s.hashed = s.fill;
+    // The tail of a body is hashed here when nothing is ahead of it on the lane, since a hop costs more than a few kilobytes.
+    if (m_async && !(last && m_hash_out == 0 && n <= hash_inline_max))
+    {
+        // Behind the earlier pieces of this body on one thread, reading the
+        // bytes where they landed; the buffer is held until it reports.
+        ++s.hash_out;
+        ++m_hash_out;
+        const int index = m_active;
+        m_store->m_hash->submit(m_lane,
+            [hs = m_hs, buf = s.data, p, n]
+            {
+                hs->md5.update(p, n);
+                if (hs->ck)
+                    hs->ck->update(p, n);
+            },
+            [self = shared_from_this(), index] { self->on_hashed(index); });
+        return;
+    }
+    m_hs->md5.update(p, n);
+    if (m_hs->ck)
+        m_hs->ck->update(p, n);
 }
 
 size_t put_op::append(const char* p, size_t n)
@@ -328,6 +346,7 @@ void put_op::pump()
                 if (s.data && s.state == stage_state::free)
                 {
                     s.fill     = 0;
+                    s.hashed   = 0;
                     s.file_off = m_next_off;
                     s.state    = stage_state::filling;
                     m_active   = i;
@@ -442,6 +461,7 @@ void put_op::finish(const md5_t* expected_md5, std::function<void(put_result)> c
     }
     m_done = std::move(cb);
     m_has_expect_md5 = expected_md5 != nullptr;
+    hash_staged(true);
     if (expected_md5)
         m_expect_md5 = *expected_md5;
     // The digests are complete only when every piece has been hashed.

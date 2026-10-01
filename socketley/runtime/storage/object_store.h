@@ -294,6 +294,8 @@ private:
         // Shared with the digest jobs, which may outlive this operation.
         std::shared_ptr<char[]> data;
         size_t                  fill{0};
+        // Where the bytes not yet handed to the digests begin.
+        size_t                  hashed{0};
         uint64_t                file_off{0};
         stage_state             state{stage_state::free};
         // Digest jobs of this buffer that have not reported.
@@ -309,6 +311,8 @@ private:
     };
 
     void on_hashed(int stage_index);
+    // Hands what the active buffer holds past `hashed` to the digests; `last` is the end of the body.
+    void hash_staged(bool last);
     void finish_now();
     void begin(object_store* store, std::string bucket, std::string key, object_meta meta,
                uint64_t expected, bool size_known, bool plain);

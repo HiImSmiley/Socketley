@@ -6877,6 +6877,14 @@ quarter of a second per 100,000 objects with a warm cache and about a second fro
 cold one on four CPUs (see How objects are stored). Uploads of 256 KiB or more are
 hashed on helper threads (\fBSOCKETLEY_STORAGE_HASH_THREADS\fR), which is what lets
 a 64 MiB put at 32 connections use the disk rather than one core.
+.PP
+A body of known length that arrives slower than 4 MB/s, judged over 10 ms, is
+left to gather in the socket and read once per 10 ms tick shared by every such
+connection, except for its last 64 KiB, so a slow upload is not paid for with a
+receive and a wakeup per TCP segment; its digests are handed to the hashing
+threads 64 KiB at a time. A 1 MiB put sent in 1448\-byte segments at 0.8 MB/s,
+eight at once, took about 35 to 60 ms of worker CPU per MiB before and about 6
+to 9 after, against about 3 to 5 for the same put sent at loopback speed.
 .
 .SS Sharding
 .B \-\-shards
@@ -6996,9 +7004,12 @@ reports
 .BR timeouts ,
 .B tls
 (1 when the listener is TLS),
-.B tls_handshakes
-and
+.BR tls_handshakes ,
 .BR tls_failures ,
+.B body_recvs
+(receives that brought bytes of an upload's body) and
+.B hash_handoffs
+(pieces of digest work handed to the hashing threads),
 and one line
 .BI error_ Code
 for every S3 error code the runtime has answered, such as
@@ -11285,7 +11296,8 @@ that the worker's loop is not the one core every upload's hashing has to fit in.
 .B 0
 hashes on the loop. The threads are started by the first upload of 256 KiB or
 more (or of unknown length) and end with the runtime; smaller bodies are hashed
-in line, since the hop costs more than their digest. This changes CPU use and
+in line, since the hop costs more than their digest, and a body that arrives a few
+segments at a time is handed over 64 KiB at a time for the same reason. This changes CPU use and
 the throughput of large puts, never what is stored.
 .IP
 Inherited by worker processes, which have no command line of their own.

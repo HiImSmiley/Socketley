@@ -374,7 +374,9 @@ std::string storage_instance::stats_lines() const
         << "tls_failures:" << c.tls_failures << "\n"
         << "recv_fallbacks:" << c.recv_fallbacks << "\n"
         << "recv_cancels:" << c.recv_cancels << "\n"
-        << "recv_direct_bytes:" << c.recv_direct_bytes << "\n";
+        << "recv_direct_bytes:" << c.recv_direct_bytes << "\n"
+        << "body_recvs:" << c.body_recvs << "\n"
+        << "hash_handoffs:" << m_run->hash_handoffs() << "\n";
     // One line per code answered, so a client's mistakes and the runtime's own
     // are told apart without reading a log.
     for (const auto& [code, n] : c.errors)

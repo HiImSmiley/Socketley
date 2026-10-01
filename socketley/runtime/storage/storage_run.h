@@ -77,6 +77,8 @@ struct storage_counters
     uint64_t recv_cancels{0};
     // Body bytes received straight into a put's staging buffer, without passing through one the ring lent.
     uint64_t recv_direct_bytes{0};
+    // Receives that brought bytes of a body being streamed into an object.
+    uint64_t body_recvs{0};
     // S3 errors answered, by the code in the XML.
     std::map<std::string, uint64_t, std::less<>> errors;
 };
@@ -233,6 +235,13 @@ struct conn
     bool        rd_cancel{false};
     // The last recv took what the socket had and left it empty, so the next one waits for data instead of trying first.
     bool        rd_drained{true};
+    // The body is trickling in, judged by what arrived since `rate_since`, and its next recv waits for the pace tick.
+    bool        trickle{false};
+    std::chrono::steady_clock::time_point rate_since{};
+    uint64_t    rate_bytes{0};
+    // Waiting for the tick, and armed by it, which the next recv is then not held from.
+    bool        paced{false};
+    bool        pace_due{false};
     // The peer will send no more, which a connection still answering does not act on until it is done.
     bool        peer_eof{false};
     // Read into by a recv the ring could not serve, and only then allocated.
@@ -274,6 +283,8 @@ struct conn
     // A recv for a body whose hook is heavy lands here, in a buffer that the
     // hook's job then owns until it reports.
     std::shared_ptr<char[]> hbuf;
+    // What `hbuf` holds that the hook has not been given, gathered so a trickling body is not handed over per segment.
+    size_t      hfill{0};
     bool        rd_hook{false};
     bool        hook_busy{false};
     uint32_t    hash_lane{0};
@@ -398,6 +409,8 @@ public:
     const storage_counters& counters() const { return m_c; }
     object_store& store() { return m_store; }
     uint64_t hot_bytes() const { return m_store.hot_bytes(); }
+    // Pieces of digest work handed to the helper threads.
+    uint64_t hash_handoffs() const { return m_hash.submitted(); }
     shard_node& node() { return m_node; }
     file_io& io() { return m_io; }
     void set_authenticator(authenticator* a) { m_auth = a; }
@@ -439,6 +452,8 @@ public:
     read_plan plan_read(const conn& c) const;
     // Withdraws the recv that is armed, whose last completion says -ECANCELED.
     void cancel_read(const std::shared_ptr<conn>& c);
+    // Arms the recvs that waited for this tick.
+    void pace_tick();
     void read_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void write_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
     void splice_in_done(const std::shared_ptr<conn>& c, struct io_uring_cqe* cqe);
@@ -642,6 +657,9 @@ private:
     timer       m_accept_backoff;
     // The pause between the steps of a lifecycle pass.
     timer       m_lc_timer;
+    // One timer for every trickling body, and the connections waiting for it.
+    timer       m_pace_timer;
+    std::vector<uint64_t> m_paced;
 
     // Asked again at each sweep until every sibling has heard this shard started, or it gave up.
     void tell_started();
