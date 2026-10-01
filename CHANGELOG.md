@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Storage: bucket CORS, lifecycle, object tagging and reads by part number.**
+  PutBucketCors/GetBucketCors/DeleteBucketCors with S3's CORSConfiguration, an
+  unauthenticated `OPTIONS` preflight, and the CORS headers on every answer to an
+  allowed origin, errors included. PutBucketLifecycleConfiguration and its Get and
+  Delete: expiration by days (counted to the next midnight UTC, as S3 does) or by
+  date, the abort of incomplete multipart uploads, filters by prefix, tag, size
+  and `And`; a paced sweep on each shard deletes through the ordinary delete path
+  and counts in `stats` (`lifecycle_expired`, `lifecycle_aborted`);
+  `SOCKETLEY_STORAGE_LIFECYCLE_DAY_SECS` shortens a day for tests. Both are
+  per-bucket documents written by shard 0, told to every shard before the answer
+  and read back at a start. PutObjectTagging/GetObjectTagging/DeleteObjectTagging,
+  `x-amz-tagging` on a put, a multipart upload and a copy (`COPY` or `REPLACE`),
+  and `x-amz-tagging-count`; a tag change is written in place into one of two
+  checksummed slots in the header's padding with one sync, about 2.5 ms whatever
+  the object's size, where rewriting a 1 GiB object took 1.07 s. GetObject and
+  HeadObject by `partNumber`, from the part sizes a completion now records in the
+  object's header.
+
+- **Storage: a slow upload costs a fraction of the CPU, and four shards cost less
+  per HEAD and listing.** A body that trickles in (an upload over the internet)
+  is read once per 10 ms tick and hashed 64 KiB at a time instead of once per TCP
+  segment: 1 MiB through an emulated 50 Mbit, 30 ms link took 28 ms of worker CPU
+  before and 9.4 after, paced on loopback 39 and 7; fast uploads are unchanged
+  (`stats` counts `body_recvs` and `hash_handoffs`). With four shards a HEAD of
+  another shard's key is answered from metadata kept for it instead of opening its
+  file (21.9 to 16.2 us of worker CPU per HEAD at 32 connections), and a sibling's
+  listing page is written straight from its walk and read without a copy per entry
+  (385 to 278 us per listing).
+
 - **A storage runtime against MinIO, and what was made faster.**
   Measured with `warp` and boto3 over plain HTTP with SigV4, on one 16-core VM
   with an ext4 virtio disk, against MinIO single node single drive on the same
@@ -435,6 +464,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   be after the next worker had bound it.
 
 ### Changed
+
+- **Storage: a copy of a multipart object is a single-part object**, as S3
+  makes it: its ETag is the MD5 of its bytes without `-N`, taken during the copy,
+  and `partNumber=1` reads all of it. Copies used to keep the source's multipart
+  ETag.
 
 - **Unix stream sockets get a 1 MiB send buffer** (512 KiB asked, doubled by
   the kernel, capped at `net.core.wmem_max`): every socket accepted off
