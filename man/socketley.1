@@ -6952,7 +6952,7 @@ and
 wildcards, compared without case, or
 .B *
 alone. A name must be one of S3's, and those this runtime does not implement
-(s3:GetObjectVersion, s3:PutObjectAcl, .\|.\|.) are taken and match nothing.
+(s3:PutObjectAcl, s3:GetObjectRetention, .\|.\|.) are taken and match nothing.
 GetObject covers GetObject and HeadObject, by part too; PutObject covers PutObject,
 CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and
 CompleteMultipartUpload; DeleteObject covers DeleteObject and DeleteObjects; ListBucket
@@ -6960,7 +6960,13 @@ covers ListObjects, ListObjectsV2 and HeadBucket; PutBucketCORS and
 PutLifecycleConfiguration cover the deletes of those configurations; the rest are
 named as S3 names them (GetObjectTagging, AbortMultipartUpload,
 ListMultipartUploadParts, ListBucketMultipartUploads, GetBucketLocation, CreateBucket,
-DeleteBucket, .\|.\|.).
+DeleteBucket, GetBucketVersioning, PutBucketVersioning, .\|.\|.). A request that names a
+version with ?versionId= is the version's action, as in S3: GetObjectVersion for GET
+and HEAD (and for a copy's source named key?versionId=), DeleteObjectVersion for DELETE
+and for each DeleteObjects entry with a VersionId (judged per entry, a refused one
+answered AccessDenied in the result), and GetObjectVersionTagging,
+PutObjectVersionTagging and DeleteObjectVersionTagging; ListBucketVersions covers
+ListObjectVersions.
 .TP
 .B Resource
 one or a list of
