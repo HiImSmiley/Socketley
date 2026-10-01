@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -219,11 +220,16 @@ struct assemble_state
     // The format the parts are sealed in, 0 for none, since their bytes on disk are more than their sizes say.
     uint8_t  sealed{0};
     complete_binder bind;
+    // The part list written after the body, when the header has no room for it.
+    std::string trailer;
 };
 
 multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& store)
     : m_loop(&loop), m_io(&io), m_store(&store), m_alive(std::make_shared<bool>(true))
 {
+    // A smaller room for the part list in the header, so a test reaches the trailer without gigabytes of parts.
+    if (const char* e = std::getenv("SOCKETLEY_STORAGE_PART_LIST_MAX"))
+        m_list_max = std::strtoull(e, nullptr, 10);
 }
 
 multipart_store::~multipart_store()
@@ -1058,39 +1064,20 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             plan.checksum_b64 = composite_checksum_b64(u->algo, raw_checksums, parts.size());
             plan.meta.extra.emplace_back(std::string(checksum_header(u->algo)), plan.checksum_b64);
         }
-        std::vector<uint64_t> sizes;
-        sizes.reserve(plan.parts.size());
+        // Kept in the header when it fits and after the body otherwise, so any list S3 takes completes.
+        part_list list;
+        const uint8_t sealed = sse_version_of(plan.meta);
+        uint64_t body = 0;
         for (const mpu_part& p : plan.parts)
-            sizes.push_back(p.size);
-        bool recorded = parts.size() == 1;
-        if (std::string v = encode_part_sizes(sizes); !v.empty())
         {
-            plan.meta.extra.emplace_back(std::string(part_sizes_extra), std::move(v));
-            recorded = true;
+            list.numbers.push_back(p.number);
+            list.sizes.push_back(p.size);
+            body += sealed ? sse_stored_len(p.size, sealed) : p.size;
         }
-        // A version 2 stream is sealed as the part number it was uploaded as, which a list of 1..N goes without.
-        if (sse_version_of(plan.meta) >= sse_format)
-        {
-            std::vector<uint32_t> numbers;
-            bool one_to_n = true;
-            for (const mpu_part& p : plan.parts)
-            {
-                numbers.push_back(p.number);
-                one_to_n = one_to_n && p.number == numbers.size();
-            }
-            std::string v = encode_part_numbers(numbers);
-            recorded = recorded && (one_to_n || !v.empty());
-            if (!v.empty())
-                plan.meta.extra.emplace_back(std::string(part_numbers_extra), std::move(v));
-        }
-        // An encrypted object's chunks are found by its parts, so one whose parts cannot be kept is not made.
-        if (is_encrypted(plan.meta) && !recorded)
-        {
-            reject("InvalidRequest", "The parts of an encrypted upload must leave its part sizes short enough to "
-                                     "record: make every part but the last one size");
-            return;
-        }
-        plan.in_place = copy_free(*u, plan.parts);
+        // A version 2 stream is sealed as the part number it was uploaded as, so its object keeps the numbers.
+        const bool trailer = !record_part_list(plan.meta, list, body, sealed >= sse_format, m_list_max).empty();
+        m_trailers += trailer ? 1 : 0;
+        plan.in_place = !trailer && copy_free(*u, plan.parts);
         u->place_planned = plan.in_place;
         cb({}, std::move(plan));
     };
@@ -1104,6 +1091,16 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
 void multipart_store::assemble(std::shared_ptr<assemble_state> a)
 {
     a->sealed = sse_version_of(a->meta);
+    if (part_trailer t; part_trailer_of(a->meta, t))
+    {
+        part_list list;
+        for (const mpu_part& p : a->parts)
+        {
+            list.numbers.push_back(p.number);
+            list.sizes.push_back(p.size);
+        }
+        a->trailer = encode_part_list(list, a->meta.size);
+    }
     if (a->bind)
         if (s3_error e = a->bind(a->meta); !e.code.empty())
         {
@@ -1113,8 +1110,8 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
         }
     const uint64_t base = a->in_place && !a->parts.empty() ? a->parts.front().data_off : 0;
     auto header = std::make_shared<std::string>(encode_object_header(a->key, a->meta, base));
-    // A header that outgrew the room its upload reserved would be written over part 1.
-    if (!a->in_place || header->size() != base)
+    // A header that outgrew the room its upload reserved would be written over part 1, and a trailer is only copied.
+    if (!a->in_place || header->size() != base || !a->trailer.empty())
     {
         a->in_place = false;
         assemble_copy(std::move(a));
@@ -1360,6 +1357,28 @@ void multipart_store::assemble_finish(const std::shared_ptr<assemble_state>& a)
     if (a->failed)
     {
         assemble_fail(a, errno_st(a->err));
+        return;
+    }
+    // The part list the header had no room for goes after the last part, before the sync that makes both durable.
+    if (!a->trailer.empty())
+    {
+        auto list = std::make_shared<std::string>(std::move(a->trailer));
+        a->trailer.clear();
+        const bool qt = m_io->pwrite(*a->dst, list->data(), static_cast<uint32_t>(list->size()), a->dst_off,
+            [this, alive = m_alive, a, list](int64_t r)
+            {
+                if (!*alive)
+                    return;
+                if (r != static_cast<int64_t>(list->size()))
+                {
+                    assemble_fail(a, errno_st(r < 0 ? r : -EIO));
+                    return;
+                }
+                a->dst_off += list->size();
+                assemble_finish(a);
+            });
+        if (!qt)
+            assemble_fail(a, st::io_error);
         return;
     }
     const bool q = m_io->fsync(*a->dst, true, [this, alive = m_alive, a](int64_t r)

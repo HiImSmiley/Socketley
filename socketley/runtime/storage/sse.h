@@ -90,15 +90,17 @@ inline uint64_t sse_stored_len(uint64_t plain, uint8_t version)
     return plain + sse_chunks(plain, version) * sse_overhead;
 }
 
-// The bytes of `m`'s body on disk, UINT64_MAX when an encrypted multipart object's part sizes are not known.
+// The bytes after `m`'s header on disk, its part list included when that follows the body, UINT64_MAX when an
+// encrypted multipart object's part sizes are not known.
 uint64_t stored_size(const object_meta& m);
 
 // What a commit or an open needs to know of the chunks of an encrypted body.
 class sse_layout
 {
 public:
-    // False when the record is not one, or a per-part body's parts are not recorded.
-    bool init(const object_meta& m);
+    // False when the record is not one, or a per-part body's parts are not recorded; `list` is the one read
+    // after the body when the header has no room for it.
+    bool init(const object_meta& m, const part_list* list = nullptr);
 
     struct chunk
     {
@@ -137,6 +139,9 @@ private:
     std::vector<uint64_t> m_plain_at;
     std::vector<uint64_t> m_cipher_at;
 };
+
+// The digest a version 2 per-part object's data key is wrapped with, from its header alone.
+bool sse_parts_digest(const object_meta& m, sse_digest& out);
 
 sse_key sse_random_key();
 // A short name of a master key, which is what its objects record.

@@ -214,14 +214,12 @@ bool storage_run::sse_data_key(const object_meta& m, const std::optional<sse_key
     const sse_digest* parts = nullptr;
     if (rec.version != sse_format_v1 && rec.per_part && m.parts >= 1)
     {
-        sse_layout l;
-        if (!l.init(m))
+        if (!sse_parts_digest(m, digest))
         {
             err = sse_error("InternalError", "The object's part list cannot be read");
             return false;
         }
-        digest = l.parts_digest();
-        parts  = &digest;
+        parts = &digest;
     }
     if (rec.mode == sse_mode::c)
     {
@@ -277,10 +275,9 @@ s3_error storage_run::sse_bind_parts(object_meta& m, const std::optional<sse_key
         return sse_error("InternalError", "The upload's encryption record cannot be read");
     if (rec.version == sse_format_v1 || !rec.per_part)
         return {};
-    sse_layout l;
-    if (!l.init(m))
+    sse_digest parts{};
+    if (!sse_parts_digest(m, parts))
         return sse_error("InternalError", "The completed object's part list cannot be read");
-    const sse_digest parts = l.parts_digest();
     const sse_key* kek = nullptr;
     if (rec.mode == sse_mode::s3)
     {

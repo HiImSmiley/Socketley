@@ -389,6 +389,7 @@ std::string storage_instance::stats_lines() const
         << "multipart_created:" << c.mpu_created << "\n"
         << "multipart_completed:" << c.mpu_completed << "\n"
         << "multipart_aborted:" << c.mpu_aborted << "\n"
+        << "multipart_list_trailers:" << m_run->multipart().trailers() << "\n"
         << "lifecycle_expired:" << c.lifecycle_expired << "\n"
         << "lifecycle_aborted:" << c.lifecycle_aborted << "\n"
         << "tls:" << (m_run->tls_enabled() ? 1 : 0) << "\n"

@@ -47,6 +47,7 @@ private:
     };
 
     void fetch();
+    void load_list();
     void read_done(int index, int64_t res, uint64_t want, std::shared_ptr<std::vector<sse_layout::chunk>> chunks);
     void hand_out();
 
@@ -57,6 +58,11 @@ private:
     int        m_fd{-1};
     uint64_t   m_data_off{0};
     sse_layout m_layout;
+    // The object while its part list, kept after its body, is still to be read.
+    std::unique_ptr<object_meta> m_meta;
+    part_trailer m_trailer;
+    bool       m_list_reading{false};
+    bool       m_list_failed{false};
     std::optional<sse_key> m_key;
     // The next plaintext byte to fetch, and the end of the range.
     uint64_t   m_pos{0};

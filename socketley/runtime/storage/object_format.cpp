@@ -158,7 +158,7 @@ void encode_meta(std::string& out, std::string_view key, const object_meta& m)
     }
 }
 
-std::string encode_part_sizes(const std::vector<uint64_t>& sizes)
+std::string encode_part_sizes(const std::vector<uint64_t>& sizes, size_t max)
 {
     if (sizes.empty())
         return {};
@@ -173,7 +173,7 @@ std::string encode_part_sizes(const std::vector<uint64_t>& sizes)
         if (!out.empty())
             out += ',';
         out += std::to_string(s);
-        if (out.size() > max_part_sizes_bytes)
+        if (out.size() > max)
             return {};
     }
     return out;
@@ -302,7 +302,7 @@ bool each_item(std::string_view v, F take)
 
 }   // namespace
 
-std::string encode_part_numbers(const std::vector<uint32_t>& numbers)
+std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max)
 {
     bool plain = true;
     for (size_t i = 0; i < numbers.size(); ++i)
@@ -320,7 +320,7 @@ std::string encode_part_numbers(const std::vector<uint32_t>& numbers)
         out += std::to_string(numbers[i]);
         if (j > i)
             out += '-' + std::to_string(numbers[j]);
-        if (out.size() > max_part_sizes_bytes)
+        if (out.size() > max)
             return {};
         i = j + 1;
     }
@@ -394,7 +394,81 @@ bool part_list_of(const object_meta& m, part_list& out)
 
 void clear_part_layout(object_meta& m)
 {
-    std::erase_if(m.extra, [](const auto& e) { return e.first == part_sizes_extra || e.first == part_numbers_extra; });
+    std::erase_if(m.extra, [](const auto& e)
+                  { return e.first == part_sizes_extra || e.first == part_numbers_extra || e.first == part_layout_extra; });
+}
+
+bool part_trailer_of(const object_meta& m, part_trailer& out)
+{
+    const std::string* v = extra_of(m, part_layout_extra);
+    if (!v || m.parts == 0)
+        return false;
+    const size_t semi = v->find(';');
+    const std::string_view hexd = semi == std::string::npos ? std::string_view{} : std::string_view(*v).substr(semi + 1);
+    if (!decimal(std::string_view(*v).substr(0, semi), out.at) || hexd.size() != 2 * out.digest.size())
+        return false;
+    for (size_t i = 0; i < out.digest.size(); ++i)
+    {
+        uint64_t b = 0;
+        const auto r = std::from_chars(hexd.data() + 2 * i, hexd.data() + 2 * i + 2, b, 16);
+        if (r.ec != std::errc{} || r.ptr != hexd.data() + 2 * i + 2)
+            return false;
+        out.digest[i] = static_cast<uint8_t>(b);
+    }
+    out.len = part_list_magic.size() + 12 + 12ull * m.parts;
+    return true;
+}
+
+bool decode_part_trailer(std::string_view bytes, const object_meta& m, const part_trailer& t, part_list& out)
+{
+    if (bytes.size() != t.len || bytes.substr(0, part_list_magic.size()) != part_list_magic)
+        return false;
+    digest_stream d(EVP_sha256());
+    d.update(bytes.data(), bytes.size());
+    if (d.finish<32>() != t.digest)
+        return false;
+    reader r{bytes.substr(part_list_magic.size())};
+    const uint64_t total = r.u64();
+    const uint32_t count = r.u32();
+    if (!r.ok || total != m.size || count != m.parts)
+        return false;
+    out.numbers.clear();
+    out.sizes.clear();
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const uint32_t n = r.u32();
+        const uint64_t s = r.u64();
+        if (!r.ok || n < 1 || n > 10000 || (!out.numbers.empty() && n <= out.numbers.back()) || s > total - sum)
+            return false;
+        sum += s;
+        out.numbers.push_back(n);
+        out.sizes.push_back(s);
+    }
+    return r.in.empty() && sum == total;
+}
+
+std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_stored, bool numbers, size_t max)
+{
+    clear_part_layout(m);
+    bool one_to_n = true;
+    for (size_t i = 0; i < l.numbers.size(); ++i)
+        one_to_n = one_to_n && l.numbers[i] == i + 1;
+    std::string sizes = encode_part_sizes(l.sizes, max);
+    std::string nums  = numbers && !one_to_n ? encode_part_numbers(l.numbers, max) : std::string{};
+    if (!sizes.empty() && (!numbers || one_to_n || !nums.empty()))
+    {
+        m.extra.emplace_back(std::string(part_sizes_extra), std::move(sizes));
+        if (!nums.empty())
+            m.extra.emplace_back(std::string(part_numbers_extra), std::move(nums));
+        return {};
+    }
+    std::string bytes = encode_part_list(l, m.size);
+    digest_stream d(EVP_sha256());
+    d.update(bytes.data(), bytes.size());
+    const auto h = d.finish<32>();
+    m.extra.emplace_back(std::string(part_layout_extra), std::to_string(body_stored) + ";" + hex(h.data(), h.size()));
+    return bytes;
 }
 
 std::string encode_part_list(const part_list& l, uint64_t total)
@@ -415,9 +489,19 @@ part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64
     const uint32_t count = m.parts ? m.parts : 1;
     if (n < 1 || n > count)
         return part_status::out_of_range;
+    part_trailer t;
+    if (part_trailer_of(m, t))
+        return part_status::in_trailer;
     part_list l;
     if (!part_list_of(m, l))
         return part_status::unknown;
+    return part_range_in(l, n, first, len);
+}
+
+part_status part_range_in(const part_list& l, uint32_t n, uint64_t& first, uint64_t& len)
+{
+    if (n < 1 || n > l.sizes.size())
+        return part_status::out_of_range;
     first = 0;
     for (uint32_t i = 0; i + 1 < n; ++i)
         first += l.sizes[i];

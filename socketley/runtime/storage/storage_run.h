@@ -640,6 +640,10 @@ public:
     bool sse_read_key(const std::shared_ptr<conn>& c, const object_meta& m, std::string_view prefix, sse_key& out,
                       s3_error& err, bool need_key = true);
     // Sends [first, first + len) of an encrypted object through its chunks, as send_file sends a clear one.
+    // Reads the part list `m` keeps after its body, from `fd` or from the file opened again when it is -1, and
+    // hands `then` the header of the file it came from, the file still open for a GET, and the list.
+    void read_part_list(const std::shared_ptr<conn>& c, const object_meta& m, int fd, uint64_t data_off, bool head,
+                        std::function<void(const object_meta&, int, uint64_t, bool, const part_list&)> then);
     void send_sealed(const std::shared_ptr<conn>& c, response head, int fd, uint64_t data_off, const object_meta& m,
                      const sse_key& key, uint64_t first, uint64_t len);
     void sealed_pump(const std::shared_ptr<conn>& c);

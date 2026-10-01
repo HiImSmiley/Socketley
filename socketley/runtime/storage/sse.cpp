@@ -190,6 +190,8 @@ uint8_t sse_version_of(const object_meta& m)
 
 uint64_t stored_size(const object_meta& m)
 {
+    if (part_trailer t; part_trailer_of(m, t))
+        return t.at + t.len;
     const std::string* v = sse_value(m);
     if (!v)
         return m.size;
@@ -199,7 +201,7 @@ uint64_t stored_size(const object_meta& m)
 
 // ─── Where the chunks are ───────────────────────────────────────────────────
 
-bool sse_layout::init(const object_meta& m)
+bool sse_layout::init(const object_meta& m, const part_list* list)
 {
     const std::string* v = sse_value(m);
     sse_record r;
@@ -217,6 +219,11 @@ bool sse_layout::init(const object_meta& m)
     {
         m_stream.push_back(0);
         m_len.push_back(m.size);
+    }
+    else if (list)
+    {
+        m_stream = list->numbers;
+        m_len    = list->sizes;
     }
     else
     {
@@ -238,9 +245,12 @@ bool sse_layout::init(const object_meta& m)
         plain  += s;
         cipher += sse_stored_len(s, m_version);
     }
-    if (plain != m.size)
+    if (plain != m.size || m_stream.size() != m_len.size())
         return false;
     m_stored = cipher;
+    // A list kept after the body says where it lies, which is where the body it describes must end.
+    if (part_trailer t; part_trailer_of(m, t))
+        return t.at == m_stored;
     return true;
 }
 
@@ -301,6 +311,20 @@ sse_digest sse_layout::parts_digest() const
     digest_stream d(EVP_sha256());
     d.update(bytes.data(), bytes.size());
     return d.finish<32>();
+}
+
+bool sse_parts_digest(const object_meta& m, sse_digest& out)
+{
+    if (part_trailer t; part_trailer_of(m, t))
+    {
+        out = t.digest;
+        return true;
+    }
+    sse_layout l;
+    if (!l.init(m))
+        return false;
+    out = l.parts_digest();
+    return true;
 }
 
 // ─── Keys ───────────────────────────────────────────────────────────────────

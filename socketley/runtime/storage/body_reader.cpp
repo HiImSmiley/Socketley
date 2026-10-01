@@ -30,7 +30,10 @@ std::shared_ptr<body_reader> body_reader::make(file_io& io, hash_pool* pool, std
                                                uint64_t first, uint64_t len)
 {
     std::shared_ptr<body_reader> r(new body_reader);
-    if (key && !r->m_layout.init(m))
+    // A part list kept after the body is read before the first window, which is the only one that needs it.
+    if (key && part_trailer_of(m, r->m_trailer))
+        r->m_meta = std::make_unique<object_meta>(m);
+    else if (key && !r->m_layout.init(m))
         return nullptr;
     r->m_io       = &io;
     r->m_pool     = pool && pool->enabled() ? pool : nullptr;
@@ -53,8 +56,58 @@ void body_reader::next(deliver cb)
         m_held = -1;
     }
     m_waiter = std::move(cb);
+    // A list that could not be read leaves nothing to deliver, which every later call is told too.
+    if (m_list_failed)
+    {
+        auto w = std::move(m_waiter);
+        m_waiter = nullptr;
+        w(false, {});
+        return;
+    }
+    if (m_meta)
+    {
+        load_list();
+        return;
+    }
     fetch();
     hand_out();
+}
+
+void body_reader::load_list()
+{
+    if (m_list_reading)
+        return;
+    m_list_reading = true;
+    auto buf  = std::make_shared<std::string>(static_cast<size_t>(m_trailer.len), '\0');
+    auto self = shared_from_this();
+    auto failed = [this]
+    {
+        m_meta.reset();
+        m_list_failed = true;
+        auto cb = std::move(m_waiter);
+        m_waiter = nullptr;
+        if (cb)
+            cb(false, {});
+    };
+    const bool q = m_io->pread(m_fd, buf->data(), static_cast<uint32_t>(buf->size()), m_data_off + m_trailer.at,
+        [self, buf, failed](int64_t res)
+        {
+            if (!*self->m_alive)
+                return;
+            part_list list;
+            if (res != static_cast<int64_t>(buf->size()) ||
+                !decode_part_trailer(*buf, *self->m_meta, self->m_trailer, list) ||
+                !self->m_layout.init(*self->m_meta, &list))
+            {
+                failed();
+                return;
+            }
+            self->m_meta.reset();
+            self->fetch();
+            self->hand_out();
+        });
+    if (!q)
+        failed();
 }
 
 void body_reader::hand_out()
@@ -197,7 +250,12 @@ void body_reader::read_done(int index, int64_t res, uint64_t want, std::shared_p
 bool sse_open_body(const object_meta& m, const sse_key& key, std::string_view stored, std::string& plain)
 {
     sse_layout l;
-    if (!l.init(m) || stored.size() < l.stored())
+    part_list  list;
+    part_trailer t;
+    const bool trailer = part_trailer_of(m, t);
+    if (trailer && (stored.size() < t.at + t.len || !decode_part_trailer(stored.substr(t.at, t.len), m, t, list)))
+        return false;
+    if (!l.init(m, trailer ? &list : nullptr) || stored.size() < l.stored())
         return false;
     plain.resize(static_cast<size_t>(m.size));
     // Every chunk on disk, the empty ones that end a stream too, which are the proof it was not cut short.

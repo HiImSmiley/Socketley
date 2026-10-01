@@ -1407,6 +1407,75 @@ cond evaluate(const s3_request& q, const object_meta& m)
 
 }   // namespace
 
+void storage_run::read_part_list(const std::shared_ptr<conn>& c, const object_meta& m, int fd, uint64_t data_off,
+                                 bool head,
+                                 std::function<void(const object_meta&, int, uint64_t, bool, const part_list&)> then)
+{
+    std::weak_ptr<conn> weak = c;
+    // Reads the list from an open file, whose own header `fm` is what the answer is then given about.
+    auto read = [this, weak, then](object_meta fm, int rfd, uint64_t off, bool keep_fd)
+    {
+        part_trailer t;
+        if (!part_trailer_of(fm, t))
+        {
+            m_loop.close_fd(rfd);
+            if (auto cc = weak.lock(); cc && !cc->dead)
+                send_error(cc, make_error("InternalError"));
+            return;
+        }
+        auto buf = std::make_shared<std::string>(static_cast<size_t>(t.len), '\0');
+        auto meta = std::make_shared<object_meta>(std::move(fm));
+        const bool q = m_io.pread(rfd, buf->data(), static_cast<uint32_t>(buf->size()), off + t.at,
+            [this, weak, then, buf, meta, rfd, off, keep_fd, t](int64_t res)
+            {
+                auto cc = weak.lock();
+                part_list l;
+                const bool ok = res == static_cast<int64_t>(buf->size()) && decode_part_trailer(*buf, *meta, t, l);
+                if (!keep_fd || !ok || !cc || cc->dead)
+                    m_loop.close_fd(rfd);
+                if (!cc || cc->dead)
+                    return;
+                if (!ok)
+                {
+                    LOG_WARN(("storage: the part list after the body of \"" + cc->req.key + "\" cannot be read").c_str());
+                    send_error(cc, make_error("InternalError"));
+                    return;
+                }
+                then(*meta, keep_fd ? rfd : -1, keep_fd ? off : 0, !keep_fd, l);
+            });
+        if (!q)
+        {
+            m_loop.close_fd(rfd);
+            if (auto cc = weak.lock(); cc && !cc->dead)
+                send_error(cc, make_error("InternalError"));
+        }
+    };
+    if (fd >= 0)
+    {
+        read(m, fd, data_off, true);
+        return;
+    }
+    // A HEAD has no file open, so the object's is opened for the list and closed again.
+    auto opened = [this, weak, read, head](open_result o)
+    {
+        auto cc = weak.lock();
+        if (!cc || cc->dead || o.status != st::ok)
+        {
+            if (o.fd >= 0)
+                m_loop.close_fd(o.fd);
+            if (cc && !cc->dead)
+                send_error_st(cc, o.status == st::ok ? st::io_error : o.status);
+            return;
+        }
+        read(std::move(o.meta), o.fd, o.data_off, !head);
+    };
+    const std::string version(c->req.get_query("versionId"));
+    if (version.empty())
+        m_store.open_object(c->req.bucket, c->req.key, 0, std::move(opened));
+    else
+        m_store.open_version(c->req.bucket, c->req.key, version, 0, std::move(opened));
+}
+
 void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
 {
     s3_request& q = c->req;
@@ -1454,9 +1523,14 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         return;
     }
     // Answers a request whose object is known, from a HEAD's memory or a GET's file; `clear` says the bytes
-    // already in hand are the object's own rather than what its file holds.
-    auto answer = [this, head, part](const std::shared_ptr<conn>& cc, const object_meta& m, int fd,
-                               uint64_t data_off, const std::string& prefetch, bool clear)
+    // already in hand are the object's own rather than what its file holds, and `list` is a part list read
+    // after the body, for a partNumber the header alone cannot place.
+    using answer_fn = std::function<void(const std::shared_ptr<conn>&, const object_meta&, int, uint64_t,
+                                         const std::string&, bool, const part_list*)>;
+    auto again = std::make_shared<answer_fn>();
+    *again = [this, head, part, weak_again = std::weak_ptr<answer_fn>(again)](
+                 const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
+                 const std::string& prefetch, bool clear, const part_list* list)
     {
         const s3_request& rq = cc->req;
 
@@ -1495,7 +1569,19 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         bool ranged = false;
         if (part)
         {
-            const part_status ps = part_range(m, part, first, len);
+            const part_status ps = list ? part_range_in(*list, part, first, len) : part_range(m, part, first, len);
+            if (ps == part_status::in_trailer)
+            {
+                // The answer is given again once the list is read, from the file whose list it is.
+                read_part_list(cc, m, fd, data_off, head,
+                    [weak = std::weak_ptr<conn>(cc), again = weak_again.lock()](
+                        const object_meta& m2, int fd2, uint64_t off2, bool clear2, const part_list& l)
+                    {
+                        if (auto c2 = weak.lock())
+                            (*again)(c2, m2, fd2, off2, {}, clear2, &l);
+                    });
+                return;
+            }
             if (ps != part_status::ok)
             {
                 close_file();
@@ -1605,6 +1691,9 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         }
         send_file(cc, std::move(r), fd, data_off + first, len);
     };
+    auto answer = [again](const std::shared_ptr<conn>& cc, const object_meta& m, int fd, uint64_t data_off,
+                          const std::string& prefetch, bool clear)
+    { (*again)(cc, m, fd, data_off, prefetch, clear, nullptr); };
 
     // A version asked for by its id is read where it is, and never from or into a held copy, which is the latest's.
     if (!version_id.empty())

@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include "runtime/storage/body_reader.h"
 #include "runtime/storage/checksum.h"
 #include "runtime/storage/multipart.h"
 #include "runtime/storage/object_format.h"
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -335,7 +337,7 @@ struct rig : io_handler
     // A part through the streaming path, the way the runtime takes one: written into
     // the upload's data file when its owner gives it a place there.
     put_result part(const std::string& b, const std::string& id, uint32_t n, const std::string& body,
-                    bool wait = true, part_place* given = nullptr)
+                    bool wait = true, part_place* given = nullptr, const sse_seal_spec* seal = nullptr)
     {
         checksum_algo algo = checksum_algo::none;
         part_place place;
@@ -348,8 +350,11 @@ struct rig : io_handler
             meta.extra.emplace_back(std::string(checksum_header(algo)), std::string(checksum_b64_len(algo), 'A'));
         if (place.off)
             meta.extra.emplace_back(std::string(mpu_place_extra), encode_place(place.off));
+        if (seal)
+            meta.extra.emplace_back(std::string(sse_extra), place.sse);
         st why = st::ok;
-        auto op = store->begin_put(b, "mpu/" + id + "/" + std::to_string(n), std::move(meta), body.size(), true, why);
+        auto op = store->begin_put(b, "mpu/" + id + "/" + std::to_string(n), std::move(meta), body.size(), true, why,
+                                   false, seal);
         REQUIRE(op);
         if (algo != checksum_algo::none)
             op->track_checksum(algo, {});
@@ -743,6 +748,14 @@ complete_part listed(uint32_t n, const std::string& body)
     return {n, hex(md5_of(body)), {}, {}};
 }
 
+std::string slurp_file(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream s;
+    s << f.rdbuf();
+    return s.str();
+}
+
 }   // namespace
 
 TEST_CASE("equal parts are written into the data file at their place and the file becomes the object")
@@ -944,4 +957,105 @@ TEST_CASE("a commit that names a place its owner never gave is refused")
     CHECK(out.status == st::io_error);
     CHECK(!up->parts.contains(7));
     CHECK(r.until([&] { return names_in(d.path + "/bkt/tmp").empty(); }));
+}
+
+TEST_CASE("a part list too long for the header follows the body, so any list S3 takes completes")
+{
+    // A header room of 12 bytes, so three parts of unequal sizes are already too many for it.
+    ::setenv("SOCKETLEY_STORAGE_PART_LIST_MAX", "12", 1);
+    tmpdir d;
+    std::optional<rig> r(std::in_place, d.path);
+    ::unsetenv("SOCKETLEY_STORAGE_PART_LIST_MAX");
+    r->bucket("bkt");
+    const std::string a = pattern(5 * MiB + 1, 41), b = pattern(5 * MiB + 70000, 42), c = pattern(999, 43);
+    const std::string whole = a + b + c;
+
+    for (const bool sealed : {false, true})
+    {
+        INFO("sealed " << sealed);
+        const std::string key = sealed ? "s" : "p";
+        object_meta meta;
+        sse_seal_spec seal;
+        if (sealed)
+        {
+            sse_record rec;
+            rec.mode     = sse_mode::s3;
+            rec.per_part = true;
+            seal.key     = sse_random_key();
+            REQUIRE(sse_wrap(sse_random_key(), seal.key, rec.wrapped));
+            meta.extra.emplace_back(std::string(sse_extra), encode_sse(rec));
+        }
+        const std::string id = r->create("bkt", key, checksum_algo::none, meta);
+        // Uploaded as 2, 5 and 9, which a sealed object must keep since each stream was sealed as its number.
+        for (const auto& [n, body] : {std::pair<uint32_t, const std::string*>{5, &b}, {2, &a}, {9, &c}})
+        {
+            seal.stream = n;
+            REQUIRE(r->part("bkt", id, n, *body, true, nullptr, sealed ? &seal : nullptr).status == st::ok);
+        }
+        const uint64_t trailers = r->mp->trailers();
+        const complete_result done = r->finish("bkt", id, {listed(2, a), listed(5, b), listed(9, c)});
+        REQUIRE(done.error.code.empty());
+        CHECK(r->mp->trailers() == trailers + 1);
+
+        const std::string file = slurp_file(d.path + "/bkt/data/" + object_rel_path(key));
+        const decoded_header h = decode_object_header(file);
+        REQUIRE(h.status == header_status::ok);
+        part_trailer t;
+        REQUIRE(part_trailer_of(h.meta, t));
+        bool sizes_in_header = false;
+        for (const auto& [n, v] : h.meta.extra)
+            sizes_in_header = sizes_in_header || n == part_sizes_extra || n == part_numbers_extra;
+        CHECK_FALSE(sizes_in_header);
+        const uint64_t body_len = sealed ? sse_stored_len(a.size(), sse_format) + sse_stored_len(b.size(), sse_format) +
+                                               sse_stored_len(c.size(), sse_format)
+                                         : whole.size();
+        CHECK(t.at == body_len);
+        CHECK(t.len == 20 + 3 * 12);
+        CHECK(stored_size(h.meta) == body_len + t.len);
+        CHECK(file.size() == h.header_len + stored_size(h.meta));
+
+        part_list l;
+        REQUIRE(decode_part_trailer(std::string_view(file).substr(h.header_len + t.at), h.meta, t, l));
+        CHECK(l.numbers == std::vector<uint32_t>{2, 5, 9});
+        CHECK(l.sizes == std::vector<uint64_t>{a.size(), b.size(), c.size()});
+        uint64_t first = 0, len = 0;
+        CHECK(part_range(h.meta, 2, first, len) == part_status::in_trailer);
+        REQUIRE(part_range_in(l, 2, first, len) == part_status::ok);
+        CHECK((first == a.size() && len == b.size()));
+        CHECK(part_range_in(l, 4, first, len) == part_status::out_of_range);
+        // A list bent by a byte, or claimed for another object, is not taken.
+        std::string bent = file.substr(h.header_len + t.at);
+        bent[24] ^= 1;
+        CHECK_FALSE(decode_part_trailer(bent, h.meta, t, l));
+        object_meta other = h.meta;
+        other.size += 1;
+        CHECK_FALSE(decode_part_trailer(std::string_view(file).substr(h.header_len + t.at), other, t, l));
+
+        if (sealed)
+        {
+            std::string back;
+            REQUIRE(sse_open_body(h.meta, seal.key, std::string_view(file).substr(h.header_len), back));
+            CHECK(back == whole);
+        }
+        else
+        {
+            std::string body;
+            REQUIRE(r->object("bkt", key, body) == st::ok);
+            CHECK(body == whole);
+        }
+    }
+
+    // A start that reads the files, the journals gone, takes both objects back at their length with the list.
+    r.reset();
+    for (const auto& e : fs::directory_iterator(d.path + "/bkt"))
+        if (e.path().filename().string().starts_with("index."))
+            fs::remove(e.path());
+    rig again(d.path);
+    for (const char* key : {"p", "s"})
+    {
+        const object_meta* m = again.store->find("bkt", key);
+        REQUIRE(m != nullptr);
+        part_trailer t;
+        CHECK(part_trailer_of(*m, t));
+    }
 }

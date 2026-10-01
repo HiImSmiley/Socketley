@@ -3,6 +3,7 @@
 // header in front of its bytes, and the journal record that names it.
 //
 // Pure encoding with no I/O, so a unit test and a fuzz target reach it without a ring.
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -55,15 +56,15 @@ inline constexpr std::string_view part_sizes_extra = "x-socketley-part-sizes";
 // The longest list kept, so the header stays within its bounds; a longer one is not recorded.
 inline constexpr size_t max_part_sizes_bytes = 4096;
 
-// The entry for parts of these sizes, empty when it would be longer than the bound.
-std::string encode_part_sizes(const std::vector<uint64_t>& sizes);
+// The entry for parts of these sizes, empty when it would be longer than `max`.
+std::string encode_part_sizes(const std::vector<uint64_t>& sizes, size_t max = max_part_sizes_bytes);
 
 // The extra entry naming the numbers a multipart object's parts were uploaded as, when they are not 1..N:
 // single numbers and ranges, comma-separated, such as 1-3,5,9.
 inline constexpr std::string_view part_numbers_extra = "x-socketley-part-numbers";
 
-// The entry for these ascending numbers, empty when they are 1..N or the entry would be longer than the bound.
-std::string encode_part_numbers(const std::vector<uint32_t>& numbers);
+// The entry for these ascending numbers, empty when they are 1..N or the entry would be longer than `max`.
+std::string encode_part_numbers(const std::vector<uint32_t>& numbers, size_t max = max_part_sizes_bytes);
 
 // A multipart object's parts in order: the number each was uploaded as, and its size.
 struct part_list
@@ -73,7 +74,7 @@ struct part_list
 };
 
 // The parts `m`'s header records, a single-part object being its own part 1; false when they are not
-// recorded or do not add up to the object.
+// recorded there or do not add up to the object.
 bool part_list_of(const object_meta& m, part_list& out);
 
 // Removes what `m` records of its parts, for a copy that is one part whatever its source was.
@@ -81,6 +82,29 @@ void clear_part_layout(object_meta& m);
 
 // The list in one canonical encoding, of 20 + 12 bytes per part, which is what a digest of it is taken over.
 std::string encode_part_list(const part_list& l, uint64_t total);
+
+// The extra entry of a multipart object whose part list did not fit in its header and follows its body
+// instead, in the canonical encoding: the body's length on disk, a semicolon, and the list's SHA-256 in hex.
+inline constexpr std::string_view part_layout_extra = "x-socketley-part-layout";
+
+// Where a part list kept after the body lies, counted from the body's start, and the digest it must have.
+struct part_trailer
+{
+    uint64_t at{0};
+    uint64_t len{0};
+    std::array<uint8_t, 32> digest{};
+};
+
+// False when `m` keeps no part list after its body.
+bool part_trailer_of(const object_meta& m, part_trailer& out);
+
+// The list `bytes` hold, false unless they are the ones `t` names and describe `m`.
+bool decode_part_trailer(std::string_view bytes, const object_meta& m, const part_trailer& t, part_list& out);
+
+// Records `l` in `m`'s header when it fits in `max` bytes, the numbers only when `numbers` asks and they are not
+// 1..N, and otherwise names a trailer after a body of `body_stored` bytes, whose bytes are returned.
+std::string record_part_list(object_meta& m, const part_list& l, uint64_t body_stored, bool numbers,
+                             size_t max = max_part_sizes_bytes);
 
 // The extra entry a version of a key in a versioned bucket is named by: its order among the
 // key's versions, whether it is a delete marker, and its id.
@@ -115,11 +139,15 @@ enum class part_status : uint8_t
     out_of_range,
     // A multipart object completed without its sizes recorded.
     unknown,
+    // The sizes follow the object's body, which has to be read for them.
+    in_trailer,
 };
 
 // Where part `n` (from 1) of the object begins and how long it is; a
 // single-part object is its own part 1.
 part_status part_range(const object_meta& m, uint32_t n, uint64_t& first, uint64_t& len);
+// The same from a list read after the body, which part_range() says it needs with in_trailer.
+part_status part_range_in(const part_list& l, uint32_t n, uint64_t& first, uint64_t& len);
 
 inline constexpr size_t object_header_align = 4096;
 inline constexpr size_t max_key_bytes       = 1024;

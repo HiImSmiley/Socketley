@@ -250,6 +250,9 @@ public:
     // Aborts the open uploads begun before `cutoff_ms`, and returns how many.
     size_t expire(int64_t cutoff_ms);
 
+    // Completions whose part list was too long for the header and was written after the body.
+    uint64_t trailers() const { return m_trailers; }
+
     // Whether anything is in flight, which a stop does not wait for but a test may.
     bool busy() const { return m_inflight != 0; }
 
@@ -290,6 +293,9 @@ private:
     std::map<key_t, std::unique_ptr<mpu_upload>> m_uploads;
     std::shared_ptr<bool> m_alive;
     uint32_t     m_inflight{0};
+    // The most a part list may take in a header before it is kept after the body, and how many have been.
+    size_t       m_list_max{max_part_sizes_bytes};
+    uint64_t     m_trailers{0};
 };
 
 }   // namespace socketley::storage
