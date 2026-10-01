@@ -1209,9 +1209,12 @@ namespace
 {
 
 // The headers an object's stored metadata puts on a response, with the
-// response-* query overrides a presigned URL may add.
-void object_headers(const s3_request& q, const object_meta& m, response& r, bool ranged)
+// response-* query overrides a presigned URL may add; in a `versioned` bucket an
+// object written before it was versioned is named as the null version.
+void object_headers(const s3_request& q, const object_meta& m, response& r, bool ranged, bool versioned)
 {
+    if (versioned && !has_version(m))
+        r.headers.emplace_back("x-amz-version-id", "null");
     r.headers.emplace_back("Accept-Ranges", "bytes");
     r.headers.emplace_back("ETag", "\"" + m.etag() + "\"");
     r.headers.emplace_back("Last-Modified", http_date(m.mtime_ms));
@@ -1292,10 +1295,10 @@ void object_headers(const s3_request& q, const object_meta& m, response& r, bool
 }
 
 // The headers of an object's plain answer as the lines they are sent as.
-void render_object_headers(const s3_request& q, const object_meta& m, std::string& out)
+void render_object_headers(const s3_request& q, const object_meta& m, std::string& out, bool versioned)
 {
     response r;
-    object_headers(q, m, r, false);
+    object_headers(q, m, r, false, versioned);
     for (const auto& [k, v] : r.headers)
     {
         out += k;
@@ -1463,7 +1466,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
             }
         }
 
-        object_headers(rq, m, r, ranged);
+        object_headers(rq, m, r, ranged, m_store.bucket_versioning(rq.bucket) != versioning::off);
         if (ranged)
         {
             r.status = 206;
@@ -1590,7 +1593,7 @@ void storage_run::op_get_object(const std::shared_ptr<conn>& c, bool head)
         {
             if (hot.head->empty())
             {
-                render_object_headers(q, *hot.meta, *hot.head);
+                render_object_headers(q, *hot.meta, *hot.head, m_store.bucket_versioning(q.bucket) != versioning::off);
                 m_store.hot_charge(hot.head->size());
             }
             response r;

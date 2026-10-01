@@ -81,7 +81,8 @@ void storage_run::op_get_object_tagging(const std::shared_ptr<conn>& c)
             send_error_st(cc, s);
             return;
         }
-        response r = tagged(200, has_version(m) ? version_of(m).id : std::string{});
+        const bool named = has_version(m) || m_store.bucket_versioning(cc->req.bucket) != versioning::off;
+        response r = tagged(200, named ? version_of(m).id : std::string{});
         r.headers.emplace_back("Content-Type", "application/xml");
         r.body = tagging_xml(decode_tags(tags_of(m)));
         send_response(cc, std::move(r));

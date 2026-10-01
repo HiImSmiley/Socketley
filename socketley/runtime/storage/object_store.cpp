@@ -2881,6 +2881,9 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         versioning v = versioning::off;
         if (!xml.empty() && !parse_versioning(xml, v, err))
             return false;
+        // A held copy's headers were rendered without the version id a versioned bucket names.
+        if ((v == versioning::off) != (b.vstate == versioning::off))
+            hot_drop_bucket(b.name);
         b.vstate = v;
         return true;
     }
