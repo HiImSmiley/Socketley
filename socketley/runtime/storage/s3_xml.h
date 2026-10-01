@@ -113,6 +113,8 @@ inline s3_error make_error(std::string_view code)
         {"AccessForbidden", 403, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec."},
         {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist"},
         {"NoSuchBucketPolicy", 404, "The bucket policy does not exist"},
+        {"ServerSideEncryptionConfigurationNotFoundError", 404, "The server side encryption configuration was not found"},
+        {"InvalidEncryptionAlgorithmError", 400, "The encryption request you specified is not valid. The valid value is AES256."},
         {"MalformedPolicy", 400, "Policies must be valid JSON and the first byte must be '{'"},
         {"BadRequest", 400, "Bad Request"},
         {"InvalidTag", 400, "The tag provided was not a valid tag."},

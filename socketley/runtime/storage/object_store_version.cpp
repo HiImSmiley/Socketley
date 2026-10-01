@@ -433,9 +433,10 @@ void object_store::vop_copy(std::shared_ptr<vop> v, int src, uint64_t data_off)
         return m_io->pwrite(*dst, header->data(), static_cast<uint32_t>(header->size()), 0,
                             [header, d](int64_t r) { d(r == static_cast<int64_t>(header->size()) ? 0 : r < 0 ? r : -EIO); });
     });
-    for (uint64_t off = 0; off < v->meta.size; off += chunk)
+    const uint64_t body = stored_size(v->meta);
+    for (uint64_t off = 0; off < body; off += chunk)
     {
-        const uint32_t n = static_cast<uint32_t>(std::min(chunk, v->meta.size - off));
+        const uint32_t n = static_cast<uint32_t>(std::min(chunk, body - off));
         ch->then([this, src, buf, n, at = data_off + off](file_io::done d)
         {
             return m_io->pread(src, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });

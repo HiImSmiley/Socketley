@@ -125,11 +125,18 @@ uint64_t place_base_of(std::string_view key, const object_meta& meta, checksum_a
     return object_header_len(key, m);
 }
 
+// How far apart the parts of an upload lie in its data file: their size, or what that size takes sealed.
+uint64_t place_stride(const mpu_upload& u)
+{
+    return is_encrypted(u.meta) ? sse_stored_len(u.place_size) : u.place_size;
+}
+
 // Whether the listed parts are 1..N, each where the object needs it in the data file, and the only parts there.
 bool copy_free(const mpu_upload& u, const std::vector<mpu_part>& parts)
 {
     if (u.place_frozen || u.place_base == 0 || u.place_size == 0 || !u.placing.empty())
         return false;
+    const uint64_t stride = place_stride(u);
     size_t in_place = 0;
     for (const auto& [n, p] : u.parts)
         in_place += p.in_place ? 1 : 0;
@@ -139,7 +146,7 @@ bool copy_free(const mpu_upload& u, const std::vector<mpu_part>& parts)
     {
         const mpu_part& p = parts[i];
         const bool last = i + 1 == parts.size();
-        if (!p.in_place || p.number != i + 1 || p.data_off != u.place_base + i * u.place_size ||
+        if (!p.in_place || p.number != i + 1 || p.data_off != u.place_base + i * stride ||
             (last ? p.size > u.place_size : p.size != u.place_size))
             return false;
     }
@@ -209,6 +216,8 @@ struct assemble_state
     bool     local{true};
     // The parts are in place in the data file, which becomes the object itself.
     bool     in_place{false};
+    // The parts are sealed, and so are their bytes on disk, which is more than their sizes say.
+    bool     sealed{false};
 };
 
 multipart_store::multipart_store(event_loop& loop, file_io& io, object_store& store)
@@ -396,8 +405,8 @@ bool multipart_store::recover_bucket(const std::string& bucket, std::string& err
                     // A part in the data file is a header naming its place, and the data file reaching past it.
                     keep = pd.status == header_status::ok &&
                            (at ? has_data && fsize == pd.header_len &&
-                                     static_cast<uint64_t>(data_sb.st_size) >= at + pd.meta.size
-                               : fsize == pd.header_len + pd.meta.size);
+                                     static_cast<uint64_t>(data_sb.st_size) >= at + stored_size(pd.meta)
+                               : fsize == pd.header_len + stored_size(pd.meta));
                     if (keep)
                     {
                         part.number   = n;
@@ -614,6 +623,9 @@ st multipart_store::begin_part(std::string_view bucket, std::string_view id, uin
     place = part_place{};
     const st s = begin_part(bucket, id, algo);
     mpu_upload* up = find_mut(bucket, id);
+    if (s == st::ok && up)
+        if (const std::string* v = sse_value(up->meta))
+            place.sse = *v;
     if (s != st::ok || !up || !known || expected == 0 || up->place_base == 0 || up->place_frozen ||
         up->placed.contains(number))
         return s;
@@ -624,7 +636,7 @@ st multipart_store::begin_part(std::string_view bucket, std::string_view id, uin
             return s;
         up->place_size = expected;
     }
-    const uint64_t rel = static_cast<uint64_t>(number - 1) * up->place_size;
+    const uint64_t rel = static_cast<uint64_t>(number - 1) * place_stride(*up);
     if (expected > up->place_size || rel + expected > m_store->options().max_object_bytes)
         return s;
     up->placed.insert(number);
@@ -696,7 +708,7 @@ put_op::committer multipart_store::part_committer(std::string bucket, std::strin
             // A place is committed once, by the body it was given to, and holds no more than that body was to be.
             const auto g = up->placing.find(number);
             place_ok = g != up->placing.end() && up->place_size != 0 &&
-                       pc->place_off == up->place_base + static_cast<uint64_t>(number - 1) * up->place_size &&
+                       pc->place_off == up->place_base + static_cast<uint64_t>(number - 1) * place_stride(*up) &&
                        pc->req.meta.size <= g->second;
             if (g != up->placing.end())
                 up->placing.erase(g);
@@ -1047,6 +1059,13 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
             sizes.push_back(p.size);
         if (std::string v = encode_part_sizes(sizes); !v.empty())
             plan.meta.extra.emplace_back(std::string(part_sizes_extra), std::move(v));
+        // An encrypted object's chunks are found by its part sizes, so one whose sizes cannot be kept is not made.
+        else if (is_encrypted(plan.meta) && parts.size() > 1)
+        {
+            reject("InvalidRequest", "The parts of an encrypted upload must leave its part sizes short enough to "
+                                     "record: make every part but the last one size");
+            return;
+        }
         plan.in_place = copy_free(*u, plan.parts);
         u->place_planned = plan.in_place;
         cb({}, std::move(plan));
@@ -1060,6 +1079,7 @@ void multipart_store::prepare_complete(std::string bucket, std::string id, std::
 
 void multipart_store::assemble(std::shared_ptr<assemble_state> a)
 {
+    a->sealed = is_encrypted(a->meta);
     const uint64_t base = a->in_place && !a->parts.empty() ? a->parts.front().data_off : 0;
     auto header = std::make_shared<std::string>(encode_object_header(a->key, a->meta, base));
     // A header that outgrew the room its upload reserved would be written over part 1.
@@ -1077,7 +1097,7 @@ void multipart_store::assemble(std::shared_ptr<assemble_state> a)
     auto fd    = hold_fd(m_loop, m_alive, -1);
     auto probe = std::make_shared<std::array<char, 2>>();
     auto linking = std::make_shared<bool>(false);
-    const uint64_t end = base + a->meta.size;
+    const uint64_t end = base + stored_size(a->meta);
     file_io* io = m_io;
     auto ch = std::make_shared<disk_chain>(m_alive);
     ch->then([io, data, fd](file_io::done d)
@@ -1185,7 +1205,8 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
     while (!a->failed && a->header_done && a->part_idx < a->parts.size())
     {
         const mpu_part& p = a->parts[a->part_idx];
-        if (p.size == 0 || a->part_off >= p.size)
+        const uint64_t  len = a->sealed ? sse_stored_len(p.size) : p.size;
+        if (len == 0 || a->part_off >= len)
         {
             ++a->part_idx;
             a->part_off = 0;
@@ -1225,7 +1246,7 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
             break;
         }
 
-        const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(chunk_bytes, p.size - a->part_off));
+        const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(chunk_bytes, len - a->part_off));
         const uint64_t src_off = p.data_off + a->part_off;
         const uint64_t dst_off = a->dst_off;
         std::shared_ptr<int> src = a->cur;
@@ -1233,7 +1254,7 @@ void multipart_store::assemble_pump(const std::shared_ptr<assemble_state>& a)
         ++a->inflight;
         a->part_off += n;
         a->dst_off  += n;
-        if (a->part_off >= p.size)
+        if (a->part_off >= len)
         {
             ++a->part_idx;
             a->part_off = 0;

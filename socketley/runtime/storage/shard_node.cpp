@@ -410,6 +410,7 @@ std::string doc_label(bucket_doc kind)
         case bucket_doc::lifecycle: return "lifecycle configuration";
         case bucket_doc::policy:    return "policy";
         case bucket_doc::versioning: return "versioning configuration";
+        case bucket_doc::encryption: return "encryption configuration";
     }
     return "configuration";
 }

@@ -29,7 +29,7 @@ st write_status(int64_t res)
 }   // namespace
 
 void put_op::begin(object_store* store, std::string bucket, std::string key, object_meta meta,
-                   uint64_t expected, bool size_known, bool plain)
+                   uint64_t expected, bool size_known, bool plain, const sse_seal_spec* seal)
 {
     m_store  = store;
     m_alive  = store->m_alive;
@@ -56,6 +56,13 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
                                        : mib;
     m_cap = std::clamp(want, m_header_len + object_header_align, mib + m_header_len);
     m_cap = (m_cap + object_header_align - 1) / object_header_align * object_header_align;
+    if (seal)
+    {
+        // Every buffer holds whole chunks behind the header's room, so each is sealed and written on its own.
+        m_seal = std::make_shared<const sse_seal_spec>(*seal);
+        const size_t body = size_known ? static_cast<size_t>(std::min<uint64_t>(expected, mib)) : mib;
+        m_cap = m_header_len + std::max(sse_chunk, (body + sse_chunk - 1) / sse_chunk * sse_chunk);
+    }
 
     m_hs = std::make_shared<hash_state>();
     // A small body is hashed where it lands: the hop to a helper thread costs
@@ -64,6 +71,9 @@ void put_op::begin(object_store* store, std::string bucket, std::string key, obj
     m_async = store->m_hash && store->m_hash->enabled() && (!size_known || expected >= async_min);
     if (m_async)
         m_lane = store->m_hash->next_lane();
+    // A lane of its own, so the chunks are sealed beside the digests rather than behind them.
+    if (m_async && m_seal)
+        m_seal_lane = store->m_hash->next_lane();
 
     m_stage[0].data = std::make_shared_for_overwrite<char[]>(m_cap);
     std::memset(m_stage[0].data.get(), 0, m_header_len);
@@ -213,8 +223,8 @@ size_t put_op::stage_room() const
     if (m_status != st::ok || m_eof)
         return 0;
     const stage& s = m_stage[m_active];
-    if (s.state == stage_state::filling && s.fill < m_cap)
-        return m_cap - s.fill;
+    if (s.state == stage_state::filling && s.fill < limit(s))
+        return limit(s) - s.fill;
     m_want_ready = true;
     return 0;
 }
@@ -235,7 +245,7 @@ void put_op::staged(size_t n)
     s.fill += n;
     m_received += n;
     // A body that trickles in is handed over in batches, so a hop to a helper thread is not paid per segment.
-    if (s.fill - s.hashed >= hash_batch || s.fill == m_cap || !m_async)
+    if (s.fill - s.hashed >= hash_batch || s.fill == limit(s) || !m_async)
         hash_staged(false);
 
     if (m_received > m_store->m_opts.max_object_bytes)
@@ -263,7 +273,7 @@ void put_op::staged(size_t n)
     }
     // The last piece of a body of known length waits for finish(), which puts
     // the header in front of it so the two go in one write.
-    if (s.fill == m_cap && m_received != m_whole)
+    if (s.fill == limit(s) && m_received != m_whole)
     {
         s.state = stage_state::full;
         m_next_off = s.file_off + s.fill;
@@ -381,6 +391,11 @@ void put_op::flush(stage& s)
     s.state = stage_state::writing;
     if (s.file_off == 0)
         m_first_written = true;
+    if (m_seal)
+    {
+        flush_sealed(s);
+        return;
+    }
     auto self = shared_from_this();
     stage* sp = &s;
     int         fd  = m_tmp_fd;
@@ -397,6 +412,71 @@ void put_op::flush(stage& s)
         off = m_place_off + s.file_off + skip - m_header_len;
     }
     const bool queued = m_store->m_io->pwrite(fd, p, static_cast<uint32_t>(n), off,
+        [self, sp](int64_t r)
+        {
+            if (!*self->m_alive)
+                return;
+            self->on_write_done(*sp, r);
+        });
+    if (!queued)
+    {
+        s.state = stage_state::free;
+        fail(st::io_error);
+    }
+}
+
+void put_op::flush_sealed(stage& s)
+{
+    const size_t   lead  = s.file_off == 0 ? m_header_len : 0;
+    const size_t   n     = s.fill - lead;
+    const uint64_t index = (s.file_off == 0 ? 0 : s.file_off - m_header_len) / sse_chunk;
+    if (!s.out)
+        s.out = std::make_shared_for_overwrite<char[]>(m_header_len + sse_stored_len(m_cap - m_header_len));
+    auto bad  = std::make_shared<bool>(false);
+    // The header's room goes along as it is, which finish() may already have filled.
+    auto work = [seal = m_seal, data = s.data, out = s.out, lead, n, index, bad]
+    {
+        std::memcpy(out.get(), data.get(), lead);
+        *bad = !sse_seal(seal->key, index, data.get() + lead, n, out.get() + lead);
+    };
+    stage* sp = &s;
+    if (m_async)
+    {
+        m_store->m_hash->submit(m_seal_lane, std::move(work), [self = shared_from_this(), sp, lead, n, bad]
+        {
+            if (!*self->m_alive || self->m_status != st::ok)
+                return;
+            if (*bad)
+                self->fail(st::io_error);
+            else
+                self->write_sealed(*sp, lead, n);
+        });
+        return;
+    }
+    work();
+    if (*bad)
+        fail(st::io_error);
+    else
+        write_sealed(s, lead, n);
+}
+
+void put_op::write_sealed(stage& s, size_t lead, size_t n)
+{
+    const uint64_t at = (s.file_off == 0 ? 0 : s.file_off - m_header_len) / sse_chunk * (sse_chunk + sse_overhead);
+    int         fd  = m_tmp_fd;
+    const char* p   = s.out.get();
+    size_t      len = lead + static_cast<size_t>(sse_stored_len(n));
+    uint64_t    off = lead ? 0 : m_header_len + at;
+    if (m_placed)
+    {
+        fd   = m_place_fd;
+        p   += lead;
+        len -= lead;
+        off  = m_place_off + at;
+    }
+    auto self = shared_from_this();
+    stage* sp = &s;
+    const bool queued = m_store->m_io->pwrite(fd, p, static_cast<uint32_t>(len), off,
         [self, sp](int64_t r)
         {
             if (!*self->m_alive)
@@ -490,6 +570,8 @@ void put_op::finish_now()
         fail(st::bad_digest);
         return;
     }
+    if (m_seal && m_seal->opaque_etag)
+        m_meta.md5 = sse_opaque_etag(m_seal->key, m_meta.md5);
     if (m_hs->ck)
     {
         const std::string got = m_hs->ck->peek_b64();

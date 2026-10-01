@@ -14,6 +14,7 @@
 #include "disk_chain.h"
 #include "lifecycle.h"
 #include "s3_cors.h"
+#include "s3_encryption.h"
 #include "s3_names.h"
 #include "s3_versioning.h"
 #include "shard_owner.h"
@@ -167,6 +168,9 @@ void object_store::hot_insert(const std::string& id, const object_meta& read, st
 {
     // A delete marker is answered as no object, which a held copy would answer as an empty one.
     if (is_delete_marker(read))
+        return;
+    // The bytes of an object under a client's key are opened for whoever holds it, and never kept for the next reader.
+    if (!body.empty() && sse_mode_of(read) == sse_mode::c)
         return;
     if (auto it = m_hot_index.find(id); it != m_hot_index.end())
     {
@@ -1946,9 +1950,10 @@ void object_store::tags_rewrite(std::shared_ptr<tag_change> tc, uint64_t data_of
         return m_io->pwrite(*dst, header->data(), static_cast<uint32_t>(header->size()), 0,
                             [header, d](int64_t r) { d(r == static_cast<int64_t>(header->size()) ? 0 : r < 0 ? r : -EIO); });
     });
-    for (uint64_t off = 0; off < tc->meta.size; off += chunk)
+    const uint64_t body = stored_size(tc->meta);
+    for (uint64_t off = 0; off < body; off += chunk)
     {
-        const uint32_t n = static_cast<uint32_t>(std::min(chunk, tc->meta.size - off));
+        const uint32_t n = static_cast<uint32_t>(std::min(chunk, body - off));
         ch->then([this, src, buf, n, at = data_off + off](file_io::done d)
         {
             return m_io->pread(src, buf.get(), n, at, [buf, n, d](int64_t r) { d(r == n ? 0 : r < 0 ? r : -EIO); });
@@ -2132,7 +2137,7 @@ void object_store::open_file(int dir_fd, std::string rel, std::string key, size_
                         {
                             const size_t have = got.size() - d.header_len;
                             out.prefetch = std::string(got.substr(d.header_len,
-                                std::min<uint64_t>({have, prefetch, d.meta.size})));
+                                std::min<uint64_t>({have, prefetch, stored_size(d.meta)})));
                         }
                         cb(std::move(out));
                     });
@@ -2154,7 +2159,7 @@ void object_store::open_file(int dir_fd, std::string rel, std::string key, size_
 
 std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, std::string_view key,
                                                 object_meta meta, uint64_t expected,
-                                                bool size_known, st& why, bool plain)
+                                                bool size_known, st& why, bool plain, const sse_seal_spec* seal)
 {
     bucket* b = find_bucket(bucket_name);
     if (!b || b->closing)
@@ -2188,8 +2193,12 @@ std::shared_ptr<put_op> object_store::begin_put(std::string_view bucket_name, st
         why = st::storage_full;
         return nullptr;
     }
+    // A pooled file is rolled forward after a crash only once its digest checks, which a sealed body's cannot without its key.
+    if (seal)
+        plain = false;
+
     std::shared_ptr<put_op> op(new put_op);
-    op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain);
+    op->begin(this, std::string(bucket_name), std::string(key), std::move(meta), expected, size_known, plain, seal);
     why = st::ok;
     return op;
 }
@@ -2284,6 +2293,13 @@ void object_store::copy(std::string_view src_bucket, std::string_view src_key, s
             // owns is not in this shard's memory.
             cs->src_fd  = o.fd;
             cs->src_off = o.data_off;
+            // Its bytes would be copied sealed under a header that no longer says how, which the caller re-encrypts instead.
+            if (is_encrypted(o.meta))
+            {
+                LOG_WARN(("storage: a byte copy of the encrypted object \"" + cs->dst_key + "\" was refused").c_str());
+                (*finish)({st::io_error, cs->meta});
+                return;
+            }
             if (m_opts.max_bytes && m_totals.bytes + m_reserved + o.meta.size > quota())
             {
                 (*finish)({st::storage_full, cs->meta});
@@ -2651,8 +2667,7 @@ void object_store::create_bucket_impl(std::string name, bool adopt, int64_t crea
                 cs->fd        = -1;
                 // A bucket taken up late may already have documents, which are read before it serves anything.
                 if (cs->adopt)
-                    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                                  bucket_doc::versioning})
+                    for (const bucket_doc kind : all_bucket_docs)
                         set_doubt(*b, kind, 0);
                 m_buckets.emplace(cs->name, std::move(b));
                 m_creating.erase(cs->name);
@@ -2721,8 +2736,7 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                  bucket_doc::versioning})
+    for (const bucket_doc kind : all_bucket_docs)
     {
         if (take_doc(bb, kind, {})) {}
         clear_doubt(bb, kind);
@@ -2800,7 +2814,9 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
 // ─── Bucket configuration documents ─────────────────────────────────────────
 
 static_assert(cors_max_bytes <= doc_max_bytes && lifecycle_max_bytes <= doc_max_bytes &&
-              policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes);
+              policy_max_bytes <= doc_max_bytes && versioning_max_bytes <= doc_max_bytes &&
+              encryption_max_bytes <= doc_max_bytes);
+static_assert(std::size(all_bucket_docs) <= 8, "doc_doubt has a bit per kind");
 
 const char* object_store::doc_file(bucket_doc kind)
 {
@@ -2810,8 +2826,15 @@ const char* object_store::doc_file(bucket_doc kind)
         case bucket_doc::lifecycle:  return "lifecycle";
         case bucket_doc::policy:     return "policy";
         case bucket_doc::versioning: return "versioning";
+        case bucket_doc::encryption: return "encryption";
     }
     return "?";
+}
+
+bool object_store::bucket_encrypts(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && b->encrypts;
 }
 
 const bucket_policy* object_store::policy(std::string_view name) const
@@ -2885,6 +2908,18 @@ bool object_store::take_doc(bucket& b, bucket_doc kind, std::string_view xml, st
         if ((v == versioning::off) != (b.vstate == versioning::off))
             hot_drop_bucket(b.name);
         b.vstate = v;
+        return true;
+    }
+    if (kind == bucket_doc::encryption)
+    {
+        // A document that does not parse still encrypts, since its bucket asked for it once.
+        b.encrypts = !xml.empty();
+        if (!xml.empty() && !parse_encryption(xml, err))
+        {
+            if (why)
+                *why = err.message;
+            return false;
+        }
         return true;
     }
     std::shared_ptr<lifecycle_config> l;
@@ -3149,8 +3184,7 @@ bool object_store::read_decided_doc(int dir_fd, bucket_doc kind, std::string& xm
 
 bool object_store::settle_bucket(bucket& b)
 {
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                  bucket_doc::versioning})
+    for (const bucket_doc kind : all_bucket_docs)
     {
         if (!(b.doc_doubt & (1u << static_cast<unsigned>(kind))))
             continue;

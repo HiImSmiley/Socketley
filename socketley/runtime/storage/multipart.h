@@ -60,6 +60,8 @@ struct part_place
     uint64_t    off{0};
     uint64_t    room{0};
     std::string path;
+    // The upload's encryption record, which every part is sealed under whether or not it has a place; empty for none.
+    std::string sse;
 };
 
 struct mpu_part
@@ -202,7 +204,8 @@ public:
     // or on its way out.
     st begin_part(std::string_view bucket, std::string_view id, checksum_algo& algo) const;
     // The same for an UploadPart of `expected` bytes (when `known`), which is given a
-    // place in the data file in `place` when it can be written there.
+    // place in the data file in `place` when it can be written there, and is told
+    // there what the upload's parts are sealed under.
     st begin_part(std::string_view bucket, std::string_view id, uint32_t number, uint64_t expected, bool known,
                   checksum_algo& algo, part_place& place);
     std::string data_path(std::string_view bucket, std::string_view id) const;

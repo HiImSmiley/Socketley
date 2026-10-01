@@ -8,6 +8,7 @@
 // ─── LAYOUT ─────────────────────────────────────────────────────────────────
 //   <dir>/<bucket>/created            decimal milliseconds since the epoch
 //   <dir>/<bucket>/cors               the bucket's CORSConfiguration, when it has one, written by shard 0
+//   <dir>/<bucket>/encryption         its ServerSideEncryptionConfiguration, likewise
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/lifecycle          its LifecycleConfiguration, likewise
@@ -39,6 +40,7 @@
 
 #include "checksum.h"
 #include "object_format.h"
+#include "sse.h"
 #include "../../shared/event_loop.h"
 #include "../../shared/file_io.h"
 #include "../../shared/cache_shard_map.h"
@@ -58,7 +60,11 @@ enum class bucket_doc : uint8_t
     lifecycle,
     policy,
     versioning,
+    encryption,
 };
+// Every kind, for the walks that settle or take up all of a bucket's documents.
+inline constexpr bucket_doc all_bucket_docs[] = {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
+                                                 bucket_doc::versioning, bucket_doc::encryption};
 
 // A bucket's versioning: never configured, keeping every version, or writing the null version.
 enum class versioning : uint8_t
@@ -363,6 +369,8 @@ private:
     {
         // Shared with the digest jobs, which may outlive this operation.
         std::shared_ptr<char[]> data;
+        // The sealed chunks of `data`, written instead of it when the body is encrypted.
+        std::shared_ptr<char[]> out;
         size_t                  fill{0};
         // Where the bytes not yet handed to the digests begin.
         size_t                  hashed{0};
@@ -385,9 +393,14 @@ private:
     void hash_staged(bool last);
     void finish_now();
     void begin(object_store* store, std::string bucket, std::string key, object_meta meta,
-               uint64_t expected, bool size_known, bool plain);
+               uint64_t expected, bool size_known, bool plain, const sse_seal_spec* seal);
     void pump();
     void flush(stage& s);
+    // The bytes a buffer takes before it is written: an encrypted body's are whole chunks.
+    size_t limit(const stage& s) const { return m_seal && s.file_off != 0 ? m_cap - m_header_len : m_cap; }
+    // Seals an encrypted buffer's chunks, then writes them where the body's layout puts them.
+    void flush_sealed(stage& s);
+    void write_sealed(stage& s, size_t lead, size_t n);
     void on_write_done(stage& s, int64_t res);
     void fail(st why);
     void maybe_finish();
@@ -427,6 +440,9 @@ private:
     md5_t       m_expect_md5{};
     bool        m_has_expect_md5{false};
     std::string m_ck_expect;
+    // The key the body is encrypted with, shared with the jobs that seal it, and their lane.
+    std::shared_ptr<const sse_seal_spec> m_seal;
+    uint32_t    m_seal_lane{0};
     committer   m_committer;
     st         m_status{st::ok};
     // A body placed into another file by place_body(), and the syncs still owed before the commit.
@@ -539,6 +555,8 @@ public:
     size_t lifecycle_buckets() const { return m_lifecycle_buckets; }
     // Whether any bucket has a policy, so a request to a store without one looks nothing up.
     bool any_policy() const { return m_policy_buckets != 0; }
+    // Whether the bucket encrypts every new object it is given without being asked to.
+    bool bucket_encrypts(std::string_view name) const;
     // The bucket's policy, null when it has none; valid until it next changes.
     const bucket_policy* policy(std::string_view name) const;
     // Told whenever a bucket's lifecycle rules change here.
@@ -612,10 +630,11 @@ public:
     // then fed to the returned operation.  `expected` is the size a
     // Content-Length promised, and 0 with size_known false when it is not
     // known.  `plain` is a put of an object with no condition and no
-    // committer, which may take a file from the pool.
+    // committer, which may take a file from the pool.  `seal`, when given, is
+    // the key the body is encrypted with, whose record `meta` already carries.
     std::shared_ptr<put_op> begin_put(std::string_view bucket, std::string_view key,
                                       object_meta meta, uint64_t expected, bool size_known,
-                                      st& why, bool plain = false);
+                                      st& why, bool plain = false, const sse_seal_spec* seal = nullptr);
 
     // The largest body a pooled file takes, since a start reads it whole to roll it forward.
     static constexpr uint64_t pooled_max = 1u << 20;
@@ -699,6 +718,9 @@ public:
 
     // Where a body's digests are taken when it is big; null takes them in line.
     void set_hash_pool(hash_pool* pool) { m_hash = pool; }
+    hash_pool* hashes() const { return m_hash; }
+    // False once the store is gone, for work of a caller's that outlives a callback.
+    const std::shared_ptr<bool>& alive_token() const { return m_alive; }
 
     // Whether anything is still being written, which a clean stop must wait out.
     bool busy() const;
@@ -775,7 +797,9 @@ private:
         std::map<std::string, std::vector<object_meta>, std::less<>> versions;
         // The documents, a bit per kind, this shard may hold an old copy of, and the change each is waiting on.
         uint8_t     doc_doubt{0};
-        uint64_t    doc_doubt_seq[4]{};
+        uint64_t    doc_doubt_seq[std::size(all_bucket_docs)]{};
+        // New objects are encrypted with the master key when they ask for nothing else.
+        bool        encrypts{false};
         // How many entries `versions` holds across its keys.
         uint64_t    nversions{0};
         // The compaction's cursor: the key it goes on at, in objects and then in versions, valid while journal.frozen.

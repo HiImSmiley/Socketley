@@ -222,7 +222,7 @@ bool decode_doc(std::string_view payload, op want, bucket_doc& kind, std::string
 {
     bytes::reader r(payload);
     uint8_t k = 0;
-    if (!open_request(r, want) || !r.u8(k) || k > static_cast<uint8_t>(bucket_doc::versioning) ||
+    if (!open_request(r, want) || !r.u8(k) || k >= std::size(all_bucket_docs) ||
         !r.bytes(bucket, name_cap) || !r.bytes(xml, doc_max_bytes) || !r.u64(seq))
         return false;
     kind = static_cast<bucket_doc>(k);
@@ -705,6 +705,7 @@ std::string encode_mpu_begin(st s, checksum_algo algo, const part_place& place)
     w.u8(static_cast<uint8_t>(algo));
     w.u64(place.off);
     w.u64(place.room);
+    w.bytes(place.sse);
     return w.take();
 }
 
@@ -712,7 +713,8 @@ bool decode_mpu_begin(std::string_view reply, st& s, checksum_algo& algo, part_p
 {
     bytes::reader r(reply);
     place = part_place{};
-    return status_byte(r, s) && algo_byte(r, algo) && r.u64(place.off) && r.u64(place.room);
+    return status_byte(r, s) && algo_byte(r, algo) && r.u64(place.off) && r.u64(place.room) &&
+           r.bytes(place.sse, 512);
 }
 
 std::string encode_mpu_plan(const s3_error& err, const assemble_plan& plan)

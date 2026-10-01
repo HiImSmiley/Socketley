@@ -297,7 +297,7 @@ file_verdict judge_object_file(walker& w, int fd, const struct stat& sb, const c
     if (n >= 0 && d.status == header_status::ok && w.ignores(d.key))
         return file_verdict::skip;
     const bool sound = n >= 0 && d.status == header_status::ok &&
-                       static_cast<uint64_t>(sb.st_size) == d.header_len + d.meta.size &&
+                       static_cast<uint64_t>(sb.st_size) == d.header_len + stored_size(d.meta) &&
                        named_right(w, d, name);
     return sound ? file_verdict::ok : file_verdict::unsound;
 }
@@ -660,8 +660,7 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
     }
 
     // The configuration documents shard 0 last synced, and not what a write it was cut short in left.
-    for (const bucket_doc kind : {bucket_doc::cors, bucket_doc::lifecycle, bucket_doc::policy,
-                                  bucket_doc::versioning})
+    for (const bucket_doc kind : all_bucket_docs)
     {
         const std::string file = base + "/" + doc_file(kind);
         if (m_opts.shard == 0 && ::unlink((file + ".new").c_str()) < 0) {}
@@ -679,6 +678,9 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             LOG_ERROR(("storage: the policy of bucket " + name + " does not compile (" + why +
                        "), so the bucket refuses every request but the policy's own until it is replaced or deleted")
                           .c_str());
+        else if (kind == bucket_doc::encryption)
+            LOG_ERROR(("storage: the encryption configuration of bucket " + name + " does not parse (" + why +
+                       "), so its new objects are encrypted with AES256 until it is replaced or deleted").c_str());
         else
             LOG_WARN(("storage: the " + std::string(doc_file(kind)) + " configuration of bucket " + name +
                       " does not parse and is not applied: " + why).c_str());
