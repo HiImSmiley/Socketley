@@ -1,0 +1,2 @@
+ 	
+{ "Statement" : [ { "Effect" : "Deny" , "Principal" : "*" , "Action" : [ "s3:PutObject" ] , "Resource" : [ "arn:aws:s3:::pub/*" ] } ] } 

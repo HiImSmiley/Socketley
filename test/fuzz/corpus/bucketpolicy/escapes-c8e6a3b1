@@ -1,0 +1,1 @@
+{"Statement":{"\u0045ffect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/caf\u00e9/\ud83d\ude00/\"q\"/*"}}

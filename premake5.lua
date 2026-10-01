@@ -1295,6 +1295,27 @@ project "fuzz_s3_sigv4"
 
     fuzz_target_settings()
 
+-- ─── Fuzz: a storage bucket's policy, its JSON reader and its compiler ───
+--
+-- Reachable by any access key through PutBucketPolicy, and by the bucket's directory at every start.
+-- One translation unit of the tree, and nothing to link.
+
+project "fuzz_bucket_policy"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+
+    includedirs { "socketley", "test/fuzz" }
+
+    files {
+        "test/fuzz/fuzz_bucket_policy.cpp",
+        "test/fuzz/fuzz_replay_main.cpp",
+        "test/fuzz/fuzz_common.h",
+        "socketley/runtime/storage/bucket_policy.cpp"
+    }
+
+    fuzz_target_settings()
+
 -- ─── Fuzz: cache_store as an operation sequence ───
 --
 -- Not a parser target.  It decodes the fuzzer's bytes into a program —
@@ -1760,6 +1781,42 @@ project "test_cluster_state"
 -- ─── Test: AWS Signature V4 verification, against the published vectors and boto3's own requests ───
 --
 -- Pure code over libcrypto, so one translation unit of the tree.
+
+-- ─── Storage: a bucket policy's JSON reader and compiler, alone ───
+
+project "test_storage_policy"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    targetdir ("bin/%{cfg.buildcfg}")
+    location("%{wks.location}")
+
+    includedirs {
+        "thirdparty/doctest",
+        "socketley"
+    }
+
+    files {
+        "test/unit/test_storage_policy.cpp",
+        "socketley/runtime/storage/bucket_policy.cpp"
+    }
+
+    filter "configurations:Debug"
+        defines { "DEBUG" }
+        symbols "On"
+    filter {}
+
+    filter "configurations:Release"
+        defines { "NDEBUG" }
+        optimize "Full"
+    filter {}
+
+    filter "configurations:Sanitize"
+        defines { "DEBUG" }
+        symbols "On"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer" }
+        linkoptions { "-fsanitize=address,undefined" }
+    filter {}
 
 project "test_s3_sigv4"
     kind "ConsoleApp"

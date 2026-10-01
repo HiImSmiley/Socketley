@@ -225,6 +225,7 @@ for f in "$BIN_DIR"/fuzz_*; do
         fuzz_lua_json)       corpus=luajson ;;
         fuzz_raft_msg)       corpus=raftmsg ;;
         fuzz_s3_sigv4)       corpus=s3sigv4 ;;
+        fuzz_bucket_policy)  corpus=bucketpolicy ;;
         *)
             echo "ERROR: $fname has no corpus mapping in run_all.sh."
             echo "       A target nothing replays is a target that does not run."

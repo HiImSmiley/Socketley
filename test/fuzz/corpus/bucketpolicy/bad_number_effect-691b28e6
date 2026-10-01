@@ -1,0 +1,1 @@
+{"Statement":{"Effect":-0.000000000000000000001e-99999,"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}

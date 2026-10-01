@@ -16,6 +16,13 @@ usage: lib_storage_policy.py MODE ARGS...
   secure  PLAIN TLS CAFILE   aws:SecureTransport on a cleartext and a TLS listener
   anon    NODE               a Deny on a runtime with --anonymous
   shards  NODE0 NODE1        set through one shard and judged the same by both
+  missing PORT               a key that is not there is 403 to whoever may read and not list
+  brokenprep PORT            bucket "brk" with a policy, before its file is replaced by one that does not compile
+  broken  PORT               that bucket refuses everything but the policy operations by its keys
+  brokenfix PORT             and is opened again by a policy put in its place
+  propagation NODE0 NODE1 FAULTDIR DATADIR
+                             a change shard 1 cannot be told of fails and changes nothing, and
+                             one it is not told the outcome of is never served old there
   persist TARGET...          PUBLIC is on "pub" through every target and is obeyed
 
 A TARGET is a port or a unix socket path.  The keys are AK1/SK1 and AK2/SK2 in the
@@ -299,7 +306,8 @@ def mode_config(port):
     r = req(T, "GET", "/pub/public/a", headers={"Range": "bytes=0-5"})
     check("an anonymous ranged GET is served", r.status == 206 and r.body == b"public", repr(r))
     r = req(T, "GET", "/pub/public/missing")
-    check("an anonymous GET of a public key that is not there is NoSuchKey", r.status == 404 and r.code() == "NoSuchKey", repr(r))
+    check("an anonymous GET of a public key that is not there is AccessDenied, since it may not list",
+          r.status == 403 and r.code() == "AccessDenied", repr(r))
     r = req(T, "GET", "/pub/private/b")
     check("an anonymous GET outside the prefix is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
     r = req(T, "HEAD", "/pub/private/b")
@@ -595,6 +603,167 @@ def mode_shards(n0, n1):
     check("the policy is set again through shard 0 for the restart", put_policy(n0, "pub", PUBLIC).status == 204)
 
 
+# ─── missing ────────────────────────────────────────────────────────────────
+
+def mode_missing(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/mis", key=K1).status == 200)
+    check("an object is put", put_object(T, "mis", "pub/here", b"here").status == 200)
+    read_only = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::mis/pub/*"))
+    check("a policy that lets everyone read and not list is taken", put_policy(T, "mis", read_only).status == 204)
+    r = req(T, "GET", "/mis/pub/here")
+    check("an anonymous GET of a key that is there is served", r.status == 200 and r.body == b"here", repr(r))
+    r = req(T, "GET", "/mis/pub/gone")
+    check("an anonymous GET of a key that is not there is 403 AccessDenied without s3:ListBucket",
+          r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "HEAD", "/mis/pub/gone")
+    check("and an anonymous HEAD is 403", r.status == 403, repr(r))
+    r = req(T, "GET", "/mis/pub/gone", "tagging")
+    check("and its tags are not there either, as AccessDenied", r.status == 403, repr(r))
+    r = req(T, "GET", "/mis/pub/gone", key=K1)
+    check("a signed GET of it is still 404 NoSuchKey", r.status == 404 and r.code() == "NoSuchKey", repr(r))
+
+    listable = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::mis/pub/*"),
+                      stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::mis"))
+    check("a policy that lets everyone read and list is taken", put_policy(T, "mis", listable).status == 204)
+    r = req(T, "GET", "/mis/pub/gone")
+    check("with s3:ListBucket an anonymous GET of a key that is not there is 404 NoSuchKey",
+          r.status == 404 and r.code() == "NoSuchKey", repr(r))
+    r = req(T, "HEAD", "/mis/pub/gone")
+    check("and an anonymous HEAD is 404", r.status == 404, repr(r))
+
+    cond = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::mis/pub/*"),
+                  stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::mis", {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}))
+    check("a policy that lets everyone list only from elsewhere is taken", put_policy(T, "mis", cond).status == 204)
+    r = req(T, "GET", "/mis/pub/gone")
+    check("s3:ListBucket that does not apply to the requester is not s3:ListBucket", r.status == 403, repr(r))
+
+    no_list = policy(stmt("Deny", {"AWS": AK2}, "s3:ListBucket", "arn:aws:s3:::mis"))
+    check("a policy that denies one key the listing is taken", put_policy(T, "mis", no_list).status == 204)
+    r = req(T, "GET", "/mis/pub/gone", key=K2)
+    check("that key is told 403 for a key that is not there", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "GET", "/mis/pub/here", key=K2)
+    check("and is served one that is", r.status == 200, repr(r))
+    r = req(T, "GET", "/mis/pub/gone", key=K1)
+    check("the other key is told 404", r.status == 404 and r.code() == "NoSuchKey", repr(r))
+    check("the policy is removed", delete_policy(T, "mis").status == 204)
+
+
+# ─── broken ─────────────────────────────────────────────────────────────────
+
+BROKEN = json.dumps({"Statement": [{"Effect": "Deny", "NotPrincipal": {"AWS": AK2}, "Action": "s3:*",
+                                    "Resource": "arn:aws:s3:::brk/*"}]})
+
+
+def mode_brokenprep(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/brk", key=K1).status == 200)
+    check("an object is put", put_object(T, "brk", "public/a", b"brk bytes").status == 200)
+    doc = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::brk/public/*"),
+                 stmt("Deny", {"AWS": AK2}, "s3:GetObject", "arn:aws:s3:::brk/*"))
+    check("a policy is taken", put_policy(T, "brk", doc).status == 204)
+    check("which lets everyone read", req(T, "GET", "/brk/public/a").status == 200)
+    check("and denies the second key", req(T, "GET", "/brk/public/a", key=K2).status == 403)
+
+
+def mode_broken(port):
+    T = port
+    r = req(T, "GET", "/brk/public/a", key=K1)
+    check("a stored policy that does not compile refuses a signed GET",
+          r.status == 403 and r.code() == "AccessDenied" and "cannot be applied" in r.message(), repr(r))
+    r = req(T, "GET", "/brk/public/a")
+    check("and an anonymous one", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = put_object(T, "brk", "public/b", b"x")
+    check("and a signed PUT", r.status == 403, repr(r))
+    r = req(T, "GET", "/brk", "list-type=2", key=K1)
+    check("and a signed listing", r.status == 403, repr(r))
+    r = req(T, "GET", "/brk", "cors", key=K1)
+    check("and the bucket's other configuration", r.status == 403, repr(r))
+    r = get_policy(T, "brk")
+    check("GetBucketPolicy by a key answers the stored document so it can be fixed",
+          r.status == 200 and r.body.decode() == BROKEN, repr(r))
+    r = req(T, "GET", "/brk", "policyStatus", key=K1)
+    check("GetBucketPolicyStatus by a key says it is not public", r.status == 200 and b"<IsPublic>false</IsPublic>" in r.body,
+          repr(r))
+    r = req(T, "GET", "/pub", "policyStatus", key=K1)
+    check("another bucket's policy is unaffected", r.status == 200, repr(r))
+    r = delete_policy(T, "brk", key=None)
+    check("an anonymous DeleteBucketPolicy is still refused", r.status == 403, repr(r))
+    check("DeleteBucketPolicy by a key is taken", delete_policy(T, "brk").status == 204)
+    r = req(T, "GET", "/brk/public/a", key=K1)
+    check("and the bucket serves again", r.status == 200 and r.body == b"brk bytes", repr(r))
+
+
+def mode_brokenfix(port):
+    T = port
+    r = req(T, "GET", "/brk/public/a", key=K1)
+    check("after another start the bucket refuses again", r.status == 403, repr(r))
+    good = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::brk/public/*"))
+    check("PutBucketPolicy by a key replaces it", put_policy(T, "brk", good).status == 204)
+    r = req(T, "GET", "/brk/public/a")
+    check("and the replacement is obeyed", r.status == 200 and r.body == b"brk bytes", repr(r))
+    check("by signed requests too", req(T, "GET", "/brk/public/a", key=K1).status == 200)
+
+
+# ─── propagation ────────────────────────────────────────────────────────────
+
+def touch(path):
+    open(path, "w").close()
+
+
+def mode_propagation(n0, n1, faults, data):
+    nodes = (n0, n1)
+    narrow = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/public/k0*"))
+    deny_all = policy(stmt("Deny", "*", "s3:GetObject", "arn:aws:s3:::pub/*"))
+
+    def on_disk(name):
+        try:
+            with open(os.path.join(data, "pub", name)) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    check("PUBLIC is on the bucket", put_policy(n0, "pub", PUBLIC).status == 204)
+
+    # Shard 1 is alive and never hears that a change may happen.
+    touch(os.path.join(faults, "1.prepare"))
+    r = put_policy(n0, "pub", deny_all)
+    check("a policy shard 1 cannot be told of is refused 503 through shard 0",
+          r.status == 503 and r.code() == "ServiceUnavailable", repr(r))
+    r = put_policy(n1, "pub", deny_all)
+    check("and through shard 1", r.status == 503 and r.code() == "ServiceUnavailable", repr(r))
+    r = delete_policy(n1, "pub")
+    check("and so is its removal", r.status == 503, repr(r))
+    os.unlink(os.path.join(faults, "1.prepare"))
+    check("nothing changed on disk", on_disk("policy") == PUBLIC and on_disk("policy.new") is None,
+          (on_disk("policy"), on_disk("policy.new")))
+    for i, n in enumerate(nodes):
+        check("shard %d still has the policy that was there" % i, get_policy(n, "pub").body.decode() == PUBLIC)
+        r = req(n, "GET", "/pub/public/k15")
+        check("shard %d still obeys it" % i, r.status == 200, repr(r))
+
+    # Shard 1 promised to wait and never hears how the change ended.
+    touch(os.path.join(faults, "1.commit"))
+    r = put_policy(n0, "pub", narrow)
+    check("a policy shard 1 is not told the outcome of is taken", r.status == 204, repr(r))
+    r = req(n1, "GET", "/pub/public/k15")
+    check("and shard 1 does not go on with the old one", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(n1, "GET", "/pub/public/k01")
+    check("it obeys the new one", r.status == 200, repr(r))
+    check("and answers it", get_policy(n1, "pub").body.decode() == narrow)
+    r = delete_policy(n0, "pub")
+    check("a removal shard 1 is not told the outcome of is taken", r.status == 204, repr(r))
+    r = get_policy(n1, "pub")
+    check("and shard 1 has no policy either", r.status == 404 and r.code() == "NoSuchBucketPolicy", repr(r))
+    check("and refuses what it no longer allows", req(n1, "GET", "/pub/public/k01").status == 403)
+    os.unlink(os.path.join(faults, "1.commit"))
+
+    check("PUBLIC is put back for the restart", put_policy(n0, "pub", PUBLIC).status == 204)
+    for i, n in enumerate(nodes):
+        r = req(n, "GET", "/pub/public/k15")
+        check("shard %d serves under PUBLIC again" % i, r.status == 200, repr(r))
+
+
 # ─── persist ────────────────────────────────────────────────────────────────
 
 def mode_persist(targets):
@@ -624,6 +793,16 @@ def main():
         mode_anon(a[0])
     elif mode == "shards":
         mode_shards(a[0], a[1])
+    elif mode == "missing":
+        mode_missing(int(a[0]))
+    elif mode == "brokenprep":
+        mode_brokenprep(int(a[0]))
+    elif mode == "broken":
+        mode_broken(int(a[0]))
+    elif mode == "brokenfix":
+        mode_brokenfix(int(a[0]))
+    elif mode == "propagation":
+        mode_propagation(a[0], a[1], a[2], a[3])
     elif mode == "persist":
         mode_persist([int(x) if x.isdigit() else x for x in a])
     else:

@@ -47,6 +47,7 @@ Usage:  python3 test/fuzz/make_corpus.py [output-root]
 
 import hashlib
 import hmac
+import json
 import os
 import struct
 import sys
@@ -2413,6 +2414,7 @@ KEPT_BUDGET = {
     "proxytunnel": 8,  # 0 kept
     "raftmsg": 8,      # 0 kept
     "s3sigv4": 8,      # 0 kept
+    "bucketpolicy": 8, # 0 kept
 }
 
 
@@ -2552,6 +2554,90 @@ def s3sigv4_seeds():
     }
 
 
+# ──────────────────────────── bucket policy ──────────────────────────────────
+#
+# Seeds for fuzz_bucket_policy, compiled for the bucket "pub": the accepted forms the integration test puts, one of
+# each refusal, and the JSON edges (escapes, raw UTF-8, nesting, numbers, duplicated names) the reader decides on.
+
+
+def _bp(*statements, version="2012-10-17", extra=None):
+    doc = {"Version": version, "Statement": list(statements)}
+    if extra:
+        doc.update(extra)
+    return json.dumps(doc).encode()
+
+
+def _bs(effect, principal, action, resource, condition=None, sid=None):
+    s = {"Effect": effect, "Principal": principal, "Action": action, "Resource": resource}
+    if condition is not None:
+        s["Condition"] = condition
+    if sid is not None:
+        s["Sid"] = sid
+    return s
+
+
+def bucketpolicy_seeds():
+    ak = "AKIAPOLICYKEYONE0001"
+    good = _bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/public/*", sid="PublicRead")
+    seeds = {
+        "public_read": _bp(good),
+        "single_statement_object": json.dumps({"Version": "2008-10-17", "Statement":
+                                               _bs("Allow", {"AWS": "*"}, "s3:Get*", "arn:aws:s3:::pub/public/*")}).encode(),
+        "deny_user_arn": _bp(_bs("Deny", {"AWS": "arn:aws:iam::123456789012:user/" + ak}, ["s3:PutObject", "s3:DeleteObject"],
+                                 "arn:aws:s3:::pub/*")),
+        "deny_bare_key_and_root": _bp(_bs("Deny", {"AWS": [ak, "arn:aws:iam::123456789012:root"]}, "s3:*",
+                                          ["arn:aws:s3:::pub", "arn:aws:s3:::pub/zz*"])),
+        "wildcards": _bp(_bs("Allow", "*", "s3:?etObject*", "arn:aws:s3:::pub/v?/*"),
+                         _bs("Allow", "*", ["s3:ListBucket", "s3:GetBucketLocation"], "arn:aws:s3:::pub")),
+        "conditions": _bp(_bs("Deny", "*", "s3:*", "arn:aws:s3:::pub/*",
+                              {"Bool": {"aws:SecureTransport": False},
+                               "NotIpAddress": {"aws:SourceIp": ["::1/128", "10.0.0.0/8", "::ffff:127.0.0.0/104"]}})),
+        "ip_allow": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                            {"IpAddress": {"aws:SourceIp": "127.0.0.1/31"}})),
+        "unimplemented_action": _bp(_bs("Allow", "*", ["s3:GetObject", "s3:GetObjectVersion"], "arn:aws:s3:::pub/public/*")),
+        "every_action_name": _bp(_bs("Allow", "*", "*", ["arn:aws:s3:::pub", "arn:aws:s3:::pub/*"])),
+        "escapes": b'{"Statement":{"\\u0045ffect":"Allow","Principal":"*","Action":"s3:GetObject",'
+                   b'"Resource":"arn:aws:s3:::pub/caf\\u00e9/\\ud83d\\ude00/\\"q\\"/*"}}',
+        "raw_utf8": '{"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/café/😀/*"}}'.encode(),
+        "whitespace": b' \t\r\n{ "Statement" : [ { "Effect" : "Deny" , "Principal" : "*" , "Action" : [ "s3:PutObject" ] ,'
+                      b' "Resource" : [ "arn:aws:s3:::pub/*" ] } ] } \n',
+        # Refused, one of each.
+        "bad_not_json": b"this is not json",
+        "bad_array": b"[]",
+        "bad_trailing": _bp(good) + b"x",
+        "bad_duplicate_field": b'{"Version":"2012-10-17","Version":"2012-10-17","Statement":[]}',
+        "bad_duplicate_escaped": b'{"Statement":{"Effect":"Allow","\\u0045ffect":"Deny","Principal":"*",'
+                                 b'"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}',
+        "bad_duplicate_nested": b'{"Statement":{"Effect":"Allow","Principal":{"AWS":"*","AWS":"x"},'
+                                b'"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}',
+        "bad_no_statements": b'{"Version":"2012-10-17","Statement":[]}',
+        "bad_version": _bp(good, version="2020-01-01"),
+        "bad_unknown_field": _bp(good, extra={"Foo": 1}),
+        "bad_not_action": json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "NotAction": "s3:PutObject",
+                                                     "Resource": "arn:aws:s3:::pub/*"}]}).encode(),
+        "bad_action": _bp(_bs("Allow", "*", "s3:FlyToTheMoon", "arn:aws:s3:::pub/*")),
+        "bad_resource": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::other/*")),
+        "bad_variable": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/${aws:username}/*")),
+        "bad_operator": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*", {"StringEquals": {"aws:Referer": "x"}})),
+        "bad_cidr": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*", {"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}})),
+        "bad_sid": _bp(_bs("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*", sid="same"),
+                       _bs("Deny", "*", "s3:PutObject", "arn:aws:s3:::pub/*", sid="same")),
+        "bad_number_id": b'{"Id":1e999999999,"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",'
+                         b'"Resource":"arn:aws:s3:::pub/*"}}',
+        "bad_number_effect": b'{"Statement":{"Effect":-0.000000000000000000001e-99999,"Principal":"*",'
+                             b'"Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}}',
+        "bad_deep": b'{"Id":' + b"[" * 64 + b"]" * 64 + b"}",
+        "bad_lone_surrogate": b'{"Id":"\\ud800","Statement":[]}',
+        "bad_low_surrogate_first": b'{"Id":"\\udc00\\ud800","Statement":[]}',
+        "bad_overlong_utf8": b'{"Id":"\xc0\xaf","Statement":[]}',
+        "bad_utf8_surrogate": b'{"Id":"\xed\xa0\x80","Statement":[]}',
+        "bad_truncated_utf8": b'{"Id":"\xe2\x82","Statement":[]}',
+        "bad_control": b'{"Id":"a\x01b","Statement":[]}',
+        "bad_over_20k": _bp(good, extra={"Id": "x" * 20500}),
+    }
+    return seeds
+
+
 def write_set(root, name, seeds):
     d = os.path.join(root, name)
     os.makedirs(d, exist_ok=True)
@@ -2584,7 +2670,8 @@ def main(argv):
                         ("proxytunnel", proxytunnel_seeds()),
                         ("eventloop", eventloop_seeds()),
                         ("raftmsg", raftmsg_seeds()),
-                        ("s3sigv4", s3sigv4_seeds())):
+                        ("s3sigv4", s3sigv4_seeds()),
+                        ("bucketpolicy", bucketpolicy_seeds())):
         d, count, written, stale = write_set(root, name, seeds)
         total += count
         print("%-8s %3d seeds -> %s (%d new/changed)" % (name, count, d, written))

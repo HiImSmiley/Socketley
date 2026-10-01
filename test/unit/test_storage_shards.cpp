@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
+#include "runtime/storage/bucket_policy.h"
 #include "runtime/storage/lifecycle.h"
 #include "runtime/storage/object_format.h"
 #include "runtime/storage/multipart.h"
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <set>
@@ -99,6 +101,9 @@ struct cluster : shard_transport
     std::deque<task>                     queue;
     // A shard the transport cannot reach, for the cases that lose one.
     std::set<uint32_t>                   unreachable;
+    // Decides per message whether it is delivered (0), lost (1) or held back until release_held() (2).
+    std::function<int(uint32_t peer, wire::op o)> fault;
+    std::deque<task>                     withheld;
     uint64_t                             calls{0};
 
     cluster(std::string d, uint32_t shards, uint64_t max_bytes = 0)
@@ -149,6 +154,7 @@ struct cluster : shard_transport
             mb->loop.poll_completions(0);
         m.clear();
         queue.clear();
+        withheld.clear();
     }
 
     void restart(uint32_t shards, bool clean = true)
@@ -174,8 +180,31 @@ struct cluster : shard_transport
                 t.cb(false, {});
                 continue;
             }
+            if (wire::op o{}; fault && wire::request_op(t.payload, o))
+            {
+                const int f = fault(t.peer, o);
+                if (f == 1)
+                {
+                    t.cb(false, {});
+                    continue;
+                }
+                if (f == 2)
+                {
+                    withheld.push_back(std::move(t));
+                    continue;
+                }
+            }
             auto cb = t.cb;
             m[t.peer]->node->serve(t.payload, [cb](bool ok, std::string reply) { cb(ok, reply); });
+        }
+    }
+
+    void release_held()
+    {
+        while (!withheld.empty())
+        {
+            queue.push_back(std::move(withheld.front()));
+            withheld.pop_front();
         }
     }
 
@@ -1879,6 +1908,180 @@ TEST_CASE("a lifecycle configuration put through any shard is synced by shard 0 
     }
 }
 
+TEST_CASE("a document change is answered only once no shard can go on with the old one")
+{
+    tmpdir d;
+    const std::string p1 = R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/one/*"}})";
+    const std::string p2 = R"({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/*"}})";
+    const std::string p3 = R"({"Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bkt/three/*"}})";
+    auto start_set = [](cluster& c, uint32_t s, const std::string& doc, st& got, bool& fired)
+    {
+        fired = false;
+        c.m[s]->node->set_doc(bucket_doc::policy, "bkt", doc, [&](st r) { got = r; fired = true; });
+    };
+    auto set = [&](cluster& c, uint32_t s, const std::string& doc)
+    {
+        st got = st::io_error;
+        bool fired = false;
+        start_set(c, s, doc, got, fired);
+        REQUIRE(c.until([&] { return fired; }));
+        return got;
+    };
+    auto text = [](cluster& c, uint32_t s) -> std::string
+    {
+        const bucket_policy* p = c.m[s]->store->policy("bkt");
+        return p ? p->text() : std::string("none");
+    };
+    auto on_disk = [&](const std::string& file) -> std::string
+    {
+        std::ifstream f(d.path + "/bkt/" + file);
+        if (!f)
+            return "none";
+        return std::string(std::istreambuf_iterator<char>(f), {});
+    };
+
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(1, "bkt") == st::ok);
+    REQUIRE(set(c, 1, p1) == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        CHECK(c.m[s]->store->docs_settled("bkt"));
+        CHECK(text(c, s) == p1);
+    }
+
+    // A shard that cannot be told the change may happen makes it fail, and nothing changes anywhere.
+    c.unreachable = {2};
+    CHECK(set(c, 1, p2) == st::unavailable);
+    CHECK(set(c, 0, "") == st::unavailable);
+    c.unreachable.clear();
+    // The word that the change was abandoned is not waited for, and settles the shard that promised when it lands.
+    c.settle();
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        CHECK(text(c, s) == p1);
+        CHECK_FALSE(c.m[s]->store->any_doubt());
+    }
+    CHECK(on_disk("policy") == p1);
+    CHECK(on_disk("policy.new") == "none");
+
+    // A shard that promised and never heard the change was abandoned waits, then settles on the file as it is.
+    c.fault = [](uint32_t peer, wire::op o)
+    {
+        return (peer == 2 && o == wire::op::doc_prepare) || (peer == 1 && o == wire::op::doc_abort) ? 1 : 0;
+    };
+    CHECK(set(c, 0, p2) == st::unavailable);
+    c.fault = nullptr;
+    CHECK(c.m[1]->store->any_doubt());
+    CHECK(c.m[1]->store->docs_settled("bkt"));
+    CHECK_FALSE(c.m[1]->store->any_doubt());
+    CHECK(text(c, 1) == p1);
+
+    // A shard that misses the change being made still holds the old copy, and settles on the new one before serving.
+    c.fault = [](uint32_t peer, wire::op o) { return peer == 2 && o == wire::op::doc_adopt ? 1 : 0; };
+    CHECK(set(c, 1, p2) == st::ok);
+    c.fault = nullptr;
+    CHECK(text(c, 0) == p2);
+    CHECK(text(c, 1) == p2);
+    CHECK(c.m[2]->store->any_doubt());
+    CHECK(text(c, 2) == p1);
+    CHECK(c.m[2]->store->docs_settled("bkt"));
+    CHECK(text(c, 2) == p2);
+
+    // Between its promise and the outcome a shard serves nothing of the bucket, and the outcome lets it go.
+    st got = st::io_error;
+    bool fired = false;
+    c.fault = [](uint32_t peer, wire::op o) { return peer == 1 && o == wire::op::doc_prepare ? 2 : 0; };
+    start_set(c, 0, p3, got, fired);
+    REQUIRE(c.until([&] { return c.m[2]->store->any_doubt(); }));
+    c.settle();
+    CHECK_FALSE(fired);
+    CHECK(on_disk("policy.new") == p3);
+    CHECK_FALSE(c.m[2]->store->docs_settled("bkt"));
+    CHECK(c.m[1]->store->docs_settled("bkt"));
+    c.fault = nullptr;
+    c.release_held();
+    REQUIRE(c.until([&] { return fired; }));
+    CHECK(got == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+    {
+        CHECK_FALSE(c.m[s]->store->any_doubt());
+        CHECK(text(c, s) == p3);
+    }
+
+    // A removal is decided the same way.
+    c.fault = [](uint32_t peer, wire::op o) { return peer == 1 && o == wire::op::doc_adopt ? 1 : 0; };
+    CHECK(set(c, 2, "") == st::ok);
+    c.fault = nullptr;
+    CHECK(c.m[1]->store->docs_settled("bkt"));
+    for (uint32_t s = 0; s < 3; ++s)
+        CHECK(text(c, s) == "none");
+    CHECK(on_disk("policy") == "none");
+    CHECK(on_disk("policy.new") == "none");
+}
+
+TEST_CASE("a shard that takes a bucket up late reads the documents it already has before serving it")
+{
+    tmpdir d;
+    const std::string doc = R"({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::bkt/*"}})";
+    cluster c(d.path, 3);
+    c.unreachable = {2};
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    c.unreachable.clear();
+    CHECK_FALSE(c.m[2]->store->has_bucket("bkt"));
+    bool fired = false;
+    st got = st::io_error;
+    c.m[1]->node->set_doc(bucket_doc::policy, "bkt", doc, [&](st r) { got = r; fired = true; });
+    REQUIRE(c.until([&] { return fired; }));
+    CHECK(got == st::ok);
+    // Asked to make the bucket, shard 2 learns it is there and takes it up.
+    CHECK(c.make_bucket(2, "bkt") == st::bucket_exists);
+    REQUIRE(c.m[2]->store->has_bucket("bkt"));
+    CHECK(c.m[2]->store->any_doubt());
+    CHECK(c.m[2]->store->docs_settled("bkt"));
+    const bucket_policy* p = c.m[2]->store->policy("bkt");
+    REQUIRE(p != nullptr);
+    CHECK(p->text() == doc);
+}
+
+TEST_CASE("a stored policy that no longer compiles refuses every request at every shard")
+{
+    tmpdir d;
+    {
+        cluster c(d.path, 2);
+        REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    }
+    {
+        std::ofstream f(d.path + "/bkt/policy");
+        f << R"({"Statement":{"Effect":"Deny","NotPrincipal":{"AWS":"k"},"Action":"s3:*","Resource":"arn:aws:s3:::bkt/*"}})";
+    }
+    cluster c(d.path, 2);
+    for (uint32_t s = 0; s < 2; ++s)
+    {
+        CHECK(c.m[s]->store->docs_settled("bkt"));
+        const bucket_policy* p = c.m[s]->store->policy("bkt");
+        REQUIRE(p != nullptr);
+        CHECK(p->broken().find("NotPrincipal") != std::string::npos);
+        CHECK(p->has_deny());
+        CHECK_FALSE(p->is_public());
+        policy_request r;
+        r.action    = s3_action::get_object;
+        r.key       = "a";
+        r.principal = "k";
+        CHECK(p->evaluate(r) == policy_effect::deny);
+        r.anonymous = true;
+        CHECK(p->evaluate(r) == policy_effect::deny);
+    }
+    // Replaced through the keys, the bucket is open again.
+    bool fired = false;
+    st got = st::io_error;
+    const std::string good = R"({"Statement":{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bkt/*"}})";
+    c.m[1]->node->set_doc(bucket_doc::policy, "bkt", good, [&](st r) { got = r; fired = true; });
+    REQUIRE(c.until([&] { return fired; }));
+    CHECK(got == st::ok);
+    for (uint32_t s = 0; s < 2; ++s)
+        CHECK(c.m[s]->store->policy("bkt")->broken().empty());
+}
+
 TEST_CASE("a conditional delete keeps an object its condition refuses, decided under the key's lane")
 {
     tmpdir d;
@@ -2080,6 +2283,50 @@ TEST_CASE("the versioned wire forms round-trip, and merged version pages stop at
     CHECK(cut.truncated);
     CHECK(wire::merge_version_pages({b}, 2).items.size() == 2);
     CHECK(wire::merge_version_pages({b}, 2).truncated);
+}
+
+TEST_CASE("the owner of a key writes nothing by a versioning it may hold an old copy of")
+{
+    tmpdir d;
+    cluster c(d.path, 3);
+    REQUIRE(c.make_bucket(0, "bkt") == st::ok);
+    for (uint32_t s = 0; s < 3; ++s)
+        REQUIRE(c.m[s]->store->docs_settled("bkt"));
+    std::string key;
+    for (int i = 0; key.empty(); ++i)
+        if (object_owner("bkt", "k" + std::to_string(i), 3) == 2)
+            key = "k" + std::to_string(i);
+    const std::string enabled = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+
+    // Shard 2 promised and never heard: it holds "off", and settles on the file before it commits a write.
+    c.fault = [](uint32_t peer, wire::op o) { return peer == 2 && o == wire::op::doc_adopt ? 1 : 0; };
+    st got = st::io_error;
+    bool fired = false;
+    c.m[1]->node->set_doc(bucket_doc::versioning, "bkt", enabled, [&](st r) { got = r; fired = true; });
+    REQUIRE(c.until([&] { return fired; }));
+    c.fault = nullptr;
+    REQUIRE(got == st::ok);
+    CHECK(c.m[2]->store->bucket_versioning("bkt") == versioning::off);
+    const put_result r = c.put(0, "bkt", key, "v1");
+    REQUIRE(r.status == st::ok);
+    CHECK(version_of(r.meta).id != "null");
+    CHECK(c.m[2]->store->bucket_versioning("bkt") == versioning::enabled);
+
+    // While a change is undecided the owner refuses the write, and the shard that took it answers so.
+    c.fault = [](uint32_t peer, wire::op o) { return peer == 1 && o == wire::op::doc_prepare ? 2 : 0; };
+    fired = false;
+    c.m[0]->node->set_doc(bucket_doc::versioning, "bkt",
+                          "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+                          [&](st s) { got = s; fired = true; });
+    REQUIRE(c.until([&] { return c.m[2]->store->any_doubt(); }));
+    c.fault = nullptr;
+    CHECK(c.put(0, "bkt", key, "v2").status == st::unavailable);
+    c.release_held();
+    REQUIRE(c.until([&] { return fired; }));
+    CHECK(got == st::ok);
+    const put_result r3 = c.put(0, "bkt", key, "v3");
+    REQUIRE(r3.status == st::ok);
+    CHECK(version_of(r3.meta).id == "null");
 }
 
 TEST_CASE("a key's versions through any shard: markers, removal for good, a listing, and a start from the files alone")

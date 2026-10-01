@@ -16,8 +16,16 @@
 #   conditions  aws:SourceIp in and out of range, aws:SecureTransport over
 #               cleartext and over TLS
 #   order       authentication, then the policy, then on_request
+#   missing     a key that is not there is 403 AccessDenied to a requester the
+#               policy lets read and not list, and 404 NoSuchKey to one it lets list
 #   restart     the policy is on disk with the bucket and comes back with it
+#   broken      a stored policy that no longer compiles refuses every request but
+#               the policy operations by the keys, and says so in the log
 #   shards      set through a shard that is not 0, every shard judges by it
+#   propagation a change a shard cannot be told of is refused 503 and changes
+#               nothing anywhere, and a shard that is not told how a change ended
+#               never serves the bucket under the old policy (the losses are made
+#               by the SOCKETLEY_STORAGE_DOC_FAULT test hook)
 #
 # The assertions live in lib_storage_policy.py, which prints one line each.
 set -uo pipefail
@@ -38,6 +46,9 @@ export AK2="AKIAPOLICYKEYTWO0002" SK2="policy/two/secret+2"
 CREDS="$D/creds"
 printf '%s:%s\n%s:%s\n' "$AK1" "$SK1" "$AK2" "$SK2" > "$CREDS"
 RUNTIMES="pol ptls panon ptwo"
+# Read by the workers the daemon starts, so it is set before the daemon is; it does nothing until a file is put there.
+export SOCKETLEY_STORAGE_DOC_FAULT="$D/faults"
+mkdir -p "$SOCKETLEY_STORAGE_DOC_FAULT"
 
 PASS=0; FAIL=0; TOTAL=0
 ok()  { TOTAL=$((TOTAL+1)); PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -112,11 +123,33 @@ echo "== aws:SourceIp =="
 run_py sourceip "$PT"
 echo "== the policy and on_request =="
 run_py hook "$PT"
+echo "== a key that is not there =="
+run_py missing "$PT"
+run_py brokenprep "$PT"
 
 echo "== a restart =="
 restart pol
 wait_port "http://127.0.0.1:$PT/" && ok "the runtime is back" || bad "restart" "no answer"
 run_py persist "$PT"
+
+echo "== a stored policy that does not compile =="
+write_broken() {
+    python3 -c "import sys; sys.path.insert(0, '$HERE'); import lib_storage_policy as l; open('$D/pol/brk/policy', 'w').write(l.BROKEN)"
+}
+"$BIN" stop pol >/dev/null 2>&1
+sleep 0.3
+write_broken
+"$BIN" start pol >/dev/null 2>&1
+wait_port "http://127.0.0.1:$PT/" && ok "the runtime starts with it" || bad "broken start" "no answer"
+grep -q "the policy of bucket brk does not compile (NotPrincipal is not supported)" "$SOCKETLEY_DLOG" \
+    && ok "the log says the bucket refuses every request, and why" || bad "broken log" "$(grep -i brk "$SOCKETLEY_DLOG" | tail -3)"
+run_py broken "$PT"
+"$BIN" stop pol >/dev/null 2>&1
+sleep 0.3
+write_broken
+"$BIN" start pol >/dev/null 2>&1
+wait_port "http://127.0.0.1:$PT/" && ok "and starts with it again" || bad "broken restart" "no answer"
+run_py brokenfix "$PT"
 
 # ── aws:SecureTransport ─────────────────────────────────────────────────────
 echo "== aws:SecureTransport =="
@@ -150,6 +183,8 @@ expect "a runtime of two shards is made" "$?" 0
 N=("$D/two#0.sock" "$D/two#1.sock")
 wait_nodes "${N[@]}" && ok "both shards answer" || bad "nodes" "no answer from ${N[*]}"
 run_py shards "${N[@]}"
+echo "== a shard that misses a change =="
+run_py propagation "${N[@]}" "$SOCKETLEY_STORAGE_DOC_FAULT" "$D/two"
 restart ptwo
 wait_nodes "${N[@]}" && ok "both shards are back after a restart" || bad "restart" "no answer"
 run_py persist "${N[@]}"
