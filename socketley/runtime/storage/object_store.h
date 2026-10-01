@@ -820,9 +820,26 @@ private:
     void sync_pool_round(const std::string& bucket_name);
     // Removes a temporary file, and for a pooled one waits until the removal is durable.
     void drop_tmp(bucket& b, const std::string& tmp, bool pooled, std::function<void()> then);
+    // What every step of a commit shares, so a step's callback holds one pointer and not copies of the rest.
+    struct commit_state
+    {
+        std::shared_ptr<bool>           alive;
+        commit_request                  req;
+        std::function<void(put_result)> cb;
+        std::string                     rel;
+        // The syncs a pooled commit hands the lane on after, and whether every one of them held.
+        int                             syncs_left{2};
+        bool                            synced{true};
+    };
+    using commit_ptr = std::shared_ptr<commit_state>;
+    // The lane is handed on and the bucket released once nothing of the commit is left to do.
+    void commit_release(const commit_state& c);
+    // Every way out but a pooled commit's answer, which releases before the caller hears because it may start the next operation.
+    void commit_done(const commit_ptr& c, st s);
+    // A refusal after the body was synced, which for a pooled file first makes its removal durable.
+    void commit_refuse(const commit_ptr& c, st s);
     // The rest of a pooled commit once its rename is done: the answer, then the syncs.
-    void commit_pooled(bucket& b, const std::string& key, const object_meta& meta, int leaf,
-                       std::function<void()> release, std::function<void(put_result)> cb);
+    void commit_pooled(bucket& b, const commit_ptr& c, int leaf);
     uint64_t roll_forward_pooled(bucket& b, std::unordered_set<std::string>& keep);
     void compact_step(std::shared_ptr<bool> alive, const std::string& name);
     void compact_finish(const std::string& name, bool ok);

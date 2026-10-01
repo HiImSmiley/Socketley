@@ -1290,192 +1290,181 @@ void object_store::commit_local(commit_request req, std::function<void(put_resul
     ++b->active_ops;
     ++m_inflight;
 
-    auto alive = m_alive;
-    const std::string bname = req.bucket;
-    const std::string key   = req.key;
-    const object_meta meta  = req.meta;
-    const std::string tmp   = req.tmp_name;
-    const bool create_only  = req.create_only;
-    const bool pooled       = req.pooled;
-
-    // The lane is handed on and the bucket released once nothing of the
-    // commit is left to do, which for a pooled file is after the answer.
-    auto release = [this, bname, key]()
+    auto c   = std::make_shared<commit_state>();
+    c->alive = m_alive;
+    c->req   = std::move(req);
+    c->cb    = std::move(cb);
+    lane_enter(*b, c->req.key, [this, c]()
     {
-        if (bucket* bp = find_bucket(bname))
-            --bp->active_ops;
-        --m_inflight;
-        lane_leave(bname, key);
-    };
-    // Every other way out releases before the caller hears, because the
-    // caller is free to start the next operation from its callback.
-    auto done = [alive, release, cb](put_result r)
-    {
-        if (!*alive)
-            return;
-        release();
-        cb(std::move(r));
-    };
-    // A refusal after the body was synced, which for a pooled file first makes its removal durable.
-    auto refuse = [this, alive, bname, tmp, pooled, done](put_result r)
-    {
-        bucket* bp = find_bucket(bname);
+        const commit_request& rq = c->req;
+        bucket* bp = find_bucket(rq.bucket);
         if (!bp)
         {
-            done(std::move(r));
+            commit_done(c, st::no_such_bucket);
             return;
         }
-        drop_tmp(*bp, tmp, pooled, [done, r]() { done(r); });
-    };
-
-    lane_enter(*b, key, [this, alive, bname, key, meta, tmp, create_only, pooled, release, cb, done, refuse]()
-    {
-        bucket* bp = find_bucket(bname);
-        if (!bp)
+        if (rq.create_only && bp->objects.contains(rq.key))
         {
-            done({st::no_such_bucket, meta});
-            return;
-        }
-        if (create_only && bp->objects.contains(key))
-        {
-            if (!m_io->unlinkat(bp->tmp_fd, tmp, 0, [](int64_t) {})) {}
-            done({st::precondition_failed, meta});
+            if (!m_io->unlinkat(bp->tmp_fd, rq.tmp_name, 0, [](int64_t) {})) {}
+            commit_done(c, st::precondition_failed);
             return;
         }
         // The landing shard judged the quota from its own bytes, which is only a
         // sample of the owner's, so the owner judges it again for the key it holds.
         if (m_opts.nshards > 1 && m_opts.max_bytes)
         {
-            const auto old = bp->objects.find(key);
+            const auto old = bp->objects.find(rq.key);
             const uint64_t held = old == bp->objects.end() ? 0 : old->second.size;
-            if (m_totals.bytes - held + meta.size > quota())
+            if (m_totals.bytes - held + rq.meta.size > quota())
             {
-                refuse({st::storage_full, meta});
+                commit_refuse(c, st::storage_full);
                 return;
             }
         }
-        if (versioned(*bp, key))
+        if (versioned(*bp, rq.key))
         {
-            commit_versioned(bname, key, tmp, pooled, meta, release, cb);
+            commit_versioned(rq.bucket, rq.key, rq.tmp_name, rq.pooled, rq.meta, [this, c]() { commit_release(*c); },
+                             std::move(c->cb));
             return;
         }
-        const std::string rel = object_rel_path(key);
-        ensure_dirs(bname, rel, [this, alive, bname, key, meta, tmp, rel, pooled, release, cb, done, refuse](int leaf, st why)
+        c->rel = object_rel_path(rq.key);
+        ensure_dirs(rq.bucket, c->rel, [this, c](int leaf, st why)
         {
-            if (!*alive)
+            if (!*c->alive)
                 return;
-            bucket* bq = find_bucket(bname);
+            bucket* bq = find_bucket(c->req.bucket);
             if (!bq || why != st::ok)
             {
-                refuse({why == st::ok ? st::no_such_bucket : why, meta});
+                commit_refuse(c, why == st::ok ? st::no_such_bucket : why);
                 return;
             }
-            const bool q = m_io->renameat(pooled ? bq->pool_fd : bq->tmp_fd, tmp, bq->data_fd, rel,
-                [this, alive, bname, key, meta, leaf, pooled, release, cb, done, refuse](int64_t r)
+            const bool q = m_io->renameat(c->req.pooled ? bq->pool_fd : bq->tmp_fd, c->req.tmp_name, bq->data_fd, c->rel,
+                [this, c, leaf](int64_t r)
                 {
-                    if (!*alive)
+                    if (!*c->alive)
                         return;
-                    bucket* br = find_bucket(bname);
+                    bucket* br = find_bucket(c->req.bucket);
                     if (!br)
                     {
-                        done({st::no_such_bucket, meta});
+                        commit_done(c, st::no_such_bucket);
                         return;
                     }
                     if (r < 0)
                     {
                         m_loop->close_fd(leaf);
-                        refuse({errno_status(r), meta});
+                        commit_refuse(c, errno_status(r));
                         return;
                     }
-                    if (!m_kill_after_rename.empty() && key.starts_with(m_kill_after_rename))
+                    if (!m_kill_after_rename.empty() && c->req.key.starts_with(m_kill_after_rename))
                         ::raise(SIGKILL);
-                    if (pooled)
+                    if (c->req.pooled)
                     {
-                        commit_pooled(*br, key, meta, leaf, release, cb);
+                        commit_pooled(*br, c, leaf);
                         return;
                     }
                     // The rename is in the directory now and durable once the
                     // directory is synced; only then may the journal say so.
-                    const bool q2 = m_io->fsync(leaf, false,
-                        [this, alive, bname, key, meta, leaf, done](int64_t r2)
+                    const bool q2 = m_io->fsync(leaf, false, [this, c, leaf](int64_t r2)
+                    {
+                        if (!*c->alive)
+                            return;
+                        ++m_totals.fsyncs;
+                        m_loop->close_fd(leaf);
+                        bucket* bs = find_bucket(c->req.bucket);
+                        if (!bs)
                         {
-                            if (!*alive)
-                                return;
-                            ++m_totals.fsyncs;
-                            m_loop->close_fd(leaf);
-                            bucket* bs = find_bucket(bname);
-                            if (!bs)
-                            {
-                                done({st::no_such_bucket, meta});
-                                return;
-                            }
-                            if (r2 < 0)
-                            {
-                                done({st::io_error, meta});
-                                return;
-                            }
-                            // The object is durable: its file is synced, renamed and its
-                            // directory synced.  The journal record is only the index
-                            // of it, written behind the answer and synced in a group.
-                            std::string rec;
-                            encode_put_record(rec, key, meta);
-                            journal_append(*bs, rec, nullptr);
-                            apply_put(*bs, key, meta);
-                            invalidate_siblings(bname, key, [done, meta]() { done({st::ok, meta}); });
-                        });
+                            commit_done(c, st::no_such_bucket);
+                            return;
+                        }
+                        if (r2 < 0)
+                        {
+                            commit_done(c, st::io_error);
+                            return;
+                        }
+                        // The object is durable: its file is synced, renamed and its
+                        // directory synced.  The journal record is only the index
+                        // of it, written behind the answer and synced in a group.
+                        std::string rec;
+                        encode_put_record(rec, c->req.key, c->req.meta);
+                        journal_append(*bs, rec, nullptr);
+                        apply_put(*bs, c->req.key, c->req.meta);
+                        invalidate_siblings(c->req.bucket, c->req.key, [this, c]() { commit_done(c, st::ok); });
+                    });
                     if (!q2)
                     {
                         m_loop->close_fd(leaf);
-                        done({st::io_error, meta});
+                        commit_done(c, st::io_error);
                     }
                 });
             if (!q)
             {
                 m_loop->close_fd(leaf);
-                done({st::io_error, meta});
+                commit_done(c, st::io_error);
             }
         });
     });
 }
 
-void object_store::commit_pooled(bucket& b, const std::string& key, const object_meta& meta, int leaf,
-                                 std::function<void()> release, std::function<void(put_result)> cb)
+void object_store::commit_release(const commit_state& c)
+{
+    if (bucket* bp = find_bucket(c.req.bucket))
+        --bp->active_ops;
+    --m_inflight;
+    lane_leave(c.req.bucket, c.req.key);
+}
+
+void object_store::commit_done(const commit_ptr& c, st s)
+{
+    if (!*c->alive)
+        return;
+    commit_release(*c);
+    c->cb({s, c->req.meta});
+}
+
+void object_store::commit_refuse(const commit_ptr& c, st s)
+{
+    bucket* bp = find_bucket(c->req.bucket);
+    if (!bp)
+    {
+        commit_done(c, s);
+        return;
+    }
+    drop_tmp(*bp, c->req.tmp_name, c->req.pooled, [this, c, s]() { commit_done(c, s); });
+}
+
+void object_store::commit_pooled(bucket& b, const commit_ptr& c, int leaf)
 {
     // Answered at the rename: the body and the pool name it was written under
     // were durable before it, so a crash that takes the rename leaves a whole
     // file the next start rolls forward.
-    apply_put(b, key, meta);
-    auto alive = m_alive;
-    const std::string bname = b.name;
+    apply_put(b, c->req.key, c->req.meta);
 
     // The key's next operation waits for both syncs, since a pool file whose
     // removal is not durable would be rolled forward over it.
-    auto left = std::make_shared<int>(2);
-    auto ok   = std::make_shared<bool>(true);
-    auto part = [this, alive, bname, key, meta, left, ok, release](bool good)
+    auto part = [this, c](bool good)
     {
-        if (!*alive)
+        if (!*c->alive)
             return;
-        *ok = *ok && good;
-        if (--*left > 0)
+        c->synced = c->synced && good;
+        if (--c->syncs_left > 0)
             return;
-        if (!*ok)
+        if (!c->synced)
         {
             m_sync_lost = true;
-            LOG_WARN(("storage: syncing the directories of an answered put to " + bname + "/" + key +
+            LOG_WARN(("storage: syncing the directories of an answered put to " + c->req.bucket + "/" + c->req.key +
                       " failed; the next start reads the files again").c_str());
         }
-        if (bucket* bs = find_bucket(bname))
+        if (bucket* bs = find_bucket(c->req.bucket))
         {
             std::string rec;
-            encode_put_record(rec, key, meta);
+            encode_put_record(rec, c->req.key, c->req.meta);
             journal_append(*bs, rec, nullptr);
         }
-        release();
+        commit_release(*c);
     };
-    if (!m_io->fsync(leaf, false, [this, alive, leaf, part](int64_t r)
+    if (!m_io->fsync(leaf, false, [this, c, leaf, part](int64_t r)
         {
-            if (!*alive)
+            if (!*c->alive)
                 return;
             ++m_totals.fsyncs;
             m_loop->close_fd(leaf);
@@ -1486,7 +1475,7 @@ void object_store::commit_pooled(bucket& b, const std::string& key, const object
         part(false);
     }
     sync_pool(b, part);
-    invalidate_siblings(bname, key, [cb, meta]() { cb({st::ok, meta}); });
+    invalidate_siblings(c->req.bucket, c->req.key, [c]() { c->cb({st::ok, c->req.meta}); });
 }
 
 void object_store::remove(std::string_view bucket_name, std::string_view key_sv,
