@@ -6279,7 +6279,7 @@ BucketAlreadyOwnedByYou (409) if it exists; InvalidBucketName (400) for a name S
 T}
 DeleteBucket	DELETE /bucket	T{
 .ad l
-BucketNotEmpty (409) while it holds objects.
+BucketNotEmpty (409) while it holds objects, noncurrent versions or delete markers.
 T}
 HeadBucket	HEAD /bucket	T{
 .ad l
@@ -6288,6 +6288,18 @@ T}
 GetBucketLocation	GET /bucket?location	T{
 .ad l
 An empty LocationConstraint.
+T}
+PutBucketVersioning	PUT /bucket?versioning	T{
+.ad l
+Status Enabled or Suspended; MfaDelete Enabled, or an x\-amz\-mfa header, is 501 NotImplemented. See \fBVersioning\fR below.
+T}
+GetBucketVersioning	GET /bucket?versioning	T{
+.ad l
+An empty VersioningConfiguration for a bucket never versioned.
+T}
+ListObjectVersions	GET /bucket?versions	T{
+.ad l
+prefix, delimiter, key\-marker, version\-id\-marker, max\-keys (at most 1000), encoding\-type=url; Version and DeleteMarker entries by key, each key's newest first.
 T}
 PutBucketCors	PUT /bucket?cors	T{
 .ad l
@@ -6319,11 +6331,11 @@ Streamed; Content\-MD5 checked; Content\-Type, Cache\-Control, Content\-Disposit
 T}
 GetObject	GET /bucket/key	T{
 .ad l
-Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too).
+Range (one range), If\-Match, If\-None\-Match, If\-Modified\-Since, If\-Unmodified\-Since, response\-* header overrides; x\-amz\-tagging\-count when the object has tags (on HEAD too); ?versionId= reads that version, and x\-amz\-version\-id names it.
 T}
 HeadObject	HEAD /bucket/key	T{
 .ad l
-The headers of a GET, from memory, or from the object's header when another shard owns the key.
+The headers of a GET, from memory, or from the object's header when another shard owns the key; ?versionId= as for GET.
 T}
 GetObject, HeadObject by part	GET|HEAD /bucket/key?partNumber=N	T{
 .ad l
@@ -6331,19 +6343,19 @@ Part N of a multipart object as a 206 with its Content\-Range and x\-amz\-mp\-pa
 T}
 DeleteObject	DELETE /bucket/key	T{
 .ad l
-204 whether or not the key existed.
+204 whether or not the key existed; in a versioned bucket a delete marker, and with ?versionId= that version removed for good.
 T}
 DeleteObjects	POST /bucket?delete	T{
 .ad l
-Up to 1000 keys, Quiet, Content\-MD5 checked.
+Up to 1000 keys, each with or without a VersionId, Quiet, Content\-MD5 checked.
 T}
 CopyObject	PUT /bucket/key + x\-amz\-copy\-source	T{
 .ad l
-Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE. The copy is a single\-part object whose ETag is the md5 of its bytes.
+Within or across buckets; x\-amz\-metadata\-directive COPY or REPLACE; x\-amz\-tagging\-directive COPY (the default, the source's tags) or REPLACE (those x\-amz\-tagging names, or none); x\-amz\-copy\-source\-if\-match and \-if\-none\-match; onto itself only with REPLACE or from an older version; a source of key?versionId=ID copies that version. The copy is a single\-part object whose ETag is the md5 of its bytes.
 T}
 PutObjectTagging	PUT /bucket/key?tagging	T{
 .ad l
-A Tagging document replacing the object's tags; Content\-MD5 checked. See \fBObject tags\fR below.
+A Tagging document replacing the object's tags; Content\-MD5 checked. See \fBObject tags\fR below. The tagging operations take ?versionId= too.
 T}
 GetObjectTagging	GET /bucket/key?tagging	T{
 .ad l
@@ -6363,7 +6375,7 @@ Streamed like a put, Content\-MD5 and the checksums checked; a part sent again r
 T}
 UploadPartCopy	PUT /bucket/key?partNumber=N&uploadId=ID + x\-amz\-copy\-source	T{
 .ad l
-The whole source or x\-amz\-copy\-source\-range=bytes=first\-last.
+The whole source or x\-amz\-copy\-source\-range=bytes=first\-last; a source of key?versionId=ID reads that version.
 T}
 CompleteMultipartUpload	POST /bucket/key?uploadId=ID	T{
 .ad l
@@ -6411,7 +6423,7 @@ IsPublic: whether an Allow lets everyone in from any address; NoSuchBucketPolicy
 T}
 .TE
 .PP
-Anything else \(em ACLs, versioning, a bucket's own tags \(em is answered
+Anything else \(em ACLs, object lock, a bucket's own tags \(em is answered
 .B "501 NotImplemented"
 and never mistaken for the plain operation. A single put is at most 5 GiB and a
 key at most 1024 bytes.
@@ -6694,6 +6706,70 @@ rather than a guess; a plain GET or a Range reads it as before.
 CopyObject makes a single\-part object, as S3 does: a multipart source's bytes
 are hashed on the way through and the copy's ETag is their md5, with no
 .BR \-N .
+.SS Versioning
+.B PutBucketVersioning
+with
+.B Enabled
+makes every PUT, CopyObject and CompleteMultipartUpload of the bucket a new version
+of its key with an id of its own (32 hex digits), answered in
+.BR x\-amz\-version\-id ;
+the versions before it stay, and GET, HEAD, DeleteObject and the tagging operations
+take
+.BI ?versionId= ID
+to name one. A GET without one is the latest. A DELETE without one puts a delete
+marker in front of the key (204 with
+.B "x\-amz\-delete\-marker: true"
+and the marker's id), after which a GET or HEAD of the key is
+.B "404 NoSuchKey"
+with
+.B "x\-amz\-delete\-marker: true"
+and a GET of the marker by its id
+.BR "405 MethodNotAllowed" ;
+a listing leaves the key out. A DELETE with a version id removes that version for
+good: the marker, which undeletes the key, or the latest, after which the version
+behind it is the latest. An object written before versioning was enabled is the
+.B null
+version.
+.B Suspended
+keeps the versions there are and writes the
+.B null
+version, which the next write or delete marker replaces. A bucket is never
+unversioned again, as in S3, and
+.B GetBucketVersioning
+of one never versioned is an empty configuration. MFA delete is refused with
+.BR "501 NotImplemented" .
+A version id that could not be one is
+.BR "400 InvalidArgument" ,
+and one the key has no version of
+.BR "404 NoSuchVersion" .
+.PP
+The latest version of a key is its file at the usual path, so a read without a
+version id, on any shard, is the read of an unversioned bucket; a version that a
+new latest replaces is linked to
+.IB dir / bucket /versions/ ab / sha256(key) . id
+and that directory synced before the new file is renamed over it, and the 256
+directories of
+.B versions/
+are made with the configuration, which shard 0 writes like the CORS and lifecycle
+documents. Each version's header carries its id and its order among the key's
+versions, written there by the key's owner, which answers only once the file, the
+link and both directories are synced; a versioned put therefore takes a header
+write and up to two syncs more than an unversioned one, and never a file of the pool. A
+version removed for good is unlinked, or for the latest the version behind it is
+renamed over it. The journal still indexes the latest objects only, so a bucket
+with
+.B versions/
+is read from its files at every start, clean or not: the headers give each key's
+versions in order and its delete markers, a version left under both its names by a
+crash between the link and the rename is kept once (as the latest), and a key whose
+latest file is gone is given its newest version back. With
+.BR \-\-shards ,
+all versions of a key are its owner's; a shard that does not own the key reads a
+version by its id from the file where it is, looking at the other place once if a
+rename moved it meanwhile, and a held copy of a latest is dropped on every shard
+before a new version, a marker or a removal that changes the latest is answered.
+.B ListObjectVersions
+asks every shard and merges their pages.
 .SS Bucket lifecycle
 A bucket's lifecycle configuration is S3's
 .B LifecycleConfiguration
@@ -6734,9 +6810,18 @@ or by
 by
 .BR DaysAfterInitiation .
 .B ExpiredObjectDeleteMarker
-is kept and does nothing, since there are no versions.
-.B Transition
-and the noncurrent\-version actions are refused with
+.RB ( true ,
+in an
+.B Expiration
+of its own), and
+.B NoncurrentVersionExpiration
+by
+.BR NoncurrentDays .
+.BR Transition ,
+.B NoncurrentVersionTransition
+and
+.B NewerNoncurrentVersions
+are refused with
 .B "501 NotImplemented"
 and the configuration that was there stays; a document that is not one is
 .BR MalformedXML ,
@@ -6773,7 +6858,14 @@ obeyed. The tags and size a filter asks about are the index's, in memory, so a
 filter on them costs the walk no reads. An upload is
 aborted
 .B DaysAfterInitiation
-days after it began, rounded the same way. A pass runs at each start, within a
+days after it began, rounded the same way. In a versioned bucket an expiring
+latest version is covered by a delete marker, as S3 does, rather than removed; a
+noncurrent version is removed for good
+.B NoncurrentDays
+days after the version that replaced it was written, rounded the same way and
+filtered by the version's own tags and size; and with
+.B ExpiredObjectDeleteMarker
+a delete marker that is its key's only version left is removed. A pass runs at each start, within a
 second of a change to the rules and then hourly; it walks the index a page at a
 time with at most eight removals in flight and a pause between steps, so a
 bucket with a great many expiring keys is worked through without holding up
@@ -7138,7 +7230,7 @@ reached fails the listing with a 500 rather than shortening it.
 .PP
 Buckets are made and dropped by shard 0 and told to the others before it answers;
 a bucket is dropped only when every shard agrees it holds nothing and is idle. A
-bucket's CORS and lifecycle configurations and its policy are written by shard 0 the same way, one change of a bucket at a time, whichever
+bucket's CORS, lifecycle and versioning configurations and its policy are written by shard 0 the same way, one change of a bucket at a time, whichever
 shard took the request, and each shard sweeps the keys it owns.
 Temporary files are named for the shard that wrote them, so a shard restarted by
 the supervisor removes only its own. A shard killed between a rename and its
