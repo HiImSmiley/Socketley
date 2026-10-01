@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""A storage runtime's bucket policies: the configuration and how every request is judged by it.
+
+usage: lib_storage_policy.py MODE ARGS...
+
+  config  PORT               Put/Get/DeleteBucketPolicy and GetBucketPolicyStatus through
+                             boto3 and by hand, every MalformedPolicy, public read on a
+                             prefix for anonymous GET and HEAD and nothing else, presigned
+                             URLs beside it; leaves bucket "pub" with PUBLIC for the restart
+  deny    PORT               a Deny for one signed key and not the other, by bare key, by
+                             user ARN and for the account, DeleteObjects, the source of a
+                             copy, and the policy operations no policy can refuse
+  sourceip PORT              aws:SourceIp IpAddress and NotIpAddress, 127.0.0.1 inside and
+                             outside the range
+  hook    PORT               the order: authentication, the policy, then on_request
+  secure  PLAIN TLS CAFILE   aws:SecureTransport on a cleartext and a TLS listener
+  anon    NODE               a Deny on a runtime with --anonymous
+  shards  NODE0 NODE1        set through one shard and judged the same by both
+  persist TARGET...          PUBLIC is on "pub" through every target and is obeyed
+
+A TARGET is a port or a unix socket path.  The keys are AK1/SK1 and AK2/SK2 in the
+environment.  Every mode prints one PASS or FAIL line per assertion and exits with
+the number of failures.
+"""
+import base64
+import hashlib
+import http.client
+import json
+import os
+import socket
+import ssl
+import sys
+import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_s3_signing as sig  # noqa: E402
+
+AK1 = os.environ.get("AK1", "AKIAPOLICYKEYONE0001")
+SK1 = os.environ.get("SK1", "policy/one/secret")
+AK2 = os.environ.get("AK2", "AKIAPOLICYKEYTWO0002")
+SK2 = os.environ.get("SK2", "policy/two/secret")
+
+PUBLIC = json.dumps({
+    "Version": "2012-10-17",
+    "Id": "public-read",
+    "Statement": [
+        {"Sid": "PublicRead", "Effect": "Allow", "Principal": "*",
+         "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::pub/public/*"},
+    ],
+}, indent=2)
+
+passed = failed = 0
+
+
+def check(name, cond, detail=""):
+    global passed, failed
+    if cond:
+        passed += 1
+        print("  PASS: " + name)
+    else:
+        failed += 1
+        print("  FAIL [%s]: %s" % (name, detail))
+
+
+def finish():
+    print("Results: %d passed, %d failed" % (passed, failed))
+    sys.exit(min(failed, 100))
+
+
+class UnixConn(http.client.HTTPConnection):
+    def __init__(self, path, timeout=30):
+        super().__init__("localhost", timeout=timeout)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+class Resp:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    def code(self):
+        try:
+            return ET.fromstring(self.body).findtext("Code") or ""
+        except ET.ParseError:
+            return ""
+
+    def message(self):
+        try:
+            return ET.fromstring(self.body).findtext("Message") or ""
+        except ET.ParseError:
+            return ""
+
+    def __repr__(self):
+        return "%d %s" % (self.status, self.body[:300])
+
+
+# A target is a port, a unix socket path, or ("tls", port, cafile).
+def connect(target):
+    if isinstance(target, tuple):
+        ctx = ssl.create_default_context(cafile=target[2])
+        return http.client.HTTPSConnection("localhost", target[1], context=ctx, timeout=30), "localhost:%d" % target[1]
+    if str(target).isdigit():
+        return http.client.HTTPConnection("127.0.0.1", int(target), timeout=30), "127.0.0.1:%d" % int(target)
+    return UnixConn(target), "localhost"
+
+
+def req(target, method, path, query="", body=b"", key=None, headers=None):
+    """One request, signed with `key` (an (access, secret) pair) or anonymous when it is None."""
+    if isinstance(body, str):
+        body = body.encode()
+    c, host = connect(target)
+    hdrs = dict(headers or {})
+    if key is not None:
+        signed = sig.sign(method, path, query, host, key[0], key[1], sig.sha256hex(body), extra_headers=hdrs)
+        hdrs = dict(signed.headers)
+    hdrs["Host"] = host
+    try:
+        c.request(method, path + ("?" + query if query else ""), body=body if body or method in ("PUT", "POST") else None,
+                  headers=hdrs)
+        r = c.getresponse()
+        data = r.read()
+        return Resp(r.status, {k.lower(): v for k, v in r.getheaders()}, data)
+    finally:
+        c.close()
+
+
+K1 = (AK1, SK1)
+K2 = (AK2, SK2)
+
+
+def put_policy(target, bucket, doc, key=K1, md5=True):
+    body = doc.encode() if isinstance(doc, str) else doc
+    h = {}
+    if md5:
+        h["Content-MD5"] = base64.b64encode(hashlib.md5(body).digest()).decode()
+    return req(target, "PUT", "/" + bucket, "policy", body, key, h)
+
+
+def get_policy(target, bucket, key=K1):
+    return req(target, "GET", "/" + bucket, "policy", key=key)
+
+
+def delete_policy(target, bucket, key=K1):
+    return req(target, "DELETE", "/" + bucket, "policy", key=key)
+
+
+def policy(*statements, version="2012-10-17"):
+    return json.dumps({"Version": version, "Statement": list(statements)})
+
+
+def stmt(effect, principal, action, resource, condition=None, sid=None):
+    s = {"Effect": effect, "Principal": principal, "Action": action, "Resource": resource}
+    if condition is not None:
+        s["Condition"] = condition
+    if sid is not None:
+        s["Sid"] = sid
+    return s
+
+
+def put_object(target, bucket, k, data, key=K1):
+    return req(target, "PUT", "/%s/%s" % (bucket, k), "", data, key)
+
+
+def boto(port, key=K1):
+    import boto3
+    from botocore.config import Config
+    return boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % port, aws_access_key_id=key[0],
+                        aws_secret_access_key=key[1], region_name="us-east-1",
+                        config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
+                                      retries={"max_attempts": 1}))
+
+
+def malformed(target, bucket, name, doc, want_message=None):
+    r = put_policy(target, bucket, doc)
+    ok = r.status == 400 and r.code() == "MalformedPolicy"
+    if want_message is not None:
+        ok = ok and want_message in r.message()
+    check("MalformedPolicy: " + name, ok, repr(r))
+
+
+# ─── config ─────────────────────────────────────────────────────────────────
+
+def mode_config(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/pub", key=K1).status == 200)
+    for k, v in (("public/a", b"public bytes"), ("private/b", b"private bytes"), ("v1/x", b"v1"),
+                 ("v10/x", b"v10")):
+        check("object %s is put" % k, put_object(T, "pub", k, v).status == 200)
+
+    r = get_policy(T, "pub")
+    check("GetBucketPolicy with none is 404 NoSuchBucketPolicy",
+          r.status == 404 and r.code() == "NoSuchBucketPolicy" and b"<BucketName>pub</BucketName>" in r.body, repr(r))
+    r = req(T, "GET", "/pub", "policyStatus", key=K1)
+    check("GetBucketPolicyStatus with none is 404 NoSuchBucketPolicy", r.status == 404 and r.code() == "NoSuchBucketPolicy", repr(r))
+    r = delete_policy(T, "pub")
+    check("DeleteBucketPolicy with none is 204", r.status == 204, repr(r))
+    r = get_policy(T, "nosuchbucket")
+    check("GetBucketPolicy on a bucket that is not there is NoSuchBucket", r.status == 404 and r.code() == "NoSuchBucket", repr(r))
+    r = put_policy(T, "nosuchbucket", PUBLIC.replace("pub/", "nosuchbucket/"))
+    check("PutBucketPolicy on a bucket that is not there is NoSuchBucket", r.status == 404 and r.code() == "NoSuchBucket", repr(r))
+    r = req(T, "GET", "/pub/public/a", "policy", key=K1)
+    check("?policy on an object is NotImplemented, never a GetObject", r.status == 501, repr(r))
+
+    # Before any policy, an anonymous request is refused exactly as it was.
+    r = req(T, "GET", "/pub/public/a")
+    check("without a policy an anonymous GET is 403 AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+
+    good = PUBLIC
+    bad = [
+        ("not JSON", "this is not json", "valid JSON"),
+        ("a list, not an object", "[]", "valid JSON"),
+        ("trailing bytes", good + "x", None),
+        ("a duplicated field", '{"Version":"2012-10-17","Version":"2012-10-17","Statement":%s}'
+         % json.dumps(json.loads(good)["Statement"]), None),
+        ("no statements", '{"Version":"2012-10-17","Statement":[]}', None),
+        ("no Statement", '{"Version":"2012-10-17"}', "Statement"),
+        ("an unknown Version", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*"), version="2020-01-01"), "Version"),
+        ("an unknown top-level field", json.dumps({"Version": "2012-10-17", "Foo": 1, "Statement": json.loads(good)["Statement"]}), "Foo"),
+        ("no Principal", json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::pub/*"}]}), "Principal"),
+        ("no Resource", json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject"}]}), "Resource"),
+        ("Effect in lowercase", policy(stmt("allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*")), "Effect"),
+        ("NotAction", json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*", "NotAction": "s3:PutObject", "Resource": "arn:aws:s3:::pub/*"}]}), "NotAction"),
+        ("NotPrincipal", json.dumps({"Statement": [{"Effect": "Deny", "NotPrincipal": {"AWS": AK1}, "Action": "s3:*", "Resource": "arn:aws:s3:::pub/*"}]}), "NotPrincipal"),
+        ("an action S3 does not have", policy(stmt("Allow", "*", "s3:FlyToTheMoon", "arn:aws:s3:::pub/*")), "invalid action"),
+        ("an action of another service", policy(stmt("Allow", "*", "ec2:RunInstances", "arn:aws:s3:::pub/*")), "invalid action"),
+        ("a resource in another bucket", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::other/*")), "invalid resource"),
+        ("a wildcard in the bucket name", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pu*/x")), "invalid resource"),
+        ("a resource that is not an S3 ARN", policy(stmt("Allow", "*", "s3:GetObject", "pub/*")), "invalid resource"),
+        ("a policy variable", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/${aws:username}/*")), "variables"),
+        ("an object action on the bucket alone", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub")), "does not apply"),
+        ("a bucket action on objects alone", policy(stmt("Allow", "*", "s3:ListBucket", "arn:aws:s3:::pub/*")), "does not apply"),
+        ("a condition operator not supported", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                                           {"StringEquals": {"aws:Referer": "x"}})), "StringEquals"),
+        ("an IfExists operator", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                             {"IpAddressIfExists": {"aws:SourceIp": "127.0.0.1/32"}})), "IpAddressIfExists"),
+        ("IpAddress on another key", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                                 {"IpAddress": {"aws:Referer": "127.0.0.1/32"}})), "aws:Referer"),
+        ("an address that is not one", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                                    {"IpAddress": {"aws:SourceIp": "300.0.0.0/8"}})), "300.0.0.0/8"),
+        ("a prefix length too long", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*",
+                                                 {"IpAddress": {"aws:SourceIp": "10.0.0.0/33"}})), None),
+        ("SecureTransport neither true nor false", policy(stmt("Deny", "*", "s3:*", "arn:aws:s3:::pub/*",
+                                                              {"Bool": {"aws:SecureTransport": "maybe"}})), "maybe"),
+        ("a service principal", policy(stmt("Allow", {"Service": "s3.amazonaws.com"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "Service"),
+        ("a role principal", policy(stmt("Allow", {"AWS": "arn:aws:iam::123456789012:role/x"}, "s3:GetObject", "arn:aws:s3:::pub/*")), "principal"),
+        ("a principal string that is not *", policy(stmt("Allow", AK1, "s3:GetObject", "arn:aws:s3:::pub/*")), "principal"),
+        ("an empty action list", policy(stmt("Allow", "*", [], "arn:aws:s3:::pub/*")), "Action"),
+        ("two statements with one Sid", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/*", sid="same"),
+                                              stmt("Deny", "*", "s3:PutObject", "arn:aws:s3:::pub/*", sid="same")), "unique"),
+        ("a document over 20 KiB", json.dumps({"Version": "2012-10-17", "Id": "x" * 20500,
+                                               "Statement": json.loads(good)["Statement"]}), "maximum"),
+    ]
+    for name, doc, msg in bad:
+        malformed(T, "pub", name, doc, msg)
+    check("no refused document was kept", get_policy(T, "pub").status == 404)
+    r = put_policy(T, "pub", good.replace("public", "publik"), md5=False, key=K1)
+    r2 = req(T, "PUT", "/pub", "policy", good.encode(), K1,
+             {"Content-MD5": base64.b64encode(hashlib.md5(b"other").digest()).decode()})
+    check("a Content-MD5 the body does not match is BadDigest", r2.status == 400 and r2.code() == "BadDigest", repr(r2))
+    check("a policy is taken without Content-MD5", r.status == 204, repr(r))
+
+    # Accepted forms beside the ones above: one statement as an object, the older Version, a wildcard action.
+    for name, doc in (
+        ("Statement as a single object", json.dumps({"Version": "2008-10-17", "Statement":
+                                                     stmt("Allow", {"AWS": "*"}, "s3:Get*", "arn:aws:s3:::pub/public/*")})),
+        ("no Version, Action *, a root principal", json.dumps({"Statement": [stmt("Deny", {"AWS": ["arn:aws:iam::123456789012:root"]},
+                                                                                "*", ["arn:aws:s3:::pub", "arn:aws:s3:::pub/zz*"])]})),
+        ("an action named for S3 that this runtime does not implement", policy(stmt("Allow", "*", ["s3:GetObject", "s3:GetObjectVersion"],
+                                                                                   "arn:aws:s3:::pub/public/*"))),
+        ("a JSON boolean for SecureTransport and IPv6 ranges", policy(stmt("Deny", "*", "s3:*", "arn:aws:s3:::pub/zz/*",
+                                                                          {"Bool": {"aws:SecureTransport": False},
+                                                                           "NotIpAddress": {"aws:SourceIp": ["::1/128", "10.0.0.0/8"]}}))),
+    ):
+        r = put_policy(T, "pub", doc)
+        check("accepted: " + name, r.status == 204, repr(r))
+
+    # A refused document leaves the one that was there.
+    check("the public-read policy is set", put_policy(T, "pub", PUBLIC).status == 204)
+    malformed(T, "pub", "after a good one", "{")
+    r = get_policy(T, "pub")
+    check("GetBucketPolicy answers the document as it was given, after a refusal",
+          r.status == 200 and r.body.decode() == PUBLIC and r.headers.get("content-type") == "application/json", repr(r))
+    r = req(T, "GET", "/pub", "policyStatus", key=K1)
+    check("GetBucketPolicyStatus says it is public",
+          r.status == 200 and b"<IsPublic>true</IsPublic>" in r.body and b"<PolicyStatus" in r.body, repr(r))
+
+    # What it lets an anonymous request do, and what it does not.
+    r = req(T, "GET", "/pub/public/a")
+    check("an anonymous GET under the public prefix is served", r.status == 200 and r.body == b"public bytes", repr(r))
+    r = req(T, "HEAD", "/pub/public/a")
+    check("an anonymous HEAD under the public prefix is served",
+          r.status == 200 and r.headers.get("content-length") == str(len(b"public bytes")), repr(r))
+    r = req(T, "GET", "/pub/public/a", headers={"Range": "bytes=0-5"})
+    check("an anonymous ranged GET is served", r.status == 206 and r.body == b"public", repr(r))
+    r = req(T, "GET", "/pub/public/missing")
+    check("an anonymous GET of a public key that is not there is NoSuchKey", r.status == 404 and r.code() == "NoSuchKey", repr(r))
+    r = req(T, "GET", "/pub/private/b")
+    check("an anonymous GET outside the prefix is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "HEAD", "/pub/private/b")
+    check("an anonymous HEAD outside the prefix is 403", r.status == 403, repr(r))
+    r = req(T, "PUT", "/pub/public/new", body=b"anonymous upload")
+    check("an anonymous PUT under the public prefix is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "GET", "/pub/public/new", key=K1)
+    check("and stored nothing", r.status == 404, repr(r))
+    r = req(T, "DELETE", "/pub/public/a")
+    check("an anonymous DELETE under the public prefix is AccessDenied", r.status == 403, repr(r))
+    check("and removed nothing", req(T, "GET", "/pub/public/a").status == 200)
+    r = req(T, "GET", "/pub", "list-type=2")
+    check("an anonymous listing is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "GET", "/")
+    check("an anonymous ListBuckets is AccessDenied", r.status == 403, repr(r))
+    r = req(T, "GET", "/pub", "policy")
+    check("an anonymous GetBucketPolicy is AccessDenied", r.status == 403, repr(r))
+    r = req(T, "GET", "/pub/public/a", "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=nobody")
+    check("a broken presigned URL under the public prefix is still refused, never read as anonymous",
+          r.status in (400, 403) and r.code() != "", repr(r))
+    r = req(T, "GET", "/pub/public/a", headers={"Authorization": "AWS4-HMAC-SHA256 Credential=%s/x, Signature=00" % AK1})
+    check("a bad signature under the public prefix is refused, never read as anonymous", r.status in (400, 403), repr(r))
+
+    # The ? wildcard: one character.
+    put_policy(T, "pub", policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/v?/*")))
+    check("? matches one character", req(T, "GET", "/pub/v1/x").status == 200)
+    check("and not two", req(T, "GET", "/pub/v10/x").status == 403)
+
+    # A policy that grants everything still grants nobody the policy itself.
+    check("a policy of s3:* for everyone is taken",
+          put_policy(T, "pub", policy(stmt("Allow", "*", "s3:*", ["arn:aws:s3:::pub", "arn:aws:s3:::pub/*"]))).status == 204)
+    r = req(T, "GET", "/pub", "list-type=2")
+    check("under it an anonymous listing is served", r.status == 200 and b"<Key>public/a</Key>" in r.body, repr(r))
+    r = req(T, "PUT", "/pub/anon/up", body=b"anonymous upload")
+    check("and an anonymous PUT", r.status == 200, repr(r))
+    check("which stored the body", req(T, "GET", "/pub/anon/up", key=K1).body == b"anonymous upload")
+    check("and an anonymous DELETE", req(T, "DELETE", "/pub/anon/up").status == 204)
+    r = delete_policy(T, "pub", key=None)
+    check("but an anonymous DeleteBucketPolicy is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = put_policy(T, "pub", PUBLIC, key=None)
+    check("and an anonymous PutBucketPolicy", r.status == 403, repr(r))
+    r = req(T, "GET", "/pub", "policyStatus")
+    check("and an anonymous GetBucketPolicyStatus", r.status == 403, repr(r))
+
+    # Through boto3, the client people run.
+    try:
+        c = boto(T)
+        c.put_bucket_policy(Bucket="pub", Policy=PUBLIC)
+        check("boto3 put_bucket_policy", True)
+        got = c.get_bucket_policy(Bucket="pub")["Policy"]
+        check("boto3 get_bucket_policy returns the document", got == PUBLIC, got[:200])
+        st = c.get_bucket_policy_status(Bucket="pub")["PolicyStatus"]
+        check("boto3 get_bucket_policy_status reads IsPublic", st.get("IsPublic") is True, st)
+        c.delete_bucket_policy(Bucket="pub")
+        check("boto3 delete_bucket_policy", get_policy(T, "pub").status == 404)
+        check("an anonymous GET is refused once the policy is gone", req(T, "GET", "/pub/public/a").status == 403)
+        c.put_bucket_policy(Bucket="pub", Policy=policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::pub/public/*",
+                                                             {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}})))
+        st = c.get_bucket_policy_status(Bucket="pub")["PolicyStatus"]
+        check("a policy that lets everyone in only from a range is not public", st.get("IsPublic") is False, st)
+        c.put_bucket_policy(Bucket="pub", Policy=PUBLIC)
+
+        # A presigned URL is a signed request, and the policy does not get in its way.
+        import requests
+        url = c.generate_presigned_url("get_object", Params={"Bucket": "pub", "Key": "private/b"}, ExpiresIn=300)
+        r = requests.get(url)
+        check("a presigned GET outside the public prefix is served", r.status_code == 200 and r.content == b"private bytes", r.status_code)
+        url = c.generate_presigned_url("put_object", Params={"Bucket": "pub", "Key": "private/pre"}, ExpiresIn=300)
+        r = requests.put(url, data=b"presigned")
+        check("a presigned PUT is served", r.status_code == 200, (r.status_code, r.text[:200]))
+        u = c.generate_presigned_url("get_object", Params={"Bucket": "pub", "Key": "public/a"}, ExpiresIn=300)
+        cut = u.index("X-Amz-Signature=") + len("X-Amz-Signature=")
+        r = requests.get(u[:cut] + ("0" if u[cut] != "0" else "1") + u[cut + 1:])
+        check("a presigned URL with a broken signature is refused even under the public prefix", r.status_code == 403,
+              r.status_code)
+        keys = [o["Key"] for o in c.list_objects_v2(Bucket="pub").get("Contents", [])]
+        check("a signed listing is served as before", "private/b" in keys and "private/pre" in keys, keys)
+    except ImportError:
+        print("  SKIP: boto3 is not installed")
+    check("PUBLIC is left on the bucket", put_policy(T, "pub", PUBLIC).status == 204)
+
+
+# ─── deny ───────────────────────────────────────────────────────────────────
+
+def mode_deny(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/dny", key=K1).status == 200)
+    for k in ("open/a", "secret/a", "keep/a", "keep/b", "src/a", "other/a"):
+        put_object(T, "dny", k, ("body of " + k).encode())
+    doc = policy(
+        stmt("Deny", {"AWS": "arn:aws:iam::123456789012:user/" + AK2}, ["s3:PutObject", "s3:DeleteObject"],
+             "arn:aws:s3:::dny/*", sid="two-writes-nothing"),
+        stmt("Deny", {"AWS": AK2}, "s3:GetObject", "arn:aws:s3:::dny/secret/*", sid="two-reads-no-secrets"),
+        stmt("Deny", {"AWS": "arn:aws:iam::123456789012:root"}, "s3:DeleteObject", "arn:aws:s3:::dny/keep/*", sid="keep"),
+        stmt("Allow", "*", "s3:GetObject", ["arn:aws:s3:::dny/open/*", "arn:aws:s3:::dny/src/*"], sid="open"),
+        stmt("Allow", "*", "s3:PutObject", "arn:aws:s3:::dny/drop/*", sid="drop"),
+    )
+    r = put_policy(T, "dny", doc)
+    check("a policy with denials is taken", r.status == 204, repr(r))
+    r = req(T, "GET", "/dny", "policyStatus", key=K1)
+    check("it is public, since anyone may read open/", b"<IsPublic>true</IsPublic>" in r.body, repr(r))
+
+    r = put_object(T, "dny", "other/new", b"x", key=K2)
+    check("a PUT by the key a user ARN denies is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    check("and stored nothing", req(T, "GET", "/dny/other/new", key=K1).status == 404)
+    check("the other key may PUT", put_object(T, "dny", "other/new", b"x", key=K1).status == 200)
+    r = req(T, "DELETE", "/dny/other/a", key=K2)
+    check("a DELETE by the denied key is AccessDenied", r.status == 403, repr(r))
+    check("and removed nothing", req(T, "GET", "/dny/other/a", key=K1).status == 200)
+    r = req(T, "GET", "/dny/secret/a", key=K2)
+    check("a GET a bare-key Deny covers is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "GET", "/dny/other/a", key=K2)
+    check("a GET by that key outside it is served", r.status == 200 and r.body == b"body of other/a", repr(r))
+    check("the other key reads the secret", req(T, "GET", "/dny/secret/a", key=K1).status == 200)
+    r = req(T, "GET", "/dny", "list-type=2", key=K2)
+    check("a listing by the denied key, which no statement denies, is served", r.status == 200, repr(r))
+
+    for kk, name in ((K1, "one"), (K2, "two")):
+        r = req(T, "DELETE", "/dny/keep/a", key=kk)
+        check("a DELETE the account-root Deny covers is refused for key %s" % name, r.status == 403, repr(r))
+    check("and keep/a is still there", req(T, "GET", "/dny/keep/a", key=K1).status == 200)
+    check("the account-root Deny does not touch an anonymous GET it does not name",
+          req(T, "GET", "/dny/open/a").status == 200)
+
+    # DeleteObjects names its keys in the body, so any Deny over a key of the bucket refuses it.
+    body = b"<Delete><Object><Key>other/a</Key></Object></Delete>"
+    md5h = {"Content-MD5": base64.b64encode(hashlib.md5(body).digest()).decode()}
+    r = req(T, "POST", "/dny", "delete", body, K2, md5h)
+    check("DeleteObjects by the denied key is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(T, "POST", "/dny", "delete", body, K1, md5h)
+    check("DeleteObjects by the other key is refused too, since keep/* is denied to every key and the body may name it",
+          r.status == 403, repr(r))
+    r = req(T, "POST", "/dny", "delete", body, None, md5h)
+    check("an anonymous DeleteObjects, which no statement allows over every key, is refused", r.status == 403, repr(r))
+
+    # A copy reads its source, and the source has to be readable too.
+    r = req(T, "PUT", "/dny/drop/x", headers={"x-amz-copy-source": "/dny/src/a"})
+    check("an anonymous copy from a readable source into a writable prefix is served", r.status == 200, repr(r))
+    check("and copied the bytes", req(T, "GET", "/dny/drop/x", key=K1).body == b"body of src/a")
+    r = req(T, "PUT", "/dny/drop/y", headers={"x-amz-copy-source": "/dny/other/a"})
+    check("an anonymous copy from a source it may not read is AccessDenied", r.status == 403, repr(r))
+    check("and copied nothing", req(T, "GET", "/dny/drop/y", key=K1).status == 404)
+    r = req(T, "PUT", "/dny/drop/z", key=K2, headers={"x-amz-copy-source": "/dny/secret/a"})
+    check("a signed copy whose source a Deny covers is AccessDenied", r.status == 403, repr(r))
+    r = req(T, "PUT", "/dny/drop/w", headers={"x-amz-copy-source": "/dny/src/a"}, key=K1)
+    check("a signed copy is served as before", r.status == 200, repr(r))
+
+    # Presigned URLs carry the same key, and the same denials.
+    try:
+        import requests
+        u2 = boto(T, K2).generate_presigned_url("get_object", Params={"Bucket": "dny", "Key": "secret/a"}, ExpiresIn=300)
+        u1 = boto(T, K1).generate_presigned_url("get_object", Params={"Bucket": "dny", "Key": "secret/a"}, ExpiresIn=300)
+        check("a presigned GET by the denied key is refused", requests.get(u2).status_code == 403)
+        check("a presigned GET by the other key is served", requests.get(u1).status_code == 200)
+    except ImportError:
+        print("  SKIP: boto3 is not installed")
+
+    # A Deny over everything still leaves the policy itself in reach.
+    lock = policy(stmt("Deny", "*", "s3:*", ["arn:aws:s3:::dny", "arn:aws:s3:::dny/*"]))
+    check("a policy that denies everything to everyone is taken", put_policy(T, "dny", lock).status == 204)
+    check("under it a signed GET is refused", req(T, "GET", "/dny/open/a", key=K1).status == 403)
+    check("and a signed listing", req(T, "GET", "/dny", "list-type=2", key=K1).status == 403)
+    check("and a signed HeadBucket", req(T, "HEAD", "/dny", key=K1).status == 403)
+    r = req(T, "GET", "/dny", "policyStatus", key=K2)
+    check("but GetBucketPolicyStatus is not, and the policy is not public", r.status == 200 and b"false" in r.body, repr(r))
+    check("nor GetBucketPolicy", get_policy(T, "dny", key=K2).body.decode() == lock)
+    check("nor DeleteBucketPolicy", delete_policy(T, "dny", key=K2).status == 204)
+    check("and with it gone a signed GET is served again", req(T, "GET", "/dny/open/a", key=K1).status == 200)
+    check("and an anonymous one refused again", req(T, "GET", "/dny/open/a").status == 403)
+
+
+# ─── sourceip ───────────────────────────────────────────────────────────────
+
+def mode_sourceip(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/ips", key=K1).status == 200)
+    put_object(T, "ips", "public/a", b"ip bytes")
+
+    def allow_from(ranges):
+        return policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::ips/public/*", {"IpAddress": {"aws:SourceIp": ranges}}))
+
+    put_policy(T, "ips", allow_from("127.0.0.0/8"))
+    check("an anonymous GET from inside the allowed range is served", req(T, "GET", "/ips/public/a").status == 200)
+    put_policy(T, "ips", allow_from("127.0.0.1"))
+    check("a bare address is a /32", req(T, "GET", "/ips/public/a").status == 200)
+    put_policy(T, "ips", allow_from("::ffff:127.0.0.1/128"))
+    check("an IPv4 address written as IPv6 is the IPv4 address", req(T, "GET", "/ips/public/a").status == 200)
+    put_policy(T, "ips", allow_from(["10.0.0.0/8", "192.168.0.0/16", "::1/128"]))
+    r = req(T, "GET", "/ips/public/a")
+    check("an anonymous GET from outside every allowed range is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    put_policy(T, "ips", allow_from("127.0.0.2/31"))
+    check("a range that ends one address short of the client is outside", req(T, "GET", "/ips/public/a").status == 403)
+    put_policy(T, "ips", allow_from("127.0.0.0/31"))
+    check("and one whose last bit holds it is inside", req(T, "GET", "/ips/public/a").status == 200)
+
+    def deny_unless(ranges):
+        return policy(stmt("Deny", "*", "s3:*", ["arn:aws:s3:::ips", "arn:aws:s3:::ips/*"],
+                           {"NotIpAddress": {"aws:SourceIp": ranges}}))
+
+    put_policy(T, "ips", deny_unless("10.0.0.0/8"))
+    r = req(T, "GET", "/ips/public/a", key=K1)
+    check("a signed GET from outside a NotIpAddress Deny's range is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    check("and a signed PUT", put_object(T, "ips", "public/b", b"x").status == 403)
+    put_policy(T, "ips", deny_unless(["10.0.0.0/8", "127.0.0.1/32"]))
+    check("a signed GET from inside it is served", req(T, "GET", "/ips/public/a", key=K1).status == 200)
+    check("and a signed PUT", put_object(T, "ips", "public/b", b"x").status == 200)
+    check("and an anonymous GET, which no statement allows, is refused as before", req(T, "GET", "/ips/public/a").status == 403)
+    check("the policy is removed", delete_policy(T, "ips").status == 204)
+
+
+# ─── hook ───────────────────────────────────────────────────────────────────
+
+def mode_hook(port):
+    T = port
+    check("the bucket is made", req(T, "PUT", "/hook", key=K1).status == 200)
+    for k in ("public/a", "hooked/a", "hooked/deny-a"):
+        put_object(T, "hook", k, b"hook bytes")
+    doc = policy(stmt("Allow", "*", "s3:GetObject", ["arn:aws:s3:::hook/public/*", "arn:aws:s3:::hook/hooked/*"]),
+                 stmt("Deny", "*", "s3:GetObject", "arn:aws:s3:::hook/hooked/deny-*"))
+    check("the policy is taken", put_policy(T, "hook", doc).status == 204)
+    r = req(T, "GET", "/hook/public/a")
+    check("a request the policy lets in and the hook lets through is served", r.status == 200, repr(r))
+    r = req(T, "GET", "/hook/hooked/a")
+    check("a request the policy lets in is still the hook's to refuse",
+          r.status == 403 and r.message() == "hook says no", repr(r))
+    r = req(T, "GET", "/hook/hooked/deny-a")
+    check("a request the policy refuses never reaches the hook",
+          r.status == 403 and r.code() == "AccessDenied" and r.message() == "Access Denied", repr(r))
+    r = req(T, "GET", "/hook/hooked/a", key=K1)
+    check("the hook refuses a signed request too", r.status == 403 and r.message() == "hook says no", repr(r))
+    check("the policy is removed", delete_policy(T, "hook").status == 204)
+
+
+# ─── secure ─────────────────────────────────────────────────────────────────
+
+def mode_secure(plain, tls_port, cafile):
+    TLS = ("tls", int(tls_port), cafile)
+    doc = policy(stmt("Allow", "*", "s3:GetObject", "arn:aws:s3:::sec/public/*", {"Bool": {"aws:SecureTransport": "true"}}),
+                 stmt("Deny", "*", "s3:GetObject", "arn:aws:s3:::sec/private/*", {"Bool": {"aws:SecureTransport": "false"}}))
+    for T, name in ((plain, "cleartext"), (TLS, "TLS")):
+        check("the bucket is made over " + name, req(T, "PUT", "/sec", key=K1).status == 200)
+        put_object(T, "sec", "public/a", b"sec bytes")
+        put_object(T, "sec", "private/a", b"sec private")
+        check("the policy is taken over " + name, put_policy(T, "sec", doc).status == 204)
+    r = req(plain, "GET", "/sec/public/a")
+    check("an anonymous GET that must be over TLS is refused in cleartext", r.status == 403, repr(r))
+    r = req(TLS, "GET", "/sec/public/a")
+    check("and served over TLS", r.status == 200 and r.body == b"sec bytes", repr(r))
+    r = req(plain, "GET", "/sec/private/a", key=K1)
+    check("a signed GET denied in cleartext is AccessDenied", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    r = req(TLS, "GET", "/sec/private/a", key=K1)
+    check("and served over TLS", r.status == 200 and r.body == b"sec private", repr(r))
+
+
+# ─── anon ───────────────────────────────────────────────────────────────────
+
+def mode_anon(node):
+    T = node
+    check("the bucket is made", req(T, "PUT", "/anon").status == 200)
+    check("an object is put", put_object(T, "anon", "ro/a", b"anon bytes", key=None).status == 200)
+    doc = policy(stmt("Deny", "*", ["s3:PutObject", "s3:DeleteObject"], "arn:aws:s3:::anon/ro/*"))
+    r = put_policy(T, "anon", doc, key=None)
+    check("on a runtime with --anonymous an anonymous request may set the policy", r.status == 204, repr(r))
+    r = put_object(T, "anon", "ro/b", b"x", key=None)
+    check("a Deny refuses an anonymous PUT the runtime would otherwise take", r.status == 403 and r.code() == "AccessDenied", repr(r))
+    check("and an anonymous DELETE", req(T, "DELETE", "/anon/ro/a").status == 403)
+    check("an anonymous GET it does not deny is served", req(T, "GET", "/anon/ro/a").body == b"anon bytes")
+    check("and a PUT elsewhere", put_object(T, "anon", "rw/a", b"x", key=None).status == 200)
+    check("the policy is removed", delete_policy(T, "anon", key=None).status == 204)
+    check("and the PUT is taken again", put_object(T, "anon", "ro/b", b"x", key=None).status == 200)
+
+
+# ─── shards ─────────────────────────────────────────────────────────────────
+
+def mode_shards(n0, n1):
+    nodes = (n0, n1)
+    check("the bucket is made", req(n0, "PUT", "/pub", key=K1).status == 200)
+    keys = ["public/k%02d" % i for i in range(16)] + ["private/k%02d" % i for i in range(16)]
+    for i, k in enumerate(keys):
+        put_object(nodes[i % 2], "pub", k, k.encode())
+    r = put_policy(n1, "pub", PUBLIC)
+    check("the policy is set through shard 1", r.status == 204, repr(r))
+    for i, n in enumerate(nodes):
+        check("shard %d has it" % i, get_policy(n, "pub").body.decode() == PUBLIC)
+        pub = [req(n, "GET", "/pub/" + k).status for k in keys if k.startswith("public/")]
+        prv = [req(n, "GET", "/pub/" + k).status for k in keys if k.startswith("private/")]
+        check("shard %d serves every public key, whichever shard owns it, anonymously" % i, pub == [200] * 16, pub)
+        check("shard %d refuses every private key" % i, prv == [403] * 16, prv)
+    check("the policy is removed through shard 0", delete_policy(n0, "pub").status == 204)
+    for i, n in enumerate(nodes):
+        check("shard %d no longer has it" % i, get_policy(n, "pub").status == 404)
+        check("shard %d refuses a public key again" % i, req(n, "GET", "/pub/public/k00").status == 403)
+    check("the policy is set again through shard 0 for the restart", put_policy(n0, "pub", PUBLIC).status == 204)
+
+
+# ─── persist ────────────────────────────────────────────────────────────────
+
+def mode_persist(targets):
+    for t in targets:
+        r = get_policy(t, "pub")
+        check("%s has the policy as it was given" % t, r.status == 200 and r.body.decode() == PUBLIC, repr(r))
+        r = req(t, "GET", "/pub/public/a" if str(t).isdigit() else "/pub/public/k01")
+        check("%s serves an anonymous GET under the prefix" % t, r.status == 200, repr(r))
+        r = req(t, "GET", "/pub/private/b" if str(t).isdigit() else "/pub/private/k01")
+        check("%s refuses one outside it" % t, r.status == 403, repr(r))
+
+
+def main():
+    mode = sys.argv[1]
+    a = sys.argv[2:]
+    if mode == "config":
+        mode_config(int(a[0]))
+    elif mode == "deny":
+        mode_deny(int(a[0]))
+    elif mode == "sourceip":
+        mode_sourceip(int(a[0]))
+    elif mode == "hook":
+        mode_hook(int(a[0]))
+    elif mode == "secure":
+        mode_secure(int(a[0]), a[1], a[2])
+    elif mode == "anon":
+        mode_anon(a[0])
+    elif mode == "shards":
+        mode_shards(a[0], a[1])
+    elif mode == "persist":
+        mode_persist([int(x) if x.isdigit() else x for x in a])
+    else:
+        print("unknown mode " + mode)
+        sys.exit(1)
+    finish()
+
+
+if __name__ == "__main__":
+    main()
