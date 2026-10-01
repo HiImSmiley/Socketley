@@ -6287,6 +6287,22 @@ GetBucketLocation	GET /bucket?location	T{
 .ad l
 An empty LocationConstraint.
 T}
+PutBucketCors	PUT /bucket?cors	T{
+.ad l
+A CORSConfiguration of at most 100 rules and 64 KiB, replacing the one before; Content\-MD5 checked. See \fBCORS\fR below.
+T}
+GetBucketCors	GET /bucket?cors	T{
+.ad l
+The rules as they are kept; NoSuchCORSConfiguration (404) when there are none.
+T}
+DeleteBucketCors	DELETE /bucket?cors	T{
+.ad l
+204 whether or not there were rules.
+T}
+(preflight)	OPTIONS /bucket[/key]	T{
+.ad l
+Answered from the bucket's CORS rules, with no signature.
+T}
 ListObjectsV2	GET /bucket?list\-type=2	T{
 .ad l
 prefix, delimiter, continuation\-token, max\-keys (at most 1000), start\-after, encoding\-type=url, fetch\-owner; CommonPrefixes count against max\-keys.
@@ -6390,6 +6406,88 @@ The answers are S3's:
 .B AuthorizationHeaderMalformed
 (400). A denied request is answered before its body is read and the connection is
 closed.
+.SS CORS
+A bucket's CORS rules let a page served from another origin use it from a
+browser: read objects, and upload with a presigned URL. They are set with
+PutBucketCors as S3's
+.B CORSConfiguration
+document, up to 100
+.B CORSRule
+elements each holding one or more
+.B AllowedOrigin
+(with at most one
+.B *
+standing for any run of characters, and
+.B *
+alone for every origin) and
+.B AllowedMethod
+(GET, PUT, HEAD, POST or DELETE), and any number of
+.B AllowedHeader
+(at most one
+.B *
+each, compared without case),
+.BR ExposeHeader ,
+an optional
+.B MaxAgeSeconds
+and an optional
+.B ID
+of up to 255 characters. A document that is not one is
+.BR "400 MalformedXML" ;
+an unknown method, a second wildcard or a 101st rule is
+.BR "400 InvalidRequest" ,
+and a refused document leaves the rules that were there.
+.PP
+The rules are kept in
+.IB dir / bucket /cors ,
+written beside it, synced and renamed over it, so they survive a restart and a
+crash leaves the old rules or the new ones; they go with the bucket when it is
+deleted, and a bucket made again under the name has none. With
+.B \-\-shards
+shard 0 writes them, whichever shard took the request, and every shard has them
+before the request is answered; a shard that was not running reads them from the
+file when it starts.
+.PP
+A preflight,
+.B OPTIONS
+on the bucket or on a key with
+.B Origin
+and
+.B Access\-Control\-Request\-Method
+(and
+.B Access\-Control\-Request\-Headers
+when the request will send others), is answered without authentication from the
+first rule whose origin, method and every requested header match: 200 with
+.B Access\-Control\-Allow\-Origin
+(the origin, or
+.B *
+when the rule allows every origin),
+.BR Access\-Control\-Allow\-Methods ,
+.B Access\-Control\-Allow\-Headers
+(the headers asked for),
+.B Access\-Control\-Allow\-Credentials: true
+for a named origin,
+.B Access\-Control\-Expose\-Headers
+and
+.B Access\-Control\-Max\-Age
+when the rule has them, and
+.BR Vary .
+A bucket without rules is
+.B "403 AccessForbidden"
+("CORSResponse: CORS is not enabled for this bucket."), a request no rule
+allows is the same with "This CORS request is not allowed", and a preflight
+without
+.B Origin
+or with a method S3 does not have is
+.BR "400 BadRequest" .
+.PP
+Every other request that carries an
+.B Origin
+some rule allows for its method gets the same headers but
+.BR Access\-Control\-Allow\-Headers ,
+on every answer: errors and authentication refusals included, so a page can
+read why it was refused. A request from an origin no rule allows is served as
+before, with no CORS headers. A runtime none of whose buckets has rules looks
+nothing up for a request.
 .SS Checksums
 .BR x\-amz\-checksum\-crc32 ,
 .BR \-crc32c ,

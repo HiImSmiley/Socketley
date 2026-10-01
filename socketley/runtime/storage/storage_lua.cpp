@@ -57,6 +57,8 @@ std::string_view storage_run::operation_name(const s3_request& r)
     const std::string_view m = r.method;
     if (service)
         return m == "GET" ? "ListBuckets" : "Unknown";
+    if (bucket_level && r.has_query("cors"))
+        return m == "GET" ? "GetBucketCors" : m == "PUT" ? "PutBucketCors" : m == "DELETE" ? "DeleteBucketCors" : "Unknown";
     if (bucket_level)
     {
         if (m == "GET")

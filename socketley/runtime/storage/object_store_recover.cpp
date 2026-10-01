@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "s3_cors.h"
 #include "s3_names.h"
 #include "shard_owner.h"
 #include "../../shared/logging.h"
@@ -629,6 +630,18 @@ bool object_store::recover_bucket(const std::string& name, recovery_report& rep,
             }
         }
         b->created_ms = ms;
+    }
+
+    // The CORS rules, which shard 0 writes beside the file and renames over it.
+    {
+        if (m_opts.shard == 0 && ::unlink((base + "/cors.new").c_str()) < 0) {}
+        const std::string xml = slurp(base + "/cors");
+        auto c = std::make_shared<cors_config>();
+        s3_error why;
+        if (!xml.empty() && parse_cors_xml(xml, *c, why))
+            set_bucket_cors(*b, std::move(c));
+        else if (!xml.empty())
+            LOG_WARN(("storage: the CORS rules of bucket " + name + " do not parse and are not applied").c_str());
     }
 
     b->dir_fd  = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

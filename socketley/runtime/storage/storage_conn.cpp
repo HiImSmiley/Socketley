@@ -1241,7 +1241,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
     size_t need = 200 + reason.size() + cached_date.size() + 2 * c.req.request_id.size();
     for (const auto& [k, v] : r.headers)
         need += k.size() + v.size() + 4;
-    need += r.headers_raw.size();
+    need += r.headers_raw.size() + c.cors_head.size();
     std::string h;
     h.reserve(need + room);
     auto number = [&h](uint64_t n)
@@ -1268,6 +1268,7 @@ std::string storage_run::response_head(const conn& c, const response& r, size_t 
         h += "\r\n";
     }
     h += r.headers_raw;
+    h += c.cors_head;
     if (r.status != 204 && r.status != 304 && r.status != 100)
     {
         h += "Content-Length: ";
@@ -1372,6 +1373,7 @@ void storage_run::reset_request(const std::shared_ptr<conn>& c)
     c->sent_body = 0;
     c->rd_direct = false;
     c->principal.clear();
+    c->cors_head.clear();
 }
 
 void storage_run::finish_request(const std::shared_ptr<conn>& c)

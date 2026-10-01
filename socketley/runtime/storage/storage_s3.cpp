@@ -6,6 +6,7 @@
 
 #include <openssl/evp.h>
 
+#include "s3_cors.h"
 #include "s3_names.h"
 #include "s3_xml.h"
 #include "storage_instance.h"
@@ -26,13 +27,15 @@ bool unsupported_subresource(const s3_request& r, bool object)
 {
     static constexpr std::string_view names[] = {
         "acl", "tagging", "versioning", "versions",
-        "versionId", "policy", "policyStatus", "cors", "lifecycle", "website", "notification",
+        "versionId", "policy", "policyStatus", "lifecycle", "website", "notification",
         "object-lock", "retention", "legal-hold", "encryption", "replication", "accelerate",
         "requestPayment", "logging", "analytics", "metrics", "inventory", "ownershipControls",
         "publicAccessBlock", "intelligent-tiering", "attributes", "restore", "select", "torrent",
         "acl", "location-constraint",
     };
-    (void)object;
+    // CORS rules belong to a bucket and to nothing else.
+    if (object && r.has_query("cors"))
+        return true;
     // A part number outside an upload asks for one part of a finished object.
     if (r.has_query("partNumber") && !r.has_query("uploadId"))
         return true;
@@ -160,6 +163,16 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     rv.key          = r.key;
     rv.tls          = c->ssl != nullptr;
 
+    // A browser asks before a cross-origin request, and cannot sign the asking.
+    if (r.method == "OPTIONS")
+    {
+        op_preflight(c);
+        return;
+    }
+    // Every answer to a cross-origin request a rule allows carries the rule, refusals included.
+    if (m_store.any_cors())
+        cors_actual(c);
+
     auth_verdict v = m_auth->authorize(rv);
     if (!v.allowed)
     {
@@ -220,7 +233,7 @@ void storage_run::route(const std::shared_ptr<conn>& c)
         return;
     }
 
-    collect_body(c, small_body_limit);
+    collect_body(c, bucket_level && r.has_query("cors") ? cors_max_bytes : small_body_limit);
 }
 
 void storage_run::route_small(const std::shared_ptr<conn>& c)
@@ -233,6 +246,18 @@ void storage_run::route_small(const std::shared_ptr<conn>& c)
     {
         if (m == "GET")
             op_list_buckets(c);
+        else
+            send_error(c, make_error("MethodNotAllowed"));
+        return;
+    }
+    if (bkt && q.has_query("cors"))
+    {
+        if (m == "GET")
+            op_get_cors(c);
+        else if (m == "PUT")
+            op_put_cors(c);
+        else if (m == "DELETE")
+            op_delete_cors(c);
         else
             send_error(c, make_error("MethodNotAllowed"));
         return;

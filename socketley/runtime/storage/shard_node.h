@@ -7,7 +7,9 @@
 // a worker and over a pair of stores in one process.  A runtime of one shard
 // makes no call at all: every operation below then runs on the store alone.
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -74,6 +76,8 @@ public:
     // ── Buckets are made and dropped by shard 0 and told to the rest ────────
     void create_bucket(std::string name, std::function<void(st)> cb);
     void delete_bucket(std::string name, std::function<void(st)> cb);
+    // Sets a bucket's CORS document, or removes it when `xml` is empty; every shard has it before `cb`.
+    void set_cors(std::string name, std::string xml, std::function<void(st)> cb);
 
     // ── A listing is every shard's, merged ──────────────────────────────────
     void list(std::string_view bucket, const list_query& q, std::function<void(st, list_page)> cb);
@@ -112,6 +116,9 @@ public:
 private:
     void run_create(std::string name, std::function<void(st, int64_t)> cb);
     void run_drop(std::string name, std::function<void(st)> cb);
+    // Shard 0's half of set_cors, one change of a bucket at a time so every shard hears them in one order.
+    void run_cors(std::string name, std::string xml, std::function<void(st)> cb);
+    void cors_next(const std::string& name);
 
     // Asks every shard but this one, and `done` runs when the last has answered.
     void each_peer(const std::function<std::string(uint32_t peer)>& make,
@@ -125,6 +132,8 @@ private:
     multipart_store* m_mpu{nullptr};
     shard_transport& m_transport;
     shard_counters   m_c;
+    // The CORS changes of a bucket waiting behind the one being made.
+    std::map<std::string, std::deque<std::function<void()>>> m_cors_lanes;
     std::shared_ptr<bool> m_alive;
 };
 

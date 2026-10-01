@@ -107,6 +107,9 @@ inline s3_error make_error(std::string_view code)
         {"MethodNotAllowed", 405, "The specified method is not allowed against this resource."},
         {"NotImplemented", 501, "A header you provided implies functionality that is not implemented"},
         {"AccessDenied", 403, "Access Denied"},
+        {"AccessForbidden", 403, "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec."},
+        {"NoSuchCORSConfiguration", 404, "The CORS configuration does not exist"},
+        {"BadRequest", 400, "Bad Request"},
         {"SignatureDoesNotMatch", 403, "The request signature we calculated does not match the signature you provided. Check your key and signing method."},
         {"InvalidAccessKeyId", 403, "The AWS Access Key Id you provided does not exist in our records."},
         {"RequestTimeout", 400, "Your socket connection to the server was not read from or written to within the timeout period."},
@@ -165,7 +168,8 @@ inline std::string error_xml(const s3_error& e, const error_context& c)
     if (!c.extra_name.empty())
         x += "<" + std::string(c.extra_name) + ">" + xml_escape(c.extra_value) + "</" +
              std::string(c.extra_name) + ">";
-    if (e.code == "NoSuchBucket" || e.code == "BucketNotEmpty" || e.code == "InvalidBucketName")
+    if (e.code == "NoSuchBucket" || e.code == "BucketNotEmpty" || e.code == "InvalidBucketName" ||
+        e.code == "NoSuchCORSConfiguration")
         x += "<BucketName>" + xml_escape(c.bucket) + "</BucketName>";
     if (e.code == "NoSuchKey")
         x += "<Key>" + xml_escape(c.key) + "</Key>";

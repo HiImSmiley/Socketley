@@ -58,7 +58,7 @@ bool request_op(std::string_view payload, op& out)
     uint32_t m = 0;
     uint8_t  o = 0;
     if (!r.u32(m) || m != magic || !r.u8(o) || o < static_cast<uint8_t>(op::commit) ||
-        o > static_cast<uint8_t>(op::hot_owner_started))
+        o > static_cast<uint8_t>(op::cors_adopt))
         return false;
     out = static_cast<op>(o);
     return true;
@@ -128,6 +128,20 @@ bool decode_hot_owner_started(std::string_view payload, uint32_t& shard)
 {
     bytes::reader r(payload);
     return open_request(r, op::hot_owner_started) && r.u32(shard);
+}
+
+std::string encode_cors(op o, std::string_view bucket, std::string_view xml)
+{
+    bytes::writer w = begin(o);
+    w.bytes(bucket);
+    w.bytes(xml);
+    return w.take();
+}
+
+bool decode_cors(std::string_view payload, op want, std::string& bucket, std::string& xml)
+{
+    bytes::reader r(payload);
+    return open_request(r, want) && r.bytes(bucket, name_cap) && r.bytes(xml, record_cap);
 }
 
 std::string encode_list(std::string_view bucket, const list_query& q)

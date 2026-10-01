@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 
+#include "s3_cors.h"
 #include "s3_names.h"
 #include "shard_owner.h"
 #include "../../shared/logging.h"
@@ -2211,6 +2212,7 @@ void object_store::forget_bucket(const std::string& name)
             *fd = -1;
         }
     m_totals.journal_records -= std::min(m_totals.journal_records, bb.j.records);
+    set_bucket_cors(bb, nullptr);
     hot_drop_bucket(name);
     m_buckets.erase(it);
 }
@@ -2279,6 +2281,148 @@ void object_store::drop_rename(std::string name, std::function<void(st)> cb)
         --m_inflight;
         cb(st::io_error);
     }
+}
+
+// ─── CORS ───────────────────────────────────────────────────────────────────
+
+const cors_config* object_store::bucket_cors(std::string_view name) const
+{
+    const bucket* b = find_bucket(name);
+    return b && !b->closing ? b->cors.get() : nullptr;
+}
+
+void object_store::set_bucket_cors(bucket& b, std::shared_ptr<const cors_config> c)
+{
+    if (b.cors)
+        --m_cors_buckets;
+    if (c)
+        ++m_cors_buckets;
+    b.cors = std::move(c);
+}
+
+st object_store::adopt_cors(std::string_view name, std::string_view xml)
+{
+    bucket* b = find_bucket(name);
+    if (!b)
+        return st::no_such_bucket;
+    if (xml.empty())
+    {
+        set_bucket_cors(*b, nullptr);
+        return st::ok;
+    }
+    auto c = std::make_shared<cors_config>();
+    s3_error err;
+    if (!parse_cors_xml(xml, *c, err))
+        return st::io_error;
+    set_bucket_cors(*b, std::move(c));
+    return st::ok;
+}
+
+namespace
+{
+
+struct cors_write
+{
+    std::string name;
+    std::string xml;
+    uint64_t    gen{0};
+    int         stage{0};
+    int         fd{-1};
+    std::function<void(st)> cb;
+};
+
+}   // namespace
+
+void object_store::write_cors(std::string name, std::string xml, std::function<void(st)> cb)
+{
+    bucket* b = find_bucket(name);
+    if (!b || b->closing)
+    {
+        cb(st::no_such_bucket);
+        return;
+    }
+    // Counted as work in the bucket, so a drop waits for the file to settle.
+    ++b->active_ops;
+    auto ws  = std::make_shared<cors_write>();
+    ws->name = std::move(name);
+    ws->xml  = std::move(xml);
+    ws->gen  = b->gen;
+    ws->cb   = std::move(cb);
+    // Rules are written beside the file and renamed over it, so a crash leaves the old ones or the new.
+    ws->stage = ws->xml.empty() ? 10 : 0;
+
+    auto alive = m_alive;
+    auto step  = std::make_shared<std::function<void(int64_t)>>();
+    std::weak_ptr<std::function<void(int64_t)>> wstep = step;
+    *step = [this, alive, ws, wstep](int64_t res)
+    {
+        if (!*alive)
+            return;
+        auto self = wstep.lock();
+        bucket* bp = find_bucket(ws->name);
+        if (bp && bp->gen != ws->gen)
+            bp = nullptr;
+        auto finish = [this, ws, bp](st s)
+        {
+            if (ws->fd >= 0)
+                m_loop->close_fd(ws->fd);
+            ws->fd = -1;
+            if (bp)
+            {
+                --bp->active_ops;
+                if (s == st::ok)
+                    s = adopt_cors(ws->name, ws->xml);
+            }
+            ws->cb(bp ? s : st::no_such_bucket);
+        };
+        if (!bp)
+        {
+            finish(st::no_such_bucket);
+            return;
+        }
+        auto next = [self](int64_t r) { if (self) (*self)(r); };
+        const int stage = ws->stage++;
+        bool queued = true;
+        switch (stage)
+        {
+            case 0:
+                queued = m_io->openat(bp->dir_fd, "cors.new", O_WRONLY | O_CREAT | O_TRUNC, 0644, next);
+                break;
+            case 1:
+                if (res < 0) { finish(errno_status(res)); return; }
+                ws->fd = static_cast<int>(res);
+                queued = m_io->pwrite(ws->fd, ws->xml.data(), static_cast<uint32_t>(ws->xml.size()), 0, next);
+                break;
+            case 2:
+                if (res != static_cast<int64_t>(ws->xml.size())) { finish(errno_status(res < 0 ? res : -EIO)); return; }
+                queued = m_io->fsync(ws->fd, true, next);
+                break;
+            case 3:
+                if (res < 0) { finish(errno_status(res)); return; }
+                m_loop->close_fd(ws->fd);
+                ws->fd = -1;
+                queued = m_io->renameat(bp->dir_fd, "cors.new", bp->dir_fd, "cors", next);
+                break;
+            case 4:
+            case 11:
+                if (res < 0 && !(stage == 11 && res == -ENOENT)) { finish(errno_status(res)); return; }
+                ++m_totals.fsyncs;
+                ws->stage = 20;
+                queued = m_io->fsync(bp->dir_fd, false, next);
+                break;
+            case 10:
+                queued = m_io->unlinkat(bp->dir_fd, "cors", 0, next);
+                break;
+            default:
+                finish(res < 0 ? st::io_error : st::ok);
+                return;
+        }
+        if (!queued)
+            finish(st::io_error);
+    };
+    (*step)(0);
+    // The sequence outlives this frame through the completion each step queues.
+    (void)step;
 }
 
 }   // namespace socketley::storage

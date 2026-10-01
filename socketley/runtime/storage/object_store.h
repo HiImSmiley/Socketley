@@ -7,6 +7,7 @@
 //
 // ─── LAYOUT ─────────────────────────────────────────────────────────────────
 //   <dir>/<bucket>/created            decimal milliseconds since the epoch
+//   <dir>/<bucket>/cors               the bucket's CORSConfiguration, when it has one
 //   <dir>/<bucket>/index.<shard>      the journal of puts and deletes
 //   <dir>/<bucket>/tmp/<random>       a body on its way in
 //   <dir>/<bucket>/data/ab/<hash>     header + bytes, hash = sha256(key) in hex; the 256 ab
@@ -38,6 +39,8 @@
 
 namespace socketley::storage
 {
+
+struct cors_config;
 
 // What an operation came to, named for the S3 error a client is given.
 enum class st : uint8_t
@@ -412,6 +415,16 @@ public:
     // Removes a body that will not become anything from the bucket's tmp directory.
     void remove_tmp(std::string_view bucket, std::string tmp_name);
 
+    // ── CORS ────────────────────────────────────────────────────────────────
+    // Whether any bucket has rules, so a request to a store without them looks nothing up.
+    bool any_cors() const { return m_cors_buckets != 0; }
+    // The bucket's rules, null when it has none; valid until they next change.
+    const cors_config* bucket_cors(std::string_view name) const;
+    // Makes `xml` the bucket's rules on disk, or removes them when it is empty, and then here; shard 0's half.
+    void write_cors(std::string name, std::string xml, std::function<void(st)> cb);
+    // Takes up rules another shard wrote, from their document.
+    st adopt_cors(std::string_view name, std::string_view xml);
+
     // ── Sharding ────────────────────────────────────────────────────────────
     uint32_t shard() const { return m_opts.shard; }
     uint32_t shards() const { return m_opts.nshards; }
@@ -579,6 +592,7 @@ private:
         uint32_t    active_puts{0};
         uint32_t    active_ops{0};
         bool        closing{false};
+        std::shared_ptr<const cors_config> cors;
         // The compaction's cursor, valid while journal.frozen.
         std::map<std::string, object_meta, std::less<>>::const_iterator dump_it;
         int         dump_fd{-1};
@@ -690,6 +704,9 @@ private:
     uint64_t m_drop_epoch{0};
     uint64_t m_drop_ring[drop_ring_size]{};
     uint64_t m_reserved{0};
+    // Buckets whose rules are set.
+    uint32_t m_cors_buckets{0};
+    void set_bucket_cors(bucket& b, std::shared_ptr<const cors_config> c);
     store_totals m_totals;
     // Set false when the store goes away, so a callback still in the ring finds out.
     std::shared_ptr<bool> m_alive;

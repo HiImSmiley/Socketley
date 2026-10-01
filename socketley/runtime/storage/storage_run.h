@@ -298,6 +298,8 @@ struct conn
     std::string peer;
     // Who the authenticator said made the request, for the script.
     std::string principal;
+    // The CORS header lines every answer to this request carries, empty unless a rule allows its origin.
+    std::string cors_head;
 };
 
 // An object's metadata as a script sees it: the user metadata without its
@@ -485,6 +487,13 @@ public:
     void op_delete_bucket(const std::shared_ptr<conn>& c);
     void op_head_bucket(const std::shared_ptr<conn>& c);
     void op_bucket_location(const std::shared_ptr<conn>& c);
+    // PutBucketCors, GetBucketCors and DeleteBucketCors, and the OPTIONS preflight, in storage_cors.cpp.
+    void op_put_cors(const std::shared_ptr<conn>& c);
+    void op_get_cors(const std::shared_ptr<conn>& c);
+    void op_delete_cors(const std::shared_ptr<conn>& c);
+    void op_preflight(const std::shared_ptr<conn>& c);
+    // Fills the connection's CORS lines for an actual request from an origin a rule of its bucket allows.
+    void cors_actual(const std::shared_ptr<conn>& c);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                       bool replace, const object_meta& src_meta);
