@@ -407,15 +407,15 @@ constexpr action_name action_names[] = {
     {"GetBucketPolicyStatus", res_kind::bucket, s3_action::get_bucket_policy_status},
 
     {"ListAllMyBuckets", res_kind::service, s3_action::none},
-    {"GetObjectVersion", res_kind::object, s3_action::none},
+    {"GetObjectVersion", res_kind::object, s3_action::get_object_version},
     {"GetObjectAcl", res_kind::object, s3_action::none},
     {"PutObjectAcl", res_kind::object, s3_action::none},
     {"GetObjectVersionAcl", res_kind::object, s3_action::none},
     {"PutObjectVersionAcl", res_kind::object, s3_action::none},
-    {"DeleteObjectVersion", res_kind::object, s3_action::none},
-    {"GetObjectVersionTagging", res_kind::object, s3_action::none},
-    {"PutObjectVersionTagging", res_kind::object, s3_action::none},
-    {"DeleteObjectVersionTagging", res_kind::object, s3_action::none},
+    {"DeleteObjectVersion", res_kind::object, s3_action::delete_object_version},
+    {"GetObjectVersionTagging", res_kind::object, s3_action::get_object_version_tagging},
+    {"PutObjectVersionTagging", res_kind::object, s3_action::put_object_version_tagging},
+    {"DeleteObjectVersionTagging", res_kind::object, s3_action::delete_object_version_tagging},
     {"GetObjectAttributes", res_kind::object, s3_action::none},
     {"GetObjectVersionAttributes", res_kind::object, s3_action::none},
     {"GetObjectRetention", res_kind::object, s3_action::none},
@@ -429,11 +429,11 @@ constexpr action_name action_names[] = {
     {"ReplicateObject", res_kind::object, s3_action::none},
     {"ReplicateDelete", res_kind::object, s3_action::none},
     {"ReplicateTags", res_kind::object, s3_action::none},
-    {"ListBucketVersions", res_kind::bucket, s3_action::none},
+    {"ListBucketVersions", res_kind::bucket, s3_action::list_bucket_versions},
     {"GetBucketAcl", res_kind::bucket, s3_action::none},
     {"PutBucketAcl", res_kind::bucket, s3_action::none},
-    {"GetBucketVersioning", res_kind::bucket, s3_action::none},
-    {"PutBucketVersioning", res_kind::bucket, s3_action::none},
+    {"GetBucketVersioning", res_kind::bucket, s3_action::get_bucket_versioning},
+    {"PutBucketVersioning", res_kind::bucket, s3_action::put_bucket_versioning},
     {"GetBucketTagging", res_kind::bucket, s3_action::none},
     {"PutBucketTagging", res_kind::bucket, s3_action::none},
     {"GetBucketWebsite", res_kind::bucket, s3_action::none},
@@ -853,6 +853,9 @@ s3_action action_of_operation(std::string_view op)
         {"PutBucketPolicy", s3_action::put_bucket_policy},
         {"DeleteBucketPolicy", s3_action::delete_bucket_policy},
         {"GetBucketPolicyStatus", s3_action::get_bucket_policy_status},
+        {"GetBucketVersioning", s3_action::get_bucket_versioning},
+        {"PutBucketVersioning", s3_action::put_bucket_versioning},
+        {"ListObjectVersions", s3_action::list_bucket_versions},
     };
     for (const row& r : table)
         if (r.op == op)
@@ -872,9 +875,27 @@ bool action_on_object(s3_action a)
         case s3_action::delete_object_tagging:
         case s3_action::abort_multipart_upload:
         case s3_action::list_multipart_upload_parts:
+        case s3_action::get_object_version:
+        case s3_action::delete_object_version:
+        case s3_action::get_object_version_tagging:
+        case s3_action::put_object_version_tagging:
+        case s3_action::delete_object_version_tagging:
             return true;
         default:
             return false;
+    }
+}
+
+s3_action version_action(s3_action a)
+{
+    switch (a)
+    {
+        case s3_action::get_object:            return s3_action::get_object_version;
+        case s3_action::delete_object:         return s3_action::delete_object_version;
+        case s3_action::get_object_tagging:    return s3_action::get_object_version_tagging;
+        case s3_action::put_object_tagging:    return s3_action::put_object_version_tagging;
+        case s3_action::delete_object_tagging: return s3_action::delete_object_version_tagging;
+        default:                               return a;
     }
 }
 

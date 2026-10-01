@@ -124,7 +124,9 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
             return;
     }
 
-    const s3_action action = action_of_operation(operation_name(r));
+    // A request that names a version is the version's own action, as S3 judges it.
+    const s3_action plain  = action_of_operation(operation_name(r));
+    const s3_action action = r.has_query("versionId") ? version_action(plain) : plain;
     // The policy's own operations answer to the credentials alone, so a policy that shuts everyone out can be removed.
     if (action == s3_action::none || action == s3_action::put_bucket_policy || action == s3_action::get_bucket_policy ||
         action == s3_action::delete_bucket_policy || action == s3_action::get_bucket_policy_status)
@@ -139,18 +141,7 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     pr.ip        = &c->ip;
     pr.every_key = action == s3_action::delete_object && r.key.empty();
 
-    auto judge = [this, &c](std::string_view bucket, const policy_request& q)
-    {
-        const bucket_policy* p = m_store.policy(bucket);
-        if (!p || (!q.anonymous && !p->has_deny()))
-            return policy_effect::none;
-        if (p->needs_ip() && !c->ip_known)
-        {
-            c->ip       = client_ip_of(c->fd);
-            c->ip_known = true;
-        }
-        return p->evaluate(q);
-    };
+    auto judge = [this, &c](std::string_view bucket, const policy_request& q) { return policy_effect_of(c, bucket, q); };
 
     const policy_effect dest = judge(r.bucket, pr);
     // A copy reads its source, which the source bucket's policy has its say on as a GetObject.
@@ -158,12 +149,12 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
     policy_effect src = policy_effect::none;
     if (copy)
     {
-        std::string sb, sk;
+        std::string sb, sk, sv;
         s3_error    ignored;
-        if (parse_copy_source(r.header("x-amz-copy-source"), sb, sk, ignored))
+        if (parse_copy_source(r.header("x-amz-copy-source"), sb, sk, ignored, &sv))
         {
             policy_request sq = pr;
-            sq.action = s3_action::get_object;
+            sq.action = sv.empty() ? s3_action::get_object : s3_action::get_object_version;
             sq.key    = sk;
             src       = judge(sb, sq);
         }
@@ -183,7 +174,36 @@ void storage_run::apply_policy(const std::shared_ptr<conn>& c, const request_vie
         v.allowed = true;
         v.error   = {};
         v.hook    = unsigned_trailer_hook(rv);
+        c->policy_admitted = true;
     }
+}
+
+policy_effect storage_run::policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket,
+                                            const policy_request& q)
+{
+    const bucket_policy* p = m_store.policy(bucket);
+    if (!p || (!q.anonymous && !p->has_deny()))
+        return policy_effect::none;
+    if (p->needs_ip() && !c->ip_known)
+    {
+        c->ip       = client_ip_of(c->fd);
+        c->ip_known = true;
+    }
+    return p->evaluate(q);
+}
+
+bool storage_run::policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key)
+{
+    policy_request q;
+    q.action    = s3_action::delete_object_version;
+    q.key       = key;
+    q.anonymous = c->anonymous;
+    q.principal = c->principal;
+    q.tls       = c->ssl != nullptr;
+    q.ip        = &c->ip;
+    const policy_effect e = policy_effect_of(c, c->req.bucket, q);
+    // A request a policy let in is let delete a version only by an Allow of that too.
+    return e != policy_effect::deny && (!c->policy_admitted || e == policy_effect::allow);
 }
 
 }   // namespace socketley::storage

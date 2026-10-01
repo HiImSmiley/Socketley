@@ -326,6 +326,9 @@ struct conn
     // The peer's address as a policy condition compares it, read the first time one does.
     client_ip   ip;
     bool        ip_known{false};
+    // The request carried no credentials, and was let in by a bucket policy rather than by the runtime.
+    bool        anonymous{false};
+    bool        policy_admitted{false};
 };
 
 // An object's metadata as a script sees it: the user metadata without its
@@ -566,6 +569,10 @@ public:
     void op_get_policy_status(const std::shared_ptr<conn>& c);
     // Judges an authenticated or anonymous request by the policies of the buckets it touches, changing `v`.
     void apply_policy(const std::shared_ptr<conn>& c, const request_view& rv, auth_verdict& v);
+    // What the policy of `bucket` says to `q` from this connection, none when the bucket has none that could apply.
+    policy_effect policy_effect_of(const std::shared_ptr<conn>& c, std::string_view bucket, const policy_request& q);
+    // Whether this request's policies let it remove version `version_id`'s key, which DeleteObjects names only in its body.
+    bool policy_allows_version_delete(const std::shared_ptr<conn>& c, std::string_view key);
     void op_list_objects(const std::shared_ptr<conn>& c, bool v2);
     void op_copy_from(const std::shared_ptr<conn>& c, std::string src_bucket, std::string src_key,
                       std::string src_version, bool replace, const object_meta& src_meta);

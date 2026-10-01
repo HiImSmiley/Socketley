@@ -226,6 +226,7 @@ void storage_run::dispatch(const std::shared_ptr<conn>& c)
     }
     c->hook = std::move(v.hook);
     c->principal = std::move(v.principal);
+    c->anonymous = v.anonymous;
 
     // A client that signs its payload in chunks, talking to a runtime with no
     // decoder for them, would have the framing stored as the object.
@@ -732,6 +733,14 @@ void storage_run::op_delete_objects(const std::shared_ptr<conn>& c)
         {
             res.ok    = false;
             res.error = make_error("NoSuchVersion");
+            done_one(b);
+            continue;
+        }
+        // An entry that names a version is s3:DeleteObjectVersion, which the dispatch could not see in the body.
+        if (!res.version_id.empty() && m_store.any_policy() && !policy_allows_version_delete(c, res.key))
+        {
+            res.ok    = false;
+            res.error = make_error("AccessDenied");
             done_one(b);
             continue;
         }

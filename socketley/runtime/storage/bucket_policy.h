@@ -45,6 +45,15 @@ enum class s3_action : uint8_t
     put_bucket_policy,
     delete_bucket_policy,
     get_bucket_policy_status,
+    // A request that names a version is checked as the action S3 has for it.
+    get_object_version,
+    delete_object_version,
+    get_object_version_tagging,
+    put_object_version_tagging,
+    delete_object_version_tagging,
+    list_bucket_versions,
+    get_bucket_versioning,
+    put_bucket_versioning,
     count,
 };
 static_assert(static_cast<int>(s3_action::count) <= 64);
@@ -54,6 +63,9 @@ s3_action action_of_operation(std::string_view operation);
 
 // Whether the action acts on an object, whose resource is bucket/key, rather than on the bucket.
 bool action_on_object(s3_action a);
+
+// The action `a` is when the request names a version with ?versionId=, `a` itself when S3 has no other for it.
+s3_action version_action(s3_action a);
 
 // A client's address as a condition compares it: an IPv4 address mapped into
 // IPv6 is the IPv4 address, and a unix socket has none.
