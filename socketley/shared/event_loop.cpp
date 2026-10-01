@@ -1165,7 +1165,7 @@ uint32_t event_loop::poll_completions(int timeout_ms)
     // settled, because that entry also carries the queued submissions and one
     // of them completing inline is a hit the credit is not charged for.
     uint32_t spun = 0;
-    if (!cqe && m_pending_submissions > 0 && timeout_ms > 0
+    if (!cqe && m_spin && m_pending_submissions > 0 && timeout_ms > 0
         && credit_after_turn(m_last_batch, m_busy_credit) > 0)
     {
         if (enter_get_events() < 0 || io_uring_peek_cqe(&m_ring, &cqe) != 0)
@@ -1202,7 +1202,7 @@ uint32_t event_loop::poll_completions(int timeout_ms)
         // about to sleep, which is the one moment the previous turn is a
         // poor witness; a credit that a batch refills and every quiet turn
         // spends answers for the phase instead of the instant.
-        m_busy_credit = credit_after_turn(m_last_batch, m_busy_credit);
+        m_busy_credit = m_spin ? credit_after_turn(m_last_batch, m_busy_credit) : 0;
 
         for (uint32_t s = m_busy_credit ? SPIN_BUDGET - spun : 0; s > 0; --s)
         {

@@ -40,6 +40,8 @@ public:
     // flags at creation, and calling it marks the choice explicit so a flag
     // beats the environment.
     void set_cpus(const cpu_set_spec& cpus);
+    // Whether a quiet turn enters the ring again before it sleeps; on unless a runtime says otherwise.
+    void set_busy_spin(bool on) { m_spin = on; }
 
     bool init();
     void run();
@@ -407,6 +409,7 @@ private:
     // that stops leaves at most this many extra ring entries behind it.
     static constexpr uint32_t BUSY_CREDIT = 64;
     uint32_t m_busy_credit{0};
+    bool     m_spin{true};
     // The credit after a turn that found nothing: a batch refills it and a
     // quiet turn spends one, written once so a turn can read what the
     // settlement will say before it makes the entry the answer depends on.

@@ -167,6 +167,8 @@ bool storage_instance::setup(event_loop& loop)
     std::erase_if(m_graveyard, [](const auto& r) { return r->drained(); });
 
     m_loop = &loop;
+    // Storage waits on the disk rather than on the next packet, so a spin finds nothing and only spends CPU.
+    loop.set_busy_spin(false);
     refresh_cached_limits();
 
     // Read here, at every start, so a `reload` installs a replaced certificate.
